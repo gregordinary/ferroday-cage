@@ -42,6 +42,31 @@ fn range_map_available() -> bool {
     }
 }
 
+/// The size of the caller's subordinate uid allocation, when `/etc/subuid`
+/// states it plainly.
+///
+/// Used only to decide whether a nested test can fit inside the allocation,
+/// never to build a map: `unshare --map-auto` reads the allocation itself,
+/// through the same NSS-aware path the shadow helpers use. This is the
+/// cheaper question of whether the allocation is large enough to bother
+/// trying, so an allocation this cannot see — one a directory service
+/// provides rather than the file — returns `None` and the caller proceeds
+/// rather than skipping.
+#[cfg(feature = "subid")]
+fn subordinate_uid_count() -> Option<u32> {
+    let uid = rustix::process::getuid().as_raw().to_string();
+    let name = std::env::var("USER").ok();
+    let text = std::fs::read_to_string("/etc/subuid").ok()?;
+    text.lines().find_map(|line| {
+        let mut fields = line.trim().splitn(3, ':');
+        let owner = fields.next()?;
+        let _start = fields.next()?;
+        let count = fields.next()?.parse().ok()?;
+        let mine = owner == uid || name.as_deref().is_some_and(|name| owner == name);
+        mine.then_some(count)
+    })
+}
+
 /// Runs a shell script in the cage, capturing its output.
 fn run_script(cage: &Cage) -> Output {
     cage.output().expect("the sandbox should launch")
@@ -387,17 +412,28 @@ fn a_nested_cage_writes_its_own_range_map() {
     }
 
     // The outer namespace: this test binary re-run under the host unshare,
-    // with the caller's own id at 0 and the subordinate allocation behind
-    // it. An unshare without --map-users support skips.
+    // with the caller's own id at 0 and the subordinate allocation behind it.
+    // An unshare without --map-auto support skips.
+    //
+    // --map-auto rather than an explicit --map-users, because the range a
+    // host delegates is a host detail: useradd hands out 65536-wide blocks
+    // marching up from SUB_UID_MIN, so which one a user holds depends on how
+    // many users preceded it, and a directory service may supply it instead
+    // of the file. Naming a range here would assert one machine's answer.
+    // The inner run maps 65535 ids above root, so an allocation known to be
+    // smaller cannot carry it and the test says so rather than failing.
+    if subordinate_uid_count().is_some_and(|count| count < 65536) {
+        eprintln!("skipping: the caller's subordinate allocation is too small to nest inside");
+        return;
+    }
     let exe = std::env::current_exe().expect("the test binary path");
     let output = Command::new("unshare")
         .args([
             "--setgroups",
             "allow",
             "--map-user=0",
-            "--map-users=1:100000:65536",
             "--map-group=0",
-            "--map-groups=1:100000:65536",
+            "--map-auto",
             "--",
         ])
         .arg(&exe)
