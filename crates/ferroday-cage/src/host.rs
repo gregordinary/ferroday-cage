@@ -1,0 +1,869 @@
+//! Host support probing for unprivileged user namespaces.
+//!
+//! The sandbox is built from unprivileged user namespaces, and several common
+//! host configurations disable them. [`userns_blocker`] inspects the host for
+//! the known ones, so that a denial surfaces as an explanation rather than a
+//! raw `EPERM`, and so that test suites can skip sandbox tests explicitly on
+//! hosts that cannot run them. [`range_map_blocker`] does the same for
+//! uid/gid range maps, whose availability depends on the caller's privilege
+//! and, for the delegated tier, on the shadow suite's helpers.
+
+use std::ffi::{CStr, CString};
+use std::fmt;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+use rustix::fs::{AtFlags, Mode, OFlags, RawDir, SeekFrom, XattrFlags};
+use rustix::io::Errno;
+use rustix::rand::GetRandomFlags;
+
+/// A host configuration known to block unprivileged user namespace creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum UsernsBlocker {
+    /// The `kernel.unprivileged_userns_clone` sysctl is `0`.
+    ///
+    /// This out-of-tree sysctl appears on Debian-derived kernels; `0` denies
+    /// user namespace creation to unprivileged processes.
+    UnprivilegedUsernsCloneDisabled,
+    /// The `user.max_user_namespaces` sysctl is `0`.
+    ///
+    /// A limit of zero denies user namespace creation outright.
+    MaxUserNamespacesIsZero,
+    /// The `kernel.apparmor_restrict_unprivileged_userns` sysctl is `1`.
+    ///
+    /// On Ubuntu-derived systems this restricts user namespace creation to
+    /// programs granted the capability by an AppArmor profile.
+    ApparmorRestrictsUnprivilegedUserns,
+}
+
+impl fmt::Display for UsernsBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            UsernsBlocker::UnprivilegedUsernsCloneDisabled => {
+                "the kernel.unprivileged_userns_clone sysctl is 0; set it to 1 to permit \
+                 unprivileged user namespace creation"
+            }
+            UsernsBlocker::MaxUserNamespacesIsZero => {
+                "the user.max_user_namespaces sysctl is 0; raise it to permit user \
+                 namespace creation"
+            }
+            UsernsBlocker::ApparmorRestrictsUnprivilegedUserns => {
+                "the kernel.apparmor_restrict_unprivileged_userns sysctl is 1; set it to 0, \
+                 or grant this program an AppArmor profile that permits user namespace \
+                 creation"
+            }
+        })
+    }
+}
+
+/// Probes the host for configurations that block unprivileged user namespace
+/// creation, returning the first one identified.
+///
+/// The probe is best-effort and read-only: it inspects sysctl values and
+/// creates no namespaces. `None` means no known blocker was found, not a
+/// guarantee that namespace creation succeeds — a seccomp filter or an LSM
+/// policy can still deny it. The blockers describe creation by unprivileged
+/// processes; a privileged process may be exempt from some of them.
+pub fn userns_blocker() -> Option<UsernsBlocker> {
+    if sysctl_value("/proc/sys/kernel/unprivileged_userns_clone") == Some(0) {
+        return Some(UsernsBlocker::UnprivilegedUsernsCloneDisabled);
+    }
+    if sysctl_value("/proc/sys/user/max_user_namespaces") == Some(0) {
+        return Some(UsernsBlocker::MaxUserNamespacesIsZero);
+    }
+    if sysctl_value("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") == Some(1) {
+        return Some(UsernsBlocker::ApparmorRestrictsUnprivilegedUserns);
+    }
+    None
+}
+
+/// The supported Landlock ABI version, or `None` when the running kernel
+/// offers no Landlock security module.
+///
+/// The version rises as the kernel gains filesystem and network access
+/// rights; [`CageBuilder::landlock_fs`] enforces best-effort down to it. A
+/// `None` result means a Landlock request would fail at setup rather than
+/// apply.
+///
+/// [`CageBuilder::landlock_fs`]: crate::CageBuilder::landlock_fs
+#[cfg(feature = "hardening")]
+pub fn landlock_abi() -> Option<i32> {
+    crate::mechanism::probe_landlock_abi()
+}
+
+/// Whether the running kernel offers seccomp syscall filtering.
+///
+/// `false` means the kernel was built without `CONFIG_SECCOMP` and a seccomp
+/// policy would fail to install.
+#[cfg(feature = "hardening")]
+pub fn seccomp_available() -> bool {
+    // PR_GET_SECCOMP answers with the current mode when seccomp is compiled
+    // in, and errors when it is not. The probe changes no state.
+    rustix::thread::secure_computing_mode().is_ok()
+}
+
+/// Reads a sysctl file and parses its leading integer value.
+///
+/// Returns `None` when the file does not exist, cannot be read, or does not
+/// parse; an absent sysctl is simply not part of this host's configuration.
+fn sysctl_value(path: &str) -> Option<i64> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.split_whitespace().next()?.parse().ok()
+}
+
+/// A host condition known to make a uid/gid range map unavailable.
+///
+/// The single-identity map needs none of this; the conditions concern the
+/// range tiers: writing a map directly requires capabilities over the parent
+/// user namespace, and delegating to the shadow suite requires working,
+/// privileged helpers and a subordinate allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RangeMapBlocker {
+    /// The library was built without the `subid` feature, and the caller
+    /// holds no capabilities over its user namespace.
+    ///
+    /// Without the feature the only bundled delegate writes maps directly,
+    /// which requires `CAP_SETUID` and `CAP_SETGID` — running as root, or
+    /// inside an already range-mapped namespace.
+    SubidFeatureDisabled,
+    /// A shadow suite helper is not on `PATH`.
+    ///
+    /// The commonest cause is a container runtime installed without its
+    /// recommended packages. The helpers ship with the shadow suite's
+    /// subordinate-id tools: `uidmap` on Debian, Devuan, and Ubuntu,
+    /// `shadow-subids` on Alpine, `shadow` elsewhere.
+    #[non_exhaustive]
+    HelperMissing {
+        /// The missing helper, `newuidmap` or `newgidmap`.
+        helper: &'static str,
+    },
+    /// A helper exists but holds no privilege.
+    ///
+    /// A working helper is either setuid-root or carries the needed
+    /// capability as a file capability; this one is neither. openSUSE's
+    /// `shadow.paranoid` permissions profile ships the helpers this way,
+    /// and a copy that did not preserve `security.*` extended attributes
+    /// loses a file capability while leaving the file looking intact.
+    #[non_exhaustive]
+    HelperUnprivileged {
+        /// The unprivileged helper.
+        path: PathBuf,
+    },
+    /// The helper carries file capabilities without `CAP_SETFCAP`, so the
+    /// kernel refuses to let it map uid 0.
+    ///
+    /// shadow builds before 4.11.1 granted only `CAP_SETUID`; every map
+    /// this library establishes contains uid 0, which since Linux 5.12
+    /// requires the writer to also hold `CAP_SETFCAP`. Setuid-root helpers
+    /// are unaffected.
+    #[non_exhaustive]
+    HelperCannotMapRoot {
+        /// The affected helper.
+        path: PathBuf,
+    },
+    /// A subordinate file is a symbolic link, which the helpers refuse.
+    ///
+    /// `newuidmap` opens the file with `O_NOFOLLOW` and reports the
+    /// refusal as a missing-privilege error, obscuring the real cause.
+    #[non_exhaustive]
+    SubordinateFileSymlink {
+        /// The offending file, `/etc/subuid` or `/etc/subgid`.
+        path: &'static str,
+    },
+    /// The calling user has no subordinate id allocation.
+    NoSubordinateAllocation,
+}
+
+impl fmt::Display for RangeMapBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeMapBlocker::SubidFeatureDisabled => f.write_str(
+                "the caller holds no CAP_SETUID/CAP_SETGID over its user namespace, and the \
+                 library was built without the `subid` feature, so no delegate can establish \
+                 a range map; enable the feature, or run with those capabilities",
+            ),
+            RangeMapBlocker::HelperMissing { helper } => write!(
+                f,
+                "{helper} was not found on PATH; install the shadow suite's subordinate-id \
+                 helpers (packaged as uidmap on Debian and Ubuntu, shadow-subids on Alpine, \
+                 and shadow on most other distributions)",
+            ),
+            RangeMapBlocker::HelperUnprivileged { path } => write!(
+                f,
+                "{} is neither setuid-root nor granted a file capability, so it cannot \
+                 establish maps; reinstall the shadow suite's subordinate-id helpers or \
+                 restore the packaged privilege",
+                path.display(),
+            ),
+            RangeMapBlocker::HelperCannotMapRoot { path } => write!(
+                f,
+                "{} carries file capabilities without CAP_SETFCAP and so cannot map uid 0 \
+                 (shadow before 4.11.1); upgrade the shadow suite",
+                path.display(),
+            ),
+            RangeMapBlocker::SubordinateFileSymlink { path } => write!(
+                f,
+                "{path} is a symbolic link, which the shadow helpers refuse to follow; make \
+                 it a regular file",
+            ),
+            RangeMapBlocker::NoSubordinateAllocation => f.write_str(
+                "the calling user has no subordinate id allocation; grant one with \
+                 usermod --add-subuids and --add-subgids, or entries in /etc/subuid and \
+                 /etc/subgid",
+            ),
+        }
+    }
+}
+
+/// A host condition known to prevent an unprivileged overlay-rooted cage.
+///
+/// A cage rooted on an overlay ([`CageBuilder::overlay_rootfs`]) mounts an
+/// overlay from inside its user namespace. Two host properties gate that, and
+/// each maps to a variant here.
+///
+/// [`CageBuilder::overlay_rootfs`]: crate::CageBuilder::overlay_rootfs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OverlayBlocker {
+    /// An unprivileged overlay mount was refused.
+    ///
+    /// The running kernel predates unprivileged overlay in a user namespace
+    /// (before Linux 5.11), or the overlay filesystem is otherwise unavailable.
+    Unsupported,
+    /// The upper layer's filesystem does not support the `user.*` extended-
+    /// attribute namespace.
+    ///
+    /// An unprivileged overlay records its metadata — whiteouts and opaque
+    /// markers — in `user.*` xattrs. tmpfs gained support for them only in
+    /// Linux 6.6; an on-disk filesystem (ext4, xfs, btrfs) supports them
+    /// throughout. Place the overlay's upper layer on such a filesystem, or use
+    /// a newer kernel.
+    UpperUnsupported,
+}
+
+impl fmt::Display for OverlayBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            OverlayBlocker::Unsupported => {
+                "the kernel refused an unprivileged overlay mount; overlay in a user namespace \
+                 needs Linux 5.11 or later"
+            }
+            OverlayBlocker::UpperUnsupported => {
+                "the upper layer's filesystem does not support user.* extended attributes, which \
+                 an unprivileged overlay records its metadata in; put the upper on an on-disk \
+                 filesystem such as ext4, xfs, or btrfs, or use Linux 6.6 or later for a tmpfs \
+                 upper"
+            }
+        })
+    }
+}
+
+/// Probes the host for a condition that prevents an unprivileged overlay-rooted
+/// cage whose upper layer sits on the filesystem hosting `scratch_dir`.
+///
+/// `scratch_dir` is a directory on the filesystem the overlay's upper layer
+/// will live on; the probe tests that filesystem for `user.*` xattr support and
+/// forks a throwaway child that attempts an unprivileged overlay mount. It
+/// returns the first blocker found, or `None` when an overlay-rooted cage should
+/// be establishable.
+///
+/// The probe is best-effort. It creates and removes temporary files and
+/// directories under `scratch_dir` and forks a short-lived child, but changes no
+/// durable state; `None` is the absence of a known blocker, not a guarantee.
+/// When the probe cannot set up a user namespace to test in — because
+/// unprivileged user namespaces are themselves unavailable — it returns `None`
+/// and leaves that diagnosis to [`userns_blocker`], the boundary that owns it.
+/// Test suites use it to skip overlay tests explicitly on hosts that cannot run
+/// them, as they use [`userns_blocker`] and [`range_map_blocker`].
+pub fn overlay_blocker(scratch_dir: impl AsRef<Path>) -> Option<OverlayBlocker> {
+    let scratch_dir = scratch_dir.as_ref();
+    // The upper-filesystem gate first: it is a direct, fork-free xattr write on
+    // the target filesystem, and it identifies the specific "upper cannot record
+    // metadata" case a bare mount test would miss (a pre-6.6 tmpfs mounts but
+    // cannot record whiteouts).
+    if upper_lacks_user_xattr(scratch_dir) {
+        return Some(OverlayBlocker::UpperUnsupported);
+    }
+    // The mount gate: can an unprivileged overlay mount at all on this kernel?
+    if overlay_mount_refused(scratch_dir) {
+        return Some(OverlayBlocker::Unsupported);
+    }
+    None
+}
+
+/// Opens `dir` as a directory descriptor for the work below to anchor against.
+///
+/// `dir` is the caller's to name, so reaching it through a symlink is the
+/// caller's business; what the descriptor buys is that every entry created,
+/// inspected, or removed within it resolves relative to one directory, with no
+/// path walk another user of a shared directory can step into.
+fn open_dir(dir: &Path) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// A probe entry name: `prefix` followed by 16 hex digits of kernel entropy.
+///
+/// Every probe entry is created exclusively — `O_EXCL` for the xattr probe's
+/// file, `mkdirat` for the mount probe's directory — so an unpredictable name is
+/// not what makes the probe safe against a hostile neighbour. It is what keeps
+/// one from parking a squatter at a name the probe is bound to choose and
+/// turning the preflight into a standing denial of service.
+fn probe_name(prefix: &str) -> String {
+    format!("{prefix}{}", unique_hex())
+}
+
+/// Sixteen hex digits distinguishing one call from every other, for naming a
+/// filesystem entry no concurrent caller may collide with.
+///
+/// The pid seeds the buffer so that concurrent callers on a host where
+/// `getrandom` is unavailable still differ; where it works, it overwrites the
+/// seed, and a short read (which a request this small does not produce in
+/// practice) leaves a mixture that is no less unique.
+pub(crate) fn unique_hex() -> String {
+    let mut bytes = u64::from(std::process::id()).to_ne_bytes();
+    let _ = rustix::rand::getrandom(&mut bytes, GetRandomFlags::empty());
+    format!("{:016x}", u64::from_ne_bytes(bytes))
+}
+
+/// Whether the filesystem hosting `dir` refuses a `user.*` extended attribute,
+/// the condition that makes it unable to back an unprivileged overlay.
+///
+/// A write that succeeds, or fails for any reason other than the namespace being
+/// unsupported (a full disk, a permission quirk), is not treated as a blocker:
+/// the probe reports only the specific unsupported-namespace signal.
+fn upper_lacks_user_xattr(dir: &Path) -> bool {
+    let Ok(parent) = open_dir(dir) else {
+        // Cannot even open the directory: inconclusive, not a blocker.
+        return false;
+    };
+    let name = probe_name(".fcage-xattr-probe-");
+    let Ok(probe) = create_probe_file(&parent, &name) else {
+        // Cannot write here at all: inconclusive, not a blocker.
+        return false;
+    };
+    // The attribute goes on the descriptor rather than the name, so the write
+    // cannot land anywhere the exclusive create did not reach.
+    let result = rustix::fs::fsetxattr(&probe, "user.fcage.probe", b"1", XattrFlags::empty());
+    drop(probe);
+    let _ = rustix::fs::unlinkat(&parent, name.as_str(), AtFlags::empty());
+    matches!(result, Err(errno) if crate::mechanism::xattr_unsupported(errno))
+}
+
+/// Creates the xattr probe's file at `name` under `parent`, refusing anything
+/// already there.
+///
+/// `O_EXCL | O_NOFOLLOW`: the scratch directory may be shared with other local
+/// users, so the probe must only ever hold a file it created itself. Anything
+/// already at the name — a regular file, or a symlink aimed at a file the caller
+/// can write — fails the create with `EEXIST` instead of being truncated and
+/// written through.
+fn create_probe_file(parent: &OwnedFd, name: &str) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+}
+
+/// Whether an unprivileged overlay mount is refused on this host, tested by
+/// mounting a throwaway overlay under `scratch_dir` in a forked child.
+///
+/// Returns `false` when the mount succeeds and when the probe is inconclusive —
+/// it could not lay out the test directories, or could not create a user
+/// namespace to test in — so only a genuine mount refusal reads as a blocker.
+fn overlay_mount_refused(scratch_dir: &Path) -> bool {
+    let Ok(parent) = open_dir(scratch_dir) else {
+        return false;
+    };
+    let name = probe_name(".fcage-overlay-probe-");
+    // `mkdirat` refuses a name that already exists — including one another user
+    // planted as a symlink — so, like the xattr probe's `O_EXCL` create, the
+    // probe works only inside a directory it created itself. Mode `0700` keeps
+    // the layer directories laid out below out of a neighbour's reach.
+    if rustix::fs::mkdirat(&parent, name.as_str(), Mode::RWXU).is_err() {
+        return false;
+    }
+
+    // The mount syscall names its layers as paths, so the layout below is
+    // path-based; it is safe because this base directory is fresh, private, and
+    // unpredictably named.
+    let base = scratch_dir.join(&name);
+    let outcome = overlay_mount_probe(&base);
+    force_remove_dir_all(&base);
+    matches!(outcome, Some(crate::mechanism::OverlayProbe::MountFailed))
+}
+
+/// Removes a directory tree, restoring traversable permissions as it descends.
+///
+/// The overlay mount leaves a mode-`0` `work/work` directory in its work area,
+/// which a plain recursive removal cannot read into. When every entry was
+/// created by the caller — the overlay probe here, and a single-identity layered
+/// build's upper and work directories — making each directory traversable before
+/// descending into it lets the cleanup leave no residue. Best-effort throughout:
+/// a failure to remove is not surfaced, and the walk stops at the first entry it
+/// cannot remove rather than pressing on, so a caller whose verdict does not
+/// depend on cleanup can ignore the outcome. It is not for a range-mapped tree,
+/// whose subordinate-owned entries the caller cannot `chmod`; that removal
+/// escalates through [`crate::provision::remove`] instead.
+///
+/// The walk is iterative and holds one directory descriptor, so an unexpectedly
+/// deep tree costs no stack: each pass unlinks what it can, descends into a
+/// subdirectory that is not yet empty and restarts there, and leaves an emptied
+/// directory through `..` for its parent's next pass to remove. The only state is
+/// the current descriptor and the starting directory's identity, remembered by
+/// device and inode so the ascent knows where to stop. It is the same shape
+/// `mechanism::remove` uses post-fork, where the constant memory is a hard
+/// requirement rather than a convenience.
+pub(crate) fn force_remove_dir_all(path: &Path) {
+    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    // A bare file name — no parent component at all — is relative to the
+    // process's working directory.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let (Ok(parent_fd), Ok(leaf)) = (open_dir(parent), CString::new(leaf.as_bytes())) else {
+        return;
+    };
+    let leaf = leaf.as_c_str();
+
+    // A plain entry (file or symlink) needs no walk at all.
+    match rustix::fs::unlinkat(&parent_fd, leaf, AtFlags::empty()) {
+        // Linux reports the attempt to unlink a directory as EISDIR; POSIX
+        // permits EPERM, so accept both as "this is a directory".
+        Err(Errno::ISDIR | Errno::PERM) => {}
+        _ => return,
+    }
+
+    let Some(start) = open_removable_dir(&parent_fd, leaf) else {
+        return;
+    };
+    let Ok(start_stat) = rustix::fs::fstat(&start) else {
+        return;
+    };
+    let mut current = start;
+
+    'walk: loop {
+        // Rescan the current directory from the top; unlinking during getdents
+        // iteration is safe, but a fresh pass keeps the logic simple and the
+        // state constant.
+        if rustix::fs::seek(&current, SeekFrom::Start(0)).is_err() {
+            return;
+        }
+        let mut buf = [MaybeUninit::uninit(); 2048];
+        let mut entries = RawDir::new(&current, &mut buf);
+        let mut removed = false;
+        while let Some(entry) = entries.next() {
+            let Ok(entry) = entry else {
+                return;
+            };
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
+                continue;
+            }
+            match rustix::fs::unlinkat(&current, name, AtFlags::empty()) {
+                Ok(()) => removed = true,
+                // Something else removed it first; nothing owed here.
+                Err(Errno::NOENT) => {}
+                Err(Errno::ISDIR | Errno::PERM) => {
+                    match rustix::fs::unlinkat(&current, name, AtFlags::REMOVEDIR) {
+                        Ok(()) => removed = true,
+                        Err(Errno::NOENT) => {}
+                        // Not empty: descend and restart the walk there. Only a
+                        // directory proven non-empty is descended into, so the
+                        // parent's next pass removes it outright and no
+                        // directory is ever visited twice.
+                        Err(Errno::NOTEMPTY | Errno::EXIST) => {
+                            let Some(child) = open_removable_dir(&current, name) else {
+                                return;
+                            };
+                            current = child;
+                            continue 'walk;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+
+        if removed {
+            // Something went; the directory may be empty now. Rescan.
+            continue;
+        }
+
+        // An empty directory. The start is removed from its parent and the walk
+        // is done; anything deeper is left through `..`, for its parent's next
+        // pass to remove.
+        let Ok(here) = rustix::fs::fstat(&current) else {
+            return;
+        };
+        if here.st_dev == start_stat.st_dev && here.st_ino == start_stat.st_ino {
+            let _ = rustix::fs::unlinkat(&parent_fd, leaf, AtFlags::REMOVEDIR);
+            return;
+        }
+        let Ok(up) = rustix::fs::openat(
+            &current,
+            c"..",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return;
+        };
+        current = up;
+    }
+}
+
+/// Opens `name` under `parent` as a directory, reinstating the owner's rights
+/// first when the open is refused for want of them.
+///
+/// The overlay mount leaves its work area's inner directory mode `0`, which
+/// cannot be read into at all. A `chmod` restores traversal; the re-open stays
+/// `O_NOFOLLOW`, so an entry that became a symlink in between is refused rather
+/// than descended through.
+fn open_removable_dir(parent: impl AsFd, name: &CStr) -> Option<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::openat(&parent, name, flags, Mode::empty()) {
+        Ok(fd) => Some(fd),
+        Err(Errno::ACCESS) => {
+            rustix::fs::chmodat(&parent, name, Mode::RWXU, AtFlags::empty()).ok()?;
+            rustix::fs::openat(&parent, name, flags, Mode::empty()).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// Lays out the probe's lower, upper, work, and merged directories under `base`
+/// and runs the fork-based mount test, returning its outcome or `None` when the
+/// layout could not be prepared.
+///
+/// `base` was just created empty and private by [`overlay_mount_refused`], so
+/// each layer directory is created outright: a name already taken is a surprise
+/// worth failing on, not something to reuse.
+fn overlay_mount_probe(base: &Path) -> Option<crate::mechanism::OverlayProbe> {
+    let dir = |name: &str| {
+        let path = base.join(name);
+        std::fs::create_dir(&path).ok().map(|()| path)
+    };
+    let lower = dir("lower")?;
+    let upper = dir("upper")?;
+    let work = dir("work")?;
+    let merged = dir("merged")?;
+
+    // The option string names the three layer paths verbatim; a ',' or ':' in
+    // any would misparse, so an unusual scratch path is left inconclusive rather
+    // than reported as a mount refusal.
+    for path in [&lower, &upper, &work] {
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.contains(&b',') || bytes.contains(&b':') {
+            return None;
+        }
+    }
+    let mut options = Vec::new();
+    options.extend_from_slice(b"lowerdir=");
+    options.extend_from_slice(lower.as_os_str().as_bytes());
+    options.extend_from_slice(b",upperdir=");
+    options.extend_from_slice(upper.as_os_str().as_bytes());
+    options.extend_from_slice(b",workdir=");
+    options.extend_from_slice(work.as_os_str().as_bytes());
+    options.extend_from_slice(b",userxattr");
+
+    let options = CString::new(options).ok()?;
+    let merged = CString::new(merged.as_os_str().as_bytes()).ok()?;
+    Some(crate::mechanism::probe_overlay_mount(&merged, &options))
+}
+
+/// Probes the host for conditions that make a uid/gid range map unavailable,
+/// returning the first one identified.
+///
+/// Returns `None` when a range map should be establishable: the caller holds
+/// `CAP_SETUID` and `CAP_SETGID` in its effective set (enough to write a map
+/// directly), or (with the `subid` feature) the shadow suite's helpers are
+/// present, privileged, and backed by an allocation.
+///
+/// The capability check reflects the effective set only. The direct tier and
+/// the kernel's map write both require the capabilities effective and do not
+/// raise them from the permitted set, so a caller that has parked them in
+/// `permitted` — after a privilege-lowering wrapper, say — reads as needing
+/// the delegate until it raises them into effective itself. The probe is
+/// best-effort and read-only; `None` is an absence of known blockers, not a
+/// guarantee.
+pub fn range_map_blocker() -> Option<RangeMapBlocker> {
+    // A caller holding CAP_SETUID and CAP_SETGID in its effective set writes
+    // maps directly; nothing else matters. The effective set is the right
+    // question here because the direct tier requires the capabilities
+    // effective and does not raise them from permitted (see `DirectMapper`).
+    if let Ok(sets) = rustix::thread::capabilities(None)
+        && sets
+            .effective
+            .contains(rustix::thread::CapabilitySet::SETUID)
+        && sets
+            .effective
+            .contains(rustix::thread::CapabilitySet::SETGID)
+    {
+        return None;
+    }
+
+    #[cfg(not(feature = "subid"))]
+    {
+        Some(RangeMapBlocker::SubidFeatureDisabled)
+    }
+    #[cfg(feature = "subid")]
+    {
+        delegated_blocker()
+    }
+}
+
+/// The delegated-tier checks behind [`range_map_blocker`]: helper presence
+/// and privilege, the subordinate files, and the allocation.
+#[cfg(feature = "subid")]
+fn delegated_blocker() -> Option<RangeMapBlocker> {
+    use rustix::thread::CapabilitySet;
+
+    for (helper, capability) in [
+        ("newuidmap", CapabilitySet::SETUID),
+        ("newgidmap", CapabilitySet::SETGID),
+    ] {
+        let Some(path) = find_on_path(helper) else {
+            return Some(RangeMapBlocker::HelperMissing { helper });
+        };
+        match helper_privilege(&path, capability) {
+            HelperPrivilege::SetuidRoot | HelperPrivilege::FileCaps { setfcap: true } => {}
+            // CAP_SETGID needs no CAP_SETFCAP: only mapping uid 0 does.
+            HelperPrivilege::FileCaps { setfcap: false } if helper == "newgidmap" => {}
+            HelperPrivilege::FileCaps { setfcap: false } => {
+                return Some(RangeMapBlocker::HelperCannotMapRoot { path });
+            }
+            HelperPrivilege::None => {
+                return Some(RangeMapBlocker::HelperUnprivileged { path });
+            }
+        }
+    }
+
+    for path in ["/etc/subuid", "/etc/subgid"] {
+        if std::fs::symlink_metadata(path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Some(RangeMapBlocker::SubordinateFileSymlink { path });
+        }
+    }
+
+    if crate::idmap::probe_allocation_is_empty() {
+        return Some(RangeMapBlocker::NoSubordinateAllocation);
+    }
+
+    None
+}
+
+/// How a shadow helper holds its privilege, if at all.
+#[cfg(feature = "subid")]
+enum HelperPrivilege {
+    /// Setuid-root: full privilege when run.
+    SetuidRoot,
+    /// File capabilities carrying the needed `CAP_SETUID`/`CAP_SETGID`;
+    /// `setfcap` reports whether `CAP_SETFCAP` accompanies it.
+    FileCaps { setfcap: bool },
+    /// Neither: the helper cannot work.
+    None,
+}
+
+/// Determines a helper's privilege: the setuid bit, or the needed capability
+/// in its `security.capability` extended attribute. Podman's probe accepts
+/// either, and so does this one; a mode check alone would misreport
+/// capability-based installations (Alpine's, for one) as unprivileged.
+#[cfg(feature = "subid")]
+fn helper_privilege(
+    path: &std::path::Path,
+    capability: rustix::thread::CapabilitySet,
+) -> HelperPrivilege {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.uid() == 0
+        && meta.permissions().mode() & 0o4000 != 0
+    {
+        return HelperPrivilege::SetuidRoot;
+    }
+
+    // The VFS capability attribute: a little-endian magic/version word, then
+    // per-word permitted and inheritable masks. CAP_SETUID, CAP_SETGID, and
+    // CAP_SETFCAP all live in the low word, the attribute's second u32.
+    let mut buf = [0u8; 40];
+    let Ok(len) = rustix::fs::getxattr(path, "security.capability", &mut buf[..]) else {
+        return HelperPrivilege::None;
+    };
+    if len < 8 {
+        return HelperPrivilege::None;
+    }
+    let permitted_low = u32::from_le_bytes(buf[4..8].try_into().expect("slice length is 4"));
+    if u64::from(permitted_low) & capability.bits() == 0 {
+        return HelperPrivilege::None;
+    }
+    let setfcap = u64::from(permitted_low) & rustix::thread::CapabilitySet::SETFCAP.bits() != 0;
+    HelperPrivilege::FileCaps { setfcap }
+}
+
+/// Finds an executable on `PATH`.
+#[cfg(feature = "subid")]
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if let Ok(meta) = std::fs::metadata(&candidate)
+            && meta.is_file()
+            && meta.permissions().mode() & 0o111 != 0
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_runs_without_panicking() {
+        // The result is host-dependent; the probe itself must always be safe
+        // to call.
+        let _ = userns_blocker();
+    }
+
+    #[test]
+    fn overlay_probe_runs_without_panicking_and_cleans_up() {
+        // The result is host-dependent, but the probe — which forks a child and
+        // creates temporary files and directories — must always be safe to call
+        // and must leave nothing behind under the scratch directory.
+        let dir = std::env::temp_dir().join(format!("fcage-overlay-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = overlay_blocker(&dir);
+        // No probe residue remains in the scratch directory.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the overlay probe left {} entries behind",
+            leftovers.len(),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn probe_names_differ_between_calls() {
+        // The names carry kernel entropy, not just a pid, so a neighbour in a
+        // shared scratch directory cannot predict — and squat on — the next one.
+        let first = probe_name(".fcage-probe-");
+        let second = probe_name(".fcage-probe-");
+        assert!(first.starts_with(".fcage-probe-"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_xattr_probe_refuses_a_planted_name() {
+        // A neighbour who guesses the probe's name must not have the probe write
+        // through what it finds there. Both plants are refused outright, and the
+        // symlink's target survives intact.
+        let dir = std::env::temp_dir().join(probe_name("fcage-plant-"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("victim"), b"intact").unwrap();
+        std::os::unix::fs::symlink("victim", dir.join("link")).unwrap();
+        std::fs::write(dir.join("regular"), b"mine").unwrap();
+
+        let parent = open_dir(&dir).unwrap();
+        for name in ["link", "regular"] {
+            assert_eq!(
+                create_probe_file(&parent, name).map(|_| ()),
+                Err(rustix::io::Errno::EXIST),
+                "the probe created {name} over a planted entry",
+            );
+        }
+        assert_eq!(std::fs::read(dir.join("victim")).unwrap(), b"intact");
+
+        // The mount probe's directory is created the same way, and `mkdirat`
+        // refuses a planted name for the same reason.
+        assert_eq!(
+            rustix::fs::mkdirat(&parent, "link", Mode::RWXU),
+            Err(rustix::io::Errno::EXIST),
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn force_remove_clears_a_deep_tree_with_an_unreadable_directory() {
+        // A tree deeper than a recursive walk would want to hold on the stack —
+        // and, at 2000 levels, longer than `PATH_MAX`, so it has to be laid out
+        // through relative descriptors rather than joined paths. At the bottom
+        // sits the mode-`0` directory an overlay work area leaves behind, with a
+        // file and a dangling symlink beside it.
+        let root = std::env::temp_dir().join(probe_name("fcage-force-remove-"));
+        std::fs::create_dir(&root).unwrap();
+        let descend = |dir: &OwnedFd, name: &str| {
+            rustix::fs::mkdirat(dir, name, Mode::RWXU).unwrap();
+            rustix::fs::openat(
+                dir,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap()
+        };
+
+        let mut deep = open_dir(&root).unwrap();
+        for _ in 0..2_000 {
+            deep = descend(&deep, "level");
+        }
+        create_probe_file(&deep, "file").unwrap();
+        rustix::fs::symlinkat("/nowhere", &deep, "dangling").unwrap();
+        let sealed = descend(&deep, "work");
+        create_probe_file(&sealed, "inner").unwrap();
+        rustix::fs::fchmod(&sealed, Mode::empty()).unwrap();
+
+        force_remove_dir_all(&root);
+        assert!(
+            std::fs::symlink_metadata(&root).is_err(),
+            "the tree survived removal",
+        );
+    }
+
+    #[test]
+    fn force_remove_tolerates_a_missing_path() {
+        // Nothing to remove is not a failure, and there is no path to walk.
+        force_remove_dir_all(&std::env::temp_dir().join(probe_name("fcage-absent-")));
+    }
+
+    #[test]
+    fn sysctl_value_parses_a_leading_integer() {
+        // max_user_namespaces exists on any modern kernel and holds a
+        // non-negative integer.
+        if let Some(value) = sysctl_value("/proc/sys/user/max_user_namespaces") {
+            assert!(value >= 0);
+        }
+    }
+
+    #[test]
+    fn sysctl_value_is_none_for_missing_files() {
+        assert_eq!(sysctl_value("/proc/sys/ferroday/cage/does_not_exist"), None);
+    }
+}

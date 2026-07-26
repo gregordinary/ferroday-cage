@@ -1,0 +1,7 @@
+# The "net-dev" group: the host network shared into the sandbox, for commands
+# that fetch from the network. The host's resolv.conf is bound in so DNS
+# resolves. Point --rootfs at a root filesystem you have.
+rootfs = "/srv/rootfs/alpine"
+network = "host"
+hostname = "net-dev"
+workdir = "/root"

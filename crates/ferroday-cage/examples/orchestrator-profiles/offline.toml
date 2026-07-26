@@ -1,0 +1,10 @@
+# The "offline" group: a sandbox with no network at all, not even loopback.
+# Suited to running untrusted or fully hermetic work. Point --rootfs at a root
+# filesystem you have, or edit the rootfs line below.
+rootfs = "/srv/rootfs/alpine"
+network = "none"
+hostname = "offline"
+workdir = "/tmp"
+
+[env]
+LANG = "C.UTF-8"

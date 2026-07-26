@@ -1,0 +1,38 @@
+[package]
+name = "ferroday-cage-cli"
+description = "Command-line interface for the ferroday-cage sandbox"
+# `fcage` versions independently of the library. Its compatibility contract is
+# its flags, exit codes, and output format, which a library release does not
+# necessarily change — and a library release that does break its own API need
+# not break the CLI's.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
+keywords = ["sandbox", "namespaces", "linux", "unprivileged", "container"]
+
+[[bin]]
+name = "fcage"
+path = "src/main.rs"
+
+[dependencies]
+# Every feature the library offers, so `fcage` is the whole library at a shell
+# prompt: a profile or flag that names any capability works rather than being
+# refused by a binary built without it. `subid` is included for that reason —
+# it is the one feature that executes an external binary (the shadow suite's
+# newuidmap/newgidmap), and only when a run asks for a subordinate map.
+ferroday-cage = { version = "0.1.0", path = "../ferroday-cage", features = ["serde", "tarball", "debian", "hardening", "netstack", "subid"] }
+toml = "0.8"
+# Resolves a `--rlimit` resource name through the library's own `Deserialize`,
+# so the flag and a profile's `[rlimit]` keys cannot drift apart.
+serde = "1.0"
+# Resolves seccomp syscall names to numbers for the host architecture, the
+# same crate and native table the library uses.
+syscalls = { version = "0.8", default-features = false }
+
+[lints]
+workspace = true

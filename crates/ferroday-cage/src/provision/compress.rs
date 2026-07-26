@@ -1,0 +1,495 @@
+//! Compression sniffing for tar streams.
+//!
+//! A rootfs tarball and a `.deb`'s `data.tar` member are both a tar stream
+//! optionally wrapped in gzip, xz, or zstd. The wrapper is identified from
+//! the leading magic bytes, never a file name, and unwrapped through the
+//! pure-Rust streaming decoders.
+//!
+//! Each wrapper's multi-member form is handled: concatenated xz streams, and
+//! multi-frame zstd (as `pzstd` emits, including a leading skippable frame).
+//! `ruzstd`'s `StreamingDecoder` decodes a single frame, so [`ZstdReader`]
+//! drives one decoder per frame and caps every data frame's declared window.
+
+use std::io::{self, Read};
+
+use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
+
+use super::ProvisionError;
+
+/// The number of leading bytes read to sniff the compression format. The
+/// longest magic is xz's six-byte signature.
+const MAGIC_LEN: usize = 6;
+
+/// The largest zstd window this provisioner decodes, bounding the memory the
+/// streaming decoder retains for back-references.
+///
+/// A zstd frame declares its window size, and the decoder buffers up to that
+/// many bytes before yielding output. `ruzstd`'s fresh-decoder path does not
+/// itself cap the window (its 100 MiB guard applies only to decoder reuse), and
+/// its ring buffer allocates infallibly, aborting the process on OOM. Without a
+/// bound a tiny hostile archive could declare a multi-gigabyte window over a
+/// highly compressible payload and exhaust memory. 128 MiB admits archives
+/// compressed with zstd's long-distance matching up to a window log of 27 while
+/// keeping the bound fixed and modest.
+const MAX_ZSTD_WINDOW: u64 = 128 * 1024 * 1024;
+
+/// The most bytes of a zstd frame this provisioner buffers to read the window
+/// size: the four-byte magic plus the largest possible frame header (a
+/// descriptor byte, a window descriptor, a four-byte dictionary id, and an
+/// eight-byte frame content size).
+const ZSTD_HEADER_PEEK: usize = 4 + 14;
+
+/// Reads up to [`MAGIC_LEN`] leading bytes for format sniffing.
+///
+/// Fewer bytes are returned only at end of stream; a real tar stream is at
+/// least one 512-byte block, so a short read simply falls through to the
+/// plain-tar path.
+pub(crate) fn sniff_head<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut head = [0u8; MAGIC_LEN];
+    let mut filled = 0;
+    while filled < head.len() {
+        let got = reader.read(&mut head[filled..])?;
+        if got == 0 {
+            break;
+        }
+        filled += got;
+    }
+    Ok(head[..filled].to_vec())
+}
+
+/// Wraps `rest` in the decoder selected by `head`, reconstructing the full
+/// stream with `head` prepended.
+///
+/// `head` is the bytes [`sniff_head`] read from the front of the same
+/// stream; `rest` is that stream with those bytes already consumed. gzip,
+/// xz, and zstd are detected by magic; anything else is treated as a plain
+/// tar stream and the caller's tar reader decides whether it truly is one.
+pub(crate) fn decompress<'r, R: Read + 'r>(
+    head: &[u8],
+    rest: R,
+) -> Result<Box<dyn Read + 'r>, ProvisionError> {
+    let stream = io::Cursor::new(head.to_vec()).chain(rest);
+    Ok(if head.starts_with(&[0x1f, 0x8b]) {
+        Box::new(flate2::read::GzDecoder::new(stream))
+    } else if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        // Multiple concatenated xz streams are legal in one file and some
+        // producers emit them.
+        Box::new(lzma_rust2::XzReader::new(stream, true))
+    } else if is_zstd_start(head) {
+        // zstd is framed, and a producer such as `pzstd` emits several frames
+        // (often behind a leading skippable frame). Decode every frame, capping
+        // each data frame's declared window: the decoder does not cap it and
+        // would buffer a hostile window into an OOM.
+        Box::new(ZstdReader::new(Box::new(stream))?)
+    } else {
+        // Not a recognized compression: assume plain tar and let the header
+        // check decide.
+        Box::new(stream)
+    })
+}
+
+/// Reads up to `limit` bytes from `reader` into `buf`, stopping early only at
+/// end of stream. Used to buffer a zstd frame header before decoding.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut Vec<u8>, limit: usize) -> io::Result<()> {
+    let mut chunk = [0u8; ZSTD_HEADER_PEEK];
+    while buf.len() < limit {
+        let want = (limit - buf.len()).min(chunk.len());
+        let got = reader.read(&mut chunk[..want])?;
+        if got == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..got]);
+    }
+    Ok(())
+}
+
+/// The four-byte zstd frame magic, little-endian.
+const ZSTD_FRAME_MAGIC: u32 = 0xFD2F_B528;
+
+/// The inclusive range of skippable-frame magics (RFC 8878 section 3.1.2).
+const SKIPPABLE_MAGIC: std::ops::RangeInclusive<u32> = 0x184D_2A50..=0x184D_2A5F;
+
+/// Whether `head` begins a zstd stream: a data frame or a skippable frame.
+fn is_zstd_start(head: &[u8]) -> bool {
+    let Some(magic) = head
+        .get(0..4)
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    else {
+        return false;
+    };
+    magic == ZSTD_FRAME_MAGIC || SKIPPABLE_MAGIC.contains(&magic)
+}
+
+/// A single-frame decoder over a boxed reader: one frame of the stream. Boxing
+/// the reader keeps its type from growing as [`ZstdReader`] re-wraps it frame
+/// after frame.
+type FrameReader<'r> = StreamingDecoder<Box<dyn Read + 'r>, FrameDecoder>;
+
+/// A zstd reader that decodes every frame of a possibly multi-frame stream.
+///
+/// `ruzstd`'s [`StreamingDecoder`] decodes a single frame, so a `.tar.zst` from
+/// a multi-frame producer such as `pzstd` would otherwise be truncated after
+/// the first frame and rejected downstream as a malformed tar. This drives one
+/// decoder per frame: when a frame ends it recovers the underlying reader and,
+/// if another frame follows, caps that frame's window and decodes it too, until
+/// the input is exhausted. Skippable frames between or before data frames are
+/// consumed and ignored.
+struct ZstdReader<'r> {
+    /// The decoder for the frame currently being read, or `None` once every
+    /// frame has been decoded.
+    decoder: Option<FrameReader<'r>>,
+}
+
+impl<'r> ZstdReader<'r> {
+    /// Builds a reader positioned on the first frame. A stream with no frame at
+    /// all, or a first frame whose window is over the cap, is an error.
+    fn new(source: Box<dyn Read + 'r>) -> Result<ZstdReader<'r>, ProvisionError> {
+        let decoder =
+            start_frame(source)?.ok_or_else(|| archive_error("the zstd stream has no frame"))?;
+        Ok(ZstdReader {
+            decoder: Some(decoder),
+        })
+    }
+}
+
+impl Read for ZstdReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let Some(decoder) = self.decoder.as_mut() else {
+                return Ok(0);
+            };
+            let read = decoder.read(buf)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            // The frame is exhausted (its decoder yields zero only at its end).
+            // Recover the reader and start the next frame, if any.
+            let source = self
+                .decoder
+                .take()
+                .expect("the decoder is present")
+                .into_inner();
+            self.decoder = start_frame(source).map_err(io::Error::other)?;
+            if self.decoder.is_none() {
+                return Ok(0);
+            }
+        }
+    }
+}
+
+/// Peeks the next frame in `source` and builds a decoder for it, or `None` at a
+/// clean end of input. A skippable frame is consumed and the search continues;
+/// a data frame's declared window is capped before any decoding.
+fn start_frame<'r>(
+    mut source: Box<dyn Read + 'r>,
+) -> Result<Option<FrameReader<'r>>, ProvisionError> {
+    loop {
+        let mut header = Vec::with_capacity(ZSTD_HEADER_PEEK);
+        read_up_to(&mut source, &mut header, ZSTD_HEADER_PEEK)
+            .map_err(|err| archive_error(format!("reading zstd header: {err}")))?;
+        if header.is_empty() {
+            // The previous frame was the last: a clean end of the stream.
+            return Ok(None);
+        }
+        let Some(magic) = header
+            .get(0..4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        else {
+            return Err(archive_error(
+                "trailing bytes are too short to be a zstd frame",
+            ));
+        };
+        if SKIPPABLE_MAGIC.contains(&magic) {
+            source = skip_skippable(source, &header)?;
+            continue;
+        }
+        if magic != ZSTD_FRAME_MAGIC {
+            return Err(archive_error(
+                "trailing bytes after the last zstd frame are not a frame",
+            ));
+        }
+        if let Some(window) = zstd_window_size(&header)
+            && window > MAX_ZSTD_WINDOW
+        {
+            return Err(archive_error(format!(
+                "zstd window of {window} bytes exceeds the limit of {MAX_ZSTD_WINDOW} bytes"
+            )));
+        }
+        // Reconstruct the frame with the peeked header prepended so nothing is
+        // lost, then hand it to a single-frame decoder.
+        let framed: Box<dyn Read + 'r> = Box::new(io::Cursor::new(header).chain(source));
+        let decoder = StreamingDecoder::new(framed)
+            .map_err(|err| archive_error(format!("invalid zstd stream: {err}")))?;
+        return Ok(Some(decoder));
+    }
+}
+
+/// Consumes a skippable frame whose header (magic and, ideally, size) has been
+/// peeked into `header`, returning the source positioned at the next frame.
+///
+/// A skippable frame is a four-byte magic, a four-byte little-endian content
+/// size, and that many content bytes. Because the peek may have read past the
+/// frame's end (small skippable frames) or stopped before it, the leftover
+/// peeked bytes are pushed back ahead of the source.
+fn skip_skippable<'r>(
+    mut source: Box<dyn Read + 'r>,
+    header: &[u8],
+) -> Result<Box<dyn Read + 'r>, ProvisionError> {
+    let size = read_le(header, 4, 4)
+        .ok_or_else(|| archive_error("a skippable zstd frame has a truncated size"))?
+        as usize;
+    // Content begins after the eight-byte magic-and-size prefix.
+    const PREFIX: usize = 8;
+    let peeked_content = header.len().saturating_sub(PREFIX);
+    if peeked_content >= size {
+        // The whole frame — and possibly the start of the next — is in `header`.
+        let leftover = header[PREFIX + size..].to_vec();
+        Ok(Box::new(io::Cursor::new(leftover).chain(source)))
+    } else {
+        discard_exact(&mut source, size - peeked_content)
+            .map_err(|err| archive_error(format!("skipping a skippable zstd frame: {err}")))?;
+        Ok(source)
+    }
+}
+
+/// Reads and discards exactly `count` bytes, failing on a short read: a
+/// skippable frame that runs off the end of the stream is malformed.
+fn discard_exact<R: Read>(reader: &mut R, mut count: usize) -> io::Result<()> {
+    let mut scratch = [0u8; 4096];
+    while count > 0 {
+        let want = count.min(scratch.len());
+        let got = reader.read(&mut scratch[..want])?;
+        if got == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the frame ended before its declared size",
+            ));
+        }
+        count -= got;
+    }
+    Ok(())
+}
+
+/// A tar/archive error at offset zero, for the compression layer's failures.
+fn archive_error(reason: impl Into<String>) -> ProvisionError {
+    ProvisionError::Archive {
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
+/// The window size a zstd frame declares, or `None` when `header` is truncated
+/// before the fields that determine it (a short stream the decoder will reject
+/// on its own).
+///
+/// `header` begins at the frame magic. Follows the zstd frame format (RFC 8878
+/// section 3.1.1): the window is the explicit window descriptor, or, for a
+/// single-segment frame, the frame content size the whole frame must fit.
+fn zstd_window_size(header: &[u8]) -> Option<u64> {
+    // The frame header descriptor follows the four-byte magic.
+    let descriptor = *header.get(4)?;
+    let fcs_flag = descriptor >> 6;
+    let single_segment = descriptor & 0x20 != 0;
+    let dict_id_flag = descriptor & 0x03;
+
+    if single_segment {
+        // No window descriptor: the window is the frame content size, since the
+        // whole frame is one segment the decoder must hold. The content size
+        // follows the descriptor and the dictionary id.
+        let dict_id_size = match dict_id_flag {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        let fcs_size = match fcs_flag {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        let offset = 5 + dict_id_size;
+        let value = read_le(header, offset, fcs_size)?;
+        // A two-byte content size carries an offset of 256 (RFC 8878).
+        Some(if fcs_size == 2 { value + 256 } else { value })
+    } else {
+        // The window descriptor byte follows the frame header descriptor.
+        let window_descriptor = u64::from(*header.get(5)?);
+        let exponent = window_descriptor >> 3;
+        let mantissa = window_descriptor & 0x07;
+        let window_base = 1u64 << (10 + exponent);
+        let window_add = (window_base >> 3) * mantissa;
+        Some(window_base + window_add)
+    }
+}
+
+/// Reads `size` little-endian bytes of `header` at `offset` as a `u64`, or
+/// `None` if the slice is too short.
+fn read_le(header: &[u8], offset: usize, size: usize) -> Option<u64> {
+    let bytes = header.get(offset..offset + size)?;
+    let mut value = 0u64;
+    for (index, byte) in bytes.iter().enumerate() {
+        value |= u64::from(*byte) << (8 * index);
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+    #[test]
+    fn window_descriptor_frame_reports_its_window() {
+        // Descriptor 0x00: not single-segment, no dictionary id, no content
+        // size. Window descriptor 0x00 is the minimum window of 1 KiB.
+        let header = [
+            ZSTD_MAGIC[0],
+            ZSTD_MAGIC[1],
+            ZSTD_MAGIC[2],
+            ZSTD_MAGIC[3],
+            0x00,
+            0x00,
+        ];
+        assert_eq!(zstd_window_size(&header), Some(1024));
+
+        // Window descriptor 0xff is the maximum: exponent 31, mantissa 7, well
+        // past any sane limit.
+        let header = [
+            ZSTD_MAGIC[0],
+            ZSTD_MAGIC[1],
+            ZSTD_MAGIC[2],
+            ZSTD_MAGIC[3],
+            0x00,
+            0xff,
+        ];
+        let window = zstd_window_size(&header).unwrap();
+        assert!(
+            window > MAX_ZSTD_WINDOW,
+            "the maximum window exceeds the limit"
+        );
+    }
+
+    #[test]
+    fn single_segment_frame_uses_the_content_size() {
+        // Descriptor 0x20: single-segment set, FCS field size 1 byte. The
+        // window is the content size, here 200 bytes.
+        let header = [
+            ZSTD_MAGIC[0],
+            ZSTD_MAGIC[1],
+            ZSTD_MAGIC[2],
+            ZSTD_MAGIC[3],
+            0x20,
+            200,
+        ];
+        assert_eq!(zstd_window_size(&header), Some(200));
+
+        // Descriptor 0xe0: FCS field size 8 bytes, single-segment set. A
+        // multi-gigabyte content size is the window and exceeds the limit.
+        let mut header = vec![
+            ZSTD_MAGIC[0],
+            ZSTD_MAGIC[1],
+            ZSTD_MAGIC[2],
+            ZSTD_MAGIC[3],
+            0xe0,
+        ];
+        header.extend_from_slice(&(4u64 * 1024 * 1024 * 1024).to_le_bytes());
+        assert_eq!(zstd_window_size(&header), Some(4 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_truncated_header_reports_no_window() {
+        // Only the magic and descriptor: the window descriptor is missing.
+        let header = [
+            ZSTD_MAGIC[0],
+            ZSTD_MAGIC[1],
+            ZSTD_MAGIC[2],
+            ZSTD_MAGIC[3],
+            0x00,
+        ];
+        assert_eq!(zstd_window_size(&header), None);
+    }
+
+    /// Compresses `data` into a single zstd frame.
+    fn zstd_frame(data: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    /// Builds a skippable frame carrying `content`.
+    fn skippable_frame(content: &[u8]) -> Vec<u8> {
+        let mut frame = 0x184D_2A50u32.to_le_bytes().to_vec();
+        frame.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        frame.extend_from_slice(content);
+        frame
+    }
+
+    /// Sniffs and fully decodes `bytes` through [`decompress`].
+    fn decode_all(bytes: &[u8]) -> Result<Vec<u8>, io::Error> {
+        let head = sniff_head(&mut &bytes[..]).unwrap();
+        let mut reader = decompress(&head, &bytes[head.len()..])
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn multi_frame_zstd_decodes_every_frame() {
+        // Two concatenated frames, as `pzstd` emits: both must be decoded, not
+        // just the first.
+        let mut stream = zstd_frame(b"first frame ");
+        stream.extend_from_slice(&zstd_frame(b"second frame"));
+        assert_eq!(decode_all(&stream).unwrap(), b"first frame second frame");
+    }
+
+    #[test]
+    fn a_leading_skippable_frame_is_skipped() {
+        // A skippable frame ahead of the data frame, the shape `pzstd` writes.
+        let mut stream = skippable_frame(b"pzstd metadata here");
+        stream.extend_from_slice(&zstd_frame(b"payload"));
+        assert_eq!(decode_all(&stream).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_small_skippable_frame_does_not_consume_the_next_frame() {
+        // A skippable frame shorter than the header peek: the pushback path must
+        // return the over-read bytes so the following data frame still decodes.
+        let mut stream = skippable_frame(b"xy");
+        stream.extend_from_slice(&zstd_frame(b"payload"));
+        assert_eq!(decode_all(&stream).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_later_frames_window_is_also_capped() {
+        // A valid first frame followed by a second frame whose header declares
+        // the maximum window: the per-frame cap must reject it, not only the
+        // first frame's.
+        let mut stream = zstd_frame(b"ok");
+        stream.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xff]);
+        let err = decode_all(&stream).unwrap_err();
+        assert!(err.to_string().contains("window"), "{err}");
+    }
+
+    #[test]
+    fn decompress_rejects_an_oversized_zstd_window() {
+        // A frame declaring the maximum window over an empty body: the header
+        // check refuses it before any decoding.
+        let bytes = [
+            ZSTD_MAGIC[0],
+            ZSTD_MAGIC[1],
+            ZSTD_MAGIC[2],
+            ZSTD_MAGIC[3],
+            0x00,
+            0xff,
+        ];
+        let head = sniff_head(&mut &bytes[..]).unwrap();
+        match decompress(&head, &bytes[head.len()..]) {
+            Err(ProvisionError::Archive { reason, .. }) => {
+                assert!(reason.contains("window"), "{reason}");
+            }
+            Err(other) => panic!("expected a window error, got {other:?}"),
+            Ok(_) => panic!("an oversized window must be rejected"),
+        }
+    }
+}

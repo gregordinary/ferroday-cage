@@ -1,0 +1,275 @@
+# Userspace networking
+
+The default network is an isolated namespace whose only interface is loopback:
+the sandbox can talk to itself and nothing else. [`Network::Host`] trades that
+isolation for the host's interfaces, and [`Network::None`] removes even
+loopback. Between them sits a third option — an isolated namespace that still
+reaches the outside, through a *userspace network stack*.
+
+A userspace network stack terminates the sandbox's network traffic in ordinary
+host sockets: a tap interface inside the namespace carries the guest's packets,
+a stack reads them, and it forwards the flows out through the host as any
+application would. The library ships its own, the native stack, behind the
+`netstack` feature; it also leaves the seam open for an external stack such as
+[`pasta`] or [`slirp4netns`]. Either way the sandbox keeps its private
+namespace and the host network policy stays outside it.
+
+## The seam
+
+Attaching a stack has an ordering requirement: the tap must exist before the
+command relies on the network, or the command's first socket call races the
+stack's startup. The seam is a pause that removes the race.
+
+[`Cage::spawn_pending`] builds the sandbox — creating its namespaces — but
+holds the command at a gate just before it runs, returning a [`Pending`]
+handle instead of a running one. The handle exposes
+[`netns_pid`](Pending::netns_pid), a host pid of a process inside the
+sandbox's network namespace. A stack attaches to that namespace, and
+[`proceed`](Pending::proceed) then releases the command and returns the usual
+[`Running`] handle. Because the stack is up before the command runs, the
+sandbox sees the network from its first instruction.
+
+Dropping a `Pending` without proceeding tears the launch down — the supervisor
+is killed and the launch stage reaped — so an aborted attach leaves no sandbox
+running. [`spawn_pending_with`](Cage::spawn_pending_with) is the streaming
+counterpart: it binds an observer that receives the command's output once
+`proceed` releases it.
+
+The seam is meaningful only where the sandbox has a private network namespace:
+[`Network::Isolated`] (the default) or [`Network::None`]. Under
+[`Network::Host`] the sandbox shares the host's namespace, where attaching a
+stack is neither needed nor correct.
+
+## The native stack
+
+With the `netstack` feature, [`NetStack`] is the library's own stack, attached
+from inside the caller's own process. It creates and configures
+the tap device in the sandbox's namespace, terminates the guest's TCP and UDP
+flows in an in-process TCP/IP implementation, and forwards each over an
+ordinary host socket. The result is unprivileged outbound IPv4 and IPv6: the
+host sees a normal application making connections, and the sandbox sees a
+gateway to the world.
+
+A stack is built from a [`NetStackBuilder`], attached to a pending launch, and
+stopped once the command has finished:
+
+```rust
+# use ferroday_cage::{Cage, NetStack};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let cage = Cage::builder().rootfs("/srv/rootfs").command("/usr/bin/job").build()?;
+let stack = NetStack::builder().build()?;
+
+let pending = cage.spawn_pending()?;
+let handle = stack.attach(&pending)?; // the tap is up and configured
+let mut running = pending.proceed()?; // the command runs with the network live
+let status = running.wait()?;
+handle.stop()?; // tear the stack down after the command
+# let _ = status;
+# Ok(())
+# }
+```
+
+One `NetStack` attaches to any number of sandboxes; each attachment runs its
+own pump and configures its guest independently. Their host resources are not
+isolated from one another, though — see [Resource model and
+tenancy](#resource-model-and-tenancy). [`NetStack::default`] is the default
+configuration, ready to attach as-is.
+
+### Defaults
+
+The builder configures the addressing and interface. Within a configured
+network the stack always places the gateway at host 2 and the guest at host
+15.
+
+| Setting | Default | Builder method |
+|---|---|---|
+| IPv4 | on | [`ipv4`](NetStackBuilder::ipv4) |
+| IPv6 | on | [`ipv6`](NetStackBuilder::ipv6) |
+| IPv4 network | `10.0.2.0/24` (guest `.15`, gateway `.2`) | [`ipv4_cidr`](NetStackBuilder::ipv4_cidr) |
+| IPv6 network | `fd00::/64` (guest `::15`, gateway `::2`) | [`ipv6_cidr`](NetStackBuilder::ipv6_cidr) |
+| MTU | 1500 | [`mtu`](NetStackBuilder::mtu) |
+| Interface name | `tap0` | [`interface`](NetStackBuilder::interface) |
+| Host-loopback mapping | off | [`host_loopback`](NetStackBuilder::host_loopback) |
+
+With the `serde` feature the builder is also the stack's profile format: it
+serializes and deserializes as the stack specification, for embedding in a
+consumer's own configuration. Keys are kebab-case, unknown keys are rejected,
+and the CIDR fields read and write as `"address/len"` strings.
+
+### The handle owns the stack
+
+[`attach`](NetStack::attach) returns a [`NetStackHandle`] that owns the pump
+thread serving the tap. The pump holds the tap descriptor open, which pins the
+device and, through it, the sandbox's network namespace — so the pump never
+observes the sandbox's death on its own. Two rules follow:
+
+- **Wait, then stop.** Wait for the command to finish, then call
+  [`stop`](NetStackHandle::stop). `stop` signals the pump, joins it, and
+  reports any error the pump ended on. Stopping before the command exits
+  simply cuts the network early.
+- **Dropping the handle is safe.** A dropped handle stops the pump the same
+  way and discards its outcome. It never affects the sandbox: a running
+  command merely loses connectivity. The stack is an attachment, not a
+  lifeline.
+
+[`is_running`](NetStackHandle::is_running) reports whether the pump is still
+serving the tap — false after `stop`, or on its own if the pump hit an
+unrecoverable error, which `stop` then reports.
+
+### Resource model and tenancy
+
+Each attachment bounds what one guest can consume: a guest serves at most 128
+concurrent TCP flows and tracks at most 256 UDP flows, and each is backed by a
+host socket. Those caps are per attachment, not per process. The pump and every
+host socket run in the caller's own process, so several attachments in one
+process draw on one shared descriptor table and one heap; the per-guest caps do
+not partition those shared resources between attachments. A guest that fills its
+own budget can therefore consume enough host descriptors to affect a co-resident
+attachment, or the caller's own descriptor-opening operations, once the
+process's `RLIMIT_NOFILE` is reached.
+
+The native stack is accordingly intended for one — or a few mutually trusted —
+sandboxes per process. A caller that must isolate untrusted tenants from one
+another should run each in its own process, or [supply an external
+stack](#bring-your-own-stack) whose resource accounting is the operating
+system's rather than one shared address space's.
+
+### What the stack forwards
+
+The stack forwards where the guest could plausibly reach and refuses what it
+should not. Multicast, broadcast, unspecified, loopback, and link-local
+destinations are always refused; a refused destination answers the guest with
+a connection reset, so denial costs nothing. Refusing loopback keeps the
+sandbox away from services bound to the host's `127.0.0.1`.
+
+Two refusals follow from the same principle. The IPv4 `0.0.0.0/8` block is
+refused in full rather than only the unspecified address, and an IPv6 address
+that embeds an IPv4 one — the mapped `::ffff:a.b.c.d` and the deprecated
+compatible `::a.b.c.d` alike — is refused so that an IPv4 refusal cannot be
+re-expressed in the other family. The guest's own subnet is refused too: it is a
+private link between the guest and the stack, and forwarding it would send the
+guest's on-link traffic to the host's view of those addresses, which collides
+with a real LAN wherever the default `10.0.2.0/24` overlaps one.
+
+The gateway address is the one deliberate exception. With
+[`host_loopback(true)`](NetStackBuilder::host_loopback), a connection to the
+gateway (`10.0.2.2` or `fd00::2` by default) is forwarded to the host's
+loopback, port preserved — the conventional way to reach a host-local service,
+granted explicitly rather than by opening the whole loopback range.
+
+### DNS
+
+The stack carries packets; it does not resolve names. A sandbox resolves
+through whatever `/etc/resolv.conf` it has, and that file is the caller's to
+provide. One case needs care: a host running systemd-resolved lists only
+`127.0.0.53`, a loopback stub the stack refuses, so binding that
+`resolv.conf` into the sandbox yields no working DNS. Bind the host's
+`resolv.conf` only when it names a routable (non-loopback) nameserver, point
+the sandbox at a public resolver, or address services by IP. The
+[`fcage`](#the-command-line) command and the `fetch-sandbox` example both
+apply the first rule.
+
+### One namespace move, on a helper process
+
+Joining the sandbox's network namespace requires `CAP_SYS_ADMIN` in the
+caller's own user namespace as well as the target's, and acquiring that means
+entering the sandbox's user namespace first — which the kernel refuses to a
+multithreaded process. `attach` therefore does its namespace work on a
+freshly forked, single-threaded helper process, which joins the user and
+network namespaces, creates and configures the tap, hands the descriptor back,
+and exits. The caller's own threads never change namespace. This is internal
+to `attach`; a consumer sees only the call.
+
+### The command line
+
+The [`fcage`](quick-start.md) tool exposes the native stack with `--netstack`:
+
+```sh
+fcage --rootfs ./alpine --netstack /usr/bin/wget -qO- http://example.org
+```
+
+`--netstack-cidr` and `--netstack-mtu` configure the interface, and
+`--netstack-host-loopback` maps the gateway address onto host loopback.
+`--netstack` composes the sandbox's `resolv.conf` from the host's routable
+nameservers, warning instead when the host offers only loopback resolvers;
+`--no-resolv-conf` opts out. The flag conflicts with `--share-net` and with
+`--restrict`.
+
+### A worked example
+
+The `fetch-sandbox` example provisions an Alpine root, attaches the stack, and
+fetches a URL, exercising every public item of the API in order:
+
+```sh
+cargo run --example fetch-sandbox --features netstack,tarball -- \
+    --rootfs ./alpine --tarball alpine-minirootfs.tar.gz http://example.org
+```
+
+## Bring your own stack
+
+The seam also accepts an external stack. `slirp4netns` takes the target pid and
+a tap name, creates the tap inside the namespace, and signals readiness by
+writing one byte to a caller-provided descriptor. A consumer wires that
+descriptor to the seam:
+
+```rust,ignore
+let pending = cage.spawn_pending()?;
+let pid = pending.netns_pid();
+
+// slirp4netns <pid> tap0 --configure --ready-fd=<fd>
+let (ready_read, ready_write) = /* a pipe */;
+let mut helper = Command::new("slirp4netns")
+    .args([&pid.to_string(), "tap0", "--configure", "--ready-fd=3"])
+    .fd(3, ready_write) // the ready descriptor as fd 3 in the child
+    .spawn()?;
+
+// Block until slirp4netns has created and configured the tap.
+read_one_byte(&ready_read)?;
+
+let mut running = pending.proceed()?;
+let status = running.wait()?;
+
+// The helper runs for the sandbox's lifetime; it exits when the namespace
+// goes away, and the caller reaps it.
+helper.wait()?;
+```
+
+The helper is the caller's process to own: it runs alongside the sandbox,
+exits when the sandbox's network namespace is destroyed, and is reaped by the
+caller. The library's responsibility ends at the namespace and the gate.
+
+## What the seam provides
+
+The seam gives a stack exactly two things: a network namespace with a live
+process to target, and the guarantee that the command does not run until the
+caller proceeds. Everything else — which stack, its addressing, port
+forwarding, DNS — is the stack's, whether that is the native [`NetStack`] or an
+external helper. A stack that needs the sandbox to reach it over loopback finds
+loopback already up under [`Network::Isolated`]; one that configures every
+interface itself can start from the bare namespace of [`Network::None`].
+
+[`Network::Host`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
+[`Network::Isolated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
+[`Network::None`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
+[`Cage::spawn_pending`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.spawn_pending
+[`Cage::spawn_pending_with`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.spawn_pending_with
+[`Pending`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html
+[`Pending::netns_pid`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html#method.netns_pid
+[`Pending::proceed`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html#method.proceed
+[`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html
+[`NetStack`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html
+[`NetStack::attach`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.attach
+[`NetStack::default`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html
+[`NetStackBuilder`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html
+[`NetStackBuilder::ipv4`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv4
+[`NetStackBuilder::ipv6`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv6
+[`NetStackBuilder::ipv4_cidr`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv4_cidr
+[`NetStackBuilder::ipv6_cidr`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv6_cidr
+[`NetStackBuilder::mtu`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.mtu
+[`NetStackBuilder::interface`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.interface
+[`NetStackBuilder::host_loopback`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.host_loopback
+[`NetStackHandle`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html
+[`NetStackHandle::stop`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.stop
+[`NetStackHandle::is_running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.is_running
+[`pasta`]: https://passt.top/
+[`slirp4netns`]: https://github.com/rootless-containers/slirp4netns

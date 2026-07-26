@@ -1,0 +1,18 @@
+# The "builder" group: an isolated, loopback-only sandbox with a scratch
+# directory bound at /build. It carries a default command, so `run builder`
+# with no command prints a short banner; a command given on the prompt
+# replaces that default as a unit. Point --rootfs at a root filesystem you have.
+rootfs = "/srv/rootfs/alpine"
+network = "isolated"
+hostname = "builder"
+workdir = "/build"
+command = "/bin/sh"
+args = ["-c", "echo 'builder group: no command given'; id"]
+
+# A scratch directory the sandbox builds into. Point it at a directory you
+# control and create it first; binding shared, world-writable /tmp would expose
+# its contents to the sandbox and let the sandbox write into everyone's /tmp.
+[[mount]]
+kind = "bind"
+source = "/tmp/ferroday-build"
+target = "/build"

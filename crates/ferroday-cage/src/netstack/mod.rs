@@ -1,0 +1,980 @@
+//! The native userspace network stack.
+//!
+//! The default sandbox network is an isolated namespace whose only interface
+//! is loopback. This module attaches the library's own network stack to
+//! such a sandbox at the [`Pending`] seam: [`NetStack::attach`] creates a
+//! tap device in the sandbox's network namespace, configures its addresses
+//! and routes, and hands the device's descriptor to a pump thread in the
+//! caller's process. The pump terminates the guest's TCP connections and
+//! UDP flows in an in-process TCP/IP implementation and forwards each over
+//! an ordinary, unprivileged host socket, so the sandbox gets outbound
+//! connectivity while the host sees a normal application. The stack is
+//! self-contained, and the privilege it needs is exactly what creating the
+//! sandbox already granted: the caller's user owns the sandbox's user
+//! namespace, and entering it confers the network capabilities inside.
+//!
+//! The stack forwards where the guest could plausibly reach on its own and
+//! nowhere surprising: multicast, broadcast, loopback, and link-local
+//! destinations are refused, with one deliberate exception —
+//! [`host_loopback`](NetStackBuilder::host_loopback) maps connections to
+//! the gateway address onto the host's loopback. Refused destinations
+//! answer with a connection reset.
+//!
+//! Attachment happens in a forked, short-lived helper process that joins
+//! the sandbox's user and network namespaces, creates and configures the
+//! tap, passes its descriptor back, and exits; the caller's own threads
+//! never change namespace ([`tap`] explains why the kernel forces this
+//! shape). The returned [`NetStackHandle`] owns the pump thread. The pump's
+//! open tap descriptor pins the device and its namespace, so the handle
+//! outlives the sandbox gracefully: wait for the command first, then
+//! [`stop`](NetStackHandle::stop) the stack. Dropping the handle stops the
+//! pump the same way and leaves the sandbox running — a sandbox without its
+//! stack merely loses connectivity.
+
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::fd::OwnedFd;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+
+use rustix::fs::{Mode, OFlags};
+use rustix::pipe::{self, PipeFlags};
+
+use crate::running::Pending;
+
+mod device;
+mod pump;
+mod sniff;
+mod tap;
+mod tcp;
+mod udp;
+
+/// The guest interface's MAC address: locally administered and stable, so
+/// the guest side of every exchange is deterministic.
+const GUEST_MAC: [u8; 6] = [0x02, 0xfc, 0x0d, 0x00, 0x00, 0x0f];
+
+/// The gateway MAC address the stack's interface answers with.
+const GATEWAY_MAC: [u8; 6] = [0x02, 0xfc, 0x0d, 0x00, 0x00, 0x02];
+
+/// The host part of the guest's IPv4 address within the configured network.
+const GUEST_HOST_V4: u32 = 15;
+/// The host part of the gateway's IPv4 address. The stack's interface owns
+/// this address; the guest's default route points at it.
+const GATEWAY_HOST_V4: u32 = 2;
+/// The host part of the guest's IPv6 address (`::15`).
+const GUEST_HOST_V6: u128 = 0x15;
+/// The host part of the gateway's IPv6 address (`::2`).
+const GATEWAY_HOST_V6: u128 = 0x2;
+
+/// The widest IPv4 prefix that leaves room for the address plan: the
+/// gateway at host 2 and the guest at host 15, below the broadcast address.
+const MAX_PREFIX_V4: u8 = 27;
+/// The widest IPv6 prefix that leaves the address plan a full final byte.
+const MAX_PREFIX_V6: u8 = 120;
+
+/// The smallest usable MTU with IPv4 alone (RFC 791's reassembly minimum).
+const MIN_MTU_V4: u16 = 576;
+/// The smallest usable MTU when IPv6 is enabled (RFC 8200's link minimum).
+const MIN_MTU_V6: u16 = 1280;
+
+/// A frozen network-stack configuration, ready to attach to sandboxes.
+///
+/// Built by [`NetStackBuilder`]; the default configuration is valid and
+/// matches the builder's defaults. One `NetStack` may be attached to any
+/// number of sandboxes — [`attach`](Self::attach) borrows it and every
+/// attachment is independent.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let cage = ferroday_cage::Cage::builder().rootfs("/r").command("/bin/x").build()?;
+/// use ferroday_cage::NetStack;
+///
+/// let stack = NetStack::default();
+/// let pending = cage.spawn_pending()?;
+/// let handle = stack.attach(&pending)?;
+/// let mut running = pending.proceed()?;
+/// let status = running.wait()?;
+/// handle.stop()?;
+/// # let _ = status;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct NetStack {
+    plan: Plan,
+}
+
+/// The validated address and interface plan an attachment executes.
+#[derive(Debug, Clone)]
+struct Plan {
+    /// The IPv4 side, when enabled.
+    v4: Option<PlanV4>,
+    /// The IPv6 side, when enabled.
+    v6: Option<PlanV6>,
+    /// The tap interface's MTU.
+    mtu: u16,
+    /// The tap interface's name inside the sandbox.
+    interface: String,
+    /// Whether connections to the gateway address map to host loopback.
+    host_loopback: bool,
+}
+
+/// The IPv4 half of the plan: the guest address the tap carries and the
+/// gateway address the stack's interface answers for.
+#[derive(Debug, Clone)]
+struct PlanV4 {
+    guest: Ipv4Addr,
+    gateway: Ipv4Addr,
+    prefix_len: u8,
+}
+
+/// The IPv6 half of the plan.
+#[derive(Debug, Clone)]
+struct PlanV6 {
+    guest: Ipv6Addr,
+    gateway: Ipv6Addr,
+    prefix_len: u8,
+}
+
+impl NetStack {
+    /// Returns a builder holding the default configuration.
+    pub fn builder() -> NetStackBuilder {
+        NetStackBuilder::default()
+    }
+
+    /// Attaches the stack to a pending sandbox launch.
+    ///
+    /// A forked helper process joins the sandbox's user and network
+    /// namespaces through `/proc/<pid>/ns`, creates the tap device, assigns
+    /// the guest addresses and default routes, brings the interface up, and
+    /// exits. The tap's descriptor comes back to a pump thread in the
+    /// caller's process, owned by the returned handle. On return the
+    /// sandbox's interface is fully configured, so the caller proceeds
+    /// immediately:
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let cage = ferroday_cage::Cage::builder().rootfs("/r").command("/bin/x").build()?;
+    /// # let stack = ferroday_cage::NetStack::default();
+    /// let pending = cage.spawn_pending()?;
+    /// let handle = stack.attach(&pending)?;
+    /// let mut running = pending.proceed()?;
+    /// let status = running.wait()?;
+    /// handle.stop()?;
+    /// # let _ = status;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The sandbox must have a private network namespace —
+    /// [`Network::Isolated`](crate::Network::Isolated) (the default) or
+    /// [`Network::None`](crate::Network::None). A sandbox sharing the host's
+    /// namespace ([`Network::Host`](crate::Network::Host)) is refused with
+    /// [`NetStackError::SharedNamespace`].
+    ///
+    /// When the configuration enables IPv6, the guest address is usable
+    /// immediately where the stack could disable duplicate address detection
+    /// (it tries, through the sandbox's `net.ipv6.conf` sysctls); where it
+    /// could not, the kernel holds the address tentative for about a second
+    /// after launch, and the guest's first IPv6 connection may stall that
+    /// long. IPv4 is never delayed.
+    pub fn attach(&self, pending: &Pending<'_>) -> Result<NetStackHandle, NetStackError> {
+        let pid = pending.netns_pid();
+        let target = format!("/proc/{pid}/ns/net");
+
+        // Refuse a sandbox that shares the caller's namespace: attaching
+        // would create a tap on the host network, which is never what a
+        // caller means. The namespace links compare equal exactly when the
+        // namespaces are the same.
+        let caller = std::fs::read_link("/proc/self/ns/net").map_err(|err| {
+            NetStackError::NamespaceJoin {
+                which: "reading the caller's namespace link",
+                errno: err.raw_os_error().unwrap_or(0),
+            }
+        })?;
+        let sandbox = std::fs::read_link(&target).map_err(|err| NetStackError::NamespaceJoin {
+            which: "reading the sandbox's namespace link",
+            errno: err.raw_os_error().unwrap_or(0),
+        })?;
+        if caller == sandbox {
+            return Err(NetStackError::SharedNamespace);
+        }
+
+        // The Pending handle keeps the supervisor alive, so the pid cannot
+        // be recycled while these descriptors are being opened. The user
+        // namespace is joined for its capabilities; the network namespace
+        // is where the tap is created.
+        let netns = rustix::fs::open(&target, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .map_err(|errno| NetStackError::NamespaceJoin {
+                which: "opening the sandbox's network namespace",
+                errno: errno.raw_os_error(),
+            })?;
+        let userns = rustix::fs::open(
+            format!("/proc/{pid}/ns/user"),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|errno| NetStackError::NamespaceJoin {
+            which: "opening the sandbox's user namespace",
+            errno: errno.raw_os_error(),
+        })?;
+
+        let tap = tap::create(userns, netns, &self.plan)?;
+
+        // The stop pipe wakes the pump: stop() writes a byte, and a dropped
+        // handle closes the write end, which the pump sees as a hangup.
+        let (stop_read, stop_write) =
+            pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|errno| NetStackError::Spawn {
+                errno: errno.raw_os_error(),
+            })?;
+        let running = Arc::new(AtomicBool::new(true));
+        let running_pump = Arc::clone(&running);
+        let plan = self.plan.clone();
+        let pump = std::thread::Builder::new()
+            .name("fcage-netstack".to_string())
+            .spawn(move || {
+                // Panics are converted into a failed exit and the running
+                // flag is cleared on every path, so the handle's view of the
+                // pump is always truthful and stop() never rethrows.
+                let exit =
+                    std::panic::catch_unwind(AssertUnwindSafe(|| pump::run(tap, stop_read, plan)));
+                running_pump.store(false, Ordering::SeqCst);
+                exit.unwrap_or(PumpExit::Failed {
+                    op: "recovering from a panic",
+                    errno: 0,
+                })
+            })
+            .map_err(|err| NetStackError::Spawn {
+                errno: err.raw_os_error().unwrap_or(0),
+            })?;
+
+        Ok(NetStackHandle {
+            pump: Some(pump),
+            stop: Some(stop_write),
+            running,
+        })
+    }
+}
+
+impl Default for NetStack {
+    fn default() -> Self {
+        NetStackBuilder::default()
+            .build()
+            .expect("the default network-stack configuration is valid")
+    }
+}
+
+/// How the pump thread concluded.
+enum PumpExit {
+    /// The pump stopped because the handle asked it to.
+    Clean,
+    /// The pump stopped on an unrecoverable error of its own machinery.
+    Failed { op: &'static str, errno: i32 },
+}
+
+/// A handle to one attached network stack.
+///
+/// Owns the pump thread serving one sandbox's tap device. The intended order
+/// is: wait for the sandbox's command, then [`stop`](Self::stop) the stack —
+/// the pump holds the sandbox's network namespace open, so it never observes
+/// the sandbox's death and does not stop by itself. Dropping the handle stops
+/// the pump the same way, discarding its outcome. Stopping or dropping never
+/// affects the sandbox: a running command merely loses connectivity.
+#[derive(Debug)]
+pub struct NetStackHandle {
+    /// The pump thread; `None` only after `stop` or `drop` takes it.
+    pump: Option<JoinHandle<PumpExit>>,
+    /// Write end of the stop pipe; closing it is itself a stop signal.
+    stop: Option<OwnedFd>,
+    /// Cleared by the pump on every exit path.
+    running: Arc<AtomicBool>,
+}
+
+impl NetStackHandle {
+    /// Stops the stack and reports how the pump fared.
+    ///
+    /// Signals the pump, waits for it to exit, and returns the first error
+    /// the pump stopped on, if any. A pump that failed earlier — leaving
+    /// [`is_running`](Self::is_running) false — still has its outcome
+    /// reported here.
+    pub fn stop(mut self) -> Result<(), NetStackError> {
+        let pump = self
+            .pump
+            .take()
+            .expect("a handle owns its pump thread until stop or drop consumes it");
+        // Closing the stop pipe's write end wakes the pump's poll with a
+        // hangup, which is the whole stop signal. Dropping the descriptor here
+        // closes it. A byte-write would also wake the pump, but a pump that
+        // exited on its own has closed the read end, so the write could raise
+        // SIGPIPE; the close cannot.
+        drop(self.stop.take());
+        match pump.join() {
+            Ok(PumpExit::Clean) => Ok(()),
+            Ok(PumpExit::Failed { op, errno }) => Err(NetStackError::Pump { op, errno }),
+            // The pump converts its panics into a failed exit; a join error
+            // means that conversion itself was bypassed. Report, not rethrow.
+            Err(_) => Err(NetStackError::Pump {
+                op: "recovering from a panic",
+                errno: 0,
+            }),
+        }
+    }
+
+    /// Whether the pump thread is still serving the tap device.
+    ///
+    /// False once the stack has stopped — after [`stop`](Self::stop), or on
+    /// its own if the pump hit an unrecoverable error (reported by `stop`).
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for NetStackHandle {
+    fn drop(&mut self) {
+        // Closing the stop pipe's write end hangs up the pump's read end,
+        // which the pump treats as a stop request. Join so the tap descriptor
+        // is closed — and the sandbox's namespace released — before drop
+        // returns; the outcome is discarded, stop() being the reporting path.
+        drop(self.stop.take());
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.join();
+        }
+    }
+}
+
+/// Builder for a [`NetStack`].
+///
+/// The defaults follow the established userspace-networking convention:
+/// IPv4 and IPv6 both enabled, the guest at `10.0.2.15/24` and `fd00::15/64`,
+/// the gateway — the stack itself — at `10.0.2.2` and `fd00::2`, MTU 1500,
+/// interface `tap0`. Within a configured network the stack always places the
+/// gateway at host 2 and the guest at host 15.
+///
+/// With the `serde` feature the builder serializes and deserializes as the
+/// stack specification, for embedding in a consumer's own configuration.
+/// Keys are kebab-case; unknown keys are rejected; the CIDR fields read and
+/// write as strings. In TOML:
+///
+/// ```toml
+/// ipv4-cidr = "10.0.2.0/24"
+/// ipv6 = false
+/// mtu = 1500
+/// interface = "tap0"
+/// ```
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, rename_all = "kebab-case", deny_unknown_fields)
+)]
+pub struct NetStackBuilder {
+    #[cfg_attr(feature = "serde", serde(rename = "ipv4"))]
+    ipv4: bool,
+    #[cfg_attr(feature = "serde", serde(rename = "ipv6"))]
+    ipv6: bool,
+    #[cfg_attr(feature = "serde", serde(with = "serde_cidr::v4"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ipv4-cidr"))]
+    ipv4_cidr: (Ipv4Addr, u8),
+    #[cfg_attr(feature = "serde", serde(with = "serde_cidr::v6"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ipv6-cidr"))]
+    ipv6_cidr: (Ipv6Addr, u8),
+    #[cfg_attr(feature = "serde", serde(rename = "mtu"))]
+    mtu: u16,
+    #[cfg_attr(feature = "serde", serde(rename = "interface"))]
+    interface: String,
+    #[cfg_attr(feature = "serde", serde(rename = "host-loopback"))]
+    host_loopback: bool,
+}
+
+impl Default for NetStackBuilder {
+    fn default() -> Self {
+        NetStackBuilder {
+            ipv4: true,
+            ipv6: true,
+            ipv4_cidr: (Ipv4Addr::new(10, 0, 2, 0), 24),
+            ipv6_cidr: (Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0), 64),
+            mtu: 1500,
+            interface: "tap0".to_string(),
+            host_loopback: false,
+        }
+    }
+}
+
+impl NetStackBuilder {
+    /// Enables or disables IPv4. Enabled by default.
+    pub fn ipv4(mut self, enabled: bool) -> Self {
+        self.ipv4 = enabled;
+        self
+    }
+
+    /// Enables or disables IPv6. Enabled by default.
+    pub fn ipv6(mut self, enabled: bool) -> Self {
+        self.ipv6 = enabled;
+        self
+    }
+
+    /// Sets the IPv4 network. The default is `10.0.2.0/24`.
+    ///
+    /// `network` must be the network address itself — no bits set past the
+    /// prefix — and the prefix length must be between 1 and 27, leaving room
+    /// for the gateway at host 2 and the guest at host 15. Validated by
+    /// [`build`](Self::build).
+    pub fn ipv4_cidr(mut self, network: Ipv4Addr, prefix_len: u8) -> Self {
+        self.ipv4_cidr = (network, prefix_len);
+        self
+    }
+
+    /// Sets the IPv6 network. The default is `fd00::/64`.
+    ///
+    /// `network` must be the network address itself and the prefix length
+    /// must be between 1 and 120, leaving the address plan the final byte.
+    /// Validated by [`build`](Self::build).
+    pub fn ipv6_cidr(mut self, network: Ipv6Addr, prefix_len: u8) -> Self {
+        self.ipv6_cidr = (network, prefix_len);
+        self
+    }
+
+    /// Sets the tap interface's MTU. The default is 1500.
+    ///
+    /// The minimum is 576, or 1280 while IPv6 is enabled. Validated by
+    /// [`build`](Self::build).
+    pub fn mtu(mut self, mtu: u16) -> Self {
+        self.mtu = mtu;
+        self
+    }
+
+    /// Names the tap interface inside the sandbox. The default is `tap0`.
+    ///
+    /// The name must satisfy the kernel's interface-name rules: 1 to 15
+    /// bytes, not `.` or `..`, and free of `/`, `:`, and whitespace.
+    /// Validated by [`build`](Self::build).
+    pub fn interface(mut self, name: impl Into<String>) -> Self {
+        self.interface = name.into();
+        self
+    }
+
+    /// Maps connections to the gateway address onto host loopback. Off by
+    /// default.
+    ///
+    /// The stack never forwards guest traffic to the host's loopback
+    /// addresses: `127.0.0.0/8` and `::1` destinations are refused
+    /// outright. With this option, a connection to the *gateway* address
+    /// (`10.0.2.2` and `fd00::2` by default) is instead forwarded to
+    /// `127.0.0.1` or `::1` on the host, port preserved — the conventional
+    /// way to reach a host-local service from inside the sandbox, granted
+    /// deliberately rather than by making the whole loopback range
+    /// reachable.
+    pub fn host_loopback(mut self, enabled: bool) -> Self {
+        self.host_loopback = enabled;
+        self
+    }
+
+    /// Validates the configuration and freezes it into a [`NetStack`].
+    pub fn build(self) -> Result<NetStack, NetStackError> {
+        if !self.ipv4 && !self.ipv6 {
+            return Err(NetStackError::NoProtocols);
+        }
+        let v4 = self
+            .ipv4
+            .then(|| {
+                let (network, prefix_len) = self.ipv4_cidr;
+                let invalid = |reason| NetStackError::PrefixInvalid {
+                    network: IpAddr::V4(network),
+                    prefix_len,
+                    reason,
+                };
+                if prefix_len == 0 || prefix_len > MAX_PREFIX_V4 {
+                    return Err(invalid("the IPv4 prefix length must be between 1 and 27"));
+                }
+                let base = u32::from(network);
+                if base & !(u32::MAX << (32 - prefix_len)) != 0 {
+                    return Err(invalid("the address has bits set past the prefix"));
+                }
+                if network.is_loopback()
+                    || network.is_multicast()
+                    || network.is_broadcast()
+                    || network.is_link_local()
+                    || network.octets()[0] == 0
+                {
+                    return Err(invalid("the network must be an ordinary unicast range"));
+                }
+                Ok(PlanV4 {
+                    guest: Ipv4Addr::from(base | GUEST_HOST_V4),
+                    gateway: Ipv4Addr::from(base | GATEWAY_HOST_V4),
+                    prefix_len,
+                })
+            })
+            .transpose()?;
+        let v6 = self
+            .ipv6
+            .then(|| {
+                let (network, prefix_len) = self.ipv6_cidr;
+                let invalid = |reason| NetStackError::PrefixInvalid {
+                    network: IpAddr::V6(network),
+                    prefix_len,
+                    reason,
+                };
+                if prefix_len == 0 || prefix_len > MAX_PREFIX_V6 {
+                    return Err(invalid("the IPv6 prefix length must be between 1 and 120"));
+                }
+                let base = u128::from(network);
+                if base & !(u128::MAX << (128 - prefix_len)) != 0 {
+                    return Err(invalid("the address has bits set past the prefix"));
+                }
+                if base == 0 || network.is_multicast() || (network.segments()[0] & 0xffc0) == 0xfe80
+                {
+                    return Err(invalid("the network must be an ordinary unicast range"));
+                }
+                Ok(PlanV6 {
+                    guest: Ipv6Addr::from(base | GUEST_HOST_V6),
+                    gateway: Ipv6Addr::from(base | GATEWAY_HOST_V6),
+                    prefix_len,
+                })
+            })
+            .transpose()?;
+        let minimum = if self.ipv6 { MIN_MTU_V6 } else { MIN_MTU_V4 };
+        if self.mtu < minimum {
+            return Err(NetStackError::MtuInvalid {
+                mtu: self.mtu,
+                minimum,
+            });
+        }
+        if !interface_name_valid(&self.interface) {
+            return Err(NetStackError::InterfaceNameInvalid {
+                name: self.interface,
+            });
+        }
+        Ok(NetStack {
+            plan: Plan {
+                v4,
+                v6,
+                mtu: self.mtu,
+                interface: self.interface,
+                host_loopback: self.host_loopback,
+            },
+        })
+    }
+}
+
+/// Mirrors the kernel's `dev_valid_name`: 1 to 15 bytes (`IFNAMSIZ` minus
+/// the terminator), not `.` or `..`, and free of `/`, `:`, and whitespace.
+/// NUL is additionally rejected so the name embeds cleanly in the
+/// NUL-terminated kernel requests.
+fn interface_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < 16
+        && name != "."
+        && name != ".."
+        && !name
+            .bytes()
+            .any(|byte| byte == b'/' || byte == b':' || byte == 0 || byte.is_ascii_whitespace())
+}
+
+/// An error from building or running a network stack.
+///
+/// Never a [`crate::Error`]: the stack is an attachment to a sandbox, not
+/// part of launching one, and its failures are its own. A failed
+/// [`attach`](NetStack::attach) leaves the pending launch untouched — the
+/// caller may still proceed (without connectivity) or drop it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum NetStackError {
+    /// A configured network cannot hold the stack's address plan.
+    #[non_exhaustive]
+    PrefixInvalid {
+        /// The network address as it was given to the builder.
+        network: IpAddr,
+        /// The prefix length as it was given to the builder.
+        prefix_len: u8,
+        /// What makes the pair unusable.
+        reason: &'static str,
+    },
+    /// The MTU is below the minimum for the enabled protocols.
+    #[non_exhaustive]
+    MtuInvalid {
+        /// The MTU as it was given to the builder.
+        mtu: u16,
+        /// The minimum the enabled protocols require.
+        minimum: u16,
+    },
+    /// The interface name does not satisfy the kernel's rules.
+    #[non_exhaustive]
+    InterfaceNameInvalid {
+        /// The name as it was given to the builder.
+        name: String,
+    },
+    /// The configuration enables neither IPv4 nor IPv6.
+    NoProtocols,
+    /// The sandbox shares the caller's network namespace, where a stack
+    /// must not attach. Sandboxes built with
+    /// [`Network::Host`](crate::Network::Host) are refused with this error.
+    SharedNamespace,
+    /// The sandbox's network namespace could not be examined or joined.
+    #[non_exhaustive]
+    NamespaceJoin {
+        /// The step that failed.
+        which: &'static str,
+        /// The raw OS error it failed with.
+        errno: i32,
+    },
+    /// `/dev/net/tun` could not be opened.
+    ///
+    /// The tun device is compiled into every mainstream kernel but a host
+    /// may omit the module or restrict the device node; the stack cannot
+    /// run there.
+    #[non_exhaustive]
+    TapOpen {
+        /// The raw OS error the open failed with.
+        errno: i32,
+    },
+    /// The tap interface could not be created.
+    #[non_exhaustive]
+    TapCreate {
+        /// The interface name the creation was asked for.
+        name: String,
+        /// The raw OS error the creation failed with.
+        errno: i32,
+    },
+    /// The tap interface was created but could not be configured.
+    #[non_exhaustive]
+    TapConfigure {
+        /// The configuration step that failed.
+        detail: &'static str,
+        /// The raw OS error it failed with.
+        errno: i32,
+    },
+    /// The stack's helper process or pump thread could not be started.
+    #[non_exhaustive]
+    Spawn {
+        /// The raw OS error the spawn failed with.
+        errno: i32,
+    },
+    /// The tap helper exited without delivering a result.
+    ///
+    /// The helper always reports an outcome — the tap descriptor or a typed
+    /// failure — before it exits; silence means it was killed from outside
+    /// or its result could not be read.
+    HelperLost,
+    /// The pump stopped on an error of its own machinery, reported by
+    /// [`NetStackHandle::stop`].
+    #[non_exhaustive]
+    Pump {
+        /// The operation the pump failed at.
+        op: &'static str,
+        /// The raw OS error it failed with, when the failure was a syscall.
+        errno: i32,
+    },
+}
+
+impl fmt::Display for NetStackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NetStackError::PrefixInvalid {
+                network,
+                prefix_len,
+                reason,
+            } => write!(
+                f,
+                "the network {network}/{prefix_len} is unusable: {reason}"
+            ),
+            NetStackError::MtuInvalid { mtu, minimum } => write!(
+                f,
+                "the MTU {mtu} is below {minimum}, the minimum for the enabled protocols",
+            ),
+            NetStackError::InterfaceNameInvalid { name } => {
+                write!(f, "{name:?} is not a valid interface name")
+            }
+            NetStackError::NoProtocols => {
+                f.write_str("the configuration enables neither IPv4 nor IPv6")
+            }
+            NetStackError::SharedNamespace => f.write_str(
+                "the sandbox shares the caller's network namespace; a network stack \
+                 attaches only to a private one",
+            ),
+            NetStackError::NamespaceJoin { which, errno } => write!(
+                f,
+                "could not join the sandbox's network namespace while {which}: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+            NetStackError::TapOpen { errno } => write!(
+                f,
+                "could not open /dev/net/tun: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+            NetStackError::TapCreate { name, errno } => write!(
+                f,
+                "could not create the tap interface {name}: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+            NetStackError::TapConfigure { detail, errno } => write!(
+                f,
+                "could not configure the tap interface while {detail}: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+            NetStackError::Spawn { errno } => write!(
+                f,
+                "could not start the network stack's helper or pump: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+            NetStackError::HelperLost => {
+                f.write_str("the network stack's tap helper exited without delivering a result")
+            }
+            NetStackError::Pump { op, errno: 0 } => {
+                write!(f, "the network stack pump failed while {op}")
+            }
+            NetStackError::Pump { op, errno } => write!(
+                f,
+                "the network stack pump failed while {op}: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NetStackError {}
+
+/// Serde adapters presenting the CIDR fields as `"address/len"` strings, the
+/// reviewable form for profile files.
+#[cfg(feature = "serde")]
+mod serde_cidr {
+    use std::fmt;
+    use std::marker::PhantomData;
+    use std::str::FromStr;
+
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    /// Serializes an `(address, prefix_len)` pair as `"address/len"`.
+    fn serialize_pair<A: fmt::Display, S: Serializer>(
+        (address, len): &(A, u8),
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{address}/{len}"))
+    }
+
+    /// Deserializes `"address/len"` into an `(address, prefix_len)` pair.
+    fn deserialize_pair<'de, A, D>(
+        deserializer: D,
+        family: &'static str,
+    ) -> Result<(A, u8), D::Error>
+    where
+        A: FromStr,
+        D: Deserializer<'de>,
+    {
+        struct CidrVisitor<A> {
+            family: &'static str,
+            marker: PhantomData<A>,
+        }
+
+        impl<A: FromStr> Visitor<'_> for CidrVisitor<A> {
+            type Value = (A, u8);
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "an {} network in \"address/len\" form", self.family)
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                let (address, len) = value
+                    .split_once('/')
+                    .ok_or_else(|| E::custom(format!("{value:?} has no '/' separator")))?;
+                let address = address.parse().map_err(|_| {
+                    E::custom(format!("{address:?} is not an {} address", self.family))
+                })?;
+                let len = len
+                    .parse()
+                    .map_err(|_| E::custom(format!("{len:?} is not a prefix length")))?;
+                Ok((address, len))
+            }
+        }
+
+        deserializer.deserialize_str(CidrVisitor {
+            family,
+            marker: PhantomData,
+        })
+    }
+
+    pub(super) mod v4 {
+        use std::net::Ipv4Addr;
+
+        use serde::{Deserializer, Serializer};
+
+        pub(crate) fn serialize<S: Serializer>(
+            pair: &(Ipv4Addr, u8),
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            super::serialize_pair(pair, serializer)
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<(Ipv4Addr, u8), D::Error> {
+            super::deserialize_pair(deserializer, "IPv4")
+        }
+    }
+
+    pub(super) mod v6 {
+        use std::net::Ipv6Addr;
+
+        use serde::{Deserializer, Serializer};
+
+        pub(crate) fn serialize<S: Serializer>(
+            pair: &(Ipv6Addr, u8),
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            super::serialize_pair(pair, serializer)
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<(Ipv6Addr, u8), D::Error> {
+            super::deserialize_pair(deserializer, "IPv6")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_configuration_builds() {
+        let stack = NetStack::builder().build().expect("the defaults are valid");
+        let v4 = stack.plan.v4.expect("IPv4 is on by default");
+        assert_eq!(v4.guest, Ipv4Addr::new(10, 0, 2, 15));
+        assert_eq!(v4.gateway, Ipv4Addr::new(10, 0, 2, 2));
+        assert_eq!(v4.prefix_len, 24);
+        let v6 = stack.plan.v6.expect("IPv6 is on by default");
+        assert_eq!(v6.guest, "fd00::15".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(v6.gateway, "fd00::2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(v6.prefix_len, 64);
+        assert_eq!(stack.plan.mtu, 1500);
+        assert_eq!(stack.plan.interface, "tap0");
+    }
+
+    #[test]
+    fn a_custom_network_places_the_plan_within_it() {
+        let stack = NetStack::builder()
+            .ipv4_cidr(Ipv4Addr::new(192, 168, 100, 0), 24)
+            .ipv6_cidr("fdab:cd::".parse().unwrap(), 64)
+            .build()
+            .expect("a valid custom network");
+        let v4 = stack.plan.v4.expect("IPv4 is on");
+        assert_eq!(v4.guest, Ipv4Addr::new(192, 168, 100, 15));
+        assert_eq!(v4.gateway, Ipv4Addr::new(192, 168, 100, 2));
+        let v6 = stack.plan.v6.expect("IPv6 is on");
+        assert_eq!(v6.guest, "fdab:cd::15".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(v6.gateway, "fdab:cd::2".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn disabling_both_protocols_is_refused() {
+        let err = NetStack::builder()
+            .ipv4(false)
+            .ipv6(false)
+            .build()
+            .expect_err("no protocols is invalid");
+        assert!(matches!(err, NetStackError::NoProtocols), "{err}");
+    }
+
+    #[test]
+    fn a_prefix_too_long_for_the_address_plan_is_refused() {
+        let err = NetStack::builder()
+            .ipv4_cidr(Ipv4Addr::new(10, 0, 2, 0), 28)
+            .build()
+            .expect_err("/28 cannot hold host 15 below broadcast");
+        assert!(matches!(err, NetStackError::PrefixInvalid { .. }), "{err}");
+
+        let err = NetStack::builder()
+            .ipv6_cidr("fd00::".parse().unwrap(), 121)
+            .build()
+            .expect_err("/121 does not leave the final byte");
+        assert!(matches!(err, NetStackError::PrefixInvalid { .. }), "{err}");
+    }
+
+    #[test]
+    fn host_bits_past_the_prefix_are_refused() {
+        let err = NetStack::builder()
+            .ipv4_cidr(Ipv4Addr::new(10, 0, 2, 5), 24)
+            .build()
+            .expect_err("10.0.2.5 is not a /24 network address");
+        assert!(matches!(err, NetStackError::PrefixInvalid { .. }), "{err}");
+
+        let err = NetStack::builder()
+            .ipv6_cidr("fd00::1".parse().unwrap(), 64)
+            .build()
+            .expect_err("fd00::1 is not a /64 network address");
+        assert!(matches!(err, NetStackError::PrefixInvalid { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_mtu_floor_follows_the_enabled_protocols() {
+        let err = NetStack::builder()
+            .mtu(1279)
+            .build()
+            .expect_err("1279 is below the IPv6 minimum");
+        assert!(
+            matches!(err, NetStackError::MtuInvalid { minimum: 1280, .. }),
+            "{err}"
+        );
+
+        NetStack::builder()
+            .ipv6(false)
+            .mtu(576)
+            .build()
+            .expect("576 suffices for IPv4 alone");
+
+        let err = NetStack::builder()
+            .ipv6(false)
+            .mtu(575)
+            .build()
+            .expect_err("575 is below the IPv4 minimum");
+        assert!(
+            matches!(err, NetStackError::MtuInvalid { minimum: 576, .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn interface_names_follow_the_kernel_rules() {
+        for name in ["", ".", "..", "a/b", "a:b", "a b", "sixteen-byte-name"] {
+            let err = NetStack::builder()
+                .interface(name)
+                .build()
+                .expect_err("an invalid interface name is refused");
+            assert!(
+                matches!(err, NetStackError::InterfaceNameInvalid { .. }),
+                "{name:?}: {err}"
+            );
+        }
+        NetStack::builder()
+            .interface("fifteen-byte-nm")
+            .build()
+            .expect("a 15-byte name is the longest valid one");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn the_builder_round_trips_through_serde() {
+        let toml = "ipv4-cidr = \"192.168.7.0/24\"\nipv6 = false\ninterface = \"net0\"\n";
+        let builder: NetStackBuilder = toml::from_str(toml).expect("the profile parses");
+        assert_eq!(builder.ipv4_cidr, (Ipv4Addr::new(192, 168, 7, 0), 24));
+        assert!(!builder.ipv6);
+        assert_eq!(builder.interface, "net0");
+        assert_eq!(builder.mtu, 1500, "unset keys keep their defaults");
+
+        let serialized = toml::to_string(&builder).expect("the builder serializes");
+        let reparsed: NetStackBuilder = toml::from_str(&serialized).expect("and round-trips");
+        assert_eq!(reparsed.ipv4_cidr, builder.ipv4_cidr);
+        assert_eq!(reparsed.ipv6_cidr, builder.ipv6_cidr);
+
+        let err = toml::from_str::<NetStackBuilder>("ipv4-cidr = \"10.0.2.0\"")
+            .expect_err("a CIDR without a length is refused");
+        assert!(err.to_string().contains("separator"), "{err}");
+
+        let err = toml::from_str::<NetStackBuilder>("gateway = \"10.0.2.1\"")
+            .expect_err("unknown keys are refused");
+        assert!(err.to_string().contains("gateway"), "{err}");
+    }
+}

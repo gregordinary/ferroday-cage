@@ -1,0 +1,209 @@
+[package]
+name = "ferroday-cage"
+description = "Run a command inside an unprivileged Linux sandbox: fresh namespaces, a provided root filesystem, and a clean environment, established in pure Rust against the kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+categories = ["os::linux-apis", "virtualization"]
+keywords = ["sandbox", "namespaces", "linux", "unprivileged", "container"]
+# Test fixtures are host-and-feature-gated build inputs, and the public-API
+# snapshot is a review artifact, not part of the published crate. Keep both out
+# of the packaged tarball.
+exclude = ["tests/fixtures", "public-api.txt"]
+
+# docs.rs builds with default features only; the public API is spread across
+# the optional features, so document them all. The `docsrs` cfg is set for
+# per-item `#[doc(cfg(...))]` availability annotations, should they be added.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# `rand` is the kernel's getrandom: the host probes name their scratch entries
+# from it, and the native network stack seeds its TCP sequence numbers from it.
+rustix = { version = "1.1.4", features = ["runtime", "mount", "process", "fs", "pipe", "thread", "net", "system", "event", "stdio", "rand"] }
+# A no_std, libc-free inline-assembly conduit for the syscalls rustix does not
+# wrap: mount_setattr, for recursively read-only bind mounts (core), and the
+# Landlock and seccomp-install calls (the hardening layer). The crate owns the
+# relevant uapi structs and issues the syscalls directly, so no `landlock`
+# crate is needed.
+syscalls = { version = "0.8", default-features = false }
+serde = { version = "1.0", features = ["derive"], optional = true }
+flate2 = { version = "1.1", optional = true }
+lzma-rust2 = { version = "0.16", optional = true, default-features = false, features = ["std", "xz"] }
+ruzstd = { version = "0.8", optional = true }
+# The Debian userland add-on: OpenPGP verification of the archive signature
+# (pure Rust, no C backend) and SHA-256 hashing of the release chain.
+pgp = { version = "0.20", optional = true, default-features = false }
+sha2 = { version = "0.10", optional = true }
+# The hardening add-on: seccomp-BPF compilation, pure Rust (the syscall conduit
+# it installs through is the always-present `syscalls` above).
+seccompiler = { version = "0.5", optional = true }
+# The native network stack: a userspace TCP/IP implementation, pure Rust with
+# default features off, so no libc enters the graph. It terminates the
+# sandbox's TCP and UDP flows against a tap device the library creates.
+smoltcp = { version = "0.13.1", optional = true, default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+    "auto-icmp-echo-reply",
+    "iface-max-addr-count-3",
+] }
+
+[features]
+# Serialization of the sandbox specification, for profile files.
+serde = ["dep:serde"]
+# The tarball rootfs provisioner: tar extraction with gzip, xz, and zstd
+# decoding, all pure Rust.
+tarball = ["dep:flate2", "dep:lzma-rust2", "dep:ruzstd"]
+# The Debian userland provisioner: bootstrap a suite/architecture rootfs and
+# install packages, talking to the archive directly. Builds on the tarball
+# extractor for the packages' data members.
+debian = ["tarball", "dep:pgp", "dep:sha2"]
+# The hardening layer: opt-in Landlock filesystem rules, seccomp syscall
+# filters, and capability drops applied to the sandboxed command.
+hardening = ["dep:seccompiler"]
+# The native userspace network stack: outbound TCP and UDP connectivity for
+# the isolated network namespace, with no external helper binary.
+netstack = ["dep:smoltcp"]
+# The subordinate-id delegate: establish uid/gid range maps through the
+# shadow suite's setuid `newuidmap`/`newgidmap` helpers. The one feature
+# that executes an external binary; a default build invokes none.
+subid = []
+
+[lints]
+workspace = true
+
+# The integration tests provision their rootfs fixture through the tarball
+# provisioner, so every integration-test binary requires the feature.
+[[test]]
+name = "sandbox"
+required-features = ["tarball"]
+
+[[test]]
+name = "overlay"
+required-features = ["tarball"]
+
+[[test]]
+name = "process"
+required-features = ["tarball"]
+
+[[test]]
+name = "streams"
+required-features = ["tarball"]
+
+[[test]]
+name = "handle"
+required-features = ["tarball"]
+
+[[test]]
+name = "network_seam"
+required-features = ["tarball"]
+
+[[test]]
+name = "provision"
+required-features = ["tarball"]
+
+# The export tests fork a child that re-enters an identity map; the
+# subordinate round-trip additionally needs a range-map delegate and the
+# rootfs fixture, so its body is gated on `subid` within the binary.
+[[test]]
+name = "export"
+required-features = ["tarball"]
+
+[[test]]
+name = "debian"
+required-features = ["debian"]
+
+# The native-stack tests additionally need a host with /dev/net/tun; they
+# skip (explicitly, on stderr) where it is unavailable.
+[[test]]
+name = "netstack"
+required-features = ["netstack", "tarball"]
+
+[[test]]
+name = "hardening"
+required-features = ["hardening", "tarball"]
+
+# The restriction fallback needs neither user namespaces nor a rootfs
+# fixture: its tests run host binaries and require only the feature.
+[[test]]
+name = "restrict"
+required-features = ["hardening"]
+
+# The identity-map tests need the rootfs fixture; the range-map cases
+# additionally need a working delegate on the host and skip (explicitly, on
+# stderr) where none is available.
+[[test]]
+name = "identity"
+required-features = ["tarball"]
+
+# A worked consumer: a profile-driven, group-based sandbox orchestrator. It
+# loads profiles through the `serde` feature, so it builds only when that
+# feature is enabled.
+[[example]]
+name = "orchestrator"
+required-features = ["serde"]
+
+# A worked consumer: an ebuild development sandbox that provisions a Gentoo
+# stage3 and builds packages in it under a subordinate uid/gid range map, so
+# portage's own ids exist inside. It provisions the root through the tarball
+# provisioner and establishes the map through the subid delegate, so it
+# builds only when both features are enabled.
+[[example]]
+name = "ebuild-sandbox"
+required-features = ["tarball", "subid"]
+
+# A worked consumer: a Debian source-package build sandbox that bootstraps a
+# suite with build tooling and builds a .deb from source. It provisions the
+# root through the Debian provisioner, so it builds only when the `debian`
+# feature is enabled.
+[[example]]
+name = "deb-build"
+required-features = ["debian"]
+
+# A worked consumer: a multi-repository provisioning sandbox that bootstraps a
+# root from the archive mirror plus local trusted repositories. It exercises the
+# Debian provisioner's repository builder, so it builds only when the `debian`
+# feature is enabled.
+[[example]]
+name = "deb-multirepo"
+required-features = ["debian"]
+
+# A worked consumer: a layered, multi-component build pipeline that provisions
+# one base, stages each component's build dependencies over it as a disposable
+# overlay layer, and feeds each built package into the next through a local pool.
+# It exercises the Debian provisioner's layered build path and pool writer, so it
+# builds only when the `debian` feature is enabled.
+[[example]]
+name = "deb-layer-pipeline"
+required-features = ["debian"]
+
+# A worked consumer: a fetch sandbox that provisions an Alpine root and runs
+# wget through the native network stack. It provisions through the tarball
+# provisioner and attaches the stack, so it builds only when both the
+# `netstack` and `tarball` features are enabled.
+[[example]]
+name = "fetch-sandbox"
+required-features = ["netstack", "tarball"]
+
+[dev-dependencies]
+rustix = "1.1.4"
+toml = "0.8"
+# The hardening tests name syscalls and signals by their libc constants.
+libc = "0.2"
+# The provisioning tests generate compressed fixtures.
+lzma-rust2 = { version = "0.16", default-features = false, features = ["std", "xz", "encoder"] }
+# The Debian tests build fixture repositories with correct digests.
+sha2 = "0.10"
+# The Debian signature tests generate a throwaway signing key and sign an
+# InRelease with it, to exercise the verification path adversarially. rPGP is
+# already pulled in by the `debian` feature; this adds the RNG it needs.
+rand = "0.8"

@@ -1,0 +1,76 @@
+name: Bug report
+description: Report incorrect behaviour in the library or the fcage binary.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report a containment bypass or another security issue
+        here. Use the private channel described in
+        [SECURITY.md](https://github.com/gregordinary/ferroday-cage/blob/main/SECURITY.md).
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >
+        The smallest configuration that shows the problem: a builder chain, a
+        profile, or an `fcage` command line, plus the command being sandboxed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Error or output
+      description: The full error, including the step it names.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The crate version, or the `fcage --version` output.
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Cargo features
+      description: >
+        The features the library was built with. `fcage` is built with all of
+        them.
+      placeholder: "default (none), or: tarball, debian, hardening"
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel and distribution
+      description: The output of `uname -srm`, and which distribution.
+      placeholder: "Linux 6.8.0-generic x86_64, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: host
+    attributes:
+      label: Host probes
+      description: >
+        The library's own report on what the host allows. Paste whichever
+        apply; several failures are host configuration rather than defects, and
+        these say so immediately.
+      value: |
+        host::userns_blocker():
+        host::range_map_blocker():
+        host::overlay_blocker(<the upper's directory>):
+      render: text
+  - type: checkboxes
+    id: identity
+    attributes:
+      label: Identity map
+      options:
+        - label: Single (the default)
+        - label: Subordinate or explicit ranges

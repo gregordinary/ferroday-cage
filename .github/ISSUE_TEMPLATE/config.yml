@@ -1,0 +1,10 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/gregordinary/ferroday-cage/security/advisories/new
+    about: >
+      Report a containment bypass or another security issue privately, as
+      SECURITY.md describes. Do not open a public issue for one.
+  - name: The guide
+    url: https://gregordinary.github.io/ferroday-cage/
+    about: How the sandbox is built, and what each boundary covers.

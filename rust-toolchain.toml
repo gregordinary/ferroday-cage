@@ -1,0 +1,11 @@
+[toolchain]
+# Pin the toolchain so formatting, linting, and builds are reproducible across
+# machines and CI. rustfmt output varies between rustfmt releases, so a floating
+# toolchain lets the same source format differently on different hosts; pinning
+# removes that variance. Bump it deliberately, reformatting in the same commit.
+#
+# This pin is a contributor convenience and sits ahead of the crate's minimum
+# supported Rust version, which is `rust-version` in Cargo.toml and is what the
+# MSRV job in CI builds against.
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

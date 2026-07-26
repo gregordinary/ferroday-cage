@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a capability the library does not have.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where the library stops you.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: >
+        A builder method, a profile key, a flag — whatever shape you imagine.
+        A sketch is enough; the shape is discussable.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >
+        Workarounds you found, and why they fall short. A capability that can
+        already be composed from the existing seams is worth knowing about.

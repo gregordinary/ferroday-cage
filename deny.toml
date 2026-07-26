@@ -1,0 +1,51 @@
+# cargo-deny configuration.
+#
+# The workspace and its entire dependency graph are permissively licensed, and
+# both workspace crates publish as `MIT OR Apache-2.0`. This gate keeps that
+# invariant: `cargo deny check licenses` fails if any crate enters the tree
+# under a license not listed below.
+#
+# The list is the minimal set the current graph obliges us to honor. Crates
+# offered under a choice that includes MIT or Apache-2.0 are satisfied by those
+# two; the remaining entries are licenses that some dependency pins outright
+# (the dalek crypto crates on BSD-3-Clause, syscalls on BSD-2-Clause,
+# smoltcp/managed on 0BSD, zlib-rs on Zlib) or requires in addition
+# (unicode-ident, which is `(MIT OR Apache-2.0) AND Unicode-3.0`).
+
+[licenses]
+# Reject a crate whose license text cannot be matched with high confidence,
+# rather than guessing.
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+# The RUSTSEC advisory gate: `cargo deny check advisories` fails the build if a
+# dependency carries a known security advisory, so a vulnerable version cannot
+# enter the graph unnoticed. One advisory is analyzed and deliberately ignored.
+[advisories]
+ignore = [
+    # Marvin Attack: a timing sidechannel in the `rsa` crate, pulled in through
+    # `pgp`. The attack recovers an RSA *private* key from the timing of private
+    # key operations (signing, decryption). This crate uses `pgp` only to
+    # *verify* the Debian archive's OpenPGP signature against an embedded
+    # keyring -- a public-key operation over public material -- and never holds
+    # or uses an RSA private key, so the sidechannel is not reachable here. No
+    # fixed `rsa` release exists yet; this is revisited when one does.
+    { id = "RUSTSEC-2023-0071", reason = "verification-only; no RSA private key is ever used" },
+]
+
+# Where dependencies may come from: `cargo deny check sources` fails the build
+# if a crate enters the graph from anywhere but crates.io. A security-adjacent
+# crate should not acquire a dependency from a git revision or a private
+# registry without that being a deliberate, reviewed decision.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

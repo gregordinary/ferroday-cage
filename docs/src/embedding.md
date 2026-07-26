@@ -1,0 +1,218 @@
+# Embedding in a runtime
+
+The library is synchronous and spawns no threads: a launch blocks the thread
+that made it, and captured output is pumped inside that blocking call. A
+service that wants to launch sandboxes from a thread pool or an async runtime
+therefore drives the library from a blocking context and connects it to the
+rest of the program itself. This chapter is that connection.
+
+## One cage, many launches
+
+A [`Cage`] is a frozen plan holding no live resources. It is `Clone`, it is
+`Send + Sync`, and every launch method takes `&self`, so one cage behind an
+`Arc` serves an entire pool:
+
+```rust,no_run
+use std::sync::Arc;
+
+use ferroday_cage::Cage;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cage = Arc::new(
+        Cage::builder()
+            .rootfs("/srv/rootfs/alpine")
+            .command("/bin/sh")
+            .args(["-c", "echo from a worker"])
+            .build()?,
+    );
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let cage = Arc::clone(&cage);
+            scope.spawn(move || {
+                let result = cage.output().expect("the sandbox launches");
+                assert!(result.status.success());
+            });
+        }
+    });
+    Ok(())
+}
+```
+
+Nothing is shared between those launches but the plan itself: each gets its own
+namespaces, its own supervisor, and its own channels.
+
+Setup cost is small enough that per-command overhead is rarely the thing worth
+optimizing. On an ordinary developer machine against a small Alpine root, 20
+sequential launches of a trivial command took 22.3 ms — about **1.1 ms per
+launch** — and 8 concurrent launches from 8 threads against one shared
+`Arc<Cage>` completed in 3.2 ms in total. Treat those as an order of magnitude
+rather than a promise: they move with the mount profile, the rootfs, and the
+host. The point is the order of magnitude.
+
+## Launching from an async runtime
+
+A launch blocks, so it belongs on a blocking thread. In tokio that is
+`spawn_blocking`:
+
+```rust,ignore
+let cage = Arc::clone(&cage);
+let status = tokio::task::spawn_blocking(move || cage.run()).await??;
+```
+
+That much is unremarkable. The part that is not obvious is cancellation.
+
+## Cancelling from async
+
+[`Running`] and [`Pending`] are deliberately neither `Send` nor `Sync`: they
+borrow an observer that carries no thread bounds, and the library delivers
+output on the thread that waits. So a handle cannot cross an await point, and
+the handle is exactly what holds the kill.
+
+[`KillHandle`] is the piece that does cross threads — it is `Send + Sync` — but
+it is obtained from the `Running` that is now inside the blocking task. The
+pattern that works is to ship the kill handle out of the task over a channel as
+soon as the sandbox is up, and keep it on the async side:
+
+```rust,ignore
+use std::sync::Arc;
+use std::time::Duration;
+
+use ferroday_cage::{Cage, KillHandle};
+
+async fn run_bounded(cage: Arc<Cage>) -> Result<(), Box<dyn std::error::Error>> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<KillHandle>();
+
+    let task = tokio::task::spawn_blocking(move || {
+        let mut running = cage.spawn()?;
+        // Hand the killer to the runtime before blocking on the wait.
+        let _ = tx.send(running.kill_handle()?);
+        running.wait()
+    });
+
+    let killer = rx.await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    killer.kill()?; // cancel from the async context
+
+    let status = task.await??; // terminated by SIGKILL
+    assert_eq!(status.signal(), Some(9));
+    Ok(())
+}
+```
+
+The ordering matters: the kill handle is sent *before* the wait begins, so the
+async side holds it for the whole life of the sandbox. `kill_handle` can be
+called again later from the blocking side if a second one is wanted; each owns
+its own duplicated channel ends.
+
+For a graceful stop, `KillHandle::terminate` sends SIGTERM instead, and the
+escalation recipe in [the process model](process-model.md) applies unchanged —
+either driven from the blocking side with `wait_deadline`, or from the async
+side with a `tokio::time::timeout` around the handle's `terminate` and `kill`.
+
+Two alternatives are worth knowing:
+
+- **A deadline inside the task.** If the bound is purely a timeout, there is no
+  need to involve the runtime at all: `wait_deadline` inside the blocking task
+  is simpler and needs no channel.
+- **[`stop_with_caller`].** Tying the sandbox's lifetime to the calling process
+  covers the case where the *service* exits rather than the individual task; it
+  is not a per-task cancellation mechanism.
+
+## Getting output back
+
+An observer runs on the thread that waits, which is inside the blocking task,
+so an observer that forwards to the async side is the natural shape:
+
+```rust,ignore
+use ferroday_cage::Observer;
+
+struct Forward(tokio::sync::mpsc::Sender<Vec<u8>>);
+
+impl Observer for Forward {
+    fn stdout(&mut self, chunk: &[u8]) {
+        // The blocking task is not in the runtime, so the blocking send is
+        // the correct one here.
+        let _ = self.0.blocking_send(chunk.to_vec());
+    }
+}
+```
+
+`blocking_send` rather than `send`: the task is on a blocking thread, not
+inside the reactor. A bounded channel then gives back-pressure for free — when
+the consumer falls behind, the observer blocks, the pump stops draining, and
+the command blocks writing, which is the ordinary pipe discipline rather than
+unbounded memory growth. For the whole-output case, [`output`] inside the
+blocking task is simpler, with the caution about unbounded capture from
+[Streaming output](streaming.md).
+
+## What crosses a thread boundary
+
+The rule the library follows is that a seam it *stores* carries thread bounds
+and a seam it merely *borrows* for one call does not:
+
+| Type | `Send` | `Sync` | Why |
+| --- | --- | --- | --- |
+| `Cage`, `CageBuilder` | yes | yes | Frozen configuration, no live resources |
+| `KillHandle` | yes | yes | Owns duplicated channel ends; exists to cross threads |
+| `Error`, `ConfigError` | yes | yes | A worker returns one to a coordinator |
+| `Running`, `Pending` | no | no | Borrow a `&mut dyn Observer`, called on the waiting thread |
+| `Provision`, `ProvisionRequest` | no | no | Borrow a `&mut dyn ProvisionObserver`, likewise |
+
+A consumer that needs one of the borrowed handles on the far side of a thread
+boundary moves the *inputs* across and constructs it there — which is what the
+`Arc<Cage>` fan-out above does.
+
+## Recording what a build ran under
+
+What a command produces depends on the environment it runs in and the
+filesystem it sees. A runtime that publishes artifacts usually needs to state
+those in the artifact's provenance, and the library version alone does not:
+the mount profile and the base environment are both [outside the
+compatibility promise](stability.md#what-is-not-covered) and may change in a
+patch release.
+
+[`resolved_inputs`] reports them as data. It is a projection of the frozen
+launch plan, computed on demand, so calling it costs nothing until asked and
+adds nothing to a launch:
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let cage = ferroday_cage::Cage::builder()
+    .rootfs("/srv/rootfs/alpine")
+    .command("/usr/bin/make")
+    // Prevention: the library contributes no mount and no variable of its
+    // own, in this release or any later one.
+    .managed_mounts(false)
+    .base_env(false)
+    .env("PATH", "/usr/bin:/bin")
+    .env("SOURCE_DATE_EPOCH", "1700000000")
+    .bind_ro("/srv/src", "/usr/src")
+    .build()?;
+
+// Verification: what the sandbox will actually apply, ready to stamp beside
+// the consumer's own version pin.
+let provenance = toml::to_string(&cage.resolved_inputs())?;
+# let _ = provenance;
+# Ok(())
+# }
+```
+
+The two are complements. The opt-outs keep the inputs from drifting under a
+library upgrade; the record states what they were, which is what catches the
+case where a declaration and the sandbox disagree. Note what the record
+contains that no other accessor can report: with the managed profile in force
+it lists the six `/dev` device nodes and the five `/dev` symlinks
+individually, where `get_mount_dev()` answers only whether `/dev` is
+assembled.
+
+The value's *shape* is stable API; its *contents* follow the defaults and may
+change, which is precisely why recording it is worth doing.
+
+[`Cage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html
+[`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html
+[`Pending`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html
+[`KillHandle`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.KillHandle.html
+[`output`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.output
+[`resolved_inputs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.resolved_inputs
+[`stop_with_caller`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.stop_with_caller

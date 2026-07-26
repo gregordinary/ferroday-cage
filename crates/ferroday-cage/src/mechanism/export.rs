@@ -1,0 +1,775 @@
+//! Map-assisted rootfs export: read a tree whose files a range-mapped sandbox
+//! chowned to subordinate ids, at the ownership the tree intends.
+//!
+//! A range-mapped sandbox writes real ownership, so a file the rootfs means as
+//! uid 42 is stored on the host as `100000 + 42`. Only a process re-entered
+//! into the same identity map, as root of the mapped namespace, sees that file
+//! as uid 42 again — and only such a process can read the `security.*` xattrs a
+//! setcap'd binary carries. This module forks a child that unshares a user
+//! namespace and either writes its own single-identity map or holds at a gate
+//! while the caller's delegate establishes a range map, then walks the tree as
+//! root of the mapped namespace and streams every entry's metadata and data to
+//! the parent.
+//!
+//! The division of labor is deliberate. The child does only the privileged,
+//! must-be-in-map work — `statat`, `flistxattr`/`fgetxattr`, `readlinkat`, and
+//! reading file data — under the post-fork discipline this module enforces (no
+//! allocation, no locks, no panic, rustix syscalls only), and constant memory
+//! besides the tree's own depth. It never assembles a path, tracks hardlinks,
+//! or formats a tar header: those want a heap. It emits a flat stream of
+//! [frames](#frame-protocol) instead, and the parent — in ordinary `std`
+//! context, with an allocator — reassembles paths, coalesces hardlinks, and
+//! encodes the archive (see [`provision::export`](crate::provision)).
+//!
+//! # Frame protocol
+//!
+//! The child writes little-endian frames to a stream pipe, each led by a
+//! one-byte tag:
+//!
+//! - [`FRAME_DIR`]: a directory is entered. Its metadata and xattrs follow; the
+//!   parent pushes its name and every later frame is a descendant until the
+//!   matching [`FRAME_LEAVE`]. The walk opens with one such frame for the
+//!   rootfs root itself, named `.`, so the archive equals `tar -C rootfs .`:
+//!   every member is `./`-prefixed (see [`Walker::walk_root`]).
+//! - [`FRAME_LEAVE`]: the current directory is finished; the parent pops it.
+//! - [`FRAME_FILE`]: a regular file. Its metadata, xattrs, and then exactly
+//!   `size` bytes of data follow.
+//! - [`FRAME_SYMLINK`]: a symbolic link. Its metadata and link target follow.
+//! - [`FRAME_END`]: the walk finished cleanly.
+//! - [`FRAME_ERROR`]: a syscall failed; a step discriminant and errno follow,
+//!   and the child exits.
+//!
+//! Character and block devices, FIFOs, and sockets are skipped: a deployed OS
+//! image carries none that a runtime does not provide, and the tar reader on
+//! the other end drops them regardless.
+
+use std::ffi::CStr;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SocketFlags, SocketType};
+use rustix::process::{Pid, Signal};
+use rustix::runtime::{self, Fork};
+use rustix::thread::UnshareFlags;
+
+use crate::idmap::{IdMapError, IdMapper, ResolvedMap};
+
+/// Frame tag: a directory is entered.
+pub(crate) const FRAME_DIR: u8 = 1;
+/// Frame tag: the current directory is finished.
+pub(crate) const FRAME_LEAVE: u8 = 2;
+/// Frame tag: a regular file, followed by its data.
+pub(crate) const FRAME_FILE: u8 = 3;
+/// Frame tag: a symbolic link, followed by its target.
+pub(crate) const FRAME_SYMLINK: u8 = 4;
+/// Frame tag: the walk finished cleanly.
+pub(crate) const FRAME_END: u8 = 5;
+/// Frame tag: a syscall failed; a step discriminant and errno follow.
+pub(crate) const FRAME_ERROR: u8 = 6;
+
+/// What the export child was doing when a syscall failed, carried in a
+/// [`FRAME_ERROR`] frame and by [`StartError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportStep {
+    /// Forking the export process or speaking to it.
+    Spawn,
+    /// The child could not unshare its user namespace.
+    Unshare,
+    /// The child could not write its own single-identity map.
+    SelfMap,
+    /// The child was abandoned at the map gate.
+    AwaitMap,
+    /// Reading a directory's entries failed.
+    ReadDir,
+    /// Stat-ing an entry failed.
+    Stat,
+    /// Opening an entry failed.
+    Open,
+    /// Reading a symlink target failed.
+    ReadLink,
+    /// Reading an entry's extended attributes failed.
+    Xattr,
+    /// Reading a file's data failed.
+    ReadData,
+    /// The tree is nested deeper than the export walks.
+    Depth,
+    /// Streaming a frame to the parent failed; the parent is gone.
+    Stream,
+}
+
+impl ExportStep {
+    /// The step as error prose: what the export was doing.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            ExportStep::Spawn => "spawning the export process",
+            ExportStep::Unshare => "unsharing the export namespace",
+            ExportStep::SelfMap => "writing the export identity map",
+            ExportStep::AwaitMap => "establishing the export identity map",
+            ExportStep::ReadDir => "reading a directory in the exported tree",
+            ExportStep::Stat => "inspecting an entry in the exported tree",
+            ExportStep::Open => "opening an entry in the exported tree",
+            ExportStep::ReadLink => "reading a symlink in the exported tree",
+            ExportStep::Xattr => "reading extended attributes in the exported tree",
+            ExportStep::ReadData => "reading file data in the exported tree",
+            ExportStep::Depth => "walking the exported tree, which nests too deeply",
+            ExportStep::Stream => "streaming the exported tree to the archiver",
+        }
+    }
+
+    /// The wire discriminant carried in a [`FRAME_ERROR`] frame.
+    fn wire(self) -> u32 {
+        self as u32
+    }
+
+    /// Decodes a wire discriminant, defaulting to [`ExportStep::Stream`] for an
+    /// unrecognized value (a defect that still must not panic post-fork).
+    pub(crate) fn from_wire(wire: u32) -> ExportStep {
+        match wire {
+            0 => ExportStep::Spawn,
+            1 => ExportStep::Unshare,
+            2 => ExportStep::SelfMap,
+            3 => ExportStep::AwaitMap,
+            4 => ExportStep::ReadDir,
+            5 => ExportStep::Stat,
+            6 => ExportStep::Open,
+            7 => ExportStep::ReadLink,
+            8 => ExportStep::Xattr,
+            9 => ExportStep::ReadData,
+            10 => ExportStep::Depth,
+            _ => ExportStep::Stream,
+        }
+    }
+}
+
+/// How the export child's identity map is established.
+pub(crate) enum ExportMap<'a> {
+    /// The single-identity map, which the child writes itself under the
+    /// kernel's unprivileged one-id exception. The lines are formatted by the
+    /// caller before the fork, as a launch formats its own.
+    SelfMap {
+        /// The `uid_map` line: `0 <euid> 1\n`.
+        uid_line: &'a [u8],
+        /// The `gid_map` line: `0 <egid> 1\n`.
+        gid_line: &'a [u8],
+    },
+    /// A range map, written from outside the new namespace by the resolved
+    /// delegate while the child blocks at the map gate.
+    Delegated {
+        /// The delegate that applies the map.
+        mapper: &'a dyn IdMapper,
+        /// The extents, resolved by the caller.
+        map: &'a ResolvedMap,
+    },
+}
+
+/// A failure to start the export before the child began streaming.
+pub(crate) enum StartError {
+    /// A syscall of the spawn machinery failed.
+    Spawn(Errno),
+    /// The delegate failed to apply the map; its own error is the diagnostic.
+    Map(IdMapError),
+}
+
+/// A running export child: the parent reads [`stream`](Self::stream) to
+/// completion, then calls [`finish`](Self::finish) to reap it.
+pub(crate) struct ExportChild {
+    /// The child process.
+    pid: Pid,
+    /// The read end of the frame stream.
+    stream: OwnedFd,
+}
+
+impl ExportChild {
+    /// The frame stream to read to [`FRAME_END`] or [`FRAME_ERROR`].
+    pub(crate) fn stream(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+
+    /// Reaps the child once its stream is drained.
+    pub(crate) fn finish(self) -> Result<(), Errno> {
+        drop(self.stream);
+        super::wait_for_exit(self.pid).map(|_| ())
+    }
+}
+
+/// The ready byte the child sends on the map gate once it has unshared and is
+/// blocked waiting for the delegate. Distinct value from the launch gate's,
+/// though the protocol is the same shape.
+const EXPORT_READY_BYTE: u8 = b'r';
+/// The go byte the caller sends once the delegate has applied the map.
+const EXPORT_GO_BYTE: u8 = b'g';
+
+/// Forks the export child and establishes its identity map.
+///
+/// On return the child is walking `rootfs` and streaming frames; the caller
+/// reads [`ExportChild::stream`] to [`FRAME_END`] or [`FRAME_ERROR`], then
+/// calls [`ExportChild::finish`]. A child-side walk failure surfaces in the
+/// stream as [`FRAME_ERROR`], not here; this returns only spawn failures and, for
+/// a delegated map, the delegate's own apply failure.
+pub(crate) fn start_export(rootfs: &CStr, map: ExportMap<'_>) -> Result<ExportChild, StartError> {
+    let (stream_read, stream_write) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(StartError::Spawn)?;
+
+    // The gate exists only for a delegated map; a self-mapped child needs no
+    // handshake.
+    let gate = match map {
+        ExportMap::Delegated { .. } => Some(
+            rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .map_err(StartError::Spawn)?,
+        ),
+        ExportMap::SelfMap { .. } => None,
+    };
+
+    // SAFETY: the child branch runs `export_child`, which performs raw rustix
+    // syscalls over the frozen paths and descriptors — no allocation, no
+    // locking, no panic — and never returns: every path ends in `exit_group`.
+    match unsafe { runtime::kernel_fork() } {
+        Err(errno) => Err(StartError::Spawn(errno)),
+        Ok(Fork::Child(_)) => {
+            // The fork duplicated the caller's end of the gate into this
+            // process; close it, so this child pins nothing it does not use.
+            // Closing an owned descriptor is a bare `close`, which the
+            // post-fork discipline permits.
+            let gate_child = gate.map(|(caller, child)| {
+                drop(caller);
+                child
+            });
+            export_child(
+                stream_write.as_fd(),
+                gate_child.as_ref().map(|gate| gate.as_fd()),
+                rootfs,
+                &map,
+            )
+        }
+        Ok(Fork::ParentOf(pid)) => {
+            drop(stream_write);
+            if let (Some((caller, child_end)), ExportMap::Delegated { mapper, map }) = (gate, &map)
+            {
+                drop(child_end);
+                if let Err(err) = drive_gate(&caller, pid, *mapper, map) {
+                    // The delegate failed. The child is blocked at the gate in
+                    // an unmapped namespace, has read nothing and written
+                    // nothing the caller will read, so it is killed and reaped.
+                    //
+                    // Killed rather than released by closing the gate:
+                    // `kernel_fork` copies the whole descriptor table, so a
+                    // sibling process this caller forked concurrently — another
+                    // export or removal child — holds its own copy of this
+                    // gate's caller end and keeps the peer open however
+                    // promptly this one closes. The end-of-file the child waits
+                    // on might then never arrive, and the reap below would
+                    // block forever.
+                    let _ = rustix::process::kill_process(pid, Signal::KILL);
+                    drop(caller);
+                    let _ = super::wait_for_exit(pid);
+                    return Err(err);
+                }
+            }
+            Ok(ExportChild {
+                pid,
+                stream: stream_read,
+            })
+        }
+    }
+}
+
+/// The caller's half of the map gate: waits for ready, applies the map, and
+/// releases the child.
+///
+/// An end-of-file before the ready byte means the child died before reaching
+/// the gate; the failure is already an error frame in the stream, so the gate
+/// simply falls through and lets the stream reader surface it.
+fn drive_gate(
+    gate: &OwnedFd,
+    pid: Pid,
+    mapper: &dyn IdMapper,
+    map: &ResolvedMap,
+) -> Result<(), StartError> {
+    let mut byte = [0u8; 1];
+    let ready = loop {
+        match rustix::io::read(gate, &mut byte) {
+            Ok(n) => break n,
+            Err(Errno::INTR) => continue,
+            Err(errno) => return Err(StartError::Spawn(errno)),
+        }
+    };
+    if ready == 0 || byte[0] != EXPORT_READY_BYTE {
+        // The child is gone or malfunctioning; its stream reports why.
+        return Ok(());
+    }
+
+    let raw = pid.as_raw_nonzero().get() as u32;
+    mapper.apply(raw, map).map_err(StartError::Map)?;
+
+    loop {
+        match rustix::io::write(gate, &[EXPORT_GO_BYTE]) {
+            Ok(_) => break Ok(()),
+            Err(Errno::INTR) => continue,
+            // A failed write means the child is already gone; the stream reports
+            // the outcome.
+            Err(_) => break Ok(()),
+        }
+    }
+}
+
+/// The child: unshare, establish the map, walk, and stream. Never returns.
+fn export_child(
+    stream: BorrowedFd<'_>,
+    gate: Option<BorrowedFd<'_>>,
+    rootfs: &CStr,
+    map: &ExportMap<'_>,
+) -> ! {
+    let fail = |step: ExportStep, errno: Errno| -> ! {
+        emit_error(stream, step, errno);
+        runtime::exit_group(1)
+    };
+
+    // A caller signal handler must never run in this constrained copy; the
+    // scrub is the same one every launch performs first.
+    if let Err(errno) = super::child::reset_signals() {
+        fail(ExportStep::Unshare, errno);
+    }
+
+    // The user namespace alone: the walk works on the caller's own mount view,
+    // through real paths, as root of the mapped namespace.
+    // SAFETY: the flags never include the descriptor table, and this process is
+    // a freshly forked single-threaded child besides.
+    if let Err(errno) = unsafe { rustix::thread::unshare_unsafe(UnshareFlags::NEWUSER) } {
+        fail(ExportStep::Unshare, errno);
+    }
+
+    match (map, gate) {
+        (ExportMap::SelfMap { uid_line, gid_line }, _) => {
+            // Deny setgroups first, as the one-id exception requires, then write
+            // the maps in process — exactly as stage A does for a single map.
+            if let Err(errno) = super::child::write_file(c"/proc/self/setgroups", b"deny") {
+                fail(ExportStep::SelfMap, errno);
+            }
+            if let Err(errno) = super::child::write_file(c"/proc/self/gid_map", gid_line) {
+                fail(ExportStep::SelfMap, errno);
+            }
+            if let Err(errno) = super::child::write_file(c"/proc/self/uid_map", uid_line) {
+                fail(ExportStep::SelfMap, errno);
+            }
+        }
+        (ExportMap::Delegated { .. }, Some(gate)) => {
+            // Signal ready, then block until the delegate has written the map.
+            loop {
+                match rustix::io::write(gate, &[EXPORT_READY_BYTE]) {
+                    Ok(_) => break,
+                    Err(Errno::INTR) => continue,
+                    Err(errno) => fail(ExportStep::AwaitMap, errno),
+                }
+            }
+            let mut byte = [0u8; 1];
+            loop {
+                match rustix::io::read(gate, &mut byte) {
+                    Ok(0) => runtime::exit_group(1),
+                    Ok(_) => break,
+                    Err(Errno::INTR) => continue,
+                    Err(errno) => fail(ExportStep::AwaitMap, errno),
+                }
+            }
+        }
+        (ExportMap::Delegated { .. }, None) => {
+            // start_export pairs every delegated map with a gate.
+            fail(ExportStep::AwaitMap, Errno::BADF);
+        }
+    }
+
+    let root = match fs::open(
+        rootfs,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(errno) => fail(ExportStep::Open, errno),
+    };
+
+    let walker = Walker { stream };
+    match walker.walk_root(root.as_fd()) {
+        Ok(()) => {
+            emit_tag(stream, FRAME_END);
+            runtime::exit_group(0)
+        }
+        Err((step, errno)) => fail(step, errno),
+    }
+}
+
+/// The largest depth the export descends before refusing the tree. A real
+/// rootfs nests a dozen levels; a tree deeper than this is pathological, and
+/// the bound keeps the recursion's stack use finite.
+const MAX_DEPTH: u32 = 128;
+/// The directory-iteration buffer, one per open level.
+const DIRENTS_BUF: usize = 2048;
+/// The bound on an extended-attribute name list and on a single value, both
+/// capped by the kernel at 64 KiB.
+const XATTR_BUF: usize = 65536;
+/// The file-data streaming buffer.
+const DATA_BUF: usize = 65536;
+/// The symlink-target buffer; a target is at most `PATH_MAX`.
+const LINK_BUF: usize = 4096;
+/// The largest length of a single path component, the kernel's `NAME_MAX`. A
+/// directory entry's name fits this; a longer one is rejected, not truncated.
+const NAME_MAX: usize = 255;
+/// How many successive names one scan of a directory collects.
+///
+/// A scan costs a full pass over the directory whatever it yields, so
+/// collecting a batch divides the number of scans by this factor: a directory
+/// of `n` entries costs `ceil(n / SUCCESSOR_BATCH)` scans rather than `n`. The
+/// bound is stack, not correctness — the batch is
+/// `SUCCESSOR_BATCH * (NAME_MAX + 1)` bytes live in every frame of a walk that
+/// may recurse to [`MAX_DEPTH`] — so it stays modest.
+const SUCCESSOR_BATCH: usize = 8;
+
+/// Carries the frame stream through the recursive walk. Holds no growing
+/// state: the only per-level memory is the directory-iteration buffer, and the
+/// large metadata buffers live in the leaf helpers so they never span a
+/// recursive call.
+struct Walker<'a> {
+    stream: BorrowedFd<'a>,
+}
+
+impl Walker<'_> {
+    /// Walks the export root, emitting it as a `.` directory entry — the
+    /// rootfs's own mode, ownership, mtime, and xattrs — then its contents,
+    /// then a leave.
+    ///
+    /// The root frame is what makes the archive equal `tar -C rootfs .`: the
+    /// parent's path stack starts at `.`, so the first member is `./` and every
+    /// child is `./`-prefixed (`./boot/`, `./boot/vmlinuz`). Without it the
+    /// stack starts empty, top-level entries get bare names (`boot`,
+    /// `boot/vmlinuz`), and the tar diverges from the `tar -C rootfs .`
+    /// convention consumers select members against.
+    fn walk_root(&self, root: BorrowedFd<'_>) -> Result<(), (ExportStep, Errno)> {
+        let stat = fs::fstat(root).map_err(|e| (ExportStep::Stat, e))?;
+        self.emit_meta(FRAME_DIR, c".", &stat, Some(root))?;
+        self.walk_dir(root, 0)?;
+        emit_tag_checked(self.stream, FRAME_LEAVE)
+    }
+
+    /// Walks `dir` in sorted name order, emitting a frame per entry and
+    /// descending into subdirectories. Symlinks are never followed and the walk
+    /// never leaves the tree: every step opens a single component from the
+    /// current descriptor.
+    ///
+    /// The order is deterministic so the archive is byte-reproducible, and it is
+    /// produced without the heap the post-fork child cannot use (see the module
+    /// docs). Rather than read a directory into a buffer and sort it, the walk
+    /// visits entries by *successor scan*: it keeps the last name it emitted
+    /// and, each pass, rescans the directory for the next
+    /// [`SUCCESSOR_BATCH`] names strictly greater than it, in order. A
+    /// directory's names are unique, so this is a total order and every entry is
+    /// visited once.
+    ///
+    /// The cost is quadratic in a single directory's entry count — `n` entries
+    /// cost `ceil(n / SUCCESSOR_BATCH)` passes over all `n` — which the batch
+    /// reduces by a constant factor but does not remove. It is the price of a
+    /// sorted walk in constant memory. A rootfs directory holding five figures
+    /// of entries, such as a fully populated `/usr/share/man/man3`, is where it
+    /// is felt.
+    fn walk_dir(&self, dir: BorrowedFd<'_>, depth: u32) -> Result<(), (ExportStep, Errno)> {
+        if depth >= MAX_DEPTH {
+            return Err((ExportStep::Depth, Errno::LOOP));
+        }
+        let mut buf = [MaybeUninit::uninit(); DIRENTS_BUF];
+        // The last name emitted, and the batch of successors the current pass
+        // collects: fixed buffers, so the walk allocates nothing.
+        let mut last = [0u8; NAME_MAX + 1];
+        let mut last_len = 0;
+        let mut have_last = false;
+        let mut batch = [[0u8; NAME_MAX + 1]; SUCCESSOR_BATCH];
+        let mut lens = [0usize; SUCCESSOR_BATCH];
+        loop {
+            // Rewind, then scan for the smallest names strictly greater than
+            // the last one emitted, keeping the batch sorted as it fills.
+            let mut filled = 0;
+            fs::seek(dir, fs::SeekFrom::Start(0)).map_err(|e| (ExportStep::ReadDir, e))?;
+            let mut entries = RawDir::new(dir, &mut buf);
+            while let Some(entry) = entries.next() {
+                let entry = entry.map_err(|e| (ExportStep::ReadDir, e))?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                if name.len() > NAME_MAX {
+                    return Err((ExportStep::ReadDir, Errno::NAMETOOLONG));
+                }
+                if have_last && name <= &last[..last_len] {
+                    continue;
+                }
+                // Past the batch's largest, with the batch full: not a
+                // candidate for this pass.
+                if filled == SUCCESSOR_BATCH && name >= &batch[filled - 1][..lens[filled - 1]] {
+                    continue;
+                }
+                // Insertion sort into the batch. A full batch drops its
+                // largest, which a later pass collects.
+                let mut at = filled.min(SUCCESSOR_BATCH - 1);
+                while at > 0 && name < &batch[at - 1][..lens[at - 1]] {
+                    batch[at] = batch[at - 1];
+                    lens[at] = lens[at - 1];
+                    at -= 1;
+                }
+                batch[at][..name.len()].copy_from_slice(name);
+                lens[at] = name.len();
+                filled = (filled + 1).min(SUCCESSOR_BATCH);
+            }
+            if filled == 0 {
+                return Ok(());
+            }
+            for slot in 0..filled {
+                let len = lens[slot];
+                // NUL-terminated for the `statat`/`openat` that follow.
+                batch[slot][len] = 0;
+                let name = CStr::from_bytes_with_nul(&batch[slot][..=len])
+                    .map_err(|_| (ExportStep::ReadDir, Errno::INVAL))?;
+                self.visit_entry(dir, name, depth)?;
+            }
+            // The batch's largest is the next pass's floor.
+            last_len = lens[filled - 1];
+            last[..last_len].copy_from_slice(&batch[filled - 1][..last_len]);
+            have_last = true;
+        }
+    }
+
+    /// Emits one entry: a directory, descending into it and closing with a
+    /// leave; a regular file, followed by its data; or a symlink. Character and
+    /// block devices, FIFOs, and sockets are dropped, as a deployed image's
+    /// runtime provides its own.
+    fn visit_entry(
+        &self,
+        dir: BorrowedFd<'_>,
+        name: &CStr,
+        depth: u32,
+    ) -> Result<(), (ExportStep, Errno)> {
+        let stat =
+            fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| (ExportStep::Stat, e))?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let child = fs::openat(
+                    dir,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| (ExportStep::Open, e))?;
+                // Emit the directory (with its xattrs) before descending; the
+                // 64 KiB xattr buffers are freed on return, so they never
+                // overlap the recursion's stack.
+                self.emit_meta(FRAME_DIR, name, &stat, Some(child.as_fd()))?;
+                self.walk_dir(child.as_fd(), depth + 1)?;
+                emit_tag_checked(self.stream, FRAME_LEAVE)
+            }
+            FileType::RegularFile => {
+                let file = fs::openat(
+                    dir,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| (ExportStep::Open, e))?;
+                self.emit_meta(FRAME_FILE, name, &stat, Some(file.as_fd()))?;
+                self.stream_data(file.as_fd(), stat.st_size as u64)
+            }
+            FileType::Symlink => self.emit_symlink(dir, name, &stat),
+            _ => Ok(()),
+        }
+    }
+
+    /// Emits a directory or file metadata frame: tag, name, mode, ownership,
+    /// mtime, the file-only size/dev/ino/nlink block, and the xattrs read from
+    /// `fd`.
+    fn emit_meta(
+        &self,
+        tag: u8,
+        name: &CStr,
+        stat: &fs::Stat,
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Result<(), (ExportStep, Errno)> {
+        let stream = self.stream;
+        put(stream, &[tag])?;
+        put_bytes_u16(stream, name.to_bytes())?;
+        put(stream, &stat.st_mode.to_le_bytes())?;
+        put(stream, &stat.st_uid.to_le_bytes())?;
+        put(stream, &stat.st_gid.to_le_bytes())?;
+        put(stream, &stat.st_mtime.to_le_bytes())?;
+        if tag == FRAME_FILE {
+            put(stream, &(stat.st_size as u64).to_le_bytes())?;
+            put(stream, &stat.st_dev.to_le_bytes())?;
+            put(stream, &stat.st_ino.to_le_bytes())?;
+            // `st_nlink` is u32 or u64 depending on rustix's `Stat` backing;
+            // normalize to the 8-byte field the parent decodes.
+            #[allow(clippy::useless_conversion)]
+            let nlink = u64::from(stat.st_nlink);
+            put(stream, &nlink.to_le_bytes())?;
+        }
+        match fd {
+            Some(fd) => self.emit_xattrs(fd),
+            None => put(stream, &0u16.to_le_bytes()),
+        }
+    }
+
+    /// Emits the xattr block: a count, then each name and value. Reads the name
+    /// list and each value into bounded stack buffers, the kernel's 64 KiB cap
+    /// on both keeping them finite. A filesystem or entry with no xattr support
+    /// emits an empty block.
+    fn emit_xattrs(&self, fd: BorrowedFd<'_>) -> Result<(), (ExportStep, Errno)> {
+        let stream = self.stream;
+        let mut names = [0u8; XATTR_BUF];
+        let list_len = match fs::flistxattr(fd, &mut names[..]) {
+            Ok(len) => len,
+            Err(Errno::NOTSUP) | Err(Errno::NODATA) => 0,
+            Err(e) => return Err((ExportStep::Xattr, e)),
+        };
+        let list = &names[..list_len];
+
+        // Count the NUL-terminated names first, so the count leads the block.
+        let count = list.iter().filter(|b| **b == 0).count();
+        let count = u16::try_from(count).map_err(|_| (ExportStep::Xattr, Errno::RANGE))?;
+        put(stream, &count.to_le_bytes())?;
+
+        let mut value = [0u8; XATTR_BUF];
+        let mut start = 0;
+        for (i, byte) in list.iter().enumerate() {
+            if *byte != 0 {
+                continue;
+            }
+            // The name including its terminator is a valid C string.
+            let name = CStr::from_bytes_with_nul(&list[start..=i])
+                .map_err(|_| (ExportStep::Xattr, Errno::INVAL))?;
+            start = i + 1;
+            let value_len = match fs::fgetxattr(fd, name, &mut value[..]) {
+                Ok(len) => len,
+                // The attribute vanished between listing and reading; emit it
+                // empty rather than fail the whole export.
+                Err(Errno::NODATA) => 0,
+                Err(e) => return Err((ExportStep::Xattr, e)),
+            };
+            put_bytes_u16(stream, name.to_bytes())?;
+            put(stream, &(value_len as u32).to_le_bytes())?;
+            put(stream, &value[..value_len])?;
+        }
+        Ok(())
+    }
+
+    /// Emits a symlink frame: metadata then the link target. Symlinks carry no
+    /// xattrs of interest and none is read.
+    fn emit_symlink(
+        &self,
+        dir: BorrowedFd<'_>,
+        name: &CStr,
+        stat: &fs::Stat,
+    ) -> Result<(), (ExportStep, Errno)> {
+        let mut target = [0u8; LINK_BUF];
+        let len = fs::readlinkat_raw(dir, name, &mut target[..]).map_err(|e| {
+            let e = if e == Errno::RANGE {
+                Errno::NAMETOOLONG
+            } else {
+                e
+            };
+            (ExportStep::ReadLink, e)
+        })?;
+        let stream = self.stream;
+        put(stream, &[FRAME_SYMLINK])?;
+        put_bytes_u16(stream, name.to_bytes())?;
+        put(stream, &stat.st_mode.to_le_bytes())?;
+        put(stream, &stat.st_uid.to_le_bytes())?;
+        put(stream, &stat.st_gid.to_le_bytes())?;
+        put(stream, &stat.st_mtime.to_le_bytes())?;
+        put_bytes_u16(stream, &target[..len])
+    }
+
+    /// Streams exactly `size` bytes of a file's data. A file that reads short
+    /// (a race against a live writer, which a quiesced rootfs is not) is
+    /// zero-padded to the declared size, so the parent's framing stays in
+    /// step.
+    fn stream_data(&self, fd: BorrowedFd<'_>, size: u64) -> Result<(), (ExportStep, Errno)> {
+        let stream = self.stream;
+        let mut buf = [0u8; DATA_BUF];
+        let mut remaining = size;
+        while remaining > 0 {
+            let want = remaining.min(DATA_BUF as u64) as usize;
+            let got = loop {
+                match rustix::io::read(fd, &mut buf[..want]) {
+                    Ok(got) => break got,
+                    Err(Errno::INTR) => continue,
+                    Err(e) => return Err((ExportStep::ReadData, e)),
+                }
+            };
+            if got == 0 {
+                break;
+            }
+            put(stream, &buf[..got])?;
+            remaining -= got as u64;
+        }
+        let zeros = [0u8; DATA_BUF];
+        while remaining > 0 {
+            let want = remaining.min(DATA_BUF as u64) as usize;
+            put(stream, &zeros[..want])?;
+            remaining -= want as u64;
+        }
+        Ok(())
+    }
+}
+
+/// Writes `data` in full to the frame stream, retrying short writes and
+/// interruptions. A stream failure is a gone parent, reported as
+/// [`ExportStep::Stream`].
+fn put(stream: BorrowedFd<'_>, data: &[u8]) -> Result<(), (ExportStep, Errno)> {
+    write_all(stream, data).map_err(|e| (ExportStep::Stream, e))
+}
+
+/// Writes a `u16` length prefix and the bytes it counts.
+fn put_bytes_u16(stream: BorrowedFd<'_>, data: &[u8]) -> Result<(), (ExportStep, Errno)> {
+    let len = u16::try_from(data.len()).map_err(|_| (ExportStep::Stream, Errno::RANGE))?;
+    put(stream, &len.to_le_bytes())?;
+    put(stream, data)
+}
+
+/// Emits a lone tag byte (a directory-leave or the terminator), checked.
+fn emit_tag_checked(stream: BorrowedFd<'_>, tag: u8) -> Result<(), (ExportStep, Errno)> {
+    put(stream, &[tag])
+}
+
+/// Emits a lone tag byte, best-effort (the terminator, where a gone parent is
+/// already the caller's problem).
+fn emit_tag(stream: BorrowedFd<'_>, tag: u8) {
+    let _ = write_all(stream, &[tag]);
+}
+
+/// Emits an error frame: the tag, the step discriminant, and the errno.
+fn emit_error(stream: BorrowedFd<'_>, step: ExportStep, errno: Errno) {
+    let mut record = [0u8; 9];
+    record[0] = FRAME_ERROR;
+    record[1..5].copy_from_slice(&step.wire().to_le_bytes());
+    record[5..9].copy_from_slice(&errno.raw_os_error().to_le_bytes());
+    let _ = write_all(stream, &record);
+}
+
+/// Writes `data` in full, looping over short writes and retrying `EINTR`.
+fn write_all(fd: BorrowedFd<'_>, data: &[u8]) -> Result<(), Errno> {
+    let mut written = 0;
+    while written < data.len() {
+        match rustix::io::write(fd, &data[written..]) {
+            Ok(0) => return Err(Errno::IO),
+            Ok(n) => written += n,
+            Err(Errno::INTR) => continue,
+            Err(errno) => return Err(errno),
+        }
+    }
+    Ok(())
+}
+
+/// Sends a signal to the export child, used to tear it down when the parent
+/// abandons the archive early.
+pub(crate) fn kill_export(child: &ExportChild) {
+    let _ = rustix::process::kill_process(child.pid, Signal::KILL);
+}

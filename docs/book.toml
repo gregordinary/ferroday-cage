@@ -1,0 +1,16 @@
+[book]
+title = "ferroday-cage"
+authors = ["gregordinary"]
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+# The site is served from a subpath of github.io, so the 404 page — which
+# GitHub serves for any missing path, at any depth — needs absolute asset and
+# navigation URLs rather than ones relative to the requested path.
+site-url = "/ferroday-cage/"
+git-repository-url = "https://github.com/gregordinary/ferroday-cage"
+edit-url-template = "https://github.com/gregordinary/ferroday-cage/edit/main/docs/{path}"

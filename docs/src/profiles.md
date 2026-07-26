@@ -1,0 +1,380 @@
+# Profiles
+
+With the library's `serde` feature, the sandbox specification — the builder
+itself — serializes and deserializes. A profile is a sandbox described in a
+file: a versionable, reviewable artifact that any consumer can load, in any
+serde format. The `fcage` binary loads TOML profiles with `--profile`; a
+program does the same in three lines:
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let text = std::fs::read_to_string("build.toml")?;
+let builder: ferroday_cage::CageBuilder = toml::from_str(&text)?;
+let status = builder.build()?.run()?;
+# Ok(())
+# }
+```
+
+The library itself carries no TOML dependency; it implements the serde
+traits and leaves the format to the consumer.
+
+## The format
+
+Keys are kebab-case and correspond one-to-one with the builder's methods.
+Unknown keys are rejected — a typo in a profile is an error, not a silently
+ignored setting. Every key is optional; an omitted key keeps the library
+default.
+
+```toml
+rootfs = "/srv/rootfs/alpine"
+command = "/usr/bin/make"
+args = ["-j4", "all"]
+
+network = "host"            # "isolated" (default) | "host" | "none"
+hostname = "builder"
+workdir = "/build"
+stdin = "null"              # "inherit" (default) | "null"
+
+pid-namespace = true        # default true
+mount-proc = true           # default true
+mount-dev = true            # default true
+mount-tmp = true            # default true
+resolv-conf = true          # default true; effective only with network = "host"
+managed-mounts = true       # default true; false establishes none of the four
+                            # above, nor any managed mount a later release adds
+base-env = true             # default true; false gives the command exactly the
+                            # [env] table, with no PATH or HOME underneath
+stop-with-caller = false    # default false
+
+identity-map = "subordinate"  # "single" (default) | "subordinate" | ranges
+
+[run-as]                    # a non-root identity for the command
+uid = 250
+gid = 250
+groups = [250]              # default empty
+
+[env]
+CARGO_HOME = "/cache/cargo"
+RUST_LOG = "debug"
+
+[[mount]]
+kind = "bind"
+source = "/home/user/project"
+target = "/build"
+
+[[mount]]
+kind = "bind"
+source = "/home/user/cache"
+target = "/cache"
+read-only = true            # default false
+
+[[mount]]
+kind = "raw"
+target = "/sys"
+fstype = "sysfs"
+flags = 14                  # raw MS_* bits: MS_NOSUID | MS_NODEV | MS_NOEXEC
+```
+
+`[env]` is a table of environment variables, added on top of the
+deterministic base (`PATH` and `HOME`) — or the whole environment, where
+`base-env = false`.
+
+`managed-mounts = false` and `base-env = false` are opt-outs rather than
+toggles: each reduces the library's contribution to nothing, including
+anything it may contribute in a later release. Setting `managed-mounts =
+false` alongside an explicit `mount-dev = true` is a contradiction and is
+refused at build time.
+
+`[[mount]]` entries apply in the order they appear, after the managed mount
+profile. The `kind` selects which fields the entry carries:
+
+- `kind = "bind"` presents a host path inside the sandbox: `source`, `target`,
+  and an optional `read-only`.
+- `kind = "raw"` is the escape hatch for mounts the typed specification does
+  not model: the target is validated and confined to the rootfs like every
+  mount target, and the `source`, `fstype`, `flags` — the kernel's raw `MS_*`
+  bits — and `data` string go to the kernel verbatim.
+
+Both kinds share one array so that their relative order is expressible. It
+matters whenever a mount covers a path an earlier one established: declaring a
+`raw` tmpfs on a directory and then the binds that populate it builds a
+directory whose contents the sandbox owns outright, and the reverse order
+leaves the binds hidden beneath the tmpfs.
+
+`identity-map` and `[run-as]` select the sandbox's [identity
+map](identity-maps.md) and the identity the command runs as; explicit
+ranges are spelled as an `[identity-map.ranges]` table, shown in that
+chapter. A profile requesting `subordinate` on a build without the `subid`
+feature is refused when it loads, exactly as a hardening posture is refused
+by a build that cannot enforce it. The identity-map delegate itself is
+code, not configuration, and has no profile key.
+
+## Inspecting a loaded profile
+
+A consumer that loads configuration it did not write usually wants to look at
+it before running it — to log what a group binds, to refuse one that shares the
+host network, to show a user what a `RestrictedProfile` from an untrusted
+source actually asks for. Every setting has a `get_` accessor on the builder,
+so that is a read rather than a guess:
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use ferroday_cage::{CageBuilder, Network};
+
+let builder: CageBuilder = toml::from_str(&std::fs::read_to_string("build.toml")?)?;
+
+if builder.get_network() == Network::Host {
+    eprintln!("warning: this profile shares the host network");
+}
+for bind in builder.get_binds() {
+    println!(
+        "{} -> {}{}",
+        bind.get_source().display(),
+        bind.get_target().display(),
+        if bind.is_read_only() { " (read-only)" } else { "" },
+    );
+}
+// Or `get_mounts` for every mount in the order it will be applied, which is
+// what a reviewer needs when one mount covers another.
+for mount in builder.get_mounts() {
+    println!("mounts at {}", mount.get_target().display());
+}
+# Ok(())
+# }
+```
+
+The prefix is there because the setters own the bare names, the same
+arrangement `std::process::Command` uses for `get_program` and `get_args`.
+
+For a whole-configuration view rather than a field at a time, the builder
+serializes as well as deserializes, so it round-trips back to the format it
+came from:
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let builder = ferroday_cage::Cage::builder();
+// Render the requested configuration — profile plus the consumer's own
+// calls — for a log or a confirmation prompt.
+println!("{}", toml::to_string(&builder)?);
+# Ok(())
+# }
+```
+
+One thing never appears there, because it is code rather than configuration:
+an `id_mapper` delegate, which is set on the builder in a consumer's own code,
+and which a profile naming the key is rejected for rather than silently
+ignored. `Debug` is derived on the builder too, which prints the delegate as
+well.
+
+## Intent and effect
+
+A profile records what its author asked for, not everything that will happen.
+A key left out stays out through a render-and-reload cycle, so `mount-dev`
+absent means "not stated" rather than "stated as `true`" — which is what lets
+`managed-mounts = false` coexist with an unstated `mount-dev` instead of
+contradicting it.
+
+For what a configuration actually resolves to, build it and ask the cage:
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let builder = ferroday_cage::Cage::builder().rootfs("/srv/rootfs").command("/bin/sh");
+let cage = builder.build()?;
+// Every mount the sandbox will establish, managed profile included, and the
+// command's whole environment with the library's base composed in.
+println!("{}", toml::to_string(&cage.resolved_inputs())?);
+# Ok(())
+# }
+```
+
+The two answer different questions, and a consumer recording provenance wants
+the second — see [Recording what a build ran
+under](embedding.md#recording-what-a-build-ran-under).
+
+## Resource limits in a profile
+
+An `[rlimit]` table sets the kernel's per-process limits on the command, keyed
+by resource name. One value sets the soft and hard limits alike; a
+`{ soft, hard }` table sets them apart. Either position takes an amount in the
+resource's own unit or `"unlimited"`.
+
+```toml
+[rlimit]
+processes = 64                                # 64 processes, soft and hard
+address-space = 536870912                     # 512 MiB of mapped address space
+open-files = "unlimited"
+cpu-time = { soft = 10, hard = "unlimited" }  # SIGXCPU at ten seconds
+```
+
+The resource names are the ones the [hardening
+chapter](hardening.md#resource-limits) lists, and the same ones `fcage
+--rlimit` takes. A soft limit above its hard limit is rejected when the builder
+is built rather than when the profile is parsed, alongside every other
+configuration error.
+
+A limit is safe in an untrusted profile and `RestrictedProfile` permits it: it
+is set on the command process, and an unprivileged `setrlimit` can only lower a
+hard limit or move a soft one within the hard limit the caller already had.
+
+## Hardening in a profile
+
+With the `hardening` feature, a profile carries the sandbox's Landlock,
+seccomp, and capability posture in a `[hardening]` table, so the security
+configuration is versioned and reviewed alongside the rest of the sandbox.
+
+```toml
+[hardening]
+drop-caps = true                    # drop every capability...
+# keep-caps = ["net-bind-service"]  # ...or keep only these, dropping the rest
+
+seccomp = "curated"                 # the curated deny-list of dangerous syscalls
+
+[[hardening.landlock-fs]]
+access = "rx"                       # the r, w, and x letters, like a file mode
+path = "/usr"
+
+[[hardening.landlock-fs]]
+access = "rwx"
+path = "/work"
+
+[[hardening.landlock-net]]
+access = "bc"                       # the b (bind) and c (connect) letters
+port = 8080
+```
+
+`drop-caps` and `keep-caps` set the capability posture and are mutually
+exclusive; capabilities are named in kebab-case (`net-bind-service`). An empty
+`keep-caps` is rejected — `drop-caps = true` is how a profile drops every
+capability. An `[[hardening.landlock-fs]]` entry grants an `access` set — some
+combination of the `r`, `w`, and `x` letters — beneath a `path`; an
+`[[hardening.landlock-net]]` entry grants an `access` set — some combination of
+`b` (bind) and `c` (connect) — on a TCP `port`. Enrolling any grant denies every
+path, bind, and connect not granted; paths are sandbox paths, resolved after the
+pivot, and network rights require Landlock ABI 4.
+
+`seccomp` is either the string `"curated"` or a table naming syscalls to
+filter — a deny-list, or an allow-list that must name every syscall the command
+needs:
+
+```toml
+[hardening.seccomp]
+deny = ["mount", "ptrace", "bpf"]     # these fail with EPERM, the rest allowed
+
+# ...or an allow-list:
+[hardening.seccomp]
+allow = ["read", "write", "execve"]   # only these allowed, the rest fail EPERM
+```
+
+A syscall may be narrowed by its arguments through an `allow-rule` or
+`deny-rule` array-of-tables, so the listed action applies only when the
+arguments match. Each entry names a syscall and a list of `arg` conditions,
+every one of which must hold; each condition sets an argument `index` (0 through
+5), a width `len` (`dword` for the low 32 bits, `qword` for all 64), an `op`,
+and a `value`. The `masked-eq` operator also takes a `mask` and tests
+`(arg & mask) == (value & mask)`:
+
+```toml
+[hardening.seccomp]
+allow = ["read", "write", "exit_group"]
+
+[[hardening.seccomp.allow-rule]]
+syscall = "ioctl"
+[[hardening.seccomp.allow-rule.arg]]
+index = 1
+len = "dword"
+op = "eq"
+value = 21523                         # TIOCGWINSZ; ioctl allowed only for this request
+```
+
+The width has no safe default — comparing the wrong one lets a value hide in the
+bits that are not checked — so a condition must state it. An `allow` and a `deny`
+side are mutually exclusive within one table.
+
+Syscalls are named as the kernel names them (`exit_group`), resolved for the
+host architecture. The precompiled-program escape hatch
+(`SeccompPolicy::Program`) has no place in a declarative profile and cannot be
+written to one.
+
+A profile that configures hardening requires a library built with the
+`hardening` feature; a build without it refuses such a profile rather than
+loading it with the restrictions silently dropped.
+
+## Untrusted profiles
+
+Deserializing a profile straight into a `CageBuilder` trusts it as
+code-equivalent configuration: it can bind any host path, issue raw mounts,
+share the host network, and share the host PID namespace. A profile from a
+source the consumer does not control — a repository, a download, a
+multi-tenant store — is loaded through `RestrictedProfile` instead, in the same
+serde format:
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let text = std::fs::read_to_string("untrusted.toml")?;
+let restricted: ferroday_cage::RestrictedProfile = toml::from_str(&text)?;
+let builder = restricted.into_builder();      // extend with the consumer's own trusted calls
+# let _ = builder;
+# Ok(())
+# }
+```
+
+The restricted policy refuses the operations that map host resources into the
+sandbox, write to the host outside it, or share a host namespace: a bind mount,
+a raw mount, host networking, an overlay root, and sharing the host PID
+namespace. An overlay root is refused because, unlike the rootfs, its upper
+layer is created rather than required to exist: the profile would choose a host
+path for the library to create directories at. A trusted consumer configures one
+with `overlay` after loading.
+
+The policy does not bound the host authority the command wields, which remains
+the calling user's: the rootfs the profile names is presented read-write, so it
+still grants access to that host subtree. A consumer that does not trust the
+profile to choose its own rootfs should override it —
+`into_builder().rootfs(path)` with a directory the consumer controls — after
+loading.
+
+## Profiles at the command line
+
+`fcage --profile FILE` loads a profile; flags given alongside compose with
+it:
+
+- Scalar flags override the profile's value. Every toggle has both
+  directions for this purpose — `--share-net`/`--isolate-net`,
+  `--share-pid`/`--pid-ns`, `--proc`/`--no-proc`, and so on.
+- `--bind`, `--ro-bind`, and `--setenv` extend the profile's lists.
+- A command on the command line replaces the profile's `command` and
+  `args` as a unit.
+- Hardening flags compose with a profile's `[hardening]` table:
+  `--landlock-ro`, `--landlock-rw`, `--landlock-bind`, and `--landlock-connect`
+  add grants to it, while the seccomp flags, `--drop-caps`, and `--keep-caps`
+  replace its seccomp policy or capability posture. The seccomp flags mirror the
+  profile's seccomp table: `--seccomp-allow` and `--seccomp-deny` take
+  comma-separated syscall names, and `--seccomp-allow-rule` and
+  `--seccomp-deny-rule` take a syscall name with `arg`/`len`/`op`/`value`/`mask`
+  conditions, so a rule reads the same on a flag as in the table.
+
+```sh
+# The profile's sandbox, its command replaced for one run:
+fcage --profile build.toml -- /bin/sh -c 'ls /build'
+
+# The profile with the network cut off:
+fcage --profile build.toml --isolate-net
+```
+
+`--profile` trusts the file like a script: it can bind any host path, issue
+raw mounts, share the host network, and share the host PID namespace. Load only
+a profile you trust. `--restricted-profile FILE` loads under the restricted
+policy instead, refusing those operations for a profile from an untrusted
+source; the rootfs it names still grants access to that host subtree, so pass a
+rootfs you control.
+
+A profile is plain data: loading one performs no filesystem access and
+grants nothing by itself. Validation happens at `build`, launch behavior is
+identical to the equivalent builder calls, and the profile's paths are
+interpreted exactly as if they had been passed to the builder.
+
+The same composition is available to any consumer, because a profile is a
+`CageBuilder`: scalar setters replace, `bind` and `env` extend, and
+`clear_args` before `command` replaces a profile's command as a unit.
+[Building an orchestrator](building-an-orchestrator.md) works this into a
+group-based launcher.

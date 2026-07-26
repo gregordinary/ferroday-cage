@@ -1,0 +1,277 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege by default; the guide's deploy job asks for what it needs.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Format, lint, test, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned)
+        # rust-toolchain.toml pins the toolchain and its components, so fmt,
+        # clippy, and the build all run under the same rustfmt everywhere.
+        # This provisions that toolchain; every cargo call below selects it.
+        run: rustup show
+      - name: Cache the dependency build
+        # Keyed on the lockfile and the job, so a job reuses only its own
+        # feature selection's artifacts and a dependency change invalidates
+        # them. The workspace's own crates are never cached.
+        uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Check (default features)
+        run: cargo check --workspace --all-targets
+      - name: Enable the sandbox facilities
+        # Provision everything the security-property tests need, so their
+        # REQUIRE guards below assert real enforcement rather than silently
+        # skipping. Each command tolerates a runner that already has the
+        # facility. Landlock and seccomp are kernel features present on the
+        # runner's kernel and need no setup.
+        run: |
+          # Ubuntu 23.10+ restricts unprivileged user namespaces via AppArmor;
+          # lift the restriction so the sandbox tests can run. The sysctl is
+          # absent on other hosts, which is fine.
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # /dev/net/tun for the native network-stack tests.
+          sudo modprobe tun || true
+          # The subordinate-id delegate for the range-map tests: the shadow
+          # helpers and an allocation for the test-running user.
+          sudo apt-get update
+          sudo apt-get install -y uidmap
+          sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 "$(id -un)"
+      - name: Test
+        # Each REQUIRE turns a test's explicit skip into a failure, so a run
+        # where a security-property suite silently skipped must not pass. They
+        # assume the capable runner provisioned above.
+        run: cargo test --workspace --all-features
+        env:
+          FERRODAY_CAGE_REQUIRE_USERNS: '1'
+          FERRODAY_CAGE_REQUIRE_SUBID: '1'
+          FERRODAY_CAGE_REQUIRE_TUN: '1'
+          FERRODAY_CAGE_REQUIRE_LANDLOCK: '1'
+          FERRODAY_CAGE_REQUIRE_SECCOMP: '1'
+      - name: Test (serde without hardening)
+        # A profile format built without the hardening layer must refuse a
+        # profile that configures hardening; only this feature combination
+        # compiles that path.
+        run: cargo test -p ferroday-cage --features serde
+      - name: Documentation (warning-clean)
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Documentation (default features, warning-clean)
+        # The crate documents its feature-gated sections behind the feature,
+        # so a no-feature build is warning-clean too, not only the all-features
+        # one above.
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned)
+        run: rustup show
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Check the featureless build
+        # The library has no default features, so this is the build a consumer
+        # gets from a bare dependency line. Nothing else in CI covers it: every
+        # other step is a workspace build, where the CLI's feature selection
+        # unifies onto the library.
+        run: cargo check -p ferroday-cage --no-default-features --all-targets
+      - name: Check the feature powerset
+        # Depth 2 keeps the matrix small while covering the pairwise
+        # interactions that actually break — `serde` without `hardening` is the
+        # shape of problem this catches generally. A combination that stops
+        # compiling is a breaking change for whoever selected it.
+        run: cargo hack check -p ferroday-cage --feature-powerset --depth 2
+
+  api:
+    name: Public API surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned, plus nightly for rustdoc JSON)
+        run: |
+          rustup show
+          rustup toolchain install nightly --profile minimal
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-public-api
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-public-api
+      - name: Regenerate the snapshot
+        # Auto-trait impls are kept in the snapshot on purpose: it records both
+        # `impl Send for Cage` and `!Send for Running<'obs>`, so an auto trait
+        # gained or lost shows up in review. Blanket and auto-derived impls are
+        # omitted as noise.
+        run: |
+          cargo public-api -p ferroday-cage --all-features \
+            --omit blanket-impls,auto-derived-impls \
+            > crates/ferroday-cage/public-api.txt
+      - name: Fail on an unreviewed surface change
+        # The snapshot is committed, so any change to the public API — a new
+        # item, a moved path, an appearing re-export — arrives as a reviewable
+        # diff rather than passing unnoticed. Regenerate with the command above
+        # and commit the result.
+        run: git diff --exit-code -- crates/ferroday-cage/public-api.txt
+
+  semver:
+    name: Semver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned)
+        run: rustup show
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: Check against the last published release
+        # Compares the working tree's public API against the newest version on
+        # crates.io and fails on an undeclared breaking change.
+        #
+        # Before the first publication there is no baseline, so the check is
+        # skipped. That skip is conditioned on crates.io answering "404, no such
+        # crate" specifically: any other outcome — a 5xx, a rate limit, no
+        # network — fails the job rather than silently passing it, because a
+        # gate that reports success when it did not run is worse than no gate.
+        #
+        # Delete this guard once 0.1.0 is published; from then on the baseline
+        # always exists and the command can run unconditionally.
+        #
+        # The User-Agent is mandatory: crates.io answers 403 to a request that
+        # does not identify its caller, which would otherwise look like neither
+        # "published" nor "not published".
+        run: |
+          status=$(curl -sSL -o /dev/null -w '%{http_code}' \
+            -A "ferroday-cage CI (+${{ github.server_url }}/${{ github.repository }})" \
+            https://crates.io/api/v1/crates/ferroday-cage)
+          case "$status" in
+            200)
+              cargo semver-checks check-release -p ferroday-cage
+              ;;
+            404)
+              echo "ferroday-cage has not been published; no baseline to compare against."
+              ;;
+            *)
+              echo "crates.io returned HTTP $status; cannot establish a baseline." >&2
+              exit 1
+              ;;
+          esac
+
+  deny:
+    name: License and advisory policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check dependency licenses and advisories
+        # deny.toml pins the permitted license set, the RUSTSEC advisory
+        # policy, and the registries a dependency may come from; this fails the
+        # build if a dependency enters the tree under an unlisted license, from
+        # anywhere but crates.io, or carrying a known, unignored advisory.
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories sources
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (MSRV)
+        # An independent floor guard: the `+1.91` override wins over the pinned
+        # toolchain, which sits ahead of the floor, so this checks the version
+        # `rust-version` actually promises rather than the one contributors use.
+        run: rustup toolchain install 1.91 --profile minimal
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@v2
+        with:
+          toolchain: '1.91'
+      - name: Check
+        run: cargo +1.91 check --workspace --all-targets --all-features
+
+  book:
+    name: Guide
+    runs-on: ubuntu-latest
+    env:
+      MDBOOK_VERSION: 0.5.4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned)
+        run: rustup show
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@v2
+      - name: Install mdBook
+        run: |
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
+      - name: Build
+        run: ./mdbook build docs
+      - name: Build the API documentation
+        # The link check below resolves the guide's docs.rs URLs against this
+        # output, so it has to exist first.
+        run: cargo doc --workspace --all-features --no-deps
+      - name: Check the guide's links
+        # mdBook cannot check the guide's API links: they are absolute docs.rs
+        # URLs, so to mdBook they are external and a renamed method leaves a
+        # dangling link nothing notices. This resolves each one against the
+        # rustdoc output, and each cross-chapter link (heading anchors
+        # included) against docs/src.
+        run: python3 docs/check-links.py
+      - name: Package the guide
+        # Uploaded on every run, so a pull request proves the artifact builds;
+        # only the deploy job below publishes it, and only from main.
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  pages:
+    name: Publish the guide
+    # The repository's homepage, and the target of every documentation link in
+    # README.md, SECURITY.md, CONTRIBUTING.md, and CHANGELOG.md. Publishing
+    # requires the repository's Pages source to be set to "GitHub Actions".
+    #
+    # A merged change publishes; a pull request builds and link-checks the
+    # guide in the job above without touching the live site.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: book
+    runs-on: ubuntu-latest
+    permissions:
+      # `pages` to publish, `id-token` for the deployment's OIDC exchange.
+      pages: write
+      id-token: write
+    # One deployment at a time, and never cancelled part way: a half-published
+    # site is worse than a stale one.
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
