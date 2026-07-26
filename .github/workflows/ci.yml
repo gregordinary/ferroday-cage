@@ -48,10 +48,17 @@ jobs:
           # /dev/net/tun for the native network-stack tests.
           sudo modprobe tun || true
           # The subordinate-id delegate for the range-map tests: the shadow
-          # helpers and an allocation for the test-running user.
+          # helpers and an allocation for the test-running user. The runner
+          # image already grants this user a subordinate range, and appending a
+          # second one would leave two ranges that can overlap -- which the
+          # library refuses, correctly, as an invalid map. Declare exactly one
+          # range instead, so the tests run against a known allocation whatever
+          # the image happened to hand out.
           sudo apt-get update
           sudo apt-get install -y uidmap
-          sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 "$(id -un)"
+          user="$(id -un)"
+          printf '%s:500000:65536\n' "$user" | sudo tee /etc/subuid > /dev/null
+          printf '%s:500000:65536\n' "$user" | sudo tee /etc/subgid > /dev/null
       - name: Test
         # Each REQUIRE turns a test's explicit skip into a failure, so a run
         # where a security-property suite silently skipped must not pass. They
@@ -109,12 +116,22 @@ jobs:
   api:
     name: Public API surface
     runs-on: ubuntu-latest
+    env:
+      # cargo-public-api reads rustdoc's JSON output, and how that renders
+      # standard-library paths changes between nightlies: an in-progress
+      # core::io restructuring, for one, spells std::io::Write as
+      # core::io::write::Write in emitted signatures. A floating nightly would
+      # therefore fail this gate on rustdoc drift rather than on the API change
+      # it exists to catch, which is how a gate gets trained out of. Pin it,
+      # and bump deliberately -- a bump regenerates the snapshot, and that diff
+      # is reviewed like any other.
+      RUSTDOC_JSON_NIGHTLY: nightly-2026-07-09
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (pinned, plus nightly for rustdoc JSON)
+      - name: Install Rust (pinned, plus the pinned nightly for rustdoc JSON)
         run: |
           rustup show
-          rustup toolchain install nightly --profile minimal
+          rustup toolchain install "$RUSTDOC_JSON_NIGHTLY" --profile minimal
       - name: Cache the dependency build
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-public-api
@@ -127,7 +144,7 @@ jobs:
         # gained or lost shows up in review. Blanket and auto-derived impls are
         # omitted as noise.
         run: |
-          cargo public-api -p ferroday-cage --all-features \
+          RUSTUP_TOOLCHAIN="$RUSTDOC_JSON_NIGHTLY" cargo public-api -p ferroday-cage --all-features \
             --omit blanket-impls,auto-derived-impls \
             > crates/ferroday-cage/public-api.txt
       - name: Fail on an unreviewed surface change

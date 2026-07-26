@@ -90,10 +90,13 @@ Two further gates matter when the public API moves:
 
 - **The API snapshot.** `crates/ferroday-cage/public-api.txt` is committed, so
   any change to the public surface arrives as a reviewable diff. Regenerate it
-  with the command in the `api` job of `.github/workflows/ci.yml` and commit the
-  result. That command needs `cargo-public-api`, whose own build links libcurl
-  and so wants `libssl-dev` and `pkg-config` on the machine installing it. The
-  library itself needs neither, and nothing in its dependency graph links a C
+  with the command in the `api` job of `.github/workflows/ci.yml`, including
+  the nightly that job pins, and commit the result. The pin matters: the
+  snapshot is rustdoc's JSON rendering, which differs between nightlies, so an
+  unpinned regeneration produces a diff that is not an API change. That command
+  needs `cargo-public-api`, whose own build links libcurl and so wants
+  `libssl-dev` and `pkg-config` on the machine installing it. The library
+  itself needs neither, and nothing in its dependency graph links a C
   library.
 - **Auto traits.** `crates/ferroday-cage/tests/auto_traits.rs` pins `Send` and
   `Sync` for every public type, including the ones that deliberately have
