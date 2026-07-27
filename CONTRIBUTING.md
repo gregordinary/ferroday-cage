@@ -123,17 +123,17 @@ If you touch the guide, build it: `mdbook build docs`.
    so it cannot even be packaged until that version is on crates.io — a
    workspace-wide publish fails with `no matching package named
    ferroday-cage`. Allow a moment between the two for the index to catch up.
-4. **After the first publication, delete the crates.io guard in the `semver`
-   job of `.github/workflows/ci.yml`.** It exists only because
-   `cargo-semver-checks` has no baseline to compare against before then; once
-   one exists the check runs unconditionally, and leaving the guard in place
-   would let a future outage look like "not yet published" and skip the gate.
-   The job's own comment says so as well.
-5. Confirm the guide published: the `pages` job runs on a push to `main`, and
+4. Confirm the guide published: the `pages` job runs on a push to `main`, and
    the site it serves is what `homepage` in `Cargo.toml` and every
    documentation link in `README.md`, `SECURITY.md`, `CONTRIBUTING.md`, and
    `CHANGELOG.md` point at. Publishing requires the repository's Pages source
    to be set to "GitHub Actions".
+
+A published version is immutable. The keywords, description, and README shown
+on the registry are recorded at publish time, so correcting any of them takes a
+new version even when no code changes. That metadata is applied by every
+publish rather than by the newest version alone, so releasing a patch on an
+older line replaces the crate page with that line's metadata.
 
 ## Code conventions
 

@@ -170,35 +170,7 @@ jobs:
       - name: Check against the last published release
         # Compares the working tree's public API against the newest version on
         # crates.io and fails on an undeclared breaking change.
-        #
-        # Before the first publication there is no baseline, so the check is
-        # skipped. That skip is conditioned on crates.io answering "404, no such
-        # crate" specifically: any other outcome — a 5xx, a rate limit, no
-        # network — fails the job rather than silently passing it, because a
-        # gate that reports success when it did not run is worse than no gate.
-        #
-        # Delete this guard once 0.1.0 is published; from then on the baseline
-        # always exists and the command can run unconditionally.
-        #
-        # The User-Agent is mandatory: crates.io answers 403 to a request that
-        # does not identify its caller, which would otherwise look like neither
-        # "published" nor "not published".
-        run: |
-          status=$(curl -sSL -o /dev/null -w '%{http_code}' \
-            -A "ferroday-cage CI (+${{ github.server_url }}/${{ github.repository }})" \
-            https://crates.io/api/v1/crates/ferroday-cage)
-          case "$status" in
-            200)
-              cargo semver-checks check-release -p ferroday-cage
-              ;;
-            404)
-              echo "ferroday-cage has not been published; no baseline to compare against."
-              ;;
-            *)
-              echo "crates.io returned HTTP $status; cannot establish a baseline." >&2
-              exit 1
-              ;;
-          esac
+        run: cargo semver-checks check-release -p ferroday-cage
 
   deny:
     name: License and advisory policy

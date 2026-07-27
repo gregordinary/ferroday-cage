@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 categories = ["os::linux-apis", "virtualization"]
-keywords = ["sandbox", "namespaces", "linux", "unprivileged", "container"]
+keywords = ["sandbox", "container", "rootless", "seccomp", "debootstrap"]
 # Test fixtures are host-and-feature-gated build inputs, and the public-API
 # snapshot is a review artifact, not part of the published crate. Keep both out
 # of the packaged tarball.

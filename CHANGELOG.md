@@ -16,11 +16,21 @@ affected.
 
 Nothing yet.
 
+## [0.1.1] - 2026-07-26
+
+### Changed
+
+- Both crates carry keywords chosen for how the registry is actually searched,
+  and the README states the boundary against container runtimes. `fcage` gains
+  a description naming the binary and what it does, in place of one that only
+  named the library.
+
 ## [0.1.0] - 2026-07-26
 
 Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/gregordinary/ferroday-cage/releases/tag/v0.1.0

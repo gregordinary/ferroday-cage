@@ -15,6 +15,15 @@ self-contained: pure Rust throughout, resting on the kernel alone. `unsafe` is
 confined to the small kernel-facing core — namespaces, id maps, mounts, `pivot_root`,
 `exec` — and everything above it, and every consumer, is safe Rust.
 
+The sandbox rests on the same kernel primitives as bubblewrap — user and mount
+namespaces, `pivot_root`, seccomp — and presents them as a library with a typed builder
+and an in-process handle rather than a command to shell out to. `fcage` covers the
+command-line case.
+
+It is not a container runtime: there are no images, no registry, and no OCI runtime
+specification. A root filesystem is a directory you supply or provision, and every
+sandbox is rootless — built with the caller's own credentials, with no daemon involved.
+
 ## Features
 
 A bare dependency gives the sandbox itself: namespaces, mounts, the root swap,

@@ -1,11 +1,11 @@
 [package]
 name = "ferroday-cage-cli"
-description = "Command-line interface for the ferroday-cage sandbox"
+description = "Run a command inside an unprivileged Linux sandbox from a shell prompt: fresh namespaces, a provided root filesystem, seccomp and Landlock hardening, and a clean environment. Installs the fcage binary"
 # `fcage` versions independently of the library. Its compatibility contract is
 # its flags, exit codes, and output format, which a library release does not
 # necessarily change — and a library release that does break its own API need
 # not break the CLI's.
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
-keywords = ["sandbox", "namespaces", "linux", "unprivileged", "container"]
+keywords = ["sandbox", "container", "rootless", "chroot", "debootstrap"]
 
 [[bin]]
 name = "fcage"
