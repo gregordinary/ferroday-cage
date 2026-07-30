@@ -94,11 +94,11 @@ Remove::new("./gentoo-root").map(IdentityMap::Subordinate).run()?;
 # }
 ```
 
-At a shell prompt, the equivalent incantation is the one rootless container
-storage is removed with:
+At a shell prompt, `fcage` removes the same tree. The example provisions under
+the subordinate map, which is what the flag assumes:
 
 ```sh
-unshare --map-auto rm -rf ./gentoo-root
+fcage --remove-rootfs ./gentoo-root
 ```
 
 ## Running the example

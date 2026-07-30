@@ -151,6 +151,14 @@ Remove::new("/var/lib/myapp/rootfs")
 `provision::remove(dest)` is the shorthand for the common case: the bundled
 chain, and nothing to configure.
 
+At a shell prompt, `fcage --remove-rootfs DIR` is the same removal. It takes
+`--identity-map` for the map the tree was provisioned under, defaulting to the
+subordinate one, and is a mode of its own that accepts no other option:
+
+```sh
+fcage --remove-rootfs /var/lib/myapp/rootfs
+```
+
 ## Exporting a rootfs
 
 With the `tarball` cargo feature, `provision::export_tar` writes a provisioned
@@ -213,6 +221,62 @@ archive on any host.
 As with removal, a tree built under a `CageBuilder::id_mapper` delegate is
 exported through `Export::mapper`, which re-enters the map using that same
 delegate rather than the bundled chain.
+
+### What a launch leaves in the tree
+
+An export records the tree as it is, so what a provisioning sandbox contributed
+to the tree is what the archive carries. A launch over a plain rootfs leaves its
+mount points behind and nothing else:
+
+| Path | What is left | Mode |
+| --- | --- | --- |
+| `/proc` | the mount point, empty | `0755` |
+| `/dev` | the mount point, empty | `0755` |
+| `/tmp` | the mount point, empty | `1777` |
+
+A mount point is created only when the rootfs does not already have the path,
+and a path the rootfs ships keeps the mode it shipped with — the tree owns what
+it ships, the sandbox owns what it creates. The mode is the directory's own,
+independent of the launching process's umask, so the same tree exports the same
+way from any host.
+
+Nothing survives *inside* those directories. The `/dev` the sandbox assembles —
+the six device nodes, the five symlinks, the `devpts` on `/dev/pts` and the
+tmpfs on `/dev/shm` — is built inside the tmpfs that covers the mount point, so
+it goes with the mount namespace. An exported tree holds `./dev/` and nothing
+under it.
+
+One managed mount can contribute a file rather than a directory, and it takes it
+back. A bind needs its target to exist, so the `/etc/resolv.conf` bind that host
+networking performs creates an empty file when the rootfs ships none — and
+removes it once the sandbox is gone, leaving the tree without the resolver
+configuration it never had. A rootfs that does ship the file keeps it untouched:
+the bind covers it for the sandbox's life and reveals it again afterwards.
+
+A caller's own `bind` or `raw_mount` is the case where a target is created and
+*stays*: missing directories as `0755`, a missing file target as an empty `0644`
+file. That is worth knowing when the tree being written into is the one being
+shipped — a bind declared for the duration of a build leaves its mount point in
+the artifact.
+
+Where a launch must leave the tree untouched entirely, root it on an overlay.
+Every mount point, and every write the command makes, lands in the upper rather
+than in the base:
+
+```rust,no_run
+# use ferroday_cage::Cage;
+# fn main() -> ferroday_cage::Result<()> {
+Cage::builder()
+    .overlay_rootfs("/var/lib/myapp/rootfs", "/var/tmp/build-42")
+    .command("/usr/bin/make")
+    .build()?
+    .run()?;
+# Ok(())
+# }
+```
+
+Discarding the upper reverts the run, base included, and exporting the base
+afterwards gives an archive of a tree no sandbox has written to.
 
 ## The tarball provisioner
 

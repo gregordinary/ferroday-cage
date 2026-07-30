@@ -168,12 +168,17 @@ directories, a service's `/var/lib` tree, a user's home — refuses the plain
 caller's `rm -rf`, which is how rootless container storage has always
 behaved. [`provision::remove`] handles it: plain removal first, and where
 ownership refuses it, the same map is re-entered and the tree deleted from
-inside, where the ids are the caller's own. The manual form every rootless
-runtime documents works too:
+inside, where the ids are the caller's own. At a shell prompt, `fcage` removes
+the same tree:
 
 ```sh
-unshare --map-auto rm -rf ./rootfs
+fcage --remove-rootfs ./rootfs
 ```
+
+The flag takes the map the tree was provisioned under and defaults to the
+subordinate one, so `--identity-map` is needed only for a tree written under
+another. Without either, the manual form every rootless runtime documents is
+`unshare --map-auto rm -rf ./rootfs`.
 
 ## Running as a non-root identity
 

@@ -523,6 +523,8 @@ impl RestrictionBuilder {
                 workdir,
                 ops: Vec::new(),
                 op_labels: Vec::new(),
+                // A restriction establishes no mount, so it creates no target.
+                managed_placeholder: None,
                 exec_label,
                 rlimits,
                 rlimit_labels,

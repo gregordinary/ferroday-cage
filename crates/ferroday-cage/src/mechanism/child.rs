@@ -54,7 +54,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
-use rustix::fs::{self, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags};
+use rustix::fs::{self, AtFlags, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags};
 use rustix::io::Errno;
 use rustix::ioctl;
 use rustix::mount::{self, MountFlags, MountPropagationFlags, UnmountFlags};
@@ -978,24 +978,39 @@ fn parse_fd(name: &CStr) -> Option<RawFd> {
     Some(value)
 }
 
+/// Creates one mount-target directory at exactly `mode`, leaving an existing
+/// entry — directory or symlink — untouched.
+///
+/// The mode is set again after the `mkdir` because `mkdir` narrows it by the
+/// process umask, and the mount point outlives the sandbox: a launch under
+/// `umask 077` would otherwise leave a `0700` `/tmp` in the rootfs for a
+/// provisioned tree to carry forward. Setting it only on the directory this
+/// call just created keeps the rootfs's own modes intact — the tree owns what
+/// it ships, the sandbox owns what it creates.
+fn create_mount_dir(dir: BorrowedFd<'_>, leaf: &CStr, mode: Mode) -> Result<(), Errno> {
+    match fs::mkdirat(dir, leaf, mode) {
+        Ok(()) => fs::chmodat(dir, leaf, mode, AtFlags::empty()),
+        Err(Errno::EXIST) => Ok(()),
+        Err(errno) => Err(errno),
+    }
+}
+
 /// Executes one frozen mount op against the new root.
 fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errno)> {
     // Create missing mount-target directories, one component at a time.
     // The parent directory is resolved in-root first, so a symlinked
     // component is followed only within the rootfs; an existing entry —
     // directory or symlink — is left alone.
-    for (parent, leaf) in &op.dirs {
-        let created = if parent.is_empty() {
-            fs::mkdirat(root, leaf.as_c_str(), Mode::from_raw_mode(0o755))
+    for dir in &op.dirs {
+        let mode = Mode::from_raw_mode(dir.mode);
+        let created = if dir.parent.is_empty() {
+            create_mount_dir(root, dir.leaf.as_c_str(), mode)
         } else {
-            let parent = open_in_root(root, parent, OFlags::PATH | OFlags::DIRECTORY)
+            let parent = open_in_root(root, &dir.parent, OFlags::PATH | OFlags::DIRECTORY)
                 .map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
-            fs::mkdirat(&parent, leaf.as_c_str(), Mode::from_raw_mode(0o755))
+            create_mount_dir(parent.as_fd(), dir.leaf.as_c_str(), mode)
         };
-        match created {
-            Ok(()) | Err(Errno::EXIST) => {}
-            Err(errno) => return Err((SetupStep::CreateMountTarget, errno)),
-        }
+        created.map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
     }
 
     // The target of a file bind must exist before a file can be bound onto

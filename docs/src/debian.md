@@ -56,6 +56,31 @@ A bootstrap runs in stages:
    is not represented in that map; a range map keeps apt's default sandbox.
    When every package reaches the installed state, the rootfs is published.
 
+A bootstrapped rootfs carries no `/etc/resolv.conf`, because the provisioner
+writes none: a resolver configuration belongs to wherever the tree is deployed,
+not to the archive it was built from. An in-cage `apt-get update` still resolves
+names, because host networking binds the host's `resolv.conf` in — creating the
+file to mount onto, and removing it once the sandbox is gone, so the tree keeps
+carrying none:
+
+```rust,no_run
+# use ferroday_cage::{Cage, Network};
+# fn main() -> ferroday_cage::Result<()> {
+Cage::builder()
+    .rootfs("/var/lib/myapp/debian")
+    .network(Network::Host)
+    .command("/usr/bin/apt-get")
+    .args(["update"])
+    .build()?
+    .run()?;
+# Ok(())
+# }
+```
+
+[What a launch leaves in the
+tree](provisioning.md#what-a-launch-leaves-in-the-tree) covers the general rule
+for a tree that goes on to be exported.
+
 ## The package cache
 
 `cache_dir` sets a directory downloaded packages are kept in, so a later
@@ -236,9 +261,7 @@ The call reads each `.deb`'s control stanza, copies it into the pool under
 the suite's `Release`. It is idempotent and incremental: the pool directory is
 updated in place, and the index keeps the highest version of each package name —
 the same rule resolution applies — so republishing over a superset of a prior
-run is well-defined. Point a [`Repository`] at the pool directory with a
-`file://` mirror and `trust_unsigned`, and the next bootstrap resolves against
-it.
+run is well-defined.
 
 Publishing an empty set writes a valid, empty repository: the `Release` still
 declares the architecture and component, so the pool can be created before the
@@ -246,6 +269,50 @@ first `.deb` exists and referenced from the start, resolving against an empty
 package set rather than a missing repository. The pool is trusted, not signed —
 a `file://` repository under the caller's control, apt's `[trusted=yes]` — so no
 OpenPGP signature is written and none is expected.
+
+### The pool's own layout
+
+A pool reports the paths it owns, so nothing outside it needs to know how an
+archive is laid out. [`Pool::mirror_url`] is the `file://` URL that declares the
+pool as a [`Repository`]; [`Pool::release_path`] and [`Pool::dists_dir`] are the
+suite's `Release` and the directory it sits in. A relative pool root is made
+absolute for the URL, and none of the three requires the pool to exist, so a
+pipeline can wire itself together before its first publish.
+
+```rust,no_run
+use ferroday_cage::provision::debian::{Pool, Repository};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let pool = Pool::at("build/pool").suite("trixie");
+pool.publish(["build/my-package_1.0_amd64.deb"])?;
+
+let repository = Repository::builder("trixie")
+    .mirror(pool.mirror_url()?)
+    .trust_unsigned(true)
+    .name("build-pool")
+    .build()?;
+# let _ = repository;
+# Ok(())
+# }
+```
+
+### Signing a pool
+
+A pool that leaves the machine that built it is signed by its owner:
+`release_path` names the document to sign and `dists_dir` the directory the
+signature belongs in. The signature must be an inline cleartext-signed
+`InRelease` — the form the provisioner reads for a repository with a
+[`keyring`] — since a detached `Release.gpg` is not fetched. A signed pool needs
+no `Valid-Until`; a release that carries none is simply unbounded, as Debian
+stable's is.
+
+Publishing removes any signature the pool already carries, both spellings, so a
+signature made over a superseded `Release` can never outlive it. That matters
+more than it looks: the by-hash index copies are immutable and never removed, so
+a stale-but-valid signature would not fail a reader — it would quietly resolve
+the older package set. Leaving the pool unsigned between a publish and its
+signature fails closed instead, and it means a pool is signed after every
+publish rather than once.
 
 ### What publishing costs
 
@@ -570,6 +637,9 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`mirror_fallback`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.mirror_fallback
 [`name`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.RepositoryBuilder.html#method.name
 [`Pool`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html
+[`Pool::mirror_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.mirror_url
+[`Pool::release_path`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.release_path
+[`Pool::dists_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.dists_dir
 [`base_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.base_layer
 [`stage_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.stage_layer
 [`resolve_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.resolve_layer

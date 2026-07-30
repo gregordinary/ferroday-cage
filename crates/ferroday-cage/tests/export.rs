@@ -12,7 +12,6 @@ use std::path::Path;
 use ferroday_cage::IdentityMap;
 use ferroday_cage::provision;
 
-#[cfg(feature = "subid")]
 mod common;
 
 /// Skips a test when the host cannot create unprivileged user namespaces.
@@ -670,10 +669,118 @@ fn exports_a_large_directory_in_sorted_order() {
     let _ = provision::remove(&dir);
 }
 
+/// A launch leaves its mount points in the rootfs, and nothing else. What a
+/// provisioning sandbox contributes to a tree is what an export of that tree
+/// carries into whatever is made of it, so it is asserted rather than observed.
+#[test]
+fn a_launch_leaves_only_its_mount_points_in_the_exported_tree() {
+    let Some(fixture) = fixture_rootfs() else {
+        return;
+    };
+    let dir = scratch("residue");
+    let root = dir.join("root");
+    copy_fixture(fixture, &root);
+    // The preconditions the assertions below are about: a rootfs that ships
+    // none of the paths the managed profile mounts on, and no resolv.conf.
+    for mount_point in ["dev", "proc", "tmp"] {
+        let _ = std::fs::remove_dir_all(root.join(mount_point));
+    }
+    let _ = std::fs::remove_file(root.join("etc/resolv.conf"));
+
+    // Host networking is the only posture that binds resolv.conf, so it is the
+    // one that creates a target to mount onto — and the one whose cleanup this
+    // asserts. The command resolves a name, so the bind is exercised rather
+    // than merely established.
+    let cage = ferroday_cage::Cage::builder()
+        .rootfs(&root)
+        .command("/bin/busybox")
+        .args(["nslookup", "example.com"])
+        .network(ferroday_cage::Network::Host)
+        .build()
+        .expect("the cage builds");
+    let bound = cage
+        .resolved_inputs()
+        .mounts
+        .iter()
+        .any(|mount| mount.get_target() == Path::new("/etc/resolv.conf"));
+    let status = cage.run().expect("the cage runs");
+    if bound {
+        assert!(
+            status.success(),
+            "DNS must work in the sandbox when the host's resolv.conf is bound: {status:?}"
+        );
+    }
+
+    let mut out = Vec::new();
+    provision::export_tar(&root, &mut out, IdentityMap::Single).expect("export should succeed");
+    let entries = parse_tar(&out);
+    let index = by_path(&entries);
+
+    // The `/dev` the sandbox assembles is built inside the tmpfs that covers
+    // the mount point, so the device nodes, the symlinks, `pts` and `shm` all
+    // go with the namespace. What reaches the tree is the mount point alone.
+    let under_dev: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.path.starts_with(b"./dev/") && entry.path != b"./dev/")
+        .map(|entry| bstr(&entry.path))
+        .collect();
+    assert!(
+        under_dev.is_empty(),
+        "the launch left entries under ./dev/: {under_dev:?}"
+    );
+
+    // A mount point carries the mode of the directory it stands for. `/tmp` is
+    // the case that matters and the one that proves the umask cannot reach the
+    // tree: `mkdir(1777)` under the conventional `umask 022` would yield 1755.
+    for (path, mode) in [
+        (&b"./dev/"[..], 0o755),
+        (b"./proc/", 0o755),
+        (b"./tmp/", 0o1777),
+    ] {
+        let entry = index
+            .get(path)
+            .unwrap_or_else(|| panic!("no {} in the export", bstr(path)));
+        assert_eq!(entry.typeflag, b'5', "{} is not a directory", bstr(path));
+        assert_eq!(
+            entry.mode & 0o7777,
+            mode,
+            "{} has mode {:04o}, expected {mode:04o}",
+            bstr(path),
+            entry.mode & 0o7777
+        );
+    }
+
+    // The one file the profile creates rather than mounts on something the
+    // rootfs ships. It exists for the sandbox's life and is taken away again
+    // afterwards, so the tree is as it was and the export holds no resolver
+    // configuration the rootfs never had.
+    assert!(
+        !index.contains_key(&b"./etc/resolv.conf"[..]),
+        "the launch left an empty ./etc/resolv.conf behind"
+    );
+    assert!(
+        !root.join("etc/resolv.conf").exists(),
+        "the resolv.conf mount target outlived the sandbox"
+    );
+
+    let _ = provision::remove(&dir);
+}
+
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
-#[cfg(feature = "subid")]
 fn fixture_rootfs() -> Option<&'static Path> {
     common::fixture_rootfs()
+}
+
+/// Copies the shared fixture into `dest`, so a test that launches a sandbox
+/// over it cannot mutate the tree every other test reads.
+fn copy_fixture(fixture: &Path, dest: &Path) {
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(fixture)
+        .arg(dest)
+        .status()
+        .expect("cp runs");
+    assert!(status.success(), "copying the fixture rootfs failed");
 }
 
 /// Builds a fixed tree — six top-level files and a `nested/` directory holding

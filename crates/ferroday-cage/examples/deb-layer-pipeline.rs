@@ -317,14 +317,13 @@ fn build_component(config: &Config, source: &Path) -> Result<(), String> {
 /// Builds a [`Repository`] pointing at the pool: a trusted `file://` mirror the
 /// resolver merges alongside the archive.
 fn pool_repository(config: &Config) -> Result<Repository, String> {
-    // A file:// URL needs an absolute path; the pool exists by now, so it
-    // canonicalizes.
-    let pool = config
-        .pool
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve the pool path: {error}"))?;
+    // The pool names its own mirror URL, so the pipeline holds no copy of the
+    // archive layout.
+    let mirror = pool(config)
+        .mirror_url()
+        .map_err(|error| format!("cannot resolve the pool's mirror URL: {error}"))?;
     Repository::builder(&config.suite)
-        .mirror(format!("file://{}", pool.display()))
+        .mirror(mirror)
         .trust_unsigned(true)
         .name("pipeline-pool")
         .build()

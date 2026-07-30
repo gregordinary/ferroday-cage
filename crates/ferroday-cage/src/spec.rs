@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{Mode, OFlags, RawMode};
 use rustix::io::Errno;
 use rustix::mount::MountFlags;
 use rustix::thread::UnshareFlags;
@@ -16,7 +16,7 @@ use crate::error::{ConfigError, Error, OverlayLayer};
 use crate::idmap::{self, IdMapper, Identity, IdentityMap};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
-    Confinement, IdentityPlan, LaunchPlan, MountAction, MountOp, OverlayPlan, RlimitPlan,
+    Confinement, IdentityPlan, LaunchPlan, MountAction, MountDir, MountOp, OverlayPlan, RlimitPlan,
     RunAsPlan, StdinPlan,
 };
 use crate::observer::{Collect, Observer, Output};
@@ -40,6 +40,24 @@ const BASE_ENV: [(&str, &str); 2] = [("PATH", BASE_PATH), ("HOME", "/root")];
 /// `mknod` for character devices is denied in an unprivileged user
 /// namespace, so the minimal device set is bind-mounted from the host.
 const DEV_DEVICES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
+
+/// The mode a mount point the sandbox creates is given, and the mode of any
+/// ancestor directory created on the way to one.
+///
+/// A mount point outlives the sandbox — it persists in the rootfs directory on
+/// the host — so the profile states the mode rather than leaving it to the
+/// process umask. This is the conventional directory mode, and what a
+/// distribution ships `/dev` and `/proc` as.
+const DIR_MODE: RawMode = 0o755;
+/// The mode of a mount point standing in for a world-writable sticky
+/// directory: `/tmp` and `/dev/shm`, which the profile covers with a
+/// `mode=1777` tmpfs.
+///
+/// The mount hides the mode for as long as it is established, so this is what
+/// the directory is for every other purpose — including a rootfs provisioned
+/// through a sandbox and then deployed, where a `/tmp` no unprivileged process
+/// can write to is a broken image.
+const STICKY_DIR_MODE: RawMode = 0o1777;
 
 /// The symlinks created inside the sandbox's `/dev`, as (name, content).
 const DEV_SYMLINKS: [(&str, &str); 5] = [
@@ -1118,8 +1136,9 @@ impl CageBuilder {
     /// [`Network::Host`], which is applied last of all. Submounts of the
     /// source are included. A
     /// missing target is created inside the rootfs — including missing parent
-    /// directories — and persists in the rootfs directory on the host after
-    /// the sandbox exits.
+    /// directories, as mode-`0755` directories, and a file target as an empty
+    /// mode-`0644` file — and persists in the rootfs directory on the host
+    /// after the sandbox exits.
     pub fn bind(mut self, source: impl AsRef<Path>, target: impl AsRef<Path>) -> Self {
         self.mounts.push(Mount::Bind(Bind {
             source: source.as_ref().to_path_buf(),
@@ -1391,6 +1410,10 @@ impl CageBuilder {
     }
 
     /// Controls whether a tmpfs is mounted on `/tmp` (default `true`).
+    ///
+    /// The tmpfs is `mode=1777`, and a `/tmp` the sandbox has to create to
+    /// mount it on is created the same way, so the mount point a rootfs is left
+    /// with is the directory it stands for.
     pub fn mount_tmp(mut self, mount: bool) -> Self {
         self.mount_tmp = Some(mount);
         self
@@ -1405,6 +1428,13 @@ impl CageBuilder {
     /// `/etc/resolv.conf` in the rootfs. When the host has no usable
     /// `resolv.conf` the bind is omitted. An isolated network never binds
     /// it.
+    ///
+    /// A rootfs that ships no `/etc/resolv.conf` gets an empty one created to
+    /// mount onto, and it is removed once the sandbox is gone: the tree is left
+    /// as it was, rather than carrying a resolver configuration it never had
+    /// into whatever is made of it. A rootfs that does ship the file keeps it,
+    /// untouched — the bind covers it for the sandbox's life and reveals it
+    /// again afterwards.
     pub fn resolv_conf(mut self, bind: bool) -> Self {
         self.resolv_conf = Some(bind);
         self
@@ -1794,9 +1824,11 @@ impl CageBuilder {
                 Mount::Raw(raw) => lowering.push_raw(raw)?,
             }
         }
-        if resolv_conf && matches!(self.network, Network::Host) {
-            lowering.push_resolv_conf()?;
-        }
+        let managed_placeholder = if resolv_conf && matches!(self.network, Network::Host) {
+            lowering.push_resolv_conf(&rootfs)?
+        } else {
+            None
+        };
 
         // The identity plan: validate the requested map, resolve a range
         // request through the delegate seam, and validate the run-as
@@ -1886,6 +1918,7 @@ impl CageBuilder {
                 workdir,
                 ops: lowering.ops,
                 op_labels: lowering.labels,
+                managed_placeholder,
                 exec_label,
                 rlimits,
                 rlimit_labels,
@@ -2441,11 +2474,10 @@ fn overlay_io(layer: OverlayLayer, path: &Path, err: std::io::Error) -> Error {
 /// Lowers the mount profile into the frozen op list the child process
 /// executes.
 ///
-/// Each op carries every path it needs as a rootfs-relative `CString`,
-/// with mount-target directory chains precomputed as (parent, leaf) pairs,
-/// so the child process performs no path manipulation. The label list is
-/// parallel to the ops and caller-side only: it names the mount in a setup
-/// error.
+/// Each op carries every path it needs as a rootfs-relative `CString`, with
+/// mount-target directory chains precomputed as [`MountDir`]s, so the child
+/// process performs no path manipulation. The label list is parallel to the ops
+/// and caller-side only: it names the mount in a setup error.
 #[derive(Default)]
 struct Lowering {
     ops: Vec<MountOp>,
@@ -2462,7 +2494,7 @@ impl Lowering {
     fn push_proc_fresh(&mut self) -> Result<(), Error> {
         self.push(
             MountOp {
-                dirs: dir_chain(&["proc"])?,
+                dirs: dir_chain(&["proc"], DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Procfs {
                     target: rel_cstring(&["proc"])?,
@@ -2481,7 +2513,7 @@ impl Lowering {
     fn push_proc_bind(&mut self) -> Result<(), Error> {
         self.push(
             MountOp {
-                dirs: dir_chain(&["proc"])?,
+                dirs: dir_chain(&["proc"], DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Bind {
                     source: cstring(OsStr::new("/proc"))?,
@@ -2506,7 +2538,7 @@ impl Lowering {
         // does, and the choice is intentional rather than an oversight.
         self.push(
             MountOp {
-                dirs: dir_chain(&["dev"])?,
+                dirs: dir_chain(&["dev"], DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Tmpfs {
                     target: rel_cstring(&["dev"])?,
@@ -2546,7 +2578,10 @@ impl Lowering {
         }
         self.push(
             MountOp {
-                dirs: dir_chain(&["dev", "pts"])?,
+                // The mount point is an ordinary directory: devpts's `mode=` is
+                // the mode of the pseudo-terminals it allocates, not of its
+                // own root, so there is nothing here to mirror.
+                dirs: dir_chain(&["dev", "pts"], DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Devpts {
                     target: rel_cstring(&["dev", "pts"])?,
@@ -2560,7 +2595,7 @@ impl Lowering {
         );
         self.push(
             MountOp {
-                dirs: dir_chain(&["dev", "shm"])?,
+                dirs: dir_chain(&["dev", "shm"], STICKY_DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Tmpfs {
                     target: rel_cstring(&["dev", "shm"])?,
@@ -2576,7 +2611,7 @@ impl Lowering {
     fn push_tmp(&mut self) -> Result<(), Error> {
         self.push(
             MountOp {
-                dirs: dir_chain(&["tmp"])?,
+                dirs: dir_chain(&["tmp"], STICKY_DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Tmpfs {
                     target: rel_cstring(&["tmp"])?,
@@ -2600,12 +2635,15 @@ impl Lowering {
         let components = sandbox_path_components(&bind.target)?;
 
         let (dirs, create_file) = if source_is_dir {
-            (dir_chain(&components)?, None)
+            (dir_chain(&components, DIR_MODE)?, None)
         } else {
             // A file bind creates the parent directories and then the
             // target file itself.
             let parents = &components[..components.len() - 1];
-            (dir_chain(parents)?, Some(rel_cstring(&components)?))
+            (
+                dir_chain(parents, DIR_MODE)?,
+                Some(rel_cstring(&components)?),
+            )
         };
 
         let label = format!(
@@ -2647,7 +2685,7 @@ impl Lowering {
         };
         self.push(
             MountOp {
-                dirs: dir_chain(&components)?,
+                dirs: dir_chain(&components, DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Raw {
                     source,
@@ -2662,19 +2700,33 @@ impl Lowering {
         Ok(())
     }
 
-    fn push_resolv_conf(&mut self) -> Result<(), Error> {
-        // Resolve the host's resolv.conf to its real file (it is commonly a
-        // symlink into a resolver's runtime directory). A host without a
-        // usable resolv.conf simply gets no bind.
+    /// The host's `resolv.conf`, bound read-only over the rootfs's own.
+    ///
+    /// Resolving the host's `resolv.conf` can fail — it is commonly a symlink
+    /// into a resolver's runtime directory, which need not exist — and a host
+    /// without a usable one simply gets no bind.
+    ///
+    /// A bind needs its target to exist before anything can be mounted onto it,
+    /// so a rootfs shipping no `resolv.conf` gets an empty one created. That
+    /// file would otherwise outlive the sandbox as a resolver configuration the
+    /// rootfs never had, which an export carries into whatever is made of the
+    /// tree; the path is reported to the caller instead, which removes it once
+    /// the sandbox is gone. Returns that path when the launch will create one.
+    fn push_resolv_conf(&mut self, rootfs: &Path) -> Result<Option<PathBuf>, Error> {
         let Ok(source) = std::fs::canonicalize("/etc/resolv.conf") else {
-            return Ok(());
+            return Ok(None);
         };
         if !source.is_file() {
-            return Ok(());
+            return Ok(None);
         }
+        // Whether the target has to be created is decided here, before the
+        // launch, so the caller side knows what the sandbox will contribute
+        // without having to ask it afterwards.
+        let target = rootfs.join("etc/resolv.conf");
+        let placeholder = (!target.exists()).then_some(target);
         self.push(
             MountOp {
-                dirs: dir_chain(&["etc"])?,
+                dirs: dir_chain(&["etc"], DIR_MODE)?,
                 create_file: Some(rel_cstring(&["etc", "resolv.conf"])?),
                 action: MountAction::Bind {
                     source: cstring(source.as_os_str())?,
@@ -2684,7 +2736,7 @@ impl Lowering {
             },
             "/etc/resolv.conf".to_string(),
         );
-        Ok(())
+        Ok(placeholder)
     }
 }
 
@@ -2713,17 +2765,31 @@ fn sandbox_path_components(path: &Path) -> Result<Vec<&OsStr>, Error> {
     Ok(components)
 }
 
-/// Builds the mount-target directory chain for a rootfs-relative path:
-/// one (parent, leaf) pair per component, the first parent being the empty
-/// string, meaning the rootfs itself.
-fn dir_chain<S: AsRef<OsStr>>(components: &[S]) -> Result<Vec<(CString, CString)>, Error> {
+/// Builds the mount-target directory chain for a rootfs-relative path: one
+/// [`MountDir`] per component, the first parent being the empty string, meaning
+/// the rootfs itself.
+///
+/// The mount point itself — the last component — is created at `leaf_mode`,
+/// the mode of the directory it stands for once the mount that covers it is
+/// gone. Every ancestor created on the way to it is an ordinary directory.
+fn dir_chain<S: AsRef<OsStr>>(
+    components: &[S],
+    leaf_mode: RawMode,
+) -> Result<Vec<MountDir>, Error> {
     let mut chain = Vec::with_capacity(components.len());
     let mut parent: Vec<u8> = Vec::new();
-    for component in components {
-        chain.push((
-            CString::new(parent.clone()).map_err(|_| ConfigError::EmbeddedNul)?,
-            cstring(component.as_ref())?,
-        ));
+    for (depth, component) in components.iter().enumerate() {
+        chain.push(MountDir {
+            parent: CString::new(parent.clone()).map_err(|_| ConfigError::EmbeddedNul)?,
+            leaf: cstring(component.as_ref())?,
+            // Only the mount point itself carries the profile's mode; an
+            // ancestor created on the way to it is an ordinary directory.
+            mode: if depth + 1 == components.len() {
+                leaf_mode
+            } else {
+                DIR_MODE
+            },
+        });
         if !parent.is_empty() {
             parent.push(b'/');
         }
@@ -3739,30 +3805,115 @@ mod tests {
         assert!(!cage.plan.hardening.set_securebits);
     }
 
+    /// Whether the plan holds the managed `resolv.conf` bind.
+    fn binds_resolv_conf(cage: &Cage) -> bool {
+        cage.plan
+            .op_labels
+            .contains(&"/etc/resolv.conf".to_string())
+    }
+
+    /// Whether the host end of the `resolv.conf` bind is available at all; the
+    /// rootfs end is what each case below varies.
+    fn host_has_resolv_conf() -> bool {
+        std::fs::canonicalize("/etc/resolv.conf")
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    }
+
     #[test]
     fn host_network_skips_the_loopback_and_may_bind_resolv_conf() {
         let cage = sh_in("/tmp").network(Network::Host).build().unwrap();
         assert!(!cage.plan.configure_loopback);
-        let with_resolv = cage
-            .plan
-            .op_labels
-            .contains(&"/etc/resolv.conf".to_string());
-        let host_has_resolv = std::fs::canonicalize("/etc/resolv.conf")
-            .map(|path| path.is_file())
-            .unwrap_or(false);
-        assert_eq!(with_resolv, host_has_resolv);
+        assert_eq!(binds_resolv_conf(&cage), host_has_resolv_conf());
 
         let cage = sh_in("/tmp")
             .network(Network::Host)
             .resolv_conf(false)
             .build()
             .unwrap();
-        assert!(
-            !cage
-                .plan
-                .op_labels
-                .contains(&"/etc/resolv.conf".to_string())
+        assert!(!binds_resolv_conf(&cage));
+        assert!(cage.plan.managed_placeholder.is_none());
+    }
+
+    #[test]
+    fn a_resolv_conf_target_the_launch_creates_is_recorded_for_removal() {
+        // A bind needs its target to exist, so a rootfs shipping no resolv.conf
+        // has one created. The plan records that path, which is how the caller
+        // side knows to take it away once the sandbox is gone. A rootfs that
+        // ships the file has nothing created and so nothing to remove.
+        if !host_has_resolv_conf() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("fcage-resolv-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        let rootfs = dir.to_str().unwrap();
+
+        let created = sh_in(rootfs).network(Network::Host).build().unwrap();
+        assert!(binds_resolv_conf(&created));
+        assert_eq!(
+            created.plan.managed_placeholder.as_deref(),
+            Some(dir.join("etc/resolv.conf").as_path()),
+            "a target the launch creates must be recorded for removal"
         );
+
+        std::fs::write(dir.join("etc/resolv.conf"), b"nameserver 192.0.2.1\n").unwrap();
+        let shipped = sh_in(rootfs).network(Network::Host).build().unwrap();
+        assert!(binds_resolv_conf(&shipped));
+        assert!(
+            shipped.plan.managed_placeholder.is_none(),
+            "a file the rootfs ships is not the sandbox's to remove"
+        );
+
+        // An isolated network never binds it, so it never creates one either.
+        let isolated = sh_in(rootfs).build().unwrap();
+        assert!(!binds_resolv_conf(&isolated));
+        assert!(isolated.plan.managed_placeholder.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_managed_mount_point_carries_the_mode_of_the_directory_it_stands_for() {
+        // The mount hides the mode for as long as it is established, but the
+        // mount point outlives the sandbox: a `/tmp` the sandbox creates must be
+        // the 1777 directory `/tmp` is, not a 0755 one nothing unprivileged can
+        // write to.
+        let cage = sh_in("/tmp").build().unwrap();
+        let mode_of = |target: &str| -> RawMode {
+            let (op, _) = cage
+                .plan
+                .ops
+                .iter()
+                .zip(&cage.plan.op_labels)
+                .find(|(_, label)| label.as_str() == target)
+                .unwrap_or_else(|| panic!("no {target} op in {:?}", cage.plan.op_labels));
+            op.dirs.last().expect("a mount point to create").mode
+        };
+        assert_eq!(mode_of("/tmp"), 0o1777);
+        assert_eq!(mode_of("/dev/shm"), 0o1777);
+        assert_eq!(mode_of("/dev"), 0o755);
+        assert_eq!(mode_of("/proc"), 0o755);
+        // devpts's `mode=` is the mode of the pseudo-terminals it allocates,
+        // not of its own root, so its mount point is an ordinary directory.
+        assert_eq!(mode_of("/dev/pts"), 0o755);
+
+        // An ancestor created on the way to a mount point is an ordinary
+        // directory whatever the mount point itself is.
+        let cage = sh_in("/tmp")
+            .bind("/etc/hostname", "/a/b/hostname")
+            .build()
+            .expect("a file bind into fresh directories builds");
+        let (op, _) = cage
+            .plan
+            .ops
+            .iter()
+            .zip(&cage.plan.op_labels)
+            .find(|(_, label)| label.ends_with("at /a/b/hostname"))
+            .expect("the bind op");
+        assert_eq!(op.dirs.len(), 2, "both /a and /a/b are created");
+        assert!(op.dirs.iter().all(|dir| dir.mode == 0o755));
     }
 }
 

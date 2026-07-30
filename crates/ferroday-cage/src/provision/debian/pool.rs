@@ -12,6 +12,21 @@
 //! owning the directory, exactly as the consume side documents for
 //! [`trust_unsigned`](super::RepositoryBuilder::trust_unsigned).
 //!
+//! # Signing
+//!
+//! A caller that distributes its pool beyond the machine that built it signs it
+//! itself: [`Pool::release_path`] names the document to sign and
+//! [`Pool::dists_dir`] the directory the signature belongs in, so a signer needs
+//! no knowledge of the archive layout. The signature must be an inline
+//! cleartext-signed `InRelease`; a detached `Release.gpg` is not read.
+//!
+//! A signature is only ever as current as the `Release` it was made over, so a
+//! publish removes any the pool carries before it writes a new one. A pool
+//! between a publish and its signature is unsigned rather than stale-signed: a
+//! reader that requires a signature finds none and moves on, instead of
+//! verifying a release that a later publish superseded. Signing therefore
+//! follows every publish, not just the first.
+//!
 //! # Copying
 //!
 //! Publishing does not buffer packages. A `.deb`'s control member is reached by
@@ -74,6 +89,13 @@ use super::{DebianError, arch, deb, staging_path, version, write_atomically};
 /// and `dists/<suite>/Release` are regenerated to describe the pool's current
 /// contents.
 ///
+/// The pool owns its layout, and reports it rather than leaving a caller to
+/// rebuild it: [`mirror_url`](Self::mirror_url) is the URL that declares the
+/// pool as a [`Repository`](super::Repository), and
+/// [`release_path`](Self::release_path) and [`dists_dir`](Self::dists_dir) are
+/// what a caller signing the pool needs. All three are available before the
+/// first publish.
+///
 /// # Example
 ///
 /// ```no_run
@@ -128,6 +150,89 @@ impl Pool {
         self
     }
 
+    /// The pool's root: the directory it was opened at, holding `dists/` and
+    /// `pool/`.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The suite directory, `dists/<suite>` beneath the root.
+    ///
+    /// This is where the suite's `Release` lives and where a signature over it
+    /// belongs, so a caller signing the pool needs this path rather than a
+    /// reconstruction of the archive layout.
+    ///
+    /// The path is what a publish would write, and does not depend on the pool
+    /// existing: it is available before the first [`publish`](Self::publish), so
+    /// a pipeline can settle where it will sign before it has anything to sign.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DebianError::Config`] when no suite was set, or the suite is
+    /// empty.
+    pub fn dists_dir(&self) -> Result<PathBuf, DebianError> {
+        Ok(self.dir.join("dists").join(self.checked_suite()?))
+    }
+
+    /// The path of the suite's `Release`, the document a signature is made over.
+    ///
+    /// A signature belongs beside it as an inline cleartext-signed `InRelease`,
+    /// which is the form the provisioner reads; a detached `Release.gpg` is
+    /// ignored. A publish removes either before writing a new `Release`, so a
+    /// pool is signed after each publish rather than once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DebianError::Config`] when no suite was set, or the suite is
+    /// empty.
+    pub fn release_path(&self) -> Result<PathBuf, DebianError> {
+        Ok(self.dists_dir()?.join("Release"))
+    }
+
+    /// The `file://` mirror URL naming this pool, ready to hand to
+    /// [`RepositoryBuilder::mirror`](super::RepositoryBuilder::mirror).
+    ///
+    /// The URL addresses the pool root, the directory `dists/` and `pool/` sit
+    /// under. A relative root is made absolute against the current directory,
+    /// since a `file://` URL cannot carry a relative path; the pool need not
+    /// exist yet, so the URL is available before the first
+    /// [`publish`](Self::publish).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DebianError::Config`] for a root that is not valid UTF-8, which
+    /// cannot be spelled in a URL, and [`DebianError::Io`] when the current
+    /// directory cannot be read to make a relative root absolute.
+    pub fn mirror_url(&self) -> Result<String, DebianError> {
+        let absolute = std::path::absolute(&self.dir).map_err(|source| DebianError::Io {
+            op: "resolving the pool's path for its mirror URL",
+            path: self.dir.clone(),
+            source,
+        })?;
+        let path = absolute.to_str().ok_or_else(|| DebianError::Config {
+            reason: format!(
+                "the pool path {} is not valid UTF-8 and cannot be named by a file:// URL",
+                absolute.display(),
+            ),
+        })?;
+        Ok(format!("file://{path}"))
+    }
+
+    /// The suite the pool publishes under, the one setting with no default.
+    fn checked_suite(&self) -> Result<&str, DebianError> {
+        let Some(suite) = self.suite.as_deref() else {
+            return Err(DebianError::Config {
+                reason: "no suite was given for the pool".to_string(),
+            });
+        };
+        if suite.trim().is_empty() {
+            return Err(DebianError::Config {
+                reason: "the pool's suite is empty".to_string(),
+            });
+        }
+        Ok(suite)
+    }
+
     /// Writes or updates the pool from a set of freshly-built `.deb`s.
     ///
     /// The index keeps the highest version of each package name across what the
@@ -158,28 +263,30 @@ impl Pool {
     /// digest check. In a build pipeline that means two components produced the
     /// same package version.
     ///
+    /// A publish discards any signature the pool carries — an `InRelease` or a
+    /// `Release.gpg` a caller wrote over an earlier release — since a signature
+    /// describes the `Release` it was made over and this call replaces it. A
+    /// caller that signs its pool signs it again after each publish; see the
+    /// module documentation.
+    ///
     /// # Errors
     ///
-    /// Returns [`DebianError::Config`] when no suite was set or the component or
-    /// architecture is empty; [`DebianError::Deb`] for a `.deb` that cannot be
-    /// read, whose architecture belongs in neither this pool nor `all`, or that
-    /// was rewritten into a different package while it was being published; and
-    /// [`DebianError::Io`] for a failure writing or locking the pool.
+    /// Returns [`DebianError::Config`] when no suite was set or the suite,
+    /// component, or architecture is empty; [`DebianError::Deb`] for a `.deb`
+    /// that cannot be read, whose architecture belongs in neither this pool nor
+    /// `all`, or that was rewritten into a different package while it was being
+    /// published; and [`DebianError::Io`] for a failure writing or locking the
+    /// pool.
     pub fn publish<P: AsRef<Path>>(
         &self,
         debs: impl IntoIterator<Item = P>,
     ) -> Result<(), DebianError> {
-        let Some(suite) = self.suite.as_deref() else {
-            return Err(DebianError::Config {
-                reason: "no suite was given for the pool".to_string(),
-            });
-        };
+        let suite = self.checked_suite()?;
         let architecture = match self.architecture.clone() {
             Some(architecture) => architecture,
             None => arch::host_architecture(),
         };
         for (label, value) in [
-            ("suite", suite),
             ("component", self.component.as_str()),
             ("architecture", architecture.as_str()),
         ] {
@@ -201,6 +308,10 @@ impl Pool {
 /// before any index names it; every index lands before the `Release` that
 /// records its digest; and the `Release` is renamed into place last, so the
 /// publish becomes visible at that single step.
+///
+/// Any signature a caller wrote over the previous release is removed first, so
+/// the pool is unsigned for the whole of a publish rather than carrying a
+/// signature that stops describing it partway through.
 fn write_pool<P: AsRef<Path>>(
     pool_dir: &Path,
     debs: impl IntoIterator<Item = P>,
@@ -213,12 +324,15 @@ fn write_pool<P: AsRef<Path>>(
     mkdir_all(pool_dir)?;
     let _lock = lock_pool(pool_dir)?;
 
-    let binary_dir = pool_dir
-        .join("dists")
-        .join(suite)
+    let suite_dir = pool_dir.join("dists").join(suite);
+    let binary_dir = suite_dir
         .join(component)
         .join(format!("binary-{architecture}"));
     mkdir_all(&binary_dir)?;
+
+    // Before anything this call writes can be described by it, whatever signed
+    // the release this call replaces is gone.
+    remove_signatures(&suite_dir)?;
 
     // Start from whatever the pool already indexes, so the call is incremental.
     // The read is under the lock, so no other publish can merge against the
@@ -273,11 +387,44 @@ fn write_pool<P: AsRef<Path>>(
         architecture,
         &[("Packages", &packages_bytes), ("Packages.gz", &packages_gz)],
     );
-    write_file(
-        &pool_dir.join("dists").join(suite).join("Release"),
-        release.as_bytes(),
-    )?;
+    write_file(&suite_dir.join("Release"), release.as_bytes())?;
 
+    Ok(())
+}
+
+/// Removes any signature the suite carries, so one made over a superseded
+/// `Release` cannot outlive it.
+///
+/// A signature is written by the caller, not by the pool, and it describes the
+/// exact release bytes it was made over. Leaving one in place across a publish
+/// would leave a document that still verifies but no longer describes the pool,
+/// and — because the by-hash index copies are immutable and never removed — a
+/// reader following it would successfully resolve the superseded package set
+/// rather than fail. Removing it makes the pool unsigned instead: a reader that
+/// requires a signature finds none, which fails over to another mirror or
+/// reports a missing release, both of which are recoverable.
+///
+/// Both spellings go: `InRelease` is the inline form the provisioner reads, and
+/// `Release.gpg` the detached form other clients accept.
+///
+/// A removal that fails for any reason other than the file's absence fails the
+/// publish, since continuing would publish a release under a signature for
+/// different bytes.
+fn remove_signatures(suite_dir: &Path) -> Result<(), DebianError> {
+    for name in ["InRelease", "Release.gpg"] {
+        let path = suite_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(DebianError::Io {
+                    op: "removing a superseded pool signature",
+                    path,
+                    source,
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -807,6 +954,98 @@ mod tests {
                 "the clone was refused for a bad descriptor, not for lack of support",
             ),
         }
+    }
+
+    #[test]
+    fn the_pool_reports_the_layout_it_owns() {
+        // The paths a caller would otherwise hardcode: the release to sign, the
+        // directory to sign it into, and the URL that declares the pool as a
+        // repository. None of them requires the pool to exist, so a pipeline can
+        // wire itself up before its first publish.
+        let pool = Pool::at("/srv/pool").suite("local");
+        assert_eq!(pool.dir(), Path::new("/srv/pool"));
+        assert_eq!(
+            pool.dists_dir().expect("the suite directory"),
+            Path::new("/srv/pool/dists/local"),
+        );
+        assert_eq!(
+            pool.release_path().expect("the release path"),
+            Path::new("/srv/pool/dists/local/Release"),
+        );
+        assert_eq!(
+            pool.mirror_url().expect("the mirror URL"),
+            "file:///srv/pool",
+        );
+        // The layout does not move with the component or the architecture: a
+        // release describes the whole suite.
+        let pool = pool.component("contrib").architecture("riscv64");
+        assert_eq!(
+            pool.release_path().expect("the release path"),
+            Path::new("/srv/pool/dists/local/Release"),
+        );
+    }
+
+    #[test]
+    fn a_relative_pool_yields_an_absolute_mirror_url() {
+        // A file:// URL names an absolute path, and a pool opened at a relative
+        // one is the ordinary case for a build run from its own tree.
+        let url = Pool::at("build/pool")
+            .suite("local")
+            .mirror_url()
+            .expect("the mirror URL");
+        let expected = std::env::current_dir().unwrap().join("build/pool");
+        assert_eq!(url, format!("file://{}", expected.display()));
+    }
+
+    #[test]
+    fn the_layout_getters_require_a_suite() {
+        // The suite is the one setting with no default, and the getters report
+        // its absence the same way publishing does rather than inventing one.
+        let pool = Pool::at("/srv/pool");
+        for reason in [
+            pool.dists_dir().unwrap_err().to_string(),
+            pool.release_path().unwrap_err().to_string(),
+        ] {
+            assert!(reason.contains("no suite"), "unexpected reason: {reason}");
+        }
+        let blank = Pool::at("/srv/pool").suite("  ");
+        assert!(
+            blank
+                .release_path()
+                .unwrap_err()
+                .to_string()
+                .contains("empty"),
+            "a blank suite must be refused, not joined into the path",
+        );
+        // The URL names the root, which no suite is part of.
+        assert!(pool.mirror_url().is_ok());
+    }
+
+    #[test]
+    fn publishing_discards_a_signature_made_over_the_previous_release() {
+        // A signature describes the release bytes it was made over. Carrying one
+        // across a publish would leave a document that still verifies but names
+        // superseded indexes — and since by-hash copies are never removed, a
+        // reader would resolve them successfully instead of failing.
+        let dir = tempdir("signature");
+        let pool = Pool::at(&dir).suite("local");
+        pool.publish::<&Path>([]).expect("the first publish");
+
+        let suite_dir = pool.dists_dir().unwrap();
+        std::fs::write(suite_dir.join("InRelease"), b"signed over the old release").unwrap();
+        std::fs::write(suite_dir.join("Release.gpg"), b"detached, over the same").unwrap();
+
+        pool.publish::<&Path>([]).expect("the second publish");
+        assert!(
+            !suite_dir.join("InRelease").exists(),
+            "a superseded InRelease outlived the Release it signed",
+        );
+        assert!(
+            !suite_dir.join("Release.gpg").exists(),
+            "a superseded Release.gpg outlived the Release it signed",
+        );
+        // The publish itself is unaffected: the release it wrote is there.
+        assert!(pool.release_path().unwrap().exists());
     }
 
     #[test]

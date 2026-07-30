@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "ferroday-cage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "libc",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "ferroday-cage-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ferroday-cage",
  "serde",

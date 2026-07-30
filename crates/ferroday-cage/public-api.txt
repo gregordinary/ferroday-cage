@@ -346,7 +346,11 @@ impl ferroday_cage::provision::debian::Pool
 pub fn ferroday_cage::provision::debian::Pool::architecture(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::Pool
 pub fn ferroday_cage::provision::debian::Pool::at(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::debian::Pool
 pub fn ferroday_cage::provision::debian::Pool::component(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::Pool
+pub fn ferroday_cage::provision::debian::Pool::dir(&self) -> &std::path::Path
+pub fn ferroday_cage::provision::debian::Pool::dists_dir(&self) -> core::result::Result<std::path::PathBuf, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Pool::mirror_url(&self) -> core::result::Result<alloc::string::String, ferroday_cage::provision::debian::DebianError>
 pub fn ferroday_cage::provision::debian::Pool::publish<P: core::convert::AsRef<std::path::Path>>(&self, impl core::iter::traits::collect::IntoIterator<Item = P>) -> core::result::Result<(), ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Pool::release_path(&self) -> core::result::Result<std::path::PathBuf, ferroday_cage::provision::debian::DebianError>
 pub fn ferroday_cage::provision::debian::Pool::suite(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::Pool
 impl core::marker::Freeze for ferroday_cage::provision::debian::Pool
 impl core::marker::Send for ferroday_cage::provision::debian::Pool

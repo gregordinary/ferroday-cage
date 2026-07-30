@@ -3,12 +3,18 @@
 //! `fcage` runs a command inside an unprivileged Linux sandbox built by the
 //! ferroday-cage library: fresh namespaces, the given root filesystem
 //! presented at `/` with the default mount profile assembled over it, and
-//! the calling user mapped to root inside. Every flag maps onto a call on
-//! the library's builder, and `--profile` loads a TOML sandbox
+//! the calling user mapped to root inside. Almost every flag maps onto a call
+//! on the library's builder, and `--profile` loads a TOML sandbox
 //! specification through the library's `serde` feature; the binary contains
 //! no sandboxing logic of its own. `--restrict` selects the library's
 //! restriction fallback instead: Landlock and seccomp confinement of a
 //! plain process, for hosts without unprivileged user namespaces.
+//!
+//! Not every flag configures a launch. The `--provision-*` family publishes a
+//! rootfs before the command runs, and given without a command provisions and
+//! exits; `--remove-rootfs` deletes a provisioned rootfs and exits, a mode of
+//! its own that accepts no other option. Both carry the library's `provision`
+//! calls to a shell prompt.
 //!
 //! The binary is built with every library feature enabled, so any profile the
 //! library accepts loads here, and every capability the builder offers has a
@@ -38,6 +44,7 @@ const USAGE: &str = "\
 Run a command inside an unprivileged Linux sandbox.
 
 Usage: fcage [--rootfs DIR | --profile FILE | --restricted-profile FILE | --restrict] [OPTIONS] [--] [COMMAND [ARGS...]]
+       fcage --remove-rootfs DIR [--identity-map M]
 
 Options:
   --rootfs DIR          Directory to present as the sandbox root filesystem
@@ -85,6 +92,14 @@ Options:
                         'suite=S mirror=URL [mirror-fallback=URL]
                         [components=a,b] [keyring=PATH] [name=NAME]
                         [trust-unsigned] [allow-stale-release]'. Repeatable
+  --remove-rootfs DIR   Delete the provisioned rootfs at DIR and exit,
+                        including one a range-mapped sandbox wrote and a plain
+                        'rm -rf' cannot remove. Give the --identity-map the
+                        tree was provisioned under; the default is
+                        'subordinate'. Removing a path that is not there
+                        succeeds, so the call is repeatable. Takes no other
+                        option: it removes a rootfs rather than running a
+                        command in one
   --profile FILE        Load a TOML sandbox profile; flags given alongside
                         override its settings, binds and variables extend it,
                         and any [hardening] table it carries takes effect. A
@@ -244,6 +259,12 @@ exist, and 2 on usage errors.
 enum Invocation {
     /// Launch a sandbox.
     Run(Box<Options>),
+    /// Delete a provisioned rootfs, under the identity map it was written
+    /// under.
+    Remove {
+        dest: PathBuf,
+        map: IdentityMap,
+    },
     Help,
     Version,
 }
@@ -378,6 +399,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Invocation::Run(options)) => run(*options),
+        Ok(Invocation::Remove { dest, map }) => remove_rootfs(&dest, map),
         Err(message) => {
             eprintln!("fcage: {message}");
             eprintln!("Try 'fcage --help' for usage.");
@@ -387,7 +409,19 @@ fn main() -> ExitCode {
 }
 
 /// Parses the command line, excluding the program name.
-fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
+fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
+    let args: Vec<OsString> = args.collect();
+    // A removal is a mode of its own rather than a launch, so it is recognized
+    // before the launch vocabulary is parsed and accepts only its own flags.
+    // Splitting it this way is what keeps the two in step: a flag added to a
+    // launch is refused alongside --remove-rootfs by the same `else` that
+    // refuses every other one, rather than being silently accepted and then
+    // ignored by a removal that never reads it.
+    if args.iter().any(|arg| names_removal(arg)) {
+        return parse_removal(args);
+    }
+    let mut args = args.into_iter();
+
     let mut options = Options {
         profile: None,
         profile_restricted: false,
@@ -980,6 +1014,60 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         return Err("no command given".to_string());
     }
     Ok(Invocation::Run(Box::new(options)))
+}
+
+/// Whether `arg` names the removal flag, in either the separated or the
+/// `=`-joined form.
+fn names_removal(arg: &OsStr) -> bool {
+    arg == "--remove-rootfs" || arg.as_bytes().starts_with(b"--remove-rootfs=")
+}
+
+/// Parses a `--remove-rootfs` command line, excluding the program name.
+///
+/// A removal takes the destination and the identity map the tree was written
+/// under. Every other flag configures a launch that does not happen here, so
+/// naming one is a usage error rather than a setting with no effect.
+fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
+    let mut dest: Option<PathBuf> = None;
+    // The same default the library's own removal carries: a tree written by a
+    // bundled-delegate sandbox is the case that needs the escalation at all.
+    let mut map = IdentityMap::Subordinate;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            return Ok(Invocation::Help);
+        } else if arg == "-V" || arg == "--version" {
+            return Ok(Invocation::Version);
+        } else if arg == "--remove-rootfs" {
+            let value = args
+                .next()
+                .ok_or_else(|| "--remove-rootfs requires a value".to_string())?;
+            dest = Some(PathBuf::from(value));
+        } else if let Some(value) = flag_value(&arg, b"--remove-rootfs=") {
+            dest = Some(PathBuf::from(value));
+        } else if arg == "--identity-map" {
+            map = parse_identity_map(
+                "--identity-map",
+                &string_value("--identity-map", &mut args)?,
+            )?;
+        } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
+            map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
+        } else {
+            return Err(format!(
+                "{} cannot be used with --remove-rootfs",
+                arg.to_string_lossy()
+            ));
+        }
+    }
+
+    // The caller established that the flag is present, so this is a guard
+    // rather than a live path: the only value-taking flag here would reject
+    // `--remove-rootfs` as a map spelling before reaching it. It stays a usage
+    // error rather than an `expect` because what upholds it is the shape of the
+    // argument vector, not an invariant of this module.
+    let dest = dest.ok_or_else(|| "--remove-rootfs requires a value".to_string())?;
+    Ok(Invocation::Remove { dest, map })
 }
 
 /// Whether any `--debian-*` modifier flag was given.
@@ -1606,6 +1694,23 @@ fn load_profile(
     Ok((builder, meta))
 }
 
+/// Deletes the provisioned rootfs at `dest`, under the identity map it was
+/// written under.
+///
+/// A tree a range-mapped sandbox wrote carries subordinate ownership that a
+/// plain `rm -rf` cannot delete; the library re-enters the same map to remove
+/// it. A failure exits 125, the code every other setup failure uses: nothing
+/// ran, so there is no command status to report.
+fn remove_rootfs(dest: &Path, map: IdentityMap) -> ExitCode {
+    match ferroday_cage::provision::Remove::new(dest).map(map).run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("fcage: {error}");
+            ExitCode::from(125)
+        }
+    }
+}
+
 /// Builds and runs the sandbox, mapping the outcome onto the exit status.
 fn run(options: Options) -> ExitCode {
     if options.restrict {
@@ -2123,6 +2228,103 @@ fn error_exit_code(error: &Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parses an argument list given as string slices.
+    fn parse_args(args: &[&str]) -> Result<Invocation, String> {
+        parse(args.iter().map(OsString::from))
+    }
+
+    /// The usage error `args` produces, panicking if it is accepted instead.
+    fn parse_error(args: &[&str]) -> String {
+        match parse_args(args) {
+            Err(message) => message,
+            Ok(_) => panic!("{args:?} should be refused"),
+        }
+    }
+
+    #[test]
+    fn remove_rootfs_takes_a_destination_in_either_form() {
+        for args in [
+            ["--remove-rootfs", "/var/lib/roots/trixie"].as_slice(),
+            ["--remove-rootfs=/var/lib/roots/trixie"].as_slice(),
+        ] {
+            match parse_args(args).expect("the removal should parse") {
+                Invocation::Remove { dest, map } => {
+                    assert_eq!(dest, PathBuf::from("/var/lib/roots/trixie"));
+                    assert_eq!(
+                        map,
+                        IdentityMap::Subordinate,
+                        "the default is the map a bundled-delegate sandbox writes under"
+                    );
+                }
+                _ => panic!("expected a removal for {args:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn remove_rootfs_takes_the_identity_map_the_tree_was_written_under() {
+        // A tree provisioned under the single-identity map is removed under it
+        // too, whichever side of the destination the flag appears on.
+        for args in [
+            ["--identity-map", "single", "--remove-rootfs", "/roots/a"].as_slice(),
+            ["--remove-rootfs", "/roots/a", "--identity-map=single"].as_slice(),
+        ] {
+            match parse_args(args).expect("the removal should parse") {
+                Invocation::Remove { map, .. } => assert_eq!(map, IdentityMap::Single),
+                _ => panic!("expected a removal for {args:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn remove_rootfs_refuses_every_launch_option() {
+        // The removal vocabulary is closed, so a launch flag is a usage error
+        // rather than a setting a removal would silently ignore. This holds for
+        // flags added later too: the parser rejects by exhaustion, not by a
+        // list kept in step by hand.
+        for flag in [
+            "--rootfs",
+            "--restrict",
+            "--share-net",
+            "--provision-tar",
+            "--profile",
+            "--bind",
+            "--seccomp",
+        ] {
+            let error = parse_error(&["--remove-rootfs", "/roots/a", flag]);
+            assert!(
+                error.contains(flag) && error.contains("--remove-rootfs"),
+                "the error should name both flags, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_rootfs_refuses_a_command() {
+        let error = parse_error(&["--remove-rootfs", "/roots/a", "/bin/true"]);
+        assert!(error.contains("/bin/true"), "{error}");
+    }
+
+    #[test]
+    fn remove_rootfs_requires_a_destination() {
+        assert!(parse_args(&["--remove-rootfs"]).is_err());
+        // The map parser rejects the flag as a spelling before it can be
+        // mistaken for the destination.
+        assert!(parse_args(&["--identity-map", "--remove-rootfs"]).is_err());
+    }
+
+    #[test]
+    fn remove_rootfs_still_answers_help_and_version() {
+        assert!(matches!(
+            parse_args(&["--remove-rootfs", "/roots/a", "--help"]),
+            Ok(Invocation::Help)
+        ));
+        assert!(matches!(
+            parse_args(&["--remove-rootfs", "/roots/a", "--version"]),
+            Ok(Invocation::Version)
+        ));
+    }
 
     #[test]
     fn rlimit_parses_a_shared_and_a_split_value() {

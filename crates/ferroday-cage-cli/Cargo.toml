@@ -5,7 +5,7 @@ description = "Run a command inside an unprivileged Linux sandbox from a shell p
 # its flags, exit codes, and output format, which a library release does not
 # necessarily change — and a library release that does break its own API need
 # not break the CLI's.
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

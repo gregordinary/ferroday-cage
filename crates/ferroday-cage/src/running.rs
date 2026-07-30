@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -96,6 +97,10 @@ pub struct Running<'obs> {
     reap: Option<OwnedFd>,
     /// The pump's read buffer, allocated once when capturing.
     buf: Vec<u8>,
+    /// Held only for its `Drop`: it removes the mount target the managed
+    /// profile created in the rootfs, if any. See
+    /// [`LaunchPlan::managed_placeholder`].
+    _placeholder: PlaceholderGuard,
 }
 
 /// Which captured stream a read belongs to.
@@ -120,13 +125,18 @@ impl<'obs> Running<'obs> {
                 observer.progress(event);
             }
         })?;
-        Ok(Running::from_launched(launched, observer))
+        Ok(Running::from_launched(
+            launched,
+            observer,
+            plan.managed_placeholder.clone(),
+        ))
     }
 
     /// Wraps the caller-side channels of an already-launched sandbox.
     pub(crate) fn from_launched(
         launched: mechanism::Launched,
         observer: Option<&'obs mut dyn Observer>,
+        placeholder: Option<PathBuf>,
     ) -> Running<'obs> {
         let buf = if observer.is_some() {
             vec![0; PUMP_BUF]
@@ -147,6 +157,7 @@ impl<'obs> Running<'obs> {
             kill_sent: Arc::new(AtomicBool::new(false)),
             reap: launched.reap,
             buf,
+            _placeholder: PlaceholderGuard { path: placeholder },
         }
     }
 
@@ -415,6 +426,54 @@ impl fmt::Debug for Running<'_> {
     }
 }
 
+/// Removes the mount target it holds when it goes out of scope.
+///
+/// A guard of its own, rather than a [`Drop`] on the handles that carry it,
+/// because a type implementing `Drop` keeps every borrow it holds live until
+/// the end of its scope. [`Running`] borrows the caller's observer, so a `Drop`
+/// there would stop a caller from reading its own observer after waiting — the
+/// ordinary way to collect captured output. The guard borrows nothing, so
+/// dropping it observes nothing.
+struct PlaceholderGuard {
+    /// The path to remove, taken when it is handed on instead.
+    path: Option<PathBuf>,
+}
+
+impl Drop for PlaceholderGuard {
+    fn drop(&mut self) {
+        remove_managed_placeholder(self.path.as_deref());
+    }
+}
+
+/// Removes a mount target the managed profile created in the rootfs, once the
+/// sandbox that needed it is gone.
+///
+/// Only an empty regular file is removed. The placeholder the profile creates
+/// is empty and stays that way — the bind covers it for the sandbox's whole
+/// life, and the mount is confined to the sandbox's own namespace, so nothing
+/// can write through it. Anything with content, or anything that is no longer a
+/// plain file, arrived between the build and here and belongs to whoever put it
+/// there.
+///
+/// Safe while the sandbox is still running, which a handle dropped without
+/// waiting leaves it: the bind is established inside the sandbox's own mount
+/// namespace, over its own root, so it holds the inode rather than this name.
+/// Unlinking here leaves the running sandbox's `/etc/resolv.conf` intact.
+///
+/// Best-effort, like the teardown around it. A failure leaves a file the rootfs
+/// did not ship, which is untidy but not a failure of the launch itself.
+fn remove_managed_placeholder(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() && meta.len() == 0 => {
+            let _ = std::fs::remove_file(path);
+        }
+        _ => {}
+    }
+}
+
 /// A detached signaling handle for a running sandbox.
 ///
 /// Obtained from [`Running::kill_handle`]; owns duplicated channel ends, so
@@ -484,6 +543,9 @@ pub struct Pending<'obs> {
     inner: Option<mechanism::PendingLaunch>,
     /// The observer bound at spawn, carried into the [`Running`] handle.
     observer: Option<&'obs mut dyn Observer>,
+    /// A mount target the managed profile created in the rootfs, handed to the
+    /// [`Running`] this becomes, or removed here if it never proceeds.
+    placeholder: PlaceholderGuard,
 }
 
 impl<'obs> Pending<'obs> {
@@ -501,6 +563,9 @@ impl<'obs> Pending<'obs> {
         Ok(Pending {
             inner: Some(inner),
             observer,
+            placeholder: PlaceholderGuard {
+                path: plan.managed_placeholder.clone(),
+            },
         })
     }
 
@@ -540,7 +605,11 @@ impl<'obs> Pending<'obs> {
                 observer.progress(event);
             }
         })?;
-        Ok(Running::from_launched(launched, observer))
+        Ok(Running::from_launched(
+            launched,
+            observer,
+            self.placeholder.path.take(),
+        ))
     }
 }
 
@@ -562,6 +631,7 @@ impl Drop for Pending<'_> {
         if let Some(inner) = self.inner.take() {
             inner.abandon();
         }
+        // The guard field removes the placeholder as this drops.
     }
 }
 

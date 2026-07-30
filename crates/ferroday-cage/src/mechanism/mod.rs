@@ -96,6 +96,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
+use rustix::fs::RawMode;
 use rustix::io::Errno;
 use rustix::mount::MountFlags;
 use rustix::net::{
@@ -276,6 +277,20 @@ pub(crate) struct LaunchPlan {
     /// Caller-side labels parallel to `ops`, naming each mount in a setup
     /// error. Never touched by the sandbox stages.
     pub(crate) op_labels: Vec<String>,
+    /// A mount target the managed profile has to create in the rootfs, as an
+    /// absolute host path, removed once the sandbox that needed it is gone.
+    ///
+    /// A bind needs its target to exist before anything can be mounted onto it,
+    /// so the managed `/etc/resolv.conf` bind of host networking creates an
+    /// empty file when the rootfs ships none. Left behind, that file is a
+    /// resolver configuration the rootfs did not have, which an export carries
+    /// into whatever is made of the tree. The caller side removes it after the
+    /// launch instead — the sandbox owns what it creates. `None` when the
+    /// rootfs already ships the file, or when the bind is not made at all.
+    ///
+    /// Caller-side only, and never touched by the sandbox stages: inside the
+    /// sandbox the path is under the bind, where unlinking it is `EBUSY`.
+    pub(crate) managed_placeholder: Option<std::path::PathBuf>,
     /// The caller-side label naming the command in a failed exec step: the
     /// program path, or the bare name and the candidates a path lookup tried.
     /// Never touched by the sandbox stages.
@@ -458,15 +473,32 @@ impl HardeningPlan {
 /// pre-pivot window.
 #[derive(Debug, Clone)]
 pub(crate) struct MountOp {
-    /// Mount-target directories to create first: (parent, leaf) pairs, the
-    /// parent being rootfs-relative and the empty string meaning the rootfs
-    /// itself. Existing entries are left alone.
-    pub(crate) dirs: Vec<(CString, CString)>,
+    /// Mount-target directories to create first, outermost first. Existing
+    /// entries are left alone.
+    pub(crate) dirs: Vec<MountDir>,
     /// A rootfs-relative file to create (empty, mode 0644) as the target of
     /// a file bind.
     pub(crate) create_file: Option<CString>,
     /// The mount action itself.
     pub(crate) action: MountAction,
+}
+
+/// One mount-target directory to create, and the mode to create it at.
+///
+/// A mount point the sandbox creates outlives the sandbox: it persists in the
+/// rootfs directory on the host, and a provisioned tree carries it into
+/// whatever is made of the tree afterwards. Its mode is therefore part of what
+/// a launch contributes, and is stated here rather than left to the mount that
+/// covers it — which hides the mode for as long as it is mounted.
+#[derive(Debug, Clone)]
+pub(crate) struct MountDir {
+    /// The rootfs-relative directory to create it in; the empty string is the
+    /// rootfs itself.
+    pub(crate) parent: CString,
+    /// The directory's own name.
+    pub(crate) leaf: CString,
+    /// The mode to create it at, applied exactly.
+    pub(crate) mode: RawMode,
 }
 
 /// The action a [`MountOp`] performs once its target exists.
