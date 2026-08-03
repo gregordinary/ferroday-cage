@@ -162,6 +162,12 @@ needs nothing more — and [`repository`] merges in additional sources. A
 [`Repository`] carries an ordered list of mirror URLs, and the two things a
 caller reaches for both fall out of that one type.
 
+Every mirror URL is fetched through the configured transport, and the built-in
+one speaks `http://` and `file://` only. An `https://` mirror therefore needs a
+transport of the caller's own, supplied through [`fetcher`]; see
+[Trust](#trust). It is the archive signature, not the transport, that
+authenticates a package.
+
 **Distinct sources in one resolution.** A local trusted pool of a build's own
 `.deb`s and one or more signed feature repositories are separate repositories,
 each with its own trust anchor, contributing packages to a single dependency

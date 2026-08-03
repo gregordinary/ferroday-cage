@@ -325,6 +325,104 @@ fn tcp_delivers_a_bulk_transfer_that_ends_in_a_prompt_close() {
     );
 }
 
+/// A host listener that answers each connection the way a `Connection: close`
+/// server does — read the request, write a short response, close — and serves
+/// `connections` of them one after another. Returns its port.
+///
+/// The close comes from the host, which is the point of the fixture: the stack
+/// forwards it as the first FIN, so each finished exchange leaves the stack's
+/// guest-facing socket in TIME_WAIT.
+fn closing_listener(connections: usize) -> u16 {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    let port = listener
+        .local_addr()
+        .expect("the listener has an address")
+        .port();
+    std::thread::spawn(move || {
+        for _ in 0..connections {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read the request out first: closing with the peer's bytes still
+            // unread makes the kernel send a reset instead of the FIN this
+            // fixture is about.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 256];
+            while let Ok(read) = stream.read(&mut buf) {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            // Dropping the stream closes the connection from the host side.
+        }
+    });
+    port
+}
+
+#[test]
+fn back_to_back_connections_are_not_capped_by_finished_ones() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    // Comfortably more than the stack's 128 flow slots, so a stack that held a
+    // slot for each finished exchange would run out. smoltcp keeps a closed
+    // socket in TIME_WAIT for ten seconds, which would put the ceiling at
+    // 12.8 connections a second; the guest below runs far faster than that, and
+    // reports how many it completed either way.
+    const CONNECTIONS: usize = 160;
+    let port = closing_listener(CONNECTIONS);
+
+    // wget is the client because it does not half-close before reading the
+    // response: the host closes first, which is the shape that ends in
+    // TIME_WAIT. nc would half-close as soon as its stdin ended, and the guest
+    // closing first never reaches that state.
+    let mut observer = Collect::default();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!(
+                "i=0; while [ $i -lt {CONNECTIONS} ]; do \
+                 /usr/bin/wget -q -O /dev/null http://10.0.2.2:{port}/ || break; \
+                 i=$((i+1)); done; echo $i"
+            ),
+        ])
+        .build()
+        .expect("a valid sandbox configuration");
+    let pending = cage
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = NetStack::builder()
+        .host_loopback(true)
+        .build()
+        .expect("a valid stack configuration")
+        .attach(&pending)
+        .expect("the stack attaches");
+    let mut running = pending.proceed().expect("the command is released");
+    let status = running
+        .wait_timeout(Duration::from_secs(120))
+        .expect("the wait completes")
+        .expect("the command exits before the deadline");
+    handle.stop().expect("the stack stops cleanly");
+
+    assert!(status.success(), "the guest's loop ran to completion");
+    assert_eq!(
+        String::from_utf8_lossy(&observer.stdout).trim(),
+        CONNECTIONS.to_string(),
+        "every connection was admitted; a lower count is the flow table \
+         filling with exchanges that are already over",
+    );
+}
+
 #[test]
 fn the_default_policy_blocks_a_host_local_service() {
     let Some(rootfs) = common::fixture_rootfs() else {

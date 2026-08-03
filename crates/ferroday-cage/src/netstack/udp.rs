@@ -252,6 +252,12 @@ impl UdpTables {
 
     /// Reads each host socket's replies and sends them back to the guest,
     /// stamped with the original destination as their source.
+    ///
+    /// A reply is taken off the host socket only once the guest's ring has a
+    /// slot for it, since `recv` consumes the datagram: judging the room
+    /// afterwards would discard the one already in hand along with leaving its
+    /// successors queued. The interface drains that ring on every poll, so a
+    /// deferred reply waits one pass rather than being lost.
     fn host_to_guest(&mut self, sockets: &mut SocketSet<'static>, now: Instant) -> bool {
         let mut progress = false;
         let UdpTables {
@@ -268,6 +274,12 @@ impl UdpTables {
             let ceiling = deliverable(*mtu, &flow.destination);
             let socket = sockets.get_mut::<udp::Socket>(port.handle);
             for _ in 0..REPLY_BATCH {
+                // Ask before taking: the guest's ring must have a metadata slot
+                // free, or the datagram this pass reads would have nowhere to
+                // go and be lost with it.
+                if !socket.can_send() {
+                    break;
+                }
                 // A zero-length read is a zero-length datagram, not end of
                 // stream: a datagram socket has no end of stream, and the drain
                 // ends on `EAGAIN` below. Forwarding it keeps the empty
@@ -294,10 +306,12 @@ impl UdpTables {
                             meta: Default::default(),
                         };
                         if socket.send_slice(&scratch[..len], meta).is_err() {
-                            // The guest's transmit ring is full: it is not
-                            // keeping up, so reading further replies would only
-                            // discard them. Leave the rest on the host socket
-                            // for the next pass.
+                            // The metadata slot checked for above was there but
+                            // the ring's payload bytes were not: a large
+                            // datagram can exhaust those while slots remain.
+                            // The relay accepts that much loss — UDP is lossy,
+                            // and the ring drains on the next interface poll.
+                            // Leave the replies behind it on the host socket.
                             break;
                         }
                     }
@@ -502,6 +516,49 @@ mod tests {
             socket.send_queue(),
             b"answer".len(),
             "the reply behind the empty datagram reached the guest",
+        );
+    }
+
+    #[test]
+    fn a_reply_is_left_unread_while_the_guest_ring_is_full() {
+        // `recv` consumes the datagram, so a drain that read first and looked
+        // for room afterwards would drop the reply it had just taken. Checking
+        // first leaves it on the host socket, where the next pass — after the
+        // interface has drained the ring — picks it up.
+        let mut tables = UdpTables::new(1500);
+        let mut sockets = SocketSet::new(Vec::new());
+        tables.ensure_port(53, &mut sockets);
+        let (flow_side, peer) = host_pair();
+        let flow = flow_over(flow_side);
+        {
+            let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+            for _ in 0..PACKET_SLOTS {
+                let meta = udp::UdpMetadata {
+                    endpoint: flow.guest,
+                    local_address: Some(flow.destination.addr),
+                    meta: Default::default(),
+                };
+                socket
+                    .send_slice(b"queued", meta)
+                    .expect("the ring holds one datagram per slot");
+            }
+            assert!(!socket.can_send(), "every metadata slot is taken");
+        }
+        rustix::net::send(&peer, b"answer", SendFlags::NOSIGNAL).unwrap();
+        let before = flow.last_active;
+        tables.flows.push(flow);
+
+        assert!(
+            !tables.host_to_guest(&mut sockets, Instant::now()),
+            "a pass that can deliver nothing moves nothing",
+        );
+        assert_eq!(
+            tables.flows[0].last_active, before,
+            "an untouched flow is not refreshed",
+        );
+        assert!(
+            !drained(&tables.flows[0]),
+            "the reply is still on the host socket",
         );
     }
 

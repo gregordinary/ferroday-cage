@@ -360,9 +360,15 @@ fn resolve_redirect(base: &str, location: &str) -> String {
 /// Parses an `http://host[:port]/path` URL.
 fn parse_http_url(url: &str) -> Result<HttpUrl, FetchError> {
     let bad = |reason: &str| FetchError::url(url, reason);
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| bad("only http:// and file:// URLs are supported"))?;
+    // The remedy is named, not just the constraint: the scheme is refused
+    // because this fetcher carries no TLS, which a caller reads as a broken URL
+    // unless told that supplying a transport is how an https:// mirror works.
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        bad(
+            "this fetcher speaks only http:// and file://; an https:// mirror needs a Fetch \
+             implementation of your own, set with DebianBuilder::fetcher",
+        )
+    })?;
     let (authority, path) = match rest.find('/') {
         Some(slash) => (&rest[..slash], &rest[slash..]),
         None => (rest, "/"),
@@ -677,10 +683,18 @@ mod tests {
 
     #[test]
     fn non_http_schemes_are_rejected() {
-        assert!(matches!(
-            parse_http_url("https://host/x"),
-            Err(FetchError::Url { .. })
-        ));
+        let Err(err) = parse_http_url("https://host/x") else {
+            panic!("https is not this fetcher's scheme");
+        };
+        assert!(matches!(err, FetchError::Url { .. }));
+        // The refusal points at the transport a TLS mirror needs rather than
+        // reading as a malformed URL, which is the whole of the diagnosis for a
+        // caller who has just typed a perfectly good https:// address.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("DebianBuilder::fetcher"),
+            "the scheme refusal must name the remedy, got {rendered}",
+        );
     }
 
     #[test]

@@ -18,10 +18,14 @@
 //! destinations are refused, with one deliberate exception —
 //! [`host_loopback`](NetStackBuilder::host_loopback) maps connections to
 //! the gateway address onto the host's loopback. A refused TCP connection is
-//! answered with a reset. A refused UDP datagram is dropped, and whether the
-//! guest also receives an ICMP port-unreachable depends on whether the stack
-//! happens to hold a socket on that port for some other destination, so a
-//! caller must not read anything into either outcome.
+//! answered with a reset, with one exception: the guest's own subnet is
+//! on-link from the guest's point of view, so it resolves a hardware address
+//! before it sends a segment, and the stack answers address resolution only
+//! for the gateway. Those destinations fail when the guest's own resolution
+//! gives up rather than on a reset. A refused UDP datagram is dropped, and
+//! whether the guest also receives an ICMP port-unreachable depends on
+//! whether the stack happens to hold a socket on that port for some other
+//! destination, so a caller must not read anything into either outcome.
 //!
 //! Attachment happens in a forked, short-lived helper process that joins
 //! the sandbox's user and network namespaces, creates and configures the

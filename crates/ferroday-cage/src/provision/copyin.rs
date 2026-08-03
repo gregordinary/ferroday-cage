@@ -48,15 +48,7 @@ const DATA_BUF: usize = 65536;
     feature = "tarball",
     doc = "the map to *read* a tree at the ownership it intends; this forks one to"
 )]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "*write* one. The source tree's ids are interpreted as in-rootfs ids, which"
-)]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "is what a tar extraction does and what lets a tree ship a file owned by a"
-)]
-#[cfg_attr(feature = "tarball", doc = "target uid.")]
+#[cfg_attr(feature = "tarball", doc = "*write* one.")]
 #[cfg_attr(feature = "tarball", doc = "")]
 #[cfg_attr(
     feature = "tarball",
@@ -79,10 +71,16 @@ const DATA_BUF: usize = 65536;
     doc = "everything it can create — a named pipe included — and names the rest."
 )]
 #[cfg_attr(feature = "tarball", doc = "")]
+/// A source entry's host ownership is read back through the map to the id it
+/// means inside the rootfs. So a tree an earlier mapped sandbox produced copies
+/// in owned as it was written, and a tree the caller staged as themselves lands
+/// as whatever id the map gives the calling user — root, under a
+/// [`Single`](IdentityMap::Single) map.
+///
 /// That is the thing a plain `cp` structurally cannot do. `cp` runs as the
 /// calling user, which can create a file owned by nobody else, so a tree laid
-/// into a rootfs by hand arrives owned by the caller — and under a range map
-/// that reads as root inside, whatever the source intended.
+/// into a rootfs by hand arrives owned by the caller's own host id, whatever the
+/// source intended — an id a range-mapped rootfs has no name for at all.
 ///
 /// The destination must already exist. Entries are added to it: a directory the
 /// rootfs already carries is kept and descended into, and a file, symlink, or

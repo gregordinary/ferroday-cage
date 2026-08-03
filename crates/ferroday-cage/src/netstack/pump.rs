@@ -18,7 +18,12 @@
 //! The interface owns the gateway addresses, answers ARP, neighbor
 //! discovery, and ICMP echo for them itself, and accepts any destination
 //! (`any_ip`) so the sniffed listeners see segments addressed to the wider
-//! world.
+//! world. `any_ip` covers only what the interface receives, not what it
+//! answers for: an address on the guest's own subnet other than the gateway
+//! is on-link as far as the guest is concerned, so the guest asks for its
+//! hardware address and nothing replies. No segment for such a destination
+//! ever reaches the stack, which is why that refusal alone is not a reset —
+//! see [`host_target`].
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
@@ -443,6 +448,15 @@ impl Engine {
 ///   stack. Forwarding it would send the guest's on-link traffic to the host's
 ///   view of those addresses instead, colliding with a real LAN wherever the two
 ///   overlap. This subsumes the subnet's broadcast address.
+///
+/// Every refusal but the guest's own subnet is answered with a reset: the guest
+/// routes those destinations through the gateway, so its segment arrives, finds
+/// no listener waiting for it, and the interface resets it. The subnet is
+/// different in kind. Those addresses are on-link, so the guest resolves a
+/// hardware address before sending anything, and the interface answers ARP and
+/// neighbor discovery only for the addresses it owns — the gateway. Nothing
+/// replies, and the connection fails when the guest's own address resolution
+/// gives up.
 ///
 /// The refusals do not shield a host service bound to a wildcard address
 /// (`0.0.0.0` or `::`): that service is reachable through the host's own

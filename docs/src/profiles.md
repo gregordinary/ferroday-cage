@@ -39,7 +39,9 @@ pid-namespace = true        # default true
 mount-proc = true           # default true
 mount-dev = true            # default true
 mount-tmp = true            # default true
-resolv-conf = true          # default true; effective only with network = "host"
+resolv-conf = true          # default true; binds the host resolv.conf with
+                            # network = "host", and governs the one fcage
+                            # composes for --netstack
 managed-mounts = true       # default true; false establishes none of the four
                             # above, nor any managed mount a later release adds
 base-env = true             # default true; false gives the command exactly the

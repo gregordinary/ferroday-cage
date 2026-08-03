@@ -120,13 +120,17 @@ unrecoverable error, which `stop` then reports.
 
 Each attachment bounds what one guest can consume: a guest serves at most 128
 concurrent TCP flows and tracks at most 256 UDP flows, and each is backed by a
-host socket. Those caps are per attachment, not per process. The pump and every
-host socket run in the caller's own process, so several attachments in one
-process draw on one shared descriptor table and one heap; the per-guest caps do
-not partition those shared resources between attachments. A guest that fills its
-own budget can therefore consume enough host descriptors to affect a co-resident
-attachment, or the caller's own descriptor-opening operations, once the
-process's `RLIMIT_NOFILE` is reached.
+host socket. The TCP cap counts flows in flight rather than connections made: a
+flow's slot, its buffers, and its host socket are released once the exchange has
+closed on both sides, whichever side closed first, so a guest opening and
+closing connections back to back is not throttled by the table. Those caps are
+per attachment, not per process. The pump and every host socket run in the
+caller's own process, so several attachments in one process draw on one shared
+descriptor table and one heap; the per-guest caps do not partition those shared
+resources between attachments. A guest that fills its own budget can therefore
+consume enough host descriptors to affect a co-resident attachment, or the
+caller's own descriptor-opening operations, once the process's `RLIMIT_NOFILE`
+is reached.
 
 The native stack is accordingly intended for one — or a few mutually trusted —
 sandboxes per process. A caller that must isolate untrusted tenants from one
@@ -143,7 +147,8 @@ reset, so denial costs the guest nothing; a refused UDP datagram is simply
 dropped, and whether the guest also receives an ICMP port-unreachable depends
 on whether the stack happens to hold a socket on that port for another
 destination — read nothing into either outcome. Refusing loopback keeps the
-sandbox away from services bound to the host's `127.0.0.1`.
+sandbox away from services bound to the host's `127.0.0.1`. One refusal reaches
+the guest by silence rather than by a reset; it is described below.
 
 Two refusals follow from the same principle. The IPv4 `0.0.0.0/8` block is
 refused in full rather than only the unspecified address, and an IPv6 address
@@ -154,11 +159,25 @@ private link between the guest and the stack, and forwarding it would send the
 guest's on-link traffic to the host's view of those addresses, which collides
 with a real LAN wherever the default `10.0.2.0/24` overlaps one.
 
+That subnet refusal is the silent one. Those addresses are on-link from the
+guest's point of view, so it resolves a hardware address before it sends a
+segment, and the stack answers ARP and neighbor discovery only for the gateway.
+Nothing replies, and the connection fails a few seconds later, when the guest's
+own address resolution gives up.
+
 The gateway address is the one deliberate exception. With
 [`host_loopback(true)`][`NetStackBuilder::host_loopback`], a connection to the
 gateway (`10.0.2.2` or `fd00::2` by default) is forwarded to the host's
-loopback, port preserved — the conventional way to reach a host-local service,
-granted explicitly rather than by opening the whole loopback range.
+`127.0.0.1` or `::1`, port preserved — the conventional way to reach a
+host-local service, granted explicitly rather than by opening the whole
+loopback range.
+
+The mapping lands on that one address, so it reaches a host service only if the
+service is bound there. A service on another loopback address is not reached,
+and systemd-resolved's `127.0.0.53` stub is the case that catches people out:
+it is a loopback destination like any other, so the guest cannot address it
+directly, and the gateway mapping goes to `127.0.0.1` where the stub is not
+listening.
 
 ### One datagram, one packet
 
@@ -192,6 +211,13 @@ the sandbox at a public resolver, or address services by IP. The
 apply the first rule. Large answers have a size ceiling of their own — see
 [One datagram, one packet](#one-datagram-one-packet).
 
+Reaching a host-local resolver through the gateway is the remaining option,
+and it has a precise requirement: the resolver must listen on `127.0.0.1`,
+because that is the only address the gateway maps onto. Give the sandbox a
+`resolv.conf` naming the gateway address and enable
+[`host_loopback`][`NetStackBuilder::host_loopback`]. This does not work for
+systemd-resolved's stub as shipped, which listens on `127.0.0.53` instead.
+
 ### One namespace move, on a helper process
 
 Joining the sandbox's network namespace requires `CAP_SYS_ADMIN` in the
@@ -212,14 +238,18 @@ fcage --rootfs ./alpine --netstack /usr/bin/wget -qO- http://example.org
 ```
 
 `--netstack-cidr` and `--netstack-mtu` configure the interface, and
-`--netstack-host-loopback` maps the gateway address onto host loopback.
+`--netstack-host-loopback` maps the gateway address onto host `127.0.0.1`.
 `--netstack` composes the sandbox's `resolv.conf` from the host's routable
-nameservers, warning instead when the host offers only loopback resolvers;
-`--no-resolv-conf` opts out, and so does `--no-managed-mounts`, whose promise is
-that the sandbox carries exactly the binds the command line names. A rootfs that
-ships no `/etc/resolv.conf` gets one created to mount onto and taken away again
-afterwards, as every file bind target does. The flag conflicts with `--share-net`
-and with `--restrict`.
+nameservers. A host offering only loopback resolvers composes nothing and warns:
+the sandbox keeps whatever `resolv.conf` its rootfs ships, which may name a
+routable resolver and work perfectly well, so the warning reports what was not
+composed rather than predicting the run's DNS. `--no-resolv-conf` opts out of
+the composition, and so does `--no-managed-mounts`, whose promise is that the
+sandbox carries exactly the binds the command line names; a profile setting
+either toggle governs it the same way. A rootfs that ships no
+`/etc/resolv.conf` gets one created to mount onto and taken away again
+afterwards, as every file bind target does. The flag conflicts with
+`--share-net` and with `--restrict`.
 
 ### A worked example
 

@@ -14,11 +14,14 @@
 //! Each direction half-closes independently. A guest FIN, once the receive
 //! buffer drains, becomes a write shutdown on the host socket; end of
 //! stream from the host, once copied out, becomes a close of the smoltcp
-//! socket, which sends the guest a FIN after the in-flight data. A failure
-//! on either side — a failed or refused host connect, a host socket error,
-//! a reset from the guest — aborts the other side. A flow that has not
-//! established both sides within [`ESTABLISH_DEADLINE`] is aborted, which
-//! bounds what a connection flood can pin.
+//! socket, which sends the guest a FIN after the in-flight data. Where the
+//! host closed first the guest's answering FIN leaves the smoltcp socket in
+//! TIME_WAIT, which the flow collapses rather than hold a slot through (see
+//! [`TcpFlow::only_time_wait_remains`]). A failure on either side — a failed
+//! or refused host connect, a host socket error, a reset from the guest —
+//! aborts the other side. A flow that has not established both sides within
+//! [`ESTABLISH_DEADLINE`] is aborted, which bounds what a connection flood
+//! can pin.
 //!
 //! An established flow whose guest stops reading fills the transmit buffer, so
 //! no forwarding is possible until the guest reads again. Such a flow stays
@@ -146,8 +149,9 @@ pub(super) struct TcpFlow {
     /// The destination the guest addressed, the other half.
     pub(super) destination: IpEndpoint,
     /// The host-side socket, nonblocking from creation. Dropped once both
-    /// half-closes complete, releasing the descriptor while the guest socket
-    /// finishes its own close (TIME_WAIT) rather than holding it until then.
+    /// half-closes complete, so the descriptor is released the moment the host
+    /// side is done rather than held while the guest socket finishes its own
+    /// close.
     host: Option<OwnedFd>,
     /// Whether the host connect has completed.
     connected: bool,
@@ -365,11 +369,16 @@ impl TcpFlow {
 
         // Both directions have half-closed: the host socket is done both ways,
         // so release its descriptor now rather than hold it while the guest
-        // socket works through its own close (TIME_WAIT). The flow lingers
-        // until the guest side reaches Closed, but no host descriptor with it.
+        // socket works through its own close.
         if self.host_eof && self.host_shutdown && self.host.is_some() {
             self.host = None;
             progress = true;
+        }
+
+        // Nothing is left of the flow but the guest-facing socket's TIME_WAIT,
+        // so collapse it and end the flow here.
+        if self.only_time_wait_remains(socket.state()) {
+            socket.abort();
         }
 
         // A fully closed guest socket ends the flow; dropping the host
@@ -379,6 +388,36 @@ impl TcpFlow {
             progress = true;
         }
         progress
+    }
+
+    /// Whether the exchange is over and only the guest-facing socket's
+    /// TIME_WAIT is still holding the flow's slot.
+    ///
+    /// That is the state a host-closes-first exchange ends in — `Connection:
+    /// close` HTTP and most short request/response protocols — because the
+    /// stack sends the first FIN and the guest answers it. smoltcp then holds
+    /// the socket in TIME_WAIT for ten seconds, over which the flow would go on
+    /// counting against [`MAX_FLOWS`] and pinning its two [`BUFFER_SIZE`]
+    /// buffers: a sustained rate above `MAX_FLOWS` per ten seconds would fill
+    /// the table with remnants and see every further connection refused. The
+    /// flow is collapsed instead, which also keeps a fresh connection reusing
+    /// the same endpoint pair from being taken for a retransmission of the
+    /// finished one.
+    ///
+    /// Collapsing is safe because of what this link is. TIME_WAIT absorbs
+    /// delayed duplicates from an earlier incarnation of the connection and
+    /// covers the loss of the final acknowledgement. Neither can happen between
+    /// a guest kernel, one tap queue, and this pump: the path is single-hop and
+    /// in order, so no segment can arrive late, and the guest's kernel finishes
+    /// its own close on its own schedule. The abort emits at most a reset, which
+    /// arrives at a socket the guest has already closed and is discarded.
+    ///
+    /// Both half-closes must be complete, not merely the socket's state: a guest
+    /// that sends data and its FIN together reaches TIME_WAIT with bytes still
+    /// queued for the host, and those are forwarded — which is what sets
+    /// `host_shutdown` — before the flow is finished with.
+    fn only_time_wait_remains(&self, state: tcp::State) -> bool {
+        self.host_eof && self.host_shutdown && state == tcp::State::TimeWait
     }
 
     /// Whether both sides are past their handshakes.
@@ -779,6 +818,47 @@ mod tests {
         assert_eq!(flow.deadline_in(socket, expired), None);
         flow.enforce_deadline(socket, expired);
         assert!(!flow.dead, "an established flow outlives the deadline");
+    }
+
+    #[test]
+    fn a_finished_close_is_collapsed_out_of_time_wait() {
+        // A host-closes-first exchange ends with the guest-facing socket in
+        // TIME_WAIT, where it would hold a flow slot and two buffers for ten
+        // seconds. Once both half-closes are through there is nothing left to
+        // wait for, and the flow says so.
+        let (_sockets, handle) = guest_socket();
+        let (mut flow, _peer) = connected_flow(handle);
+        flow.host_eof = true;
+        flow.host_shutdown = true;
+        assert!(flow.only_time_wait_remains(tcp::State::TimeWait));
+
+        // Every earlier state has something still outstanding: an
+        // acknowledgement, the guest's own FIN, or live traffic.
+        for state in [
+            tcp::State::Established,
+            tcp::State::FinWait1,
+            tcp::State::FinWait2,
+            tcp::State::Closing,
+            tcp::State::CloseWait,
+            tcp::State::LastAck,
+            tcp::State::Closed,
+        ] {
+            assert!(!flow.only_time_wait_remains(state), "{state}");
+        }
+    }
+
+    #[test]
+    fn a_time_wait_socket_with_bytes_still_to_forward_is_left_alone() {
+        // The guest may send data after the stack's FIN and close in the same
+        // breath, which reaches TIME_WAIT with those bytes still queued for the
+        // host. Collapsing on the state alone would discard them; the host
+        // half-close is what says they have been passed on.
+        let (_sockets, handle) = guest_socket();
+        let (mut flow, _peer) = connected_flow(handle);
+        flow.host_eof = true;
+        assert!(!flow.only_time_wait_remains(tcp::State::TimeWait));
+        flow.host_shutdown = true;
+        assert!(flow.only_time_wait_remains(tcp::State::TimeWait));
     }
 
     #[test]

@@ -6,13 +6,17 @@
 //! same poll that ingests the SYN. The classifier is a pure function over
 //! `smoltcp::wire`, with no state and no side effects.
 //!
-//! Only cleanly parsed frames classify. IPv6 extension headers are not
-//! walked: a connection-opening segment behind one classifies as
-//! [`Sniff::Other`], leaving it to the interface, which answers an
-//! unmatched segment with a reset. Checksums are not verified here; the
-//! interface remains the arbiter of validity, and a listener created for
-//! a segment the interface then discards is reaped by the establish
-//! deadline.
+//! Only cleanly parsed, unfragmented frames classify. IP fragmentation is
+//! not compiled in, so the interface rejects every fragment before it
+//! reaches a socket; classifying one would create state for a frame that
+//! is about to be discarded, so an IPv4 fragment classifies as
+//! [`Sniff::Other`] here too. IPv6 needs no such rule, since its fragment
+//! header is an extension header and extension headers are not walked: a
+//! connection-opening segment behind one classifies as [`Sniff::Other`],
+//! leaving it to the interface, which answers an unmatched segment with a
+//! reset. Checksums are not verified here; the interface remains the
+//! arbiter of validity, and a listener created for a segment the interface
+//! then discards is reaped by the establish deadline.
 
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpAddress, IpEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet,
@@ -51,6 +55,15 @@ pub(super) fn classify(frame: &[u8]) -> Sniff {
             let Ok(packet) = Ipv4Packet::new_checked(ethernet.payload()) else {
                 return Sniff::Other;
             };
+            // Reassembly is not compiled in, so the interface rejects every
+            // fragment. A first fragment does carry a transport header and
+            // would classify on it; a later one carries the middle of a
+            // datagram and would classify on whatever those bytes say. Either
+            // way the state raised for it — a flow, a port socket — would serve
+            // traffic that never reaches a socket.
+            if packet.more_frags() || packet.frag_offset() != 0 {
+                return Sniff::Other;
+            }
             classify_transport(
                 packet.next_header(),
                 IpAddress::Ipv4(packet.src_addr()),
@@ -231,6 +244,50 @@ mod tests {
             packet.payload_mut()[..ip_payload.len()].copy_from_slice(&ip_payload);
         }
         frame
+    }
+
+    /// Rewrites an IPv4 frame's fragmentation fields in place: the first
+    /// fragment of a datagram when `offset` is zero and `more` is set, a later
+    /// one otherwise. The header checksum is refilled so the frame stays
+    /// well-formed.
+    fn fragment(frame: &mut [u8], offset: u16, more: bool) {
+        let mut ethernet = EthernetFrame::new_unchecked(frame);
+        let mut packet = Ipv4Packet::new_unchecked(ethernet.payload_mut());
+        packet.set_dont_frag(false);
+        packet.set_more_frags(more);
+        packet.set_frag_offset(offset);
+        packet.fill_checksum();
+    }
+
+    #[test]
+    fn a_fragmented_syn_is_not_a_connection_attempt() {
+        // A first fragment does carry a complete TCP header, so it would
+        // otherwise classify as a connection attempt — but reassembly is not
+        // compiled in, so the interface rejects it and no socket ever sees it.
+        // Acting on it would start a real host connect and hold a flow slot to
+        // the establish deadline for traffic the guest cannot complete.
+        let mut frame = tcp_frame(false, TcpControl::Syn, None);
+        fragment(&mut frame, 0, true);
+        assert_eq!(classify(&frame), Sniff::Other);
+    }
+
+    #[test]
+    fn a_later_fragment_is_not_read_as_a_transport_header() {
+        // A non-first fragment's payload is the middle of a datagram, not a
+        // header; reading ports out of it yields whatever the bytes say.
+        let mut frame = tcp_frame(false, TcpControl::Syn, None);
+        fragment(&mut frame, 8, false);
+        assert_eq!(classify(&frame), Sniff::Other);
+    }
+
+    #[test]
+    fn an_unfragmented_syn_still_classifies() {
+        // The fragmentation check must turn on the fragmentation fields alone:
+        // an ordinary datagram sets neither, and clearing "don't fragment"
+        // makes a packet fragmentable, not a fragment.
+        let mut frame = tcp_frame(false, TcpControl::Syn, None);
+        fragment(&mut frame, 0, false);
+        assert!(matches!(classify(&frame), Sniff::TcpSyn { .. }));
     }
 
     #[test]

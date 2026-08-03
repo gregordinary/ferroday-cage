@@ -14,7 +14,100 @@ affected.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- An archive whose signing key had its expiration removed by a later
+  self-signature verifies again. A key created with a finite lifetime and later
+  re-dated to never expire carries two self-signatures, the newer one simply
+  omitting the key-expiration subpacket — which is how an expiry is removed. The
+  expiry was read from the newest self-signature that *set* one, so the
+  superseded lifetime governed forever and every release signed after it was
+  refused with "the release signature was made after its signing key expired".
+  Extending a key rather than rotating it is the ordinary practice, so the
+  archives this made unusable were not unusual ones.
+
+  The expiry is now whatever the governing self-signature says, present or
+  absent, and a signature governs the object it was made over: the key itself,
+  for a direct-key signature, or one user id, for a certification. Recency is
+  compared within an object, so a user id added later does not lift an expiry
+  set on another, and where objects disagree the earliest expiry governs. A
+  deliberate shortening still takes effect, being the newest signature over its
+  object. Self-signatures must now verify cryptographically as issued by the
+  primary before they are read, absence of a subpacket carrying as much meaning
+  as its presence.
+
+- `provision::CopyIn`'s type documentation described the identity translation
+  backwards, saying a source tree's ids are interpreted as in-rootfs ids. They
+  are read the other way, through the map, exactly as an export reads them; the
+  copy has always behaved that way and the rest of the documentation described
+  it correctly. Read the wrong way round, the paragraph implied a caller-owned
+  staged tree lands owned by the calling user inside the rootfs rather than as
+  root, which is the difference between a working `/etc` and a broken one.
+
+- `fcage`: a profile setting `resolv-conf` or `managed-mounts` now governs the
+  `resolv.conf` composed for `--netstack`, as the matching flag always has. The
+  composition consulted the command line alone, so a profile opting out of the
+  bind was ignored under `--netstack` and `--resolv-conf` could not override a
+  profile that had — the one direction the flag exists to cover.
+
+- The native network stack no longer holds a flow slot for the ten seconds a
+  finished TCP exchange spends in `TIME_WAIT`. Where the host closes first —
+  `Connection: close` HTTP and most short request/response protocols — the stack
+  sends the first FIN, so the guest's answer left the flow lingering with its
+  slot and its two 64 KiB buffers still held. A guest connecting faster than
+  about thirteen times a second filled the 128-flow table with exchanges that
+  were already over, and every further connection was refused with a reset and
+  no diagnostic. A flow closed on both sides is now finished with at once, which
+  also stops a fresh connection reusing the endpoint pair from landing on the
+  spent one and waiting out a retransmission timeout.
+
+- The native network stack no longer acts on IPv4 fragments. Reassembly is not
+  compiled in, so its interface discards every fragment before one reaches a
+  socket — but the classifier that runs ahead of the interface read a first
+  fragment's TCP header as a connection attempt and started a real outbound host
+  connect for it, holding a flow slot until the establish deadline, and read a
+  later fragment's payload bytes as a transport header. Fragments now classify
+  as traffic the classifier has nothing to say about, which is what the
+  interface then does with them. The forwarding policy was never affected: a
+  destination address is read from the IP header and was checked throughout.
+
+- A UDP reply is no longer lost when the guest's receive ring is momentarily
+  full. The relay took the datagram off the host socket before asking whether it
+  could be handed on, so a refused hand-off discarded the reply already in hand
+  while leaving the ones behind it queued. It now asks first, and a reply it
+  cannot place stays on the host socket for the next pass, after the interface
+  has drained the ring.
+
+- The native network stack documented every refused TCP destination as answered
+  with a reset. That holds for the destinations the guest routes through the
+  gateway, but not for the guest's own subnet: those addresses are on-link, so
+  the guest resolves a hardware address before it sends a segment, and the stack
+  answers ARP and neighbor discovery only for the gateway. Such a connection
+  fails when the guest's own address resolution gives up, a few seconds later,
+  and the module documentation, the policy function, and the guide now say so.
+
+### Changed
+
+- The mirror setters document that the built-in fetcher speaks `http://` and
+  `file://` only, so an `https://` mirror needs a transport supplied through
+  `DebianBuilder::fetcher`. The fetcher's own refusal names that remedy too,
+  rather than reporting an unsupported scheme as though the URL were malformed.
+
+- `fcage`: the warning raised when the host's nameservers are all on loopback no
+  longer claims the sandbox has no working DNS. Composing nothing leaves the
+  `resolv.conf` the rootfs ships, which may name a routable resolver and resolve
+  perfectly well, so the warning states what was not composed and leaves the
+  outcome to the run.
+
+- `fcage`: `--netstack-host-loopback` documents that it maps the gateway onto
+  `127.0.0.1` alone, so a resolver on any other loopback address is not reached
+  — including systemd-resolved's `127.0.0.53` stub, the configuration that
+  raises the loopback-nameserver warning. The warning offered the flag as a
+  remedy without that condition, and the guide states the requirement where the
+  gateway mapping and DNS are described.
+
+- `fcage`: `--no-resolv-conf` records that it opts out of the `resolv.conf`
+  `--netstack` composes, not only the bind `--share-net` makes.
 
 ## [0.1.3] - 2026-08-03
 

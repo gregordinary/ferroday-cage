@@ -1566,8 +1566,12 @@ impl CageBuilder {
         self.network
     }
 
-    /// Whether the host's `resolv.conf` is bound in under
-    /// [`Network::Host`].
+    /// Whether the host's `resolv.conf` bind is enabled, with the
+    /// managed-mount master switch folded in.
+    ///
+    /// The library acts on this only under [`Network::Host`]. A caller that
+    /// composes resolver configuration of its own — as `fcage` does for a
+    /// native-stack run — can read it to honor the same opt-out.
     pub fn get_resolv_conf(&self) -> bool {
         self.managed(self.resolv_conf)
     }
@@ -4266,6 +4270,25 @@ read-only = true
         assert_eq!(builder.network, Network::Isolated);
         assert!(matches!(builder.stdin, Stdin::Inherit));
         assert!(!builder.stop_with_caller);
+    }
+
+    /// `get_resolv_conf` is a consumer-facing opt-out signal, not only an
+    /// internal one: `fcage` reads it to decide whether to compose a
+    /// `resolv.conf` for a native-stack run, where the library's own bind does
+    /// not apply. Either toggle has to turn it off, from a profile as surely as
+    /// from a setter.
+    #[test]
+    fn either_toggle_turns_the_resolv_conf_bind_off() {
+        let default: CageBuilder = toml::from_str("").unwrap();
+        assert!(default.get_resolv_conf());
+
+        assert!(!Cage::builder().resolv_conf(false).get_resolv_conf());
+        assert!(!Cage::builder().managed_mounts(false).get_resolv_conf());
+
+        let from_profile: CageBuilder = toml::from_str("resolv-conf = false").unwrap();
+        assert!(!from_profile.get_resolv_conf());
+        let managed_off: CageBuilder = toml::from_str("managed-mounts = false").unwrap();
+        assert!(!managed_off.get_resolv_conf());
     }
 
     #[test]

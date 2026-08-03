@@ -618,6 +618,13 @@ impl<'a> DebianBuilder<'a> {
     /// primary repository — the one that owns the finished rootfs's
     /// `sources.list`. Additional sources are added with
     /// [`repository`](Self::repository).
+    ///
+    /// The default transport speaks `http://` and `file://` only, so an
+    /// `https://` mirror needs a fetcher of the caller's own, set with
+    /// [`fetcher`](Self::fetcher); without one the URL is refused when the solve
+    /// first reaches for it. Carrying a TLS stack is the consumer's decision,
+    /// not the crate's — the archive signature, not the transport, is what
+    /// authenticates a package.
     pub fn mirror(mut self, mirror: impl Into<String>) -> Self {
         self.mirror = Some(mirror.into());
         self
@@ -634,6 +641,9 @@ impl<'a> DebianBuilder<'a> {
     /// snapshot normally also sets
     /// [`allow_stale_release`](Self::allow_stale_release), the snapshot's
     /// release being expired by design.
+    ///
+    /// A backstop is fetched through the same transport as the primary, so the
+    /// scheme constraint of [`mirror`](Self::mirror) applies to it too.
     pub fn mirror_fallback(mut self, url: impl Into<String>) -> Self {
         self.mirror_fallbacks.push(url.into());
         self

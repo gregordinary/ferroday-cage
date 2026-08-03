@@ -190,17 +190,21 @@ Networking:
   --netstack            Attach the native userspace network stack: outbound
                         IPv4 and IPv6 for the isolated network, forwarded over
                         host sockets with no external helper. Composes the
-                        sandbox's resolv.conf from the host's usable
+                        sandbox's resolv.conf from the host's routable
                         nameservers unless --no-resolv-conf or
-                        --no-managed-mounts is given
+                        --no-managed-mounts is given; a host with only loopback
+                        nameservers composes nothing, leaving the rootfs's own
+                        resolv.conf in place
   --netstack-cidr V4/LEN
                         IPv4 network for --netstack (default 10.0.2.0/24; the
                         gateway is host 2, the guest host 15)
   --netstack-mtu N      Interface MTU for --netstack (default 1500)
   --netstack-host-loopback
                         Map connections to the gateway address onto the host's
-                        loopback, to reach a host-local service (off by
-                        default; other loopback destinations stay blocked)
+                        127.0.0.1, port preserved, to reach a service bound
+                        there (off by default; every other loopback destination
+                        stays blocked, including a resolver on another loopback
+                        address such as systemd-resolved's 127.0.0.53 stub)
 
 Hardening:
   --restrict            Confine the command with Landlock and seccomp only:
@@ -249,7 +253,8 @@ Turning off what is on by default:
   --no-proc             Do not mount /proc
   --no-dev              Do not assemble the minimal /dev
   --no-tmp              Do not mount a tmpfs on /tmp
-  --no-resolv-conf      Do not bind the host resolv.conf with --share-net
+  --no-resolv-conf      Do not bind the host resolv.conf: neither the bind
+                        --share-net makes nor the one --netstack composes
   --no-managed-mounts   Establish no mount of the library's own, so the sandbox
                         carries exactly the --bind and --raw-mount flags given.
                         Unlike the individual --no-* toggles this also excludes
@@ -2324,12 +2329,16 @@ fn run(options: Options) -> ExitCode {
     }
 
     if options.netstack {
-        // The native stack composes the sandbox's DNS from the host's usable
+        // The native stack composes the sandbox's DNS from the host's routable
         // nameservers, unless the run opts out. --no-managed-mounts opts out
         // as surely as --no-resolv-conf does: its promise is that the sandbox
         // carries exactly the binds the command line names, and this would be
         // one it does not.
-        if options.resolv_conf != Some(false) && options.managed_mounts != Some(false) {
+        //
+        // The builder is asked rather than the flags, so that a profile
+        // setting either toggle governs this composition exactly as the
+        // matching flag does. Both have already been applied above.
+        if builder.get_resolv_conf() {
             builder = compose_netstack_resolv_conf(builder);
         }
         return run_with_netstack(
@@ -2419,11 +2428,16 @@ fn run_with_netstack(
 
 /// Composes the sandbox's `resolv.conf` for a native-stack run: binds the
 /// host's `resolv.conf` read-only when it names a routable nameserver, and
-/// otherwise warns that DNS will not resolve.
+/// otherwise composes nothing and says so.
 ///
 /// A loopback nameserver — systemd-resolved's `127.0.0.53` stub is the
 /// common one — is unreachable through the stack, which refuses loopback
 /// destinations, so binding it would only produce silent DNS failures.
+///
+/// Composing nothing leaves whatever `resolv.conf` the rootfs ships, which
+/// may name a routable resolver and resolve perfectly well. The warning
+/// therefore reports what was not composed; it does not predict that the
+/// sandbox has no DNS, which is not this function's to know.
 fn compose_netstack_resolv_conf(builder: CageBuilder) -> CageBuilder {
     let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
         // No host resolv.conf to compose from; leave the sandbox's as-is.
@@ -2433,9 +2447,12 @@ fn compose_netstack_resolv_conf(builder: CageBuilder) -> CageBuilder {
         return builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf");
     }
     eprintln!(
-        "fcage: the host's nameservers are all on loopback and unreachable through the \
-         network stack; the sandbox has no working DNS (point it at a routable resolver, \
-         or use --netstack-host-loopback to reach a host-local one via the gateway)"
+        "fcage: the host's nameservers are all on loopback, which the network stack \
+         refuses, so no resolv.conf was composed; the sandbox resolves through whatever \
+         its rootfs ships (point it at a routable nameserver, or give it the gateway \
+         address and pass --netstack-host-loopback, which reaches a host resolver only \
+         when that resolver listens on 127.0.0.1 — not systemd-resolved's 127.0.0.53 \
+         stub)"
     );
     builder
 }

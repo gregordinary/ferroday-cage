@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey, SignedPublicSubKey};
 use pgp::packet::{Signature, SignatureType};
-use pgp::types::KeyDetails;
+use pgp::types::{KeyDetails, Tag};
 
 use super::index::parse_stanzas;
 
@@ -249,23 +249,30 @@ fn signing_subkeys(cert: &SignedPublicKey) -> Vec<SigningSubkey<'_>> {
 /// carries no valid binding.
 ///
 /// A subkey may have been re-bound over time; the newest binding (by creation)
-/// carries the current capability flags and expiration, mirroring how
-/// [`key_expiry_epoch`] takes the newest expiration-bearing self-signature. A
-/// binding with no creation time cannot be ordered by recency and is not
-/// eligible to govern.
+/// carries the current capability flags and expiration, exactly as
+/// [`key_expiry_epoch`] takes the newest self-signature over each object the
+/// primary signs.
 fn governing_binding<'a>(
     cert: &SignedPublicKey,
     subkey: &'a SignedPublicSubKey,
 ) -> Option<&'a Signature> {
-    subkey
-        .signatures
-        .iter()
-        .filter(|signature| signature.typ() == Some(SignatureType::SubkeyBinding))
-        .filter(|signature| {
-            signature
+    governing_signature(subkey.signatures.iter().filter(|signature| {
+        signature.typ() == Some(SignatureType::SubkeyBinding)
+            && signature
                 .verify_subkey_binding(&cert.primary_key, &subkey.key)
                 .is_ok()
-        })
+    }))
+}
+
+/// The newest of a set of signatures over one object, which is the one that
+/// governs that object's current validity.
+///
+/// A signature with no creation time cannot be ordered by recency and is not
+/// eligible to govern.
+fn governing_signature<'a>(
+    signatures: impl Iterator<Item = &'a Signature>,
+) -> Option<&'a Signature> {
+    signatures
         .filter_map(|signature| Some((signature.created()?, signature)))
         .max_by_key(|(created, _)| *created)
         .map(|(_, signature)| signature)
@@ -293,13 +300,20 @@ fn subkey_is_revoked(cert: &SignedPublicKey, subkey: &SignedPublicSubKey) -> boo
 /// binding sets no expiration.
 ///
 /// A subkey's key-expiration subpacket is relative to the subkey's own creation
-/// time, not the primary's, so the epoch is computed from the subkey. A zero
-/// duration is the wire form for "no expiration" and yields `None`, left to the
-/// other checks.
+/// time, not the primary's, so the epoch is computed from the subkey.
 fn subkey_expiry_epoch(subkey: &SignedPublicSubKey, binding: &Signature) -> Option<i64> {
-    let created = i64::from(subkey.key.created_at().as_secs());
-    let seconds = binding.key_expiration_time()?.as_secs();
-    (seconds > 0).then(|| created.saturating_add(i64::from(seconds)))
+    expiry_epoch(i64::from(subkey.key.created_at().as_secs()), binding)
+}
+
+/// The expiration a signature sets for a (sub)key created at `key_created`:
+/// that creation plus the key-expiration duration the signature carries, or
+/// `None` if it sets no expiration.
+///
+/// The subpacket's absence and a zero duration are the two wire forms of "this
+/// key does not expire", and both yield `None`.
+fn expiry_epoch(key_created: i64, signature: &Signature) -> Option<i64> {
+    let seconds = signature.key_expiration_time()?.as_secs();
+    (seconds > 0).then(|| key_created.saturating_add(i64::from(seconds)))
 }
 
 /// Rejects a signature made after its signing (sub)key had expired.
@@ -311,8 +325,8 @@ fn subkey_expiry_epoch(subkey: &SignedPublicSubKey, binding: &Signature) -> Opti
 /// leaving a genuinely old signature (made while the key was valid) acceptable,
 /// so a pinned snapshot still verifies. `expiry` is the signing (sub)key's
 /// expiration epoch, from [`key_expiry_epoch`] for a primary or
-/// [`subkey_expiry_epoch`] for a subkey; `None` there, or a signature with no
-/// creation time, leaves the judgement to the other checks.
+/// [`subkey_expiry_epoch`] for a subkey; a key that does not expire, or a
+/// signature with no creation time, leaves the judgement to the other checks.
 fn check_key_valid_at_signing(
     expiry: Option<i64>,
     signature: &Signature,
@@ -328,57 +342,71 @@ fn check_key_valid_at_signing(
     Ok(())
 }
 
-/// The Unix time at which a key expires, from the key-expiration subpacket of
-/// its most recent expiration-bearing self-signature relative to the primary
-/// key's creation, or `None` if no self-signature sets an expiration.
+/// The Unix time at which a key expires, relative to the primary key's
+/// creation, or `None` if the key does not expire.
 ///
 /// OpenPGP key validity is time-relative: a later self-signature re-dates the
-/// key. Among the self-signatures that set an expiration, the one made most
-/// recently governs, so a re-dating that shortens the key's lifetime supersedes
-/// an earlier, more generous one. Taking the newest such signature rather than
-/// the maximum expiry across all of them is what honors a deliberate
-/// shortening, so a key retired by a re-dating is judged expired at the
-/// intended time. A self-signature carrying no expiration does not itself grant
-/// unlimited validity here — it simply does not define the current expiry, so
-/// it is skipped rather than read as "never expires", the conservative reading.
-/// Only signatures the primary key issued over itself are authoritative; the
-/// keyring is vendored and trusted, so a self-signature is taken by its issuer
-/// key id without a separate cryptographic check.
+/// key, and the expiration one carries is a duration from the primary's
+/// creation. The current expiry is whatever the *governing* self-signature
+/// sets, and a signature governs the object it was made over: the key itself,
+/// for a direct-key signature, or one user id, for a certification. RFC 4880
+/// section 5.2.3.3 gives priority to the most recent self-signature over the
+/// same object, so recency is compared within an object rather than across
+/// objects — a user id added later governs only itself.
+///
+/// The governing signature's key-expiration subpacket is then read for what it
+/// says: present means the key expires then, absent means it does not. Both a
+/// deliberate shortening and a deliberate removal therefore take effect, the
+/// removal being how a project extends a key rather than rotating it, and a key
+/// retired by re-dating is still judged expired at the intended time — the
+/// retiring signature is the newest over its object. Where objects disagree the
+/// earliest expiry governs, so an expiry set on one user id is not lifted by a
+/// second user id whose certification simply says nothing about it.
+///
+/// Only self-signatures that cryptographically verify as issued by the primary
+/// over the object they cover are authoritative, the same rule
+/// [`governing_binding`] applies to a subkey binding. Absence carries meaning
+/// here as much as presence does, so an unverified packet could otherwise lift
+/// an expiry as readily as impose one.
 fn key_expiry_epoch(key: &SignedPublicKey) -> Option<i64> {
-    let primary_created = i64::from(key.primary_key.created_at().as_secs());
-    let primary_id = key.primary_key.legacy_key_id();
-    // The authoritative self-signatures live on the key's direct signatures and
-    // on each user id's binding signatures.
-    let self_signatures = key
-        .details
-        .direct_signatures
-        .iter()
-        .chain(
-            key.details
-                .users
-                .iter()
-                .flat_map(|user| user.signatures.iter()),
+    let primary = &key.primary_key;
+    let primary_created = i64::from(primary.created_at().as_secs());
+
+    // The key itself, as covered by direct-key signatures.
+    let direct = governing_signature(key.details.direct_signatures.iter().filter(|signature| {
+        signature.typ() == Some(SignatureType::Key) && signature.verify_key(primary).is_ok()
+    }));
+    // Each user id, as covered by the certifications over it. A certification
+    // revocation is not a statement of validity and never governs.
+    let certified = key.details.users.iter().map(|user| {
+        governing_signature(user.signatures.iter().filter(|signature| {
+            is_positive_certification(signature)
+                && signature
+                    .verify_certification(primary, Tag::UserId, &user.id)
+                    .is_ok()
+        }))
+    });
+
+    std::iter::once(direct)
+        .chain(certified)
+        .flatten()
+        .filter_map(|signature| expiry_epoch(primary_created, signature))
+        .min()
+}
+
+/// Whether a signature is a certification of a user id, as opposed to a
+/// revocation of one. rPGP's own predicate counts a certification revocation as
+/// a certification, which is not the question asked here.
+fn is_positive_certification(signature: &Signature) -> bool {
+    matches!(
+        signature.typ(),
+        Some(
+            SignatureType::CertGeneric
+                | SignatureType::CertPersona
+                | SignatureType::CertCasual
+                | SignatureType::CertPositive
         )
-        .filter(|signature| {
-            signature
-                .issuer_key_id()
-                .iter()
-                .any(|id| **id == primary_id)
-        });
-
-    // The current expiry is the one carried by the newest self-signature that
-    // sets an expiration. A signature with no creation time cannot be ordered
-    // by recency, so it is not eligible to define the current validity.
-    let newest_expiry = self_signatures
-        .filter_map(|signature| {
-            let created = signature.created()?;
-            let seconds = signature.key_expiration_time()?.as_secs();
-            (seconds > 0).then_some((created, seconds))
-        })
-        .max_by_key(|(created, _)| *created)?
-        .1;
-
-    Some(primary_created.saturating_add(newest_expiry as i64))
+    )
 }
 
 /// Rejects a release signature that has passed its own expiration.
@@ -1074,13 +1102,30 @@ Valid-Until: sometime next week
     /// Generates a throwaway Ed25519 signing key with the given user id.
     #[cfg(test)]
     fn test_key(user_id: &str) -> pgp::composed::SignedSecretKey {
+        test_key_created_at(user_id, Timestamp::now(), &[])
+    }
+
+    /// Generates a throwaway Ed25519 signing key created at `created`, with
+    /// `user_id` as its primary user id and `also` as any further ones. The
+    /// creation time matters to the key-expiry tests, an expiration being a
+    /// duration from it.
+    #[cfg(test)]
+    fn test_key_created_at(
+        user_id: &str,
+        created: Timestamp,
+        also: &[&str],
+    ) -> pgp::composed::SignedSecretKey {
         use pgp::composed::{KeyType, SecretKeyParamsBuilder};
         let mut params = SecretKeyParamsBuilder::default();
         params
             .key_type(KeyType::Ed25519)
             .can_sign(true)
             .can_certify(true)
+            .created_at(created)
             .primary_user_id(user_id.to_string());
+        for id in also {
+            params.user_id(*id);
+        }
         params
             .build()
             .expect("valid key params")
@@ -1208,6 +1253,46 @@ Valid-Until: sometime next week
                 subkey.public_key(),
             )
             .expect("signing subkey binding")
+    }
+
+    /// Certifies `user`'s id with `signer`'s primary key, carrying the given
+    /// creation time and optional key-expiration. Key generation emits a single
+    /// certification per user id, so a test that needs a re-dating — the shape
+    /// a key extended or shortened in place has — crafts the packet here.
+    #[cfg(test)]
+    fn craft_certification(
+        signer: &pgp::composed::SignedSecretKey,
+        user: &pgp::types::SignedUser,
+        created: pgp::types::Timestamp,
+        key_expiration: Option<pgp::types::Duration>,
+    ) -> Signature {
+        use pgp::packet::{SignatureConfig, Subpacket, SubpacketData};
+        use pgp::types::Password;
+        let mut config =
+            SignatureConfig::from_key(rand::thread_rng(), &**signer, SignatureType::CertPositive)
+                .expect("signature config");
+        let mut hashed = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(created))
+                .expect("creation-time subpacket"),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(signer.fingerprint()))
+                .expect("issuer subpacket"),
+        ];
+        if let Some(duration) = key_expiration {
+            hashed.push(
+                Subpacket::regular(SubpacketData::KeyExpirationTime(duration))
+                    .expect("key-expiration subpacket"),
+            );
+        }
+        config.hashed_subpackets = hashed;
+        config
+            .sign_certification(
+                &**signer,
+                signer.public_key(),
+                &Password::empty(),
+                Tag::UserId,
+                &user.id,
+            )
+            .expect("signing the certification")
     }
 
     /// Key flags with only the signing capability set.
@@ -1384,6 +1469,168 @@ Valid-Until: sometime next week
         assert!(
             matches!(err, ReleaseError::Release(_)),
             "expiry is a Release error, got {err:?}",
+        );
+    }
+
+    /// The 2018 creation the key-expiry tests date their keys to, and the
+    /// two-year lifetime an early self-signature grants: together an expiry in
+    /// 2020, comfortably in the past.
+    #[cfg(test)]
+    const KEY_CREATED: u32 = 1_544_987_117;
+    #[cfg(test)]
+    const TWO_YEARS: u32 = 63_072_000;
+
+    #[test]
+    fn an_expiry_a_later_self_signature_drops_is_lifted() {
+        // The shape of a key created with a finite lifetime and later made
+        // non-expiring: an early self-signature sets a two-year expiry, and a
+        // later one re-dates the key carrying no key-expiration subpacket at
+        // all, which is how an expiry is removed. The later signature governs,
+        // so the key does not expire and a release signed today verifies.
+        let archive = test_key_created_at(
+            "archive <archive@test.invalid>",
+            Timestamp::from_secs(KEY_CREATED),
+            &[],
+        );
+        let user = archive.details.users[0].clone();
+        let expiring = craft_certification(
+            &archive,
+            &user,
+            Timestamp::from_secs(KEY_CREATED),
+            Some(Duration::from_secs(TWO_YEARS)),
+        );
+        let lifting = craft_certification(
+            &archive,
+            &user,
+            Timestamp::from_secs(1_606_071_634), // 2020-11-22, after the expiry.
+            None,
+        );
+
+        let body = "Suite: test\nComponents: main\nSHA256:\n abc 10 main/binary-amd64/Packages\n";
+        let signed = clearsign(&archive, body);
+
+        // With only the early self-signature the key is genuinely expired and
+        // the release is refused, which is what makes the case below a test of
+        // the removal rather than of a key that never expired.
+        let mut public = archive.to_public_key();
+        public.details.users[0].signatures = vec![expiring.clone()];
+        assert_eq!(
+            key_expiry_epoch(&public),
+            Some(i64::from(KEY_CREATED) + i64::from(TWO_YEARS)),
+        );
+        let keyring = Keyring {
+            keys: vec![public.clone()],
+        };
+        keyring
+            .verify(signed.as_bytes(), false)
+            .expect_err("a key whose only self-signature has expired must be refused");
+
+        // Adding the later, expiry-less self-signature lifts the expiry.
+        public.details.users[0].signatures = vec![expiring, lifting];
+        assert_eq!(
+            key_expiry_epoch(&public),
+            None,
+            "the newest self-signature sets no expiration, so the key does not expire",
+        );
+        let keyring = Keyring { keys: vec![public] };
+        keyring
+            .verify(signed.as_bytes(), false)
+            .expect("a key whose expiry a later self-signature removed must verify");
+    }
+
+    #[test]
+    fn a_later_self_signature_that_shortens_the_expiry_governs() {
+        // The converse re-dating: the newest self-signature is authoritative
+        // whichever way it moves the expiry, so a deliberate shortening is not
+        // masked by an earlier, more generous one.
+        let archive = test_key_created_at(
+            "archive <archive@test.invalid>",
+            Timestamp::from_secs(KEY_CREATED),
+            &[],
+        );
+        let user = archive.details.users[0].clone();
+        let generous = craft_certification(
+            &archive,
+            &user,
+            Timestamp::from_secs(KEY_CREATED),
+            Some(Duration::from_secs(10 * TWO_YEARS)),
+        );
+        let shortening = craft_certification(
+            &archive,
+            &user,
+            Timestamp::from_secs(1_606_071_634),
+            Some(Duration::from_secs(TWO_YEARS)),
+        );
+
+        let mut public = archive.to_public_key();
+        public.details.users[0].signatures = vec![generous, shortening];
+        assert_eq!(
+            key_expiry_epoch(&public),
+            Some(i64::from(KEY_CREATED) + i64::from(TWO_YEARS)),
+        );
+    }
+
+    #[test]
+    fn an_expiry_is_not_lifted_by_a_certification_over_another_user_id() {
+        // Recency is compared within one certified object. A user id added
+        // later says nothing about the expiry another user id's certification
+        // set, so its silence must not be read as a removal — otherwise adding
+        // an address would quietly make a key immortal.
+        let archive = test_key_created_at(
+            "archive <archive@test.invalid>",
+            Timestamp::from_secs(KEY_CREATED),
+            &["archive <second@test.invalid>"],
+        );
+        let (first, second) = (
+            archive.details.users[0].clone(),
+            archive.details.users[1].clone(),
+        );
+        let expiring = craft_certification(
+            &archive,
+            &first,
+            Timestamp::from_secs(KEY_CREATED),
+            Some(Duration::from_secs(TWO_YEARS)),
+        );
+        let silent =
+            craft_certification(&archive, &second, Timestamp::from_secs(1_606_071_634), None);
+
+        let mut public = archive.to_public_key();
+        public.details.users[0].signatures = vec![expiring];
+        public.details.users[1].signatures = vec![silent];
+        assert_eq!(
+            key_expiry_epoch(&public),
+            Some(i64::from(KEY_CREATED) + i64::from(TWO_YEARS)),
+        );
+    }
+
+    #[test]
+    fn a_certification_the_primary_did_not_issue_cannot_lift_an_expiry() {
+        // Absence of a key-expiration subpacket now carries meaning, so a
+        // self-signature is authoritative only once it verifies as issued by
+        // the primary. A packet appended to the keyring by anyone else must not
+        // be able to extend a key's life.
+        let archive = test_key_created_at(
+            "archive <archive@test.invalid>",
+            Timestamp::from_secs(KEY_CREATED),
+            &[],
+        );
+        let foreign = test_key("foreign <foreign@test.invalid>");
+        let user = archive.details.users[0].clone();
+        let expiring = craft_certification(
+            &archive,
+            &user,
+            Timestamp::from_secs(KEY_CREATED),
+            Some(Duration::from_secs(TWO_YEARS)),
+        );
+        let forged =
+            craft_certification(&foreign, &user, Timestamp::from_secs(1_606_071_634), None);
+
+        let mut public = archive.to_public_key();
+        public.details.users[0].signatures = vec![expiring, forged];
+        assert_eq!(
+            key_expiry_epoch(&public),
+            Some(i64::from(KEY_CREATED) + i64::from(TWO_YEARS)),
+            "a certification the primary did not issue must not govern",
         );
     }
 
