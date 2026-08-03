@@ -92,7 +92,7 @@ impl Keyring {
         &self,
         inrelease: &[u8],
         require_fresh: bool,
-    ) -> Result<String, ReleaseError> {
+    ) -> Result<Verified, ReleaseError> {
         let (message, _headers) = CleartextSignedMessage::from_armor(inrelease)
             .map_err(|err| ReleaseError::Signature(err.to_string()))?;
         // For each keyring cert, try its primary key and then each of its
@@ -104,7 +104,12 @@ impl Keyring {
             // The primary, judged against its own expiry.
             if let Ok(signature) = message.verify(cert) {
                 match check_signature_valid(signature, key_expiry_epoch(cert), require_fresh) {
-                    Ok(()) => return Ok(message.signed_text()),
+                    Ok(()) => {
+                        return Ok(Verified {
+                            body: message.signed_text(),
+                            signed_by: fingerprint_hex(&cert.fingerprint()),
+                        });
+                    }
                     Err(err) => {
                         deferred.get_or_insert(err);
                     }
@@ -115,7 +120,17 @@ impl Keyring {
             for candidate in signing_subkeys(cert) {
                 if let Ok(signature) = message.verify(candidate.subkey) {
                     match check_signature_valid(signature, candidate.expiry, require_fresh) {
-                        Ok(()) => return Ok(message.signed_text()),
+                        Ok(()) => {
+                            return Ok(Verified {
+                                body: message.signed_text(),
+                                // The subkey's own fingerprint, not the
+                                // primary's: it is the key that made the
+                                // signature, and it is what a caller comparing
+                                // against `gpg --list-keys` output on the
+                                // signing subkey will see.
+                                signed_by: fingerprint_hex(&candidate.subkey.fingerprint()),
+                            });
+                        }
                         Err(err) => {
                             deferred.get_or_insert(err);
                         }
@@ -127,6 +142,26 @@ impl Keyring {
             ReleaseError::Signature("no signature verified against the archive keyring".to_string())
         }))
     }
+}
+
+/// A release whose signature verified: the signed bytes, and the key that
+/// signed them.
+#[derive(Debug)]
+pub(crate) struct Verified {
+    /// The cleartext the signature covers — the release body itself, with the
+    /// armor and the signature stripped.
+    pub(crate) body: String,
+    /// The verifying key's fingerprint, uppercase hex.
+    pub(crate) signed_by: String,
+}
+
+/// A fingerprint as the OpenPGP tools present one: uppercase hex, undelimited.
+///
+/// The spelling matters because the value's whole use is comparison — against
+/// `gpg --fingerprint` output, or against a fingerprint a policy pins — and
+/// uppercase is what those produce.
+fn fingerprint_hex(fingerprint: &pgp::types::Fingerprint) -> String {
+    format!("{fingerprint:X}")
 }
 
 /// Applies the validity gates layered over rPGP's cryptographic verification: a
@@ -378,10 +413,20 @@ pub(crate) struct Release {
     architectures: Vec<String>,
     components: Vec<String>,
     valid_until: Option<String>,
+    /// The release's own `Date:` field, as written. Read for provenance rather
+    /// than for any check: freshness is judged against `Valid-Until`.
+    date: Option<String>,
     /// The release's own `Suite:` field (for example `stable`), if present.
     suite: Option<String>,
     /// The release's own `Codename:` field (for example `trixie`), if present.
     codename: Option<String>,
+    /// The SHA-256 of the body this was parsed from, lowercase hex.
+    ///
+    /// Computed here rather than by the caller so it is unambiguously the
+    /// digest of the bytes that were verified: for a signed repository that is
+    /// the cleartext the signature covers, not the `InRelease` armor around it
+    /// and not a re-fetch.
+    sha256: String,
 }
 
 impl Release {
@@ -414,9 +459,26 @@ impl Release {
             architectures: split_ws(stanza.get("Architectures")),
             components: split_ws(stanza.get("Components")),
             valid_until: stanza.get("Valid-Until").map(str::to_string),
+            date: stanza.get("Date").map(|value| value.trim().to_string()),
             suite: stanza.get("Suite").map(|value| value.trim().to_string()),
             codename: stanza.get("Codename").map(|value| value.trim().to_string()),
+            sha256: super::deb::sha256_hex(body.as_bytes()),
         })
+    }
+
+    /// The release's `Date` field, as written.
+    pub(crate) fn date(&self) -> Option<&str> {
+        self.date.as_deref()
+    }
+
+    /// The release's `Valid-Until` field, as written.
+    pub(crate) fn valid_until(&self) -> Option<&str> {
+        self.valid_until.as_deref()
+    }
+
+    /// The SHA-256 of the verified body, lowercase hex.
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
     }
 
     /// Checks that the release binds to the requested `suite`, offers
@@ -539,7 +601,7 @@ fn split_ws(value: Option<&str>) -> Vec<String> {
 
 /// The current time as a Unix timestamp, or `None` if the clock is before
 /// the epoch (which would make a freshness check meaningless).
-fn now_epoch() -> Option<i64> {
+pub(super) fn now_epoch() -> Option<i64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -554,7 +616,7 @@ fn now_epoch() -> Option<i64> {
 /// does not misread the time by the offset. A value that does not parse —
 /// including one with an unrecognized zone — returns `None`, which the
 /// caller treats as a freshness failure rather than a silent pass.
-fn parse_rfc5322(text: &str) -> Option<i64> {
+pub(super) fn parse_rfc5322(text: &str) -> Option<i64> {
     let mut fields = text.split_whitespace();
     // Optional "Dow," leader.
     let mut first = fields.next()?;
@@ -582,6 +644,19 @@ fn parse_rfc5322(text: &str) -> Option<i64> {
     let hour: i64 = time.next()?.parse().ok()?;
     let minute: i64 = time.next()?.parse().ok()?;
     let second: i64 = time.next().unwrap_or("0").parse().ok()?;
+    // The civil-date arithmetic below is happy to roll an out-of-range field
+    // over — `32 Jan` would land in February — which would read a malformed
+    // deadline as a slightly wrong one instead of the documented hard failure.
+    // A leap second is the one deliberate tolerance, since a stamp may carry
+    // `:60`.
+    if !(1..=days_in_month(year, month)).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        // A stamp may carry a leap second, so 60 is the ceiling here.
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
     let offset = parse_zone(fields.next()?)?;
     // Checked throughout: an absurd year, hour, or minute overflows to `None`,
     // which the caller treats as a freshness failure rather than a wrapped,
@@ -614,7 +689,7 @@ fn parse_zone(token: &str) -> Option<i64> {
             };
             let hours: i64 = token.get(1..3)?.parse().ok()?;
             let minutes: i64 = token.get(3..5)?.parse().ok()?;
-            if minutes >= 60 {
+            if hours >= 24 || minutes >= 60 {
                 return None;
             }
             Some(sign * (hours * 3600 + minutes * 60))
@@ -622,9 +697,78 @@ fn parse_zone(token: &str) -> Option<i64> {
     }
 }
 
+/// Formats a Unix timestamp as the RFC 5322 date a `Release` stamps, for
+/// example `Sat, 11 Jul 2026 09:02:23 UTC`.
+///
+/// The zone is spelled `UTC` rather than `+0000`, which is what the Debian
+/// archive stamps and what every client that reads one therefore accepts;
+/// [`parse_rfc5322`] reads either. The result round-trips through it.
+///
+/// Every timestamp formats, including one before the epoch: the field records
+/// when a pool was published rather than gating anything, so an odd clock
+/// yields an odd date instead of failing the publish that carries it.
+pub(super) fn format_rfc5322(epoch: i64) -> String {
+    // Floored division throughout, so a pre-epoch timestamp borrows into the
+    // previous day rather than truncating toward zero into the next one.
+    let days = epoch.div_euclid(86400);
+    let seconds = epoch.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    // 1970-01-01 was a Thursday, the fourth day of a week starting Sunday.
+    let weekday =
+        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][(days + 4).rem_euclid(7) as usize];
+    let month_name = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(month - 1) as usize];
+    format!(
+        "{weekday}, {day:02} {month_name} {year:04} {:02}:{:02}:{:02} UTC",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60,
+    )
+}
+
+/// The civil date for a count of days since the Unix epoch (Howard Hinnant's
+/// algorithm), the inverse of [`days_from_civil`].
+///
+/// Total where its inverse is checked: the input is a day count derived from a
+/// timestamp rather than parsed from a document, so there is no absurd year to
+/// reject, and the arithmetic cannot overflow for any `i64` a clock produces.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719468;
+    let era = shifted.div_euclid(146097);
+    let day_of_era = shifted.rem_euclid(146097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    // The algorithm counts years from March, so January and February belong to
+    // the following civil year.
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm),
 /// or `None` if the arithmetic overflows for an absurd year — treated by the
 /// caller as an unparseable, and therefore stale, date.
+/// The number of days in `month` of `year`, for bounding a parsed date. The
+/// Gregorian leap rule applies, so February is 29 days only in a leap year.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+    }
+}
+
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     let year = if month <= 2 {
         year.checked_sub(1)?
@@ -746,6 +890,48 @@ Components: main
     }
 
     #[test]
+    fn formatting_names_the_instant_the_parser_reads_back() {
+        // The dates a pool stamps, spelled the way the Debian archive spells
+        // them. The cases are the ones the civil-date arithmetic can get wrong:
+        // the epoch itself, a leap day, the day after a century that is not a
+        // leap year, and a pre-epoch instant, where flooring toward the
+        // previous day is what keeps the time of day from running backwards.
+        for (epoch, text) in [
+            (0, "Thu, 01 Jan 1970 00:00:00 UTC"),
+            (1_709_210_096, "Thu, 29 Feb 2024 12:34:56 UTC"),
+            (4_107_542_400, "Mon, 01 Mar 2100 00:00:00 UTC"),
+            (-1, "Wed, 31 Dec 1969 23:59:59 UTC"),
+            (1_783_760_543, "Sat, 11 Jul 2026 09:02:23 UTC"),
+        ] {
+            assert_eq!(format_rfc5322(epoch), text);
+            // The pair is a round trip: what the writer stamps is what the
+            // reader — this crate's own, and apt's — resolves back to.
+            assert_eq!(parse_rfc5322(text), Some(epoch));
+        }
+        // The date is caller-supplied, so the extremes are reachable. Dividing
+        // to days bounds every intermediate well inside i64, and each formats
+        // rather than overflowing one — however absurd the year it names.
+        for extreme in [i64::MIN, i64::MAX] {
+            assert!(format_rfc5322(extreme).ends_with(" UTC"));
+        }
+    }
+
+    #[test]
+    fn every_civil_date_round_trips_through_both_directions() {
+        // A day-by-day sweep either side of the epoch, across the 2024 leap
+        // day, and across 2100 — a century that is not a leap year. Those are
+        // where an off-by-one in either direction of the conversion shows up
+        // and a spot check does not.
+        let spans = [-400..400, 19_650..20_150, 47_300..47_800];
+        for day in spans.into_iter().flatten() {
+            let epoch = day * 86400 + 3661;
+            let (year, month, date) = civil_from_days(day);
+            assert_eq!(days_from_civil(year, month, date), Some(day));
+            assert_eq!(parse_rfc5322(&format_rfc5322(epoch)), Some(epoch));
+        }
+    }
+
+    #[test]
     fn an_absurd_year_does_not_overflow() {
         // A year large enough to overflow the day arithmetic parses to None
         // rather than panicking or wrapping to a bogus deadline.
@@ -753,6 +939,31 @@ Components: main
         // A 19-digit year within i64's range parses, then overflows the day
         // arithmetic; the checked path returns None rather than wrapping.
         assert_eq!(parse_rfc5322("11 Jul 9000000000000000000 UTC"), None);
+    }
+
+    #[test]
+    fn an_out_of_range_field_does_not_roll_over() {
+        // The civil-date arithmetic would happily read `32 Jan` as 1 February
+        // and `25:00` as the next day, turning a malformed Valid-Until into a
+        // deadline that is merely wrong. A malformed stamp is a freshness
+        // failure instead.
+        for text in [
+            "32 Jan 2026 09:02:23 UTC",
+            "0 Jan 2026 09:02:23 UTC",
+            "30 Feb 2026 09:02:23 UTC",
+            "29 Feb 2026 09:02:23 UTC",
+            "31 Apr 2026 09:02:23 UTC",
+            "11 Jul 2026 24:02:23 UTC",
+            "11 Jul 2026 09:60:23 UTC",
+            "11 Jul 2026 09:02:61 UTC",
+            "11 Jul 2026 09:02:23 +2400",
+        ] {
+            assert_eq!(parse_rfc5322(text), None, "{text}");
+        }
+        // The boundaries that are legal stay legal: a leap day in a leap year,
+        // and the leap second a stamp may carry.
+        assert!(parse_rfc5322("29 Feb 2028 09:02:23 UTC").is_some());
+        assert!(parse_rfc5322("31 Dec 2026 23:59:60 UTC").is_some());
     }
 
     #[test]
@@ -1025,7 +1236,10 @@ Valid-Until: sometime next week
         // A good signature verifies and returns the signed body.
         let good = clearsign(&archive, body);
         let verified = keyring.verify(good.as_bytes(), false).expect("verifies");
-        assert!(verified.contains("Suite: test"), "body was {verified:?}");
+        assert!(
+            verified.body.contains("Suite: test"),
+            "body was {verified:?}"
+        );
 
         // A signature by a key the keyring does not hold is refused.
         let foreign_signed = clearsign(&foreign, body);
@@ -1067,7 +1281,10 @@ Valid-Until: sometime next week
         let verified = keyring
             .verify(signed.as_bytes(), false)
             .expect("a subkey signature verifies");
-        assert!(verified.contains("Suite: test"), "body was {verified:?}");
+        assert!(
+            verified.body.contains("Suite: test"),
+            "body was {verified:?}"
+        );
     }
 
     #[test]
@@ -1200,12 +1417,29 @@ Valid-Until: sometime next week
             "the fixture must be subkey-signed, or it does not exercise the fix",
         );
 
-        let body = keyring
+        let verified = keyring
             .verify(&inrelease, false)
             .expect("a real subkey-signed Debian release must verify");
         assert!(
-            body.contains("Codename: forky"),
+            verified.body.contains("Codename: forky"),
             "the verified body is the forky release",
+        );
+        // The subkey that signed it, not the primary that bound the subkey: it
+        // is the key that made the signature, so it is the one a caller pinning
+        // a fingerprint would pin.
+        assert_eq!(
+            verified.signed_by.len(),
+            40,
+            "an uppercase v4 fingerprint: {}",
+            verified.signed_by,
+        );
+        assert!(
+            verified
+                .signed_by
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase()),
+            "uppercase hex, as the OpenPGP tools present one: {}",
+            verified.signed_by,
         );
     }
 

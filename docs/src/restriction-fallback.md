@@ -4,8 +4,8 @@ Some hosts cannot run the sandbox at all: unprivileged user namespaces are
 disabled, and with them every namespace facility the cage is built from. For
 those hosts the library offers a degraded mode, the *restriction*: it spawns
 the command directly on the host and confines it with the same Landlock
-filesystem rules and seccomp filters the hardening layer provides, always
-under the no-new-privileges flag.
+filesystem rules, Landlock network rules, and seccomp filters the hardening
+layer provides, always under the no-new-privileges flag.
 
 A restriction is a weaker boundary than a cage, and the difference is worth
 stating plainly. The command runs as the calling user, on the host
@@ -43,10 +43,23 @@ let status = Restriction::builder()
 # }
 ```
 
-[`landlock_fs`] and [`seccomp`] behave exactly as they do on the cage
-builder, and at least one of the two must be configured: a restriction that
-restricts nothing is rejected at build time rather than launching a plain
+[`landlock_fs`], [`landlock_net`], and [`seccomp`] behave exactly as they do on
+the cage builder, and at least one control must be configured: a restriction
+that restricts nothing is rejected at build time rather than launching a plain
 process that appears sandboxed.
+
+[`landlock_net`] grants TCP bind and connect on a named port. Configuring any
+grant — filesystem or network — enrolls the command in Landlock, so a
+restriction whose only grant is a network one denies every TCP bind and connect
+it did not name, and the filesystem stays open. It governs TCP alone: UDP, raw
+sockets, and other socket families, `AF_UNIX` among them, are untouched, which
+is why the abstract-socket surfaces below survive it.
+
+Network rights need Landlock ABI 4, where filesystem rights need only ABI 1. On
+an older Landlock kernel a filesystem grant narrows away best-effort, but a
+restriction whose *only* grant is a network one would then enforce nothing at
+all, so it is refused at build with
+[`ConfigError::RestrictionLandlockUnenforceable`].
 
 The command starts in `/` (or the [`current_dir`]) with a deterministic base
 environment plus the caller's variables. The base is `PATH` alone — unlike
@@ -149,6 +162,8 @@ consumes.
 
 [`Restriction`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Restriction.html
 [`landlock_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_fs
+[`landlock_net`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_net
+[`ConfigError::RestrictionLandlockUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
 [`seccomp`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.seccomp
 [`current_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.current_dir
 [`stdin`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.stdin

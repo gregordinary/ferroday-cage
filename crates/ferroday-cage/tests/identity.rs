@@ -16,27 +16,40 @@ use ferroday_cage::{Cage, Output};
 // Identity maps and the run-as identity are exercised only by the range-map
 // tests, all of which are gated on the `subid` delegate.
 #[cfg(feature = "subid")]
-use ferroday_cage::{Identity, IdentityMap};
+use ferroday_cage::{IdRange, Identity, IdentityMap};
 
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
 fn rootfs() -> Option<&'static Path> {
     common::fixture_rootfs()
 }
 
-/// Skips a range-map test when no delegate can establish one on this host.
+/// Reports an explicit skip on stderr, or fails when the environment demands
+/// the test runs.
 ///
-/// The skip is explicit on stderr, and `FERRODAY_CAGE_REQUIRE_SUBID` turns
-/// it into a failure so CI can assert the range-map tests actually ran.
+/// Every skip in this file is a property of the host's subordinate-id setup or
+/// of its `unshare(1)`: no delegate at all, an allocation the files do not
+/// state, one too small to carry the map a test needs, or a util-linux without
+/// `--map-users`. `FERRODAY_CAGE_REQUIRE_SUBID` turns each of them into a
+/// failure, not only the first: a runner whose allocation is a single
+/// 65536-id block satisfies the delegate check and still cannot nest, so
+/// gating only that one would let tests quietly stop running while the
+/// guarded run stayed green.
+#[cfg(feature = "subid")]
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
+        "range maps are required but this test cannot run here: {reason}"
+    );
+    eprintln!("skipping: {reason}");
+}
+
+/// Skips a range-map test when no delegate can establish one on this host.
 #[cfg(feature = "subid")]
 fn range_map_available() -> bool {
     match ferroday_cage::host::range_map_blocker() {
         None => true,
         Some(blocker) => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
-                "a range map is required but unavailable: {blocker}"
-            );
-            eprintln!("skipping: no delegate can establish a range map: {blocker}");
+            skip(&format!("no delegate can establish a range map: {blocker}"));
             false
         }
     }
@@ -54,16 +67,27 @@ fn range_map_available() -> bool {
 /// rather than skipping.
 #[cfg(feature = "subid")]
 fn subordinate_uid_count() -> Option<u32> {
-    let uid = rustix::process::getuid().as_raw().to_string();
+    subordinate_allocation("/etc/subuid").map(|(_start, count)| count)
+}
+
+/// The caller's first subordinate allocation in `path`, as `(start, count)`.
+///
+/// Reads the file directly, which is enough for a test to compose a request
+/// the delegate will then accept on its own terms. An allocation the file does
+/// not state — one a directory service provides — returns `None`, and the
+/// caller skips rather than guessing at ids it has no claim to.
+#[cfg(feature = "subid")]
+fn subordinate_allocation(path: &str) -> Option<(u32, u32)> {
+    let id = rustix::process::getuid().as_raw().to_string();
     let name = std::env::var("USER").ok();
-    let text = std::fs::read_to_string("/etc/subuid").ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
     text.lines().find_map(|line| {
         let mut fields = line.trim().splitn(3, ':');
         let owner = fields.next()?;
-        let _start = fields.next()?;
+        let start = fields.next()?.parse().ok()?;
         let count = fields.next()?.parse().ok()?;
-        let mine = owner == uid || name.as_deref().is_some_and(|name| owner == name);
-        mine.then_some(count)
+        let mine = owner == id || name.as_deref().is_some_and(|name| owner == name);
+        mine.then_some((start, count))
     })
 }
 
@@ -286,6 +310,11 @@ fn a_kept_capability_survives_the_identity_switch() {
 
 /// An explicit range request whose ids sit inside the caller's allocation,
 /// exercising the explicit-`Ranges` path end to end.
+///
+/// The request is composed from the caller's own allocation rather than
+/// delegated to `Subordinate`, so it is the `Ranges` arm of the delegate — and
+/// its containment check — that is exercised, not the composition the
+/// subordinate arm performs for itself.
 #[cfg(feature = "subid")]
 #[test]
 fn an_explicit_range_request_launches() {
@@ -293,21 +322,105 @@ fn an_explicit_range_request_launches() {
     if !range_map_available() {
         return;
     }
-    // Compose a request from the caller's own id plus part of whatever the
-    // subordinate map resolves to; simplest is to reuse Subordinate, whose
-    // resolution the delegate reports, and assert the id space's edge.
+    let (Some((uid_start, uid_count)), Some((gid_start, gid_count))) = (
+        subordinate_allocation("/etc/subuid"),
+        subordinate_allocation("/etc/subgid"),
+    ) else {
+        skip("the subordinate allocation is not stated in the files");
+        return;
+    };
+    // Inside id 0 is the caller, as every map must have; inside 1 onward covers
+    // the allocation, far enough to hold the id the chown below names.
+    let span = 1_000.min(uid_count).min(gid_count);
+    if span <= 250 {
+        skip("the subordinate allocation is too small to map id 250");
+        return;
+    }
+    let uid = vec![
+        IdRange {
+            inside: 0,
+            outside: rustix::process::geteuid().as_raw(),
+            count: 1,
+        },
+        IdRange {
+            inside: 1,
+            outside: uid_start,
+            count: span,
+        },
+    ];
+    let gid = vec![
+        IdRange {
+            inside: 0,
+            outside: rustix::process::getegid().as_raw(),
+            count: 1,
+        },
+        IdRange {
+            inside: 1,
+            outside: gid_start,
+            count: span,
+        },
+    ];
     let cage = Cage::builder()
         .rootfs(rootfs)
         .command("/bin/sh")
-        .args(["-c", "cat /proc/self/uid_map | wc -l"])
-        .identity_map(IdentityMap::Subordinate)
+        .args([
+            "-c",
+            "touch /tmp/probe; chown 250:250 /tmp/probe;              cat /proc/self/uid_map | wc -l",
+        ])
+        .identity_map(IdentityMap::ranges(uid, gid))
         .build()
         .expect("the sandbox should build");
     let output = run_script(&cage);
     let stdout = stdout_of(&output);
     assert!(output.status.success(), "{stdout}");
     let extents: u32 = stdout.trim().parse().expect("an extent count");
-    assert!(extents >= 2, "expected a multi-extent map: {stdout}");
+    assert_eq!(extents, 2, "the requested extents are the map: {stdout}");
+}
+
+/// An explicit range request for ids the caller has no claim to is refused at
+/// build time, with the offending extent named.
+#[cfg(feature = "subid")]
+#[test]
+fn an_out_of_allocation_range_request_is_refused() {
+    let Some(rootfs) = rootfs() else { return };
+    if !range_map_available() {
+        return;
+    }
+    // The top of the id space: no subordinate allocation reaches it, and no
+    // parent map the direct tier could read contains it either, so both
+    // delegates refuse and the build reports why rather than failing at launch.
+    let far = u32::MAX - 10;
+    let err = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/true")
+        .identity_map(IdentityMap::ranges(
+            vec![
+                IdRange {
+                    inside: 0,
+                    outside: rustix::process::geteuid().as_raw(),
+                    count: 1,
+                },
+                IdRange {
+                    inside: 1,
+                    outside: far,
+                    count: 4,
+                },
+            ],
+            vec![IdRange {
+                inside: 0,
+                outside: rustix::process::getegid().as_raw(),
+                count: 1,
+            }],
+        ))
+        .build()
+        .expect_err("ids outside the allocation cannot be mapped");
+    assert!(
+        matches!(
+            err,
+            ferroday_cage::Error::Config(ferroday_cage::ConfigError::IdentityMapUnavailable { .. })
+        ),
+        "{err}"
+    );
 }
 
 /// The removal that real ownership requires: a tree a range-mapped sandbox
@@ -423,7 +536,7 @@ fn a_nested_cage_writes_its_own_range_map() {
     // The inner run maps 65535 ids above root, so an allocation known to be
     // smaller cannot carry it and the test says so rather than failing.
     if subordinate_uid_count().is_some_and(|count| count < 65536) {
-        eprintln!("skipping: the caller's subordinate allocation is too small to nest inside");
+        skip("the caller's subordinate allocation is too small to nest inside");
         return;
     }
     let exe = std::env::current_exe().expect("the test binary path");
@@ -443,7 +556,7 @@ fn a_nested_cage_writes_its_own_range_map() {
     let output = match output {
         Ok(output) => output,
         Err(err) => {
-            eprintln!("skipping: the host unshare could not run: {err}");
+            skip(&format!("the host unshare could not run: {err}"));
             return;
         }
     };
@@ -452,7 +565,7 @@ fn a_nested_cage_writes_its_own_range_map() {
         // An old util-linux without --map-users is a skip; an assertion
         // failure inside the nested run is a real failure.
         if stderr.contains("unrecognized option") || stderr.contains("bad usage") {
-            eprintln!("skipping: the host unshare does not support --map-users");
+            skip("the host unshare does not support --map-users");
             return;
         }
         panic!(

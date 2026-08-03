@@ -30,11 +30,12 @@ use crate::IdentityMap;
 /// files the base actually holds in agreement, and requiring the caller to
 /// thread nothing.
 ///
-/// Only packages the status database records as `install ok installed` count:
-/// the base must be a fully configured bootstrap, so a base whose status
-/// database is absent or lists nothing installed — an `extract_only` tree — is
-/// rejected rather than treated as an empty base, which would draw the whole
-/// base system into the increment.
+/// Only packages the status database records as installed and error-free count —
+/// `install ok installed`, and the held `hold ok installed` alongside it. The
+/// base must be a fully configured bootstrap, so a base whose status database is
+/// absent or lists nothing installed — an `extract_only` tree — is rejected
+/// rather than treated as an empty base, which would draw the whole base system
+/// into the increment.
 ///
 /// [`Debian::stage_layer`]: super::Debian::stage_layer
 pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianError> {
@@ -64,10 +65,9 @@ pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianE
         let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status")) else {
             continue;
         };
-        // The third word of the status is the install state; a fully configured
-        // package is `install ok installed`. Anything short of that is not a
-        // dependency the increment may assume satisfied.
-        if status != "install ok installed" {
+        // Anything short of present-and-configured is not a dependency the
+        // increment may assume satisfied.
+        if !is_configured(status) {
             continue;
         }
         installed.insert(name.to_string());
@@ -89,6 +89,21 @@ pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianE
         });
     }
     Ok(installed)
+}
+
+/// Whether a dpkg `Status` field describes a package present and configured in
+/// the tree.
+///
+/// The field is three words, `<want> <error flag> <state>`. Only the last two
+/// speak to what is on disk: the state must be `installed` — not `unpacked`,
+/// `half-configured`, or `config-files` — and the error flag must be `ok`, since
+/// a package awaiting reinstallation cannot be assumed whole. The want is the
+/// administrator's intention rather than the tree's contents, so a held package
+/// (`hold ok installed`) counts exactly as an `install ok installed` one does.
+fn is_configured(status: &str) -> bool {
+    let mut words = status.split_ascii_whitespace();
+    let (_want, flag, state) = (words.next(), words.next(), words.next());
+    words.next().is_none() && flag == Some("ok") && state == Some("installed")
 }
 
 /// A staged build layer: the disposable overlay upper an increment was installed
@@ -169,6 +184,7 @@ impl Drop for BuildLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     fn base_with_status(dir: &Path, status: &str) {
         let dpkg = dir.join("var/lib/dpkg");
@@ -176,12 +192,8 @@ mod tests {
         std::fs::write(dpkg.join("status"), status).unwrap();
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ferroday-cage-layer-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir(tag: &str) -> Scratch {
+        Scratch::new(&format!("layer-{tag}"))
     }
 
     #[test]
@@ -253,6 +265,5 @@ mod tests {
             !work.exists(),
             "the work directory is removed despite mode-0"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

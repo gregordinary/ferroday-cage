@@ -1,7 +1,27 @@
-//! The resolved install plan: the packages a bootstrap would install, reported
-//! without downloading or configuring any of them.
+//! The resolved install plan: the packages a bootstrap would install, and the
+//! archive state it resolved them against, reported without downloading or
+//! configuring any of them.
+//!
+//! A plan is also a document. [`Plan::to_document`] writes it in the archive's
+//! own deb822 control format and [`Plan::parse_document`] reads it back, so a
+//! plan resolved on one machine can be committed, reviewed in a diff, and
+//! replayed on another against a snapshot mirror. That is the form the
+//! reproduce case needs: the same-process handoff to
+//! [`DebianBuilder::plan`](super::DebianBuilder::plan) covers resolving once
+//! and installing once, and nothing else.
 
-use super::index::Package;
+use std::fmt::Write as _;
+
+use super::DebianError;
+use super::index::{Package, parse_stanzas};
+
+/// The document's first field, naming the format and its version.
+///
+/// A document carries its own version because the plan is a trust anchor: a
+/// reader that cannot tell which shape it is holding cannot say what it is
+/// trusting. The version is bumped only for a change a previous reader would
+/// misread; adding a field is not one, since an unknown field is ignored.
+const FORMAT: &str = "ferroday-cage-plan 1";
 
 /// The packages a [`Debian`](super::Debian) bootstrap resolves for its suite,
 /// produced without downloading or unpacking anything.
@@ -12,6 +32,36 @@ use super::index::Package;
 /// to the archive signature rather than to a mirror's unverified word. The
 /// packages are ordered by name, so the plan is a stable value to cache a build
 /// on or compare across runs.
+///
+/// [`archives`](Self::archives) records the state each package was resolved
+/// against, which is what makes the plan a description of a moment in an
+/// archive's life rather than only of a package set.
+///
+/// # Keeping a plan
+///
+/// [`to_document`](Self::to_document) and
+/// [`parse_document`](Self::parse_document) are the plan's on-disk form, in the
+/// archive's own deb822 control format:
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use ferroday_cage::provision::debian::Plan;
+///
+/// // Resolve now, and keep what was resolved.
+/// # let plan: Plan = unimplemented!();
+/// std::fs::write("trixie.plan", plan.to_document()?)?;
+///
+/// // Replay later, against a snapshot mirror.
+/// let kept = Plan::parse_document(&std::fs::read_to_string("trixie.plan")?)?;
+/// # let _ = kept;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A document written by a later version of this library reads back here as
+/// long as its format version is unchanged: a field this version does not know
+/// is ignored rather than refused, which is what lets a plan outlive the
+/// program that wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Plan {
@@ -21,6 +71,56 @@ pub struct Plan {
     pub architecture: String,
     /// The resolved install set, ordered by name.
     pub packages: Vec<PlannedPackage>,
+    /// The archive state each package was resolved against, in the order the
+    /// repositories were configured — the primary first.
+    pub archives: Vec<ResolvedArchive>,
+    /// Header fields a document carried that this version does not know.
+    ///
+    /// Private because they are not this version's data to interpret; they
+    /// exist so that reading a document and writing it back loses nothing. See
+    /// [`Plan::parse_document`].
+    carried: Carried,
+}
+
+/// One repository's state at the moment a [`Plan`] resolved against it.
+///
+/// A reproducibility model that fixes the archive state needs this: the same
+/// suite resolves to different versions a week apart, and a plan naming only
+/// what it selected cannot say what it selected *from*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedArchive {
+    /// The mirror URL that served the release, which is the one the packages
+    /// will be fetched from.
+    ///
+    /// The URL that answered, not the configured list: a repository with a
+    /// snapshot backstop resolves against whichever mirror served, and
+    /// recording the list would describe a choice rather than the choice made.
+    pub mirror: String,
+    /// The suite as the repository requested it.
+    pub suite: String,
+    /// The components resolved from this repository.
+    pub components: Vec<String>,
+    /// The SHA-256 of the release body that was verified, lowercase hex.
+    ///
+    /// For a signed repository this is the digest of the cleartext the
+    /// signature covers, so it identifies the exact archive state the
+    /// signature vouched for.
+    pub release_sha256: String,
+    /// The release's `Date` field, as written, when it carries one.
+    pub date: Option<String>,
+    /// The release's `Valid-Until` field, as written, when it carries one.
+    pub valid_until: Option<String>,
+    /// The fingerprint of the key that verified the release, uppercase hex.
+    ///
+    /// Empty for a repository configured as
+    /// [`trust_unsigned`](super::RepositoryBuilder::trust_unsigned), where
+    /// nothing was verified. A release may carry several signatures;
+    /// verification stops at the first valid one, so this names the key that
+    /// was actually used rather than every key that could have been.
+    pub signed_by: Vec<String>,
+    /// Fields this archive's stanza carried that this version does not know.
+    carried: Carried,
 }
 
 /// One package in a [`Plan`]: enough to identify the exact `.deb` and to key a
@@ -38,19 +138,247 @@ pub struct PlannedPackage {
     pub sha256: String,
     /// The pool path of the `.deb`, relative to the mirror root.
     pub filename: String,
+    /// Which of [`Plan::archives`] this package's winning version came from,
+    /// as an index into that list.
+    ///
+    /// Resolution is highest-version-wins across the merged repositories, so
+    /// with more than one configured this is the only thing that says where a
+    /// package will actually be fetched from.
+    pub archive: usize,
+    /// Fields this package's stanza carried that this version does not know.
+    carried: Carried,
 }
 
+/// The fields of one stanza that the reading version did not recognize, in the
+/// order the document wrote them.
+///
+/// A plan document is meant to outlive the program that wrote it, so a reader
+/// ignores a field it does not know rather than refusing the document. Ignoring
+/// it on the way in and dropping it on the way out are different things: a
+/// consumer that reads a plan and writes it back — into a provenance record, or
+/// to normalize a file it commits — would silently discard whatever a newer
+/// writer had added. So the fields are carried, and re-emitted after the ones
+/// this version does know.
+///
+/// A round trip therefore preserves every field. It does not promise byte
+/// identity across versions: a future writer may interleave its own fields with
+/// these rather than append them, and this version cannot know where they
+/// belong.
+type Carried = Vec<(String, String)>;
+
 impl Plan {
+    /// Renders the plan as a deb822 document.
+    ///
+    /// The document is the plan and nothing else: one header stanza, one stanza
+    /// per archive in [`archives`](Self::archives) order, then one per package
+    /// in [`packages`](Self::packages) order. Since both lists are already
+    /// ordered, two renderings of one plan are byte-identical, and a plan that
+    /// changes shows the change as a diff rather than as a different blob.
+    ///
+    /// # Errors
+    ///
+    /// [`DebianError::PlanDocument`] when a field's value cannot be written as
+    /// a single deb822 line — one holding a newline, or one empty where the
+    /// format has no way to say "empty". Both mean the plan came from an
+    /// archive that fed the resolver something the format cannot carry back,
+    /// which is worth refusing rather than writing a document that reads back
+    /// as something else.
+    pub fn to_document(&self) -> Result<String, DebianError> {
+        let mut out = String::new();
+        let mut header = Stanza::new();
+        header.put("Format", FORMAT);
+        header.put("Suite", &self.suite);
+        header.put("Architecture", &self.architecture);
+        header.put_carried(&self.carried);
+        header.render(&mut out)?;
+
+        for (index, archive) in self.archives.iter().enumerate() {
+            let mut stanza = Stanza::new();
+            stanza.put("Archive", &index.to_string());
+            stanza.put("Mirror", &archive.mirror);
+            stanza.put("Suite", &archive.suite);
+            stanza.put_list("Components", &archive.components);
+            stanza.put("Release-SHA256", &archive.release_sha256);
+            stanza.put_optional("Date", archive.date.as_deref());
+            stanza.put_optional("Valid-Until", archive.valid_until.as_deref());
+            // Written even when empty: an unsigned repository is a fact about
+            // the plan's trust, not an absence of information, and a reader
+            // that saw no key at all could not tell the two apart.
+            stanza.put_allowing_empty("Signed-By", &archive.signed_by.join(" "));
+            stanza.put_carried(&archive.carried);
+            stanza.render(&mut out)?;
+        }
+
+        for package in &self.packages {
+            if package.archive >= self.archives.len() {
+                return Err(document(format!(
+                    "the package {} names archive {}, and the plan records {}",
+                    package.name,
+                    package.archive,
+                    self.archives.len(),
+                )));
+            }
+            let mut stanza = Stanza::new();
+            stanza.put("Package", &package.name);
+            stanza.put("Version", &package.version);
+            stanza.put("Architecture", &package.architecture);
+            stanza.put("SHA256", &package.sha256);
+            stanza.put("Filename", &package.filename);
+            stanza.put("Archive", &package.archive.to_string());
+            stanza.put_carried(&package.carried);
+            stanza.render(&mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Reads a plan back from a document [`to_document`](Self::to_document)
+    /// wrote.
+    ///
+    /// A field the reader does not know is ignored, so a document written by a
+    /// later version of this library still reads. A stanza order other than
+    /// header, archives, packages is not: the archive index each package refers
+    /// to is resolved as the document is read.
+    ///
+    /// # Errors
+    ///
+    /// [`DebianError::PlanDocument`] for a document with no header, a format
+    /// version this library does not read, a stanza missing a field the plan
+    /// cannot do without, a malformed archive index, or a package naming an
+    /// archive the document does not carry.
+    pub fn parse_document(text: &str) -> Result<Plan, DebianError> {
+        let stanzas = parse_stanzas(text);
+        let (header, rest) = stanzas
+            .split_first()
+            .ok_or_else(|| document("the document holds no stanzas".to_string()))?;
+
+        let format = header
+            .get("Format")
+            .ok_or_else(|| document("the first stanza has no Format field".to_string()))?;
+        if format != FORMAT {
+            return Err(document(format!(
+                "the document is in format {format:?}, and this library reads {FORMAT:?}"
+            )));
+        }
+        let mut plan = Plan {
+            suite: required(header.get("Suite"), "Suite", "the header")?,
+            architecture: required(header.get("Architecture"), "Architecture", "the header")?,
+            packages: Vec::new(),
+            archives: Vec::new(),
+            carried: carried(header, HEADER_FIELDS),
+        };
+
+        for stanza in rest {
+            if let Some(name) = stanza.get("Package") {
+                let at = stanza
+                    .get("Archive")
+                    .ok_or_else(|| document(format!("the package {name} names no archive")))?
+                    .parse::<usize>()
+                    .map_err(|_| {
+                        document(format!("the package {name} has a malformed archive index"))
+                    })?;
+                if at >= plan.archives.len() {
+                    return Err(document(format!(
+                        "the package {name} names archive {at}, which the document does not \
+                         carry — archive stanzas must precede the packages that refer to them",
+                    )));
+                }
+                let at_package = format!("the package {name}");
+                plan.packages.push(PlannedPackage {
+                    name: name.to_string(),
+                    version: required(stanza.get("Version"), "Version", &at_package)?,
+                    architecture: required(
+                        stanza.get("Architecture"),
+                        "Architecture",
+                        &at_package,
+                    )?,
+                    sha256: required(stanza.get("SHA256"), "SHA256", &at_package)?,
+                    filename: required(stanza.get("Filename"), "Filename", &at_package)?,
+                    archive: at,
+                    carried: carried(stanza, PACKAGE_FIELDS),
+                });
+                continue;
+            }
+
+            let index = stanza.get("Archive").ok_or_else(|| {
+                document("a stanza is neither a package nor an archive".to_string())
+            })?;
+            // The index is written out so the document reads on its own, and
+            // checked rather than trusted: a document whose archives are out of
+            // order would silently attribute packages to the wrong mirror.
+            let expected = plan.archives.len();
+            if index.parse::<usize>().ok() != Some(expected) {
+                return Err(document(format!(
+                    "the archive stanzas are numbered out of order: expected {expected}, \
+                     found {index:?}",
+                )));
+            }
+            let at_archive = format!("archive {expected}");
+            plan.archives.push(ResolvedArchive {
+                mirror: required(stanza.get("Mirror"), "Mirror", &at_archive)?,
+                suite: required(stanza.get("Suite"), "Suite", &at_archive)?,
+                components: list(stanza.get("Components")),
+                release_sha256: required(
+                    stanza.get("Release-SHA256"),
+                    "Release-SHA256",
+                    &at_archive,
+                )?,
+                date: stanza.get("Date").map(str::to_string),
+                valid_until: stanza.get("Valid-Until").map(str::to_string),
+                signed_by: list(stanza.get("Signed-By")),
+                carried: carried(stanza, ARCHIVE_FIELDS),
+            });
+        }
+        Ok(plan)
+    }
+
     /// Builds a plan from a resolved package set, projecting each package onto
     /// the public shape. Shared by [`Debian::resolve`](super::Debian::resolve)
     /// and the mid-bootstrap [`Resolved`](super::DebianEvent::Resolved) event, so
     /// the plan a caller previews and the plan an in-flight bootstrap reports are
     /// the same value built one way.
-    pub(crate) fn project(suite: &str, architecture: &str, packages: &[Package]) -> Plan {
+    pub(crate) fn project(
+        suite: &str,
+        architecture: &str,
+        packages: &[Package],
+        archives: &[ResolvedArchive],
+    ) -> Plan {
         Plan {
             suite: suite.to_string(),
             architecture: architecture.to_string(),
             packages: packages.iter().map(PlannedPackage::from_package).collect(),
+            archives: archives.to_vec(),
+            // A plan built from a live resolution has no document behind it,
+            // so there is nothing to carry.
+            carried: Carried::new(),
+        }
+    }
+}
+
+impl ResolvedArchive {
+    /// Records one repository's state as a live resolution observed it.
+    ///
+    /// A constructor rather than a struct literal because the carried-field
+    /// list is private: a record built from a resolution has no document behind
+    /// it, so there is nothing to carry.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolved(
+        mirror: String,
+        suite: String,
+        components: Vec<String>,
+        release_sha256: String,
+        date: Option<String>,
+        valid_until: Option<String>,
+        signed_by: Vec<String>,
+    ) -> ResolvedArchive {
+        ResolvedArchive {
+            mirror,
+            suite,
+            components,
+            release_sha256,
+            date,
+            valid_until,
+            signed_by,
+            carried: Carried::new(),
         }
     }
 }
@@ -64,6 +392,505 @@ impl PlannedPackage {
             architecture: package.architecture.clone(),
             sha256: package.sha256.clone(),
             filename: package.filename.clone(),
+            // The index tags each retained package with the repository it came
+            // from, which is exactly this list's ordering.
+            archive: package.origin,
+            carried: Carried::new(),
         }
+    }
+}
+
+/// A field's name: one this version writes, or one it is only passing through.
+enum Name {
+    Known(&'static str),
+    Carried(String),
+}
+
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Name::Known(name) => f.write_str(name),
+            Name::Carried(name) => f.write_str(name),
+        }
+    }
+}
+
+/// One field of a stanza being written.
+struct Field {
+    name: Name,
+    value: String,
+    /// Whether an empty value is an answer here rather than a missing one. An
+    /// unsigned repository's `Signed-By` is empty and means it; a `Suite` that
+    /// came out empty is a plan that cannot be written.
+    may_be_empty: bool,
+}
+
+/// One stanza being written: its fields in the order they will appear.
+///
+/// Collected before anything is written, so a value the format cannot carry
+/// stops the whole document rather than truncating it mid-stanza.
+struct Stanza {
+    fields: Vec<Field>,
+}
+
+impl Stanza {
+    fn new() -> Stanza {
+        Stanza { fields: Vec::new() }
+    }
+
+    /// Adds a field that must carry a value.
+    fn put(&mut self, name: &'static str, value: &str) {
+        self.fields.push(Field {
+            name: Name::Known(name),
+            value: value.to_string(),
+            may_be_empty: false,
+        });
+    }
+
+    /// Adds a field whose value may be empty, where empty is itself the answer.
+    fn put_allowing_empty(&mut self, name: &'static str, value: &str) {
+        self.fields.push(Field {
+            name: Name::Known(name),
+            value: value.to_string(),
+            may_be_empty: true,
+        });
+    }
+
+    /// Adds a field only when the source carries one, so an absent value reads
+    /// back as absent rather than as empty.
+    fn put_optional(&mut self, name: &'static str, value: Option<&str>) {
+        if let Some(value) = value {
+            self.put(name, value);
+        }
+    }
+
+    /// Adds a space-separated list field, which may be empty.
+    fn put_list(&mut self, name: &'static str, values: &[String]) {
+        self.put_allowing_empty(name, &values.join(" "));
+    }
+
+    /// Appends the fields a document carried that this version does not know,
+    /// after every field it does.
+    ///
+    /// Their names are owned rather than static, since they came off a document
+    /// rather than out of this file. An empty value is written as one, because
+    /// the writer that produced it meant it.
+    fn put_carried(&mut self, carried: &Carried) {
+        for (name, value) in carried {
+            self.fields.push(Field {
+                name: Name::Carried(name.clone()),
+                value: value.clone(),
+                may_be_empty: true,
+            });
+        }
+    }
+
+    /// Writes the stanza and the blank line that ends it.
+    fn render(&self, out: &mut String) -> Result<(), DebianError> {
+        for field in &self.fields {
+            let name = &field.name;
+            // A carried name came off a document rather than out of this file,
+            // so it is checked as the values are: a name holding a colon or
+            // whitespace would read back as a different field, or as no field
+            // at all.
+            if let Name::Carried(carried) = name
+                && (carried.is_empty()
+                    || carried.contains([':', '\n', '\r'])
+                    || carried.trim() != carried)
+            {
+                return Err(document(format!(
+                    "the document carried a field named {carried:?}, which cannot be written \
+                     back as a field name",
+                )));
+            }
+            if field.value.contains(['\n', '\r']) {
+                return Err(document(format!(
+                    "the {name} value spans more than one line, which a plan document cannot \
+                     carry",
+                )));
+            }
+            // A reader strips the whitespace around a value, so a value
+            // carrying any of its own would not survive being written and read
+            // back. A leading one is worse still: deb822's continuation marker
+            // is a leading space, so such a value would be folded into the
+            // field above it.
+            if field.value.trim() != field.value {
+                return Err(document(format!(
+                    "the {name} value begins or ends with whitespace, which a reader strips, \
+                     so the document would not read back as the plan that wrote it",
+                )));
+            }
+            if field.value.is_empty() && !field.may_be_empty {
+                return Err(document(format!("the {name} value is empty")));
+            }
+            // An empty value is written as a bare `Name:`, with no space after
+            // the colon. `Name: ` would be the only line the format can
+            // produce that ends in whitespace, and it would appear exactly
+            // where a repository is trusted unsigned — so a committed plan
+            // would stop matching its own digest the first time an editor or a
+            // pre-commit hook stripped the line, without the plan changing.
+            if field.value.is_empty() {
+                let _ = writeln!(out, "{name}:");
+            } else {
+                let _ = writeln!(out, "{name}: {}", field.value);
+            }
+        }
+        out.push('\n');
+        Ok(())
+    }
+}
+
+/// The header fields this version writes and reads.
+///
+/// The three tables exist so that "a field this version does not know" has one
+/// definition, used by both halves: the reader collects what is not here, and
+/// the writer emits what is here and then what was collected. A field added to
+/// a stanza has to be added to its table, or it would be both written as a
+/// known field and carried as an unknown one.
+const HEADER_FIELDS: &[&str] = &["Format", "Suite", "Architecture"];
+/// The archive-stanza fields this version writes and reads.
+const ARCHIVE_FIELDS: &[&str] = &[
+    "Archive",
+    "Mirror",
+    "Suite",
+    "Components",
+    "Release-SHA256",
+    "Date",
+    "Valid-Until",
+    "Signed-By",
+];
+/// The package-stanza fields this version writes and reads.
+const PACKAGE_FIELDS: &[&str] = &[
+    "Package",
+    "Version",
+    "Architecture",
+    "SHA256",
+    "Filename",
+    "Archive",
+];
+
+/// Collects the stanza's fields that `known` does not name, in document order.
+///
+/// Matched case-insensitively, as every other lookup in this format is, so a
+/// document spelling `sha256` does not have that field both read as known and
+/// carried as unknown — which would write it out twice.
+fn carried(stanza: &super::index::Stanza, known: &[&str]) -> Carried {
+    stanza
+        .fields()
+        .iter()
+        .filter(|(name, _)| {
+            !known
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Reads a required field, naming where it was missing from.
+fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, DebianError> {
+    match value {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        Some(_) => Err(document(format!("{at} has an empty {field} field"))),
+        None => Err(document(format!("{at} has no {field} field"))),
+    }
+}
+
+/// Reads a space-separated list field, absent or empty giving no entries.
+fn list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Builds the document error.
+fn document(reason: String) -> DebianError {
+    DebianError::PlanDocument { reason }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan with two archives, a package from each, an unsigned repository,
+    /// and a release carrying neither optional date.
+    fn sample() -> Plan {
+        Plan {
+            suite: "trixie".to_string(),
+            architecture: "arm64".to_string(),
+            archives: vec![
+                ResolvedArchive {
+                    mirror: "http://deb.debian.org/debian".to_string(),
+                    suite: "trixie".to_string(),
+                    components: vec!["main".to_string(), "contrib".to_string()],
+                    release_sha256: "9f3a".repeat(16),
+                    date: Some("Sat, 02 Aug 2026 08:14:33 UTC".to_string()),
+                    valid_until: Some("Sat, 09 Aug 2026 08:14:33 UTC".to_string()),
+                    signed_by: vec!["4CB50190207B4758".to_string()],
+                    carried: Carried::new(),
+                },
+                ResolvedArchive {
+                    mirror: "http://mirror.invalid/local".to_string(),
+                    suite: "trixie".to_string(),
+                    components: vec!["main".to_string()],
+                    release_sha256: "1c0f".repeat(16),
+                    date: None,
+                    valid_until: None,
+                    signed_by: Vec::new(),
+                    carried: Carried::new(),
+                },
+            ],
+            packages: vec![
+                PlannedPackage {
+                    name: "base-files".to_string(),
+                    version: "13.6".to_string(),
+                    architecture: "arm64".to_string(),
+                    sha256: "aa".repeat(32),
+                    filename: "pool/main/b/base-files/base-files_13.6_arm64.deb".to_string(),
+                    archive: 0,
+                    carried: Carried::new(),
+                },
+                PlannedPackage {
+                    name: "local-tool".to_string(),
+                    // An epoch, whose colon the document carries verbatim.
+                    version: "1:2.4-1".to_string(),
+                    architecture: "all".to_string(),
+                    sha256: "bb".repeat(32),
+                    filename: "pool/main/l/local-tool/local-tool_2.4-1_all.deb".to_string(),
+                    archive: 1,
+                    carried: Carried::new(),
+                },
+            ],
+            carried: Carried::new(),
+        }
+    }
+
+    #[test]
+    fn a_plan_survives_a_document_round_trip() {
+        let plan = sample();
+        let document = plan.to_document().expect("the plan renders");
+        let read = Plan::parse_document(&document).expect("the document reads");
+        assert_eq!(read, plan, "\n{document}");
+    }
+
+    #[test]
+    fn a_rendering_is_stable_and_a_reread_renders_identically() {
+        // The plan's lists are already ordered, so the document is a value a
+        // consumer can commit and diff rather than a blob that churns.
+        let plan = sample();
+        let first = plan.to_document().unwrap();
+        assert_eq!(first, plan.to_document().unwrap());
+        assert_eq!(
+            first,
+            Plan::parse_document(&first).unwrap().to_document().unwrap(),
+        );
+    }
+
+    #[test]
+    fn the_document_is_readable_deb822() {
+        let document = sample().to_document().unwrap();
+        assert!(
+            document.starts_with("Format: ferroday-cage-plan 1\n"),
+            "{document}",
+        );
+        // Every stanza is separated by a blank line and no field is folded, so
+        // a plain deb822 reader — apt's included — parses it.
+        for line in document.lines() {
+            assert!(
+                line.is_empty() || line.contains(": ") || line.ends_with(':'),
+                "{line:?} is neither blank nor a field",
+            );
+            assert!(!line.starts_with(' '), "{line:?} reads as a continuation");
+        }
+        // The absent optional fields are absent, not empty.
+        assert!(!document.contains("Valid-Until:\n"), "{document}");
+        // The empty list is present, because unsigned is an answer -- written
+        // bare, with nothing after the colon.
+        assert!(document.contains("\nSigned-By:\n"), "{document}");
+    }
+
+    #[test]
+    fn no_line_the_format_can_produce_ends_in_whitespace() {
+        // A committed plan must survive the editors and pre-commit hooks that
+        // strip trailing whitespace. `Signed-By: ` was the one line the format
+        // could produce that would not, and it appeared exactly where a
+        // repository is trusted unsigned -- so stripping it changed a
+        // committed plan's bytes, and its digest, without the plan changing.
+        let mut plan = sample();
+        plan.archives[0].signed_by.clear();
+        plan.archives[0].components.clear();
+        let document = plan.to_document().unwrap();
+        for line in document.lines() {
+            assert_eq!(line.trim_end(), line, "{line:?} ends in whitespace");
+        }
+        // Stripping is now a no-op, so a hook cannot change the bytes.
+        let stripped: String = document
+            .lines()
+            .map(|line| format!("{}\n", line.trim_end()))
+            .collect();
+        assert_eq!(stripped, document);
+        assert_eq!(Plan::parse_document(&document).unwrap(), plan);
+    }
+
+    #[test]
+    fn a_value_whose_whitespace_a_reader_would_strip_is_refused() {
+        // A reader trims a value, so a value carrying its own whitespace would
+        // read back as a different string. Refusing is what keeps the round
+        // trip total; a leading one would additionally fold into the field
+        // above it, deb822's continuation marker being a leading space.
+        for suite in [" trixie", "trixie "] {
+            let mut plan = sample();
+            plan.suite = suite.to_string();
+            match plan.to_document() {
+                Err(DebianError::PlanDocument { reason }) => {
+                    assert!(reason.contains("whitespace"), "{reason}");
+                }
+                other => panic!("expected a whitespace refusal for {suite:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_document_from_a_format_this_library_does_not_read_is_refused() {
+        let document = sample()
+            .to_document()
+            .unwrap()
+            .replace("ferroday-cage-plan 1", "ferroday-cage-plan 2");
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("format"), "{reason}");
+            }
+            other => panic!("expected a format refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_field_this_library_does_not_know_survives_a_round_trip() {
+        // The forward-compatibility promise, and the half of it that is easy to
+        // leave out: a document written by a later version, with fields added
+        // but the format version unchanged, both reads *and writes back*.
+        //
+        // Ignoring a field on the way in and dropping it on the way out are
+        // different things. A consumer that reads a plan and writes it back --
+        // into a provenance record, or to normalize a file it commits -- would
+        // otherwise silently discard whatever the newer writer had added, which
+        // is the one thing a plan kept for reproducibility must not do.
+        let document = sample()
+            .to_document()
+            .unwrap()
+            .replace("Suite: trixie\n", "Suite: trixie\nFuture-Header: h\n")
+            .replace(
+                "Mirror: http://deb.debian.org/debian\n",
+                "Mirror: http://deb.debian.org/debian\nFuture-Archive: a\n",
+            )
+            .replace(
+                "Package: base-files\n",
+                "Package: base-files\nFuture-Package: p\n",
+            );
+
+        let plan = Plan::parse_document(&document).expect("a newer document reads");
+        let rewritten = plan.to_document().expect("and writes back");
+        for carried in ["Future-Header: h", "Future-Archive: a", "Future-Package: p"] {
+            assert!(
+                rewritten.contains(carried),
+                "{carried} was dropped:\n{rewritten}"
+            );
+        }
+        // And the carried fields are themselves stable: a second round trip is
+        // byte-identical, so re-emitting a plan does not churn a committed file.
+        assert_eq!(
+            Plan::parse_document(&rewritten)
+                .unwrap()
+                .to_document()
+                .unwrap(),
+            rewritten,
+        );
+        assert_eq!(Plan::parse_document(&rewritten).unwrap(), plan);
+    }
+
+    #[test]
+    fn a_plan_from_a_resolution_carries_nothing() {
+        // Only a document can put a field in the carry list, so a plan built
+        // from a live resolution compares equal to one read back from its own
+        // document.
+        let plan = sample();
+        assert_eq!(
+            Plan::parse_document(&plan.to_document().unwrap()).unwrap(),
+            plan
+        );
+    }
+
+    #[test]
+    fn a_package_naming_an_archive_the_document_does_not_carry_is_refused() {
+        // Silently attributing a package to the wrong mirror is the failure
+        // this prevents, and it is exactly what a plan is kept to avoid.
+        let document = sample().to_document().unwrap().replace(
+            "Filename: pool/main/b/base-files/base-files_13.6_arm64.deb\nArchive: 0",
+            "Filename: pool/main/b/base-files/base-files_13.6_arm64.deb\nArchive: 7",
+        );
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("archive 7"), "{reason}");
+            }
+            other => panic!("expected an archive refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_required_field_names_the_stanza_it_is_missing_from() {
+        let document = sample()
+            .to_document()
+            .unwrap()
+            .replace("SHA256: aa", "Sha-Was-Here: aa");
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("base-files"), "{reason}");
+                assert!(reason.contains("SHA256"), "{reason}");
+            }
+            other => panic!("expected a missing-field refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_value_the_format_cannot_carry_refuses_the_whole_document() {
+        // A hostile mirror can fold a value across lines, and a document that
+        // wrote it out would read back as a different plan. Refusing is the
+        // only answer that keeps the round trip honest.
+        let mut plan = sample();
+        plan.packages[0].filename = "pool/main/b/base-files\nArchive: 1".to_string();
+        match plan.to_document() {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("more than one line"), "{reason}");
+            }
+            other => panic!("expected a rendering refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archives_numbered_out_of_order_are_refused() {
+        let document = sample().to_document().unwrap().replace(
+            "Archive: 1\nMirror: http://mirror.invalid/local",
+            "Archive: 5\nMirror: http://mirror.invalid/local",
+        );
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("out of order"), "{reason}");
+            }
+            other => panic!("expected an ordering refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_document_is_refused_rather_than_read_as_an_empty_plan() {
+        assert!(matches!(
+            Plan::parse_document(""),
+            Err(DebianError::PlanDocument { .. }),
+        ));
+        assert!(matches!(
+            Plan::parse_document("Suite: trixie\nArchitecture: arm64\n"),
+            Err(DebianError::PlanDocument { .. }),
+        ));
     }
 }

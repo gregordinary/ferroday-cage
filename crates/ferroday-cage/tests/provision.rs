@@ -18,14 +18,29 @@ use ferroday_cage::provision::{
 /// A byte-level tar writer for test archives.
 struct TarBuilder {
     data: Vec<u8>,
+    /// Emit pre-POSIX v7 headers: everything past byte 257 left zero, so no
+    /// magic, no version, and no prefix field.
+    v7: bool,
 }
 
 impl TarBuilder {
     fn new() -> Self {
-        TarBuilder { data: Vec::new() }
+        TarBuilder {
+            data: Vec::new(),
+            v7: false,
+        }
     }
 
-    /// Appends a 512-byte ustar header. `path` and `link` are written
+    /// The same writer emitting v7 headers, so one fixture can be produced in
+    /// both formats and the two trees compared.
+    fn v7() -> Self {
+        TarBuilder {
+            data: Vec::new(),
+            v7: true,
+        }
+    }
+
+    /// Appends a 512-byte header. `path` and `link` are written
     /// verbatim, unvalidated — that is the point.
     fn header(&mut self, path: &[u8], typeflag: u8, mode: u32, size: u64, mtime: u64, link: &[u8]) {
         assert!(path.len() <= 100, "test paths fit the name field");
@@ -42,8 +57,10 @@ impl TarBuilder {
         write_octal(&mut block[136..148], mtime);
         block[156] = typeflag;
         block[157..157 + link.len()].copy_from_slice(link);
-        block[257..263].copy_from_slice(b"ustar\0");
-        block[263..265].copy_from_slice(b"00");
+        if !self.v7 {
+            block[257..263].copy_from_slice(b"ustar\0");
+            block[263..265].copy_from_slice(b"00");
+        }
         let checksum: u64 = block
             .iter()
             .enumerate()
@@ -347,6 +364,27 @@ fn later_entries_replace_earlier_ones() {
 }
 
 #[test]
+fn a_file_entry_landing_on_a_non_empty_directory_is_an_error() {
+    // The replacement path removes what is in the way. A non-empty directory
+    // cannot be removed, and extraction must say so rather than skip the entry
+    // or leave a half-replaced tree: the two differ in what the finished rootfs
+    // contains, and only one of them is reportable.
+    let mut tar = TarBuilder::new();
+    tar.dir("collide", 0o755)
+        .file("collide/inside", 0o644, b"occupant")
+        .file("collide", 0o644, b"now a file");
+    let error = provision_err("extract-onto-non-empty", &tar.finish());
+    assert!(
+        matches!(error, ProvisionError::Io { .. }),
+        "an unremovable obstruction is an I/O failure: {error}",
+    );
+    assert!(
+        error.to_string().contains("collide"),
+        "the report names the entry: {error}",
+    );
+}
+
+#[test]
 fn deferred_directory_metadata_does_not_follow_a_replacing_symlink() {
     // A directory records its deferred mode, then, while empty, is replaced by
     // a symlink to another in-tree directory. Finalizing the recorded metadata
@@ -509,6 +547,138 @@ fn gzip_xz_zstd_and_plain_all_extract() {
             "format {name}"
         );
     }
+}
+
+/// The fixture the v7 tests extract, written into whichever builder is given.
+///
+/// A file, a nested directory with a file under it, and a symlink: enough that
+/// the two formats' trees can differ if the v7 path reads any field wrong, and
+/// nothing that only ustar can express.
+fn v7_comparable_fixture(tar: &mut TarBuilder) {
+    tar.dir("nested", 0o755)
+        .file("nested/data", 0o640, b"under a directory")
+        .file("top", 0o644, b"at the root")
+        .symlink("alias", "top");
+}
+
+#[test]
+fn a_v7_archive_extracts_the_tree_a_ustar_one_does() {
+    // v7 is the subset: the first 257 bytes are laid out identically and what
+    // it lacks is everything after them. So the same fixture in both formats
+    // has to produce the same tree, byte for byte and mode for mode -- that is
+    // the whole claim the format support makes.
+    let mut ustar = TarBuilder::new();
+    v7_comparable_fixture(&mut ustar);
+    let mut old = TarBuilder::v7();
+    v7_comparable_fixture(&mut old);
+
+    let from_ustar = provision("extract-v7-control", &ustar.finish());
+    let from_v7 = provision("extract-v7", &old.finish());
+
+    for entry in ["nested", "nested/data", "top", "alias"] {
+        let (a, b) = (from_ustar.join(entry), from_v7.join(entry));
+        let (ma, mb) = (
+            fs::symlink_metadata(&a).unwrap(),
+            fs::symlink_metadata(&b).unwrap(),
+        );
+        assert_eq!(
+            ma.file_type(),
+            mb.file_type(),
+            "{entry} is a different kind"
+        );
+        assert_eq!(mode_of(&a), mode_of(&b), "{entry} has a different mode");
+        if ma.file_type().is_file() {
+            assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap(), "{entry}");
+        }
+        if ma.file_type().is_symlink() {
+            assert_eq!(fs::read_link(&a).unwrap(), fs::read_link(&b).unwrap());
+        }
+    }
+}
+
+#[test]
+fn an_archive_a_real_tar_wrote_as_v7_extracts() {
+    // The fixtures above are written byte by byte, which is what lets this file
+    // produce headers no tool would; the cost is that they prove the parser
+    // agrees with this file's model of v7 rather than with a producer's. This
+    // one closes that gap by asking GNU tar for the archive. It is skipped
+    // where `tar` is absent or does not know the format, since the parser's
+    // correctness is not conditional on a host tool being installed.
+    let dir = common::scratch_dir("extract-v7-real");
+    let source = dir.join("source");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("top"), b"at the root").unwrap();
+    fs::write(source.join("nested/data"), b"under a directory").unwrap();
+    std::os::unix::fs::symlink("top", source.join("alias")).unwrap();
+
+    let archive = dir.join("v7.tar");
+    let made = std::process::Command::new("tar")
+        .arg("--format=v7")
+        .arg("-cf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&source)
+        .arg(".")
+        .status();
+    match made {
+        Ok(status) if status.success() => {}
+        _ => return,
+    }
+
+    let dest = dir.join("rootfs");
+    assert_eq!(
+        ensure(&dest, &mut Tarball::new(&archive)).unwrap(),
+        Provisioned::Created
+    );
+    assert_eq!(fs::read(dest.join("top")).unwrap(), b"at the root");
+    assert_eq!(
+        fs::read(dest.join("nested/data")).unwrap(),
+        b"under a directory"
+    );
+    assert!(dest.join("nested").is_dir());
+    assert_eq!(fs::read_link(dest.join("alias")).unwrap(), Path::new("top"));
+}
+
+#[test]
+fn a_v7_directory_marked_only_by_a_trailing_slash_extracts_as_one() {
+    // An archive old enough to be v7 is old enough to have been written by
+    // something that did not set the typeflag reliably, and the convention it
+    // used instead was a trailing separator on the name.
+    let mut tar = TarBuilder::v7();
+    tar.header(b"olddir/", b'0', 0o755, 0, 1_000_000_000, b"");
+    tar.file("olddir/inside", 0o644, b"beneath a slash-marked directory");
+    let rootfs = provision("extract-v7-trailing-slash", &tar.finish());
+
+    assert!(rootfs.join("olddir").is_dir(), "the entry made a directory");
+    assert_eq!(
+        fs::read(rootfs.join("olddir/inside")).unwrap(),
+        b"beneath a slash-marked directory",
+    );
+}
+
+#[test]
+fn a_v7_entry_is_held_to_the_same_containment_rules() {
+    // The rules are properties of the resolved path, not of the header format,
+    // so accepting a new format must not open a new way through them.
+    let mut absolute = TarBuilder::v7();
+    absolute.file("/etc/evil-v7", 0o644, b"outside");
+    let err = provision_err("attack-v7-absolute", &absolute.finish());
+    assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
+    assert!(!Path::new("/etc/evil-v7").exists());
+
+    let mut dotdot = TarBuilder::v7();
+    dotdot.file("../escapee-v7", 0o644, b"outside");
+    let (err, dest) = provision_err_at("attack-v7-dotdot", &dotdot.finish());
+    assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
+    let escapee = dest.parent().unwrap().join("escapee-v7");
+    assert!(!escapee.exists(), "the dotdot entry escaped to {escapee:?}");
+
+    let mut escape = TarBuilder::v7();
+    escape
+        .symlink("esc", "../../outside")
+        .file("esc/pwn", 0o644, b"escaped");
+    let err = provision_err("attack-v7-symlink", &escape.finish());
+    assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
 }
 
 #[test]

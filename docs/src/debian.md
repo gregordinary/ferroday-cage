@@ -251,10 +251,11 @@ Pool::at("/srv/my-debs")
 # }
 ```
 
-The component defaults to `main` and the architecture to the host's; both have
-setters. `publish` takes anything that iterates paths, and may be called
-repeatedly on the same `Pool` — each call merges into what the pool already
-indexes.
+The component defaults to `main` and the architecture to the host's. Both have
+setters, and both select what the call writes rather than what the suite offers;
+the next section covers a suite that holds more than one of either. `publish`
+takes anything that iterates paths, and may be called repeatedly on the same
+`Pool` — each call merges into what the pool already indexes.
 
 The call reads each `.deb`'s control stanza, copies it into the pool under
 `pool/`, and regenerates the component's `Packages` index (with its `.gz`) and
@@ -269,6 +270,64 @@ first `.deb` exists and referenced from the start, resolving against an empty
 package set rather than a missing repository. The pool is trusted, not signed —
 a `file://` repository under the caller's control, apt's `[trusted=yes]` — so no
 OpenPGP signature is written and none is expected.
+
+### A suite accumulates
+
+A suite holds as many components and architectures as are published into it, and
+its `Release` describes all of them. Each publish rescans `dists/<suite>` for the
+indexes it holds and rewrites the release from what it finds, so publishing a
+second architecture leaves the first reachable, and a component published beside
+another does not retire it.
+
+```rust,no_run
+use ferroday_cage::provision::debian::Pool;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+Pool::at("build/pool")
+    .suite("trixie")
+    .architecture("amd64")
+    .publish(["build/tool_1.0_amd64.deb"])?;
+
+Pool::at("build/pool")
+    .suite("trixie")
+    .architecture("arm64")
+    .publish(["build/tool_1.0_arm64.deb"])?;
+# Ok(())
+# }
+```
+
+The release the second call writes offers both, and names the indexes of both:
+
+```text
+Architectures: amd64 arm64
+Components: main
+```
+
+This matters more than it looks. A reader consults the release before it knows
+which digests to ask for, and verifies every index it fetches against a digest
+the release records, so a section the release does not name cannot be resolved
+however intact it is on disk — and the `by-hash` copies are no way around that,
+for the same reason. A release describing only the publish that wrote it would
+make each publish retire the last.
+
+The scan costs the digest of every index in the suite rather than only the one
+just written. Indexes are small beside the packages they describe, and the scan
+runs under the publish lock along with the rest of the call, so a pipeline
+publishing components in parallel serializes on it exactly as it already does.
+
+A component may be laid out as a subtree, which is how `main/debian-installer`
+sits in the archive. It records in `Components` under its full path, since that
+is the name a reader has to ask for to reach it.
+
+The suite is a path too — Debian's security archive published `buster/updates`
+for years — so both accept an interior slash. What they refuse is a value that
+would resolve somewhere other than where it says: a leading `/`, a `..` segment,
+an empty or `.` segment. An architecture is always a single directory name and
+takes no slash at all. All three also refuse whitespace and control characters,
+which a release field has no way to name: `Architectures` and `Components` are
+whitespace-delimited lists, so a component with a space in it would read back as
+two components, neither of them the one published. Each refusal is a
+configuration error naming the field and the value.
 
 ### The pool's own layout
 
@@ -295,6 +354,73 @@ let repository = Repository::builder("trixie")
 # Ok(())
 # }
 ```
+
+### Dating a release
+
+The `Release` carries `Date`, the required field naming when the pool was
+published. A client reads it to tell how old a snapshot is and to check its own
+clock against the archive's; one that finds no `Date` reports the release as
+malformed rather than as merely undated.
+
+The release carries no `Valid-Until`, the separate and optional field, so it
+never expires. A pool stays usable for as long as its packages are wanted,
+however long after the build that wrote it that is. Dating a release does not
+bound its freshness — expiry is enforced on `Valid-Until` alone.
+
+By default the field names the time of the publish, which is what makes the
+release the one part of a pool that varies between two publishes of the same
+packages: the indexes are a function of the package set, and the release is a
+function of the indexes and the date. [`Pool::date`] pins it, making a publish
+byte-reproducible.
+
+```rust,no_run
+use ferroday_cage::provision::debian::Pool;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+Pool::at("build/pool")
+    .suite("trixie")
+    // The same timestamp a reproducible build pins everything else to.
+    .date(1_700_000_000)
+    .publish(["build/my-package_1.0_amd64.deb"])?;
+# Ok(())
+# }
+```
+
+The pinned value is a plain Unix timestamp rather than something read from the
+environment, so a pipeline that already pins a build date pins the pool's with
+the same number it gives [`Export::clamp_mtime`].
+
+### Naming a pool
+
+A release may carry `Origin`, `Label`, and `Description`, which name who
+produced the archive, what it is, and what it holds. None has a default and each
+is emitted only when set, so a pool that names none of them is a valid archive —
+inventing an origin would put a name in an archive its owner did not choose.
+
+```rust,no_run
+use ferroday_cage::provision::debian::Pool;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+Pool::at("build/pool")
+    .suite("trixie")
+    .origin("Example")
+    .label("Example build pool")
+    .description("Packages built by the example pipeline")
+    .publish(["build/my-package_1.0_amd64.deb"])?;
+# Ok(())
+# }
+```
+
+They are informational: nothing resolves against them. What they buy is how a
+client presents the archive — `apt policy` renders a repository under its origin
+and label, and `Pin: release o=Example` is the pinning form apt's own
+documentation leads with. Without them, a pool is still pinned by suite or
+codename.
+
+The three are free text and take spaces and punctuation. What they cannot carry
+is a control character: a release field ends at a newline, so a value holding one
+would continue into the release as further fields. A value that is empty is
+refused as well, the way to have no `Origin` being not to set one.
 
 ### Signing a pool
 
@@ -402,6 +528,278 @@ is about to install. A [progress sink](streaming.md) can read it there, keying a
 build cache on what the running bootstrap actually resolved without a separate
 `resolve` pass.
 
+### The archive state a plan resolved against
+
+A package set says what was selected, not what it was selected from, and the
+same suite resolves to different versions a week apart. `plan.archives` records
+the state each repository was in, one entry per configured repository with the
+primary first:
+
+```rust,no_run
+use ferroday_cage::provision::debian::Debian;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut debian = Debian::builder("trixie").build()?;
+let plan = debian.resolve()?;
+
+for archive in &plan.archives {
+    println!(
+        "{} {} released {} (verified by {})",
+        archive.mirror,
+        archive.suite,
+        archive.date.as_deref().unwrap_or("an unstated date"),
+        archive.signed_by.join(", "),
+    );
+}
+// Which archive a package will be fetched from.
+for package in &plan.packages {
+    println!("{} <- {}", package.name, plan.archives[package.archive].mirror);
+}
+# Ok(())
+# }
+```
+
+Three details are worth stating.
+
+The **mirror** recorded is the URL that answered, not the configured list. A
+repository with a [`mirror_fallback`] snapshot backstop resolves against
+whichever URL served, and recording the list would describe a choice rather than
+the choice made.
+
+The **release digest** is of the body that was verified — for a signed
+repository, the cleartext the signature covers, not the `InRelease` armor around
+it and not a re-fetch. So it identifies the exact archive state the signature
+vouched for. `signed_by` is the fingerprint of the key that verified it, in the
+uppercase hex the OpenPGP tools print, and is empty for a repository configured
+as [`trust_unsigned`] — where nothing was verified, which is a fact worth
+recording rather than an omission.
+
+`package.archive` indexes into `plan.archives`. Resolution is
+highest-version-wins across the merged repositories, so with more than one
+configured this is the only thing that says where a package will actually come
+from.
+
+## Installing a plan without resolving again
+
+[`plan`] hands a previously resolved `Plan` back to the bootstrap, which then
+fetches exactly the packages it records, by the digests it records, and never
+touches a release or a package index:
+
+```rust,no_run
+use ferroday_cage::provision::{self, debian::Debian};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// Once, when the build is first cut.
+let plan = Debian::builder("trixie").include(["build-essential"]).build()?.resolve()?;
+# let stored = plan.clone();
+
+// Later, to reproduce it exactly.
+let mut debian = Debian::builder("trixie").plan(stored).build()?;
+provision::ensure("/srv/images/replay", &mut debian)?;
+# Ok(())
+# }
+```
+
+Ordinarily `resolve` and a bootstrap each run a full resolution, so a pipeline
+that resolves once to key its cache and then provisions resolves twice — and has
+to reconcile the two when the archive publishes in between. Pinning removes both
+the second resolution and the divergence, along with the roughly 9 MB index
+download that dominates it.
+
+### The trust model changes
+
+Skipping the release and the index is the win, and it means the package digests
+no longer chain to an archive signature at install time. **The plan becomes the
+trust anchor.** It was archive-verified when it was produced, and installing
+from it asserts that whoever kept it kept it intact. Each `.deb` is still
+verified against the digest the plan records, so a tampered mirror is still
+caught; what is no longer checked is that the plan still describes what the
+archive says.
+
+That is exactly what a reproduce mode wants and exactly what an ordinary build
+should not take, so pinning is opt-in by construction: a builder that sets no
+plan resolves as it always has, chaining every digest to a repository signature
+at install time. Nothing about an ordinary bootstrap changes.
+
+### What a plan pins, and what it does not
+
+A plan describes a resolution that already happened, so anything that would
+shape a resolution contradicts it and is refused at `build` with
+`DebianError::Config` rather than given a silent precedence: `include`,
+`exclude`, and `base_priority`. A plan whose suite or architecture disagrees
+with the builder's is refused the same way, as is one naming more archives than
+there are repositories to fetch them from. Where the builder names no
+architecture the plan's is adopted, since a plan states which architecture it is
+for.
+
+Everything that shapes *how* rather than *what* still applies: `cache_dir`,
+`identity_map`, `pre_configure_overlay`, the repositories, and the fetcher. A
+package is fetched from the repository its `archive` index names, so the same
+plan can be replayed against a snapshot mirror by configuring one.
+
+A pinned install against an archive that has moved on installs the pinned
+versions, which is the point. If a `.deb` the plan names is no longer on the
+mirror, the failure names the package and its digest rather than reporting a
+resolution that found nothing — the plan is intact, and the archive no longer
+holds what it names.
+
+### Keeping a plan
+
+Handing a `Plan` straight back to `plan` covers one process: resolve once,
+install once, no second resolution and no divergence if the archive publishes in
+between. A reproduce mode resolves on Monday and replays in a month, and for
+that the plan has to leave the process. `to_document` and `parse_document` are
+that form:
+
+```rust,no_run
+use ferroday_cage::provision::debian::{Debian, Plan};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// Resolve now, and keep what was resolved.
+let plan = Debian::builder("trixie").build()?.resolve()?;
+std::fs::write("trixie.plan", plan.to_document()?)?;
+
+// Replay later, against a snapshot mirror.
+let kept = Plan::parse_document(&std::fs::read_to_string("trixie.plan")?)?;
+let mut debian = Debian::builder("trixie")
+    .mirror("http://snapshot.debian.org/archive/debian/20260802T000000Z")
+    .plan(kept)
+    .build()?;
+# let _ = &mut debian;
+# Ok(())
+# }
+```
+
+The document is deb822 — the archive's own control format, the one a `Release`
+and a `Packages` index are written in — so it reads in a terminal and diffs in a
+review:
+
+```text
+Format: ferroday-cage-plan 1
+Suite: trixie
+Architecture: arm64
+
+Archive: 0
+Mirror: http://deb.debian.org/debian
+Suite: trixie
+Components: main
+Release-SHA256: 9f3a...
+Date: Sat, 02 Aug 2026 08:14:33 UTC
+Valid-Until: Sat, 09 Aug 2026 08:14:33 UTC
+Signed-By: 4CB50190207B4758
+
+Archive: 1
+Mirror: file:///srv/pool
+Suite: trixie
+Components: main
+Release-SHA256: 1c0f...
+Date: Sat, 02 Aug 2026 09:02:11 UTC
+Signed-By:
+
+Package: base-files
+Version: 13.6
+Architecture: arm64
+SHA256: 7b21...
+Filename: pool/main/b/base-files/base-files_13.6_arm64.deb
+Archive: 0
+
+Package: local-tool
+Version: 2.4-1
+Architecture: all
+SHA256: e0d5...
+Filename: pool/main/l/local-tool/local-tool_2.4-1_all.deb
+Archive: 1
+```
+
+Archive 1 is a locally published [pool](#publishing-a-local-pool) configured with
+`trust_unsigned`, so nothing verified its release and `Signed-By` is empty —
+written bare, with nothing after the colon, because a line ending in whitespace
+would not survive the editors and hooks that strip it. It carries no
+`Valid-Until` either, an absent optional field being absent rather than empty.
+`local-tool` names `Archive: 1`, which is what says it will be fetched from the
+pool rather than from the Debian mirror.
+
+Both of a plan's lists are already ordered, so two renderings of one plan are
+byte-identical and a plan that changes shows the change as a diff rather than as
+a different blob.
+
+A field a reader does not know is ignored, so a document written by a later
+version of the library still reads here as long as the `Format` version is
+unchanged — that version is bumped only for a change an older reader would
+misread.
+
+Ignored on the way in does not mean dropped on the way out. A field this version
+does not know is carried with its stanza and re-emitted after the ones it does,
+so reading a plan and writing it back preserves every field. That matters
+because re-emitting a plan is a thing a consumer does — into a provenance
+record, or to normalize a file it commits — and a round trip that quietly
+discarded whatever a newer writer had added would corrupt exactly the record it
+was kept for.
+
+What a round trip does *not* promise is byte identity across versions: a future
+writer may interleave its own fields with the known ones rather than append
+them, and this version cannot know where they belong. Within one version it is
+byte-identical, carried fields included, so re-emitting does not churn a
+committed file. If you need bytes that are stable across versions, digest the
+document you were given rather than a re-render of it.
+
+No line the format emits ends in whitespace, so a plan survives the editors and
+pre-commit hooks that strip it. An empty field — `Signed-By` for a repository
+trusted unsigned, `Components` for none — is written bare, as `Signed-By:` with
+nothing after the colon.
+
+What is refused is anything that would read back as a *different* plan: a
+package naming an archive the document does not carry, archive stanzas numbered
+out of order, a missing required field, and, on the writing side, a value the
+format cannot carry on one line or one whose own leading or trailing whitespace
+a reader would strip.
+
+## Asking what an archive carries
+
+[`available`] answers a different question: not what a bootstrap would install,
+but which names the configured archives offer at all. It runs the same read half
+— each repository's signed release and index, merged — and returns the name set
+rather than a closure:
+
+```rust,no_run
+use ferroday_cage::provision::debian::Debian;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut debian = Debian::builder("trixie").build()?;
+let available = debian.available()?;
+
+for name in ["build-essential", "awk", "no-such-package"] {
+    println!("{name}: {}", available.contains(name));
+}
+// A virtual name reports what satisfies it.
+for provider in available.providers("awk") {
+    println!("awk is provided by {provider}");
+}
+# Ok(())
+# }
+```
+
+`resolve` cannot stand in for this, and neither of its behaviours is a defect.
+A top-level `include` naming nothing fails the whole resolve, so asking about a
+list of names that way reports whether they were all there and never which were
+not; and a transitive dependency nothing satisfies is dropped rather than
+reported, since dpkg configures with `--force-depends`. Nor is the cost the
+same: one `available` pass answers any number of names, where a resolve per name
+re-fetches and re-parses the index every time — a `Packages.xz` for trixie amd64
+is around 9 MB, and `cache_dir` caches `.deb` files, not indexes.
+
+Availability is answered at the level of the name, which is the level the
+resolver works at: a dependency's version constraint and architecture qualifier
+are parsed away, on the grounds that a single suite is internally consistent.
+So `contains` reports that the archives offer a name, not that they offer a
+version satisfying some constraint; answering the second question would be a
+version-constraint solver, which this is not.
+
+The builder's `include`, `exclude`, and `base_priority` shape a resolution and
+so do not apply; the suite, the architecture, the repositories, and the fetcher
+are what the query reads. `Available` is a snapshot: an archive can publish at
+any time, so a name it reports is a name that was there when the index was read.
+
 ## Layered build roots
 
 A pipeline that builds many packages against one shared base — a build root of
@@ -500,6 +898,11 @@ overridden. The tree is laid with the same kernel-enforced containment as
 package extraction, so nothing in it can be written outside the rootfs. The
 overlay applies only to a full bootstrap; because the base system is configured
 first, it governs the configuration of the non-essential packages.
+
+Entries land owned by the calling user, which the identity map presents as root
+inside. A tree that has to ship a file owned by some other in-rootfs id wants
+[`CopyIn`](provisioning.md#copying-a-tree-into-a-rootfs) instead, which lays one
+in through the map.
 
 ## Trust
 
@@ -607,6 +1010,65 @@ files without configuring them. An extract-only rootfs has run no maintainer
 scripts and has no configured dpkg database; it is the raw file tree, suitable
 for completing the configuration elsewhere.
 
+### Recording which interpreter ran
+
+A changed emulator silently changes compiled output, so a build that publishes
+artifacts wants the interpreter in its signature. [`foreign_interpreter`] reports
+it, read from the kernel's own `binfmt_misc` registration:
+
+```rust,no_run
+use ferroday_cage::provision::debian::foreign_interpreter;
+
+match foreign_interpreter("arm64") {
+    Some(interpreter) => println!(
+        "{} through {} (enabled: {}, flags: {})",
+        interpreter.name,
+        interpreter.path.display(),
+        interpreter.enabled,
+        interpreter.flags,
+    ),
+    None => println!("nothing emulated: run natively, or no handler registered"),
+}
+```
+
+The registration is the right source, and a `PATH` lookup is not. The kernel
+reaches the interpreter through the registration, so the two can disagree — and
+a build under a harness that strips `PATH` records no interpreter at all while
+one is executing every target binary.
+
+`None` is returned in three cases, each the honest answer rather than a failure:
+the host runs the architecture natively, the architecture is not one a
+`qemu-user` handler covers, or no handler is registered. A registered handler
+that is switched off reports as present and not enabled, which is the difference
+between "turn it on" and "install it".
+
+Two paths are reported because they are two facts. `path` is what the kernel
+recorded; `resolved` is what it canonicalizes to. On the common Debian layout
+the registration names a wrapper — `/usr/libexec/qemu-binfmt/aarch64-binfmt-P` —
+that is a symlink to the real binary, and repointing that symlink changes the
+interpreter without changing the registration.
+
+**Hash the path; do not probe the binary.** qemu refuses to run under its binfmt
+wrapper name:
+
+```console
+$ /usr/libexec/qemu-binfmt/aarch64-binfmt-P --version
+qemu: /usr/libexec/qemu-binfmt/aarch64-binfmt-P has to be run using kernel
+binfmt-misc subsystem
+```
+
+So the registered path is good for identity and not for interrogation. Hashing
+it works unchanged — `open` follows the symlink, so no canonicalization is
+needed — and is the better answer anyway: a version string is a claim the binary
+makes about itself, and a digest is what it is. Only executing the interpreter
+needs `resolved`.
+
+The digest is the caller's to take. The `F` flag means the kernel opened and
+holds the interpreter at *registration* time, so the file at that path may have
+been replaced since and a digest taken now may be of something that never ran.
+The library reports the path and states the caveat rather than handing back a
+digest that can be quietly wrong.
+
 ## The command line
 
 `fcage --provision-debian SUITE` bootstraps the `--rootfs` directory before
@@ -631,6 +1093,9 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`fetcher`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.fetcher
 [`architecture`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.architecture
 [`resolve`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.resolve
+[`available`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.available
+[`plan`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.plan
+[`foreign_interpreter`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/fn.foreign_interpreter.html
 [`pre_configure_overlay`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.pre_configure_overlay
 [`Repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Repository.html
 [`repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.repository
@@ -640,6 +1105,8 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`Pool::mirror_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.mirror_url
 [`Pool::release_path`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.release_path
 [`Pool::dists_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.dists_dir
+[`Pool::date`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.date
+[`Export::clamp_mtime`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/struct.Export.html#method.clamp_mtime
 [`base_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.base_layer
 [`stage_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.stage_layer
 [`resolve_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.resolve_layer

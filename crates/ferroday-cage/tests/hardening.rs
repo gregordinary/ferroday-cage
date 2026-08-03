@@ -66,9 +66,8 @@ fn landlock_net_supported() -> bool {
 /// A busybox TCP round trip over loopback: a listener binds a fixed port and
 /// sends a token, then a client connects and prints what it receives. The token
 /// reaches stdout only when the listener's bind, the client's connect, and the
-/// client's ephemeral source-port bind are all permitted. Each test grants the
-/// binds and varies only the connect, so a crossed or missing token isolates
-/// connect enforcement.
+/// client's ephemeral source-port bind are all permitted, so a crossed token is
+/// evidence that every one of them was.
 ///
 /// busybox `sh` redirects a backgrounded job's stdin from `/dev/null`, so the
 /// tests grant `/dev`; the client binds its ephemeral source port explicitly,
@@ -78,6 +77,25 @@ const NET_ROUNDTRIP: &str = "echo cage-net-ok | nc -l -p 50505 & sleep 1; nc -w 
 const NET_TOKEN: &str = "cage-net-ok";
 /// The fixed TCP port the round trip's listener binds.
 const NET_PORT: u16 = 50505;
+
+/// The same round trip on two ports at once, each listener carrying its own
+/// token.
+///
+/// The deny test grants `CONNECT` on one port and not the other, so the two
+/// halves differ in nothing but that grant. The granted half is the test's
+/// positive control: an absent token means the round trip itself did not work
+/// — a busybox without the `nc` applet, a port already bound, a loaded runner
+/// outrunning the `sleep` — which would otherwise make the denied half's empty
+/// stdout pass for enforcement.
+const NET_TWO_PORT_ROUNDTRIP: &str = "echo cage-net-granted | nc -l -p 50505 & \
+     echo cage-net-ungranted | nc -l -p 50506 & \
+     sleep 1; nc -w 3 127.0.0.1 50505; nc -w 3 127.0.0.1 50506";
+/// The token carried on the port the deny test grants `CONNECT` on.
+const NET_GRANTED_TOKEN: &str = "cage-net-granted";
+/// The token carried on the port it does not.
+const NET_UNGRANTED_TOKEN: &str = "cage-net-ungranted";
+/// The second listener's port, bound but never granted `CONNECT`.
+const NET_UNGRANTED_PORT: u16 = 50506;
 
 /// Skips a seccomp test when the kernel offers no seccomp filtering.
 ///
@@ -227,28 +245,40 @@ fn landlock_net_denies_a_connect_outside_the_grant() {
     if !landlock_net_supported() {
         return;
     }
-    // The binds are all granted, so the listener and the client's ephemeral
-    // source port both bind — but CONNECT is not granted. Enrolling any network
-    // grant makes CONNECT handled and denied everywhere it is not granted, so
-    // the client's connect is refused by Landlock and the token never crosses.
-    // The allow test grants the same binds and adds only CONNECT, so the missing
-    // token here is attributable to that one grant.
+    // Two round trips in one run, differing in nothing but the CONNECT grant:
+    // every bind is granted, so both listeners and the client's ephemeral
+    // source port bind, and CONNECT is granted on the first port only.
+    // Enrolling any network grant makes CONNECT handled and denied everywhere
+    // it is not granted, so the second connect is refused by Landlock and its
+    // token never crosses — while the first token proves the round trip works
+    // here, which is what makes the second's absence enforcement rather than
+    // an unrelated failure. busybox nc reports nothing on a refused connect,
+    // so this control is the only positive evidence available.
     let output = Cage::builder()
         .rootfs(rootfs)
         .command("/bin/busybox")
-        .args(["sh", "-c", NET_ROUNDTRIP])
+        .args(["sh", "-c", NET_TWO_PORT_ROUNDTRIP])
         .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/bin")
         .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/lib")
         .landlock_fs(FsAccess::READ, "/dev")
         .landlock_net(NetAccess::BIND, NET_PORT)
+        .landlock_net(NetAccess::BIND, NET_UNGRANTED_PORT)
         .landlock_net(NetAccess::BIND, 0)
+        .landlock_net(NetAccess::CONNECT, NET_PORT)
         .build()
         .expect("a valid sandbox configuration")
         .output()
         .expect("the sandbox launches");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !String::from_utf8_lossy(&output.stdout).contains(NET_TOKEN),
-        "a connect outside the grant must be denied"
+        stdout.contains(NET_GRANTED_TOKEN),
+        "the granted round trip must work, or the denial below proves nothing: \
+         stdout was {stdout:?}, stderr was {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains(NET_UNGRANTED_TOKEN),
+        "a connect outside the grant must be denied: stdout was {stdout:?}"
     );
 }
 

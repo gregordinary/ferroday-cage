@@ -164,7 +164,9 @@ pub(crate) fn resolve_seeded(
 ///
 /// If any alternative is already satisfied the group is done. Otherwise the
 /// first alternative that resolves to a non-excluded package — a real package,
-/// or a virtual with a provider — is selected. A group left unsatisfiable
+/// or a virtual with a provider — is selected. Excluding a real package that is
+/// also a provided virtual name therefore falls through to a provider rather
+/// than failing the group. A group left unsatisfiable
 /// purely because its every satisfier is excluded fails the resolution: the
 /// exclusion would break a hard dependency, which is refused rather than
 /// shipped broken. A group unsatisfiable for reasons unrelated to exclusion is
@@ -202,13 +204,20 @@ fn resolve_group(
     // unsatisfied solely by exclusion can be reported against it.
     let mut blocked: Option<String> = None;
     for atom in group {
-        if let Some(package) = index.get(&atom.name) {
-            if excluded.contains(atom.name.as_str()) {
-                blocked.get_or_insert_with(|| atom.name.clone());
-                continue;
+        match index.get(&atom.name) {
+            Some(package) if !excluded.contains(atom.name.as_str()) => {
+                add(selected, queue, package);
+                return Ok(());
             }
-            add(selected, queue, package);
-            return Ok(());
+            // The real package is excluded. One name can be both a real package
+            // and a virtual that others provide, so a provider may still
+            // satisfy the group — which is what apt's own deselection does.
+            // Fall through to the provider lookup, remembering the exclusion in
+            // case nothing else answers.
+            Some(_) => {
+                blocked.get_or_insert_with(|| atom.name.clone());
+            }
+            None => {}
         }
         if let Some(provider) = first_available_provider(index, &atom.name, excluded) {
             let package = index.get(&provider).expect("a provider is a real package");

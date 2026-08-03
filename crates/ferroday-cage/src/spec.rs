@@ -780,8 +780,11 @@ impl Overlay {
 ///
 /// The whole builder is also `Debug`, and with `serde` it serializes back to
 /// the profile format, so `toml::to_string(&builder)` renders a configuration
-/// for review. One thing does not appear there, because it is code rather than
-/// configuration: an [`id_mapper`](Self::id_mapper) delegate. Everything else
+/// for review. Two things do not survive that, both because they are code or a
+/// resource rather than configuration: an [`id_mapper`](Self::id_mapper)
+/// delegate is simply absent from the output, and a builder holding a
+/// [`Stdin::from_fd`](crate::Stdin::from_fd) disposition fails to serialize at
+/// all, since a descriptor names nothing a profile could carry. Everything else
 /// round-trips.
 // Scalar fields precede the env table and the bind and raw-mount table
 // arrays so the serialized form is valid TOML in field order.
@@ -1134,11 +1137,18 @@ impl CageBuilder {
     /// are configured — binds and raw mounts in one sequence — after the
     /// managed mount profile, save the `resolv.conf` bind of
     /// [`Network::Host`], which is applied last of all. Submounts of the
-    /// source are included. A
-    /// missing target is created inside the rootfs — including missing parent
-    /// directories, as mode-`0755` directories, and a file target as an empty
-    /// mode-`0644` file — and persists in the rootfs directory on the host
-    /// after the sandbox exits.
+    /// source are included.
+    ///
+    /// A missing target is created inside the rootfs, including missing parent
+    /// directories. Those directories are created mode `0755` and persist in
+    /// the rootfs directory on the host after the sandbox exits, as a mount
+    /// point directory of the managed profile does. A missing *file* target is
+    /// created as an empty mode-`0644` file and does not persist: it is content
+    /// the rootfs never had, present only for the mount to cover, and it is
+    /// removed once the sandbox handle is dropped. A target the rootfs already
+    /// ships is left untouched — the mount covers it for the sandbox's life and
+    /// reveals it again afterwards — and so is one created inside another mount
+    /// rather than in the rootfs itself.
     pub fn bind(mut self, source: impl AsRef<Path>, target: impl AsRef<Path>) -> Self {
         self.mounts.push(Mount::Bind(Bind {
             source: source.as_ref().to_path_buf(),
@@ -1434,7 +1444,10 @@ impl CageBuilder {
     /// as it was, rather than carrying a resolver configuration it never had
     /// into whatever is made of it. A rootfs that does ship the file keeps it,
     /// untouched — the bind covers it for the sandbox's life and reveals it
-    /// again afterwards.
+    /// again afterwards. An overlay root's created file lands in the upper,
+    /// which is where the merged view's writes go, and is removed from there.
+    /// A file bind a caller configures is treated the same way; see
+    /// [`bind`](Self::bind).
     pub fn resolv_conf(mut self, bind: bool) -> Self {
         self.resolv_conf = Some(bind);
         self
@@ -1678,13 +1691,17 @@ impl CageBuilder {
         let base_env = self.base_env.unwrap_or(true);
 
         // Exactly one root is in force: a plain rootfs, or an overlay whose
-        // first lower is the base the overlay mounts over.
+        // first lower is the base the overlay mounts over. The builder's
+        // setters keep the two exclusive, but a deserialized profile can carry
+        // both keys; taking either one would silently discard the other's
+        // configuration, so a profile that names both is refused.
         let rootfs = match (&self.rootfs, &self.overlay) {
-            (Some(rootfs), _) => rootfs.clone(),
+            (Some(_), Some(_)) => return Err(ConfigError::RootContradiction.into()),
+            (Some(rootfs), None) => rootfs.clone(),
             (None, Some(overlay)) => overlay
                 .lower
                 .first()
-                .ok_or(ConfigError::RootfsMissing)?
+                .ok_or(ConfigError::OverlayLowerMissing)?
                 .clone(),
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
@@ -1824,11 +1841,28 @@ impl CageBuilder {
                 Mount::Raw(raw) => lowering.push_raw(raw)?,
             }
         }
-        let managed_placeholder = if resolv_conf && matches!(self.network, Network::Host) {
-            lowering.push_resolv_conf(&rootfs)?
-        } else {
-            None
+        if resolv_conf && matches!(self.network, Network::Host) {
+            lowering.push_resolv_conf()?;
+        }
+
+        // Every mount target the launch has to create as an empty file, as the
+        // host path it comes to rest at. A file the sandbox creates only to
+        // mount over is not part of the root, so the caller side takes it away
+        // once the sandbox is gone. Writes land in the rootfs itself for a
+        // plain root and in the upper for an overlay root, whose pivoted root
+        // is the merged view; an existing file may come from any layer. Both
+        // are canonical paths, so a root the caller named relatively does not
+        // leave a path that re-resolves against whatever directory the process
+        // happens to be in when the handle drops.
+        let (writable, layers) = match &overlay {
+            Some(plan) => {
+                let mut layers = vec![plan.upper.clone()];
+                layers.extend(plan.lower.iter().cloned());
+                (plan.upper.as_path(), layers)
+            }
+            None => (canonical.as_path(), vec![canonical.clone()]),
         };
+        let managed_placeholders = created_file_targets(&lowering.ops, writable, &layers);
 
         // The identity plan: validate the requested map, resolve a range
         // request through the delegate seam, and validate the run-as
@@ -1915,10 +1949,11 @@ impl CageBuilder {
                 stop_with_caller: self.stop_with_caller,
                 hostname,
                 configure_loopback,
+                network: self.network,
                 workdir,
                 ops: lowering.ops,
                 op_labels: lowering.labels,
-                managed_placeholder,
+                managed_placeholders,
                 exec_label,
                 rlimits,
                 rlimit_labels,
@@ -2206,6 +2241,11 @@ impl CageBuilder {
     /// down to the kernel's supported ABI; a kernel without the Landlock LSM
     /// is a setup error, so a requested restriction never silently fails to
     /// apply.
+    ///
+    /// An empty `access` is refused at build with
+    /// [`ConfigError::LandlockGrantEmpty`](crate::ConfigError::LandlockGrantEmpty):
+    /// it reads as "grant nothing here" and would behave as "deny the whole
+    /// filesystem", the command's own binary included.
     pub fn landlock_fs(
         mut self,
         access: crate::hardening::FsAccess,
@@ -2243,6 +2283,11 @@ impl CageBuilder {
     /// namespace as its sole network confinement. Check
     /// [`host::landlock_abi`](crate::host::landlock_abi) before the build where
     /// that matters.
+    ///
+    /// An empty `access` is refused at build with
+    /// [`ConfigError::LandlockGrantEmpty`](crate::ConfigError::LandlockGrantEmpty):
+    /// enrolling a grant denies everything ungranted and the kernel skips a rule
+    /// that permits nothing, so it would deny all TCP rather than nothing.
     ///
     /// [`NetAccess::BIND`]: crate::NetAccess::BIND
     /// [`NetAccess::CONNECT`]: crate::NetAccess::CONNECT
@@ -2441,7 +2486,12 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     options.extend_from_slice(work.as_os_str().as_bytes());
     options.extend_from_slice(b",userxattr");
     let options = CString::new(options).map_err(|_| ConfigError::EmbeddedNul)?;
-    Ok(OverlayPlan { options })
+    Ok(OverlayPlan {
+        options,
+        lower: lowers,
+        upper,
+        work,
+    })
 }
 
 /// The overlay work directory the library manages beside `upper`: a hidden
@@ -2707,23 +2757,19 @@ impl Lowering {
     /// without a usable one simply gets no bind.
     ///
     /// A bind needs its target to exist before anything can be mounted onto it,
-    /// so a rootfs shipping no `resolv.conf` gets an empty one created. That
-    /// file would otherwise outlive the sandbox as a resolver configuration the
-    /// rootfs never had, which an export carries into whatever is made of the
-    /// tree; the path is reported to the caller instead, which removes it once
-    /// the sandbox is gone. Returns that path when the launch will create one.
-    fn push_resolv_conf(&mut self, rootfs: &Path) -> Result<Option<PathBuf>, Error> {
+    /// so a root shipping no `resolv.conf` gets an empty one created. That file
+    /// would otherwise outlive the sandbox as a resolver configuration the root
+    /// never had, which an export carries into whatever is made of the tree;
+    /// [`created_file_targets`] picks it up from the finished op list, along
+    /// with every other target the launch creates, and the caller side removes
+    /// it once the sandbox is gone.
+    fn push_resolv_conf(&mut self) -> Result<(), Error> {
         let Ok(source) = std::fs::canonicalize("/etc/resolv.conf") else {
-            return Ok(None);
+            return Ok(());
         };
         if !source.is_file() {
-            return Ok(None);
+            return Ok(());
         }
-        // Whether the target has to be created is decided here, before the
-        // launch, so the caller side knows what the sandbox will contribute
-        // without having to ask it afterwards.
-        let target = rootfs.join("etc/resolv.conf");
-        let placeholder = (!target.exists()).then_some(target);
         self.push(
             MountOp {
                 dirs: dir_chain(&["etc"], DIR_MODE)?,
@@ -2736,8 +2782,52 @@ impl Lowering {
             },
             "/etc/resolv.conf".to_string(),
         );
-        Ok(placeholder)
+        Ok(())
     }
+}
+
+/// The host paths of the mount targets `ops` has to create as empty files.
+///
+/// A file bind needs its target to exist, so the launch creates one where the
+/// root ships none — the managed `/etc/resolv.conf` bind of host networking,
+/// and any file bind a caller configures. That file is the sandbox's own
+/// contribution, not part of the root, so it is reported here for the caller
+/// side to remove once the sandbox is gone.
+///
+/// `writable` is the host directory the sandbox's writes land in, and `layers`
+/// the host directories an already-present target could come from; for a plain
+/// rootfs both are that rootfs, and for an overlay root the upper and the whole
+/// layer stack respectively.
+///
+/// Two targets are deliberately left out, because neither is a file in the root
+/// at a path this can name:
+///
+/// - one already present in any layer, which the root ships and the launch
+///   therefore does not create;
+/// - one under the target of an earlier op, which is created inside that mount
+///   — a tmpfs that vanishes with the namespace, or a caller's own bind source
+///   — rather than in the root directory on the host.
+///
+/// Directories the launch creates are not placeholders: a mount point directory
+/// is part of what a launch contributes to a tree, created at the mode of the
+/// directory it stands for, and is left in place.
+fn created_file_targets(ops: &[MountOp], writable: &Path, layers: &[PathBuf]) -> Vec<PathBuf> {
+    let mut mounted: Vec<PathBuf> = Vec::new();
+    let mut created = Vec::new();
+    for op in ops {
+        if let Some(file) = &op.create_file {
+            let relative = Path::new(OsStr::from_bytes(file.to_bytes()));
+            let covered = mounted.iter().any(|mount| relative.starts_with(mount));
+            let present = layers.iter().any(|layer| layer.join(relative).exists());
+            if !covered && !present {
+                created.push(writable.join(relative));
+            }
+        }
+        if let Some(target) = op.action.target() {
+            mounted.push(PathBuf::from(OsStr::from_bytes(target.to_bytes())));
+        }
+    }
+    created
 }
 
 /// Splits an absolute sandbox path into its normal components, rejecting
@@ -3812,6 +3902,20 @@ mod tests {
             .contains(&"/etc/resolv.conf".to_string())
     }
 
+    /// `path` expressed relative to the process's working directory, for a
+    /// test that needs a root the caller named relatively. Both are absolute
+    /// and physical — `current_dir` reports the kernel's own answer — so
+    /// ascending to the root and descending again names the same directory.
+    fn relative_to_working_dir(path: &Path) -> PathBuf {
+        let working = std::env::current_dir().expect("a working directory");
+        let mut relative = PathBuf::new();
+        for _ in working.components().skip(1) {
+            relative.push("..");
+        }
+        relative.extend(path.components().skip(1));
+        relative
+    }
+
     /// Whether the host end of the `resolv.conf` bind is available at all; the
     /// rootfs end is what each case below varies.
     fn host_has_resolv_conf() -> bool {
@@ -3832,7 +3936,7 @@ mod tests {
             .build()
             .unwrap();
         assert!(!binds_resolv_conf(&cage));
-        assert!(cage.plan.managed_placeholder.is_none());
+        assert!(cage.plan.managed_placeholders.is_empty());
     }
 
     #[test]
@@ -3844,34 +3948,149 @@ mod tests {
         if !host_has_resolv_conf() {
             return;
         }
-        let dir =
-            std::env::temp_dir().join(format!("fcage-resolv-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::scratch::Scratch::new("resolv");
         std::fs::create_dir_all(dir.join("etc")).unwrap();
         let rootfs = dir.to_str().unwrap();
 
         let created = sh_in(rootfs).network(Network::Host).build().unwrap();
         assert!(binds_resolv_conf(&created));
+        let canonical = std::fs::canonicalize(&dir).unwrap().join("etc/resolv.conf");
         assert_eq!(
-            created.plan.managed_placeholder.as_deref(),
-            Some(dir.join("etc/resolv.conf").as_path()),
+            created.plan.managed_placeholders,
+            std::slice::from_ref(&canonical),
             "a target the launch creates must be recorded for removal"
+        );
+
+        // The same rootfs named relative to the working directory records the
+        // same canonical path. The removal happens whenever the handle drops,
+        // which need not be in the directory the cage was built in, so a
+        // relative path recorded here would later resolve somewhere else.
+        let relative = relative_to_working_dir(&std::fs::canonicalize(&dir).unwrap());
+        let named_relatively = sh_in(relative.to_str().unwrap())
+            .network(Network::Host)
+            .build()
+            .unwrap();
+        assert_eq!(
+            named_relatively.plan.managed_placeholders,
+            [canonical],
+            "a relatively named rootfs must still record an absolute path"
         );
 
         std::fs::write(dir.join("etc/resolv.conf"), b"nameserver 192.0.2.1\n").unwrap();
         let shipped = sh_in(rootfs).network(Network::Host).build().unwrap();
         assert!(binds_resolv_conf(&shipped));
         assert!(
-            shipped.plan.managed_placeholder.is_none(),
+            shipped.plan.managed_placeholders.is_empty(),
             "a file the rootfs ships is not the sandbox's to remove"
         );
 
         // An isolated network never binds it, so it never creates one either.
         let isolated = sh_in(rootfs).build().unwrap();
         assert!(!binds_resolv_conf(&isolated));
-        assert!(isolated.plan.managed_placeholder.is_none());
+        assert!(isolated.plan.managed_placeholders.is_empty());
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn an_overlay_root_records_the_placeholder_in_the_upper() {
+        // The bind's target is created inside the pivoted root, which for an
+        // overlay cage is the merged view, so the file lands in the upper. A
+        // placeholder recorded against the lower would name a path that never
+        // exists — a silent no-op leaving the upper with a resolver
+        // configuration the base never had, which an export of that upper
+        // carries onward.
+        if !host_has_resolv_conf() {
+            return;
+        }
+        let dir = crate::scratch::Scratch::new("resolv-overlay");
+        let base = dir.join("base");
+        let upper = dir.join("upper");
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+
+        let built = Cage::builder()
+            .overlay_rootfs(&base, &upper)
+            .network(Network::Host)
+            .command("/bin/sh")
+            .build();
+        let Ok(cage) = built else {
+            // A host that cannot establish an unprivileged overlay refuses the
+            // build, so there is no plan to assert against.
+            assert!(
+                std::env::var_os("FERRODAY_CAGE_REQUIRE_OVERLAY").is_none(),
+                "overlay-rooted cages are required but unavailable here"
+            );
+            eprintln!("skipping: an unprivileged overlay is unavailable here");
+            return;
+        };
+        assert!(binds_resolv_conf(&cage));
+        assert_eq!(
+            cage.plan.managed_placeholders,
+            [std::fs::canonicalize(&upper)
+                .unwrap()
+                .join("etc/resolv.conf")],
+            "an overlay root's placeholder belongs to the upper"
+        );
+
+        // A file any layer ships is not the sandbox's to create or remove,
+        // even though the layer is not the one writes land in.
+        std::fs::write(base.join("etc/resolv.conf"), b"nameserver 192.0.2.1\n").unwrap();
+        let shipped = Cage::builder()
+            .overlay_rootfs(&base, &upper)
+            .network(Network::Host)
+            .command("/bin/sh")
+            .build()
+            .unwrap();
+        assert!(shipped.plan.managed_placeholders.is_empty());
+    }
+
+    #[test]
+    fn a_caller_file_bind_target_the_launch_creates_is_recorded_for_removal() {
+        // A caller's file bind creates its target the same way the managed
+        // resolv.conf bind does, and leaves the same residue if nothing takes
+        // it away — an empty file the root never shipped, carried into an
+        // export of the tree.
+        let dir = crate::scratch::Scratch::new("bind-placeholder");
+        let rootfs = dir.join("rootfs");
+        let source = dir.join("source");
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::fs::create_dir_all(dir.join("host-etc")).unwrap();
+        std::fs::write(&source, b"contents").unwrap();
+        std::fs::write(rootfs.join("etc/shipped"), b"already here").unwrap();
+        let canonical = std::fs::canonicalize(&rootfs).unwrap();
+        let placeholders =
+            |builder: CageBuilder| builder.build().unwrap().plan.managed_placeholders;
+
+        let cage = Cage::builder()
+            .rootfs(&rootfs)
+            .command("/bin/sh")
+            .bind_ro(&source, "/etc/created");
+        assert_eq!(placeholders(cage), [canonical.join("etc/created")]);
+
+        // A target the rootfs ships is not the launch's to create or remove.
+        let cage = Cage::builder()
+            .rootfs(&rootfs)
+            .command("/bin/sh")
+            .bind_ro(&source, "/etc/shipped");
+        assert!(placeholders(cage).is_empty());
+
+        // A target under an earlier mount is created inside that mount, not in
+        // the rootfs directory on the host: in the managed tmpfs on /tmp, which
+        // vanishes with the namespace, and in the caller's own bind source,
+        // which is theirs.
+        let cage = Cage::builder()
+            .rootfs(&rootfs)
+            .command("/bin/sh")
+            .bind_ro(&source, "/tmp/under-a-tmpfs")
+            .bind(dir.join("host-etc"), "/etc")
+            .bind_ro(&source, "/etc/under-a-bind");
+        assert!(placeholders(cage).is_empty());
+
+        // A directory bind creates no file, so it contributes no placeholder;
+        // the mount-point directory it creates stays.
+        let cage = Cage::builder()
+            .rootfs(&rootfs)
+            .command("/bin/sh")
+            .bind_ro(dir.join("host-etc"), "/mnt/data");
+        assert!(placeholders(cage).is_empty());
     }
 
     #[test]
@@ -4390,6 +4609,39 @@ read-only = true
                        upper = \"/tmp/profile-chosen-upper\"\n";
         let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
         assert!(err.to_string().contains("an overlay root"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_naming_both_roots_is_refused() {
+        // The setters keep the two exclusive, but nothing stops a profile from
+        // carrying both keys. Taking the rootfs would drop the overlay's whole
+        // lower stack; taking the overlay would ignore the stated rootfs. The
+        // contradiction is the author's to resolve.
+        let profile = "rootfs = \"/srv/alpine\"\ncommand = \"/bin/sh\"\n\n\
+                       [overlay]\n\
+                       lower = [\"/srv/base\", \"/srv/patches\"]\n\
+                       upper = \"/tmp/upper\"\n";
+        let builder: CageBuilder = toml::from_str(profile).expect("the profile parses");
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::RootContradiction)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_overlay_without_a_lower_names_what_is_missing() {
+        // "no rootfs was provided" reads as an oversight to an author who
+        // provided an overlay table and forgot its base layer.
+        let err = Cage::builder()
+            .overlay(Overlay::new().upper("/tmp/upper"))
+            .command("/bin/sh")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::OverlayLowerMissing)),
+            "{err}"
+        );
     }
 
     #[test]

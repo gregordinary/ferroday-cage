@@ -20,10 +20,16 @@
 //! established both sides within [`ESTABLISH_DEADLINE`] is aborted, which
 //! bounds what a connection flood can pin.
 //!
-//! An established flow whose guest stops reading — filling the transmit buffer
-//! so no forwarding is possible — stays watched for the host closing or
-//! resetting, and is reclaimed when that happens. That watch alone does not
-//! cover a peer that dies silently on an otherwise idle flow, so both sides
+//! An established flow whose guest stops reading fills the transmit buffer, so
+//! no forwarding is possible until the guest reads again. Such a flow stays
+//! watched for the host erroring or hanging up. An error is terminal and aborts
+//! the flow at once. A hangup is not: the kernel reports the host's FIN the
+//! moment it arrives, while unread bytes are still queued both in the receive
+//! buffer and in the transmit buffer, so forwarding continues as the buffer
+//! reopens and it is the eventual read of zero — not the hangup — that ends the
+//! stream. What the hangup starts is a [`HANGUP_DEADLINE`], measured from the
+//! last byte moved, past which a guest that never drains is reclaimed. Neither
+//! covers a peer that dies silently on an otherwise idle flow, so both sides
 //! carry keep-alive: the guest-facing smoltcp socket has a
 //! [`KEEP_ALIVE_INTERVAL`] keep-alive and an [`IDLE_TIMEOUT`], and the host
 //! kernel socket is tuned to the same cadence. A peer that crashes without a
@@ -104,6 +110,21 @@ pub(super) const IDLE_TIMEOUT: Duration =
 /// contract above.
 const _: () = assert!(KEEP_ALIVE_INTERVAL.as_secs() < IDLE_TIMEOUT.as_secs());
 
+/// How long a flow whose host side has hung up may go without moving a byte
+/// before it is reclaimed.
+///
+/// A hangup says nothing on its own about whether the bytes still queued behind
+/// it are wanted: a bulk transfer ending in a prompt close is exactly that
+/// shape, and its tail is still being acknowledged when the FIN is reported.
+/// What the hangup bounds is patience. A guest that establishes a flow and then
+/// never reads holds the transmit buffer full indefinitely while answering
+/// keep-alive probes, so [`IDLE_TIMEOUT`] never fires; this deadline is what
+/// releases the slot, its buffers, and the host descriptor. Measured from the
+/// last byte moved, so a flow that is draining, however slowly, is left alone;
+/// the budget is the idle timeout's, for one silence tolerance across the
+/// module.
+pub(super) const HANGUP_DEADLINE: Duration = IDLE_TIMEOUT;
+
 /// What became of one servicing pass.
 enum Copy {
     /// Bytes moved.
@@ -134,6 +155,10 @@ pub(super) struct TcpFlow {
     pub(super) events: PollFlags,
     /// The host delivered end of stream.
     host_eof: bool,
+    /// Poll reported the host's hangup. The descriptor stays readable from
+    /// then on — data, then end of stream — so the watch for it is retired
+    /// and reads no longer wait on a readability report.
+    host_hangup: bool,
     /// The guest's end of stream has been passed on as a host write
     /// shutdown.
     host_shutdown: bool,
@@ -141,6 +166,10 @@ pub(super) struct TcpFlow {
     guest_closed: bool,
     /// When to give up on a flow that has not established both sides.
     deadline: Instant,
+    /// When a hung-up host side first found no room in the guest's transmit
+    /// buffer; `None` whenever the flow can still move a byte. Bounds a guest
+    /// that never drains, per [`HANGUP_DEADLINE`].
+    stalled_since: Option<Instant>,
     /// The flow is finished; the pump reaps it and its socket.
     pub(super) dead: bool,
 }
@@ -188,9 +217,11 @@ impl TcpFlow {
             connected,
             events: PollFlags::empty(),
             host_eof: false,
+            host_hangup: false,
             host_shutdown: false,
             guest_closed: false,
             deadline: now + ESTABLISH_DEADLINE,
+            stalled_since: None,
             dead: false,
         })
     }
@@ -201,14 +232,21 @@ impl TcpFlow {
         self.host.as_ref()
     }
 
-    /// How long until this flow's establish deadline, for the pump's poll
-    /// timeout; `None` once established (or finished), when no deadline
-    /// applies.
+    /// How long until this flow's next deadline, for the pump's poll timeout.
+    ///
+    /// Before both sides establish that is the establish deadline; afterwards
+    /// it is the hangup deadline of a flow stalled against a guest that is not
+    /// draining. `None` when neither applies, which is the ordinary case: a
+    /// live flow is woken by its descriptors, not by a timer.
     pub(super) fn deadline_in(&self, socket: &tcp::Socket, now: Instant) -> Option<Duration> {
-        if self.dead || self.established(socket) {
+        if self.dead {
             return None;
         }
-        Some(self.deadline.saturating_duration_since(now))
+        if !self.established(socket) {
+            return Some(self.deadline.saturating_duration_since(now));
+        }
+        self.stalled_since
+            .map(|since| (since + HANGUP_DEADLINE).saturating_duration_since(now))
     }
 
     /// The poll interest of the host descriptor right now, judged against
@@ -235,8 +273,13 @@ impl TcpFlow {
         // no IN interest is set above. Without this the flow would leave the
         // poll set entirely and a dead host side would never be noticed.
         // RDHUP reports the peer's FIN; POLLERR and POLLHUP are reported
-        // whenever the descriptor is in the set at all.
-        if !self.host_eof {
+        // whenever the descriptor is in the set at all. Once the hangup has
+        // been reported the watch has nothing left to say, and keeping it would
+        // wake the pump on every pass — RDHUP is level-triggered — for a flow
+        // that cannot move until the guest reads. The remaining bytes are
+        // drained by the read path and the stall is bounded by
+        // [`HANGUP_DEADLINE`], which the pump folds into its poll timeout.
+        if !self.host_eof && !self.host_hangup {
             interest |= PollFlags::RDHUP;
         }
         interest
@@ -244,7 +287,7 @@ impl TcpFlow {
 
     /// Moves the flow forward: connect completion, both copy directions,
     /// and shutdown propagation. Returns whether anything moved.
-    pub(super) fn service(&mut self, socket: &mut tcp::Socket) -> bool {
+    pub(super) fn service(&mut self, socket: &mut tcp::Socket, now: Instant) -> bool {
         if self.dead {
             return false;
         }
@@ -280,6 +323,25 @@ impl TcpFlow {
             }
         }
 
+        // A poll error is terminal: the host socket has failed, every read of it
+        // would return that error rather than data, and the guest learns
+        // through a reset.
+        if !self.host_eof && self.events.contains(PollFlags::ERR) {
+            socket.abort();
+            self.dead = true;
+            return true;
+        }
+        // A hangup is not terminal. It is reported the moment the host's FIN
+        // arrives, with data still queued in the receive buffer and in the
+        // guest's transmit buffer, so the read path below carries on until
+        // `recv` returns zero and turns *that* into the guest's FIN. Recording
+        // the hangup retires the RDHUP watch and makes the host descriptor
+        // worth reading without a readability report, since from here it is
+        // permanently readable.
+        if !self.host_eof && self.events.intersects(PollFlags::HUP | PollFlags::RDHUP) {
+            self.host_hangup = true;
+        }
+
         progress |= self.guest_to_host(socket);
         if self.dead {
             return true;
@@ -289,23 +351,16 @@ impl TcpFlow {
             return true;
         }
 
-        // When the guest has stopped draining the transmit buffer,
-        // `host_to_guest` cannot run, so it never observes the host closing or
-        // resetting. A hangup or error reported by poll while the buffer stays
-        // full means the host side is finished and the guest is not consuming
-        // it: reclaim the flow rather than hold the host descriptor and its
-        // peer open indefinitely. With room in the buffer the ordinary read
-        // path handles a host FIN through an end-of-stream, so this stays
-        // scoped to the stalled case.
-        if !self.host_eof
-            && !socket.can_send()
-            && self
-                .events
-                .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::RDHUP)
-        {
-            socket.abort();
-            self.dead = true;
-            return true;
+        // A hung-up host side with no room left in the guest's transmit buffer
+        // can move nothing until the guest reads. That is ordinary mid-transfer
+        // and resolves itself; a guest that never reads at all does not, and
+        // keep-alive will not reclaim it because it answers the probes. Time
+        // the stall from the moment it starts and clear it the moment the flow
+        // can move again; `enforce_deadline` reclaims what stays stuck.
+        if !self.host_eof && self.host_hangup && !socket.can_send() {
+            self.stalled_since.get_or_insert(now);
+        } else {
+            self.stalled_since = None;
         }
 
         // Both directions have half-closed: the host socket is done both ways,
@@ -335,9 +390,19 @@ impl TcpFlow {
             )
     }
 
-    /// Aborts the flow if it has not established both sides by `now`.
+    /// Aborts the flow if it has run out of time: the establish deadline before
+    /// both sides are up, the hangup deadline for a stall that never resolves.
     pub(super) fn enforce_deadline(&mut self, socket: &mut tcp::Socket, now: Instant) {
-        if !self.dead && !self.established(socket) && now >= self.deadline {
+        if self.dead {
+            return;
+        }
+        let expired = if self.established(socket) {
+            self.stalled_since
+                .is_some_and(|since| now >= since + HANGUP_DEADLINE)
+        } else {
+            now >= self.deadline
+        };
+        if expired {
             socket.abort();
             self.dead = true;
         }
@@ -375,8 +440,19 @@ impl TcpFlow {
             }
         }
         // The guest has finished sending and everything it sent has been
-        // passed on: half-close the host side once.
-        if !self.host_shutdown && self.connected && !socket.may_recv() && socket.recv_queue() == 0 {
+        // passed on: half-close the host side once. Gated on both sides being
+        // past their handshakes, because a socket still in Listen, SynSent, or
+        // SynReceived also reports that it may not receive — the guest has yet
+        // to say anything, not finished saying it. Without the gate a host
+        // connect that concludes before the guest's ACK is ingested (a loopback
+        // target against a tap round trip, say) would shut the host write side
+        // down before the guest had sent its request, and the flow would linger
+        // to the idle timeout with nothing forwarded.
+        if !self.host_shutdown
+            && self.established(socket)
+            && !socket.may_recv()
+            && socket.recv_queue() == 0
+        {
             let _ = rustix::net::shutdown(host, rustix::net::Shutdown::Write);
             self.host_shutdown = true;
             progress = true;
@@ -393,7 +469,15 @@ impl TcpFlow {
             return false;
         };
         let mut progress = false;
-        while !self.host_eof && socket.can_send() && self.events.contains(PollFlags::IN) {
+        // A hung-up host descriptor is readable from then on — the queued data,
+        // then end of stream — so it is read whether or not this pass polled
+        // for readability. That matters when the transmit buffer was full at
+        // the last poll: the flow then asked for nothing, and the room the
+        // guest has since made would otherwise go unused for a whole iteration.
+        while !self.host_eof
+            && socket.can_send()
+            && (self.host_hangup || self.events.contains(PollFlags::IN))
+        {
             let outcome = socket.send(|buf| {
                 match rustix::net::recv(host, &mut buf[..], RecvFlags::empty()) {
                     Ok((0, _)) => (0, Copy::Finished),
@@ -474,13 +558,28 @@ mod tests {
                 connected: true,
                 events: PollFlags::empty(),
                 host_eof: false,
+                host_hangup: false,
                 host_shutdown: false,
                 guest_closed: false,
                 deadline: Instant::now() + ESTABLISH_DEADLINE,
+                stalled_since: None,
                 dead: false,
             },
             peer,
         )
+    }
+
+    /// A socket set whose socket is listening, the state a flow's guest side
+    /// occupies from the sniffed connection attempt until the guest's ACK is
+    /// ingested. Distinct from a fresh socket's Closed, which counts as past
+    /// the handshake.
+    fn listening_socket() -> (SocketSet<'static>, SocketHandle) {
+        let (mut sockets, handle) = guest_socket();
+        sockets
+            .get_mut::<tcp::Socket>(handle)
+            .listen(IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 80))
+            .expect("a fresh socket listens");
+        (sockets, handle)
     }
 
     /// Whether the peer end of the flow's host pair has reached end of stream,
@@ -520,13 +619,10 @@ mod tests {
         // The guest is not draining, so the transmit buffer is full and no
         // forwarding is possible. Without the RDHUP interest the flow would
         // leave the poll set and a host side that died would never be noticed.
-        let (mut sockets, handle) = guest_socket();
+        let (mut sockets, handle) = listening_socket();
         let (mut flow, _peer) = connected_flow(handle);
         {
             let socket = sockets.get_mut::<tcp::Socket>(handle);
-            socket
-                .listen(IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 80))
-                .expect("a fresh socket listens");
             assert!(
                 !socket.can_send() && !socket.can_recv(),
                 "neither direction"
@@ -550,7 +646,10 @@ mod tests {
         let (mut flow, peer) = connected_flow(handle);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
 
-        assert!(flow.service(socket), "the half-close is progress");
+        assert!(
+            flow.service(socket, Instant::now()),
+            "the half-close is progress"
+        );
         assert!(flow.host_shutdown, "the host write side is shut down");
         assert!(peer_at_eof(&peer), "the host peer sees end of stream");
         // A closed guest socket ends the flow; the pump reaps it next pass.
@@ -558,32 +657,90 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_flow_is_reclaimed_when_the_host_hangs_up() {
-        // The stalled case again, now with the hangup actually reported: the
-        // ordinary read path cannot run, so this is the only thing that
-        // releases the descriptor and its peer.
+    fn the_host_write_side_waits_for_the_guests_handshake() {
+        // A guest still handshaking has not finished sending — it has not
+        // started. Reading its "may not receive" as end of stream would shut
+        // the host write side down before the request, which the host answers
+        // with an immediate EOF, and would permanently disable the
+        // guest-to-host copy so the request could never be forwarded.
+        let (mut sockets, handle) = listening_socket();
+        let (mut flow, peer) = connected_flow(handle);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+
+        flow.service(socket, Instant::now());
+        assert!(!flow.host_shutdown, "the guest has yet to say anything");
+        assert!(!peer_at_eof(&peer), "the host peer sees no end of stream");
+        assert!(!flow.dead);
+    }
+
+    #[test]
+    fn a_stalled_flow_survives_the_host_hanging_up() {
+        // The hangup is reported the instant the host's FIN arrives, with the
+        // transfer's tail still queued in both buffers. Aborting there resets
+        // the guest and destroys every buffered byte, so the flow keeps its
+        // descriptor and starts the clock that bounds a guest which never
+        // drains instead.
+        let (mut sockets, handle) = listening_socket();
+        let (mut flow, _peer) = connected_flow(handle);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        flow.events = PollFlags::RDHUP;
+        let now = Instant::now();
+
+        flow.service(socket, now);
+        assert!(!flow.dead, "a hangup alone destroys nothing");
+        assert!(flow.host_hangup, "the hangup is remembered");
+        assert_eq!(flow.stalled_since, Some(now), "the stall clock is running");
+        // The watch has said all it has to say, and RDHUP is level-triggered:
+        // holding it would wake the pump on every pass for a flow that cannot
+        // move until the guest reads.
+        assert_eq!(flow.interest(socket), PollFlags::empty());
+    }
+
+    #[test]
+    fn a_host_error_aborts_the_flow_at_once() {
+        // Unlike a hangup, an error leaves nothing to read: every recv would
+        // return it. The guest learns through a reset rather than waiting out
+        // the hangup deadline.
+        let (mut sockets, handle) = listening_socket();
+        let (mut flow, _peer) = connected_flow(handle);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        flow.events = PollFlags::ERR;
+
+        assert!(flow.service(socket, Instant::now()));
+        assert!(flow.dead, "a failed host side is not worth draining");
+    }
+
+    #[test]
+    fn a_guest_that_never_drains_is_reclaimed_at_the_hangup_deadline() {
+        // Keep-alive cannot reclaim this flow: the guest is alive and answers
+        // the probes, it simply never reads. The deadline is what releases the
+        // slot, its buffers, and the host descriptor.
         let (mut sockets, handle) = guest_socket();
         let (mut flow, _peer) = connected_flow(handle);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
-        socket
-            .listen(IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 80))
-            .expect("a fresh socket listens");
-        flow.events = PollFlags::RDHUP;
+        let stalled_at = Instant::now();
+        flow.host_hangup = true;
+        flow.stalled_since = Some(stalled_at);
 
-        assert!(flow.service(socket));
-        assert!(flow.dead, "the flow is reclaimed rather than left stalled");
+        // The pump sleeps no longer than what is left of the deadline, since a
+        // stalled flow is out of the poll set entirely.
+        assert_eq!(flow.deadline_in(socket, stalled_at), Some(HANGUP_DEADLINE));
+        flow.enforce_deadline(
+            socket,
+            stalled_at + HANGUP_DEADLINE - Duration::from_secs(1),
+        );
+        assert!(!flow.dead, "the deadline has not fallen due");
+        flow.enforce_deadline(socket, stalled_at + HANGUP_DEADLINE);
+        assert!(flow.dead);
     }
 
     #[test]
     fn an_unestablished_flow_reports_the_time_left_and_then_zero() {
         // The pump takes the smallest deadline as its poll timeout, so an
         // elapsed deadline must report zero rather than underflow.
-        let (mut sockets, handle) = guest_socket();
+        let (mut sockets, handle) = listening_socket();
         let (mut flow, _peer) = connected_flow(handle);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
-        socket
-            .listen(IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 80))
-            .expect("a fresh socket listens");
         let start = flow.deadline - ESTABLISH_DEADLINE;
 
         assert_eq!(flow.deadline_in(socket, start), Some(ESTABLISH_DEADLINE));
@@ -599,16 +756,13 @@ mod tests {
 
     #[test]
     fn the_deadline_aborts_only_a_flow_that_never_established() {
-        let (mut sockets, handle) = guest_socket();
+        let (mut sockets, handle) = listening_socket();
         let (mut flow, _peer) = connected_flow(handle);
         let expired = flow.deadline + Duration::from_secs(1);
         {
             // Still listening: the guest never completed its handshake, so the
             // flow is aborted and its slot released.
             let socket = sockets.get_mut::<tcp::Socket>(handle);
-            socket
-                .listen(IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 80))
-                .expect("a fresh socket listens");
             assert_eq!(
                 flow.deadline_in(socket, flow.deadline),
                 Some(Duration::ZERO)

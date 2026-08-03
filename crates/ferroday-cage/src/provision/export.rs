@@ -20,14 +20,15 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::{ProvisionError, io_error};
+use super::{Delegate, ProvisionError, io_error};
 use crate::mechanism::{
-    ExportMap, ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE,
+    ChildMap, ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE,
     FRAME_SYMLINK, StartError, kill_export, start_export,
 };
 use crate::{IdMapper, IdentityMap};
@@ -53,9 +54,12 @@ const MAX_ID: u64 = (1 << 21) - 1;
 /// chowned to a system id appears at that id, not the host subordinate id it is
 /// stored as, and a setcap'd binary's `security.capability` xattr survives.
 /// Regular files, directories, symlinks, and hardlinks are emitted, with their
-/// mode, ownership, modification time, and extended attributes (ACLs and file
-/// capabilities included). Character and block devices, FIFOs, and sockets are
-/// skipped, as a deployed image's runtime provides its own.
+/// mode, ownership, and modification time. Extended attributes are emitted for
+/// everything but symlinks — ACLs and file capabilities included — since the
+/// kernel confines a symlink's attributes to the `security` and `trusted`
+/// namespaces, which an unprivileged export can neither read in full nor an
+/// unprivileged extraction restore. Character and block devices, FIFOs, and
+/// sockets are skipped, as a deployed image's runtime provides its own.
 ///
 /// Entries are emitted in sorted order — directory children by name, extended
 /// attributes by name — so the output does not depend on the order the source
@@ -84,6 +88,22 @@ pub struct Export<'a> {
     map: IdentityMap,
     mapper: Option<&'a dyn IdMapper>,
     clamp_mtime: Option<i64>,
+}
+
+impl fmt::Debug for Export<'_> {
+    /// Renders every setting, and the mapper by its presence rather than its
+    /// contents: it is a caller's trait object, with nothing useful to show.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Export")
+            .field("rootfs", &self.rootfs)
+            .field("map", &self.map)
+            .field(
+                "mapper",
+                &self.mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+            )
+            .field("clamp_mtime", &self.clamp_mtime)
+            .finish()
+    }
 }
 
 impl<'a> Export<'a> {
@@ -210,7 +230,7 @@ fn export_inner<W: Write>(
             let egid = rustix::process::getegid().as_raw();
             uid_line = format!("0 {euid} 1\n").into_bytes();
             gid_line = format!("0 {egid} 1\n").into_bytes();
-            ExportMap::SelfMap {
+            ChildMap::SelfMap {
                 uid_line: &uid_line,
                 gid_line: &gid_line,
             }
@@ -225,7 +245,7 @@ fn export_inner<W: Write>(
                     resolved = mapper
                         .resolve(map)
                         .map_err(|err| unprivileged(err.to_string()))?;
-                    ExportMap::Delegated {
+                    ChildMap::Delegated {
                         mapper,
                         map: &resolved,
                     }
@@ -233,7 +253,7 @@ fn export_inner<W: Write>(
                 None => {
                     default_chain =
                         crate::idmap::resolve_default_chain(map).map_err(unprivileged)?;
-                    ExportMap::Delegated {
+                    ChildMap::Delegated {
                         mapper: default_chain.0.as_ref(),
                         map: &default_chain.1,
                     }
@@ -833,6 +853,8 @@ fn read_symlink(reader: &mut impl Read) -> io::Result<Meta> {
         ino: 0,
         nlink: 0,
         link_target,
+        // A symlink frame carries no attribute block; the child emits none for
+        // the reason `Export`'s documentation gives.
         xattrs: Vec::new(),
     })
 }

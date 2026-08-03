@@ -197,9 +197,12 @@ what every export needs.
 The archive is written to any `Write` sink, so it can stream directly into a
 compressor or an archive reader with no intermediate file. Regular files,
 directories, symlinks, and hardlinks are emitted with their mode, ownership,
-modification time, and extended attributes — ACLs and file capabilities
-included. Character and block devices, FIFOs, and sockets are skipped, as a
-deployed image's runtime provides its own. When no delegate can establish a
+and modification time. Extended attributes come with everything but symlinks —
+ACLs and file capabilities included — since the kernel confines a symlink's
+attributes to the `security` and `trusted` namespaces, which an unprivileged
+export can neither read in full nor an unprivileged extraction restore.
+Character and block devices, FIFOs, and sockets are skipped, as a deployed
+image's runtime provides its own. When no delegate can establish a
 range map the export fails with `ProvisionError::ExportUnprivileged`, naming
 what the host is missing.
 
@@ -221,6 +224,24 @@ archive on any host.
 As with removal, a tree built under a `CageBuilder::id_mapper` delegate is
 exported through `Export::mapper`, which re-enters the map using that same
 delegate rather than the bundled chain.
+
+At a shell prompt, `fcage --export-rootfs DIR` is the same export. It takes
+`--identity-map` for the map the tree was provisioned under, defaulting to the
+subordinate one, and `--clamp-mtime` for the epoch that makes the archive
+byte-reproducible. Like the removal, it is a mode of its own that accepts no
+other option.
+
+The archive goes to standard output, so it pipes into a compressor without a
+temporary file:
+
+```sh
+fcage --export-rootfs /var/lib/myapp/rootfs --clamp-mtime 1700000000 \
+    | zstd -o rootfs.tar.zst
+```
+
+`--export-to FILE` writes to a file instead. Writing an archive to a terminal
+is refused rather than filling the screen, which is the only case where the
+default would surprise anyone.
 
 ### What a launch leaves in the tree
 
@@ -246,18 +267,19 @@ tmpfs on `/dev/shm` — is built inside the tmpfs that covers the mount point, s
 it goes with the mount namespace. An exported tree holds `./dev/` and nothing
 under it.
 
-One managed mount can contribute a file rather than a directory, and it takes it
-back. A bind needs its target to exist, so the `/etc/resolv.conf` bind that host
-networking performs creates an empty file when the rootfs ships none — and
-removes it once the sandbox is gone, leaving the tree without the resolver
-configuration it never had. A rootfs that does ship the file keeps it untouched:
-the bind covers it for the sandbox's life and reveals it again afterwards.
+A mount that contributes a *file* rather than a directory takes it back. A bind
+needs its target to exist, so the `/etc/resolv.conf` bind that host networking
+performs creates an empty file when the rootfs ships none — and removes it once
+the sandbox is gone, leaving the tree without the resolver configuration it never
+had. A caller's own file bind is treated the same way: the empty `0644` target it
+needs is present for the mount to cover and for nothing else. A rootfs that does
+ship the file keeps it untouched: the bind covers it for the sandbox's life and
+reveals it again afterwards.
 
-A caller's own `bind` or `raw_mount` is the case where a target is created and
-*stays*: missing directories as `0755`, a missing file target as an empty `0644`
-file. That is worth knowing when the tree being written into is the one being
-shipped — a bind declared for the duration of a build leaves its mount point in
-the artifact.
+A caller's own `bind` or `raw_mount` is the case where a *directory* target is
+created and stays, as `0755`. That is worth knowing when the tree being written
+into is the one being shipped — a bind declared for the duration of a build
+leaves its mount point in the artifact.
 
 Where a launch must leave the tree untouched entirely, root it on an overlay.
 Every mount point, and every write the command makes, lands in the upper rather
@@ -278,12 +300,97 @@ Cage::builder()
 Discarding the upper reverts the run, base included, and exporting the base
 afterwards gives an archive of a tree no sandbox has written to.
 
+## Copying a tree into a rootfs
+
+`CopyIn` lays a host directory tree into a rootfs with each entry created under
+the identity map the rootfs is owned through:
+
+```rust,no_run
+use ferroday_cage::IdentityMap;
+use ferroday_cage::provision::CopyIn;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let report = CopyIn::new("./overlay", "/srv/images/trixie")
+    .map(IdentityMap::Subordinate)
+    .run()?;
+
+for entry in &report.skipped {
+    eprintln!("not copied: {} ({})", entry.path.display(), entry.kind);
+}
+# Ok(())
+# }
+```
+
+It is the mirror image of the export. An export forks a child into the map to
+*read* a tree at the ownership it intends; this forks one to *write* one. That
+is what `cp` structurally cannot do: `cp` runs as the calling user, which can
+create a file owned by nobody else, so a tree laid in by hand arrives owned by
+the caller whatever the source intended.
+
+Ownership is read through the map, which is what makes the two exact mirrors. A
+file the host stores at `100000 + 42` is uid 42 as the rootfs means it, and the
+copy stores it back at the host id the map puts it at — so a tree an earlier
+mapped sandbox produced copies into a rootfs owned through the same map with its
+ownership intact. Under `IdentityMap::Single` the same rule lands everything as
+root, that map having only the one inside id, which is what such a sandbox sees
+and what it could have written itself. A source id no extent covers is refused,
+naming the path that carries it: the rootfs has no id for it.
+
+The destination must already exist, and entries are added to it — a directory
+the rootfs already carries is kept and descended into, a file, symlink, or named
+pipe is replaced.
+
+Directories, regular files, symbolic links, and named pipes are copied, with
+their modes and modification times. Several names for one file are copied as
+hard links onto the first name, so a tree keeps the sharing it was written with
+and its data is streamed once; that is what lets a tree exported by `Export`,
+which coalesces hard links of its own, come back through `CopyIn` unchanged.
+
+Character and block devices and sockets cannot be copied: a device node needs a
+privilege the copy does not hold whatever map it is under, and a socket's inode
+is created by the process that binds it and is meaningless without it. Rather
+than dropping those in silence, the run returns a `CopyReport` naming every
+entry it left out and what each one was, so a rootfs that ends up missing
+something says so.
+
+A source file that changes size while it is being read fails the run with
+`ProvisionError::SourceChanged`. The frame's length is committed before the
+data is read, so such a file is written padded or truncated; the copy finishes
+the frame to keep the stream in step and then refuses, rather than reporting
+success for a file it did not reproduce.
+
+Containment is structural rather than checked. Every frame the parent sends
+names its entry as a single path component, never a path, and the child creates
+each entry relative to the directory it currently holds open — so there is no
+path for a `..` or a leading `/` to appear in. The one exception is a hard
+link's anchor, which is a path because the two names may sit in different
+directories. Containment there rests on three things together: the child refuses
+an absolute anchor and any `.`, `..`, or empty component in one; the link is
+made without following the final component; and every directory along the
+anchor's path was created and opened `O_NOFOLLOW` by that same walk, which is
+what keeps `linkat`'s resolution of the *intermediate* components inside the
+tree. The residual is a concurrent writer inside the destination, which the
+whole copy shares. A symlink in
+the source is recreated as a symlink and never traversed: the walk does not
+descend through one, and the child opens each directory with `O_NOFOLLOW`, so a
+link pointing out of the tree lands inside the destination as a link and nothing
+is written through it.
+
 ## The tarball provisioner
 
 With the `tarball` cargo feature, `Tarball` provisions from a tar archive.
 The archive may be uncompressed or compressed with gzip, xz, or zstd —
 detected from the content, never the file name — and may use the POSIX
-ustar, GNU, or pax dialect. Decoding is pure Rust throughout.
+ustar, GNU, or pax dialect, or the pre-POSIX v7 one that predates all three.
+Decoding is pure Rust throughout.
+
+v7 is worth naming because it still turns up. It carries no magic, no
+`uname`/`gname`, no device numbers, and no `prefix` field, so a v7 path fits the
+100-byte name field or does not exist; a directory is marked by a `5` typeflag,
+a trailing `/` on the name, or both. Contemporary tooling does not write it, but
+an upstream release tarball was written by whoever released the software, on
+whatever machine, in whatever year, and a sample of Debian trixie's
+`.orig.tar.*` files finds roughly one in twelve is v7.
 
 The archive comes from a path or from any reader:
 

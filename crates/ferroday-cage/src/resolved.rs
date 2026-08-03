@@ -2,26 +2,30 @@
 //!
 //! A [`CageBuilder`](crate::CageBuilder)'s `get_` accessors report what the
 //! caller asked for. This module reports what that request resolved to: the
-//! environment the command will carry, base included, and the mounts the
-//! sandbox will establish, managed profile included, in the order they will be
-//! applied.
+//! root filesystem the command will see, the environment it will carry, base
+//! included, the mounts the sandbox will establish, managed profile included,
+//! in the order they will be applied, and the posture the launch will put it
+//! under.
 //!
 //! The distinction matters to a consumer recording provenance. What a build
-//! produces depends on the environment and the filesystem the command sees,
-//! and neither the caller's own inputs nor a library version number states
-//! those directly. [`ResolvedInputs`] does, as data a consumer can stamp into
-//! an artifact beside its own version pin.
+//! produces depends on the environment and the filesystem the command sees, on
+//! the identity it holds, on whether it can reach a network, and on which
+//! syscalls will succeed — and neither the caller's own inputs nor a library
+//! version number states those directly. [`ResolvedInputs`] does, as data a
+//! consumer can stamp into an artifact beside its own version pin.
 
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use crate::mechanism::{LaunchPlan, MountAction};
+use crate::Network;
+use crate::idmap::IdRange;
+use crate::limits::{Limit, Resource};
+use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction};
 
-/// The environment and mounts a built sandbox will apply.
+/// The root, environment, mounts, and posture a built sandbox will apply.
 ///
-/// Obtained from [`Cage::resolved_inputs`](crate::Cage::resolved_inputs) or
-/// [`Restriction::resolved_inputs`](crate::Restriction::resolved_inputs).
+/// Obtained from [`Cage::resolved_inputs`](crate::Cage::resolved_inputs).
 ///
 /// # Stability
 ///
@@ -57,6 +61,11 @@ use crate::mechanism::{LaunchPlan, MountAction};
 #[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ResolvedInputs {
+    /// What the command's root filesystem is.
+    ///
+    /// Its own field rather than a mount: the root is not something the profile
+    /// lays over the sandbox, it is what the profile is laid over.
+    pub root: ResolvedRoot,
     /// The command's complete environment, sorted by variable name.
     ///
     /// The caller's variables composed over the library's base, or the
@@ -64,13 +73,208 @@ pub struct ResolvedInputs {
     /// is set.
     #[cfg_attr(feature = "serde", serde(with = "crate::spec::serde_os::string_map"))]
     pub env: Vec<(OsString, OsString)>,
-    /// Every mount the sandbox establishes, in the order it establishes them:
-    /// the managed profile, then the caller's own, and last the `resolv.conf`
-    /// bind that [`Network::Host`](crate::Network::Host) adds.
+    /// Every mount the sandbox establishes over its root, in the order it
+    /// establishes them: the managed profile, then the caller's own, and last
+    /// the `resolv.conf` bind that [`Network::Host`] adds.
     ///
-    /// Empty for a [`Restriction`](crate::Restriction), which swaps no root
-    /// and mounts nothing.
+    /// Empty for a restriction, which mounts nothing.
     pub mounts: Vec<ResolvedMount>,
+    /// The identity the command holds inside the sandbox.
+    pub identity: ResolvedIdentity,
+    /// The network the command can reach.
+    ///
+    // The sentence links a feature-gated item, so its doc text is gated on the
+    // feature: present in the canonical all-features build, absent — link and
+    // all — from a no-feature `cargo doc`.
+    #[cfg_attr(
+        feature = "netstack",
+        doc = "A [`NetStack`](crate::NetStack) is not visible here: a stack attaches to"
+    )]
+    #[cfg_attr(
+        feature = "netstack",
+        doc = "a pending launch after the cage is built, so what this reports is the"
+    )]
+    #[cfg_attr(
+        feature = "netstack",
+        doc = "namespace the sandbox creates, not what may later be plugged into it."
+    )]
+    pub network: Network,
+    /// The resource limits applied to the command process, in the order they
+    /// are applied.
+    pub rlimits: Vec<ResolvedRlimit>,
+    /// The hardening controls the command runs under.
+    ///
+    /// Present whether or not the `hardening` feature is compiled in, reporting
+    /// [`Unavailable`](ResolvedHardening::Unavailable) when it is not. A record
+    /// that simply omitted the key could not be told apart from one written
+    /// before the key existed, and a provenance record has to be readable
+    /// without knowing which build wrote it.
+    pub hardening: ResolvedHardening,
+}
+
+/// What a built sandbox's root filesystem is.
+///
+/// The root is a first-order build input on the same argument this module
+/// exists on — it is the filesystem the command sees — and it is not a mount:
+/// a plain rootfs is pivoted into, and an overlay is assembled before every
+/// mount the profile lays over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "kind"))]
+pub enum ResolvedRoot {
+    /// No root swap: the command runs against the host's own filesystem.
+    // The sentence links a feature-gated item, so its doc text is gated on the
+    // feature: present in the canonical all-features build, absent — link and
+    // all — from a no-feature `cargo doc`.
+    #[cfg_attr(
+        feature = "hardening",
+        doc = "That is what a [`Restriction`](crate::Restriction)'s command sees."
+    )]
+    #[cfg_attr(feature = "serde", serde(rename = "host"))]
+    Host,
+    /// A plain rootfs, pivoted into.
+    #[cfg_attr(feature = "serde", serde(rename = "plain"))]
+    Plain {
+        /// The rootfs as the build resolved it: an absolute, canonicalized host
+        /// path.
+        path: PathBuf,
+    },
+    /// An overlay assembled over the rootfs and pivoted into.
+    #[cfg_attr(feature = "serde", serde(rename = "overlay"))]
+    Overlay {
+        /// The lower layers, base first — the reverse of the kernel's own
+        /// highest-precedence-first option order.
+        lower: Vec<PathBuf>,
+        /// The upper layer, where the sandbox's writes land.
+        upper: PathBuf,
+        /// The work directory the overlay requires beside the upper.
+        work: PathBuf,
+    },
+}
+
+/// The identity a built sandbox's command holds.
+///
+/// Whether a build sees uid 0 or a mapped id changes what it produces: a
+/// Debian build's `Rules-Requires-Root` handling turns on exactly this, and a
+/// file's recorded ownership follows from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "kind"))]
+pub enum ResolvedIdentity {
+    /// No user namespace, so no map: the command runs as the calling user.
+    // Gated for the reason `ResolvedRoot::Host`'s second sentence is.
+    #[cfg_attr(
+        feature = "hardening",
+        doc = "That is what a [`Restriction`](crate::Restriction)'s command holds."
+    )]
+    #[cfg_attr(feature = "serde", serde(rename = "caller"))]
+    Caller,
+    /// The single-identity map: the calling user is root inside the sandbox
+    /// and no other id is mapped.
+    #[cfg_attr(feature = "serde", serde(rename = "single"))]
+    Single,
+    /// A range map, written from outside the namespace by a delegate.
+    #[cfg_attr(feature = "serde", serde(rename = "ranged"))]
+    Ranged {
+        /// The uid extents, in the order they are written.
+        uid: Vec<IdRange>,
+        /// The gid extents, in the order they are written.
+        gid: Vec<IdRange>,
+    },
+}
+
+/// One resource limit a built sandbox applies to the command process.
+///
+/// A build that adapts its parallelism to `RLIMIT_NOFILE`, or that fails a link
+/// under `RLIMIT_AS`, produces different output, so the limits in force belong
+/// in the record beside the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ResolvedRlimit {
+    /// The kernel resource the limit governs.
+    pub resource: Resource,
+    /// The soft limit: what the kernel enforces.
+    pub soft: Limit,
+    /// The hard limit: the ceiling the command may raise its soft limit to.
+    pub hard: Limit,
+}
+
+/// The hardening controls a built sandbox applies before `execve`.
+///
+/// The subtlest of the postures to record and the one most worth recording: a
+/// seccomp policy changes which syscalls succeed, and a configure test that
+/// probes a syscall reads the refusal as an absent feature, so two builds under
+/// two policies can differ with nothing else to show for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "kind"))]
+pub enum ResolvedHardening {
+    /// The hardening layer is not compiled into this build, so no Landlock
+    /// ruleset, seccomp filter, or capability drop can apply.
+    ///
+    /// Distinct from an [`Applied`](Self::Applied) posture whose controls are
+    /// all empty, which is a build that *could* have hardened and did not.
+    #[cfg_attr(feature = "serde", serde(rename = "unavailable"))]
+    Unavailable,
+    /// The hardening layer is compiled in; these are the controls in force.
+    /// Every field empty is a sandbox that applies no hardening.
+    #[cfg_attr(feature = "serde", serde(rename = "applied"))]
+    Applied {
+        /// The Landlock filesystem grants, in the order they were declared.
+        #[cfg_attr(feature = "serde", serde(rename = "landlock-fs"))]
+        landlock_fs: Vec<ResolvedLandlockFs>,
+        /// The Landlock network grants, in the order they were declared.
+        #[cfg_attr(feature = "serde", serde(rename = "landlock-net"))]
+        landlock_net: Vec<ResolvedLandlockNet>,
+        /// The installed seccomp filter's length in BPF instructions; `None`
+        /// when no filter is installed.
+        ///
+        /// The program itself is not reported: it is thousands of instructions
+        /// and means nothing to a reader. The length is what distinguishes one
+        /// policy from another at a glance, and a consumer that needs to pin
+        /// the exact program has the policy it supplied.
+        #[cfg_attr(feature = "serde", serde(rename = "seccomp-instructions"))]
+        seccomp_instructions: Option<usize>,
+        /// The capability bits retained across the drop; `None` leaves the
+        /// namespaced capability set untouched.
+        #[cfg_attr(feature = "serde", serde(rename = "keep-capabilities"))]
+        keep_capabilities: Option<u64>,
+    },
+}
+
+/// One Landlock filesystem grant a built sandbox enrols.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ResolvedLandlockFs {
+    /// The granted path, as the command sees it after the root swap.
+    pub path: PathBuf,
+    /// The `LANDLOCK_ACCESS_FS_*` rights allowed beneath the path, as the
+    /// kernel spells them.
+    ///
+    /// This is what the ruleset receives, and it is reported unmasked, before
+    /// the command stage narrows it to the running kernel's ABI.
+    // Gated for the reason `ResolvedRoot::Host`'s second sentence is: the type
+    // is reported whether or not the feature is compiled in, but the type it
+    // contrasts with is not.
+    #[cfg_attr(
+        feature = "hardening",
+        doc = "They are the kernel's own bits rather than [`FsAccess`](crate::FsAccess)'s."
+    )]
+    pub access: u64,
+}
+
+/// One Landlock network grant a built sandbox enrols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ResolvedLandlockNet {
+    /// The TCP port the grant governs.
+    pub port: u16,
+    /// The `LANDLOCK_ACCESS_NET_*` rights allowed on the port, as the kernel
+    /// spells them and before the command stage masks them to its ABI.
+    pub access: u64,
 }
 
 /// One mount a built sandbox will establish.
@@ -118,6 +322,10 @@ pub enum ResolvedMount {
         read_only: bool,
     },
     /// A mount whose parameters go to the kernel verbatim.
+    ///
+    /// The optional fields report `None` both for a parameter that was never
+    /// set and for one set to the empty string: the two are frozen alike, and
+    /// the kernel receives the same nothing from either.
     #[cfg_attr(feature = "serde", serde(rename = "raw"))]
     Raw {
         /// The mount source, when one was given.
@@ -169,12 +377,116 @@ impl ResolvedInputs {
     /// during a launch, and a [`Cage`](crate::Cage) does not carry the result.
     pub(crate) fn project(plan: &LaunchPlan) -> ResolvedInputs {
         ResolvedInputs {
+            root: project_root(plan),
             env: plan.env.iter().map(split_env).collect(),
             mounts: plan
                 .ops
                 .iter()
                 .map(|op| project_mount(&op.action))
                 .collect(),
+            identity: project_identity(plan),
+            network: plan.network,
+            rlimits: plan.rlimits.iter().map(project_rlimit).collect(),
+            hardening: project_hardening(plan),
+        }
+    }
+}
+
+/// Projects the sandbox's root filesystem.
+///
+/// The overlay is reported from the plan's own overlay rather than from `ops`
+/// because it is not in them: the setup establishes it before the profile's
+/// mounts, over the rootfs the plan names, which is the base lower.
+fn project_root(plan: &LaunchPlan) -> ResolvedRoot {
+    match plan.confinement {
+        Confinement::Container => match &plan.overlay {
+            Some(overlay) => ResolvedRoot::Overlay {
+                lower: overlay.lower.clone(),
+                upper: overlay.upper.clone(),
+                work: overlay.work.clone(),
+            },
+            None => ResolvedRoot::Plain {
+                path: PathBuf::from(OsString::from_vec(plan.rootfs_path.as_bytes().to_vec())),
+            },
+        },
+        #[cfg(feature = "hardening")]
+        Confinement::Restriction => ResolvedRoot::Host,
+    }
+}
+
+/// Projects the identity the command holds.
+///
+/// A restriction creates no user namespace, so its plan's `Single` map is a
+/// placeholder rather than a map that is applied; the confinement is what
+/// distinguishes the two.
+fn project_identity(plan: &LaunchPlan) -> ResolvedIdentity {
+    match plan.confinement {
+        #[cfg(feature = "hardening")]
+        Confinement::Restriction => ResolvedIdentity::Caller,
+        Confinement::Container => match &plan.identity {
+            IdentityPlan::Single => ResolvedIdentity::Single,
+            IdentityPlan::Ranged { map, .. } => ResolvedIdentity::Ranged {
+                uid: map.uid().to_vec(),
+                gid: map.gid().to_vec(),
+            },
+        },
+    }
+}
+
+/// Projects one frozen resource limit.
+///
+/// The plan holds the kernel's own resource, so the public one is recovered by
+/// searching the roster. That roster is ten entries and the lookup happens once
+/// per limit on an inspection path, so the linear scan costs nothing and keeps
+/// one direction of the mapping authoritative.
+fn project_rlimit(plan: &crate::mechanism::RlimitPlan) -> ResolvedRlimit {
+    let resource = Resource::ALL
+        .iter()
+        .copied()
+        .find(|resource| resource.to_kernel() == plan.resource)
+        // Unreachable: every plan entry was lowered from a `Resource`. Naming
+        // the address-space limit beats panicking in an inspection method.
+        .unwrap_or(Resource::AddressSpace);
+    ResolvedRlimit {
+        resource,
+        soft: plan.limit.current.map_or(Limit::UNLIMITED, Limit::of),
+        hard: plan.limit.maximum.map_or(Limit::UNLIMITED, Limit::of),
+    }
+}
+
+/// Projects the hardening posture.
+///
+/// Always reports something: without the feature there is nothing that could
+/// have been applied, which is itself the fact a provenance record needs.
+fn project_hardening(plan: &LaunchPlan) -> ResolvedHardening {
+    #[cfg(not(feature = "hardening"))]
+    {
+        let _ = plan;
+        ResolvedHardening::Unavailable
+    }
+    #[cfg(feature = "hardening")]
+    {
+        ResolvedHardening::Applied {
+            landlock_fs: plan
+                .hardening
+                .landlock
+                .iter()
+                .map(|rule| ResolvedLandlockFs {
+                    path: PathBuf::from(OsString::from_vec(rule.path.as_bytes().to_vec())),
+                    access: rule.access,
+                })
+                .collect(),
+            landlock_net: plan
+                .hardening
+                .landlock_net
+                .iter()
+                .map(|rule| ResolvedLandlockNet {
+                    port: rule.port,
+                    access: rule.access,
+                })
+                .collect(),
+            seccomp_instructions: plan.hardening.seccomp.as_ref().map(Vec::len),
+            keep_capabilities: plan.hardening.keep_caps,
         }
     }
 }
@@ -352,9 +664,26 @@ mod serde_tests {
             .build()
             .expect("a valid sandbox configuration");
         let rendered = toml::to_string(&cage.resolved_inputs()).expect("the record serializes");
+        // The hardening block is the one part that depends on the build rather
+        // than on the configuration, which is the whole point of the field
+        // being present either way.
+        #[cfg(feature = "hardening")]
+        let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\n";
+        #[cfg(not(feature = "hardening"))]
+        let hardening = "[hardening]\nkind = \"unavailable\"\n";
+        // TOML puts bare keys ahead of tables, so `network` and `rlimits` lead
+        // whatever order the struct declares; the rest follow in declaration
+        // order. A `None` renders as an absent key, which is what TOML has.
         assert_eq!(
             rendered,
-            "[env]\n\
+            "network = \"isolated\"\n\
+             rlimits = []\n\
+             \n\
+             [root]\n\
+             kind = \"plain\"\n\
+             path = \"/tmp\"\n\
+             \n\
+             [env]\n\
              SOURCE_DATE_EPOCH = \"1700000000\"\n\
              \n\
              [[mounts]]\n\
@@ -367,8 +696,181 @@ mod serde_tests {
              kind = \"raw\"\n\
              target = \"/dev\"\n\
              fstype = \"tmpfs\"\n\
-             flags = 2\n",
+             flags = 2\n\
+             \n\
+             [identity]\n\
+             kind = \"single\"\n\
+             \n"
+            .to_string()
+                + hardening,
         );
+    }
+
+    #[test]
+    fn a_plain_root_and_an_overlay_root_produce_different_records() {
+        // The whole complaint this field answers: `mounts` is projected from
+        // the plan's mount actions, and the root is not one of them, so before
+        // this a plain root and an overlay over the same base recorded byte for
+        // byte the same thing while describing two different builds.
+        let scratch = crate::scratch::Scratch::new("resolved-overlay");
+        let base = scratch.join("base");
+        let patches = scratch.join("patches");
+        std::fs::create_dir_all(&base).expect("the base is creatable");
+        std::fs::create_dir_all(&patches).expect("the patch layer is creatable");
+
+        let plain = Cage::builder()
+            .rootfs(&base)
+            .managed_mounts(false)
+            .command("/bin/sh")
+            .build()
+            .expect("a plain root over the same base builds")
+            .resolved_inputs();
+        let built = Cage::builder()
+            .overlay(
+                crate::Overlay::new()
+                    .lower(&base)
+                    .lower(&patches)
+                    .upper(scratch.join("upper")),
+            )
+            .managed_mounts(false)
+            .command("/bin/sh")
+            .build();
+        let Ok(cage) = built else {
+            // A host that cannot establish an unprivileged overlay refuses the
+            // build; there is nothing to record and nothing to assert.
+            eprintln!("skipping: an unprivileged overlay is unavailable here");
+            return;
+        };
+        let layered = cage.resolved_inputs();
+
+        assert_ne!(plain.root, layered.root, "the two roots record differently");
+        assert_eq!(plain.mounts, layered.mounts, "and it is not the mounts");
+
+        let crate::ResolvedRoot::Plain { path } = &plain.root else {
+            panic!("a rootfs records as a plain root: {:?}", plain.root);
+        };
+        assert!(path.ends_with("base"), "{path:?}");
+
+        let crate::ResolvedRoot::Overlay { lower, upper, .. } = &layered.root else {
+            panic!("an overlay records as one: {:?}", layered.root);
+        };
+        assert_eq!(lower.len(), 2, "both lowers are recorded: {lower:?}");
+        assert!(lower[0].ends_with("base"), "{lower:?}");
+        assert!(lower[1].ends_with("patches"), "{lower:?}");
+        assert!(upper.ends_with("upper"), "{upper:?}");
+    }
+
+    #[test]
+    fn every_posture_the_launch_applies_reaches_the_record() {
+        // One cage carrying all four postures at once, so a field that stopped
+        // being projected shows up here rather than in a consumer's provenance.
+        let cage = Cage::builder()
+            .rootfs("/tmp")
+            .command("/bin/sh")
+            .managed_mounts(false)
+            .base_env(false)
+            .network(crate::Network::Host)
+            .rlimit(crate::limits::Resource::OpenFiles, 1024, 4096)
+            .rlimit(
+                crate::limits::Resource::Processes,
+                64,
+                crate::limits::Limit::UNLIMITED,
+            )
+            .build()
+            .expect("a valid sandbox configuration");
+        let inputs = cage.resolved_inputs();
+
+        assert_eq!(inputs.network, crate::Network::Host);
+        assert_eq!(inputs.identity, crate::ResolvedIdentity::Single);
+        assert_eq!(
+            inputs.rlimits,
+            [
+                crate::ResolvedRlimit {
+                    resource: crate::limits::Resource::OpenFiles,
+                    soft: crate::limits::Limit::of(1024),
+                    hard: crate::limits::Limit::of(4096),
+                },
+                crate::ResolvedRlimit {
+                    resource: crate::limits::Resource::Processes,
+                    soft: crate::limits::Limit::of(64),
+                    hard: crate::limits::Limit::UNLIMITED,
+                },
+            ],
+        );
+    }
+
+    /// A hardening posture reaches the record: the grants by path and port, and
+    /// the seccomp filter by the one property that distinguishes two policies
+    /// without dumping thousands of instructions into a provenance document.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_hardening_posture_records_its_grants_and_its_filter_size() {
+        use crate::{FsAccess, NetAccess, SeccompPolicy};
+
+        let cage = Cage::builder()
+            .rootfs("/tmp")
+            .command("/bin/sh")
+            .managed_mounts(false)
+            .landlock_fs(FsAccess::READ, "/usr")
+            .landlock_net(NetAccess::CONNECT, 443)
+            .seccomp(SeccompPolicy::Curated)
+            .build()
+            .expect("a valid sandbox configuration");
+        let crate::ResolvedHardening::Applied {
+            landlock_fs,
+            landlock_net,
+            seccomp_instructions,
+            ..
+        } = cage.resolved_inputs().hardening
+        else {
+            panic!("a build with the feature reports an applied posture");
+        };
+
+        assert_eq!(landlock_fs.len(), 1);
+        assert_eq!(landlock_fs[0].path, std::path::Path::new("/usr"));
+        assert_ne!(landlock_fs[0].access, 0, "the granted rights are recorded");
+        assert_eq!(landlock_net.len(), 1);
+        assert_eq!(landlock_net[0].port, 443);
+        assert!(
+            seccomp_instructions.is_some_and(|count| count > 0),
+            "the curated policy compiles to a program: {seccomp_instructions:?}",
+        );
+    }
+
+    /// A sandbox that hardens nothing still reports the layer as available.
+    ///
+    /// The distinction the always-present field exists for: this is a build
+    /// that could have hardened and did not, which is not the same fact as a
+    /// build that could not.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_sandbox_that_hardens_nothing_is_not_a_build_that_cannot() {
+        let inputs = Cage::builder()
+            .rootfs("/tmp")
+            .command("/bin/sh")
+            .managed_mounts(false)
+            .build()
+            .expect("a valid sandbox configuration")
+            .resolved_inputs();
+        assert!(
+            matches!(inputs.hardening, crate::ResolvedHardening::Applied { .. }),
+            "{:?}",
+            inputs.hardening,
+        );
+    }
+
+    /// Without the feature the record says so, rather than saying nothing.
+    #[cfg(not(feature = "hardening"))]
+    #[test]
+    fn a_build_without_the_hardening_layer_records_that_it_has_none() {
+        let inputs = Cage::builder()
+            .rootfs("/tmp")
+            .command("/bin/sh")
+            .managed_mounts(false)
+            .build()
+            .expect("a valid sandbox configuration")
+            .resolved_inputs();
+        assert_eq!(inputs.hardening, crate::ResolvedHardening::Unavailable);
     }
 
     #[test]

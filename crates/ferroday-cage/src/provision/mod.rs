@@ -48,6 +48,7 @@ use rustix::io::Errno;
 
 #[cfg(feature = "tarball")]
 mod compress;
+mod copyin;
 #[cfg(feature = "tarball")]
 mod export;
 #[cfg(feature = "tarball")]
@@ -57,6 +58,7 @@ mod tar;
 #[cfg(feature = "tarball")]
 mod tarball;
 
+pub use copyin::{CopyIn, CopyReport, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, export_tar};
 #[cfg(feature = "tarball")]
@@ -428,6 +430,42 @@ pub enum ProvisionError {
         /// Why no delegate could establish the identity map.
         reason: String,
     },
+    /// A copy into a rootfs owned through a range map could not establish that
+    /// map.
+    ///
+    /// Creating an entry owned by a mapped id needs a process inside the map,
+    /// and no delegate could establish one.
+    // The sentence links a feature-gated variant, so its doc text is gated on
+    // the feature: present in the canonical all-features build, absent — link
+    // and all — from a no-feature `cargo doc`.
+    #[cfg_attr(
+        feature = "tarball",
+        doc = "It is the mirror of [`ExportUnprivileged`](Self::ExportUnprivileged),"
+    )]
+    #[cfg_attr(feature = "tarball", doc = "which arises for the same reason.")]
+    #[non_exhaustive]
+    CopyUnprivileged {
+        /// The rootfs that could not be copied into.
+        path: PathBuf,
+        /// Why no delegate could establish the identity map.
+        reason: String,
+    },
+    /// A source file changed size while a [`CopyIn`] was reading it, so the
+    /// copy could not reproduce it.
+    ///
+    /// The copy commits a file's length before it reads the contents, and the
+    /// in-map writer reads exactly that many bytes. A file that grew or shrank
+    /// in between is therefore written truncated or zero-padded, and the run
+    /// reports this rather than presenting the result as a copy: a source tree
+    /// changing underneath a copy is something the caller would rather hear
+    /// about than discover in the rootfs later.
+    #[non_exhaustive]
+    SourceChanged {
+        /// The source file that changed.
+        path: PathBuf,
+        /// The length the copy recorded and wrote.
+        recorded: u64,
+    },
 }
 
 impl ProvisionError {
@@ -508,6 +546,18 @@ impl fmt::Display for ProvisionError {
                  and no delegate can establish the identity map to remove them ({reason})",
                 path.display(),
             ),
+            ProvisionError::CopyUnprivileged { path, reason } => write!(
+                f,
+                "cannot copy into {}: the rootfs is owned through a range identity map, \
+                 and no delegate can establish the map to write it ({reason})",
+                path.display(),
+            ),
+            ProvisionError::SourceChanged { path, recorded } => write!(
+                f,
+                "{} changed size while it was being copied: {recorded} bytes were recorded \
+                 and written, which is no longer what the file holds",
+                path.display(),
+            ),
             #[cfg(feature = "tarball")]
             ProvisionError::ExportUnprivileged { path, reason } => write!(
                 f,
@@ -563,6 +613,46 @@ fn io_error(op: &'static str, path: &Path, source: io::Error) -> ProvisionError 
 pub struct Provision<'obs> {
     dest: PathBuf,
     observer: Option<&'obs mut dyn ProvisionObserver>,
+}
+
+/// A delegate rendered by what it stands for, for the `Debug` impls of the
+/// builders that hold one.
+///
+/// A fetcher, an observer, and an identity mapper are all supplied by the
+/// caller as code behind a trait object. What a reader of a rendering wants
+/// from one is whether it is there at all, so it renders as `<dyn Fetch>`
+/// rather than as its contents, and an optional one as `Some(<dyn IdMapper>)`
+/// or `None`.
+///
+/// [`IdMapper`](crate::IdMapper) does require `Debug`, so a mapper alone could
+/// render its own. It does not, for two reasons: [`Fetch`](debian::Fetch) and
+/// [`ProvisionObserver`] carry no such bound, so one delegate rendering unlike
+/// the other two would be an inconsistency with nothing behind it, and a
+/// caller's mapper is free to render at any length in a place that should stay
+/// compact.
+pub(crate) struct Delegate(pub(crate) &'static str);
+
+impl fmt::Debug for Delegate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{}>", self.0)
+    }
+}
+
+impl fmt::Debug for Provision<'_> {
+    /// Renders the destination and whether an observer is attached. The
+    /// observer itself is a caller's trait object, with nothing useful to show.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Provision")
+            .field("dest", &self.dest)
+            .field(
+                "observer",
+                &self
+                    .observer
+                    .as_ref()
+                    .map(|_| Delegate("dyn ProvisionObserver")),
+            )
+            .finish()
+    }
 }
 
 impl<'obs> Provision<'obs> {
@@ -626,6 +716,22 @@ pub struct Remove<'a> {
     dest: PathBuf,
     map: crate::IdentityMap,
     mapper: Option<&'a dyn crate::idmap::IdMapper>,
+}
+
+impl fmt::Debug for Remove<'_> {
+    /// Renders the tree, the map it was written under, and whether a
+    /// caller-supplied mapper was given. The mapper renders by its presence
+    /// rather than its contents.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Remove")
+            .field("dest", &self.dest)
+            .field("map", &self.map)
+            .field(
+                "mapper",
+                &self.mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+            )
+            .finish()
+    }
 }
 
 impl<'a> Remove<'a> {
@@ -710,6 +816,15 @@ impl<'a> Remove<'a> {
 /// [`ProvisionError::Io`] for failures of the publication machinery. When
 /// the provisioner fails, the staging directory is removed and `dest` is
 /// left absent.
+///
+/// The two cleanups — the failed run's staging tree, and a previous run's stale
+/// one — escalate with [`IdentityMap::Subordinate`](crate::IdentityMap::Subordinate)
+/// and the bundled delegate chain, since nothing here names a map. A tree
+/// provisioned under a caller-supplied mapper, or under an explicit
+/// [`IdentityMap::Ranges`](crate::IdentityMap::Ranges) the bundled chain cannot
+/// reproduce, therefore surfaces as
+/// [`ProvisionError::RemoveUnprivileged`] rather than being cleaned; remove it
+/// with [`Remove`] and the same map and delegate that wrote it.
 pub fn ensure(
     dest: impl AsRef<Path>,
     provisioner: &mut dyn Provisioner,
@@ -997,6 +1112,7 @@ fn remove_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     struct Touch;
 
@@ -1016,14 +1132,8 @@ mod tests {
         }
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ferroday-cage-provision-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir(tag: &str) -> Scratch {
+        Scratch::new(&format!("provision-{tag}"))
     }
 
     #[test]
@@ -1060,7 +1170,6 @@ mod tests {
         assert_eq!(ensure(&dest, &mut Touch).unwrap(), Provisioned::Created);
         assert!(dest.join("marker").is_file());
         assert_eq!(ensure(&dest, &mut Fail).unwrap(), Provisioned::Existing);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1071,7 +1180,6 @@ mod tests {
         assert!(matches!(err, ProvisionError::Other { .. }), "{err}");
         assert!(!dest.exists());
         assert!(!dir.join(".rootfs.staging").exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1084,7 +1192,6 @@ mod tests {
         remove(&dest).expect("the published rootfs is removed");
         assert!(!dest.exists());
         assert!(!lock.exists(), "the lock goes with the rootfs");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1099,7 +1206,6 @@ mod tests {
         // it still clears the orphan.
         remove(&dest).expect("removing an absent rootfs is not an error");
         assert!(!lock.exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1109,7 +1215,6 @@ mod tests {
         fs::write(&dest, b"file in the way").unwrap();
         let err = ensure(&dest, &mut Touch).unwrap_err();
         assert!(matches!(err, ProvisionError::DestUnusable { .. }), "{err}");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1122,7 +1227,6 @@ mod tests {
         assert!(dest.join("marker").is_file());
         assert!(!dest.join("leftover").exists());
         assert!(!staging.exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1161,6 +1265,5 @@ mod tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

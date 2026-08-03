@@ -79,8 +79,9 @@ sequence itself.
     `openat2` and `RESOLVE_IN_ROOT`, so a symlink inside the rootfs — even
     an absolute one — resolves within the rootfs and can never address the
     host; the mount syscalls then reach the resolved target through its
-    `/proc/self/fd` path. Missing mount targets are created, and persist in
-    the rootfs directory afterwards. A read-only bind is made read-only
+    `/proc/self/fd` path. Missing mount targets are created; a directory
+    stays afterwards, a file does not (see [What a launch leaves in the
+    root](#what-a-launch-leaves-in-the-root)). A read-only bind is made read-only
     after binding with `mount_setattr` and `AT_RECURSIVE`, so the bind and
     every mount beneath it become read-only in one step; on a kernel before
     5.12, which lacks `mount_setattr`, only the top mount is made read-only
@@ -142,6 +143,32 @@ owns outright, which is how the managed `/dev` is itself assembled.
 Last, the host's `resolv.conf` — resolved to its real file — is bound
 read-only onto `/etc/resolv.conf` when the host network is shared.
 
+## What a launch leaves in the root
+
+A mount needs its target to exist, so the sandbox creates any that is
+missing. What it creates divides in two.
+
+A missing *directory* is a mount point, and it stays. It is created at the
+mode of the directory it stands for — `1777` for `/tmp` and `/dev/shm`,
+`0755` otherwise — so the tree is left holding the directory it would have
+shipped, rather than one the mount's own mode happened to hide.
+
+A missing *file* target is content the root never had — an empty
+`/etc/resolv.conf`, an empty file where a binary is bound — present only for
+its mount to cover. It does not survive the sandbox: the paths are recorded
+at build time, and dropping the handle removes each one, whether the sandbox
+ran to completion or the launch never proceeded. Only an empty regular file
+is removed, so anything that gained content or changed type in the meantime
+belongs to whoever put it there. The rule covers the managed `resolv.conf`
+bind and the caller's own file binds alike, and a target the root already
+ships is never touched.
+
+Two targets are outside the rule, because neither is a file in the root: one
+created inside an earlier mount — under the `/tmp` tmpfs, or under a bind of
+the caller's own — belongs to that mount rather than to the root, and for an
+overlay root the created file lands in the upper, where the merged view's
+writes go, and is removed from there.
+
 ## Failure reporting
 
 Every stage shares a close-on-exec report pipe created before the first
@@ -190,7 +217,8 @@ and a fatal signal are never conflated.
 The sandbox presents the rootfs as `/` with the mount profile assembled
 over it, and maps the calling user to root inside. The rootfs itself is
 writable by the command wherever the calling user could write it, and mount
-targets created during setup persist there. The mount, PID, UTS, IPC,
+point directories created during setup persist there — see [What a launch
+leaves in the root](#what-a-launch-leaves-in-the-root). The mount, PID, UTS, IPC,
 cgroup, and — by default — network spaces are isolated.
 
 The default profile is a rootless convenience for code you trust: a

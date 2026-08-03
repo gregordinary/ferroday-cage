@@ -17,8 +17,11 @@
 //! nowhere surprising: multicast, broadcast, loopback, and link-local
 //! destinations are refused, with one deliberate exception —
 //! [`host_loopback`](NetStackBuilder::host_loopback) maps connections to
-//! the gateway address onto the host's loopback. Refused destinations
-//! answer with a connection reset.
+//! the gateway address onto the host's loopback. A refused TCP connection is
+//! answered with a reset. A refused UDP datagram is dropped, and whether the
+//! guest also receives an ICMP port-unreachable depends on whether the stack
+//! happens to hold a socket on that port for some other destination, so a
+//! caller must not read anything into either outcome.
 //!
 //! Attachment happens in a forked, short-lived helper process that joins
 //! the sandbox's user and network namespaces, creates and configures the
@@ -645,6 +648,17 @@ pub enum NetStackError {
         /// The raw OS error it failed with.
         errno: i32,
     },
+    /// The tap was created and configured, but its descriptor could not be
+    /// handed back to the caller.
+    ///
+    /// Distinct from [`TapConfigure`](NetStackError::TapConfigure): nothing is
+    /// wrong with the interface, only with the handoff, and the tap is
+    /// destroyed with the helper that made it.
+    #[non_exhaustive]
+    TapHandoff {
+        /// The raw OS error the handoff failed with.
+        errno: i32,
+    },
     /// The stack's helper process or pump thread could not be started.
     #[non_exhaustive]
     Spawn {
@@ -693,6 +707,10 @@ impl fmt::Display for NetStackError {
                 "the sandbox shares the caller's network namespace; a network stack \
                  attaches only to a private one",
             ),
+            NetStackError::NamespaceJoin { which, errno: 0 } => write!(
+                f,
+                "could not join the sandbox's network namespace while {which}"
+            ),
             NetStackError::NamespaceJoin { which, errno } => write!(
                 f,
                 "could not join the sandbox's network namespace while {which}: {}",
@@ -711,6 +729,11 @@ impl fmt::Display for NetStackError {
             NetStackError::TapConfigure { detail, errno } => write!(
                 f,
                 "could not configure the tap interface while {detail}: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+            NetStackError::TapHandoff { errno } => write!(
+                f,
+                "could not send the tap descriptor back from the network stack's helper: {}",
                 std::io::Error::from_raw_os_error(*errno),
             ),
             NetStackError::Spawn { errno } => write!(

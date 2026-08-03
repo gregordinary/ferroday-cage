@@ -21,7 +21,7 @@
 
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::fs::{self, AtFlags, Mode, OFlags, RawDir, SeekFrom};
 use rustix::io::Errno;
@@ -37,6 +37,10 @@ use crate::idmap::{IdMapError, IdMapper, ResolvedMap};
 pub(crate) enum RemoveStep {
     /// Forking the removal process or speaking to it.
     Spawn,
+    /// The child could not reset its inherited signal dispositions.
+    ResetSignals,
+    /// The child could not close the descriptors it inherited.
+    SweepFds,
     /// The child could not unshare its user namespace.
     Unshare,
     /// The child died or was abandoned at the map gate.
@@ -50,6 +54,8 @@ impl RemoveStep {
     pub(crate) fn describe(self) -> &'static str {
         match self {
             RemoveStep::Spawn => "spawning the removal process",
+            RemoveStep::ResetSignals => "resetting the removal process's signal dispositions",
+            RemoveStep::SweepFds => "closing the removal process's inherited descriptors",
             RemoveStep::Unshare => "unsharing the removal namespace",
             RemoveStep::AwaitMap => "establishing the removal identity map",
             RemoveStep::Delete => "deleting the tree inside the mapped namespace",
@@ -73,10 +79,13 @@ pub(crate) enum RemoveFailure {
     Map(IdMapError),
 }
 
-/// The wire values of the child's result record: the step discriminants.
-const WIRE_UNSHARE: u32 = 1;
-const WIRE_AWAIT: u32 = 2;
-const WIRE_DELETE: u32 = 3;
+/// The wire values of the child's result record: the step discriminants. Zero
+/// is reserved for the all-zero success record.
+const WIRE_RESET_SIGNALS: u32 = 1;
+const WIRE_SWEEP_FDS: u32 = 2;
+const WIRE_UNSHARE: u32 = 3;
+const WIRE_AWAIT: u32 = 4;
+const WIRE_DELETE: u32 = 5;
 
 /// Removes `leaf` under the directory `parent`, as root of a freshly
 /// mapped user namespace.
@@ -227,6 +236,8 @@ fn decode_record(record: [u8; 8]) -> RemoveFailure {
     let wire = u32::from_le_bytes(record[0..4].try_into().expect("slice length is 4"));
     let errno = i32::from_le_bytes(record[4..8].try_into().expect("slice length is 4"));
     let step = match wire {
+        WIRE_RESET_SIGNALS => RemoveStep::ResetSignals,
+        WIRE_SWEEP_FDS => RemoveStep::SweepFds,
         WIRE_UNSHARE => RemoveStep::Unshare,
         WIRE_AWAIT => RemoveStep::AwaitMap,
         _ => RemoveStep::Delete,
@@ -246,7 +257,15 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr) -> ! {
     // A caller signal handler must never run in this constrained copy; the
     // scrub is the same one every launch performs first.
     if let Err(errno) = super::child::reset_signals() {
-        report(WIRE_UNSHARE, errno);
+        report(WIRE_RESET_SIGNALS, errno);
+        runtime::exit_group(127)
+    }
+
+    // Close the rest of the caller's descriptor table. Removing a large tree
+    // runs for a while, and an inherited copy of a live sandbox's control
+    // socket would hold that sandbox's supervisor open for all of it.
+    if let Err(errno) = super::child::sweep_fds_keeping(&[gate.as_raw_fd()]) {
+        report(WIRE_SWEEP_FDS, errno);
         runtime::exit_group(127)
     }
 
@@ -315,18 +334,28 @@ fn delete_tree(parent: &CStr, leaf: &CStr) -> Result<(), Errno> {
     // A plain entry (file or symlink) needs no walk at all. Linux reports the
     // attempt to unlink a directory as EISDIR; POSIX permits EPERM, so accept
     // both as "this is a directory".
-    match fs::unlinkat(&parent_fd, leaf, AtFlags::empty()) {
+    let refused = match fs::unlinkat(&parent_fd, leaf, AtFlags::empty()) {
         Ok(()) => return Ok(()),
-        Err(Errno::ISDIR | Errno::PERM) => {}
+        Err(errno @ (Errno::ISDIR | Errno::PERM)) => errno,
         Err(errno) => return Err(errno),
-    }
+    };
 
+    // EPERM is only a guess at "directory": an immutable file is refused the
+    // same way. Where the open proves it was not one, the first refusal is the
+    // honest diagnostic, not the ENOTDIR that disproved the guess.
     let start = fs::openat(
         &parent_fd,
         leaf,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
+    )
+    .map_err(|errno| {
+        if errno == Errno::NOTDIR {
+            refused
+        } else {
+            errno
+        }
+    })?;
     let start_stat = fs::fstat(&start)?;
     let mut current = start;
 
@@ -349,7 +378,7 @@ fn delete_tree(parent: &CStr, leaf: &CStr) -> Result<(), Errno> {
                     removed = true;
                 }
                 // EISDIR on Linux, EPERM where POSIX allows it: a directory.
-                Err(Errno::ISDIR | Errno::PERM) => {
+                Err(refused @ (Errno::ISDIR | Errno::PERM)) => {
                     match fs::unlinkat(&current, name, AtFlags::REMOVEDIR) {
                         Ok(()) => {
                             removed = true;
@@ -368,6 +397,10 @@ fn delete_tree(parent: &CStr, leaf: &CStr) -> Result<(), Errno> {
                             current = child;
                             continue 'walk;
                         }
+                        // Not a directory after all, so the EPERM that
+                        // suggested one — an immutable file, say — is the
+                        // failure worth reporting.
+                        Err(Errno::NOTDIR) => return Err(refused),
                         Err(errno) => return Err(errno),
                     }
                 }
@@ -498,11 +531,7 @@ mod tests {
 
         // A real directory, so a regression in the other direction — the
         // removal proceeding without a map — has somewhere harmless to land.
-        let dir = std::env::temp_dir().join(format!(
-            "ferroday-cage-abandon-{}",
-            rustix::process::getpid().as_raw_nonzero()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::scratch::Scratch::new("abandon");
         std::fs::create_dir_all(dir.join("tree")).expect("the scratch tree is creatable");
         let parent = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
         let leaf = c"tree";

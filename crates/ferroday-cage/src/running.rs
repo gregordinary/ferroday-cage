@@ -91,16 +91,17 @@ pub struct Running<'obs> {
     /// Whether a kill was requested through this handle or a [`KillHandle`];
     /// decides how a status pipe that closes without a record is read.
     kill_sent: Arc<AtomicBool>,
-    /// A pidfd for the outside supervisor to reap once the status arrives (no
-    /// PID namespace); the in-namespace init is not the caller's child process.
-    /// A pidfd rather than a raw pid so the reap cannot alias a recycled pid.
+    /// A pidfd of the launch stage, for the handle to reap once the status
+    /// arrives (no PID namespace); the in-namespace init is not the caller's
+    /// child process. A pidfd rather than a raw pid so the reap cannot alias a
+    /// recycled pid.
     reap: Option<OwnedFd>,
     /// The pump's read buffer, allocated once when capturing.
     buf: Vec<u8>,
-    /// Held only for its `Drop`: it removes the mount target the managed
-    /// profile created in the rootfs, if any. See
-    /// [`LaunchPlan::managed_placeholder`].
-    _placeholder: PlaceholderGuard,
+    /// Held only for its `Drop`: it removes the mount targets the launch
+    /// created in the root, if any. See
+    /// [`LaunchPlan::managed_placeholders`].
+    _placeholders: PlaceholderGuard,
 }
 
 /// Which captured stream a read belongs to.
@@ -128,7 +129,7 @@ impl<'obs> Running<'obs> {
         Ok(Running::from_launched(
             launched,
             observer,
-            plan.managed_placeholder.clone(),
+            plan.managed_placeholders.clone(),
         ))
     }
 
@@ -136,7 +137,7 @@ impl<'obs> Running<'obs> {
     pub(crate) fn from_launched(
         launched: mechanism::Launched,
         observer: Option<&'obs mut dyn Observer>,
-        placeholder: Option<PathBuf>,
+        placeholders: Vec<PathBuf>,
     ) -> Running<'obs> {
         let buf = if observer.is_some() {
             vec![0; PUMP_BUF]
@@ -157,12 +158,16 @@ impl<'obs> Running<'obs> {
             kill_sent: Arc::new(AtomicBool::new(false)),
             reap: launched.reap,
             buf,
-            _placeholder: PlaceholderGuard { path: placeholder },
+            _placeholders: PlaceholderGuard {
+                paths: placeholders,
+            },
         }
     }
 
-    /// The host process id of the sandbox supervisor: the namespace init,
-    /// or the command process itself without a PID namespace.
+    /// The host process id of the sandbox supervisor — the process this handle
+    /// anchors on: the namespace init, or the command process itself without a
+    /// PID namespace. Not the launch stage, which built the namespaces and, with
+    /// a PID namespace, has already exited.
     ///
     /// Informational — for signaling, use [`kill`](Self::kill) and
     /// [`terminate`](Self::terminate), which cannot hit a recycled pid.
@@ -426,7 +431,7 @@ impl fmt::Debug for Running<'_> {
     }
 }
 
-/// Removes the mount target it holds when it goes out of scope.
+/// Removes the mount targets it holds when it goes out of scope.
 ///
 /// A guard of its own, rather than a [`Drop`] on the handles that carry it,
 /// because a type implementing `Drop` keeps every borrow it holds live until
@@ -435,23 +440,25 @@ impl fmt::Debug for Running<'_> {
 /// ordinary way to collect captured output. The guard borrows nothing, so
 /// dropping it observes nothing.
 struct PlaceholderGuard {
-    /// The path to remove, taken when it is handed on instead.
-    path: Option<PathBuf>,
+    /// The paths to remove, taken when they are handed on instead.
+    paths: Vec<PathBuf>,
 }
 
 impl Drop for PlaceholderGuard {
     fn drop(&mut self) {
-        remove_managed_placeholder(self.path.as_deref());
+        for path in &self.paths {
+            remove_managed_placeholder(path);
+        }
     }
 }
 
-/// Removes a mount target the managed profile created in the rootfs, once the
-/// sandbox that needed it is gone.
+/// Removes a mount target the launch created in the root, once the sandbox
+/// that needed it is gone.
 ///
-/// Only an empty regular file is removed. The placeholder the profile creates
-/// is empty and stays that way — the bind covers it for the sandbox's whole
-/// life, and the mount is confined to the sandbox's own namespace, so nothing
-/// can write through it. Anything with content, or anything that is no longer a
+/// Only an empty regular file is removed. The placeholder a launch creates is
+/// empty and stays that way — the bind covers it for the sandbox's whole life,
+/// and the mount is confined to the sandbox's own namespace, so nothing can
+/// write through it. Anything with content, or anything that is no longer a
 /// plain file, arrived between the build and here and belongs to whoever put it
 /// there.
 ///
@@ -462,10 +469,7 @@ impl Drop for PlaceholderGuard {
 ///
 /// Best-effort, like the teardown around it. A failure leaves a file the rootfs
 /// did not ship, which is untidy but not a failure of the launch itself.
-fn remove_managed_placeholder(path: Option<&Path>) {
-    let Some(path) = path else {
-        return;
-    };
+fn remove_managed_placeholder(path: &Path) {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() == 0 => {
             let _ = std::fs::remove_file(path);
@@ -543,9 +547,9 @@ pub struct Pending<'obs> {
     inner: Option<mechanism::PendingLaunch>,
     /// The observer bound at spawn, carried into the [`Running`] handle.
     observer: Option<&'obs mut dyn Observer>,
-    /// A mount target the managed profile created in the rootfs, handed to the
+    /// The mount targets the launch created in the root, handed to the
     /// [`Running`] this becomes, or removed here if it never proceeds.
-    placeholder: PlaceholderGuard,
+    placeholders: PlaceholderGuard,
 }
 
 impl<'obs> Pending<'obs> {
@@ -563,8 +567,8 @@ impl<'obs> Pending<'obs> {
         Ok(Pending {
             inner: Some(inner),
             observer,
-            placeholder: PlaceholderGuard {
-                path: plan.managed_placeholder.clone(),
+            placeholders: PlaceholderGuard {
+                paths: plan.managed_placeholders.clone(),
             },
         })
     }
@@ -608,7 +612,7 @@ impl<'obs> Pending<'obs> {
         Ok(Running::from_launched(
             launched,
             observer,
-            self.placeholder.path.take(),
+            std::mem::take(&mut self.placeholders.paths),
         ))
     }
 }
@@ -631,7 +635,7 @@ impl Drop for Pending<'_> {
         if let Some(inner) = self.inner.take() {
             inner.abandon();
         }
-        // The guard field removes the placeholder as this drops.
+        // The guard field removes the placeholders as this drops.
     }
 }
 

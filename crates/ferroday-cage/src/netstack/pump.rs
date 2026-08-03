@@ -391,13 +391,12 @@ impl Engine {
     /// moved.
     fn service(&mut self) -> bool {
         let mut progress = false;
+        let now = std::time::Instant::now();
         for flow in &mut self.flows {
             let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
-            progress |= flow.service(socket);
+            progress |= flow.service(socket, now);
         }
-        progress |= self
-            .udp
-            .service(&mut self.sockets, &self.plan, std::time::Instant::now());
+        progress |= self.udp.service(&mut self.sockets, &self.plan, now);
         progress
     }
 

@@ -45,6 +45,8 @@ managed-mounts = true       # default true; false establishes none of the four
 base-env = true             # default true; false gives the command exactly the
                             # [env] table, with no PATH or HOME underneath
 stop-with-caller = false    # default false
+path-lookup = false         # default false; true resolves a command with no
+                            # slash against the sandbox's PATH
 
 identity-map = "subordinate"  # "single" (default) | "subordinate" | ranges
 
@@ -74,6 +76,25 @@ target = "/sys"
 fstype = "sysfs"
 flags = 14                  # raw MS_* bits: MS_NOSUID | MS_NODEV | MS_NOEXEC
 ```
+
+An `[overlay]` table roots the sandbox on an overlay instead of a plain
+`rootfs`; the two are alternatives, and a profile naming both is refused at
+build time rather than silently taking one:
+
+```toml
+command = "/usr/bin/make"
+
+[overlay]
+lower = ["/srv/base", "/srv/patches"]  # ordered, base first; at least one
+upper = "/var/tmp/scratch"             # required; created if absent
+work = "/var/tmp/work"                 # optional; defaults beside the upper
+```
+
+The first `lower` is the base the overlay mounts over and the rest stack on it,
+base first — the reverse of the kernel's own option order, so the array reads
+the way the layers were built. `upper` is where the sandbox's writes land, and
+discarding it reverts them. Note that a `RestrictedProfile` refuses an overlay
+root outright, for the reason [below](#untrusted-profiles).
 
 `[env]` is a table of environment variables, added on top of the
 deterministic base (`PATH` and `HOME`) — or the whole environment, where

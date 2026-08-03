@@ -287,19 +287,20 @@ pub mod deb_repo {
         pub depends: String,
         pub priority: String,
         pub essential: bool,
+        /// The `Provides` field, when the package declares one.
+        pub provides: String,
+        /// The `Architecture` field, when it is not the repository's own.
+        pub architecture: Option<String>,
     }
 
     impl Pkg {
         /// A required package (in the base seed) with the given payload.
         pub fn required(name: &str, deb: Vec<u8>, depends: &str) -> Pkg {
             Pkg {
-                name: name.to_string(),
-                version: "1.0".to_string(),
-                deb,
-                depends: depends.to_string(),
                 priority: "required".to_string(),
-                essential: false,
+                ..Pkg::ordinary(name, deb)
             }
+            .depending_on(depends)
         }
 
         /// An ordinary (non-seed) package with the given payload.
@@ -311,7 +312,29 @@ pub mod deb_repo {
                 depends: String::new(),
                 priority: String::new(),
                 essential: false,
+                provides: String::new(),
+                architecture: None,
             }
+        }
+
+        /// The same package with a `Depends` field.
+        pub fn depending_on(mut self, depends: &str) -> Pkg {
+            self.depends = depends.to_string();
+            self
+        }
+
+        /// The same package declaring `Provides`, so a virtual name resolves to
+        /// it.
+        pub fn providing(mut self, provides: &str) -> Pkg {
+            self.provides = provides.to_string();
+            self
+        }
+
+        /// The same package published for another architecture, which the
+        /// repository's own index still lists.
+        pub fn for_architecture(mut self, architecture: &str) -> Pkg {
+            self.architecture = Some(architecture.to_string());
+            self
         }
     }
 
@@ -324,10 +347,13 @@ pub mod deb_repo {
 
         let mut index = String::new();
         for package in packages {
-            let filename = format!("pool/{}_{}_{arch}.deb", package.name, package.version);
+            // A package published for another architecture still appears in
+            // this index; the reader is what filters it out.
+            let listed = package.architecture.as_deref().unwrap_or(arch);
+            let filename = format!("pool/{}_{}_{listed}.deb", package.name, package.version);
             std::fs::write(dir.join(&filename), &package.deb).unwrap();
             index.push_str(&format!(
-                "Package: {}\nVersion: {}\nArchitecture: {arch}\nFilename: {filename}\n\
+                "Package: {}\nVersion: {}\nArchitecture: {listed}\nFilename: {filename}\n\
                  Size: {}\nSHA256: {}\n",
                 package.name,
                 package.version,
@@ -336,6 +362,9 @@ pub mod deb_repo {
             ));
             if !package.depends.is_empty() {
                 index.push_str(&format!("Depends: {}\n", package.depends));
+            }
+            if !package.provides.is_empty() {
+                index.push_str(&format!("Provides: {}\n", package.provides));
             }
             if !package.priority.is_empty() {
                 index.push_str(&format!("Priority: {}\n", package.priority));

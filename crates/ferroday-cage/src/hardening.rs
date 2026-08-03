@@ -1491,10 +1491,22 @@ impl Request {
     /// and validating the Landlock grant paths. Called from the builders'
     /// `build`, where allocation and failure are free.
     pub(crate) fn lower(&self) -> Result<HardeningPlan, ConfigError> {
+        // An empty access set is a trap rather than a no-op: enrolling any
+        // grant denies everything ungranted, while the kernel skips a rule that
+        // permits nothing. A grant of `FsAccess::empty()` therefore denies the
+        // entire filesystem — including the command's own binary, which fails
+        // the launch at `execve` with nothing pointing at the cause — and an
+        // empty network grant denies all TCP. Neither is what naming a path or
+        // a port means, so both are refused here.
         let landlock = self
             .landlock
             .iter()
             .map(|grant| {
+                if grant.access.is_empty() {
+                    return Err(ConfigError::LandlockGrantEmpty {
+                        grant: grant.path.display().to_string(),
+                    });
+                }
                 Ok(LandlockRule {
                     path: grant_path_cstring(&grant.path)?,
                     access: grant.access.to_landlock(),
@@ -1505,11 +1517,18 @@ impl Request {
         let landlock_net = self
             .landlock_net
             .iter()
-            .map(|grant| LandlockNetRule {
-                port: grant.port,
-                access: grant.access.to_landlock(),
+            .map(|grant| {
+                if grant.access.is_empty() {
+                    return Err(ConfigError::LandlockGrantEmpty {
+                        grant: format!("tcp:{}", grant.port),
+                    });
+                }
+                Ok(LandlockNetRule {
+                    port: grant.port,
+                    access: grant.access.to_landlock(),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ConfigError>>()?;
 
         let seccomp = match &self.seccomp {
             Some(policy) => Some(compile_seccomp(policy)?),

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use super::available::Available;
 use super::version;
 
 /// One control-format stanza: its fields in file order.
@@ -28,6 +29,14 @@ impl Stanza {
             .find(|(name, _)| name.eq_ignore_ascii_case(key))
             .map(|(_, value)| value.as_str())
     }
+
+    /// Every field, in the order the stanza wrote them.
+    ///
+    /// For a reader that has to account for fields it does not itself
+    /// understand, rather than only look up the ones it does.
+    pub(crate) fn fields(&self) -> &[(String, String)] {
+        &self.fields
+    }
 }
 
 /// Splits control-format text into stanzas.
@@ -35,7 +44,10 @@ pub(crate) fn parse_stanzas(text: &str) -> Vec<Stanza> {
     let mut stanzas = Vec::new();
     let mut fields: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
-        if line.is_empty() {
+        // A blank line ends a stanza. Whitespace-only counts as blank: deb822
+        // readers treat it so, and a continuation line is one that starts with
+        // a space *and* carries content.
+        if line.trim().is_empty() {
             if !fields.is_empty() {
                 stanzas.push(Stanza {
                     fields: std::mem::take(&mut fields),
@@ -312,6 +324,15 @@ impl Index {
         self.providers.get(name).map_or(&[], Vec::as_slice)
     }
 
+    /// Projects the index into the names it offers, consuming it.
+    ///
+    /// The parsed packages go: what a caller asking about availability wants is
+    /// the name set and the provider map, and retaining tens of megabytes of
+    /// relation vectors to back a membership question would be the wrong trade.
+    pub(crate) fn into_available(self) -> Available {
+        Available::new(self.by_name.into_keys().collect(), self.providers)
+    }
+
     /// The base seed: every essential package and every package whose priority
     /// is at least `floor` (that is, at least as essential as it). With the
     /// default floor [`Priority::Required`] this is `debootstrap`'s minbase set;
@@ -465,6 +486,14 @@ Version: 1.0
         assert_eq!(stanzas[0].get("package"), Some("one"));
         assert_eq!(stanzas[0].get("multi-line"), Some("\nline one\nline two"));
         assert_eq!(stanzas[1].get("Version"), Some("1.0"));
+
+        // A whitespace-only line separates too, as it does for every other
+        // deb822 reader; taken as a continuation it would fold the second
+        // stanza into the first.
+        let padded = "Package: one\n \nPackage: two\n";
+        let stanzas = parse_stanzas(padded);
+        assert_eq!(stanzas.len(), 2);
+        assert_eq!(stanzas[1].get("Package"), Some("two"));
     }
 
     #[test]

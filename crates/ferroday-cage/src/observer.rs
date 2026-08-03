@@ -102,13 +102,18 @@ pub trait Observer {
 
 /// A completed command's exit status and its captured output.
 ///
-/// Produced by [`Cage::output`] and [`Restriction::output`], the
-/// run-it-and-give-me-everything shape of a launch. [`Observer`] remains the
-/// way to consume output as it is produced, to bound what is kept, or to act
-/// on it before the command finishes.
+/// Produced by [`Cage::output`], the run-it-and-give-me-everything shape of a
+/// launch. [`Observer`] remains the way to consume output as it is produced, to
+/// bound what is kept, or to act on it before the command finishes.
 ///
 /// [`Cage::output`]: crate::Cage::output
-/// [`Restriction::output`]: crate::Restriction::output
+// The restriction fallback is feature-gated, so the sentence naming it — and
+// its intra-doc link — is gated with it, per the crate-level convention.
+#[cfg_attr(
+    feature = "hardening",
+    doc = "[`Restriction::output`](crate::Restriction::output) produces the same type for a"
+)]
+#[cfg_attr(feature = "hardening", doc = "restriction.")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Output {

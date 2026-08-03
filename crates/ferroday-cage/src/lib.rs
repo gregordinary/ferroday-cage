@@ -270,6 +270,8 @@ mod resolved;
 #[cfg(feature = "hardening")]
 mod restrict;
 mod running;
+#[cfg(test)]
+mod scratch;
 mod spec;
 mod status;
 
@@ -288,7 +290,10 @@ pub use mechanism::SockFilter;
 #[cfg(feature = "netstack")]
 pub use netstack::{NetStack, NetStackBuilder, NetStackError, NetStackHandle};
 pub use observer::{Observer, Output, Progress};
-pub use resolved::{ResolvedInputs, ResolvedMount};
+pub use resolved::{
+    ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs, ResolvedLandlockNet,
+    ResolvedMount, ResolvedRlimit, ResolvedRoot,
+};
 #[cfg(feature = "hardening")]
 pub use restrict::{Restriction, RestrictionBuilder};
 pub use running::{KillHandle, Pending, Running};

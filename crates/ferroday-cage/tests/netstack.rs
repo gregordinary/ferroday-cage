@@ -251,6 +251,80 @@ fn tcp_connects_to_a_host_listener_through_the_stack() {
     assert_eq!(String::from_utf8_lossy(&from_guest).trim(), "ping");
 }
 
+/// A host TCP listener that answers one connection with `bytes` of payload and
+/// closes immediately, the shape of a `Connection: close` response. Returns its
+/// port.
+fn bulk_listener(bytes: usize) -> u16 {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    let port = listener
+        .local_addr()
+        .expect("the listener has an address")
+        .port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            // Read the guest's request out first. Closing a socket with data
+            // still unread makes the kernel send a reset instead of the FIN
+            // this fixture is about.
+            let mut request = Vec::new();
+            let _ = stream.read_to_end(&mut request);
+            let _ = stream.write_all(&vec![b'x'; bytes]);
+            // Dropping the stream here is the point of the fixture: the peer's
+            // FIN reaches the stack while the tail of the transfer is still
+            // buffered on both sides of it.
+        }
+    });
+    port
+}
+
+#[test]
+fn tcp_delivers_a_bulk_transfer_that_ends_in_a_prompt_close() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    // Comfortably past the stack's 64 KiB transmit buffer, so the buffer is
+    // full — and the host descriptor still holds unread bytes — when the host's
+    // hangup is reported. Delivering every byte regardless is what separates
+    // an end-of-stream from a reset.
+    const PAYLOAD: usize = 1024 * 1024;
+    let port = bulk_listener(PAYLOAD);
+
+    let mut observer = Collect::default();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!("echo ping | /usr/bin/nc -w 10 10.0.2.2 {port} | wc -c"),
+        ])
+        .build()
+        .expect("a valid sandbox configuration");
+    let pending = cage
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = NetStack::builder()
+        .host_loopback(true)
+        .build()
+        .expect("a valid stack configuration")
+        .attach(&pending)
+        .expect("the stack attaches");
+    let mut running = pending.proceed().expect("the command is released");
+    let status = running
+        .wait_timeout(Duration::from_secs(60))
+        .expect("the wait completes")
+        .expect("the command exits before the deadline");
+    handle.stop().expect("the stack stops cleanly");
+
+    assert!(status.success(), "the guest read the transfer to its end");
+    assert_eq!(
+        String::from_utf8_lossy(&observer.stdout).trim(),
+        PAYLOAD.to_string(),
+        "every byte of the transfer reached the guest",
+    );
+}
+
 #[test]
 fn the_default_policy_blocks_a_host_local_service() {
     let Some(rootfs) = common::fixture_rootfs() else {

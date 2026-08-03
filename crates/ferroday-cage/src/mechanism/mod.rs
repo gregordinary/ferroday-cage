@@ -72,6 +72,7 @@ compile_error!(
 );
 
 mod child;
+mod copyin;
 #[cfg(feature = "tarball")]
 mod export;
 #[cfg(feature = "hardening")]
@@ -83,17 +84,22 @@ mod remove;
 pub(crate) use harden::probe_landlock_abi;
 
 pub(crate) use child::CONTROL_TERMINATE;
+pub(crate) use copyin::{
+    COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_SYMLINK, CopyFailure,
+    LINK_BUF, start_copy_in,
+};
 #[cfg(feature = "tarball")]
 pub(crate) use export::{
-    ExportMap, ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE,
-    FRAME_SYMLINK, StartError, kill_export, start_export,
+    ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
+    StartError, kill_export, start_export,
 };
 pub(crate) use overlay::{OverlayProbe, probe_overlay_mount, xattr_unsupported};
 pub(crate) use remove::{RemoveFailure, remove_tree_mapped};
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustix::fs::RawMode;
@@ -167,6 +173,15 @@ pub(crate) struct OverlayPlan {
     /// The overlay mount options, preformatted at build time:
     /// `lowerdir=<base>,upperdir=<upper>,workdir=<work>,userxattr`.
     pub(crate) options: CString,
+    /// The resolved lower layers, first (the base the overlay mounts over)
+    /// first. Kept beside the formatted options so `resolved_inputs` can report
+    /// the stack as a structure rather than leave a caller to parse it back out
+    /// of the option string.
+    pub(crate) lower: Vec<PathBuf>,
+    /// The resolved upper layer, where the sandbox's writes land.
+    pub(crate) upper: PathBuf,
+    /// The resolved work directory the overlay requires beside the upper.
+    pub(crate) work: PathBuf,
 }
 
 /// How the command stage wires standard input, frozen at build time.
@@ -269,6 +284,16 @@ pub(crate) struct LaunchPlan {
     pub(crate) hostname: Option<CString>,
     /// Whether to bring up loopback in the isolated network namespace.
     pub(crate) configure_loopback: bool,
+    /// The network posture the sandbox was built with.
+    ///
+    /// Carried rather than reconstructed from [`unshare`](Self::unshare) and
+    /// [`configure_loopback`](Self::configure_loopback), which encode it
+    /// between them: `resolved_inputs` reports it, and a record derived from
+    /// two flags would go quietly wrong the first time a third posture did not
+    /// map onto them. A restriction creates no network namespace, so it carries
+    /// [`Network::Host`](crate::Network::Host) — the caller's, which is what it
+    /// runs in.
+    pub(crate) network: crate::Network,
     /// The working directory inside the sandbox; `None` means `/`.
     pub(crate) workdir: Option<CString>,
     /// The mount profile, lowered into frozen ops the sandbox stage executes
@@ -277,20 +302,25 @@ pub(crate) struct LaunchPlan {
     /// Caller-side labels parallel to `ops`, naming each mount in a setup
     /// error. Never touched by the sandbox stages.
     pub(crate) op_labels: Vec<String>,
-    /// A mount target the managed profile has to create in the rootfs, as an
-    /// absolute host path, removed once the sandbox that needed it is gone.
+    /// The mount targets the launch has to create as empty files, as absolute
+    /// host paths, removed once the sandbox that needed them is gone.
     ///
-    /// A bind needs its target to exist before anything can be mounted onto it,
-    /// so the managed `/etc/resolv.conf` bind of host networking creates an
-    /// empty file when the rootfs ships none. Left behind, that file is a
-    /// resolver configuration the rootfs did not have, which an export carries
-    /// into whatever is made of the tree. The caller side removes it after the
-    /// launch instead — the sandbox owns what it creates. `None` when the
-    /// rootfs already ships the file, or when the bind is not made at all.
+    /// A file bind needs its target to exist before anything can be mounted
+    /// onto it, so a root shipping none gets an empty file created. Left
+    /// behind, that file is content the root did not have — a resolver
+    /// configuration, an empty binary — which an export carries into whatever
+    /// is made of the tree. The caller side removes each one after the launch
+    /// instead: the sandbox owns what it creates.
+    ///
+    /// Only the targets whose host path is known are listed: one under an
+    /// earlier mount is created inside that mount rather than in the root, and
+    /// one the root already ships is not the launch's to remove. The path is
+    /// the root's writable layer — the rootfs itself, or an overlay's upper —
+    /// joined with the rootfs-relative target.
     ///
     /// Caller-side only, and never touched by the sandbox stages: inside the
-    /// sandbox the path is under the bind, where unlinking it is `EBUSY`.
-    pub(crate) managed_placeholder: Option<std::path::PathBuf>,
+    /// sandbox each path is under its bind, where unlinking it is `EBUSY`.
+    pub(crate) managed_placeholders: Vec<std::path::PathBuf>,
     /// The caller-side label naming the command in a failed exec step: the
     /// program path, or the bare name and the candidates a path lookup tried.
     /// Never touched by the sandbox stages.
@@ -478,6 +508,9 @@ pub(crate) struct MountOp {
     pub(crate) dirs: Vec<MountDir>,
     /// A rootfs-relative file to create (empty, mode 0644) as the target of
     /// a file bind.
+    ///
+    /// Unlike a mount point directory, it does not outlive the sandbox: see
+    /// [`LaunchPlan::managed_placeholders`], which the caller side removes.
     pub(crate) create_file: Option<CString>,
     /// The mount action itself.
     pub(crate) action: MountAction,
@@ -562,6 +595,25 @@ pub(crate) enum MountAction {
     },
 }
 
+impl MountAction {
+    /// The rootfs-relative path this action mounts something on, or `None` for
+    /// the one action that mounts nothing.
+    ///
+    /// A path under one of these is inside that mount once the action has run,
+    /// not in the rootfs directory on the host, which is what decides whether
+    /// a target the launch creates has a host path at all.
+    pub(crate) fn target(&self) -> Option<&CStr> {
+        match self {
+            MountAction::Tmpfs { target, .. }
+            | MountAction::Procfs { target }
+            | MountAction::Devpts { target, .. }
+            | MountAction::Bind { target, .. }
+            | MountAction::Raw { target, .. } => Some(target),
+            MountAction::Symlink { .. } => None,
+        }
+    }
+}
+
 /// The wire encoding of the status record: the command exited with a code.
 pub(crate) const STATUS_EXITED: u32 = 1;
 /// The wire encoding of the status record: the command was terminated by a
@@ -599,11 +651,11 @@ pub(crate) struct Launched {
     pub(crate) stdout: Option<OwnedFd>,
     /// Read end of the command's captured standard error, when observing.
     pub(crate) stderr: Option<OwnedFd>,
-    /// A pidfd for the outside supervisor to reap after the status arrives.
-    /// `None` with a PID namespace, where the launch stage is reaped at spawn
-    /// time and the init is not the caller's child process. A pidfd rather than
-    /// a raw pid so the deferred reap targets exactly this process and cannot
-    /// alias a pid a concurrent reaper freed and the OS recycled.
+    /// A pidfd of the launch stage, for the handle to reap after the status
+    /// arrives. `None` with a PID namespace, where the launch stage is reaped
+    /// at spawn time and the init is not the caller's child process. A pidfd
+    /// rather than a raw pid so the deferred reap targets exactly this process
+    /// and cannot alias a pid a concurrent reaper freed and the OS recycled.
     pub(crate) reap: Option<OwnedFd>,
 }
 
@@ -637,6 +689,32 @@ const PROCEED_BYTE: u8 = b'G';
 
 /// The ready byte stage A sends on the map gate once it has unshared and is
 /// blocked waiting for the identity map.
+/// How a forked helper child's identity map is established.
+///
+/// Shared by the export child, which reads a tree as root of the mapped
+/// namespace, and the copy-in child, which writes one: both need to be inside
+/// the map the tree's ownership is expressed in, and neither can establish a
+/// range map on its own.
+pub(crate) enum ChildMap<'a> {
+    /// The single-identity map, which the child writes itself under the
+    /// kernel's unprivileged one-id exception. The lines are formatted by the
+    /// caller before the fork, as a launch formats its own.
+    SelfMap {
+        /// The `uid_map` line: `0 <euid> 1\n`.
+        uid_line: &'a [u8],
+        /// The `gid_map` line: `0 <egid> 1\n`.
+        gid_line: &'a [u8],
+    },
+    /// A range map, written from outside the new namespace by the resolved
+    /// delegate while the child blocks at the map gate.
+    Delegated {
+        /// The delegate that applies the map.
+        mapper: &'a dyn IdMapper,
+        /// The extents, resolved by the caller.
+        map: &'a ResolvedMap,
+    },
+}
+
 pub(super) const MAP_READY_BYTE: u8 = b'R';
 
 /// The go byte the caller sends on the map gate once the identity map is
@@ -877,10 +955,10 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
 
 /// Decides how the launch stage is reaped for a command that is now running.
 ///
-/// Without a PID namespace the launch stage itself is the supervisor and is
-/// reaped by the handle once the status arrives, so it is returned; with one
-/// it has already exited and is reaped here, best-effort in case the
-/// application reaps child processes of its own.
+/// Without a PID namespace the launch stage stays outside as the command's
+/// parent and is reaped by the handle once the status arrives, so it is
+/// returned; with one it has already exited and is reaped here, best-effort in
+/// case the application reaps child processes of its own.
 fn reap_after(pid_namespace: bool, stage_a: Pid) -> Option<OwnedFd> {
     if pid_namespace {
         // The launch stage is short-lived here and reaped now, before its pid
@@ -888,11 +966,11 @@ fn reap_after(pid_namespace: bool, stage_a: Pid) -> Option<OwnedFd> {
         let _ = wait_for_exit(stage_a);
         None
     } else {
-        // The launch stage is the supervisor and outlives spawn, so the handle
-        // reaps it later. Take a pidfd now, while it is still a child, so that
-        // deferred reap targets exactly this process rather than a raw pid a
-        // concurrent reaper could free and the OS recycle. If it was already
-        // reaped, `pidfd_open` fails and there is nothing left to reap.
+        // The launch stage outlives spawn here, so the handle reaps it later.
+        // Take a pidfd now, while it is still a child, so that deferred reap
+        // targets exactly this process rather than a raw pid a concurrent
+        // reaper could free and the OS recycle. If it was already reaped,
+        // `pidfd_open` fails and there is nothing left to reap.
         process::pidfd_open(stage_a, PidfdFlags::empty()).ok()
     }
 }

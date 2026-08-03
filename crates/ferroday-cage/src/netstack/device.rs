@@ -39,6 +39,13 @@ pub(super) struct TapDevice {
     /// circulation only when [`take_buffer`](Self::take_buffer) finds this list
     /// empty, and each batch returns what it took.
     free: Vec<Vec<u8>>,
+    /// The frame each transmission is assembled in before it goes to the tap.
+    ///
+    /// One buffer rather than a list: the borrow rules hand out at most one
+    /// transmit token at a time, and it is consumed before the next is asked
+    /// for. Transmission is as hot a path as reception, so it recycles for the
+    /// same reason.
+    tx_buf: Vec<u8>,
 }
 
 impl TapDevice {
@@ -48,6 +55,7 @@ impl TapDevice {
             mtu: usize::from(mtu),
             queue: VecDeque::new(),
             free: Vec::new(),
+            tx_buf: Vec::new(),
         }
     }
 
@@ -86,17 +94,26 @@ impl phy::Device for TapDevice {
     type TxToken<'a> = TapTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // The receive token borrows the free list and the transmit token the
-        // descriptor: disjoint fields, so both can be handed out at once.
+        // The receive token borrows the free list, the transmit token the
+        // descriptor and the transmit frame: disjoint fields, so both can be
+        // handed out at once.
         let TapDevice {
-            tap, queue, free, ..
+            tap,
+            queue,
+            free,
+            tx_buf,
+            ..
         } = self;
         let frame = queue.pop_front()?;
-        Some((QueueRxToken { frame, free }, TapTxToken { tap }))
+        Some((
+            QueueRxToken { frame, free },
+            TapTxToken { tap, frame: tx_buf },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(TapTxToken { tap: &self.tap })
+        let TapDevice { tap, tx_buf, .. } = self;
+        Some(TapTxToken { tap, frame: tx_buf })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -128,10 +145,11 @@ impl phy::RxToken for QueueRxToken<'_> {
     }
 }
 
-/// A transmit slot: the closure builds the frame and the token writes it
-/// to the tap.
+/// A transmit slot: the closure builds the frame in the device's reusable
+/// buffer and the token writes it to the tap.
 pub(super) struct TapTxToken<'a> {
     tap: &'a OwnedFd,
+    frame: &'a mut Vec<u8>,
 }
 
 impl phy::TxToken for TapTxToken<'_> {
@@ -139,14 +157,19 @@ impl phy::TxToken for TapTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut frame = vec![0u8; len];
-        let result = f(&mut frame);
+        // The buffer is the device's, kept across transmissions; clearing
+        // before the resize means the resize zeroes rather than preserving a
+        // previous frame's bytes.
+        let frame = self.frame;
+        frame.clear();
+        frame.resize(len, 0);
+        let result = f(&mut frame[..]);
         // A tap write takes the whole frame or nothing. Failure — the
         // injection queue is momentarily full, or the device is going away
         // — drops the frame, which is what a network does; the protocols
         // above recover, and a vanished device surfaces through the pump's
         // read path.
-        let _ = rustix::io::write(self.tap, &frame);
+        let _ = rustix::io::write(self.tap, frame);
         result
     }
 }

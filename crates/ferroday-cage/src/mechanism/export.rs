@@ -45,7 +45,7 @@
 
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use rustix::io::Errno;
@@ -54,6 +54,7 @@ use rustix::process::{Pid, Signal};
 use rustix::runtime::{self, Fork};
 use rustix::thread::UnshareFlags;
 
+use super::ChildMap;
 use crate::idmap::{IdMapError, IdMapper, ResolvedMap};
 
 /// Frame tag: a directory is entered.
@@ -75,6 +76,10 @@ pub(crate) const FRAME_ERROR: u8 = 6;
 pub(crate) enum ExportStep {
     /// Forking the export process or speaking to it.
     Spawn,
+    /// The child could not reset its inherited signal dispositions.
+    ResetSignals,
+    /// The child could not close the descriptors it inherited.
+    SweepFds,
     /// The child could not unshare its user namespace.
     Unshare,
     /// The child could not write its own single-identity map.
@@ -104,6 +109,8 @@ impl ExportStep {
     pub(crate) fn describe(self) -> &'static str {
         match self {
             ExportStep::Spawn => "spawning the export process",
+            ExportStep::ResetSignals => "resetting the export process's signal dispositions",
+            ExportStep::SweepFds => "closing the export process's inherited descriptors",
             ExportStep::Unshare => "unsharing the export namespace",
             ExportStep::SelfMap => "writing the export identity map",
             ExportStep::AwaitMap => "establishing the export identity map",
@@ -128,40 +135,21 @@ impl ExportStep {
     pub(crate) fn from_wire(wire: u32) -> ExportStep {
         match wire {
             0 => ExportStep::Spawn,
-            1 => ExportStep::Unshare,
-            2 => ExportStep::SelfMap,
-            3 => ExportStep::AwaitMap,
-            4 => ExportStep::ReadDir,
-            5 => ExportStep::Stat,
-            6 => ExportStep::Open,
-            7 => ExportStep::ReadLink,
-            8 => ExportStep::Xattr,
-            9 => ExportStep::ReadData,
-            10 => ExportStep::Depth,
+            1 => ExportStep::ResetSignals,
+            2 => ExportStep::SweepFds,
+            3 => ExportStep::Unshare,
+            4 => ExportStep::SelfMap,
+            5 => ExportStep::AwaitMap,
+            6 => ExportStep::ReadDir,
+            7 => ExportStep::Stat,
+            8 => ExportStep::Open,
+            9 => ExportStep::ReadLink,
+            10 => ExportStep::Xattr,
+            11 => ExportStep::ReadData,
+            12 => ExportStep::Depth,
             _ => ExportStep::Stream,
         }
     }
-}
-
-/// How the export child's identity map is established.
-pub(crate) enum ExportMap<'a> {
-    /// The single-identity map, which the child writes itself under the
-    /// kernel's unprivileged one-id exception. The lines are formatted by the
-    /// caller before the fork, as a launch formats its own.
-    SelfMap {
-        /// The `uid_map` line: `0 <euid> 1\n`.
-        uid_line: &'a [u8],
-        /// The `gid_map` line: `0 <egid> 1\n`.
-        gid_line: &'a [u8],
-    },
-    /// A range map, written from outside the new namespace by the resolved
-    /// delegate while the child blocks at the map gate.
-    Delegated {
-        /// The delegate that applies the map.
-        mapper: &'a dyn IdMapper,
-        /// The extents, resolved by the caller.
-        map: &'a ResolvedMap,
-    },
 }
 
 /// A failure to start the export before the child began streaming.
@@ -208,14 +196,14 @@ const EXPORT_GO_BYTE: u8 = b'g';
 /// calls [`ExportChild::finish`]. A child-side walk failure surfaces in the
 /// stream as [`FRAME_ERROR`], not here; this returns only spawn failures and, for
 /// a delegated map, the delegate's own apply failure.
-pub(crate) fn start_export(rootfs: &CStr, map: ExportMap<'_>) -> Result<ExportChild, StartError> {
+pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChild, StartError> {
     let (stream_read, stream_write) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(StartError::Spawn)?;
 
     // The gate exists only for a delegated map; a self-mapped child needs no
     // handshake.
     let gate = match map {
-        ExportMap::Delegated { .. } => Some(
+        ChildMap::Delegated { .. } => Some(
             rustix::net::socketpair(
                 AddressFamily::UNIX,
                 SocketType::SEQPACKET,
@@ -224,7 +212,7 @@ pub(crate) fn start_export(rootfs: &CStr, map: ExportMap<'_>) -> Result<ExportCh
             )
             .map_err(StartError::Spawn)?,
         ),
-        ExportMap::SelfMap { .. } => None,
+        ChildMap::SelfMap { .. } => None,
     };
 
     // SAFETY: the child branch runs `export_child`, which performs raw rustix
@@ -233,25 +221,25 @@ pub(crate) fn start_export(rootfs: &CStr, map: ExportMap<'_>) -> Result<ExportCh
     match unsafe { runtime::kernel_fork() } {
         Err(errno) => Err(StartError::Spawn(errno)),
         Ok(Fork::Child(_)) => {
-            // The fork duplicated the caller's end of the gate into this
-            // process; close it, so this child pins nothing it does not use.
-            // Closing an owned descriptor is a bare `close`, which the
-            // post-fork discipline permits.
+            // The fork duplicated the caller's ends into this process; close
+            // what this child does not use, so it pins nothing of the caller's.
+            // The read end of its own frame pipe matters most: holding it would
+            // make `write` on the stream succeed forever, so a child orphaned
+            // by the caller's death would fill the pipe and block in `write`
+            // rather than fail with `EPIPE` and exit. Closing an owned
+            // descriptor is a bare `close`, which the post-fork discipline
+            // permits; everything else the caller had open is closed by the
+            // sweep inside `export_child`.
+            drop(stream_read);
             let gate_child = gate.map(|(caller, child)| {
                 drop(caller);
                 child
             });
-            export_child(
-                stream_write.as_fd(),
-                gate_child.as_ref().map(|gate| gate.as_fd()),
-                rootfs,
-                &map,
-            )
+            export_child(stream_write.as_fd(), gate_child, rootfs, &map)
         }
         Ok(Fork::ParentOf(pid)) => {
             drop(stream_write);
-            if let (Some((caller, child_end)), ExportMap::Delegated { mapper, map }) = (gate, &map)
-            {
+            if let (Some((caller, child_end)), ChildMap::Delegated { mapper, map }) = (gate, &map) {
                 drop(child_end);
                 if let Err(err) = drive_gate(&caller, pid, *mapper, map) {
                     // The delegate failed. The child is blocked at the gate in
@@ -320,11 +308,14 @@ fn drive_gate(
 }
 
 /// The child: unshare, establish the map, walk, and stream. Never returns.
+///
+/// Takes the gate by value so the handshake can close it: past the go byte the
+/// gate has nothing left to say, and the walk that follows is long.
 fn export_child(
     stream: BorrowedFd<'_>,
-    gate: Option<BorrowedFd<'_>>,
+    gate: Option<OwnedFd>,
     rootfs: &CStr,
-    map: &ExportMap<'_>,
+    map: &ChildMap<'_>,
 ) -> ! {
     let fail = |step: ExportStep, errno: Errno| -> ! {
         emit_error(stream, step, errno);
@@ -334,7 +325,18 @@ fn export_child(
     // A caller signal handler must never run in this constrained copy; the
     // scrub is the same one every launch performs first.
     if let Err(errno) = super::child::reset_signals() {
-        fail(ExportStep::Unshare, errno);
+        fail(ExportStep::ResetSignals, errno);
+    }
+
+    // Close the rest of the caller's descriptor table. An export of a large
+    // rootfs runs for minutes, and an inherited copy of a live sandbox's
+    // control socket would hold that sandbox's supervisor open for all of it.
+    let keep = [
+        stream.as_raw_fd(),
+        gate.as_ref().map_or(-1 as RawFd, |gate| gate.as_raw_fd()),
+    ];
+    if let Err(errno) = super::child::sweep_fds_keeping(&keep) {
+        fail(ExportStep::SweepFds, errno);
     }
 
     // The user namespace alone: the walk works on the caller's own mount view,
@@ -346,7 +348,7 @@ fn export_child(
     }
 
     match (map, gate) {
-        (ExportMap::SelfMap { uid_line, gid_line }, _) => {
+        (ChildMap::SelfMap { uid_line, gid_line }, _) => {
             // Deny setgroups first, as the one-id exception requires, then write
             // the maps in process — exactly as stage A does for a single map.
             if let Err(errno) = super::child::write_file(c"/proc/self/setgroups", b"deny") {
@@ -359,10 +361,10 @@ fn export_child(
                 fail(ExportStep::SelfMap, errno);
             }
         }
-        (ExportMap::Delegated { .. }, Some(gate)) => {
+        (ChildMap::Delegated { .. }, Some(gate)) => {
             // Signal ready, then block until the delegate has written the map.
             loop {
-                match rustix::io::write(gate, &[EXPORT_READY_BYTE]) {
+                match rustix::io::write(&gate, &[EXPORT_READY_BYTE]) {
                     Ok(_) => break,
                     Err(Errno::INTR) => continue,
                     Err(errno) => fail(ExportStep::AwaitMap, errno),
@@ -370,15 +372,18 @@ fn export_child(
             }
             let mut byte = [0u8; 1];
             loop {
-                match rustix::io::read(gate, &mut byte) {
+                match rustix::io::read(&gate, &mut byte) {
                     Ok(0) => runtime::exit_group(1),
                     Ok(_) => break,
                     Err(Errno::INTR) => continue,
                     Err(errno) => fail(ExportStep::AwaitMap, errno),
                 }
             }
+            // The map is in force and the gate has served its purpose; the walk
+            // below carries the rest of the conversation on the stream.
+            drop(gate);
         }
-        (ExportMap::Delegated { .. }, None) => {
+        (ChildMap::Delegated { .. }, None) => {
             // start_export pairs every delegated map with a gate.
             fail(ExportStep::AwaitMap, Errno::BADF);
         }
@@ -660,8 +665,16 @@ impl Walker<'_> {
         Ok(())
     }
 
-    /// Emits a symlink frame: metadata then the link target. Symlinks carry no
-    /// xattrs of interest and none is read.
+    /// Emits a symlink frame: metadata then the link target, and no attribute
+    /// block.
+    ///
+    /// The kernel confines a symlink's extended attributes to the `security`
+    /// and `trusted` namespaces — the `user` namespace is refused on anything
+    /// but a regular file or a directory — and neither is one an unprivileged
+    /// export can read in full or an unprivileged extraction restore. Reading
+    /// them would also mean an `O_PATH` descriptor and a `/proc/self/fd` detour,
+    /// since `flistxattr` refuses one; the frame format leaves the door open by
+    /// simply having no block here.
     fn emit_symlink(
         &self,
         dir: BorrowedFd<'_>,
@@ -772,4 +785,90 @@ fn write_all(fd: BorrowedFd<'_>, data: &[u8]) -> Result<(), Errno> {
 /// abandons the archive early.
 pub(crate) fn kill_export(child: &ExportChild) {
     let _ = rustix::process::kill_process(child.pid, Signal::KILL);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use rustix::event::{PollFd, PollFlags, Timespec};
+
+    use super::*;
+
+    /// The export child closes every descriptor it inherited but its own two.
+    ///
+    /// The consequence is the point: a caller that exports while a sandbox runs
+    /// has a copy of that sandbox's control socket in the fork, and the
+    /// supervisor's hangup detection — the whole of `stop_with_caller` — waits
+    /// on the last copy closing. A pipe stands in for the socket here; once the
+    /// caller drops its own end, the read end reaches end of stream only if the
+    /// child has let go of its copy too.
+    #[test]
+    fn the_export_child_sweeps_the_descriptors_it_inherited() {
+        if let Some(blocker) = crate::host::userns_blocker() {
+            // The child maps itself before it walks; without a user namespace
+            // it fails before the sweep could matter.
+            eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
+            return;
+        }
+
+        let dir = crate::scratch::Scratch::new("export-sweep");
+        // Larger than a pipe's capacity, so the child is still blocked writing
+        // frames while the check below runs. A tree the child could finish
+        // streaming would close its inherited copy by exiting, and the check
+        // would pass whether or not it ever swept.
+        std::fs::write(dir.join("file"), vec![b'x'; 256 * 1024])
+            .expect("the scratch file is writable");
+        let rootfs = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+
+        let (bystander_read, bystander_write) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).expect("a pipe is creatable");
+
+        let euid = rustix::process::geteuid().as_raw();
+        let egid = rustix::process::getegid().as_raw();
+        let uid_line = format!("0 {euid} 1\n").into_bytes();
+        let gid_line = format!("0 {egid} 1\n").into_bytes();
+        let child = start_export(
+            &rootfs,
+            ChildMap::SelfMap {
+                uid_line: &uid_line,
+                gid_line: &gid_line,
+            },
+        )
+        .unwrap_or_else(|_| panic!("the export child starts"));
+
+        // The caller's own copy goes; the child's is all that could keep the
+        // pipe open now.
+        drop(bystander_write);
+        let mut fds = [PollFd::new(&bystander_read, PollFlags::IN)];
+        let timeout = Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut fds, Some(&timeout)).expect("the poll completes");
+        assert!(
+            !fds[0].revents().is_empty(),
+            "the export child still holds the caller's descriptor",
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            rustix::io::read(&bystander_read, &mut byte),
+            Ok(0),
+            "the pipe reached end of stream, so no copy of the write end remains",
+        );
+
+        // Drain the stream so the blocked child reaches its end and can be
+        // reaped.
+        let mut frames = Vec::new();
+        std::fs::File::from(
+            child
+                .stream()
+                .try_clone_to_owned()
+                .expect("the stream is cloneable"),
+        )
+        .read_to_end(&mut frames)
+        .expect("the frame stream reads to its end");
+        assert_eq!(frames.last(), Some(&FRAME_END), "the walk finished cleanly");
+        child.finish().expect("the export child is reaped");
+    }
 }

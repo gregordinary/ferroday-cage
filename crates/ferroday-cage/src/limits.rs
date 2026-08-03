@@ -5,13 +5,21 @@
 //! confined to a private root with no network can still fork without end,
 //! allocate without end, and fill the filesystem it was given.
 //!
-//! A limit is set with [`CageBuilder::rlimit`](crate::CageBuilder::rlimit) (or
-//! [`RestrictionBuilder::rlimit`](crate::RestrictionBuilder::rlimit)) and is
-//! applied to the command process immediately before the hardening layer, so
+//! A limit is set with [`CageBuilder::rlimit`](crate::CageBuilder::rlimit) and
+//! is applied to the command process immediately before the hardening layer, so
 //! the command and every process it starts inherit it. Limits are the kernel's
 //! own `setrlimit` values with the kernel's own semantics — see
 //! [`Resource`] for the caveats that matter in a sandbox.
 //!
+#![cfg_attr(
+    feature = "hardening",
+    doc = "The restriction fallback carries the same knob as"
+)]
+#![cfg_attr(
+    feature = "hardening",
+    doc = "[`RestrictionBuilder::rlimit`](crate::RestrictionBuilder::rlimit)."
+)]
+#![cfg_attr(feature = "hardening", doc = "")]
 //! With the `serde` feature a cage's limits are part of the profile format, as
 //! an `[rlimit]` table keyed by resource name:
 //!
@@ -40,8 +48,30 @@ const UNLIMITED_NAME: &str = "unlimited";
 ///
 /// Constructed from a `u64` — `.rlimit(Resource::Processes, 64, 64)` — or as
 /// [`UNLIMITED`](Self::UNLIMITED) for the kernel's `RLIM_INFINITY`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Limit(Option<u64>);
+
+/// Orders limits by how much they permit, so `UNLIMITED` is the maximum.
+///
+/// Not derived: the inner `Option` orders `None` *below* every `Some`, which
+/// would make `Limit::UNLIMITED < Limit::of(0)` — the inverse of what a limit
+/// means and of what this type documents.
+impl Ord for Limit {
+    fn cmp(&self, other: &Limit) -> std::cmp::Ordering {
+        match (self.0, other.0) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+        }
+    }
+}
+
+impl PartialOrd for Limit {
+    fn partial_cmp(&self, other: &Limit) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl Limit {
     /// No limit: the kernel's `RLIM_INFINITY`.
@@ -393,7 +423,34 @@ pub(crate) mod serde_rlimits {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
+
+    #[test]
+    fn the_comparison_operators_agree_with_fits_within() {
+        // The derived ordering on the inner `Option` would put `UNLIMITED`
+        // below every finite limit, so a consumer sorting or clamping limits
+        // through the public operators would get the inverse of what a limit
+        // means. The two answers must not disagree.
+        assert!(Limit::UNLIMITED > Limit::of(0));
+        assert!(Limit::UNLIMITED > Limit::of(u64::MAX - 1));
+        assert!(Limit::of(1) < Limit::of(2));
+        assert_eq!(Limit::UNLIMITED.cmp(&Limit::UNLIMITED), Ordering::Equal);
+        for (soft, hard) in [
+            (Limit::of(1), Limit::UNLIMITED),
+            (Limit::UNLIMITED, Limit::UNLIMITED),
+            (Limit::UNLIMITED, Limit::of(u64::MAX - 1)),
+            (Limit::of(2), Limit::of(1)),
+            (Limit::of(1), Limit::of(2)),
+        ] {
+            assert_eq!(
+                soft.fits_within(hard),
+                soft <= hard,
+                "{soft} within {hard} disagrees with the ordering",
+            );
+        }
+    }
 
     #[test]
     fn unlimited_is_the_ceiling_in_both_directions() {

@@ -16,6 +16,14 @@
 //! folds the nearest flow's expiry into its poll timeout, so an idle flow is
 //! reaped when its timeout falls due rather than waiting on the next unrelated
 //! wakeup. The clock is injected, so expiry is testable.
+//!
+//! Both directions are bounded by one packet. IP fragmentation is not compiled
+//! in, so a guest datagram larger than the interface MTU never arrives, and a
+//! host reply larger than [`deliverable`] cannot be carried to the guest: the
+//! relay drops it rather than hand the interface a packet it would discard at
+//! egress with no diagnostic at all. A guest that needs larger datagrams — a
+//! resolver advertising a large EDNS buffer is the usual case — needs a larger
+//! MTU, which the stack's builder configures.
 
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
@@ -25,7 +33,7 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::udp;
-use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use super::Plan;
 use super::pump::host_target;
@@ -43,10 +51,36 @@ pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// one poll cycle delivers, not a backlog.
 const PACKET_SLOTS: usize = 8;
 
-/// The largest single datagram the relay copies. IP fragmentation is not
-/// compiled in, so a received datagram never exceeds the interface MTU, whose
-/// own ceiling is a `u16`; this bounds the drain scratch buffer.
+/// The largest single datagram the relay copies, which bounds the drain
+/// scratch buffer. A guest datagram never exceeds the interface MTU — IP
+/// fragmentation is not compiled in — but a host reply is whatever the peer
+/// sent, up to the protocol's own `u16` ceiling; the buffer is sized to that so
+/// an oversized reply is read whole and judged, rather than truncated.
 const MAX_DATAGRAM: usize = 65_535;
+
+/// The IPv4 header the interface emits, which carries no options.
+const IPV4_HEADER: usize = 20;
+
+/// The IPv6 header the interface emits, which carries no extension headers.
+const IPV6_HEADER: usize = 40;
+
+/// The UDP header.
+const UDP_HEADER: usize = 8;
+
+/// The largest reply payload the interface can carry to the guest in one packet
+/// over `destination`'s family: the MTU less that family's IP header and the
+/// UDP header.
+///
+/// Neither IPv4 nor IPv6 fragmentation is compiled in, so this is a hard
+/// ceiling rather than a preference: smoltcp discards a larger packet at egress
+/// and reports nothing, so the relay refuses it here instead.
+fn deliverable(mtu: usize, destination: &IpEndpoint) -> usize {
+    let ip_header = match destination.addr {
+        IpAddress::Ipv4(_) => IPV4_HEADER,
+        IpAddress::Ipv6(_) => IPV6_HEADER,
+    };
+    mtu.saturating_sub(ip_header + UDP_HEADER)
+}
 
 /// The most replies one service pass drains from a single host flow.
 ///
@@ -87,6 +121,8 @@ struct UdpFlow {
 pub(super) struct UdpTables {
     ports: Vec<UdpPort>,
     flows: Vec<UdpFlow>,
+    /// The interface MTU, which sets the reply ceiling; see [`deliverable`].
+    mtu: usize,
     /// The payload bytes each port socket's receive and transmit rings hold,
     /// sized to [`PACKET_SLOTS`] datagrams of one MTU. Fragmentation is not
     /// compiled in, so a datagram never exceeds the MTU; sizing to it rather
@@ -107,6 +143,7 @@ impl UdpTables {
         UdpTables {
             ports: Vec::new(),
             flows: Vec::new(),
+            mtu: usize::from(mtu),
             payload_bytes: PACKET_SLOTS * usize::from(mtu),
             scratch: vec![0u8; MAX_DATAGRAM].into_boxed_slice(),
         }
@@ -220,6 +257,7 @@ impl UdpTables {
         let UdpTables {
             ports,
             flows,
+            mtu,
             scratch,
             ..
         } = self;
@@ -227,13 +265,27 @@ impl UdpTables {
             let Some(port) = ports.iter().find(|port| port.port == flow.destination.port) else {
                 continue;
             };
+            let ceiling = deliverable(*mtu, &flow.destination);
             let socket = sockets.get_mut::<udp::Socket>(port.handle);
             for _ in 0..REPLY_BATCH {
+                // A zero-length read is a zero-length datagram, not end of
+                // stream: a datagram socket has no end of stream, and the drain
+                // ends on `EAGAIN` below. Forwarding it keeps the empty
+                // datagram — a legitimate keep-alive in several protocols —
+                // and, more to the point, keeps the replies queued behind it
+                // from waiting on an unrelated wakeup.
                 match rustix::net::recv(&flow.host, &mut scratch[..], RecvFlags::empty()) {
-                    Ok((0, _)) => break,
                     Ok((len, _)) => {
                         progress = true;
                         flow.last_active = now;
+                        if len > ceiling {
+                            // Larger than one packet, and the stack does not
+                            // fragment: the interface would discard it at
+                            // egress without a word. Drop it here, where the
+                            // ceiling is documented, and carry on draining so
+                            // it does not hold up the replies behind it.
+                            continue;
+                        }
                         // The reply's source is the address the guest
                         // addressed, so it appears to come from there.
                         let meta = udp::UdpMetadata {
@@ -358,9 +410,39 @@ fn connect_host(target: SocketAddr) -> Result<OwnedFd, Errno> {
 
 #[cfg(test)]
 mod tests {
-    use smoltcp::wire::IpAddress;
-
     use super::*;
+
+    /// A connected socket pair standing in for a flow's host side: the first
+    /// end is the flow's, the second plays the host peer.
+    fn host_pair() -> (OwnedFd, OwnedFd) {
+        rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::DGRAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket pair stands in for the host side")
+    }
+
+    /// A flow on port 53 over `host`, the shape the reply drain reads from.
+    fn flow_over(host: OwnedFd) -> UdpFlow {
+        UdpFlow {
+            guest: IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 40_000),
+            destination: IpEndpoint::new(IpAddress::v4(10, 0, 2, 3), 53),
+            host,
+            last_active: Instant::now(),
+            dead: false,
+        }
+    }
+
+    /// Whether the flow's host socket has been drained empty.
+    fn drained(flow: &UdpFlow) -> bool {
+        let mut leftover = [0u8; 8];
+        matches!(
+            rustix::net::recv(&flow.host, &mut leftover, RecvFlags::empty()),
+            Err(Errno::AGAIN)
+        )
+    }
 
     #[test]
     fn a_flow_is_expired_only_after_the_idle_timeout() {
@@ -383,33 +465,83 @@ mod tests {
         let mut sockets = SocketSet::new(Vec::new());
         tables.ensure_port(53, &mut sockets);
 
-        // A connected socket pair stands in for the flow's host side: one end
-        // is the flow's, the other plays the flooding peer.
-        let (flow_side, peer) = rustix::net::socketpair(
-            AddressFamily::UNIX,
-            SocketType::DGRAM,
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            None,
-        )
-        .unwrap();
+        let (flow_side, peer) = host_pair();
         for _ in 0..REPLY_BATCH * 4 {
             rustix::net::send(&peer, b"reply", SendFlags::NOSIGNAL).unwrap();
         }
-        tables.flows.push(UdpFlow {
-            guest: IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 40_000),
-            destination: IpEndpoint::new(IpAddress::v4(10, 0, 2, 3), 53),
-            host: flow_side,
-            last_active: Instant::now(),
-            dead: false,
-        });
+        tables.flows.push(flow_over(flow_side));
 
         assert!(tables.host_to_guest(&mut sockets, Instant::now()));
         let flow = &tables.flows[0];
         assert!(!flow.dead, "a bounded drain is not a flow error");
-        let mut leftover = [0u8; 8];
         assert!(
-            rustix::net::recv(&flow.host, &mut leftover, RecvFlags::empty()).is_ok(),
+            !drained(flow),
             "the pass drained the whole flood instead of stopping",
         );
+    }
+
+    #[test]
+    fn an_empty_reply_does_not_end_the_drain() {
+        // A datagram socket has no end of stream, so a zero-length read is a
+        // zero-length datagram — legitimate in several protocols. Reading it as
+        // the end of the drain would discard it and leave every reply queued
+        // behind it waiting on an unrelated wakeup.
+        let mut tables = UdpTables::new(1500);
+        let mut sockets = SocketSet::new(Vec::new());
+        tables.ensure_port(53, &mut sockets);
+
+        let (flow_side, peer) = host_pair();
+        rustix::net::send(&peer, b"", SendFlags::NOSIGNAL).unwrap();
+        rustix::net::send(&peer, b"answer", SendFlags::NOSIGNAL).unwrap();
+        tables.flows.push(flow_over(flow_side));
+
+        assert!(tables.host_to_guest(&mut sockets, Instant::now()));
+        assert!(drained(&tables.flows[0]), "both datagrams were taken");
+        let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+        assert_eq!(
+            socket.send_queue(),
+            b"answer".len(),
+            "the reply behind the empty datagram reached the guest",
+        );
+    }
+
+    #[test]
+    fn a_reply_past_the_ceiling_is_dropped_where_it_can_be_explained() {
+        // Handing the interface a packet larger than the MTU has it discarded
+        // at egress with no diagnostic, and the drain would carry on believing
+        // it delivered. Dropping it here keeps the behaviour documented and
+        // lets the replies behind it through.
+        let mut tables = UdpTables::new(1500);
+        let mut sockets = SocketSet::new(Vec::new());
+        tables.ensure_port(53, &mut sockets);
+
+        let (flow_side, peer) = host_pair();
+        let oversized =
+            vec![0u8; deliverable(1500, &IpEndpoint::new(IpAddress::v4(10, 0, 2, 3), 53)) + 1];
+        rustix::net::send(&peer, &oversized, SendFlags::NOSIGNAL).unwrap();
+        rustix::net::send(&peer, b"answer", SendFlags::NOSIGNAL).unwrap();
+        tables.flows.push(flow_over(flow_side));
+
+        assert!(tables.host_to_guest(&mut sockets, Instant::now()));
+        assert!(drained(&tables.flows[0]), "both datagrams were taken");
+        let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+        assert_eq!(
+            socket.send_queue(),
+            b"answer".len(),
+            "only the deliverable reply was queued",
+        );
+    }
+
+    #[test]
+    fn the_reply_ceiling_leaves_room_for_each_familys_headers() {
+        // The ceiling is what fits in one packet, so it has to account for the
+        // family's IP header as well as UDP's own.
+        let v4 = IpEndpoint::new(IpAddress::v4(10, 0, 2, 3), 53);
+        let v6 = IpEndpoint::new(IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 0, 3), 53);
+        assert_eq!(deliverable(1500, &v4), 1500 - 20 - 8);
+        assert_eq!(deliverable(1500, &v6), 1500 - 40 - 8);
+        // An MTU below a bare header pair yields no room at all rather than
+        // wrapping; the builder's floor keeps this out of reach in practice.
+        assert_eq!(deliverable(16, &v6), 0);
     }
 }

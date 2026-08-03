@@ -75,6 +75,38 @@ a subordinate id allocation for your user (`usermod --add-subuids
 The tests provision a pinned Alpine minirootfs fixture on first run and cache
 it under `target/`.
 
+### Scratch directories
+
+A test that needs a real filesystem tree takes it from a guard that removes the
+tree when it drops, rather than composing a path under the system temporary
+directory by hand. A directory that only clears itself on the *next* run leaves
+one tree per run behind forever, which a long-lived machine notices.
+
+- **A unit test** inside `crates/ferroday-cage/src` uses
+  `crate::scratch::Scratch`, which dereferences to its `Path`.
+- **An integration test** uses `common::scratch_dir`, which places its trees
+  under `target` so `cargo clean` clears them. `tests/export.rs` carries a guard
+  of its own, because a tree holding subordinate-owned entries has to be removed
+  through `provision::remove` rather than by the calling user.
+
+### Feature-gating a test
+
+Every command above selects all features, so none of them can catch a test that
+uses an API the feature selection it runs under does not provide. A new
+integration test declares what it needs, one of two ways:
+
+- **A whole binary needing a feature** gets a `[[test]]` entry in
+  `crates/ferroday-cage/Cargo.toml` with `required-features`. Cargo then skips
+  the target where the features are absent.
+- **A binary that is only partly feature-dependent** stays out of that list and
+  carries `#[cfg(feature = "...")]` on the imports, helpers, and tests that
+  need one. `tests/debug_rendering.rs` is the worked example: what it asserts
+  about a publication and a removal is part of a featureless build's public
+  API, and gating the whole binary would stop covering it.
+
+The `features` job checks both, so a leak surfaces there rather than in a
+consumer's build.
+
 ## Before opening a pull request
 
 CI runs all of these; running them locally first is faster than a round trip.
@@ -164,9 +196,9 @@ Write in the imperative mood, describing the change in the repository's own
 terms — what the code now does, not what a task list called it. A body
 explaining the reasoning is welcome where the reasoning is not obvious.
 
-## Licence
+## License
 
 The project is dual-licensed under Apache-2.0 and MIT. Unless you state
 otherwise, any contribution you intentionally submit for inclusion, as defined
-in the Apache-2.0 licence, is dual-licensed the same way, with no additional
+in the Apache-2.0 license, is dual-licensed the same way, with no additional
 terms or conditions.

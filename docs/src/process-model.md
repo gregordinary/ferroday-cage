@@ -20,6 +20,11 @@ pidfd for the sandbox's supervisor back to the caller before exiting. With
 the default PID namespace, the supervisor is a minimal init running as
 PID 1 inside the namespace; the command runs as PID 2 beneath it.
 
+Throughout this guide, and in the library's own errors, *the supervisor* is
+that process: the one the returned handle anchors on, kills, and collects the
+command's outcome from. *The launch stage* is the separate, short-lived process
+that built the namespaces.
+
 The init:
 
 - adopts and collects processes orphaned inside the sandbox;
@@ -32,10 +37,10 @@ process remaining in it. The sandbox's lifetime is therefore the command's
 lifetime: a process the command leaves behind cannot outlive the launch,
 and cannot keep [`run`] from returning.
 
-With [`pid_namespace(false)`], there is no init: the launch stage remains
-as a supervisor outside the sandbox, the command shares the host's PID
-space, and the command's descendants are ordinary host processes that can
-outlive it.
+With [`pid_namespace(false)`], there is no init: the command process is itself
+the supervisor, and the launch stage remains outside the sandbox as its parent
+until the outcome arrives. The command shares the host's PID space, and its
+descendants are ordinary host processes that can outlive it.
 
 ## What the command starts with
 

@@ -1,11 +1,20 @@
-//! A read-only tar parser for the formats rootfs tarballs use: POSIX ustar,
-//! GNU, and pax.
+//! A read-only tar parser for POSIX ustar, GNU, pax, and pre-POSIX v7
+//! archives.
 //!
 //! The parser yields entry metadata and streams entry data; it interprets
 //! GNU long-name (`L`)/long-link (`K`) entries and pax extended headers
 //! (`x` per-entry, `g` global) internally, so a consumer only ever sees
 //! concrete file entries with their effective path, link target, size, and
 //! times. Header checksums are verified. Writing is out of scope.
+//!
+//! v7 is a subset rather than a separate format: the first 257 bytes of a
+//! header are laid out identically, and what v7 lacks is everything after them
+//! — the magic, the version, `uname`/`gname`, the device numbers, and the
+//! `prefix`. A v7 header is therefore read as a ustar one whose fields beyond
+//! 257 are absent. It is worth reading because the archives a caller hands this
+//! parser are no longer only rootfs tarballs, which contemporary tooling
+//! produces: an upstream release tarball was produced by whoever released the
+//! software, on whatever machine, in whatever year.
 
 use std::io::Read;
 
@@ -67,6 +76,8 @@ struct PaxRecords {
     link_target: Option<Vec<u8>>,
     size: Option<u64>,
     mtime: Option<i64>,
+    uid: Option<u32>,
+    gid: Option<u32>,
 }
 
 impl PaxRecords {
@@ -81,6 +92,8 @@ impl PaxRecords {
                 .or_else(|| self.link_target.clone()),
             size: other.size.or(self.size),
             mtime: other.mtime.or(self.mtime),
+            uid: other.uid.or(self.uid),
+            gid: other.gid.or(self.gid),
         }
     }
 }
@@ -88,7 +101,7 @@ impl PaxRecords {
 /// Reasons a header block is rejected.
 #[derive(Debug, PartialEq, Eq)]
 enum HeaderFlaw {
-    Magic,
+    NotATarHeader,
     Checksum,
     Numeric,
 }
@@ -96,7 +109,10 @@ enum HeaderFlaw {
 impl HeaderFlaw {
     fn describe(&self) -> &'static str {
         match self {
-            HeaderFlaw::Magic => "the header magic is neither ustar nor GNU",
+            HeaderFlaw::NotATarHeader => {
+                "the block is not a tar header: it carries no ustar or GNU magic \
+                 and its checksum does not match"
+            }
             HeaderFlaw::Checksum => "the header checksum does not match",
             HeaderFlaw::Numeric => "a numeric header field is not octal or base-256",
         }
@@ -233,6 +249,12 @@ impl<R: Read> TarReader<R> {
                     if let Some(mtime) = pax.mtime {
                         entry.mtime = mtime;
                     }
+                    if let Some(uid) = pax.uid {
+                        entry.uid = uid;
+                    }
+                    if let Some(gid) = pax.gid {
+                        entry.gid = gid;
+                    }
                     return Ok(Some(entry));
                 }
             }
@@ -363,20 +385,30 @@ fn trim_trailing_nuls(bytes: &mut Vec<u8>) {
 
 /// Parses a 512-byte header block into an [`Entry`].
 fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
-    // Magic: POSIX writes "ustar\0" + version "00"; GNU writes
-    // "ustar " + " \0". Anything else — including pre-POSIX v7 archives,
-    // which have no magic — is rejected.
+    // Magic: POSIX writes "ustar\0" + version "00"; GNU writes "ustar " +
+    // " \0". A v7 header has neither, those bytes being part of its unused
+    // tail, so the magic no longer decides whether a block is accepted — it
+    // decides only whether the fields beyond byte 257 are there to read.
     let posix = &block[257..263] == b"ustar\0";
     let gnu = &block[257..263] == b"ustar ";
-    if !posix && !gnu {
-        return Err(HeaderFlaw::Magic);
-    }
 
-    verify_checksum(block)?;
+    // The checksum runs first, and with v7 accepted it is the only thing
+    // separating a header from arbitrary bytes. That makes the two failures
+    // worth telling apart: magic present and checksum wrong is a corrupt tar
+    // header, while neither present is a file that is very likely not a tar at
+    // all — a diagnostic worth keeping, since it is the one a caller who
+    // pointed the parser at the wrong file needs.
+    if verify_checksum(block).is_err() {
+        return Err(if posix || gnu {
+            HeaderFlaw::Checksum
+        } else {
+            HeaderFlaw::NotATarHeader
+        });
+    }
 
     let mut path = field_bytes(&block[0..100]).to_vec();
     // The POSIX prefix field extends the name; GNU reuses those bytes for
-    // other purposes.
+    // other purposes, and v7 has no such field at all.
     if posix {
         let prefix = field_bytes(&block[345..500]);
         if !prefix.is_empty() {
@@ -388,15 +420,27 @@ fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
     }
 
     let mode = numeric_field(&block[100..108])? as u32;
-    let uid = numeric_field(&block[108..116])? as u32;
-    let gid = numeric_field(&block[116..124])? as u32;
+    // An id is unsigned. The base-256 form is two's complement and can carry a
+    // negative value, which `as u32` would wrap into a plausible-looking id;
+    // refusing it keeps a malformed header from silently assigning ownership.
+    let uid = id_field(&block[108..116])?;
+    let gid = id_field(&block[116..124])?;
     let size = u64::try_from(numeric_field(&block[124..136])?).map_err(|_| HeaderFlaw::Numeric)?;
     let mtime = numeric_field(&block[136..148])?;
-    let typeflag = match block[156] {
+    let mut typeflag = match block[156] {
         // An old (v7-style) NUL typeflag is a regular file.
         0 => b'0',
         flag => flag,
     };
+    // A trailing slash marks a directory, whatever the typeflag says. The
+    // oldest archives predate a reliably-set typeflag and mark a directory this
+    // way and no other; both GNU tar's own `--format=v7` output and the archive
+    // that prompted this do set `5`, so it may never fire. It is safe to apply
+    // to every format, a regular file having no business with a name that ends
+    // in a separator.
+    if typeflag == b'0' && path.last() == Some(&b'/') {
+        typeflag = b'5';
+    }
     let link_target = field_bytes(&block[157..257]).to_vec();
 
     Ok(Entry {
@@ -463,6 +507,13 @@ fn numeric_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
     Ok(value)
 }
 
+/// Decodes a numeric header field as a user or group id: the same decoding as
+/// [`numeric_field`], refusing a negative value rather than wrapping it into an
+/// unrelated id.
+fn id_field(field: &[u8]) -> Result<u32, HeaderFlaw> {
+    u32::try_from(numeric_field(field)?).map_err(|_| HeaderFlaw::Numeric)
+}
+
 /// Decodes a GNU base-256 numeric field: big-endian two's complement with
 /// the top bit of the first byte as the format flag.
 fn base256_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
@@ -525,15 +576,41 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
                 }
                 records.size = Some(size);
             }
+            // GNU tar writes these whenever an id will not fit the header's
+            // octal field, so an archive of a tree with high ids carries its
+            // ownership here and nowhere else. Ignoring them while reporting
+            // the header's ids as meaningful yields silently wrong ownership.
+            b"uid" | b"gid" => {
+                let id: u32 = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("a pax uid or gid record is not a decimal id")?;
+                if key == b"uid" {
+                    records.uid = Some(id);
+                } else {
+                    records.gid = Some(id);
+                }
+            }
             b"mtime" => {
-                // Pax times may carry fractional seconds; the integer part
-                // is what extraction applies.
+                // Pax times may carry fractional seconds; whole seconds are
+                // what extraction applies. The fraction floors rather than
+                // truncates toward zero, as GNU tar does: `-1.5` is the instant
+                // between `-2` and `-1`, so the second containing it is `-2`.
                 let text =
                     std::str::from_utf8(value).map_err(|_| "a pax mtime record is not ASCII")?;
-                let whole = text.split('.').next().unwrap_or(text);
-                let mtime = whole
+                let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+                let seconds: i64 = whole
                     .parse()
                     .map_err(|_| "a pax mtime record is not numeric")?;
+                let negative_fraction =
+                    whole.starts_with('-') && fraction.bytes().any(|b| b != b'0');
+                let mtime = if negative_fraction {
+                    seconds
+                        .checked_sub(1)
+                        .ok_or("a pax mtime record is out of range")?
+                } else {
+                    seconds
+                };
                 records.mtime = Some(mtime);
             }
             _ => {}
@@ -592,6 +669,51 @@ mod tests {
         let records = parse_pax(data_ok).unwrap();
         assert!(records.path.is_none());
         assert!(records.size.is_none());
+        // `gname` is not ownership the extractor can act on; `uid` is.
+        assert_eq!(records.uid, Some(1000));
+    }
+
+    #[test]
+    fn a_fractional_pax_mtime_floors() {
+        // Whole seconds are what extraction applies, and the fraction floors as
+        // GNU tar's does: `-1.5` names an instant inside the second `-2`, not
+        // inside `-1`.
+        assert_eq!(
+            parse_pax(b"23 mtime=1720000000.25\n").unwrap().mtime,
+            Some(1_720_000_000)
+        );
+        assert_eq!(parse_pax(b"14 mtime=-1.5\n").unwrap().mtime, Some(-2));
+        // A zero fraction is not a fraction, in either direction.
+        assert_eq!(parse_pax(b"14 mtime=-1.0\n").unwrap().mtime, Some(-1));
+        assert_eq!(parse_pax(b"12 mtime=-1\n").unwrap().mtime, Some(-1));
+    }
+
+    #[test]
+    fn pax_ownership_records_are_read() {
+        // GNU tar writes these whenever an id will not fit the header's octal
+        // field, so an archive of a tree with high ids carries its ownership
+        // here and nowhere else.
+        let records = parse_pax(b"14 uid=888888\n14 gid=999999\n").unwrap();
+        assert_eq!(records.uid, Some(888_888));
+        assert_eq!(records.gid, Some(999_999));
+        // An id that is not a plain decimal is a malformed archive, not a
+        // record to skip: skipping would fall back on the header's octal field,
+        // which is exactly the value the record exists to correct.
+        assert!(parse_pax(b"13 uid=-1000\n").is_err());
+        assert!(parse_pax(b"12 gid=zzzz\n").is_err());
+    }
+
+    #[test]
+    fn a_negative_id_field_is_refused_rather_than_wrapped() {
+        // The base-256 form is two's complement. Casting a negative value to
+        // `u32` would produce a plausible-looking id — `-1` becomes 4294967295,
+        // the kernel's overflow id — and assign ownership from a malformed
+        // header without a word.
+        let field = [0xffu8; 8];
+        assert_eq!(numeric_field(&field).unwrap(), -1);
+        assert!(id_field(&field).is_err());
+        // The ordinary octal form still decodes.
+        assert_eq!(id_field(b"0001750\0").unwrap(), 0o1750);
     }
 
     #[test]
@@ -662,5 +784,61 @@ mod tests {
         checksum(&mut block);
         let entry = parse_header(&block).unwrap();
         assert_eq!(entry.path, &b"file.txt"[..]);
+    }
+
+    /// A v7 header block: the ustar one with everything past byte 257 cleared,
+    /// which is exactly what the format is.
+    fn v7_header(name: &[u8]) -> [u8; BLOCK as usize] {
+        let mut block = ustar_header(name, b"");
+        block[257..].fill(0);
+        checksum(&mut block);
+        block
+    }
+
+    #[test]
+    fn a_v7_header_parses_without_magic() {
+        let entry = parse_header(&v7_header(b"file.txt")).unwrap();
+        assert_eq!(entry.path, &b"file.txt"[..]);
+        assert_eq!(entry.typeflag, b'0');
+        assert_eq!(entry.mode, 0o644);
+    }
+
+    #[test]
+    fn a_v7_header_never_reads_a_prefix() {
+        // The bytes a ustar header gives the prefix are not a field in v7 at
+        // all. Whatever an old writer left in them stays out of the path.
+        let mut block = v7_header(b"file.txt");
+        block[345..357].copy_from_slice(b"not-a-prefix");
+        checksum(&mut block);
+        let entry = parse_header(&block).unwrap();
+        assert_eq!(entry.path, &b"file.txt"[..]);
+    }
+
+    #[test]
+    fn a_v7_name_ending_in_a_separator_is_a_directory() {
+        // The convention the oldest writers used in place of a typeflag. GNU
+        // tar's own `--format=v7` output sets `5` as well, so this is the
+        // belt to that archive's braces.
+        let entry = parse_header(&v7_header(b"olddir/")).unwrap();
+        assert_eq!(entry.typeflag, b'5');
+    }
+
+    #[test]
+    fn a_block_with_neither_magic_nor_a_valid_checksum_is_not_a_tar_header() {
+        // With v7 accepted the checksum is the only thing separating a header
+        // from arbitrary bytes, and the diagnostic has to stay useful to
+        // whoever pointed the parser at the wrong file.
+        let mut block = v7_header(b"file.txt");
+        block[0] = b'X'; // after the checksum was written, so it no longer matches
+        assert_eq!(parse_header(&block).unwrap_err(), HeaderFlaw::NotATarHeader);
+    }
+
+    #[test]
+    fn a_corrupt_ustar_header_reads_as_corrupt_rather_than_as_not_a_tar() {
+        // Magic present says this was meant to be a tar header, so the report
+        // is about the header rather than about the file.
+        let mut block = ustar_header(b"file.txt", b"");
+        block[0] = b'X';
+        assert_eq!(parse_header(&block).unwrap_err(), HeaderFlaw::Checksum);
     }
 }

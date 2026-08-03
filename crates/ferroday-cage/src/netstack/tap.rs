@@ -167,10 +167,13 @@ impl Step {
 }
 
 /// The interface-request views below mirror `struct ifreq`: the 16-byte
-/// interface name, then one member of the request union, padded to the
-/// kernel's 40-byte size. The ioctls copy `size_of` bytes of the request
-/// type; a layout that drifts from the kernel's must fail the build, not
-/// misissue the ioctl.
+/// interface name, then one member of the request union, padded to a fixed
+/// 40 bytes. That is the kernel's own size on 64-bit targets; on 32-bit ones
+/// `struct ifreq` is 32 bytes and the trailing padding simply goes unread,
+/// since each ioctl copies its own size and every member used here lies within
+/// the first 32. What must not drift is a member's offset, which the size
+/// assertions pin along with the overall layout: a mismatch has to fail the
+/// build rather than misissue the ioctl.
 #[repr(C)]
 struct IfreqFlags {
     name: [u8; 16],
@@ -553,7 +556,9 @@ fn step_error(step: Step, errno: i32, plan: &Plan) -> NetStackError {
         Step::OpenInet6 => configure("opening the IPv6 configuration socket"),
         Step::SetV6Addr => configure("assigning the IPv6 address"),
         Step::AddV6Route => configure("adding the IPv6 default route"),
-        Step::SendTap => configure("sending the tap descriptor back"),
+        // Not a configuration failure: the interface is built and working, and
+        // only the handoff of its descriptor failed.
+        Step::SendTap => NetStackError::TapHandoff { errno },
     }
 }
 

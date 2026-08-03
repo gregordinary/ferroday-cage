@@ -66,7 +66,7 @@
 //! still name the bytes that `Release` described, however many publishes land
 //! while it works.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
@@ -77,7 +77,7 @@ use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
 use super::index::parse_stanzas;
-use super::{DebianError, arch, deb, staging_path, version, write_atomically};
+use super::{DebianError, arch, deb, release, staging_path, version, write_atomically};
 
 /// A trusted local package pool, configured then published to.
 ///
@@ -88,6 +88,14 @@ use super::{DebianError, arch, deb, staging_path, version, write_atomically};
 /// `dists/<suite>/<component>/binary-<architecture>/Packages` (with its `.gz`)
 /// and `dists/<suite>/Release` are regenerated to describe the pool's current
 /// contents.
+///
+/// A suite accumulates. Its `Release` describes every component and
+/// architecture the suite holds, not the one publish that wrote it, so a
+/// pipeline that publishes several components into one suite — or one component
+/// for several architectures — can reach all of them. Each publish rescans the
+/// suite and rewrites the release from what it finds, so
+/// [`component`](Self::component) and [`architecture`](Self::architecture)
+/// select what this call writes rather than what the suite offers.
 ///
 /// The pool owns its layout, and reports it rather than leaving a caller to
 /// rebuild it: [`mirror_url`](Self::mirror_url) is the URL that declares the
@@ -108,24 +116,36 @@ use super::{DebianError, arch, deb, staging_path, version, write_atomically};
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct Pool {
     dir: PathBuf,
     suite: Option<String>,
     component: String,
     architecture: Option<String>,
+    date: Option<i64>,
+    origin: Option<String>,
+    label: Option<String>,
+    description: Option<String>,
 }
 
 impl Pool {
     /// Returns a pool rooted at `dir`.
     ///
-    /// The component defaults to `main` and the architecture to the host's;
-    /// the suite has no default and must be set.
+    /// The component defaults to `main`, the architecture to the host's, and
+    /// the publication date to the time of the publish; the suite has no
+    /// default and must be set. The release's identity fields — `Origin`,
+    /// `Label`, and `Description` — have no default and are emitted only when
+    /// set.
     pub fn at(dir: impl AsRef<Path>) -> Pool {
         Pool {
             dir: dir.as_ref().to_path_buf(),
             suite: None,
             component: "main".to_string(),
             architecture: None,
+            date: None,
+            origin: None,
+            label: None,
+            description: None,
         }
     }
 
@@ -133,20 +153,101 @@ impl Pool {
     ///
     /// The emitted `Release` declares it as both `Suite` and `Codename`, so a
     /// repository declaration naming either matches.
+    ///
+    /// A suite may name a subtree: `dists/<suite>` is a path rather than a
+    /// single directory name, which is how Debian's security archive published
+    /// `buster/updates` for years and why apt accepts a slashed suite in a
+    /// `sources.list` entry. A suite that would write outside the pool is
+    /// refused; see [`publish`](Self::publish).
     pub fn suite(mut self, suite: impl Into<String>) -> Pool {
         self.suite = Some(suite.into());
         self
     }
 
-    /// Sets the archive component. The default is `main`.
+    /// Sets the archive component this publish writes into. The default is
+    /// `main`.
+    ///
+    /// The component selects where this call's packages are indexed, not what
+    /// the suite offers: publishing a second component into one suite adds it,
+    /// and the release goes on describing both.
+    ///
+    /// A component may nest, which is how `main/debian-installer` is laid out.
+    /// It records in `Components` under its full path, since that is the name a
+    /// reader has to ask for to reach it. A component that would write outside
+    /// the suite is refused; see [`publish`](Self::publish).
     pub fn component(mut self, component: impl Into<String>) -> Pool {
         self.component = component.into();
         self
     }
 
-    /// Sets the architecture the pool indexes. The default is the host's.
+    /// Sets the architecture this publish indexes. The default is the host's.
+    ///
+    /// As with the component, this selects what the call writes rather than what
+    /// the suite offers: publishing a second architecture into one suite adds
+    /// it, and the release goes on describing both.
+    ///
+    /// An architecture is always a single path segment, so unlike the suite and
+    /// the component it may not contain a slash.
     pub fn architecture(mut self, architecture: impl Into<String>) -> Pool {
         self.architecture = Some(architecture.into());
+        self
+    }
+
+    /// Pins the `Date` the emitted `Release` carries, in Unix seconds. The
+    /// default is the time of the publish.
+    ///
+    /// The release always carries a `Date`, which is what makes its bytes vary
+    /// between two publishes of the same packages. Pinning it makes a publish
+    /// byte-reproducible: the indexes are a function of the package set, and
+    /// the release is then a function of the indexes and this value.
+    ///
+    /// The pinned value is a plain timestamp rather than something read from
+    /// the environment, so a pipeline that pins a build date pins the pool's
+    /// with the same number it gives
+    /// [`Export::clamp_mtime`](crate::provision::Export::clamp_mtime).
+    ///
+    /// Pinning a date does not make the release expire. Expiry is
+    /// `Valid-Until`, which the pool does not write; see
+    /// [`publish`](Self::publish).
+    pub fn date(mut self, epoch: i64) -> Pool {
+        self.date = Some(epoch);
+        self
+    }
+
+    /// Sets the release's `Origin`, naming who produced the archive.
+    ///
+    /// Emitted only when set, and with no default: inventing one would put a
+    /// name in an archive the caller did not choose. It is the field apt's own
+    /// documentation leads with for pinning — `Pin: release o=Example` — and
+    /// the one `apt policy` renders a repository under, so an archive that
+    /// leaves it unset is pinned by suite or codename instead.
+    ///
+    /// Conventionally a short name for the producing organization or build.
+    pub fn origin(mut self, origin: impl Into<String>) -> Pool {
+        self.origin = Some(origin.into());
+        self
+    }
+
+    /// Sets the release's `Label`, a short name for the archive itself.
+    ///
+    /// Emitted only when set. Where [`origin`](Self::origin) names who produced
+    /// the archive, the label names the archive, and pins as `Pin: release
+    /// l=Example`.
+    pub fn label(mut self, label: impl Into<String>) -> Pool {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Sets the release's `Description`, a one-line summary of the archive.
+    ///
+    /// Emitted only when set. It is what a client shows a reader who asks what
+    /// a repository is, and is informational: nothing resolves or pins on it.
+    ///
+    /// One line. A release field ends at a newline, so a value carrying one is
+    /// refused rather than allowed to continue into the release as further
+    /// fields; see [`publish`](Self::publish).
+    pub fn description(mut self, description: impl Into<String>) -> Pool {
+        self.description = Some(description.into());
         self
     }
 
@@ -169,7 +270,8 @@ impl Pool {
     /// # Errors
     ///
     /// Returns [`DebianError::Config`] when no suite was set, or the suite is
-    /// empty.
+    /// one the pool cannot write; [`publish`](Self::publish) lists the shapes
+    /// that are refused.
     pub fn dists_dir(&self) -> Result<PathBuf, DebianError> {
         Ok(self.dir.join("dists").join(self.checked_suite()?))
     }
@@ -184,7 +286,8 @@ impl Pool {
     /// # Errors
     ///
     /// Returns [`DebianError::Config`] when no suite was set, or the suite is
-    /// empty.
+    /// one the pool cannot write; [`publish`](Self::publish) lists the shapes
+    /// that are refused.
     pub fn release_path(&self) -> Result<PathBuf, DebianError> {
         Ok(self.dists_dir()?.join("Release"))
     }
@@ -218,18 +321,15 @@ impl Pool {
         Ok(format!("file://{path}"))
     }
 
-    /// The suite the pool publishes under, the one setting with no default.
+    /// The suite the pool publishes under, the one setting with no default,
+    /// checked as the path it becomes.
     fn checked_suite(&self) -> Result<&str, DebianError> {
         let Some(suite) = self.suite.as_deref() else {
             return Err(DebianError::Config {
                 reason: "no suite was given for the pool".to_string(),
             });
         };
-        if suite.trim().is_empty() {
-            return Err(DebianError::Config {
-                reason: "the pool's suite is empty".to_string(),
-            });
-        }
+        checked_field("suite", suite, Nesting::Nested)?;
         Ok(suite)
     }
 
@@ -269,14 +369,46 @@ impl Pool {
     /// caller that signs its pool signs it again after each publish; see the
     /// module documentation.
     ///
+    /// The `Release` describes the whole suite. After this call's indexes are
+    /// written, the suite is scanned for every `binary-<architecture>` directory
+    /// it holds, and the release names one section per index found, with
+    /// `Architectures` and `Components` as the unions those sections cover. A
+    /// publish therefore adds to what the suite offers instead of replacing it:
+    /// a second architecture or a second component published into one suite
+    /// leaves the first reachable, and republishing one leaves the other's
+    /// sections and digests as they were.
+    ///
+    /// The scan costs the digest of every index in the suite rather than only
+    /// this call's. Indexes are small beside the packages they describe, and the
+    /// scan runs under the same lock the rest of the publish does, so a pipeline
+    /// publishing components in parallel serializes on it exactly as it already
+    /// does.
+    ///
+    /// The `Release` is stamped with the time of the publish, or with the value
+    /// [`date`](Self::date) pinned. It carries no `Valid-Until`, so it never
+    /// expires: a pool stays usable for as long as its packages are wanted,
+    /// however long after the build that wrote it that is.
+    ///
     /// # Errors
     ///
-    /// Returns [`DebianError::Config`] when no suite was set or the suite,
-    /// component, or architecture is empty; [`DebianError::Deb`] for a `.deb`
-    /// that cannot be read, whose architecture belongs in neither this pool nor
-    /// `all`, or that was rewritten into a different package while it was being
-    /// published; and [`DebianError::Io`] for a failure writing or locking the
-    /// pool.
+    /// Returns [`DebianError::Config`] when no suite was set, or when the suite,
+    /// component, or architecture is one the pool cannot write: an empty value,
+    /// one containing whitespace or a control character — neither of which a
+    /// release field can name — or one that would resolve outside the pool
+    /// through a leading `/`, a `..` segment, or an empty or `.` segment. The
+    /// suite and the component may otherwise contain slashes, since both may
+    /// name a subtree; the architecture may not.
+    ///
+    /// [`origin`](Self::origin), [`label`](Self::label), and
+    /// [`description`](Self::description) are free text and take a space, but
+    /// are refused empty or carrying a control character: a release field ends
+    /// at a newline, so a value holding one would continue into the release as
+    /// further fields.
+    ///
+    /// Returns [`DebianError::Deb`] for a `.deb` that cannot be read, whose
+    /// architecture belongs in neither this pool nor `all`, or that was
+    /// rewritten into a different package while it was being published; and
+    /// [`DebianError::Io`] for a failure writing, locking, or scanning the pool.
     pub fn publish<P: AsRef<Path>>(
         &self,
         debs: impl IntoIterator<Item = P>,
@@ -286,18 +418,145 @@ impl Pool {
             Some(architecture) => architecture,
             None => arch::host_architecture(),
         };
+        checked_field("component", &self.component, Nesting::Nested)?;
+        checked_field("architecture", &architecture, Nesting::Single)?;
         for (label, value) in [
-            ("component", self.component.as_str()),
-            ("architecture", architecture.as_str()),
+            ("origin", &self.origin),
+            ("label", &self.label),
+            ("description", &self.description),
         ] {
-            if value.trim().is_empty() {
-                return Err(DebianError::Config {
-                    reason: format!("the pool's {label} is empty"),
-                });
+            if let Some(value) = value.as_deref() {
+                checked_identity(label, value)?;
             }
         }
-        write_pool(&self.dir, debs, suite, &self.component, &architecture)
+        let date = match self.date {
+            Some(pinned) => pinned,
+            // A clock before the epoch stamps the epoch rather than failing:
+            // the field records when the pool was published and gates nothing,
+            // so an odd clock is not a reason to refuse to publish.
+            None => release::now_epoch().unwrap_or(0),
+        };
+        let claims = Claims {
+            suite,
+            date,
+            origin: self.origin.as_deref(),
+            label: self.label.as_deref(),
+            description: self.description.as_deref(),
+        };
+        write_pool(&self.dir, debs, &claims, &self.component, &architecture)
     }
+}
+
+/// What a release says about itself, as distinct from the sections it names.
+///
+/// The sections are scanned from the suite; these come from the [`Pool`] the
+/// publish was configured on, and travel together because every one of them is
+/// emitted at the same point by the same call.
+struct Claims<'a> {
+    suite: &'a str,
+    date: i64,
+    origin: Option<&'a str>,
+    label: Option<&'a str>,
+    description: Option<&'a str>,
+}
+
+/// Checks one of the release's free-text identity fields.
+///
+/// These are neither paths nor lists, so a space is ordinary in them and the
+/// path checks do not apply. What they cannot carry is a line break: a deb822
+/// field ends at a newline, so one embedded in a value would close the field
+/// and let whatever followed be read as further fields of the release. Every
+/// control character is refused rather than newlines alone, since none of them
+/// belongs in a field a client displays.
+///
+/// An empty value is refused too. A field set to nothing is a mistake at the
+/// call site, and the way to have no `Origin` is not to set one.
+fn checked_identity(label: &str, value: &str) -> Result<(), DebianError> {
+    if value.trim().is_empty() {
+        return Err(DebianError::Config {
+            reason: format!("the pool's {label} is empty; leave it unset instead"),
+        });
+    }
+    if value.chars().any(|character| character.is_ascii_control()) {
+        return Err(DebianError::Config {
+            reason: format!(
+                "the pool's {label} {value:?} contains a control character, which would end \
+                 the release field it is written into",
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// How many path segments one of the pool's settings may name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nesting {
+    /// A suite or a component, either of which may name a subtree: Debian's
+    /// security archive published `dists/buster/updates/Release` for years, and
+    /// `main/debian-installer` is a component laid out the same way. An
+    /// interior slash is part of the name rather than a separator to refuse.
+    Nested,
+    /// An architecture, which is always exactly one directory name.
+    Single,
+}
+
+/// Checks one of the pool's settings, each of which becomes a path under the
+/// pool root and a field in the emitted `Release`.
+///
+/// The check refuses a value that would write outside the suite it belongs to,
+/// or that the release format cannot name. It is deliberately narrow: it
+/// refuses traversal rather than the separator, because a slashed suite and a
+/// slashed component are both legitimate layouts and apt reads them.
+///
+/// What is refused, and why each one is not merely unusual:
+///
+/// - An empty or blank value, which names no directory at all.
+/// - A `..` segment, which writes outside the suite, and a leading `/`, which
+///   writes outside the pool. These are the two that make the check worth
+///   having.
+/// - An empty interior or trailing segment, which is a path that does not say
+///   what it means, and the shape a leading `/` would otherwise be caught as.
+/// - A `.` segment, which the filesystem discards, so the directory written
+///   would not be the one the caller spelled and the scanned release would name
+///   a component the caller never asked for.
+/// - Whitespace, which the release format cannot express: `Architectures` and
+///   `Components` are whitespace-delimited lists, so a component named `my
+///   thing` would be read back as two components, neither of them the one that
+///   was published.
+/// - An ASCII control character, for the same reason a newline cannot appear in
+///   a deb822 field without ending it.
+fn checked_field(label: &str, value: &str, nesting: Nesting) -> Result<(), DebianError> {
+    let refuse = |reason: &str| {
+        Err(DebianError::Config {
+            reason: format!("the pool's {label} {value:?} {reason}"),
+        })
+    };
+    if value.trim().is_empty() {
+        return Err(DebianError::Config {
+            reason: format!("the pool's {label} is empty"),
+        });
+    }
+    if value.chars().any(|character| character.is_ascii_control()) {
+        return refuse("contains a control character");
+    }
+    if value.chars().any(char::is_whitespace) {
+        return refuse("contains whitespace, which a release field cannot name");
+    }
+    if value.starts_with('/') {
+        return refuse("is an absolute path, which would write outside the pool");
+    }
+    if nesting == Nesting::Single && value.contains('/') {
+        return refuse("is not a single path segment");
+    }
+    for segment in value.split('/') {
+        match segment {
+            "" => return refuse("has an empty path segment"),
+            "." => return refuse("has a `.` segment"),
+            ".." => return refuse("has a `..` segment, which would write outside the pool"),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Writes the pool's files: the copied `.deb`s, the regenerated `Packages` pair
@@ -315,7 +574,7 @@ impl Pool {
 fn write_pool<P: AsRef<Path>>(
     pool_dir: &Path,
     debs: impl IntoIterator<Item = P>,
-    suite: &str,
+    claims: &Claims<'_>,
     component: &str,
     architecture: &str,
 ) -> Result<(), DebianError> {
@@ -324,7 +583,7 @@ fn write_pool<P: AsRef<Path>>(
     mkdir_all(pool_dir)?;
     let _lock = lock_pool(pool_dir)?;
 
-    let suite_dir = pool_dir.join("dists").join(suite);
+    let suite_dir = pool_dir.join("dists").join(claims.suite);
     let binary_dir = suite_dir
         .join(component)
         .join(format!("binary-{architecture}"));
@@ -381,12 +640,13 @@ fn write_pool<P: AsRef<Path>>(
     // The Release names the section digests, so the provisioner verifies each
     // index against a value the release records. An unsigned pool carries no
     // Valid-Until: it is never freshness-checked.
-    let release = build_release(
-        suite,
-        component,
-        architecture,
-        &[("Packages", &packages_bytes), ("Packages.gz", &packages_gz)],
-    );
+    //
+    // The sections are scanned from the suite rather than taken from this call,
+    // so the release describes everything the suite holds. This call's own
+    // indexes are already on disk by now, so the scan picks them up with the
+    // rest and needs no special case for them.
+    let sections = scan_sections(&suite_dir)?;
+    let release = build_release(claims, &sections);
     write_file(&suite_dir.join("Release"), release.as_bytes())?;
 
     Ok(())
@@ -771,8 +1031,7 @@ fn insert_highest(by_name: &mut BTreeMap<String, Entry>, entry: Entry) {
 /// The pool-relative path a `.deb` is stored at: the conventional
 /// `pool/<component>/<prefix>/<name>/<file>` layout, where the prefix is the
 /// package's first letter (or `lib` plus the fourth letter for a `lib*`
-/// package). The `.deb`'s name encodes the version's epoch colon as `%3a`, and
-/// the same encoded path is what the `Filename` field records, so the file the
+/// package). The same path is what the `Filename` field records, so the file the
 /// resolver fetches is the file written here.
 fn pool_path(component: &str, name: &str, version: &str, architecture: &str) -> String {
     let prefix = if let Some(rest) = name.strip_prefix("lib") {
@@ -780,39 +1039,217 @@ fn pool_path(component: &str, name: &str, version: &str, architecture: &str) -> 
     } else {
         name.chars().next().unwrap_or('_').to_string()
     };
-    let file = format!("{name}_{}_{architecture}.deb", version.replace(':', "%3a"),);
+    let file = format!("{name}_{}_{architecture}.deb", filename_version(version),);
     format!("pool/{component}/{prefix}/{name}/{file}")
 }
 
-/// Builds a `Release` naming each section's size and SHA-256.
+/// The version as an archive file name records it: without the epoch.
+///
+/// Archive convention omits the epoch — `2:1.3-1` is stored as `..._1.3-1_...` —
+/// and an epoch is the only place a Debian version may carry a colon, so
+/// everything up to the first colon is the whole of it. A pool that encoded the
+/// colon instead, as apt's local cache does, would be laid out unlike every
+/// archive a client has seen, and would rest on each of them treating the
+/// `Filename` field as a literal string. Following the convention asks nothing
+/// of the client. A pool holds one version per package, so dropping the epoch
+/// cannot collide.
+fn filename_version(version: &str) -> &str {
+    match version.split_once(':') {
+        Some((epoch, rest)) if !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) => {
+            rest
+        }
+        _ => version,
+    }
+}
+
+/// One index a suite holds, as the `Release` names it.
+struct Section {
+    /// The component the index belongs to: the path between the suite directory
+    /// and the `binary-<architecture>` directory, so a nested component is
+    /// `main/debian-installer` rather than `main`.
+    component: String,
+    /// The architecture the index describes.
+    architecture: String,
+    /// The index's path relative to the suite directory — the name a reader
+    /// resolves against — as `<component>/binary-<architecture>/<file>`.
+    path: String,
+    size: u64,
+    digest: String,
+}
+
+/// Scans a suite directory for every index it holds.
+///
+/// A release names the sections a reader may resolve, and a reader consults it
+/// before it knows which digests to ask for, so a section the release omits is
+/// unreachable however intact it is on disk. Deriving the sections from the
+/// suite rather than from the call that happens to be publishing is what lets
+/// one suite hold several components and architectures: each publish rewrites
+/// the release to describe all of them, including the ones other publishes
+/// wrote.
+///
+/// The walk descends every real directory under the suite until it meets one
+/// named `binary-*`, which is an index directory rather than a component, and
+/// is not descended into. That is what keeps the `by-hash` directory beside an
+/// index from being read as a component: it is only ever reachable through the
+/// `binary-*` directory the walk stops at. A component named `by-hash` in its
+/// own right is an ordinary component and is scanned as one.
+///
+/// A symlinked directory is not descended. The suite is a tree the pool wrote,
+/// so every component in it is a real directory; refusing to follow a link is
+/// what keeps a link planted in the tree from sending the walk out of the pool
+/// or around a loop.
+///
+/// A `binary-*` directory sitting directly in the suite root is skipped. That
+/// is the flat-repository layout, which has no component, and a release has no
+/// way to name a section that belongs to none.
+fn scan_sections(suite_dir: &Path) -> Result<Vec<Section>, DebianError> {
+    let mut sections = Vec::new();
+    // Each entry is a directory to scan and the component path it stands for.
+    // The suite root stands for no component, hence the empty string.
+    let mut pending = vec![(suite_dir.to_path_buf(), String::new())];
+    while let Some((dir, component)) = pending.pop() {
+        let scanning = io_err("scanning the suite for its indexes", &dir);
+        let entries = std::fs::read_dir(&dir).map_err(scanning)?;
+        for entry in entries {
+            let entry = entry.map_err(io_err("scanning the suite for its indexes", &dir))?;
+            let is_dir = entry
+                .file_type()
+                .map_err(io_err("scanning the suite for its indexes", &dir))?
+                .is_dir();
+            // A regular file in a component directory is not an index; an index
+            // is only ever read from inside a `binary-*` directory.
+            if !is_dir {
+                continue;
+            }
+            // A name that is not UTF-8 cannot be spelled in a release, so it
+            // cannot be a component or an architecture this pool describes.
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            match name.strip_prefix("binary-") {
+                Some(architecture) if !architecture.is_empty() && !component.is_empty() => {
+                    read_indexes(&entry.path(), &component, architecture, &mut sections)?;
+                }
+                // `binary-` with no architecture, or one in the suite root.
+                Some(_) => {}
+                None if component.is_empty() => pending.push((entry.path(), name)),
+                None => pending.push((entry.path(), format!("{component}/{name}"))),
+            }
+        }
+    }
+    // The walk order follows the filesystem, so the release is sorted here
+    // instead: two pools holding the same indexes emit the same release.
+    sections.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(sections)
+}
+
+/// Digests the indexes directly inside one `binary-<architecture>` directory.
+///
+/// Only `Packages` and `Packages.gz` are read, so the by-hash copies beside them
+/// are not named a second time: they are the same bytes under their own digests,
+/// and a release names each section once, by its conventional path.
+///
+/// An index that is absent is not named, and neither is one that is not a
+/// regular file, which is not an index whatever else it is. Both are quiet
+/// rather than fatal, because the suite is scanned as it is found and a publish
+/// describes what is there.
+fn read_indexes(
+    binary_dir: &Path,
+    component: &str,
+    architecture: &str,
+    sections: &mut Vec<Section>,
+) -> Result<(), DebianError> {
+    for name in ["Packages", "Packages.gz"] {
+        let path = binary_dir.join(name);
+        if !path.metadata().is_ok_and(|meta| meta.is_file()) {
+            continue;
+        }
+        let digesting = io_err("digesting a pool index", &path);
+        let mut file = File::open(&path).map_err(digesting)?;
+        let (digest, size) =
+            deb::sha256_stream(&mut file).map_err(io_err("digesting a pool index", &path))?;
+        sections.push(Section {
+            component: component.to_string(),
+            architecture: architecture.to_string(),
+            path: format!("{component}/binary-{architecture}/{name}"),
+            size,
+            digest,
+        });
+    }
+    Ok(())
+}
+
+/// Builds a `Release` describing a suite, naming each section's size and
+/// SHA-256.
 ///
 /// The release declares the suite (as both `Suite` and `Codename`, so a request
-/// for either matches), the architecture, and the component, so the
-/// provisioner's release check passes for the pool even when it is empty. It
-/// carries no `Valid-Until`: a trusted pool is never freshness-checked.
+/// for either matches) and, as `Architectures` and `Components`, the unions of
+/// what its sections cover. A suite that holds one component and one
+/// architecture therefore names exactly those, and one that has had several
+/// published into it names them all, so a reader can resolve any of them. Both
+/// lists are sorted, and a nested component records under its full path, which
+/// is the name a reader has to ask for to reach it.
+///
+/// A suite with no indexes at all yields empty lists. A publish cannot produce
+/// one — it writes its own indexes before the scan reads them — so this is the
+/// degenerate case of describing a suite rather than a state the pool reaches.
+///
+/// It is stamped with `Date`, the required field naming when the pool was
+/// published: a reader has no other way to tell how old a snapshot is, and a
+/// client that checks for clock skew has nothing to evaluate without it.
+///
+/// It carries no `Valid-Until`, which is the separate, optional field: a
+/// trusted pool is never freshness-checked, and a release that cannot expire is
+/// what lets a pool outlive the build that wrote it. Stamping the one does not
+/// imply the other — expiry is enforced on `Valid-Until` alone.
+///
+/// `Origin`, `Label`, and `Description` are emitted only where the caller set
+/// them. There is no default for any of the three: an absent optional field is
+/// valid, and inventing one would put a name in an archive its owner did not
+/// choose.
 ///
 /// It declares `Acquire-By-Hash`, directing a reader at the index copy named by
 /// its digest. That copy is immutable, so a reader working from this release
 /// keeps resolving the indexes this release describes however many publishes
 /// land in the meantime.
-fn build_release(
-    suite: &str,
-    component: &str,
-    architecture: &str,
-    sections: &[(&str, &[u8])],
-) -> String {
+fn build_release(claims: &Claims<'_>, sections: &[Section]) -> String {
+    let union = |values: BTreeSet<&str>| values.into_iter().collect::<Vec<&str>>().join(" ");
+    let architectures = union(
+        sections
+            .iter()
+            .map(|section| section.architecture.as_str())
+            .collect(),
+    );
+    let components = union(
+        sections
+            .iter()
+            .map(|section| section.component.as_str())
+            .collect(),
+    );
+
+    // The order the archive's own releases use: who produced it, what it is,
+    // which suite it is, what it holds, when it was made, and what it is for.
     let mut release = String::new();
+    for (field, value) in [("Origin", claims.origin), ("Label", claims.label)] {
+        if let Some(value) = value {
+            release.push_str(&format!("{field}: {value}\n"));
+        }
+    }
+    let suite = claims.suite;
     release.push_str(&format!("Suite: {suite}\n"));
     release.push_str(&format!("Codename: {suite}\n"));
-    release.push_str(&format!("Architectures: {architecture}\n"));
-    release.push_str(&format!("Components: {component}\n"));
+    release.push_str(&format!("Architectures: {architectures}\n"));
+    release.push_str(&format!("Components: {components}\n"));
+    release.push_str(&format!("Date: {}\n", release::format_rfc5322(claims.date)));
+    if let Some(description) = claims.description {
+        release.push_str(&format!("Description: {description}\n"));
+    }
     release.push_str("Acquire-By-Hash: yes\n");
     release.push_str("SHA256:\n");
-    for (name, bytes) in sections {
+    for section in sections {
         release.push_str(&format!(
-            " {} {} {component}/binary-{architecture}/{name}\n",
-            deb::sha256_hex(bytes),
-            bytes.len(),
+            " {} {} {}\n",
+            section.digest, section.size, section.path,
         ));
     }
     release
@@ -837,7 +1274,9 @@ fn split_paragraphs(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current = String::new();
     for line in text.lines() {
-        if line.is_empty() {
+        // Whitespace-only separates paragraphs, as it does for every other
+        // deb822 reader; only a space followed by content continues a field.
+        if line.trim().is_empty() {
             if !current.trim().is_empty() {
                 blocks.push(current.trim_end().to_string());
             }
@@ -890,13 +1329,10 @@ mod tests {
     use std::io::Read;
 
     use super::*;
+    use crate::scratch::Scratch;
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ferroday-cage-pool-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir(tag: &str) -> Scratch {
+        Scratch::new(&format!("pool-{tag}"))
     }
 
     #[test]
@@ -1060,13 +1496,18 @@ mod tests {
             pool_path("main", "libfoo", "1.0", "amd64"),
             "pool/main/libf/libfoo/libfoo_1.0_amd64.deb",
         );
-        // A version epoch's colon is encoded, so the pool path stays a plain
-        // relative path — the same encoding the Filename records, so the file
-        // the resolver fetches is the file written.
+        // The epoch is dropped from the file name, as the archive lays it out,
+        // so a pool is laid out the way every client has already seen and a
+        // colon stays out of a path a web server serves.
         assert_eq!(
             pool_path("main", "tool", "2:1.3-1", "amd64"),
-            "pool/main/t/tool/tool_2%3a1.3-1_amd64.deb",
+            "pool/main/t/tool/tool_1.3-1_amd64.deb",
         );
+        // Only a leading numeric epoch is dropped; a colon anywhere else — which
+        // policy permits only alongside an epoch — is part of the version.
+        assert_eq!(filename_version("1.0-1"), "1.0-1");
+        assert_eq!(filename_version("2:1:3-1"), "1:3-1");
+        assert_eq!(filename_version("weird:1.0"), "weird:1.0");
     }
 
     #[test]
@@ -1101,6 +1542,29 @@ mod tests {
         assert!(by_name["p"].text.ends_with("refreshed"));
     }
 
+    /// A suite's claims with nothing optional set, for the tests that are not
+    /// about the identity fields.
+    fn claims(suite: &str, date: i64) -> Claims<'_> {
+        Claims {
+            suite,
+            date,
+            origin: None,
+            label: None,
+            description: None,
+        }
+    }
+
+    /// A section over `bytes`, as the scan would have found it.
+    fn section(component: &str, architecture: &str, name: &str, bytes: &[u8]) -> Section {
+        Section {
+            component: component.to_string(),
+            architecture: architecture.to_string(),
+            path: format!("{component}/binary-{architecture}/{name}"),
+            size: bytes.len() as u64,
+            digest: deb::sha256_hex(bytes),
+        }
+    }
+
     #[test]
     fn a_release_declares_the_arch_and_component_and_parses_back() {
         // The Release the writer emits must round-trip through the reader's own
@@ -1108,9 +1572,11 @@ mod tests {
         // component — the property that lets a published pool be declared as a
         // repository, empty or not.
         let packages = b"Package: p\nVersion: 1\n";
-        let release = build_release("trixie", "main", "amd64", &[("Packages", packages)]);
-        let parsed =
-            super::super::release::Release::parse(&release).expect("the emitted Release parses");
+        let release = build_release(
+            &claims("trixie", 1_783_760_543),
+            &[section("main", "amd64", "Packages", packages)],
+        );
+        let parsed = release::Release::parse(&release).expect("the emitted Release parses");
         parsed
             .check("trixie", "amd64", &["main".to_string()], false)
             .expect("the Release satisfies the pool's own check");
@@ -1125,5 +1591,402 @@ mod tests {
             parsed.digest("main/binary-amd64/Packages"),
             Some((packages.len() as u64, deb::sha256_hex(packages).as_str())),
         );
+    }
+
+    /// The `Date` a release carries, as the Unix timestamp it names.
+    fn release_date(release: &str) -> i64 {
+        let stanza = parse_stanzas(release)
+            .into_iter()
+            .next()
+            .expect("the release has a stanza");
+        let date = stanza.get("Date").expect("the release carries a Date");
+        release::parse_rfc5322(date).expect("the Date parses as an RFC 5322 date")
+    }
+
+    #[test]
+    fn a_release_is_stamped_with_the_date_it_was_published() {
+        // Date is a required field of a Release, and the field a client reads
+        // to tell how old a snapshot is. It must survive the round trip through
+        // the reader's own parser, since a client that cannot parse it reports
+        // the release as malformed rather than as merely undated.
+        let release = build_release(
+            &claims("trixie", 1_783_760_543),
+            &[section("main", "amd64", "Packages", b"")],
+        );
+        assert!(release.contains("Date: Sat, 11 Jul 2026 09:02:23 UTC\n"));
+        assert_eq!(release_date(&release), 1_783_760_543);
+        // The optional field is the one that expires a release, and the pool
+        // still does not write it: stamping a date must not bound freshness.
+        assert!(
+            !release.contains("Valid-Until"),
+            "a trusted pool's release must not expire",
+        );
+        // Stamping does not disturb the digest list the field sits above.
+        let parsed = release::Release::parse(&release).expect("the stamped Release parses");
+        let empty = deb::sha256_hex(b"");
+        assert_eq!(
+            parsed.digest("main/binary-amd64/Packages"),
+            Some((0, empty.as_str())),
+        );
+    }
+
+    #[test]
+    fn an_empty_pool_is_stamped_too() {
+        // The empty publish is what a pipeline creates up front so a reference
+        // to the pool resolves before anything has been built, which makes it
+        // the first release a bootstrap validates — and the one most likely to
+        // be missed by a stamp applied only where there are packages.
+        let dir = tempdir("empty-date");
+        let pool = Pool::at(&dir).suite("local").date(1_700_000_000);
+        pool.publish::<&Path>([]).expect("the empty publish");
+        let release = std::fs::read_to_string(pool.release_path().unwrap()).unwrap();
+        assert_eq!(release_date(&release), 1_700_000_000);
+    }
+
+    #[test]
+    fn a_pinned_date_makes_a_publish_byte_reproducible() {
+        // The indexes are a function of the package set, so the release is the
+        // only part of a pool that would otherwise vary between two publishes
+        // of the same packages. Pinning the date is what closes that gap for a
+        // caller building a reproducible archive.
+        let dir = tempdir("pinned-date");
+        let pool = Pool::at(&dir).suite("local").date(1_700_000_000);
+        pool.publish::<&Path>([]).expect("the first publish");
+        let first = std::fs::read(pool.release_path().unwrap()).unwrap();
+        pool.publish::<&Path>([]).expect("the second publish");
+        let second = std::fs::read(pool.release_path().unwrap()).unwrap();
+        assert_eq!(first, second, "a pinned publish was not byte-reproducible");
+
+        // Left unpinned, the same pool stamps the clock instead. The two need
+        // not differ — a second publish within the same second stamps the same
+        // date — but the field must be present and current either way.
+        let now = release::now_epoch().expect("the clock is after the epoch");
+        let unpinned = Pool::at(&dir).suite("local");
+        unpinned.publish::<&Path>([]).expect("the unpinned publish");
+        let release = std::fs::read_to_string(unpinned.release_path().unwrap()).unwrap();
+        assert!(
+            (release_date(&release) - now).abs() < 60,
+            "an unpinned publish did not stamp the current time",
+        );
+    }
+
+    /// The section paths a release names, in the order it names them.
+    fn release_sections(release: &str) -> Vec<String> {
+        let stanza = parse_stanzas(release)
+            .into_iter()
+            .next()
+            .expect("the release has a stanza");
+        stanza
+            .get("SHA256")
+            .expect("the release names its sections")
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(2).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn a_suite_holds_every_component_and_architecture_published_into_it() {
+        // A reader consults the release before it knows which digests to ask
+        // for, so a section the release does not name is unreachable however
+        // intact its index is on disk. A second architecture or component
+        // published into one suite therefore has to add to the release rather
+        // than replace what it named, or publishing one silently retires the
+        // other.
+        let dir = tempdir("accumulate");
+        let pool = |component: &str, architecture: &str| {
+            Pool::at(&dir)
+                .suite("local")
+                .component(component)
+                .architecture(architecture)
+                .date(1_700_000_000)
+        };
+        let published = [("main", "amd64"), ("main", "arm64"), ("contrib", "amd64")];
+        for (component, architecture) in published {
+            pool(component, architecture)
+                .publish::<&Path>([])
+                .unwrap_or_else(|err| panic!("publishing {component}/{architecture}: {err}"));
+        }
+
+        let release = std::fs::read_to_string(dir.join("dists/local/Release")).unwrap();
+        // The unions of what the suite holds, each sorted, so two pools holding
+        // the same sections describe themselves identically.
+        assert!(
+            release.contains("Architectures: amd64 arm64\n"),
+            "the release does not offer both architectures: {release}",
+        );
+        assert!(
+            release.contains("Components: contrib main\n"),
+            "the release does not offer both components: {release}",
+        );
+        // Every index on disk is named, both compressions of each.
+        assert_eq!(
+            release_sections(&release),
+            [
+                "contrib/binary-amd64/Packages",
+                "contrib/binary-amd64/Packages.gz",
+                "main/binary-amd64/Packages",
+                "main/binary-amd64/Packages.gz",
+                "main/binary-arm64/Packages",
+                "main/binary-arm64/Packages.gz",
+            ],
+        );
+        // Reachability is what the section list buys, and the reader's own
+        // check is the thing a declared repository has to pass.
+        let parsed = release::Release::parse(&release).expect("the release parses");
+        for (component, architecture) in published {
+            parsed
+                .check("local", architecture, &[component.to_string()], false)
+                .unwrap_or_else(|err| panic!("{component}/{architecture} is unreachable: {err:?}"));
+        }
+    }
+
+    #[test]
+    fn a_nested_component_records_under_its_full_path() {
+        // A component may be laid out as a subtree, which is how
+        // main/debian-installer sits in the archive. The full path is the name
+        // a reader has to ask for, and the reader matches a component by exact
+        // string, so recording only the first segment would name a component
+        // whose index is somewhere the reader will not look.
+        let dir = tempdir("nested-component");
+        let architecture = arch::host_architecture();
+        for component in ["main", "main/debian-installer"] {
+            Pool::at(&dir)
+                .suite("local")
+                .component(component)
+                .date(1_700_000_000)
+                .publish::<&Path>([])
+                .unwrap_or_else(|err| panic!("publishing {component}: {err}"));
+        }
+
+        let release = std::fs::read_to_string(dir.join("dists/local/Release")).unwrap();
+        assert!(
+            release.contains("Components: main main/debian-installer\n"),
+            "the nested component did not record under its full path: {release}",
+        );
+        assert_eq!(
+            release_sections(&release),
+            [
+                format!("main/binary-{architecture}/Packages"),
+                format!("main/binary-{architecture}/Packages.gz"),
+                format!("main/debian-installer/binary-{architecture}/Packages"),
+                format!("main/debian-installer/binary-{architecture}/Packages.gz"),
+            ],
+        );
+        release::Release::parse(&release)
+            .expect("the release parses")
+            .check(
+                "local",
+                &architecture,
+                &["main/debian-installer".to_string()],
+                false,
+            )
+            .expect("the nested component is reachable");
+    }
+
+    #[test]
+    fn a_by_hash_directory_is_not_read_as_a_component() {
+        // by-hash holds a copy of each index under its own digest, and it sits
+        // inside the binary directory rather than beside it. The walk stops at
+        // a binary-* directory, which is what keeps by-hash out of the
+        // component list; a walk that descended past it would name a component
+        // that does not exist and list every index a second time.
+        let dir = tempdir("by-hash-component");
+        let architecture = arch::host_architecture();
+        Pool::at(&dir)
+            .suite("local")
+            .date(1_700_000_000)
+            .publish::<&Path>([])
+            .expect("the publish");
+
+        let by_hash = dir
+            .join("dists/local/main")
+            .join(format!("binary-{architecture}"))
+            .join("by-hash/SHA256");
+        assert!(
+            by_hash.is_dir(),
+            "the publish wrote no by-hash directory for the walk to step over",
+        );
+
+        let release = std::fs::read_to_string(dir.join("dists/local/Release")).unwrap();
+        assert!(
+            release.contains("Components: main\n"),
+            "by-hash was read as a component: {release}",
+        );
+        assert_eq!(
+            release_sections(&release),
+            [
+                format!("main/binary-{architecture}/Packages"),
+                format!("main/binary-{architecture}/Packages.gz"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_field_that_the_pool_cannot_write_is_refused() {
+        // Each of the three settings becomes a path under the pool root and a
+        // field in the release. The check refuses what would resolve outside
+        // the pool, and what the release format cannot name, but not the
+        // separator itself: a slashed suite and a slashed component are both
+        // legitimate layouts.
+        let dir = tempdir("refused-fields");
+        let base = || Pool::at(&dir).suite("local").date(1_700_000_000);
+        let refused = |pool: Pool, field: &str, note: &str| {
+            let reason = pool.publish::<&Path>([]).expect_err(note).to_string();
+            assert!(
+                reason.contains(field),
+                "the refusal of {note} does not name the field: {reason}",
+            );
+        };
+
+        // Traversal, in each field that becomes a path. These are the two that
+        // make the check worth having: both write outside the pool.
+        refused(base().suite("../escape"), "suite", "a climbing suite");
+        refused(
+            base().component("../.."),
+            "component",
+            "a climbing component",
+        );
+        refused(base().architecture(".."), "architecture", "a climbing arch");
+        refused(base().suite("/etc"), "suite", "an absolute suite");
+
+        // A path that does not say what it means.
+        refused(base().component("main//x"), "component", "an empty segment");
+        refused(base().suite("local/"), "suite", "a trailing separator");
+        refused(base().component("./main"), "component", "a `.` segment");
+
+        // Shapes the release format cannot express. Architectures and
+        // Components are whitespace-delimited, so a component with a space in
+        // it reads back as two components, neither of them the published one.
+        refused(
+            base().component("my main"),
+            "component",
+            "a spaced component",
+        );
+        refused(
+            base().suite("a\nSuite: b"),
+            "suite",
+            "a suite with a newline",
+        );
+        refused(base().architecture(""), "architecture", "an empty arch");
+
+        // An architecture is always one directory name; the other two are not.
+        refused(
+            base().architecture("linux/amd64"),
+            "architecture",
+            "a slashed architecture",
+        );
+
+        // The separator itself is legitimate in both fields that may name a
+        // subtree, and neither is caught by the check that refuses traversal.
+        base()
+            .suite("buster/updates")
+            .publish::<&Path>([])
+            .expect("a slashed suite publishes");
+        base()
+            .component("main/debian-installer")
+            .publish::<&Path>([])
+            .expect("a slashed component publishes");
+    }
+
+    #[test]
+    fn the_identity_fields_round_trip_and_are_absent_until_set() {
+        // Origin, Label, and Description are what apt policy renders a
+        // repository under and what `Pin: release o=` selects it by. They have
+        // no default, because inventing one would put a name in an archive its
+        // owner did not choose.
+        let dir = tempdir("identity");
+        let bare = Pool::at(&dir).suite("local").date(1_700_000_000);
+        bare.publish::<&Path>([]).expect("the unnamed publish");
+        let release = std::fs::read_to_string(bare.release_path().unwrap()).unwrap();
+        for field in ["Origin:", "Label:", "Description:"] {
+            assert!(
+                !release.contains(field),
+                "an unset {field} was emitted anyway: {release}",
+            );
+        }
+        // An unnamed release is still a valid one.
+        release::Release::parse(&release).expect("the unnamed release parses");
+
+        let named = Pool::at(&dir)
+            .suite("local")
+            .date(1_700_000_000)
+            .origin("Example")
+            .label("Example build pool")
+            .description("Packages built by the example pipeline");
+        named.publish::<&Path>([]).expect("the named publish");
+        let release = std::fs::read_to_string(named.release_path().unwrap()).unwrap();
+        let stanza = parse_stanzas(&release)
+            .into_iter()
+            .next()
+            .expect("the release has a stanza");
+        assert_eq!(stanza.get("Origin"), Some("Example"));
+        assert_eq!(stanza.get("Label"), Some("Example build pool"));
+        assert_eq!(
+            stanza.get("Description"),
+            Some("Packages built by the example pipeline"),
+        );
+        // The fields are informational, so nothing the reader checks moves.
+        release::Release::parse(&release)
+            .expect("the named release parses")
+            .check(
+                "local",
+                &arch::host_architecture(),
+                &["main".to_string()],
+                false,
+            )
+            .expect("the named release still satisfies the pool's own check");
+    }
+
+    #[test]
+    fn an_identity_field_cannot_end_the_release_field_it_sits_in() {
+        // These are free text, so a space is ordinary in them and the path
+        // checks do not apply. A newline is the one thing they cannot carry: a
+        // deb822 field ends at one, so a value holding it would continue into
+        // the release as fields the caller never wrote -- which for a field
+        // taken from a build description is reachable without anyone meaning
+        // it.
+        let dir = tempdir("identity-refused");
+        let base = || Pool::at(&dir).suite("local").date(1_700_000_000);
+        let refused = |pool: Pool, field: &str, note: &str| {
+            let reason = pool.publish::<&Path>([]).expect_err(note).to_string();
+            assert!(
+                reason.contains(field),
+                "the refusal of {note} does not name the field: {reason}",
+            );
+        };
+        refused(
+            base().origin("Example\nSuite: other"),
+            "origin",
+            "an origin carrying a newline",
+        );
+        refused(
+            base().description("a\tdescription"),
+            "description",
+            "a description carrying a tab",
+        );
+        // A field set to nothing is a mistake at the call site; the way to have
+        // no Origin is not to set one.
+        refused(base().label("   "), "label", "a blank label");
+
+        // Spaces and punctuation are what these fields are for.
+        base()
+            .origin("Example Ltd.")
+            .description("Packages built by CI, for internal use")
+            .publish::<&Path>([])
+            .expect("ordinary free text publishes");
+    }
+
+    #[test]
+    fn the_layout_getters_refuse_the_same_suites_publishing_does() {
+        // dists_dir and release_path join the suite onto the pool root, so a
+        // suite that would climb out has to be refused before it is joined
+        // rather than only when something is published under it.
+        for suite in ["../escape", "/etc", "a//b", "with space"] {
+            let pool = Pool::at("/srv/pool").suite(suite);
+            assert!(
+                pool.dists_dir().is_err() && pool.release_path().is_err(),
+                "the suite {suite:?} was joined onto the pool root",
+            );
+        }
     }
 }

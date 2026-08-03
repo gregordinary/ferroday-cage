@@ -15,7 +15,7 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use super::fetch::{Fetch, FetchError, FetchRequest};
@@ -162,13 +162,10 @@ impl HttpFetch {
         let parsed = parse_http_url(url)?;
         let io = |op: &'static str| move |source: io::Error| FetchError::io(url, op, source);
 
-        let addr = (parsed.host.as_str(), parsed.port)
+        let addrs = (parsed.host.as_str(), parsed.port)
             .to_socket_addrs()
-            .map_err(io("resolving the address"))?
-            .next()
-            .ok_or_else(|| FetchError::url(url, "the host resolved to no addresses"))?;
-        let stream =
-            TcpStream::connect_timeout(&addr, self.connect_timeout).map_err(io("connecting"))?;
+            .map_err(io("resolving the address"))?;
+        let stream = self.connect(url, addrs)?;
         stream
             .set_read_timeout(Some(self.io_timeout))
             .map_err(io("connecting"))?;
@@ -241,11 +238,39 @@ impl HttpFetch {
         Ok(Step::Done)
     }
 
-    /// Enforces the same-host redirect policy: unless cross-host redirects are
-    /// allowed, a redirect must resolve to the same host as the URL it came
-    /// from. A target that does not parse as `http://` is left to the next
-    /// request, which refuses it. Closes the blind, GET-only SSRF an
-    /// unconstrained redirect host would otherwise allow.
+    /// Connects to the first of `addrs` that accepts, in resolver order.
+    ///
+    /// A CDN-fronted mirror resolves to several A and AAAA records, and a host
+    /// whose IPv6 egress is broken — a common CI and container condition — can
+    /// reach only some of them. Trying each address in turn, and reporting the
+    /// last failure only once none is left, keeps a bootstrap working there
+    /// instead of making it depend on the order the resolver returned. The
+    /// connect timeout applies to each attempt, as it does for every client
+    /// that walks a resolved address list.
+    fn connect(
+        &self,
+        url: &str,
+        addrs: impl Iterator<Item = SocketAddr>,
+    ) -> Result<TcpStream, FetchError> {
+        let mut last = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, self.connect_timeout) {
+                Ok(stream) => return Ok(stream),
+                Err(source) => last = Some(source),
+            }
+        }
+        Err(match last {
+            Some(source) => FetchError::io(url, "connecting", source),
+            None => FetchError::url(url, "the host resolved to no addresses"),
+        })
+    }
+
+    /// Enforces the same-origin redirect policy: unless cross-host redirects are
+    /// allowed, a redirect must resolve to the same host *and port* as the URL
+    /// it came from. A target that does not parse as `http://` is left to the
+    /// next request, which refuses it. Closes the blind, GET-only SSRF an
+    /// unconstrained redirect target would otherwise allow — including the port
+    /// scan a same-host, different-port redirect amounts to.
     fn check_redirect_host(&self, from: &str, to: &str) -> Result<(), FetchError> {
         if self.cross_host_redirects {
             return Ok(());
@@ -253,15 +278,15 @@ impl HttpFetch {
         let (Ok(from_url), Ok(to_url)) = (parse_http_url(from), parse_http_url(to)) else {
             return Ok(());
         };
-        if from_url.host.eq_ignore_ascii_case(&to_url.host) {
+        if from_url.host.eq_ignore_ascii_case(&to_url.host) && from_url.port == to_url.port {
             Ok(())
         } else {
             Err(FetchError::url(
                 to,
                 format!(
-                    "redirect to a different host ({}) than {}; \
+                    "redirect to a different host ({}:{}) than {}:{}; \
                      enable cross-host redirects to follow it",
-                    to_url.host, from_url.host
+                    to_url.host, to_url.port, from_url.host, from_url.port
                 ),
             ))
         }
@@ -413,12 +438,20 @@ fn read_status<R: BufRead>(reader: &mut R) -> io::Result<u16> {
 }
 
 /// Reads headers up to the blank separator line.
+///
+/// Only the blank separator ends the section. A stream that ends inside it is
+/// a truncated response — an overloaded backend, a proxy that dropped the
+/// response — and is refused rather than read as a complete section with no
+/// framing, which would deliver an empty body as a successful fetch.
 fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
     let mut headers = Headers::default();
     for _ in 0..MAX_HEADERS {
         let mut line = String::new();
         if read_line_limited(reader, &mut line)? == 0 {
-            return Ok(headers);
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the response ended inside the header section",
+            ));
         }
         let line = line.trim_end();
         if line.is_empty() {
@@ -428,7 +461,21 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
         if let Some((name, value)) = line.split_once(':') {
             let (name, value) = (name.trim(), value.trim());
             if name.eq_ignore_ascii_case("content-length") {
-                headers.content_length = value.parse().ok();
+                // Content-Length is framing, not decoration: a value that does
+                // not parse, or a repeat that contradicts the first, leaves the
+                // body's extent unknown. Reading such a response to end of
+                // stream would turn a truncation into a short, successful body,
+                // so it is refused instead.
+                let length: u64 = value.parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "malformed Content-Length")
+                })?;
+                if headers.content_length.is_some_and(|first| first != length) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the response repeated Content-Length with a different value",
+                    ));
+                }
+                headers.content_length = Some(length);
             } else if name.eq_ignore_ascii_case("transfer-encoding")
                 && value.to_ascii_lowercase().contains("chunked")
             {
@@ -695,8 +742,7 @@ mod tests {
 
     #[test]
     fn file_urls_read_local_paths() {
-        let dir = std::env::temp_dir().join(format!("fcage-http-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::Scratch::new("http");
         let path = dir.join("resource");
         std::fs::write(&path, b"contents").unwrap();
         let url = format!("file://{}", path.display());
@@ -711,7 +757,6 @@ mod tests {
             HttpFetch::new().fetch(&FetchRequest::new(&missing), &mut Vec::new()),
             Err(FetchError::NotFound { .. })
         ));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -735,6 +780,43 @@ mod tests {
         let mut reader = BufReader::new(body.as_bytes());
         let err = read_headers(&mut reader).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_complete_header_section_parses() {
+        let body = "Content-Length: 9\r\nLocation: /elsewhere\r\n\r\nWikipedia";
+        let mut reader = BufReader::new(body.as_bytes());
+        let headers = read_headers(&mut reader).unwrap();
+        assert_eq!(headers.content_length, Some(9));
+        assert_eq!(headers.location.as_deref(), Some("/elsewhere"));
+        assert!(!headers.chunked);
+        // A repeat that agrees with the first is not a contradiction.
+        let mut reader =
+            BufReader::new("Content-Length: 9\r\nContent-Length: 9\r\n\r\n".as_bytes());
+        assert_eq!(read_headers(&mut reader).unwrap().content_length, Some(9));
+    }
+
+    #[test]
+    fn a_truncated_header_section_is_rejected() {
+        // A mirror that sends a status line and closes cleanly must not read as
+        // a complete, unframed response: that would deliver an empty body as a
+        // successful fetch.
+        let mut reader = BufReader::new("Server: mirror\r\n".as_bytes());
+        let err = read_headers(&mut reader).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn an_unusable_content_length_is_rejected() {
+        for body in [
+            "Content-Length: abc\r\n\r\n",                     // not a number
+            "Content-Length: 18446744073709551616\r\n\r\n",    // past u64
+            "Content-Length: 9\r\nContent-Length: 10\r\n\r\n", // contradictory
+        ] {
+            let mut reader = BufReader::new(body.as_bytes());
+            let err = read_headers(&mut reader).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{body:?}");
+        }
     }
 
     #[test]
@@ -774,6 +856,12 @@ mod tests {
         // A redirect to another host is refused: it is the blind SSRF vector.
         assert!(matches!(
             fetch.check_redirect_host(from, "http://169.254.169.254/latest/meta-data"),
+            Err(FetchError::Url { .. })
+        ));
+        // So is another port on the same host, which is the same vector aimed
+        // at whatever else that host is running.
+        assert!(matches!(
+            fetch.check_redirect_host(from, "http://mirror.example:9000/pool/y.deb"),
             Err(FetchError::Url { .. })
         ));
         // Opting in allows the cross-host CDN redirect.

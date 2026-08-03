@@ -752,14 +752,8 @@ fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> DebianErr
 mod tests {
     use super::*;
 
-    fn tempdir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ferroday-cage-bootstrap-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir(tag: &str) -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new(&format!("bootstrap-{tag}"))
     }
 
     /// A signed repository over the given mirror, suite, and components.

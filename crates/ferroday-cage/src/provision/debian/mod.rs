@@ -8,8 +8,11 @@
 //! directly over a pluggable [`Fetch`] transport, and its signature is
 //! verified against an embedded keyring.
 //!
-//! [`Debian::resolve`] reports the resolved package set without downloading,
-//! for previewing a bootstrap or keying a build cache on it,
+//! The read half is reachable on its own. [`Debian::resolve`] reports the
+//! resolved package set without downloading, for previewing a bootstrap or
+//! keying a build cache on it, and [`Debian::available`] reports the names the
+//! configured archives offer at all — the question a resolve cannot answer,
+//! since it reports a closure rather than a catalogue. Beyond the read half,
 //! [`DebianBuilder::pre_configure_overlay`] lays caller configuration into the
 //! rootfs before its maintainer scripts run, and [`Pool`] writes a local
 //! trusted pool a later bootstrap resolves against.
@@ -29,6 +32,7 @@
 //! ```
 
 mod arch;
+mod available;
 mod bootstrap;
 mod deb;
 mod fetch;
@@ -47,16 +51,18 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+pub use arch::{Interpreter, foreign_interpreter};
+pub use available::Available;
 pub use fetch::{Fetch, FetchError, FetchRequest};
 pub use http::HttpFetch;
 pub use index::{Priority, build_depend_names};
 pub use layer::BuildLayer;
-pub use plan::{Plan, PlannedPackage};
+pub use plan::{Plan, PlannedPackage, ResolvedArchive};
 pub use pool::Pool;
 pub use repository::{Repository, RepositoryBuilder};
 
 use super::extract::Extraction;
-use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, io_error};
+use super::{Delegate, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, io_error};
 use crate::IdentityMap;
 use crate::status::ExitStatus;
 use bootstrap::Installable;
@@ -94,10 +100,100 @@ pub struct Debian<'a> {
     /// [`DebianBuilder::base_layer`]. `None` for a full bootstrap; required by
     /// [`Debian::stage_layer`] and [`Debian::resolve_layer`].
     base_layer: Option<PathBuf>,
+    /// A plan to install verbatim in place of resolving, set by
+    /// [`DebianBuilder::plan`]. `None` for an ordinary bootstrap, which
+    /// resolves against the archives.
+    plan: Option<Plan>,
     /// The archive sources, the primary at index zero followed by any
     /// additional repositories, merged into one resolution.
     repositories: Vec<Repository>,
     fetcher: Box<dyn Fetch + 'a>,
+}
+
+/// Refuses a pinned plan that contradicts the rest of the configuration.
+///
+/// A plan describes a resolution that already happened, so a setting shaping a
+/// resolution is a contradiction rather than a refinement, and picking a silent
+/// precedence between the two would produce a rootfs matching neither.
+fn validate_pinned_plan(
+    plan: &Plan,
+    suite: &str,
+    architecture: &str,
+    repositories: usize,
+    base_priority_set: bool,
+    includes: &[String],
+    excludes: &[String],
+) -> Result<(), DebianError> {
+    let contradiction = |reason: String| Err(DebianError::Config { reason });
+    if !includes.is_empty() {
+        return contradiction(
+            "a pinned plan already names every package to install, so include() has nothing \
+             to add; drop one of the two"
+                .to_string(),
+        );
+    }
+    if !excludes.is_empty() {
+        return contradiction(
+            "a pinned plan already names every package to install, so exclude() has nothing \
+             to remove; drop one of the two"
+                .to_string(),
+        );
+    }
+    if base_priority_set {
+        return contradiction(
+            "a pinned plan already names its base system, so base_priority() has no seed to \
+             filter; drop one of the two"
+                .to_string(),
+        );
+    }
+    if plan.suite != suite {
+        return contradiction(format!(
+            "the pinned plan resolves suite {} but the bootstrap is configured for {suite}",
+            plan.suite,
+        ));
+    }
+    if plan.architecture != architecture {
+        return contradiction(format!(
+            "the pinned plan resolves architecture {} but the bootstrap is configured for \
+             {architecture}",
+            plan.architecture,
+        ));
+    }
+    // Each package names the archive it came from as an index, and a pinned
+    // install fetches through the repository at that index, so a plan resolved
+    // against more repositories than are configured has packages with nowhere
+    // to be fetched from.
+    if plan.archives.len() > repositories {
+        return contradiction(format!(
+            "the pinned plan resolved against {} archives but only {repositories} \
+             repositories are configured, so some of its packages name no mirror",
+            plan.archives.len(),
+        ));
+    }
+    Ok(())
+}
+
+impl fmt::Debug for Debian<'_> {
+    /// Renders the bootstrap's settings and its repositories. The fetcher is a
+    /// caller's trait object and renders as its presence rather than its
+    /// contents; each repository names its trust anchor without dumping it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Debian")
+            .field("suite", &self.suite)
+            .field("architecture", &self.architecture)
+            .field("base_priority", &self.base_priority)
+            .field("includes", &self.includes)
+            .field("excludes", &self.excludes)
+            .field("plan", &self.plan)
+            .field("extract_only", &self.extract_only)
+            .field("identity_map", &self.identity_map)
+            .field("cache_dir", &self.cache_dir)
+            .field("overlay", &self.overlay)
+            .field("base_layer", &self.base_layer)
+            .field("repositories", &self.repositories)
+            .field("fetcher", &Delegate("dyn Fetch"))
+            .finish()
+    }
 }
 
 impl<'a> Debian<'a> {
@@ -109,9 +205,10 @@ impl<'a> Debian<'a> {
             mirror: None,
             mirror_fallbacks: Vec::new(),
             components: Vec::new(),
-            base_priority: Priority::Required,
+            base_priority: None,
             includes: Vec::new(),
             excludes: Vec::new(),
+            plan: None,
             extract_only: false,
             identity_map: IdentityMap::Single,
             cache_dir: None,
@@ -160,7 +257,7 @@ impl<'a> Debian<'a> {
         &mut self,
         progress: &mut dyn FnMut(DebianEvent<'_>),
     ) -> Result<Plan, DebianError> {
-        let packages = resolve_packages(
+        let (packages, archives) = resolve_packages(
             self.fetcher.as_mut(),
             &self.repositories,
             &self.architecture,
@@ -169,7 +266,59 @@ impl<'a> Debian<'a> {
             &self.excludes,
             progress,
         )?;
-        Ok(Plan::project(&self.suite, &self.architecture, &packages))
+        Ok(Plan::project(
+            &self.suite,
+            &self.architecture,
+            &packages,
+            &archives,
+        ))
+    }
+
+    /// Reports the names the configured archives offer, resolving nothing.
+    ///
+    /// It fetches and verifies each repository's release and index exactly as a
+    /// resolve does, merges them, and returns the [`Available`] name set.
+    /// Nothing is downloaded, nothing is unpacked, and no closure is computed —
+    /// so it needs neither a `qemu-user` binfmt handler nor an establishable
+    /// identity map, and serves a foreign architecture the host cannot execute.
+    ///
+    /// This is a different question from [`resolve`](Self::resolve), and the
+    /// resolvers cannot stand in for it. A top-level
+    /// [`include`](DebianBuilder::include) naming nothing fails the whole
+    /// resolve, so asking about a batch of names that way answers whether they
+    /// were all there and never which were not; and a transitive dependency
+    /// nothing satisfies is dropped rather than reported, deliberately, since
+    /// dpkg configures with `--force-depends`. Asking here costs one pass over
+    /// the index for any number of names, where a resolve per name re-fetches
+    /// and re-parses it every time.
+    ///
+    /// The builder's [`include`](DebianBuilder::include),
+    /// [`exclude`](DebianBuilder::exclude), and
+    /// [`base_priority`](DebianBuilder::base_priority) settings do not apply:
+    /// they shape a resolution, and this performs none. The suite, the
+    /// architecture, the repositories, and the fetcher are what it reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DebianError`] for a fetch failure, a signature or freshness
+    /// failure, or a release that does not offer the requested suite,
+    /// architecture, or components.
+    pub fn available(&mut self) -> Result<Available, DebianError> {
+        self.available_reporting(&mut |_| {})
+    }
+
+    /// The body of [`available`](Self::available), reporting to `progress`.
+    fn available_reporting(
+        &mut self,
+        progress: &mut dyn FnMut(DebianEvent<'_>),
+    ) -> Result<Available, DebianError> {
+        let (index, _archives) = merged_index(
+            self.fetcher.as_mut(),
+            &self.repositories,
+            &self.architecture,
+            progress,
+        )?;
+        Ok(index.into_available())
     }
 
     /// Resolves the increment a layered build would install over its base,
@@ -213,7 +362,7 @@ impl<'a> Debian<'a> {
         };
         let assume_installed = layer::read_installed_set(base)?;
 
-        let packages = resolve_delta(
+        let (packages, archives) = resolve_delta(
             self.fetcher.as_mut(),
             &self.repositories,
             &self.architecture,
@@ -222,7 +371,12 @@ impl<'a> Debian<'a> {
             &assume_installed,
             progress,
         )?;
-        Ok(Plan::project(&self.suite, &self.architecture, &packages))
+        Ok(Plan::project(
+            &self.suite,
+            &self.architecture,
+            &packages,
+            &archives,
+        ))
     }
 
     /// Stages this provisioner's packages as an increment over the base layer,
@@ -329,7 +483,9 @@ impl<'a> Debian<'a> {
 
         // Resolve the increment against the base's installed set, download it,
         // extract it into the upper, and configure it through the overlay.
-        let packages = resolve_delta(
+        // A staging run installs the increment rather than reporting it, so
+        // the archive state goes to the `Resolved` event and no further.
+        let (packages, _archives) = resolve_delta(
             self.fetcher.as_mut(),
             &self.repositories,
             &self.architecture,
@@ -346,10 +502,11 @@ impl<'a> Debian<'a> {
         if packages.is_empty() {
             return Ok(BuildLayer::new(upper, self.identity_map.clone()));
         }
+        let wanted: Vec<Wanted> = packages.iter().map(Wanted::from_package).collect();
         let installables = acquire_debs(
             self.fetcher.as_mut(),
             &self.repositories,
-            &packages,
+            &wanted,
             &archives_host,
             progress,
             cancelled,
@@ -394,9 +551,13 @@ pub struct DebianBuilder<'a> {
     mirror: Option<String>,
     mirror_fallbacks: Vec<String>,
     components: Vec<String>,
-    base_priority: Priority,
+    /// The base seed's priority floor; `None` until the caller sets one, so a
+    /// plan can refuse an explicit floor without refusing the default.
+    base_priority: Option<Priority>,
     includes: Vec<String>,
     excludes: Vec<String>,
+    /// A previously resolved plan to install verbatim, in place of resolving.
+    plan: Option<Plan>,
     extract_only: bool,
     identity_map: IdentityMap,
     cache_dir: Option<PathBuf>,
@@ -407,6 +568,38 @@ pub struct DebianBuilder<'a> {
     allow_stale: bool,
     repositories: Vec<Repository>,
     fetcher: Option<Box<dyn Fetch + 'a>>,
+}
+
+impl fmt::Debug for DebianBuilder<'_> {
+    /// Renders every setting made so far, including the primary repository's,
+    /// which are held separately until [`build`](Self::build) assembles them.
+    /// The keyring is named by its path rather than read, and the fetcher — a
+    /// caller's trait object — by its presence.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DebianBuilder")
+            .field("suite", &self.suite)
+            .field("architecture", &self.architecture)
+            .field("mirror", &self.mirror)
+            .field("mirror_fallbacks", &self.mirror_fallbacks)
+            .field("components", &self.components)
+            .field("base_priority", &self.base_priority)
+            .field("includes", &self.includes)
+            .field("excludes", &self.excludes)
+            .field("extract_only", &self.extract_only)
+            .field("identity_map", &self.identity_map)
+            .field("cache_dir", &self.cache_dir)
+            .field("overlay", &self.overlay)
+            .field("base_layer", &self.base_layer)
+            .field("keyring_path", &self.keyring_path)
+            .field("trust_unsigned", &self.trust_unsigned)
+            .field("allow_stale", &self.allow_stale)
+            .field("repositories", &self.repositories)
+            .field(
+                "fetcher",
+                &self.fetcher.as_ref().map(|_| Delegate("dyn Fetch")),
+            )
+            .finish()
+    }
 }
 
 impl<'a> DebianBuilder<'a> {
@@ -431,7 +624,8 @@ impl<'a> DebianBuilder<'a> {
     }
 
     /// Adds a backstop URL for the primary mirror, tried in order after it when
-    /// a fetch reports the resource missing or fails at the transport.
+    /// a fetch reports the resource missing, fails at the transport, or is
+    /// answered with an unsuccessful HTTP status.
     ///
     /// This expresses a live primary mirror with a `snapshot.debian.org`
     /// fallback for a version that has rotated off the live pool. The fallback
@@ -482,7 +676,7 @@ impl<'a> DebianBuilder<'a> {
     /// [`Priority::Standard`] are not meaningful for a base system: they seed
     /// the bulk of the archive.
     pub fn base_priority(mut self, priority: Priority) -> Self {
-        self.base_priority = priority;
+        self.base_priority = Some(priority);
         self
     }
 
@@ -493,6 +687,53 @@ impl<'a> DebianBuilder<'a> {
         S: Into<String>,
     {
         self.includes.extend(packages.into_iter().map(Into::into));
+        self
+    }
+
+    /// Installs a previously resolved [`Plan`] verbatim, resolving nothing.
+    ///
+    /// The bootstrap fetches exactly the packages the plan records, by the
+    /// digests it records, and never touches a release or a package index. That
+    /// is the whole win: the index is around 9 MB for trixie amd64, and a
+    /// reproduce mode that has already resolved once has no use for a second
+    /// resolution — nor for the divergence when the archive publishes between
+    /// the two.
+    ///
+    /// # The trust model changes
+    ///
+    /// Skipping the release and the index means the package digests no longer
+    /// chain to an archive signature at install time. **The plan becomes the
+    /// trust anchor**: it was archive-verified when it was produced, and
+    /// installing from it asserts that whoever kept it kept it intact. Each
+    /// `.deb` is still verified against the digest the plan records, so a
+    /// tampered mirror is caught; what is no longer checked is that the plan
+    /// itself still describes what the archive says.
+    ///
+    /// That trade is exactly what a reproduce mode wants and exactly what an
+    /// ordinary build should not take, so it is opt-in by construction: a
+    /// builder that sets no plan resolves as it always has, chaining every
+    /// digest to a repository signature.
+    ///
+    /// # Refused combinations
+    ///
+    /// A plan describes a resolution that already happened, so anything that
+    /// would shape a resolution contradicts it and is refused at
+    /// [`build`](Self::build) with [`DebianError::Config`] rather than given a
+    /// silent precedence: [`include`](Self::include), [`exclude`](Self::exclude),
+    /// and [`base_priority`](Self::base_priority). A plan whose suite or
+    /// architecture disagrees with the builder's is refused the same way, as is
+    /// one naming more archives than there are repositories to fetch them from.
+    /// Where the builder names no architecture the plan's is adopted, since a
+    /// plan states which architecture it is for.
+    ///
+    /// Everything that shapes *how* rather than *what* still applies:
+    /// [`cache_dir`](Self::cache_dir), [`identity_map`](Self::identity_map),
+    /// [`pre_configure_overlay`](Self::pre_configure_overlay), the repositories,
+    /// and the fetcher. A package is fetched from the repository its
+    /// [`PlannedPackage::archive`] names, so a reproduce run may point the same
+    /// plan at a snapshot mirror.
+    pub fn plan(mut self, plan: Plan) -> Self {
+        self.plan = Some(plan);
         self
     }
 
@@ -674,7 +915,14 @@ impl<'a> DebianBuilder<'a> {
                 reason: "no suite was given".to_string(),
             });
         }
-        let architecture = self.architecture.unwrap_or_else(arch::host_architecture);
+        // A plan states which architecture it is for, so a builder that names
+        // none adopts it: refusing a plan the caller never contradicted, over a
+        // default the caller never chose, would be a confusing rejection.
+        let architecture = match (&self.architecture, &self.plan) {
+            (Some(architecture), _) => architecture.clone(),
+            (None, Some(plan)) => plan.architecture.clone(),
+            (None, None) => arch::host_architecture(),
+        };
         let keyring = match &self.keyring_path {
             Some(path) => std::fs::read(path).map_err(|source| DebianError::Io {
                 op: "reading the keyring",
@@ -711,12 +959,25 @@ impl<'a> DebianBuilder<'a> {
         repositories.extend(self.repositories);
         repository::validate_distinct_entries(&repositories)?;
 
+        if let Some(plan) = &self.plan {
+            validate_pinned_plan(
+                plan,
+                &self.suite,
+                &architecture,
+                repositories.len(),
+                self.base_priority.is_some(),
+                &self.includes,
+                &self.excludes,
+            )?;
+        }
+
         Ok(Debian {
             suite: self.suite,
             architecture,
-            base_priority: self.base_priority,
+            base_priority: self.base_priority.unwrap_or(Priority::Required),
             includes: self.includes,
             excludes: self.excludes,
+            plan: self.plan,
             extract_only: self.extract_only,
             identity_map: self.identity_map,
             cache_dir: self.cache_dir,
@@ -788,6 +1049,7 @@ impl<'a> Debian<'a> {
             self.base_priority,
             &self.includes,
             &self.excludes,
+            self.plan.as_ref(),
             self.extract_only,
             &self.identity_map,
             self.cache_dir.as_deref(),
@@ -810,6 +1072,17 @@ pub struct Observed<'o, 'a> {
     sink: &'o mut dyn FnMut(DebianEvent<'_>),
 }
 
+impl fmt::Debug for Observed<'_, '_> {
+    /// Renders the bootstrap being observed. The sink is a caller's closure, so
+    /// it renders as its presence rather than its contents.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Observed")
+            .field("debian", &self.debian)
+            .field("sink", &Delegate("dyn FnMut(DebianEvent)"))
+            .finish()
+    }
+}
+
 impl Observed<'_, '_> {
     /// Resolves the install plan, reporting progress. See [`Debian::resolve`].
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
@@ -820,6 +1093,12 @@ impl Observed<'_, '_> {
     /// [`Debian::resolve_layer`].
     pub fn resolve_layer(&mut self) -> Result<Plan, DebianError> {
         self.debian.resolve_layer_reporting(&mut *self.sink)
+    }
+
+    /// Reports the names the archives offer, reporting progress. See
+    /// [`Debian::available`].
+    pub fn available(&mut self) -> Result<Available, DebianError> {
+        self.debian.available_reporting(&mut *self.sink)
     }
 
     /// Stages a layered build's increment, reporting progress. See
@@ -853,6 +1132,7 @@ fn bootstrap_suite(
     base_priority: Priority,
     includes: &[String],
     excludes: &[String],
+    pinned: Option<&Plan>,
     extract_only: bool,
     identity_map: &IdentityMap,
     cache_dir: Option<&Path>,
@@ -878,16 +1158,34 @@ fn bootstrap_suite(
         }
     }
 
-    let packages = resolve_packages(
-        fetcher,
-        repositories,
-        architecture,
-        base_priority,
-        includes,
-        excludes,
-        progress,
-    )
-    .map_err(wrap)?;
+    let packages = match pinned {
+        // A pinned plan is the resolution: the release and the index are never
+        // fetched, which is the whole of what this saves. The plan is reported
+        // as the resolved manifest so an observer sees the same event either
+        // way, and it is reported as it stands rather than re-projected.
+        Some(plan) => {
+            progress(DebianEvent::Resolved { plan });
+            plan.packages.iter().map(Wanted::from_planned).collect()
+        }
+        // A bootstrap installs the plan rather than reporting it, so the archive
+        // state goes to the `Resolved` event and no further.
+        None => {
+            let (packages, _archives) = resolve_packages(
+                fetcher,
+                repositories,
+                architecture,
+                base_priority,
+                includes,
+                excludes,
+                progress,
+            )
+            .map_err(wrap)?;
+            packages
+                .iter()
+                .map(Wanted::from_package)
+                .collect::<Vec<_>>()
+        }
+    };
 
     let archives_host = match cache_dir {
         Some(dir) => dir.to_path_buf(),
@@ -963,8 +1261,8 @@ fn resolve_packages(
     includes: &[String],
     excludes: &[String],
     progress: &mut dyn FnMut(DebianEvent<'_>),
-) -> Result<Vec<Package>, DebianError> {
-    let index = merged_index(fetcher, repositories, architecture, progress)?;
+) -> Result<(Vec<Package>, Vec<ResolvedArchive>), DebianError> {
+    let (index, archives) = merged_index(fetcher, repositories, architecture, progress)?;
 
     progress(DebianEvent::Resolving);
     let mut base = index.base_seed(base_priority);
@@ -972,12 +1270,8 @@ fn resolve_packages(
     let packages =
         resolve::resolve(&index, &base, includes, excludes).map_err(DebianError::from)?;
 
-    Ok(emit_resolved(
-        repositories,
-        architecture,
-        packages,
-        progress,
-    ))
+    let packages = emit_resolved(repositories, architecture, packages, &archives, progress);
+    Ok((packages, archives))
 }
 
 /// Resolves the increment a layered build installs over its base.
@@ -996,19 +1290,15 @@ fn resolve_delta(
     excludes: &[String],
     assume_installed: &HashSet<String>,
     progress: &mut dyn FnMut(DebianEvent<'_>),
-) -> Result<Vec<Package>, DebianError> {
-    let index = merged_index(fetcher, repositories, architecture, progress)?;
+) -> Result<(Vec<Package>, Vec<ResolvedArchive>), DebianError> {
+    let (index, archives) = merged_index(fetcher, repositories, architecture, progress)?;
 
     progress(DebianEvent::Resolving);
     let packages = resolve::resolve_seeded(&index, &[], includes, excludes, assume_installed)
         .map_err(DebianError::from)?;
 
-    Ok(emit_resolved(
-        repositories,
-        architecture,
-        packages,
-        progress,
-    ))
+    let packages = emit_resolved(repositories, architecture, packages, &archives, progress);
+    Ok((packages, archives))
 }
 
 /// Fetches and verifies every repository's release and index and merges them
@@ -1025,12 +1315,15 @@ fn merged_index(
     repositories: &[Repository],
     architecture: &str,
     progress: &mut dyn FnMut(DebianEvent<'_>),
-) -> Result<Index, DebianError> {
+) -> Result<(Index, Vec<ResolvedArchive>), DebianError> {
     // Each repository contributes one text block per component, tagged with the
     // repository's index so the merged index knows where each package came from.
     let mut index_inputs: Vec<(usize, String)> = Vec::new();
+    // The archive state, in repository order, so a package's origin tag indexes
+    // straight into it.
+    let mut archives: Vec<ResolvedArchive> = Vec::new();
     for (origin, repository) in repositories.iter().enumerate() {
-        let release = fetch_release(fetcher, repository, progress)?;
+        let (release, served) = fetch_release(fetcher, repository, progress)?;
         release
             .check(
                 &repository.suite,
@@ -1039,15 +1332,27 @@ fn merged_index(
                 repository.require_fresh(),
             )
             .map_err(DebianError::from)?;
+        archives.push(ResolvedArchive::resolved(
+            served.mirror,
+            repository.suite.clone(),
+            repository.components.clone(),
+            release.sha256().to_string(),
+            release.date().map(str::to_string),
+            release.valid_until().map(str::to_string),
+            served.signed_by,
+        ));
         let text = fetch_index(fetcher, repository, architecture, &release, progress)?;
         index_inputs.push((origin, text));
     }
 
-    Ok(Index::merge(
-        index_inputs
-            .iter()
-            .map(|(origin, text)| (*origin, text.as_str())),
-        architecture,
+    Ok((
+        Index::merge(
+            index_inputs
+                .iter()
+                .map(|(origin, text)| (*origin, text.as_str())),
+            architecture,
+        ),
+        archives,
     ))
 }
 
@@ -1062,12 +1367,13 @@ fn emit_resolved(
     repositories: &[Repository],
     architecture: &str,
     packages: Vec<Package>,
+    archives: &[ResolvedArchive],
     progress: &mut dyn FnMut(DebianEvent<'_>),
 ) -> Vec<Package> {
     let suite = repositories
         .first()
         .map_or("", |repository| repository.suite.as_str());
-    let plan = Plan::project(suite, architecture, &packages);
+    let plan = Plan::project(suite, architecture, &packages, archives);
     progress(DebianEvent::Resolved { plan: &plan });
     packages
 }
@@ -1083,32 +1389,78 @@ fn fetch_release(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
     progress: &mut dyn FnMut(DebianEvent<'_>),
-) -> Result<Release, DebianError> {
+) -> Result<(Release, Served), DebianError> {
     let suite = &repository.suite;
-    let body = match repository.keyring() {
+    let (body, served) = match repository.keyring() {
         None => {
             let suffix = format!("dists/{suite}/Release");
-            let bytes = fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, progress)?;
-            String::from_utf8(bytes).map_err(|_| {
+            let (bytes, mirror) =
+                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, progress)?;
+            let body = String::from_utf8(bytes).map_err(|_| {
                 DebianError::from(release::ReleaseError::Release(
                     "Release is not UTF-8".to_string(),
                 ))
-            })?
+            })?;
+            // Nothing verified it, so no key is named. An empty list is the
+            // record of that, and is not the same as an omitted repository.
+            (
+                body,
+                Served {
+                    mirror,
+                    signed_by: Vec::new(),
+                },
+            )
         }
         Some(keyring_bytes) => {
             let suffix = format!("dists/{suite}/InRelease");
-            let bytes = fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, progress)?;
+            let (bytes, mirror) =
+                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, progress)?;
             let keyring = Keyring::parse(keyring_bytes).map_err(DebianError::from)?;
-            keyring
+            let verified = keyring
                 .verify(&bytes, !repository.allow_stale)
-                .map_err(DebianError::from)?
+                .map_err(DebianError::from)?;
+            (
+                verified.body,
+                Served {
+                    mirror,
+                    signed_by: vec![verified.signed_by],
+                },
+            )
         }
     };
-    Release::parse(&body).map_err(DebianError::from)
+    let release = Release::parse(&body).map_err(DebianError::from)?;
+    Ok((release, served))
+}
+
+/// How a repository's release was obtained: which mirror answered, and which
+/// key verified it.
+///
+/// The two facts a [`ResolvedArchive`] needs that the release body does not
+/// itself carry.
+struct Served {
+    /// The mirror that served the release, which is the one the packages are
+    /// fetched from.
+    mirror: String,
+    /// The verifying key's fingerprint, or empty for a trusted-unsigned
+    /// repository.
+    signed_by: Vec<String>,
 }
 
 /// Fetches, verifies, and decompresses a repository's package index for every
 /// component, returning the concatenated text ready to merge.
+///
+/// Components are joined with a blank line between them, because that is what
+/// separates one deb822 paragraph from the next. An index ends with the final
+/// field of its last stanza rather than with a blank line — the archive's own
+/// files and this crate's [`Pool`] alike — so joining them end to end would fold
+/// the first stanza of each component into the last stanza of the one before it,
+/// and every package that stanza named would be lost from the index without any
+/// digest check noticing: each component verified against the release
+/// individually, and only their concatenation was wrong.
+///
+/// A component whose index holds no stanzas contributes nothing and is skipped,
+/// so an empty component — a pool created before the build that fills it — does
+/// not introduce a stray paragraph break.
 fn fetch_index(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
@@ -1126,12 +1478,27 @@ fn fetch_index(
             release,
             progress,
         )?;
-        merged.push_str(&text);
-        if !merged.ends_with('\n') {
-            merged.push('\n');
-        }
+        append_component(&mut merged, &text);
     }
     Ok(merged)
+}
+
+/// Appends one component's index to the merged text, separated from what is
+/// already there by the blank line that ends a deb822 paragraph.
+///
+/// Each index is normalized to end with exactly one newline before the next is
+/// joined on, so the result is well-formed whether a component's file ends with
+/// its last field, with a blank line, or with several. An index holding no
+/// stanzas is skipped rather than contributing an empty paragraph.
+fn append_component(merged: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if !merged.is_empty() {
+        merged.push('\n');
+    }
+    merged.push_str(text.trim_end_matches('\n'));
+    merged.push('\n');
 }
 
 /// Fetches one component's index, walking the repository's mirror list.
@@ -1205,7 +1572,7 @@ fn fetch_from_mirrors(
     mirrors: &[String],
     suffix: &str,
     progress: &mut dyn FnMut(DebianEvent<'_>),
-) -> Result<Vec<u8>, DebianError> {
+) -> Result<(Vec<u8>, String), DebianError> {
     let mut last_missing = None;
     for mirror in mirrors {
         let url = format!(
@@ -1215,7 +1582,11 @@ fn fetch_from_mirrors(
         );
         progress(DebianEvent::Fetching { url: &url });
         match fetch_bytes(fetcher, &url) {
-            Ok(bytes) => return Ok(bytes),
+            // The mirror that answered, not the whole list: a repository with a
+            // snapshot backstop resolves against whichever one served, and a
+            // record naming the list would describe a choice rather than the
+            // choice made.
+            Ok(bytes) => return Ok((bytes, mirror.clone())),
             Err(err) if is_failover(&err) => {
                 last_missing = Some(err);
                 continue;
@@ -1230,13 +1601,26 @@ fn fetch_from_mirrors(
     }))
 }
 
-/// Whether an error is one the mirror walk advances past: a missing resource,
-/// or a transport failure. A digest or signature failure is not — it signals
-/// corruption or tampering and stops the bootstrap.
+/// Whether an error is one the mirror walk advances past: anything saying that
+/// *this* mirror could not serve the resource.
+///
+/// A missing resource, a transport failure, and an unsuccessful HTTP status all
+/// qualify. The status case is the one worth naming: a 503 during an outage or
+/// a CDN's 403 for an absent object is exactly what a second mirror, or a
+/// snapshot backstop, exists to answer, and a walk that stopped there would
+/// fail the bootstrap without trying either. The walk keeps the last such error
+/// and reports it if no mirror answers, so the diagnostic survives.
+///
+/// Two kinds do not advance the walk. A malformed or unsupported URL is the
+/// caller's configuration rather than the mirror's state. A digest or signature
+/// failure signals corruption or tampering, and the answer to that is never to
+/// ask somewhere else.
 fn is_failover(err: &DebianError) -> bool {
     matches!(
         err,
-        DebianError::Fetch(FetchError::NotFound { .. } | FetchError::Io { .. })
+        DebianError::Fetch(
+            FetchError::NotFound { .. } | FetchError::Io { .. } | FetchError::Status { .. }
+        )
     )
 }
 
@@ -1249,7 +1633,7 @@ fn is_failover(err: &DebianError) -> bool {
 fn acquire_debs(
     fetcher: &mut dyn Fetch,
     repositories: &[Repository],
-    packages: &[Package],
+    packages: &[Wanted],
     archives_host: &Path,
     progress: &mut dyn FnMut(DebianEvent<'_>),
     cancelled: &mut dyn FnMut() -> bool,
@@ -1286,7 +1670,7 @@ fn acquire_debs(
                 total: packages.len(),
             });
             let mirrors = &repositories[package.origin].mirrors;
-            let bytes =
+            let (bytes, _mirror) =
                 fetch_from_mirrors(fetcher, mirrors, &package.filename, progress).map_err(wrap)?;
             verify_digest(&package.filename, &bytes, &package.sha256).map_err(wrap)?;
             write_atomically(&dest, &bytes).map_err(|source| {
@@ -1305,6 +1689,48 @@ fn acquire_debs(
         });
     }
     Ok(installables)
+}
+
+/// One `.deb` to acquire: what the download needs and nothing else.
+///
+/// The two sources of an install set project onto this — a fresh resolution's
+/// [`Package`], and a pinned [`Plan`]'s [`PlannedPackage`] — so the download,
+/// the digest check, and the cache reuse are one path whichever produced it.
+struct Wanted {
+    /// The package name, for the progress report and the dpkg install order.
+    name: String,
+    /// The archive-recorded SHA-256, which is both the cache key and the check
+    /// the download is held to.
+    sha256: String,
+    /// The pool path, relative to the mirror root.
+    filename: String,
+    /// Which repository serves it, as an index into the configured list.
+    origin: usize,
+}
+
+impl Wanted {
+    /// Projects a freshly resolved package.
+    fn from_package(package: &Package) -> Wanted {
+        Wanted {
+            name: package.name.clone(),
+            sha256: package.sha256.clone(),
+            filename: package.filename.clone(),
+            origin: package.origin,
+        }
+    }
+
+    /// Projects a package a plan pinned.
+    ///
+    /// The plan's archive index is the repository index, which is what
+    /// [`validate_pinned_plan`] holds the configuration to.
+    fn from_planned(package: &PlannedPackage) -> Wanted {
+        Wanted {
+            name: package.name.clone(),
+            sha256: package.sha256.clone(),
+            filename: package.filename.clone(),
+            origin: package.archive,
+        }
+    }
 }
 
 /// Stage one: lay out the merged-usr farm and every package's files, and
@@ -1739,6 +2165,14 @@ pub enum DebianError {
         /// What was wrong with it.
         reason: String,
     },
+    /// A [`Plan`] document could not be read, or a [`Plan`] could not be
+    /// written as one.
+    #[non_exhaustive]
+    PlanDocument {
+        /// What is wrong with the document, or with the plan that could not be
+        /// rendered as one.
+        reason: String,
+    },
     /// A host I/O operation failed.
     #[non_exhaustive]
     Io {
@@ -1795,6 +2229,9 @@ impl fmt::Display for DebianError {
                     "the .deb {} cannot be published: {reason}",
                     path.display()
                 )
+            }
+            DebianError::PlanDocument { reason } => {
+                write!(f, "the install plan document is not usable: {reason}")
             }
             DebianError::Io { op, path, source } => {
                 write!(
@@ -1853,13 +2290,157 @@ impl From<crate::Error> for DebianError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ferroday-cage-debian-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A transport that refuses the first mirror with a fixed error and serves
+    /// a body from any other, recording every URL it was asked for.
+    struct Failing {
+        primary: String,
+        refusal: fn(&str) -> FetchError,
+        asked: Vec<String>,
+    }
+
+    impl Fetch for Failing {
+        fn fetch(
+            &mut self,
+            request: &FetchRequest<'_>,
+            sink: &mut dyn std::io::Write,
+        ) -> Result<(), FetchError> {
+            self.asked.push(request.url().to_string());
+            if request.url().starts_with(&self.primary) {
+                return Err((self.refusal)(request.url()));
+            }
+            sink.write_all(b"from the backstop")
+                .map_err(|err| FetchError::io(request.url(), "writing the body", err))
+        }
+    }
+
+    /// A transport that serves one fixed body to whatever it is asked for.
+    struct Canned(&'static [u8]);
+
+    impl Fetch for Canned {
+        fn fetch(
+            &mut self,
+            request: &FetchRequest<'_>,
+            sink: &mut dyn std::io::Write,
+        ) -> Result<(), FetchError> {
+            sink.write_all(self.0)
+                .map_err(|err| FetchError::io(request.url(), "writing the body", err))
+        }
+    }
+
+    #[test]
+    fn a_verified_release_reports_the_mirror_the_digest_and_the_signing_key() {
+        // The three facts a plan's archive record carries that the release body
+        // does not itself state, checked against a real Debian release signed by
+        // the embedded keyring. The hermetic repository fixtures are unsigned,
+        // so this is where the signed branch's wiring is proven.
+        const INRELEASE: &[u8] =
+            include_bytes!("../../../tests/fixtures/debian-archive/forky-InRelease");
+        // The repository builder takes a keyring by path, so the embedded one
+        // goes to a file the test owns.
+        let scratch = Scratch::new("release-provenance");
+        let keyring_path = scratch.join("archive-keyring.gpg");
+        std::fs::write(&keyring_path, EMBEDDED_KEYRING).expect("the keyring is writable");
+
+        let repository = Repository::builder("forky")
+            .mirror("https://deb.example/debian")
+            .keyring(&keyring_path)
+            // The fixture is a real release with a real expiry, long past.
+            .allow_stale_release(true)
+            .build()
+            .expect("the repository validates");
+
+        let (release, served) = fetch_release(&mut Canned(INRELEASE), &repository, &mut |_| {})
+            .expect("the embedded keyring verifies a real Debian release");
+
+        assert_eq!(served.mirror, "https://deb.example/debian");
+        assert_eq!(served.signed_by.len(), 1, "{:?}", served.signed_by);
+        assert_eq!(served.signed_by[0].len(), 40, "{:?}", served.signed_by);
+
+        // The digest is over the bytes the signature covered, which is not the
+        // InRelease the transport delivered: the armor and the signature are
+        // around what was verified rather than part of it.
+        let (message, _) = pgp::composed::CleartextSignedMessage::from_armor(INRELEASE)
+            .expect("the fixture is a cleartext-signed document");
+        assert_eq!(
+            release.sha256(),
+            deb::sha256_hex(message.signed_text().as_bytes()),
+        );
+        assert_ne!(release.sha256(), deb::sha256_hex(INRELEASE));
+
+        // And it is a property of those bytes rather than of the fetch, so a
+        // second pass over the same release records the same digest.
+        let (again, _) = fetch_release(&mut Canned(INRELEASE), &repository, &mut |_| {})
+            .expect("the same release verifies again");
+        assert_eq!(release.sha256(), again.sha256());
+
+        assert_eq!(release.date(), Some("Tue, 21 Jul 2026 14:11:47 UTC"));
+        assert_eq!(release.valid_until(), Some("Tue, 28 Jul 2026 14:11:47 UTC"));
+    }
+
+    /// What a mirror walk produced: the body, and the mirror that served it.
+    type Walked = Result<(Vec<u8>, String), DebianError>;
+
+    /// Walks a two-mirror list whose primary answers with `refusal`, returning
+    /// the outcome and the URLs the walk asked for.
+    fn walk_past(refusal: fn(&str) -> FetchError) -> (Walked, Vec<String>) {
+        let mut fetcher = Failing {
+            primary: "https://primary.example".to_string(),
+            refusal,
+            asked: Vec::new(),
+        };
+        let mirrors = [
+            "https://primary.example/debian".to_string(),
+            "https://snapshot.example/debian".to_string(),
+        ];
+        let result =
+            fetch_from_mirrors(&mut fetcher, &mirrors, "dists/stable/Release", &mut |_| {});
+        (result, fetcher.asked)
+    }
+
+    #[test]
+    fn the_mirror_walk_advances_past_a_failing_mirror() {
+        // Every way a mirror can decline to serve is a reason to try the next
+        // one: the backstop exists for precisely the outage a 5xx reports, and
+        // a CDN answers an absent object with 403 as readily as with 404.
+        for refusal in [
+            |url: &str| FetchError::not_found(url),
+            |url: &str| FetchError::status(url, 503),
+            |url: &str| FetchError::status(url, 403),
+            |url: &str| {
+                FetchError::io(
+                    url,
+                    "connecting",
+                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                )
+            },
+        ] {
+            let (result, asked) = walk_past(refusal);
+            let (bytes, mirror) = result.expect("the backstop answers");
+            assert_eq!(bytes, b"from the backstop", "{asked:?}");
+            // And the walk reports the mirror that served, not the one that was
+            // asked first: a plan resolved this way records where its packages
+            // actually come from.
+            assert_eq!(mirror, "https://snapshot.example/debian", "{asked:?}");
+            assert_eq!(asked.len(), 2, "both mirrors were tried: {asked:?}");
+        }
+    }
+
+    #[test]
+    fn the_mirror_walk_stops_at_a_malformed_url() {
+        // A URL the transport cannot parse is the caller's configuration, not
+        // the mirror's state; trying the next mirror would bury the mistake.
+        let (result, asked) = walk_past(|url| FetchError::url(url, "unsupported scheme"));
+        assert!(
+            matches!(result, Err(DebianError::Fetch(FetchError::Url { .. }))),
+            "{asked:?}",
+        );
+        assert_eq!(asked.len(), 1, "the walk stopped at the first mirror");
+    }
+
+    fn tempdir(tag: &str) -> Scratch {
+        Scratch::new(&format!("debian-{tag}"))
     }
 
     #[test]
@@ -1871,7 +2452,7 @@ mod tests {
         let bytes = vec![0xab; 64 * 1024];
         let writers: Vec<_> = (0..8)
             .map(|_| {
-                let dir = dir.clone();
+                let dir = dir.to_path_buf();
                 let bytes = bytes.clone();
                 std::thread::spawn(move || write_atomically(&dir.join("entry.deb"), &bytes))
             })
@@ -1888,7 +2469,6 @@ mod tests {
             .filter(|name| name != "entry.deb")
             .collect();
         assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1907,7 +2487,6 @@ mod tests {
             .filter(|name| name != "entry.deb")
             .collect();
         assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2000,5 +2579,42 @@ mod tests {
         // The primary is element zero; the additional repository follows.
         assert_eq!(debian.repositories[0].mirrors, [DEFAULT_MIRROR]);
         assert_eq!(debian.repositories[1].name.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn components_join_with_a_paragraph_break_between_them() {
+        // An index ends with the last field of its last stanza, not with a
+        // blank line, so joining two components end to end would fold the
+        // second's first stanza into the first's last one. Nothing downstream
+        // would report it: each component verifies against the release on its
+        // own, and only the concatenation is wrong, so the packages that stanza
+        // named simply stop existing.
+        let mut merged = String::new();
+        append_component(&mut merged, "Package: a\nVersion: 1\n");
+        append_component(&mut merged, "Package: b\nVersion: 2\n");
+        assert_eq!(merged, "Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n");
+        let stanzas = index::parse_stanzas(&merged);
+        let names: Vec<_> = stanzas
+            .iter()
+            .filter_map(|stanza| stanza.get("Package"))
+            .collect();
+        assert_eq!(names, ["a", "b"], "a component's stanza was absorbed");
+
+        // The join is the same however a component's own file terminates, so a
+        // producer that does end its index with a blank line -- or with several
+        // -- does not open a gap in the merged text.
+        let mut spaced = String::new();
+        append_component(&mut spaced, "Package: a\nVersion: 1\n\n\n");
+        append_component(&mut spaced, "Package: b\nVersion: 2");
+        assert_eq!(spaced, merged);
+
+        // An empty component contributes nothing, and does not leave a stray
+        // paragraph break behind: a pool declared before the build that fills
+        // it is published empty, and is a component like any other.
+        let mut with_empty = String::new();
+        append_component(&mut with_empty, "");
+        append_component(&mut with_empty, "Package: a\nVersion: 1\n");
+        append_component(&mut with_empty, "   \n");
+        assert_eq!(with_empty, "Package: a\nVersion: 1\n");
     }
 }

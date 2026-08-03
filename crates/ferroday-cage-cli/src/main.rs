@@ -12,9 +12,10 @@
 //!
 //! Not every flag configures a launch. The `--provision-*` family publishes a
 //! rootfs before the command runs, and given without a command provisions and
-//! exits; `--remove-rootfs` deletes a provisioned rootfs and exits, a mode of
-//! its own that accepts no other option. Both carry the library's `provision`
-//! calls to a shell prompt.
+//! exits. `--remove-rootfs` deletes a provisioned rootfs and `--export-rootfs`
+//! writes one to a tar archive, each a mode of its own that accepts no other
+//! option. All three carry the library's `provision` calls to a shell prompt,
+//! which is the whole lifecycle of a rootfs: make it, ship it, delete it.
 //!
 //! The binary is built with every library feature enabled, so any profile the
 //! library accepts loads here, and every capability the builder offers has a
@@ -43,10 +44,11 @@ use serde::Deserialize as _;
 const USAGE: &str = "\
 Run a command inside an unprivileged Linux sandbox.
 
-Usage: fcage [--rootfs DIR | --profile FILE | --restricted-profile FILE | --restrict] [OPTIONS] [--] [COMMAND [ARGS...]]
+Usage: fcage [--rootfs DIR | --overlay-lower DIR | --profile FILE | --restricted-profile FILE | --restrict] [OPTIONS] [--] [COMMAND [ARGS...]]
        fcage --remove-rootfs DIR [--identity-map M]
+       fcage --export-rootfs DIR [--export-to FILE] [--identity-map M] [--clamp-mtime EPOCH]
 
-Options:
+Provisioning the root filesystem:
   --rootfs DIR          Directory to present as the sandbox root filesystem
   --provision-tar FILE  Provision --rootfs from a tar archive (plain, gzip,
                         xz, or zstd) when the directory does not exist yet
@@ -100,6 +102,21 @@ Options:
                         succeeds, so the call is repeatable. Takes no other
                         option: it removes a rootfs rather than running a
                         command in one
+  --export-rootfs DIR   Write the provisioned rootfs at DIR to a tar archive
+                        and exit, preserving the ownership the tree intends
+                        and the extended attributes a host-side 'tar' cannot
+                        read. Give the --identity-map the tree was provisioned
+                        under; the default is 'subordinate'. Takes no other
+                        option: it exports a rootfs rather than running a
+                        command in one
+  --export-to FILE      Where --export-rootfs writes. The default is standard
+                        output, so the archive pipes into a compressor without
+                        a temporary file; writing one to a terminal is refused
+  --clamp-mtime EPOCH   Cap every modification time --export-rootfs records at
+                        EPOCH, a Unix timestamp in seconds. With it the archive
+                        is byte-reproducible given the tree
+
+Profiles, overlays, and mounts:
   --profile FILE        Load a TOML sandbox profile; flags given alongside
                         override its settings, binds and variables extend it,
                         and any [hardening] table it carries takes effect. A
@@ -132,6 +149,8 @@ Options:
                         Mounts apply in the order these flags appear, so a
                         --raw-mount tmpfs followed by --bind flags into it
                         builds a directory the sandbox owns outright
+
+Identity and limits:
   --identity-map M      How the user namespace maps identities: 'single'
                         (default: root inside is you outside, and no other id
                         exists), 'subordinate' (root plus your whole
@@ -150,6 +169,8 @@ Options:
                         Repeatable (e.g. --rlimit processes=64 --rlimit
                         address-space=536870912). RES is one of:
 {rlimit-resources}
+
+The command and its process:
   --path-lookup         Resolve a command with no slash against the sandbox's
                         PATH, the way a shell does
   --setenv NAME VALUE   Set an environment variable for the command
@@ -159,7 +180,10 @@ Options:
   --timeout SECS        Terminate the command after SECS seconds, kill it
                         --kill-after seconds later, and exit 124
   --kill-after SECS     Grace between terminate and kill (default 10)
-  --stop-with-caller    Stop the sandbox when fcage itself exits
+  --stop-with-caller    Stop the sandbox when fcage itself exits (the default;
+                        --no-stop-with-caller leaves it running)
+
+Networking:
   --share-net           Share the host network (default: isolated loopback)
   --deny-net            Isolated network with loopback left down (no
                         connectivity at all, not even 127.0.0.1)
@@ -167,7 +191,8 @@ Options:
                         IPv4 and IPv6 for the isolated network, forwarded over
                         host sockets with no external helper. Composes the
                         sandbox's resolv.conf from the host's usable
-                        nameservers unless --no-resolv-conf is given
+                        nameservers unless --no-resolv-conf or
+                        --no-managed-mounts is given
   --netstack-cidr V4/LEN
                         IPv4 network for --netstack (default 10.0.2.0/24; the
                         gateway is host 2, the guest host 15)
@@ -176,6 +201,8 @@ Options:
                         Map connections to the gateway address onto the host's
                         loopback, to reach a host-local service (off by
                         default; other loopback destinations stay blocked)
+
+Hardening:
   --restrict            Confine the command with Landlock and seccomp only:
                         no namespaces, no root filesystem swap, and paths are
                         host paths. The fallback for hosts without
@@ -216,6 +243,8 @@ Options:
   --drop-caps           Drop every capability from the command
   --keep-caps LIST      Drop every capability except LIST (comma-separated,
                         e.g. net-bind-service,sys-chroot)
+
+Turning off what is on by default:
   --share-pid           Share the host PID namespace (default: isolated)
   --no-proc             Do not mount /proc
   --no-dev              Do not assemble the minimal /dev
@@ -227,12 +256,14 @@ Options:
                         any managed mount a later release adds
   --no-base-env         Give the command exactly the --setenv variables, with
                         no PATH or HOME supplied underneath them
+
+Help and version:
   -h, --help            Print this help
   -V, --version         Print the version
 
 Each toggle has a counterpart to override a profile in the other direction:
 --isolate-net, --pid-ns, --proc, --dev, --tmp, --resolv-conf,
---managed-mounts, --base-env, --no-stop-with-caller, and --no-path-lookup.
+--managed-mounts, --base-env, --stop-with-caller, and --no-path-lookup.
 A profile's [hardening] table composes with the hardening flags:
 --landlock-ro, --landlock-rw, --landlock-bind, and --landlock-connect add
 grants to it, while the seccomp flags, --drop-caps, and --keep-caps replace
@@ -264,6 +295,17 @@ enum Invocation {
     Remove {
         dest: PathBuf,
         map: IdentityMap,
+    },
+    /// Write a provisioned rootfs to a tar archive, under the identity map it
+    /// was written under.
+    Export {
+        source: PathBuf,
+        /// Where the archive goes; standard output when absent.
+        dest: Option<PathBuf>,
+        map: IdentityMap,
+        /// The `SOURCE_DATE_EPOCH` ceiling that makes the archive
+        /// byte-reproducible, when given.
+        clamp_mtime: Option<i64>,
     },
     Help,
     Version,
@@ -360,6 +402,164 @@ fn usage() -> String {
     )
 }
 
+/// The options that belong to the export mode rather than to a launch.
+///
+/// The suggester reads its candidates out of the help, and the help documents
+/// every mode, so a launch would otherwise answer a stray `--export-to` by
+/// suggesting the very flag it had just refused. Naming the mode that owns it is
+/// the useful answer instead. The roster is short and a test pins it, failing if
+/// an entry stops being an export's alone.
+const EXPORT_ONLY_FLAGS: [&str; 2] = ["--export-to", "--clamp-mtime"];
+
+/// The usage error for an option the launch parser does not know, offering the
+/// nearest flag the help documents when one is close.
+///
+/// The message may span two lines: the report, then the suggestion, which
+/// [`main`] prints above its own `Try 'fcage --help'`. Nothing is offered when
+/// nothing is close, so a string that resembles no flag is reported plainly
+/// rather than answered with an arbitrary one.
+fn unrecognized_option(arg: &OsStr) -> String {
+    let given = arg.to_string_lossy();
+    // A `--flag=value` argument names its flag before the `=`; matching the
+    // whole of it would weigh a value against a roster of flags and find
+    // nothing near.
+    let name = flag_name(&given);
+    // A flag of another mode is not a misspelling. Suggesting it would offer
+    // the spelling just refused; naming the mode that accepts it will not.
+    if let Some(owner) = export_only_owner(name) {
+        return format!(
+            "unrecognized option {given}\n{name} is an option of {owner}, which is a mode of \
+             its own.",
+        );
+    }
+    let usage = usage();
+    let candidates: Vec<&str> = documented_flags(&usage)
+        .into_iter()
+        .filter(|flag| export_only_owner(flag).is_none())
+        .collect();
+    match nearest_flag(name, &candidates) {
+        Some(flag) => format!("unrecognized option {given}\nTry 'fcage {flag}'."),
+        None => format!("unrecognized option {given}"),
+    }
+}
+
+/// The flag an argument names: everything before a `=`, so the joined and
+/// separated spellings of one option compare alike.
+fn flag_name(arg: &str) -> &str {
+    arg.split_once('=').map_or(arg, |(name, _)| name)
+}
+
+/// The mode flag that owns `flag`, when `flag` belongs to a mode of its own
+/// rather than to a launch.
+fn export_only_owner(flag: &str) -> Option<&'static str> {
+    EXPORT_ONLY_FLAGS
+        .contains(&flag)
+        .then_some("--export-rootfs")
+}
+
+/// The usage error for an argument a mode's parser does not accept.
+///
+/// A mode takes only its own options, so an unexpected one is usually a launch
+/// flag given to the wrong invocation — reported as the conflict it is. A near
+/// miss of one of the mode's own flags is a misspelling instead, and is answered
+/// like any other: the launch parser's suggestion machinery, over this mode's
+/// vocabulary.
+fn mode_conflict(arg: &OsStr, mode: &str, vocabulary: &[&'static str]) -> String {
+    let given = arg.to_string_lossy();
+    match nearest_flag(flag_name(&given), vocabulary) {
+        Some(flag) => format!("unrecognized option {given}\nTry 'fcage {flag}'."),
+        None => format!("{given} cannot be used with {mode}"),
+    }
+}
+
+/// Every long flag the help text names.
+///
+/// The roster is read out of the help rather than kept beside it, which is what
+/// stops the two from drifting: a flag the help does not name is one the
+/// suggester cannot offer, and that is a gap in the help either way. A second
+/// hand-maintained table would instead fall quietly behind the parser.
+///
+/// Flags named in prose count, not only those introducing an entry, so the
+/// toggles the closing paragraphs list — `--proc`, `--tmp`, and the rest of the
+/// counterparts — can be suggested too. The punctuation the prose wraps them in
+/// is trimmed off.
+///
+/// Two things that look like flags are not. A bare `--` is the end-of-options
+/// separator, and the help names a family as `--landlock-*` or `--no-*`, which
+/// trims to a trailing hyphen. No flag ends in one, so that is what tells them
+/// apart, and neither is a name to suggest.
+fn documented_flags(usage: &str) -> Vec<&str> {
+    let mut flags: Vec<&str> = usage
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        .filter(|token| token.starts_with("--") && token.len() > 2 && !token.ends_with('-'))
+        .collect();
+    flags.sort_unstable();
+    flags.dedup();
+    flags
+}
+
+/// The documented flag nearest `given`, or `None` when none is near enough to
+/// be worth offering.
+///
+/// A candidate qualifies on a small edit distance or on a prefix relationship.
+/// The prefix rule carries the cases the distance bound misses on a long name:
+/// a flag typed short, and one typed with something appended. Ties break on the
+/// flag's own spelling, so the suggestion for a given input never depends on
+/// the order the help happens to list its options in.
+fn nearest_flag<'a>(given: &str, flags: &[&'a str]) -> Option<&'a str> {
+    /// Two edits is a transposition, a doubled letter, or a wrong one — the
+    /// typos worth guessing at. Beyond it a suggestion is noise.
+    const FURTHEST: usize = 2;
+
+    flags
+        .iter()
+        .filter_map(|flag| {
+            let distance = edit_distance(given, flag);
+            // An abbreviation of a flag outranks any small distance: `--net`
+            // names `--netstack`, and answering it with the two-edit `--dev`
+            // is worse than useless. A flag typed with something appended is
+            // the weaker signal — `--seccomp-alow` extends `--seccomp` and
+            // misspells `--seccomp-allow` — so it merely qualifies a
+            // candidate, leaving the distance to choose.
+            let abbreviates = flag.starts_with(given);
+            let extends = given.starts_with(flag);
+            (abbreviates || extends || distance <= FURTHEST).then_some((
+                usize::from(!abbreviates),
+                distance,
+                *flag,
+            ))
+        })
+        .min()
+        .map(|(_, _, flag)| flag)
+}
+
+/// The Levenshtein distance between two strings: the fewest single-character
+/// insertions, deletions, and substitutions that turn one into the other.
+///
+/// Two rows rather than the full matrix, since only the previous one is ever
+/// read. Both inputs are short — a flag and something someone typed instead of
+/// one — so this runs once, against a couple of hundred candidates, on a path
+/// that is about to exit.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    // Row zero: turning an empty prefix of `left` into each prefix of `right`
+    // costs one insertion per character.
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (row, from) in left.chars().enumerate() {
+        current[0] = row + 1;
+        for (column, to) in right.iter().enumerate() {
+            let substitute = previous[column] + usize::from(from != *to);
+            let delete = previous[column + 1] + 1;
+            let insert = current[column] + 1;
+            current[column + 1] = substitute.min(delete).min(insert);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 /// Renders `items` as a comma-separated list, wrapped to the option-help
 /// column and indented to it.
 fn wrapped(items: &[&str]) -> String {
@@ -400,6 +600,12 @@ fn main() -> ExitCode {
         }
         Ok(Invocation::Run(options)) => run(*options),
         Ok(Invocation::Remove { dest, map }) => remove_rootfs(&dest, map),
+        Ok(Invocation::Export {
+            source,
+            dest,
+            map,
+            clamp_mtime,
+        }) => export_rootfs(&source, dest.as_deref(), map, clamp_mtime),
         Err(message) => {
             eprintln!("fcage: {message}");
             eprintln!("Try 'fcage --help' for usage.");
@@ -417,9 +623,24 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     // launch is refused alongside --remove-rootfs by the same `else` that
     // refuses every other one, rather than being silently accepted and then
     // ignored by a removal that never reads it.
-    if args.iter().any(|arg| names_removal(arg)) {
+    //
+    // The scan stops at `--`, since past it every argument belongs to the
+    // command: a tool with an `--export-rootfs` flag of its own must still be
+    // runnable inside a sandbox. Nothing before `--` can belong to the command,
+    // so the flags this finds are fcage's.
+    let configuring = &args[..args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len())];
+    if configuring.iter().any(|arg| names_removal(arg)) {
         return parse_removal(args);
     }
+    if configuring.iter().any(|arg| names_export(arg)) {
+        return parse_export(args);
+    }
+    // Kept for the no-effect check at the end, which asks what was written
+    // rather than what it parsed to.
+    let raw = args.clone();
     let mut args = args.into_iter();
 
     let mut options = Options {
@@ -467,7 +688,12 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         resolv_conf: None,
         managed_mounts: None,
         base_env: None,
-        stop_with_caller: None,
+        // On by default here, unlike in the library: `fcage` waits for the
+        // command and exits with it, so a sandbox that outlived the process is
+        // never what a shell or a supervisor meant. Without the tie a SIGTERM
+        // to `fcage` — `timeout(1)` is the everyday source — kills the waiter
+        // and orphans the sandbox.
+        stop_with_caller: Some(true),
         landlock: Vec::new(),
         landlock_net: Vec::new(),
         seccomp: None,
@@ -549,24 +775,14 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             options.debian_extract_only = true;
         } else if arg == "--profile" {
             let path = PathBuf::from(value_for("--profile", &mut args)?);
-            if options.profile.replace(path).is_some() {
-                return Err("only one --profile or --restricted-profile may be given".to_string());
-            }
+            set_profile(&mut options, path, false)?;
         } else if let Some(value) = flag_value(&arg, b"--profile=") {
-            if options.profile.replace(PathBuf::from(value)).is_some() {
-                return Err("only one --profile or --restricted-profile may be given".to_string());
-            }
+            set_profile(&mut options, PathBuf::from(value), false)?;
         } else if arg == "--restricted-profile" {
             let path = PathBuf::from(value_for("--restricted-profile", &mut args)?);
-            if options.profile.replace(path).is_some() {
-                return Err("only one --profile or --restricted-profile may be given".to_string());
-            }
-            options.profile_restricted = true;
+            set_profile(&mut options, path, true)?;
         } else if let Some(value) = flag_value(&arg, b"--restricted-profile=") {
-            if options.profile.replace(PathBuf::from(value)).is_some() {
-                return Err("only one --profile or --restricted-profile may be given".to_string());
-            }
-            options.profile_restricted = true;
+            set_profile(&mut options, PathBuf::from(value), true)?;
         } else if arg == "--bind" || arg == "--ro-bind" {
             let name = if arg == "--bind" {
                 "--bind"
@@ -865,7 +1081,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             options.command_line.extend(args);
             break;
         } else if arg.as_bytes().starts_with(b"-") && arg != "-" {
-            return Err(format!("unrecognized option {}", arg.to_string_lossy()));
+            return Err(unrecognized_option(&arg));
         } else {
             // The first positional argument is the command; everything after
             // it belongs to the command, dashes included.
@@ -1013,7 +1229,69 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     if options.command_line.is_empty() && options.profile.is_none() && !provisioning {
         return Err("no command given".to_string());
     }
+    // Nothing is launched, so a flag that configures a launch has nothing to
+    // configure. Every other no-effect combination is refused above, and
+    // silently dropping this one leaves a caller believing a sandbox was shaped
+    // the way the command line said.
+    if options.command_line.is_empty()
+        && options.profile.is_none()
+        && let Some(flag) = first_launch_flag(&raw)
+    {
+        return Err(format!(
+            "{flag} configures a launch, and a provisioning run without a command does not \
+             launch one",
+        ));
+    }
     Ok(Invocation::Run(Box::new(options)))
+}
+
+/// The first argument of a provision-and-exit invocation that configures the
+/// launch rather than the provisioning, if any.
+///
+/// A provision-and-exit run names no command, so nothing in the vector is a
+/// positional and every `--` argument is one of fcage's own. The provisioning
+/// vocabulary is short enough to name; everything else shapes a sandbox that is
+/// never built.
+fn first_launch_flag(args: &[OsString]) -> Option<String> {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .find(|arg| arg.starts_with("--") && !provisions(flag_name(arg)))
+}
+
+/// Whether `flag` configures the provisioning rather than the launch.
+fn provisions(flag: &str) -> bool {
+    matches!(flag, "--rootfs" | "--provision-tar" | "--provision-debian")
+        || flag.starts_with("--debian-")
+}
+
+/// Records the profile to load, refusing a mix of the two trust models.
+///
+/// Repeating one flag takes the last value, as repeating any other value option
+/// does. Naming both is refused instead: the two load a file under different
+/// trust, and there is no sensible way to choose between them.
+fn set_profile(options: &mut Options, path: PathBuf, restricted: bool) -> Result<(), String> {
+    if options.profile.is_some() && options.profile_restricted != restricted {
+        return Err("--profile and --restricted-profile are alternatives".to_string());
+    }
+    options.profile = Some(path);
+    options.profile_restricted = restricted;
+    Ok(())
+}
+
+/// The help or version request `args` carries, wherever it appears.
+///
+/// A mode takes no positional argument, so nothing in one can legitimately be
+/// the word `--help`. Answering it up front is what stops the destination arm
+/// from consuming it: `fcage --remove-rootfs --help` would otherwise take it as
+/// the tree to delete.
+fn help_or_version(args: &[OsString]) -> Option<Invocation> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return Some(Invocation::Help);
+    }
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        return Some(Invocation::Version);
+    }
+    None
 }
 
 /// Whether `arg` names the removal flag, in either the separated or the
@@ -1028,6 +1306,9 @@ fn names_removal(arg: &OsStr) -> bool {
 /// under. Every other flag configures a launch that does not happen here, so
 /// naming one is a usage error rather than a setting with no effect.
 fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
+    if let Some(answer) = help_or_version(&args) {
+        return Ok(answer);
+    }
     let mut dest: Option<PathBuf> = None;
     // The same default the library's own removal carries: a tree written by a
     // bundled-delegate sandbox is the case that needs the escalation at all.
@@ -1035,11 +1316,7 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
-        if arg == "-h" || arg == "--help" {
-            return Ok(Invocation::Help);
-        } else if arg == "-V" || arg == "--version" {
-            return Ok(Invocation::Version);
-        } else if arg == "--remove-rootfs" {
+        if arg == "--remove-rootfs" {
             let value = args
                 .next()
                 .ok_or_else(|| "--remove-rootfs requires a value".to_string())?;
@@ -1054,9 +1331,10 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
         } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
             map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
         } else {
-            return Err(format!(
-                "{} cannot be used with --remove-rootfs",
-                arg.to_string_lossy()
+            return Err(mode_conflict(
+                &arg,
+                "--remove-rootfs",
+                &["--remove-rootfs", "--identity-map"],
             ));
         }
     }
@@ -1068,6 +1346,93 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     // argument vector, not an invariant of this module.
     let dest = dest.ok_or_else(|| "--remove-rootfs requires a value".to_string())?;
     Ok(Invocation::Remove { dest, map })
+}
+
+/// Whether `arg` names the export flag, in either the separated or the
+/// `=`-joined form.
+fn names_export(arg: &OsStr) -> bool {
+    arg == "--export-rootfs" || arg.as_bytes().starts_with(b"--export-rootfs=")
+}
+
+/// Parses an `--export-rootfs` command line, excluding the program name.
+///
+/// An export takes the tree to read, where to write it, the identity map the
+/// tree was written under, and the modification-time ceiling. As with a
+/// removal, every other flag configures a launch that does not happen here, so
+/// naming one is a usage error rather than a setting with no effect — and
+/// parsing the mode separately is what keeps that true of a flag added to a
+/// launch later, since the vocabulary is closed by exhaustion rather than by a
+/// list kept in step by hand.
+fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
+    if let Some(answer) = help_or_version(&args) {
+        return Ok(answer);
+    }
+    let mut source: Option<PathBuf> = None;
+    let mut dest: Option<PathBuf> = None;
+    // The map a bundled-delegate sandbox writes under, as removal defaults to.
+    let mut map = IdentityMap::Subordinate;
+    let mut clamp_mtime: Option<i64> = None;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "--export-rootfs" {
+            let value = args
+                .next()
+                .ok_or_else(|| "--export-rootfs requires a value".to_string())?;
+            source = Some(PathBuf::from(value));
+        } else if let Some(value) = flag_value(&arg, b"--export-rootfs=") {
+            source = Some(PathBuf::from(value));
+        } else if arg == "--export-to" {
+            let value = args
+                .next()
+                .ok_or_else(|| "--export-to requires a value".to_string())?;
+            dest = Some(PathBuf::from(value));
+        } else if let Some(value) = flag_value(&arg, b"--export-to=") {
+            dest = Some(PathBuf::from(value));
+        } else if arg == "--identity-map" {
+            map = parse_identity_map(
+                "--identity-map",
+                &string_value("--identity-map", &mut args)?,
+            )?;
+        } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
+            map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
+        } else if arg == "--clamp-mtime" {
+            clamp_mtime = Some(parse_epoch(&string_value("--clamp-mtime", &mut args)?)?);
+        } else if let Some(value) = flag_value(&arg, b"--clamp-mtime=") {
+            clamp_mtime = Some(parse_epoch(&into_string("--clamp-mtime", value)?)?);
+        } else {
+            return Err(mode_conflict(
+                &arg,
+                "--export-rootfs",
+                &[
+                    "--export-rootfs",
+                    "--export-to",
+                    "--identity-map",
+                    "--clamp-mtime",
+                ],
+            ));
+        }
+    }
+
+    // As for a removal, the caller established that the flag is present, so
+    // this is a guard rather than a live path.
+    let source = source.ok_or_else(|| "--export-rootfs requires a value".to_string())?;
+    Ok(Invocation::Export {
+        source,
+        dest,
+        map,
+        clamp_mtime,
+    })
+}
+
+/// Parses the `--clamp-mtime` ceiling: a Unix timestamp in seconds.
+///
+/// Signed, because the ceiling is a plain timestamp rather than a duration and
+/// a tree may legitimately be pinned to an instant before the epoch.
+fn parse_epoch(value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("--clamp-mtime: {value:?} is not a Unix timestamp in whole seconds"))
 }
 
 /// Whether any `--debian-*` modifier flag was given.
@@ -1711,6 +2076,74 @@ fn remove_rootfs(dest: &Path, map: IdentityMap) -> ExitCode {
     }
 }
 
+/// Writes a provisioned rootfs to a tar archive, to a file or to standard
+/// output.
+///
+/// The terminal refusal is here rather than in the parser, so that parsing a
+/// command line stays a function of the command line: whether standard output
+/// is a terminal is a property of how `fcage` was invoked, not of what was
+/// typed, and a parser that consulted it would answer differently under a test
+/// harness than at a prompt. It is still the usage error it looks like, exit
+/// code and all.
+fn export_rootfs(
+    source: &Path,
+    dest: Option<&Path>,
+    map: IdentityMap,
+    clamp_mtime: Option<i64>,
+) -> ExitCode {
+    use std::io::IsTerminal as _;
+
+    if dest.is_none() && std::io::stdout().is_terminal() {
+        eprintln!("fcage: refusing to write an archive to the terminal");
+        eprintln!("Try '--export-to FILE', or pipe the output into a compressor.");
+        return ExitCode::from(2);
+    }
+
+    let mut export = ferroday_cage::provision::Export::new(source).map(map);
+    if let Some(epoch) = clamp_mtime {
+        export = export.clamp_mtime(epoch);
+    }
+
+    // The library buffers the writer itself, so neither arm wraps it again.
+    let written = match dest {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => {
+                let written = export.write_to(file);
+                if written.is_err() {
+                    // The archive is partial, and `File::create` truncated any
+                    // previous one to make it. Leaving it behind offers a
+                    // script an empty or half-written file where the exit
+                    // status said there was none.
+                    let _ = std::fs::remove_file(path);
+                }
+                written
+            }
+            Err(error) => {
+                eprintln!("fcage: cannot write {}: {error}", path.display());
+                return ExitCode::from(125);
+            }
+        },
+        None => export.write_to(std::io::stdout().lock()),
+    };
+
+    match written {
+        Ok(()) => ExitCode::SUCCESS,
+        // A reader that stopped early — `fcage --export-rootfs X | head -c 512`
+        // — is not a failure of the export. The conventional ending is a quiet
+        // one, so it is reported as the signal a writer to a closed pipe would
+        // ordinarily die of rather than as noise on stderr.
+        Err(ferroday_cage::provision::ProvisionError::Io { source, .. })
+            if dest.is_none() && source.kind() == std::io::ErrorKind::BrokenPipe =>
+        {
+            ExitCode::from(141)
+        }
+        Err(error) => {
+            eprintln!("fcage: {error}");
+            ExitCode::from(125)
+        }
+    }
+}
+
 /// Builds and runs the sandbox, mapping the outcome onto the exit status.
 fn run(options: Options) -> ExitCode {
     if options.restrict {
@@ -1891,9 +2324,12 @@ fn run(options: Options) -> ExitCode {
     }
 
     if options.netstack {
-        // The native stack composes the sandbox's DNS from the host's
-        // usable nameservers, unless the run opts out.
-        if options.resolv_conf != Some(false) {
+        // The native stack composes the sandbox's DNS from the host's usable
+        // nameservers, unless the run opts out. --no-managed-mounts opts out
+        // as surely as --no-resolv-conf does: its promise is that the sandbox
+        // carries exactly the binds the command line names, and this would be
+        // one it does not.
+        if options.resolv_conf != Some(false) && options.managed_mounts != Some(false) {
             builder = compose_netstack_resolv_conf(builder);
         }
         return run_with_netstack(
@@ -2242,6 +2678,358 @@ mod tests {
         }
     }
 
+    /// Every long flag the parser compares an argument against, read out of
+    /// this file's own source.
+    ///
+    /// There is no roster to read instead — the parser is a chain of
+    /// comparisons — and a list written out here would be the second table the
+    /// suggester exists to avoid. The scan stops at the test module, so a flag
+    /// spelled in a test is not mistaken for one the parser accepts.
+    fn parser_flags() -> Vec<&'static str> {
+        const SOURCE: &str = include_str!("main.rs");
+        let parser = SOURCE
+            .split_once("\n#[cfg(test)]")
+            .map_or(SOURCE, |(before, _)| before);
+
+        let mut flags = Vec::new();
+        // `arg == "--flag"`, and the inline-value form `--flag=VALUE`.
+        for (opening, closing) in [("== \"", '"'), ("starts_with(b\"", '=')] {
+            for (offset, _) in parser.match_indices(opening) {
+                let rest = &parser[offset + opening.len()..];
+                let Some(end) = rest.find(closing) else {
+                    continue;
+                };
+                let flag = &rest[..end];
+                if flag.starts_with("--") && flag.len() > 2 {
+                    flags.push(flag);
+                }
+            }
+        }
+        flags.sort_unstable();
+        flags.dedup();
+        flags
+    }
+
+    #[test]
+    fn a_misspelled_flag_suggests_the_one_it_was_meant_to_be() {
+        // With this many flags, several sharing long prefixes, a report that
+        // says only that an option is unrecognized leaves the reader to find
+        // the difference by eye.
+        for (typed, meant) in [
+            ("--rootsf", "--rootfs"),
+            ("--seccomp-alow", "--seccomp-allow"),
+            ("--no-prc", "--no-proc"),
+            ("--bnid", "--bind"),
+            ("--debian-includ", "--debian-include"),
+            // A flag typed short: too far in edit distance on a long name,
+            // caught by the prefix rule instead.
+            ("--netstack-host-loop", "--netstack-host-loopback"),
+            // A counterpart named only in the closing prose is still offered,
+            // because the candidates come from the whole help text.
+            ("--managed-mount", "--managed-mounts"),
+        ] {
+            let error = parse_error(&[typed]);
+            assert!(
+                error.contains(&format!("Try 'fcage {meant}'.")),
+                "{typed} should have suggested {meant}, got {error:?}",
+            );
+            assert!(error.contains(typed), "the report drops what was typed");
+        }
+    }
+
+    #[test]
+    fn a_joined_value_does_not_hide_the_flag_it_misspells() {
+        // `--flag=value` names its flag before the `=`. Weighing the whole
+        // argument against the roster compares a value against flag names and
+        // finds nothing near, so the one form of an option draws a suggestion
+        // and the other does not.
+        let error = parse_error(&["--rootsf=/srv/alpine"]);
+        assert!(
+            error.contains("Try 'fcage --rootfs'."),
+            "the joined form drew no suggestion: {error:?}",
+        );
+    }
+
+    #[test]
+    fn an_option_of_another_mode_names_that_mode() {
+        // The candidates come from the whole help, which documents every mode,
+        // so a launch would otherwise answer `--export-to` with `--export-to`.
+        for typed in ["--export-to", "--export-to=out.tar", "--clamp-mtime"] {
+            let error = parse_error(&["--rootfs", "/srv/alpine", typed, "/bin/sh"]);
+            assert!(
+                error.contains("is an option of --export-rootfs"),
+                "{typed} was not attributed to its mode: {error:?}",
+            );
+            assert!(
+                !error.contains("Try 'fcage --export-to'."),
+                "{typed} was answered with the spelling just refused: {error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_mode_suggests_a_misspelling_of_its_own_vocabulary() {
+        // A mode's parser refuses everything but its own options, so without
+        // this a misspelling of one of them reads as a launch flag given to the
+        // wrong invocation.
+        let error = parse_error(&["--export-rootfs", "/roots/a", "--clamp-mtme", "5"]);
+        assert!(
+            error.contains("Try 'fcage --clamp-mtime'."),
+            "the export mode did not answer its own misspelling: {error:?}",
+        );
+        let error = parse_error(&["--remove-rootfs", "/roots/a", "--identity-mp", "single"]);
+        assert!(
+            error.contains("Try 'fcage --identity-map'."),
+            "the removal mode did not answer its own misspelling: {error:?}",
+        );
+        // A launch flag is still the conflict it is, not a near miss.
+        let error = parse_error(&["--remove-rootfs", "/roots/a", "--hostname", "box"]);
+        assert!(
+            error.contains("cannot be used with --remove-rootfs"),
+            "a launch flag stopped reading as a conflict: {error:?}",
+        );
+    }
+
+    #[test]
+    fn a_commands_own_flags_do_not_choose_the_mode() {
+        // Past `--` every argument belongs to the command, including one spelled
+        // like a mode of fcage's. Scanning the whole vector for a mode flag
+        // makes a tool with an --export-rootfs option of its own unrunnable.
+        let invocation = parse_args(&[
+            "--rootfs",
+            "/srv/alpine",
+            "--",
+            "/bin/mytool",
+            "--export-rootfs",
+            "/tmp/out",
+        ])
+        .expect("the launch parses");
+        let Invocation::Run(options) = invocation else {
+            panic!("the invocation is a launch, not a mode");
+        };
+        assert_eq!(
+            options.command_line,
+            ["/bin/mytool", "--export-rootfs", "/tmp/out"],
+        );
+    }
+
+    #[test]
+    fn the_export_only_roster_holds_only_export_options() {
+        // The roster is written out rather than derived, so this is what keeps
+        // it honest: every entry must be one a launch refuses and an export
+        // accepts, or the suggester attributes a flag to the wrong mode.
+        for flag in EXPORT_ONLY_FLAGS {
+            let launch = parse_error(&["--rootfs", "/srv/alpine", flag, "/bin/sh"]);
+            assert!(
+                launch.contains("unrecognized option"),
+                "a launch accepts {flag}, which the roster calls an export's: {launch:?}",
+            );
+            let export = parse_args(&["--export-rootfs", "/roots/a", flag, "1700000000"]);
+            assert!(
+                export.is_ok(),
+                "an export refuses {flag}, which the roster calls its own: {:?}",
+                export.err(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_provision_and_exit_run_refuses_a_launch_flag() {
+        // Nothing is launched, so a launch flag has nothing to configure. The
+        // parser refuses every other no-effect combination; dropping this one
+        // would leave a caller believing a sandbox was shaped as written.
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/trixie",
+            "--provision-debian",
+            "trixie",
+            "--hostname",
+            "box",
+        ]);
+        assert!(
+            error.contains("--hostname configures a launch"),
+            "the dropped flag went unreported: {error:?}",
+        );
+        // The provisioning vocabulary itself is accepted, and so is anything at
+        // all once a command is given.
+        assert!(
+            parse_args(&[
+                "--rootfs",
+                "/roots/trixie",
+                "--provision-debian",
+                "trixie",
+                "--debian-arch",
+                "amd64",
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse_args(&[
+                "--rootfs",
+                "/roots/trixie",
+                "--provision-debian",
+                "trixie",
+                "--hostname",
+                "box",
+                "/bin/sh",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_mode_answers_help_rather_than_taking_it_as_a_path() {
+        // `--remove-rootfs` takes the next argument, so without an answer up
+        // front `fcage --remove-rootfs --help` deletes a directory named
+        // `--help` — or, finding none, exits 0 having printed nothing.
+        for args in [
+            ["--remove-rootfs", "--help"].as_slice(),
+            ["--export-rootfs", "--help"].as_slice(),
+            ["--remove-rootfs", "/roots/a", "--help"].as_slice(),
+        ] {
+            assert!(
+                matches!(parse_args(args), Ok(Invocation::Help)),
+                "{args:?} did not ask for help",
+            );
+        }
+        assert!(matches!(
+            parse_args(&["--export-rootfs", "--version"]),
+            Ok(Invocation::Version)
+        ));
+    }
+
+    #[test]
+    fn the_sandbox_is_tied_to_fcage_unless_the_run_says_otherwise() {
+        // fcage waits for the command and exits with it, so a sandbox that
+        // outlived the process is never what was meant: a SIGTERM to fcage —
+        // `timeout(1)` is the everyday source — would otherwise orphan it.
+        let options = parse_run(&["--rootfs", "/srv/alpine", "/bin/true"]).expect("it parses");
+        assert_eq!(options.stop_with_caller, Some(true));
+        let options = parse_run(&[
+            "--rootfs",
+            "/srv/alpine",
+            "--no-stop-with-caller",
+            "/bin/true",
+        ])
+        .expect("it parses");
+        assert_eq!(options.stop_with_caller, Some(false));
+    }
+
+    #[test]
+    fn a_string_resembling_no_flag_is_reported_without_a_guess() {
+        // A suggestion is worth having only where it is likely to be right.
+        for typed in ["--qqqzzz", "--", "-x", "--wildly-unlike-anything"] {
+            let error = parse_error(&[typed]);
+            assert!(
+                !error.contains("Try 'fcage --"),
+                "{typed} drew a suggestion out of nothing: {error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn every_flag_the_parser_accepts_is_in_the_help() {
+        // The suggester offers what the help documents, so a flag the help
+        // does not name is one it can never offer. That is a gap in the help
+        // whether or not anything suggests it, which is why the check is here
+        // rather than left to the reader of a second table.
+        let usage = usage();
+        let documented = documented_flags(&usage);
+        for flag in parser_flags() {
+            assert!(
+                documented.contains(&flag),
+                "the parser accepts {flag}, which --help never names",
+            );
+        }
+    }
+
+    #[test]
+    fn every_flag_the_help_names_is_one_the_parser_accepts() {
+        // The other direction, and what keeps the derived candidate list
+        // honest: a suggestion the parser would then refuse is worse than no
+        // suggestion, and it is what a stray token scanned out of the prose
+        // would produce.
+        //
+        // A flag is offered to each mode's vocabulary in turn, since some
+        // belong to one mode only -- `--clamp-mtime` is an export's -- and
+        // trying all three is what covers them without a table recording which
+        // flag belongs where.
+        let usage = usage();
+        for flag in documented_flags(&usage) {
+            let vocabularies: [Vec<&str>; 3] = [
+                vec![flag],
+                vec!["--remove-rootfs", "/roots/a", flag],
+                vec!["--export-rootfs", "/roots/a", flag],
+            ];
+            let recognized = vocabularies.iter().any(|args| match parse_args(args) {
+                // A flag needing a value reports that, which is recognition.
+                // Only being unknown, or belonging to another mode, is not.
+                Err(error) => {
+                    !error.contains("unrecognized option") && !error.contains("cannot be used with")
+                }
+                Ok(_) => true,
+            });
+            assert!(
+                recognized,
+                "--help names {flag}, which no mode's parser accepts",
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_files_every_option_under_a_section() {
+        // The options are already ordered by subject; the sections name the
+        // groups that ordering makes. An entry above the first header, or
+        // after a header that no longer exists, is one a reader has to find by
+        // scanning the whole list.
+        let usage = usage();
+        let mut section: Option<&str> = None;
+        for line in usage.lines() {
+            if line.ends_with(':') && !line.starts_with(' ') && !line.starts_with("Usage") {
+                section = Some(line);
+            } else if line.starts_with("  -") {
+                assert!(
+                    section.is_some(),
+                    "the option {line:?} sits above the first section header",
+                );
+            }
+        }
+        // The groups themselves, so a section lost in an edit is caught rather
+        // than silently folding its options into the one before it.
+        for header in [
+            "Provisioning the root filesystem:",
+            "Profiles, overlays, and mounts:",
+            "Identity and limits:",
+            "The command and its process:",
+            "Networking:",
+            "Hardening:",
+            "Turning off what is on by default:",
+            "Help and version:",
+        ] {
+            assert!(
+                usage.contains(header),
+                "the help lost the section {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_distance_counts_single_character_edits() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("--rootfs", "--rootfs"), 0);
+        // One substitution, one deletion, one insertion.
+        assert_eq!(edit_distance("--rootfs", "--roatfs"), 1);
+        assert_eq!(edit_distance("--rootfs", "--rootf"), 1);
+        assert_eq!(edit_distance("--rootfs", "--rootfss"), 1);
+        // A transposition costs two: the distance does not model a swap, which
+        // is why two is the bound worth offering a suggestion at.
+        assert_eq!(edit_distance("--rootfs", "--rootsf"), 2);
+        // Against an empty string the distance is the length, from either
+        // side, so the two rows are indexed the same way round.
+        assert_eq!(edit_distance("--bind", ""), 6);
+        assert_eq!(edit_distance("", "--bind"), 6);
+    }
+
     #[test]
     fn remove_rootfs_takes_a_destination_in_either_form() {
         for args in [
@@ -2312,6 +3100,114 @@ mod tests {
         // The map parser rejects the flag as a spelling before it can be
         // mistaken for the destination.
         assert!(parse_args(&["--identity-map", "--remove-rootfs"]).is_err());
+    }
+
+    /// The export an argument list parses to, panicking if it is anything else.
+    fn parse_export_args(args: &[&str]) -> (PathBuf, Option<PathBuf>, IdentityMap, Option<i64>) {
+        match parse_args(args).expect("the export should parse") {
+            Invocation::Export {
+                source,
+                dest,
+                map,
+                clamp_mtime,
+            } => (source, dest, map, clamp_mtime),
+            _ => panic!("expected an export for {args:?}"),
+        }
+    }
+
+    #[test]
+    fn export_rootfs_takes_its_settings_in_either_form() {
+        for args in [
+            [
+                "--export-rootfs",
+                "/roots/trixie",
+                "--export-to",
+                "/tmp/out.tar",
+                "--identity-map",
+                "single",
+                "--clamp-mtime",
+                "1700000000",
+            ]
+            .as_slice(),
+            [
+                "--export-rootfs=/roots/trixie",
+                "--export-to=/tmp/out.tar",
+                "--identity-map=single",
+                "--clamp-mtime=1700000000",
+            ]
+            .as_slice(),
+        ] {
+            let (source, dest, map, clamp) = parse_export_args(args);
+            assert_eq!(source, PathBuf::from("/roots/trixie"));
+            assert_eq!(dest, Some(PathBuf::from("/tmp/out.tar")));
+            assert_eq!(map, IdentityMap::Single);
+            assert_eq!(clamp, Some(1_700_000_000));
+        }
+    }
+
+    #[test]
+    fn export_rootfs_defaults_to_standard_output_and_the_subordinate_map() {
+        // Absent a destination the archive goes to standard output, so it pipes
+        // into a compressor without a temporary file. The map default is the
+        // one a bundled-delegate sandbox writes under, matching removal, since
+        // that is the case that needs the escalation at all.
+        let (source, dest, map, clamp) = parse_export_args(&["--export-rootfs", "/roots/a"]);
+        assert_eq!(source, PathBuf::from("/roots/a"));
+        assert_eq!(dest, None, "the default sink is standard output");
+        assert_eq!(map, IdentityMap::Subordinate);
+        assert_eq!(clamp, None, "an unclamped export records real times");
+    }
+
+    #[test]
+    fn export_rootfs_refuses_every_launch_option_and_a_command() {
+        // The export vocabulary is closed by exhaustion, so a flag added to a
+        // launch later is refused here without anyone remembering to add it.
+        for flag in [
+            "--rootfs",
+            "--restrict",
+            "--share-net",
+            "--provision-tar",
+            "--profile",
+            "--bind",
+            "--remove-rootfs",
+        ] {
+            let error = parse_error(&["--export-rootfs", "/roots/a", flag]);
+            assert!(
+                error.contains(flag) && error.contains("--export-rootfs"),
+                "the error should name both flags, got {error:?}",
+            );
+        }
+        let error = parse_error(&["--export-rootfs", "/roots/a", "/bin/true"]);
+        assert!(error.contains("/bin/true"), "{error}");
+    }
+
+    #[test]
+    fn export_rootfs_requires_a_source_and_a_well_formed_ceiling() {
+        assert!(parse_args(&["--export-rootfs"]).is_err());
+        assert!(parse_args(&["--export-rootfs", "/roots/a", "--export-to"]).is_err());
+        for bad in ["yesterday", "1.5", ""] {
+            assert!(
+                parse_args(&["--export-rootfs", "/roots/a", "--clamp-mtime", bad]).is_err(),
+                "{bad:?} must be refused as a timestamp",
+            );
+        }
+        // The ceiling is a plain instant, so one before the epoch is a value
+        // rather than an error.
+        let (_, _, _, clamp) =
+            parse_export_args(&["--export-rootfs", "/roots/a", "--clamp-mtime=-1"]);
+        assert_eq!(clamp, Some(-1));
+    }
+
+    #[test]
+    fn export_rootfs_still_answers_help_and_version() {
+        assert!(matches!(
+            parse_args(&["--export-rootfs", "/roots/a", "--help"]),
+            Ok(Invocation::Help)
+        ));
+        assert!(matches!(
+            parse_args(&["--export-rootfs", "/roots/a", "--version"]),
+            Ok(Invocation::Version)
+        ));
     }
 
     #[test]
@@ -2428,7 +3324,7 @@ mod tests {
         .unwrap();
         let rendered = format!("{repository:?}");
         assert!(rendered.contains("file:///srv/pool"), "{rendered}");
-        assert!(rendered.contains("unsigned"), "{rendered}");
+        assert!(rendered.contains("trust: Unsigned"), "{rendered}");
         assert!(parse_repository("mirror=file:///srv/pool").is_err());
     }
 

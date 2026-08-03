@@ -1,7 +1,7 @@
 //! Architecture handling: the host mapping, the merged-usr symlink farm, and
 //! the foreign-architecture binfmt preflight.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The Debian architecture name for the host, from `uname`.
 ///
@@ -93,15 +93,14 @@ pub(crate) fn preflight_foreign(host: &str, target: &str) -> Result<(), String> 
              handler, and {target} is not a known qemu target; use extract-only instead"
         ));
     };
-    let path = format!("/proc/sys/fs/binfmt_misc/qemu-{interpreter}");
-    let registration = std::fs::read_to_string(&path).map_err(|_| {
+    let registration = read_registration(interpreter).ok_or_else(|| {
         format!(
             "a full bootstrap for {target} on a {host} host needs the qemu-{interpreter} \
              binfmt handler registered (install qemu-user-static and binfmt support); \
              use extract-only to lay out the rootfs without running target binaries"
         )
     })?;
-    check_registration(&registration).map_err(|reason| {
+    check_registration(&parse_registration(&registration)).map_err(|reason| {
         format!(
             "the qemu-{interpreter} binfmt handler is registered but {reason}; a foreign \
              bootstrap needs it enabled and registered with the fix-binary (F) flag"
@@ -109,22 +108,173 @@ pub(crate) fn preflight_foreign(host: &str, target: &str) -> Result<(), String> 
     })
 }
 
-/// Validates a binfmt_misc registration: enabled, with the `F` flag.
-fn check_registration(registration: &str) -> Result<(), &'static str> {
-    let mut lines = registration.lines();
-    match lines.next().map(str::trim) {
-        Some("enabled") => {}
-        _ => return Err("it is disabled"),
+/// The kernel's registration for the `qemu-<name>` binfmt handler, or `None`
+/// when none is registered.
+fn read_registration(name: &str) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/sys/fs/binfmt_misc/qemu-{name}")).ok()
+}
+
+/// What a `binfmt_misc` registration file says, as fields.
+///
+/// The file is a line-oriented listing: a bare `enabled` or `disabled`, then
+/// `interpreter <path>`, `flags: <letters>`, and the magic and mask this does
+/// not read.
+struct Registration {
+    /// Whether the handler is enabled. A registered-but-disabled handler is a
+    /// distinct state from an absent one: the registration exists and can be
+    /// switched back on.
+    enabled: bool,
+    /// The interpreter path the kernel recorded, absent from a malformed
+    /// registration.
+    interpreter: Option<PathBuf>,
+    /// The flag letters, as written.
+    flags: String,
+}
+
+/// Reads a `binfmt_misc` registration into its fields.
+fn parse_registration(registration: &str) -> Registration {
+    let mut lines = registration.lines().map(str::trim);
+    let enabled = lines.next() == Some("enabled");
+    let mut interpreter = None;
+    let mut flags = String::new();
+    for line in registration.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("interpreter ") {
+            interpreter = Some(PathBuf::from(path.trim()));
+        } else if let Some(letters) = line.strip_prefix("flags:") {
+            flags = letters.trim().to_string();
+        }
     }
-    let flags = registration
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("flags:"))
-        .unwrap_or("");
-    if flags.contains('F') {
+    Registration {
+        enabled,
+        interpreter,
+        flags,
+    }
+}
+
+/// Validates a binfmt_misc registration: enabled, with the `F` flag.
+fn check_registration(registration: &Registration) -> Result<(), &'static str> {
+    if !registration.enabled {
+        return Err("it is disabled");
+    }
+    if registration.flags.contains('F') {
         Ok(())
     } else {
         Err("it lacks the fix-binary (F) flag")
     }
+}
+
+/// The `qemu-user` interpreter the kernel will execute `architecture` binaries
+/// through, or `None` when no interpreter is involved.
+///
+/// `None` covers three cases, and all three are the honest answer rather than a
+/// failure: the host runs `architecture` natively, so nothing is emulated; the
+/// architecture is not one a `qemu-user` binfmt handler covers; or no handler is
+/// registered for it. A caller folding the interpreter into an artifact
+/// signature wants a missing value there, not an empty string.
+///
+/// The value comes from the kernel's own registration under
+/// `/proc/sys/fs/binfmt_misc`, which is the path binaries are actually executed
+/// through. That matters: the kernel reaches the interpreter through the
+/// registration and not through `PATH`, so a caller deriving the interpreter by
+/// looking one up in `PATH` can record something other than what ran, and will
+/// record nothing at all under a harness that strips `PATH`.
+///
+/// # Hashing, not probing
+///
+/// The registered path is good for identity and not for interrogation. qemu
+/// refuses to run under its binfmt wrapper name:
+///
+/// ```text
+/// $ /usr/libexec/qemu-binfmt/aarch64-binfmt-P --version
+/// qemu: /usr/libexec/qemu-binfmt/aarch64-binfmt-P has to be run using kernel
+/// binfmt-misc subsystem
+/// ```
+///
+/// So a caller that wants to identify the interpreter should hash
+/// [`path`](Interpreter::path) rather than ask the binary about itself: `open`
+/// follows the symlink, so a digest of the registered path is a digest of the
+/// interpreter's bytes and needs no canonicalization. A version string is a
+/// claim the binary makes about itself; a digest is what it is. Only *executing*
+/// the interpreter needs [`resolved`](Interpreter::resolved).
+///
+/// The digest is the caller's to take, and deliberately not this crate's. The
+/// `F` flag means the kernel opened and holds the interpreter at *registration*
+/// time, so the file at that path may have been replaced since: a digest taken
+/// now may be of something that never ran. Handing back a digest that can be
+/// quietly wrong is worse than handing back none, so the crate reports the path
+/// and states the caveat.
+///
+/// # Example
+///
+/// ```no_run
+/// use ferroday_cage::provision::debian::foreign_interpreter;
+///
+/// match foreign_interpreter("arm64") {
+///     Some(interpreter) => println!(
+///         "emulated by {} (enabled: {})",
+///         interpreter.path.display(),
+///         interpreter.enabled,
+///     ),
+///     None => println!("no interpreter: run natively, or none registered"),
+/// }
+/// ```
+pub fn foreign_interpreter(architecture: &str) -> Option<Interpreter> {
+    if runs_natively(&host_architecture(), architecture) {
+        return None;
+    }
+    let name = qemu_interpreter(architecture)?;
+    let registration = parse_registration(&read_registration(name)?);
+    let path = registration.interpreter?;
+    Some(Interpreter {
+        name: name.to_string(),
+        resolved: std::fs::canonicalize(&path).ok(),
+        path,
+        enabled: registration.enabled,
+        flags: registration.flags,
+    })
+}
+
+/// The `qemu-user` interpreter a foreign-architecture binary is executed
+/// through, as the kernel has it registered.
+///
+/// Returned by [`foreign_interpreter`], which documents what to do with it: a
+/// changed interpreter silently changes compiled output, so it belongs in an
+/// artifact signature, and the way to identify it is to hash
+/// [`path`](Self::path) rather than to ask the binary about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Interpreter {
+    /// The qemu target name the handler is registered under: `aarch64` for the
+    /// Debian architecture `arm64`, and so on.
+    pub name: String,
+    /// The interpreter exactly as the kernel recorded it.
+    ///
+    /// This is the provenance-faithful value, and the one to hash: it is what
+    /// the registration names, and `open` follows any symlink along it. It is
+    /// not, however, a path that can be executed — see [`foreign_interpreter`].
+    pub path: PathBuf,
+    /// [`path`](Self::path) canonicalized, or `None` when it does not resolve.
+    ///
+    /// The two are different facts and both are worth recording. On the common
+    /// Debian layout the registration names a wrapper —
+    /// `/usr/libexec/qemu-binfmt/aarch64-binfmt-P` — that is a symlink to the
+    /// real binary, and repointing that symlink changes the interpreter without
+    /// changing the registration, which a record carrying one path alone could
+    /// not show. A path that does not resolve is a fact rather than an error, so
+    /// everything else is still reported.
+    pub resolved: Option<PathBuf>,
+    /// Whether the handler is enabled.
+    ///
+    /// A registered handler that is switched off is reported as present and not
+    /// enabled, rather than as absent: the registration exists, and the
+    /// distinction is the difference between "turn it on" and "install it".
+    pub enabled: bool,
+    /// The registration's flag letters, as written — `POF` on a Debian host.
+    ///
+    /// A foreign bootstrap needs `F`, the fix-binary flag, which is what makes
+    /// the interpreter keep working after the cage pivots into the target
+    /// rootfs where its own path no longer resolves.
+    pub flags: String,
 }
 
 /// Whether `path` names an existing entry (following no symlink at the leaf).
@@ -165,13 +315,101 @@ mod tests {
     #[test]
     fn registration_requires_enabled_and_fix_binary() {
         let good = "enabled\ninterpreter /usr/bin/qemu-aarch64-static\nflags: OCF\n";
-        assert!(check_registration(good).is_ok());
+        assert!(check_registration(&parse_registration(good)).is_ok());
         let disabled = "disabled\nflags: OCF\n";
-        assert!(check_registration(disabled).is_err());
+        assert!(check_registration(&parse_registration(disabled)).is_err());
         let no_fix = "enabled\nflags: OC\n";
         assert_eq!(
-            check_registration(no_fix),
+            check_registration(&parse_registration(no_fix)),
             Err("it lacks the fix-binary (F) flag")
         );
+    }
+
+    /// A registration as the kernel writes one, with the fields this reads
+    /// surrounded by the ones it does not.
+    const REGISTERED: &str = "enabled\n\
+         interpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P\n\
+         flags: POF\n\
+         offset 0\n\
+         magic 7f454c460201010000000000000000000200b7\n";
+
+    #[test]
+    fn a_registration_reports_its_interpreter_its_state_and_its_flags() {
+        let registration = parse_registration(REGISTERED);
+        assert!(registration.enabled);
+        assert_eq!(
+            registration.interpreter.as_deref(),
+            Some(Path::new("/usr/libexec/qemu-binfmt/aarch64-binfmt-P")),
+        );
+        assert_eq!(registration.flags, "POF");
+    }
+
+    #[test]
+    fn a_disabled_handler_reports_as_registered_and_not_enabled() {
+        // The distinction the preflight needs and a caller wants: the
+        // registration exists, so the remedy is to switch it on rather than to
+        // install it.
+        let registration = parse_registration(&REGISTERED.replacen("enabled", "disabled", 1));
+        assert!(!registration.enabled);
+        assert_eq!(
+            registration.interpreter.as_deref(),
+            Some(Path::new("/usr/libexec/qemu-binfmt/aarch64-binfmt-P")),
+            "everything else is still reported",
+        );
+        assert_eq!(registration.flags, "POF");
+    }
+
+    #[test]
+    fn a_native_architecture_has_no_interpreter() {
+        // Nothing is emulated, so there is no interpreter to name. An empty
+        // string here would fold into a caller's artifact signature as though
+        // it meant something.
+        let host = host_architecture();
+        assert!(foreign_interpreter(&host).is_none());
+    }
+
+    #[test]
+    fn an_architecture_qemu_does_not_cover_has_no_interpreter() {
+        assert!(qemu_interpreter("m68k").is_none());
+        assert!(foreign_interpreter("m68k").is_none());
+    }
+
+    #[test]
+    fn a_registered_symlink_reports_the_registration_and_its_target_apart() {
+        // The common Debian layout: the kernel records a wrapper name that is a
+        // symlink to the real binary. Repointing the symlink changes the
+        // interpreter without changing the registration, which a record
+        // carrying one path alone could not show.
+        let scratch = crate::scratch::Scratch::new("interpreter");
+        let real = scratch.join("qemu-aarch64-static");
+        std::fs::write(&real, b"not really qemu").expect("the stand-in is writable");
+        let wrapper = scratch.join("aarch64-binfmt-P");
+        std::os::unix::fs::symlink(&real, &wrapper).expect("the wrapper symlink is creatable");
+
+        let registration = parse_registration(&format!(
+            "enabled\ninterpreter {}\nflags: POF\n",
+            wrapper.display()
+        ));
+        let path = registration.interpreter.expect("the interpreter is named");
+        let resolved = std::fs::canonicalize(&path).ok();
+        assert_eq!(path, wrapper, "the registered path is reported as written");
+        assert_eq!(
+            resolved.as_deref().map(Path::to_path_buf),
+            std::fs::canonicalize(&real).ok(),
+            "and the target it resolves to as a second, distinct fact",
+        );
+        assert_ne!(Some(path), resolved);
+    }
+
+    #[test]
+    fn an_unresolvable_registration_still_reports_everything_else() {
+        // A path that does not resolve is a fact, not an error: the handler is
+        // registered and enabled, and only the target is unknowable.
+        let registration =
+            parse_registration("enabled\ninterpreter /nonexistent/qemu-aarch64\nflags: POF\n");
+        let path = registration.interpreter.expect("the interpreter is named");
+        assert_eq!(std::fs::canonicalize(&path).ok(), None);
+        assert!(registration.enabled);
+        assert_eq!(registration.flags, "POF");
     }
 }

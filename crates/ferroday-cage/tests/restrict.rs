@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ferroday_cage::{
-    Error, FsAccess, Restriction, RestrictionBuilder, SeccompAction, SeccompArg, SeccompPolicy,
-    SeccompRules, SetupStep,
+    Error, FsAccess, NetAccess, Restriction, RestrictionBuilder, SeccompAction, SeccompArg,
+    SeccompPolicy, SeccompRules, SetupStep, Stdin,
 };
 
 /// Skips a Landlock test when the kernel offers no Landlock LSM.
@@ -112,6 +112,104 @@ fn landlock_allows_a_granted_path_and_denies_the_rest() {
     assert!(
         !status.success(),
         "reading an ungranted path must be denied"
+    );
+}
+
+/// Skips a Landlock network test when the kernel's ABI predates network
+/// rights, which arrived in ABI 4.
+fn landlock_net_supported() -> bool {
+    match ferroday_cage::host::landlock_abi() {
+        Some(abi) if abi >= 4 => true,
+        _ => {
+            assert!(
+                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK_NET").is_none(),
+                "Landlock network rights are required but the kernel offers none",
+            );
+            eprintln!("skipping: the kernel's Landlock ABI predates network rights");
+            false
+        }
+    }
+}
+
+#[test]
+fn landlock_net_gates_a_tcp_connection() {
+    if !landlock_supported() || !landlock_net_supported() {
+        return;
+    }
+    // A host listener the command is asked to reach. The port is granted in
+    // one run and not in the other; nothing else differs.
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+    let port = listener.local_addr().expect("an address").port();
+    std::thread::spawn(move || {
+        // Accept whatever arrives for the duration of the test.
+        while listener.accept().is_ok() {}
+    });
+
+    let Some(nc) = ["/usr/bin/nc", "/bin/nc", "/usr/bin/ncat"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("skipping: no nc on this host to make the connection with");
+        return;
+    };
+
+    let connect = |granted: u16| {
+        grant_system_trees(Restriction::builder())
+            .command(nc)
+            .args(["-w", "2", "127.0.0.1", &port.to_string()])
+            .landlock_net(NetAccess::CONNECT, granted)
+            .stdin(Stdin::Null)
+            .build()
+            .expect("a valid restriction configuration")
+            .run()
+            .expect("the restriction launches")
+    };
+
+    assert!(
+        connect(port).success(),
+        "a granted port must remain connectable",
+    );
+    // Enrolling any grant denies everything ungranted, so granting a different
+    // port denies this one. The grant is what is being tested, so the run is
+    // otherwise identical.
+    assert!(
+        !connect(port.wrapping_add(1).max(1)).success(),
+        "an ungranted port must be denied",
+    );
+}
+
+#[test]
+fn an_empty_landlock_grant_is_refused() {
+    // An empty access set reads as "grant nothing here" and behaves as "deny
+    // the whole class": the enrollment denies everything ungranted, and the
+    // kernel skips a rule that permits nothing. A restriction built that way
+    // fails at `execve` with nothing pointing at the cause, so the build
+    // refuses it instead. No kernel support is needed to decide this.
+    let err = Restriction::builder()
+        .command("/bin/true")
+        .landlock_fs(FsAccess::empty(), "/usr")
+        .build()
+        .expect_err("an empty filesystem grant is refused");
+    assert!(
+        matches!(
+            err,
+            Error::Config(ferroday_cage::ConfigError::LandlockGrantEmpty { .. })
+        ),
+        "{err}"
+    );
+
+    let err = Restriction::builder()
+        .command("/bin/true")
+        .landlock_net(NetAccess::empty(), 443)
+        .build()
+        .expect_err("an empty network grant is refused");
+    assert!(
+        matches!(
+            err,
+            Error::Config(ferroday_cage::ConfigError::LandlockGrantEmpty { .. })
+        ),
+        "{err}"
     );
 }
 

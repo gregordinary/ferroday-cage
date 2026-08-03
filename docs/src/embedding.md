@@ -165,12 +165,12 @@ boundary moves the *inputs* across and constructs it there — which is what the
 
 ## Recording what a build ran under
 
-What a command produces depends on the environment it runs in and the
-filesystem it sees. A runtime that publishes artifacts usually needs to state
-those in the artifact's provenance, and the library version alone does not:
-the mount profile and the base environment are both [outside the
-compatibility promise](stability.md#what-is-not-covered) and may change in a
-patch release.
+What a command produces depends on the filesystem it sees, the environment it
+carries, the identity it holds, whether it can reach a network, and which
+syscalls will succeed. A runtime that publishes artifacts usually needs to state
+those in the artifact's provenance, and the library version alone does not: the
+mount profile and the base environment are both [outside the compatibility
+promise](stability.md#what-is-not-covered) and may change in a patch release.
 
 [`resolved_inputs`] reports them as data. It is a projection of the frozen
 launch plan, computed on demand, so calling it costs nothing until asked and
@@ -205,6 +205,40 @@ contains that no other accessor can report: with the managed profile in force
 it lists the six `/dev` device nodes and the five `/dev` symlinks
 individually, where `get_mount_dev()` answers only whether `/dev` is
 assembled.
+
+### What the record carries
+
+`root` is what the command's filesystem *is*, and it is a field of its own
+rather than an entry in `mounts`: a mount is something laid over the root, and
+the root is what it is laid over. A plain rootfs records its canonicalized path;
+an overlay records its whole lower stack, its upper, and its work directory,
+because that stack is what the root was made of. Recording only the mounts would
+leave two builds — one on a rootfs, one on an overlay over the same base —
+looking identical.
+
+`identity`, `network`, `rlimits`, and `hardening` are the posture the launch
+puts the command under, and each changes what a build produces:
+
+- **`identity`** — whether the build sees uid 0 or a mapped id. A Debian
+  build's `Rules-Requires-Root` handling turns on exactly this, and a file's
+  recorded ownership follows from it.
+- **`network`** — the namespace the sandbox creates. A stack attached to a
+  pending launch is not visible here, being established after the cage is built.
+- **`rlimits`** — a build that adapts its parallelism to `RLIMIT_NOFILE`, or
+  fails a link under `RLIMIT_AS`, produces different output.
+- **`hardening`** — the subtlest, and the one most worth recording: a seccomp
+  policy changes which syscalls succeed, and a configure test that probes a
+  syscall reads the refusal as an absent feature. The Landlock grants are
+  recorded in full, by path and by port; the seccomp filter is recorded as its
+  instruction count, since the program itself is thousands of instructions and
+  means nothing to a reader.
+
+`hardening` is present whether or not the `hardening` feature is compiled in,
+reporting `unavailable` when it is not. A record that simply left the key out
+could not be told apart from one written before the key existed, and a
+provenance record has to be readable without knowing which build wrote it.
+`unavailable` and an applied posture with no controls are different facts: the
+second is a build that could have hardened and did not.
 
 The value's *shape* is stable API; its *contents* follow the defaults and may
 change, which is precisely why recording it is worth doing.

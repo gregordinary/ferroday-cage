@@ -211,14 +211,7 @@ fn hermetic_two_repositories_merge_and_fetch_origin_correctly() {
         .finish();
     // An ordinary package that depends on the primary's library, so resolving
     // it exercises a cross-repository dependency closure.
-    let custom = Pkg {
-        name: "custom".to_string(),
-        version: "1.0".to_string(),
-        deb: deb(&custom_tar),
-        depends: "libdep".to_string(),
-        priority: String::new(),
-        essential: false,
-    };
+    let custom = Pkg::ordinary("custom", deb(&custom_tar)).depending_on("libdep");
     let feature = write_repo(&dir.join("feature"), "trixie", "amd64", &[custom]);
 
     let feature_repo = ferroday_cage::provision::debian::Repository::builder("trixie")
@@ -401,6 +394,129 @@ fn hermetic_published_pool_is_consumable_by_the_provisioner() {
         Provisioned::Created,
     );
     assert!(rootfs.join("usr/bin/custom").is_file());
+}
+
+#[test]
+fn hermetic_a_second_component_does_not_retire_the_first() {
+    // A pool's release names the sections a reader may resolve, and a reader
+    // consults it before it knows which digests to ask for. So publishing a
+    // second component into one suite has to leave the first named: the index
+    // an earlier publish wrote survives on disk either way, but a section the
+    // release does not name cannot be resolved, and the by-hash copies are no
+    // escape from that. The proof is the provisioner drawing a package out of
+    // each component after both have been published.
+    let dir = common::scratch_dir("debian-pool-two-components");
+
+    let base = Tar::new()
+        .dir("./usr", 0o755)
+        .file("./usr/bin/x", 0o755, b"ok\n")
+        .finish();
+    let primary = write_repo(
+        &dir.join("primary"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", deb(&base), "")],
+    );
+
+    // One package per component, each with contents of its own, so the two
+    // indexes differ and a digest carried across a publish is meaningful.
+    let build = |name: &str| {
+        let data = Tar::new()
+            .dir("./usr", 0o755)
+            .file(&format!("./usr/bin/{name}"), 0o755, b"#!/bin/true\n")
+            .finish();
+        let bytes = deb_with_control(
+            &format!(
+                "Package: {name}\nVersion: 1.0\nArchitecture: amd64\nMaintainer: test\n\
+                 Description: the {name} package\n"
+            ),
+            &data,
+        );
+        let path = dir.join(format!("{name}_1.0_amd64.deb"));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let in_main = build("mainpkg");
+    let in_contrib = build("contribpkg");
+
+    let pool = dir.join("pool");
+    let publish = |component: &str, package: &Path| {
+        Pool::at(&pool)
+            .suite("trixie")
+            .architecture("amd64")
+            .component(component)
+            .publish([package])
+            .unwrap_or_else(|err| panic!("publishing into {component}: {err}"));
+    };
+    publish("main", &in_main);
+    publish("contrib", &in_contrib);
+
+    let release_text = || std::fs::read_to_string(pool.join("dists/trixie/Release")).unwrap();
+    let release = release_text();
+    assert!(
+        release.contains("Components: contrib main\n"),
+        "the second publish retired the first component: {release}",
+    );
+
+    // The digest a section is recorded under is what a reader verifies its
+    // fetch against, so republishing one component must leave the other's
+    // exactly as it was. Anything else breaks a reader that is midway through
+    // resolving a component this publish has nothing to do with.
+    let digest_of = |release: &str, section: &str| -> String {
+        release
+            .lines()
+            .find(|line| line.ends_with(section))
+            .unwrap_or_else(|| panic!("the release does not name {section}: {release}"))
+            .split_whitespace()
+            .next()
+            .expect("a section line begins with its digest")
+            .to_string()
+    };
+    let contrib_before = digest_of(&release, "contrib/binary-amd64/Packages");
+    publish("main", &in_main);
+    assert_eq!(
+        digest_of(&release_text(), "contrib/binary-amd64/Packages"),
+        contrib_before,
+        "republishing main changed the digest contrib's index is recorded under",
+    );
+
+    // Reachability, end to end: resolution verifies each index it fetches
+    // against the digest the release records, so drawing a package out of both
+    // components is only possible if the release names both sections.
+    let pool_repo = Repository::builder("trixie")
+        .mirror(format!("file://{}", pool.display()))
+        .components(["main", "contrib"])
+        .trust_unsigned(true)
+        .name("localpool")
+        .build()
+        .expect("the pool repository validates");
+
+    let rootfs = dir.join("rootfs");
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(primary)
+        .trust_unsigned(true)
+        .include(["mainpkg", "contribpkg"])
+        .repository(pool_repo)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .build()
+        .expect("the builder validates");
+
+    let plan = debian
+        .resolve()
+        .expect("both components resolve out of one pool");
+    let mut names: Vec<_> = plan.packages.iter().map(|p| p.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["base", "contribpkg", "mainpkg"]);
+
+    assert_eq!(
+        provision::ensure(&rootfs, &mut debian).expect("the bootstrap runs"),
+        Provisioned::Created,
+    );
+    // Each package came from its own component's pool directory.
+    assert!(rootfs.join("usr/bin/mainpkg").is_file());
+    assert!(rootfs.join("usr/bin/contribpkg").is_file());
 }
 
 #[test]
@@ -839,14 +955,7 @@ fn hermetic_resolve_layer_omits_the_base_packages() {
         &[
             Pkg::required("base", deb(&base_data), "libdep"),
             Pkg::ordinary("libdep", deb(&libdep_data)),
-            Pkg {
-                name: "tool".to_string(),
-                version: "1.0".to_string(),
-                deb: deb(&tool_data),
-                depends: "libdep".to_string(),
-                priority: String::new(),
-                essential: false,
-            },
+            Pkg::ordinary("tool", deb(&tool_data)).depending_on("libdep"),
         ],
     );
 
@@ -1561,4 +1670,701 @@ fn full_bootstrap_under_a_range_map_carries_real_ownership() {
     // escalated path itself is exercised by the identity tests.
     provision::remove(&rootfs).expect("the removal succeeds");
     assert!(!rootfs.exists());
+}
+
+/// A payload for a fixture package: one file under `/usr/bin` named for it.
+fn payload(name: &str) -> Vec<u8> {
+    deb(&Tar::new()
+        .dir("./usr", 0o755)
+        .dir("./usr/bin", 0o755)
+        .file(&format!("./usr/bin/{name}"), 0o755, b"#!/bin/true\n")
+        .finish())
+}
+
+#[test]
+fn available_reports_the_names_the_archive_carries() {
+    // The question a resolve cannot answer. A top-level include naming nothing
+    // fails the whole resolve, so asking that way tells a caller whether every
+    // name was there and never which were not.
+    let dir = common::scratch_dir("debian-available");
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload("base"), ""),
+            Pkg::ordinary("libdep", payload("libdep")),
+        ],
+    );
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let available = debian.available().expect("the index is read");
+
+    assert!(available.contains("base"));
+    assert!(available.contains("libdep"));
+    assert!(!available.contains("not-in-this-archive"));
+    // A real package is not a provider of itself.
+    assert_eq!(available.providers("libdep").count(), 0);
+}
+
+#[test]
+fn available_reports_a_virtual_name_nothing_is_named_for() {
+    // The case that is the reason for the whole query: `awk` is no package's
+    // name, so a resolve's closure can only say something satisfied it, and a
+    // caller reporting on a package list wants to know the name resolves and
+    // what satisfies it.
+    let dir = common::scratch_dir("debian-available-virtual");
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload("base"), ""),
+            Pkg::ordinary("mawk", payload("mawk")).providing("awk"),
+            Pkg::ordinary("gawk", payload("gawk")).providing("awk"),
+        ],
+    );
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let available = debian.available().expect("the index is read");
+
+    assert!(available.contains("awk"), "the virtual name resolves");
+    let providers: Vec<&str> = available.providers("awk").collect();
+    assert_eq!(
+        providers,
+        ["gawk", "mawk"],
+        "sorted, so the order is stable"
+    );
+}
+
+#[test]
+fn available_merges_every_configured_repository() {
+    let dir = common::scratch_dir("debian-available-merge");
+    let primary = write_repo(
+        &dir.join("primary"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", payload("base"), "")],
+    );
+    let extra = write_repo(
+        &dir.join("extra"),
+        "trixie",
+        "amd64",
+        &[Pkg::ordinary("only-here", payload("only-here"))],
+    );
+
+    let extra_repo = Repository::builder("trixie")
+        .mirror(extra)
+        .trust_unsigned(true)
+        .name("extra")
+        .build()
+        .expect("the extra repository validates");
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(primary)
+        .trust_unsigned(true)
+        .repository(extra_repo)
+        .build()
+        .expect("the builder validates");
+    let available = debian.available().expect("the indexes are read and merged");
+
+    assert!(available.contains("base"), "the primary's package");
+    assert!(available.contains("only-here"), "the second's package");
+}
+
+#[test]
+fn available_applies_the_architecture_filter() {
+    // The query answers availability for the architecture that was asked for.
+    // A package published only for another one cannot be installed here, so
+    // reporting it as available would be a wrong answer rather than a generous
+    // one; an `all` package is installable everywhere and is reported.
+    let dir = common::scratch_dir("debian-available-arch");
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload("base"), ""),
+            Pkg::ordinary("elsewhere", payload("elsewhere")).for_architecture("riscv64"),
+            Pkg::ordinary("everywhere", payload("everywhere")).for_architecture("all"),
+        ],
+    );
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let available = debian.available().expect("the index is read");
+
+    assert!(available.contains("base"));
+    assert!(
+        available.contains("everywhere"),
+        "an `all` package installs here"
+    );
+    assert!(
+        !available.contains("elsewhere"),
+        "another architecture's does not"
+    );
+}
+
+#[test]
+fn available_and_resolve_agree_on_one_index() {
+    // The two read the same merged index through the same path, so every name
+    // a resolve selects has to be a name the query reports. Pinning it keeps
+    // the projection from drifting away from what the resolver sees.
+    let dir = common::scratch_dir("debian-available-agrees");
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload("base"), "libdep"),
+            Pkg::ordinary("libdep", payload("libdep")),
+            Pkg::ordinary("tool", payload("tool")).depending_on("libdep"),
+        ],
+    );
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .include(["tool"])
+        .build()
+        .expect("the builder validates");
+    let plan = debian.resolve().expect("the plan resolves");
+
+    // A fresh builder, since `available` ignores the include set rather than
+    // consuming it, and reading through the same one would prove less.
+    let mut query = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let available = query.available().expect("the index is read");
+
+    assert!(
+        !plan.packages.is_empty(),
+        "the fixture resolves to something"
+    );
+    for package in &plan.packages {
+        assert!(
+            available.contains(&package.name),
+            "{} is in the plan but not reported available",
+            package.name,
+        );
+    }
+}
+
+#[test]
+fn a_plan_records_the_archive_state_it_resolved_against() {
+    // A plan naming a package set says what was selected and not what it was
+    // selected from, and the same suite resolves to different versions a week
+    // apart. The archive record is what makes the plan a description of a
+    // moment in an archive's life.
+    let dir = common::scratch_dir("debian-plan-archives");
+    let repo = dir.join("repo");
+    let mirror = write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload("base"), "libdep"),
+            Pkg::ordinary("libdep", payload("libdep")),
+        ],
+    );
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let plan = debian.resolve().expect("the plan resolves");
+
+    assert_eq!(plan.archives.len(), 1);
+    let archive = &plan.archives[0];
+    assert_eq!(archive.mirror, mirror);
+    assert_eq!(archive.suite, "trixie");
+    assert_eq!(archive.components, ["main"]);
+    // The digest is of the release body that was read, which for an unsigned
+    // repository is the Release file itself.
+    let release = std::fs::read(repo.join("dists/trixie/Release")).unwrap();
+    assert_eq!(
+        archive.release_sha256,
+        common::deb_repo::sha256_hex(&release)
+    );
+    // Nothing verified it, so no key is named. An empty list is the record of
+    // that, not an omission.
+    assert!(archive.signed_by.is_empty(), "{:?}", archive.signed_by);
+    // Every package resolved from the only archive there is.
+    assert!(plan.packages.iter().all(|package| package.archive == 0));
+}
+
+#[test]
+fn a_plan_records_the_mirror_that_served_rather_than_the_one_configured_first() {
+    // A repository with a snapshot backstop resolves against whichever URL
+    // answered. Recording the configured list would describe a choice rather
+    // than the choice made, and a caller replaying the plan would go to a
+    // mirror that never served it.
+    let dir = common::scratch_dir("debian-plan-backstop");
+    let backstop = write_repo(
+        &dir.join("backstop"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", payload("base"), "")],
+    );
+    let missing = format!("file://{}", dir.join("does-not-exist").display());
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(missing.clone())
+        .mirror_fallback(backstop.clone())
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let plan = debian.resolve().expect("the backstop serves the resolve");
+
+    assert_eq!(plan.archives.len(), 1);
+    assert_eq!(plan.archives[0].mirror, backstop);
+    assert_ne!(plan.archives[0].mirror, missing);
+}
+
+#[test]
+fn a_plan_indexes_each_package_to_the_archive_its_version_came_from() {
+    // Resolution is highest-version-wins across the merged repositories, so
+    // with more than one configured the archive index is the only thing that
+    // says where a package will actually be fetched from.
+    let dir = common::scratch_dir("debian-plan-multirepo");
+    let primary = write_repo(
+        &dir.join("primary"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", payload("base"), "")],
+    );
+    let feature = write_repo(
+        &dir.join("feature"),
+        "trixie",
+        "amd64",
+        &[Pkg::ordinary("custom", payload("custom"))],
+    );
+    let feature_repo = Repository::builder("trixie")
+        .mirror(feature.clone())
+        .trust_unsigned(true)
+        .name("feature")
+        .build()
+        .expect("the feature repository validates");
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(primary.clone())
+        .trust_unsigned(true)
+        .include(["custom"])
+        .repository(feature_repo)
+        .build()
+        .expect("the builder validates");
+    let plan = debian.resolve().expect("the plan resolves");
+
+    assert_eq!(plan.archives.len(), 2, "one record per repository");
+    assert_eq!(plan.archives[0].mirror, primary, "the primary leads");
+    assert_eq!(plan.archives[1].mirror, feature);
+
+    let index_of = |name: &str| {
+        plan.packages
+            .iter()
+            .find(|package| package.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the plan"))
+            .archive
+    };
+    assert_eq!(index_of("base"), 0, "the primary's package");
+    assert_eq!(index_of("custom"), 1, "the second repository's package");
+    // And the index names a real archive, so a caller can follow it to a URL.
+    assert_eq!(plan.archives[index_of("custom")].mirror, feature);
+}
+
+/// A fetcher that records every URL it is asked for and otherwise reads from
+/// the `file://` mirrors the hermetic fixtures write.
+///
+/// The `.deb` fetch has to work for a pinned install to finish, so this wraps
+/// the ordinary transport rather than replacing it: the assertion is about what
+/// was *not* asked for.
+#[derive(Default)]
+struct Watching {
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ferroday_cage::provision::debian::Fetch for Watching {
+    fn fetch(
+        &mut self,
+        request: &ferroday_cage::provision::debian::FetchRequest<'_>,
+        sink: &mut dyn std::io::Write,
+    ) -> Result<(), ferroday_cage::provision::debian::FetchError> {
+        self.asked
+            .lock()
+            .expect("the URL log is not poisoned")
+            .push(request.url().to_string());
+        ferroday_cage::provision::debian::HttpFetch::new().fetch(request, sink)
+    }
+}
+
+/// Builds a two-package hermetic repository and returns its scratch directory,
+/// its mirror URL, and the plan a resolve against it produces.
+fn resolved_fixture(name: &str) -> (std::path::PathBuf, String, Plan) {
+    let dir = common::scratch_dir(name);
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload("base"), "libdep"),
+            Pkg::ordinary("libdep", payload("libdep")),
+        ],
+    );
+    let plan = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates")
+        .resolve()
+        .expect("the plan resolves");
+    (dir, mirror, plan)
+}
+
+#[test]
+fn a_pinned_plan_installs_the_tree_the_resolve_that_made_it_would_have() {
+    // The primitive a reproduce mode is missing: resolve once, install from
+    // that, and get what the inline resolution would have laid down.
+    let (dir, mirror, plan) = resolved_fixture("debian-pinned-same-tree");
+
+    let inline_rootfs = dir.join("inline");
+    let mut inline = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .build()
+        .expect("the builder validates");
+    provision::ensure(&inline_rootfs, &mut inline).expect("the inline bootstrap runs");
+
+    let pinned_rootfs = dir.join("pinned");
+    let mut pinned = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(plan)
+        .build()
+        .expect("the pinned builder validates");
+    provision::ensure(&pinned_rootfs, &mut pinned).expect("the pinned bootstrap runs");
+
+    for entry in ["usr/bin/base", "usr/bin/libdep"] {
+        assert!(
+            pinned_rootfs.join(entry).is_file(),
+            "{entry} is missing from the pinned tree",
+        );
+        assert_eq!(
+            std::fs::read(inline_rootfs.join(entry)).unwrap(),
+            std::fs::read(pinned_rootfs.join(entry)).unwrap(),
+            "{entry} differs between the two trees",
+        );
+    }
+}
+
+#[test]
+fn a_plan_kept_as_a_document_installs_what_the_plan_it_came_from_would_have() {
+    // The reproduce case the same-process handoff does not cover: resolve on
+    // one machine, keep the plan on disk, and replay it later. The document is
+    // the whole interchange — nothing else travels — so a plan that survives it
+    // must install byte for byte what the plan it was written from would have.
+    let (dir, mirror, plan) = resolved_fixture("debian-plan-document");
+
+    let kept = dir.join("trixie.plan");
+    std::fs::write(&kept, plan.to_document().expect("the plan renders")).unwrap();
+    let read = ferroday_cage::provision::debian::Plan::parse_document(
+        &std::fs::read_to_string(&kept).unwrap(),
+    )
+    .expect("the kept document reads");
+    assert_eq!(read, plan, "the document did not carry the plan intact");
+
+    let inline_rootfs = dir.join("inline");
+    let mut inline = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(plan)
+        .build()
+        .expect("the builder validates");
+    provision::ensure(&inline_rootfs, &mut inline).expect("the in-process plan installs");
+
+    let replayed_rootfs = dir.join("replayed");
+    let mut replayed = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(read)
+        .build()
+        .expect("the replayed builder validates");
+    provision::ensure(&replayed_rootfs, &mut replayed).expect("the kept plan installs");
+
+    for entry in ["usr/bin/base", "usr/bin/libdep"] {
+        assert_eq!(
+            std::fs::read(inline_rootfs.join(entry)).unwrap(),
+            std::fs::read(replayed_rootfs.join(entry)).unwrap(),
+            "{entry} differs between the in-process plan and the kept one",
+        );
+    }
+}
+
+/// The guide prints a sample plan document. It is only worth printing if it is
+/// what the library actually emits, so it is parsed and re-rendered here rather
+/// than trusted: a change to the format that nobody carried into the guide
+/// leaves a sample that reads plausibly and is wrong.
+///
+/// A locked-down sample only covers the cases it contains, so the sample is
+/// itself checked for the ones this test exists to catch. The rendering of an
+/// empty field is the first of them: `Signed-By: ` with a trailing space was
+/// the defect that made this a test rather than a one-off check, and a sample
+/// whose every archive is signed would have rendered identically before and
+/// after that fix.
+#[test]
+fn the_guides_sample_document_is_what_the_library_emits() {
+    const GUIDE: &str = include_str!("../../../docs/src/debian.md");
+
+    let start = GUIDE
+        .find("### Keeping a plan")
+        .expect("the guide still has the plan-document section");
+    let block = GUIDE[start..]
+        .split_once("```text\n")
+        .expect("the section still prints a sample")
+        .1
+        .split_once("```")
+        .expect("the sample is fenced")
+        .0;
+
+    // An empty field, so the bare-colon rendering is exercised rather than
+    // only described in the prose beside it.
+    assert!(
+        block.contains("\nSigned-By:\n"),
+        "the sample has no unsigned archive, so it does not cover the empty-field \
+         rendering this test was written for:\n{block}",
+    );
+    // And an archive a package actually refers to by index, so the sample
+    // covers a plan with more than one repository.
+    assert!(block.contains("\nArchive: 1\n"), "{block}");
+
+    let plan = ferroday_cage::provision::debian::Plan::parse_document(block)
+        .expect("the guide's sample reads");
+    let rendered = plan.to_document().expect("and renders");
+    // Every stanza ends in a blank line, so a document ends in two newlines. A
+    // fenced block cannot show that last blank line, so it is the one
+    // difference the comparison allows.
+    assert_eq!(
+        rendered.trim_end_matches('\n'),
+        block.trim_end_matches('\n'),
+        "the guide's sample is not what the library emits",
+    );
+    assert!(rendered.ends_with("\n\n"), "{rendered:?}");
+}
+
+#[test]
+fn a_pinned_install_fetches_no_release_and_no_index() {
+    // The whole win, asserted through the fetcher seam: skipping the release
+    // and the index is what removes a 9 MB download from a reproduce run, and
+    // it is checkable without a network.
+    let (dir, mirror, plan) = resolved_fixture("debian-pinned-no-index");
+
+    let watcher = Watching::default();
+    let asked = std::sync::Arc::clone(&watcher.asked);
+    let mut pinned = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(plan)
+        .fetcher(Box::new(watcher))
+        .build()
+        .expect("the pinned builder validates");
+    provision::ensure(dir.join("rootfs"), &mut pinned).expect("the pinned bootstrap runs");
+
+    let urls = asked.lock().unwrap().clone();
+    assert!(!urls.is_empty(), "the packages were still fetched");
+    for url in &urls {
+        assert!(
+            !url.contains("/dists/"),
+            "a pinned install touched archive metadata: {url}",
+        );
+        assert!(url.contains("/pool/"), "only packages are fetched: {url}");
+    }
+}
+
+#[test]
+fn a_pinned_install_survives_an_archive_that_has_moved_on() {
+    // The point of pinning. The repository republishes with a newer version
+    // and without the one the plan names; the plan still installs its own
+    // versions, because it never consults the index that no longer offers them.
+    let dir = common::scratch_dir("debian-pinned-moved-on");
+    let repo = dir.join("repo");
+    let mirror = write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", payload("base"), "")],
+    );
+    let plan = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates")
+        .resolve()
+        .expect("the plan resolves");
+    let pinned_version = plan.packages[0].version.clone();
+
+    // The archive publishes on: a new version, and the index no longer names
+    // the old one. The pool file the plan points at is left in place, as a real
+    // archive leaves a superseded .deb until it is culled.
+    let mut newer = Pkg::required("base", payload("base-2"), "");
+    newer.version = "2.0".to_string();
+    write_repo(&repo, "trixie", "amd64", &[newer]);
+
+    let rootfs = dir.join("rootfs");
+    let mut pinned = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(plan)
+        .build()
+        .expect("the pinned builder validates");
+    provision::ensure(&rootfs, &mut pinned).expect("the pinned bootstrap runs");
+
+    assert_eq!(pinned_version, "1.0");
+    assert!(rootfs.join("usr/bin/base").is_file());
+}
+
+#[test]
+fn a_pinned_install_whose_package_is_gone_fails_naming_the_package() {
+    // The failure a caller has to be able to read: the plan is intact and the
+    // archive no longer holds what it names, which is a different problem from
+    // a resolution that found nothing.
+    let (dir, mirror, plan) = resolved_fixture("debian-pinned-missing-deb");
+    let gone = plan.packages[0].filename.clone();
+    std::fs::remove_file(dir.join("repo").join(&gone)).expect("the pool file is removable");
+
+    let mut pinned = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(plan)
+        .build()
+        .expect("the pinned builder validates");
+    let err = provision::ensure(dir.join("rootfs"), &mut pinned).unwrap_err();
+    let ProvisionError::Other { source: inner, .. } = &err else {
+        panic!("expected a boxed Debian error, got {err:?}");
+    };
+    let message = inner.to_string();
+    assert!(
+        message.contains(&gone),
+        "the report names the package: {message}"
+    );
+}
+
+#[test]
+fn a_pinned_install_refuses_a_digest_mismatch_without_trying_elsewhere() {
+    // The plan is the trust anchor, so the digest it records is the whole of
+    // what a fetched .deb is held to. A mismatch means the bytes are not the
+    // ones the plan was made from; another mirror cannot make that true.
+    let (dir, mirror, plan) = resolved_fixture("debian-pinned-mismatch");
+    let pool_deb = dir.join("repo").join(&plan.packages[0].filename);
+    let mut bytes = std::fs::read(&pool_deb).unwrap();
+    bytes.extend_from_slice(b"tampered");
+    std::fs::write(&pool_deb, &bytes).unwrap();
+
+    let mut pinned = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        // A backstop that would serve, so this proves the failure is terminal
+        // rather than merely unrecoverable for want of an alternative.
+        .mirror_fallback(format!("file://{}", dir.join("repo").display()))
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(plan)
+        .build()
+        .expect("the pinned builder validates");
+    let err = provision::ensure(dir.join("rootfs"), &mut pinned).unwrap_err();
+    let ProvisionError::Other { source: inner, .. } = &err else {
+        panic!("expected a boxed Debian error, got {err:?}");
+    };
+    assert!(
+        inner.to_string().contains("digest"),
+        "a digest mismatch is reported: {inner}",
+    );
+}
+
+#[test]
+fn a_plan_refuses_every_setting_that_would_shape_a_resolution() {
+    // Each refusal names what conflicts, rather than the build picking a silent
+    // precedence between a plan and a setting that contradicts it.
+    let (_dir, mirror, plan) = resolved_fixture("debian-pinned-conflicts");
+
+    let base = |plan: Plan| {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(mirror.clone())
+            .trust_unsigned(true)
+            .plan(plan)
+    };
+    let refusal =
+        |builder: ferroday_cage::provision::debian::DebianBuilder<'_>| match builder.build() {
+            Err(ferroday_cage::provision::debian::DebianError::Config { reason, .. }) => reason,
+            other => panic!("expected a configuration refusal, got {other:?}"),
+        };
+
+    assert!(refusal(base(plan.clone()).include(["git"])).contains("include()"));
+    assert!(refusal(base(plan.clone()).exclude(["git"])).contains("exclude()"));
+    assert!(
+        refusal(
+            base(plan.clone()).base_priority(ferroday_cage::provision::debian::Priority::Important)
+        )
+        .contains("base_priority()"),
+    );
+
+    // A plan for another suite or architecture describes a different tree.
+    let mut elsewhere = plan.clone();
+    elsewhere.suite = "bookworm".to_string();
+    assert!(refusal(base(elsewhere)).contains("bookworm"));
+    let mut foreign = plan.clone();
+    foreign.architecture = "riscv64".to_string();
+    assert!(refusal(base(foreign)).contains("riscv64"));
+
+    // And a plan resolved against more archives than there are repositories has
+    // packages naming a mirror that is not configured.
+    let mut wider = plan;
+    let extra = wider.archives[0].clone();
+    wider.archives.push(extra);
+    assert!(refusal(base(wider)).contains("2 archives"));
 }

@@ -5,10 +5,12 @@
 //! the leading magic bytes, never a file name, and unwrapped through the
 //! pure-Rust streaming decoders.
 //!
-//! Each wrapper's multi-member form is handled: concatenated xz streams, and
-//! multi-frame zstd (as `pzstd` emits, including a leading skippable frame).
-//! `ruzstd`'s `StreamingDecoder` decodes a single frame, so [`ZstdReader`]
-//! drives one decoder per frame and caps every data frame's declared window.
+//! Each wrapper's multi-member form is handled: concatenated gzip members (as
+//! `pigz` and a plain `cat` of two `.gz` files produce), concatenated xz
+//! streams, and multi-frame zstd (as `pzstd` emits, including a leading
+//! skippable frame). `ruzstd`'s `StreamingDecoder` decodes a single frame, so
+//! [`ZstdReader`] drives one decoder per frame and caps every data frame's
+//! declared window.
 
 use std::io::{self, Read};
 
@@ -70,7 +72,11 @@ pub(crate) fn decompress<'r, R: Read + 'r>(
 ) -> Result<Box<dyn Read + 'r>, ProvisionError> {
     let stream = io::Cursor::new(head.to_vec()).chain(rest);
     Ok(if head.starts_with(&[0x1f, 0x8b]) {
-        Box::new(flate2::read::GzDecoder::new(stream))
+        // Several concatenated gzip members are one legal gzip file, and a
+        // single-member decoder stops silently at the first member's end. A tar
+        // reader tolerates a missing terminator at end of input, so a truncated
+        // read there provisions an incomplete rootfs without an error.
+        Box::new(flate2::read::MultiGzDecoder::new(stream))
     } else if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         // Multiple concatenated xz streams are legal in one file and some
         // producers emit them.
@@ -154,6 +160,13 @@ impl<'r> ZstdReader<'r> {
 
 impl Read for ZstdReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A zero-length request is not end of stream, and the frame handover
+        // below reads a zero-byte decoder read as one. In-crate callers always
+        // pass a real buffer, but this reader is handed out as a
+        // `Box<dyn Read>`, and the `Read` contract is the caller's to rely on.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             let Some(decoder) = self.decoder.as_mut() else {
                 return Ok(0);
@@ -339,6 +352,103 @@ mod tests {
     use super::*;
 
     const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+    /// A tar stream of one file, plus the two terminator blocks. Used to prove
+    /// that a multi-member wrapper delivers every member's bytes.
+    fn tar_of(name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut block = [0u8; 512];
+        block[..name.len()].copy_from_slice(name.as_bytes());
+        for (field, value) in [
+            (100..108, 0o644u64),
+            (108..116, 0),
+            (116..124, 0),
+            (124..136, contents.len() as u64),
+            (136..148, 0),
+        ] {
+            let width = field.len() - 1;
+            let text = format!("{value:0width$o}");
+            block[field.start..field.start + text.len()].copy_from_slice(text.as_bytes());
+        }
+        block[156] = b'0';
+        block[257..263].copy_from_slice(b"ustar\0");
+        block[263..265].copy_from_slice(b"00");
+        let sum: u64 = block
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if (148..156).contains(&i) {
+                    32
+                } else {
+                    u64::from(*b)
+                }
+            })
+            .sum();
+        let text = format!("{sum:06o}");
+        block[148..148 + text.len()].copy_from_slice(text.as_bytes());
+        let mut out = block.to_vec();
+        out.extend_from_slice(contents);
+        out.resize(out.len() + (512 - contents.len() % 512) % 512, 0);
+        out
+    }
+
+    #[test]
+    fn concatenated_gzip_members_all_decode() {
+        // Two gzip members in one file is one legal gzip stream — `pigz` emits
+        // them, and so does `cat a.gz b.gz`. A single-member decoder stops
+        // silently at the first, and the tar reader tolerates a missing
+        // terminator at end of input, so the result would be a rootfs missing
+        // everything past the first member with no error anywhere.
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+
+        let gzip = |bytes: &[u8]| {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        };
+        let first = tar_of("first", b"one\n");
+        let second = tar_of("second", b"two\n");
+        let mut stream = gzip(&first);
+        stream.extend_from_slice(&gzip(&second));
+
+        let head = sniff_head(&mut stream.as_slice()).expect("the head sniffs");
+        let mut reader = decompress(&head, &stream[head.len()..]).expect("the wrapper is gzip");
+        let mut decoded = Vec::new();
+        reader
+            .read_to_end(&mut decoded)
+            .expect("the stream decodes");
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+        assert_eq!(decoded, expected, "both members decoded");
+    }
+
+    #[test]
+    fn concatenated_xz_streams_all_decode() {
+        // The same shape for xz, which the module claims to handle and no test
+        // pinned.
+        let xz = |bytes: &[u8]| {
+            let mut out = Vec::new();
+            let mut writer = lzma_rust2::XzWriter::new(&mut out, lzma_rust2::XzOptions::default())
+                .expect("an xz writer");
+            std::io::Write::write_all(&mut writer, bytes).unwrap();
+            writer.finish().expect("the xz stream finishes");
+            out
+        };
+        let first = tar_of("first", b"one\n");
+        let second = tar_of("second", b"two\n");
+        let mut stream = xz(&first);
+        stream.extend_from_slice(&xz(&second));
+
+        let head = sniff_head(&mut stream.as_slice()).expect("the head sniffs");
+        let mut reader = decompress(&head, &stream[head.len()..]).expect("the wrapper is xz");
+        let mut decoded = Vec::new();
+        reader
+            .read_to_end(&mut decoded)
+            .expect("the stream decodes");
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+        assert_eq!(decoded, expected, "both streams decoded");
+    }
 
     #[test]
     fn window_descriptor_frame_reports_its_window() {

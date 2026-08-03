@@ -45,10 +45,12 @@
 //!   Yama policy permits it. The curated seccomp denylist blocks `ptrace`
 //!   outright.
 //! - **Terminal injection.** A command that inherits the caller's controlling
-//!   terminal can push input into it with the `TIOCSTI` ioctl. Modern kernels
-//!   neutralize this with the `dev.tty.legacy_tiocsti` sysctl, and Landlock
-//!   ABI 5 governs device ioctls; otherwise a seccomp filter on `ioctl`, or not
-//!   sharing the terminal, closes it.
+//!   terminal can push input into it with the `TIOCSTI` ioctl. Three things
+//!   close it: the `dev.tty.legacy_tiocsti` sysctl, which modern kernels
+//!   default to off; a seccomp filter on `ioctl`; or not sharing the terminal.
+//!   Landlock does not, whatever the ABI: its rights bind a descriptor when it
+//!   is opened, and an inherited terminal was opened before the ruleset
+//!   existed.
 //!
 //! A cage closes all four through its namespaces and swapped root; a
 //! restriction closes each only through the control that covers it.
@@ -399,6 +401,11 @@ impl RestrictionBuilder {
     /// base rights on every Landlock kernel, so it always enforces there; a
     /// kernel without the Landlock LSM cannot enforce the grant, so the
     /// restriction is refused at build rather than run unconfined.
+    ///
+    /// An empty `access` is refused at build with
+    /// [`ConfigError::LandlockGrantEmpty`](crate::ConfigError::LandlockGrantEmpty):
+    /// it reads as "grant nothing here" and would behave as "deny the whole
+    /// filesystem", the command's own binary included.
     pub fn landlock_fs(mut self, access: FsAccess, path: impl AsRef<Path>) -> Self {
         self.hardening.grant_fs(access, path.as_ref());
         self
@@ -423,7 +430,8 @@ impl RestrictionBuilder {
     /// Landlock they narrow away best-effort, as an unsupported filesystem
     /// right does — except that a restriction whose only Landlock grant is a
     /// network grant is refused at build, since nothing would then be
-    /// enforced.
+    /// enforced. An empty `access` is refused at build for the same reason an
+    /// empty filesystem grant is: it would deny all TCP rather than nothing.
     ///
     /// [`NetAccess::BIND`]: crate::NetAccess::BIND
     /// [`NetAccess::CONNECT`]: crate::NetAccess::CONNECT
@@ -520,11 +528,14 @@ impl RestrictionBuilder {
                 stop_with_caller: self.stop_with_caller,
                 hostname: None,
                 configure_loopback: false,
+                // No network namespace is created, so the command runs in the
+                // caller's.
+                network: crate::Network::Host,
                 workdir,
                 ops: Vec::new(),
                 op_labels: Vec::new(),
                 // A restriction establishes no mount, so it creates no target.
-                managed_placeholder: None,
+                managed_placeholders: Vec::new(),
                 exec_label,
                 rlimits,
                 rlimit_labels,

@@ -51,6 +51,13 @@ use super::{ProvisionError, io_error};
 /// so a pathological filesystem state cannot loop forever.
 const REPLACE_ATTEMPTS: u32 = 3;
 
+/// The mode of a directory the extraction implies but no entry names.
+///
+/// An archive that carries `usr/lib/x` without an entry for `usr/lib` leaves
+/// the mode of that directory unstated; the conventional `0755` is the only
+/// answer available, and it is the one every other extractor gives.
+const IMPLIED_DIR_MODE: u32 = 0o755;
+
 /// The per-entry hook the extractor calls before writing each entry.
 ///
 /// Receives the entry's header and its validated path components. Its error
@@ -135,7 +142,7 @@ impl Extraction {
                 _ => {}
             }
 
-            let components = validate_path(&entry.path, &entry.path)?;
+            let components = validate_path(&entry.path, &entry.path, "path")?;
             if components.is_empty() {
                 // The `./` entry: metadata for the extraction root itself.
                 if entry.typeflag == b'5' {
@@ -193,18 +200,26 @@ pub(crate) fn extract_archive<R: Read>(
 /// Returns the path's components; `.` components and empty segments are
 /// dropped, so `./` normalizes to an empty list. `context` names the
 /// entry in errors (for a hardlink target, the entry it belongs to).
-fn validate_path(raw: &[u8], context: &[u8]) -> Result<Vec<Vec<u8>>, ProvisionError> {
+fn validate_path(raw: &[u8], context: &[u8], noun: &str) -> Result<Vec<Vec<u8>>, ProvisionError> {
     if raw.contains(&0) {
-        return Err(entry_unsafe(context, "the path contains a NUL byte"));
+        return Err(entry_unsafe(
+            context,
+            format!("the {noun} contains a NUL byte"),
+        ));
     }
     if raw.first() == Some(&b'/') {
-        return Err(entry_unsafe(context, "the path is absolute"));
+        return Err(entry_unsafe(context, format!("the {noun} is absolute")));
     }
     let mut components = Vec::new();
     for component in raw.split(|b| *b == b'/') {
         match component {
             b"" | b"." => continue,
-            b".." => return Err(entry_unsafe(context, "the path contains a `..` component")),
+            b".." => {
+                return Err(entry_unsafe(
+                    context,
+                    format!("the {noun} contains a `..` component"),
+                ));
+            }
             _ => components.push(component.to_vec()),
         }
     }
@@ -217,11 +232,19 @@ fn validate_path(raw: &[u8], context: &[u8]) -> Result<Vec<Vec<u8>>, ProvisionEr
 /// Resolution is kernel-scoped to `root` (`RESOLVE_BENEATH`); a parent
 /// path that escapes — through `..` in a symlink, an absolute symlink
 /// target, or any other route — is refused.
+///
+/// A directory created here is a parent the archive implied but never named,
+/// and gets the conventional `0755`. `dir_meta` is the deferred-metadata map of
+/// a caller that applies directory modes in a later pass, which records the
+/// mode rather than applying it: an implied parent's contents are still to be
+/// created, and it is created `0700` until they are. A caller with no such pass
+/// passes `None` and has the mode applied at once, so an implied parent is
+/// never left at the creation mode.
 fn open_parent(
     root: BorrowedFd<'_>,
     components: &[Vec<u8>],
     entry_path: &[u8],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    mut dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
 ) -> Result<OwnedFd, ProvisionError> {
     let parent = &components[..components.len() - 1];
     match open_dir_at(root, parent) {
@@ -242,12 +265,29 @@ fn open_parent(
             .map_err(|errno| resolve_error(errno, entry_path))?;
         let leaf = component_cstr(&parent[depth - 1], entry_path)?;
         match rustix::fs::mkdirat(&above, &leaf, Mode::from_raw_mode(0o700)) {
-            Ok(()) => {
-                dir_meta.entry(join(&parent[..depth])).or_insert(DirMeta {
-                    mode: 0o755,
-                    mtime: None,
-                });
-            }
+            Ok(()) => match dir_meta.as_deref_mut() {
+                Some(dir_meta) => {
+                    dir_meta.entry(join(&parent[..depth])).or_insert(DirMeta {
+                        mode: IMPLIED_DIR_MODE,
+                        mtime: None,
+                    });
+                }
+                None => {
+                    rustix::fs::chmodat(
+                        &above,
+                        &leaf,
+                        Mode::from_raw_mode(IMPLIED_DIR_MODE),
+                        AtFlags::empty(),
+                    )
+                    .map_err(|errno| {
+                        io_error(
+                            "setting the mode of a parent directory for",
+                            &bytes_to_path(entry_path),
+                            errno.into(),
+                        )
+                    })?;
+                }
+            },
             // A concurrent creation cannot happen (the staging tree is
             // private); EEXIST here means a dangling symlink or another
             // non-directory in the way, which the re-resolve below turns
@@ -364,7 +404,7 @@ fn extract_file<R: Read>(
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(root, components, &entry.path, dir_meta)?;
+    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
 
     let fd = create_replacing(
@@ -417,7 +457,7 @@ fn extract_dir(
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(root, components, &entry.path, dir_meta)?;
+    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
 
     match rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)) {
@@ -471,7 +511,7 @@ fn extract_symlink(
     }
     let target = CString::new(entry.link_target.clone())
         .map_err(|_| entry_unsafe(&entry.path, "the symlink target contains a NUL byte"))?;
-    let parent = open_parent(root, components, &entry.path, dir_meta)?;
+    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
 
     create_replacing(
@@ -505,7 +545,9 @@ fn extract_hardlink(
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let target_components = validate_path(&entry.link_target, &entry.path)?;
+    // The context is the entry's own path — the archive member at fault — while
+    // the noun names which of its two paths was rejected.
+    let target_components = validate_path(&entry.link_target, &entry.path, "hardlink target")?;
     if target_components.is_empty() {
         return Err(entry_unsafe(&entry.path, "the hardlink target is empty"));
     }
@@ -513,7 +555,7 @@ fn extract_hardlink(
         .map_err(|errno| resolve_error(errno, &entry.path))?;
     let target_leaf = component_cstr(target_components.last().expect("non-empty"), &entry.path)?;
 
-    let parent = open_parent(root, components, &entry.path, dir_meta)?;
+    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
 
     create_replacing(
@@ -541,7 +583,7 @@ fn extract_fifo(
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(root, components, &entry.path, dir_meta)?;
+    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
 
     create_replacing(
@@ -729,10 +771,10 @@ fn component_cstr(component: &[u8], entry_path: &[u8]) -> Result<CString, Provis
 }
 
 /// Builds [`ProvisionError::EntryUnsafe`].
-fn entry_unsafe(path: &[u8], reason: &str) -> ProvisionError {
+fn entry_unsafe(path: &[u8], reason: impl Into<String>) -> ProvisionError {
     ProvisionError::EntryUnsafe {
         path: bytes_to_path(path),
-        reason: reason.to_string(),
+        reason: reason.into(),
     }
 }
 
@@ -856,7 +898,7 @@ fn overlay_mkdir(
     components: &[Vec<u8>],
 ) -> Result<(), ProvisionError> {
     let path = join(components);
-    let parent = open_parent(root, components, &path, &mut HashMap::new())?;
+    let parent = open_parent(root, components, &path, None)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
     let mode = source_mode(source_path)?;
 
@@ -901,7 +943,7 @@ fn overlay_file(
     components: &[Vec<u8>],
 ) -> Result<(), ProvisionError> {
     let path = join(components);
-    let parent = open_parent(root, components, &path, &mut HashMap::new())?;
+    let parent = open_parent(root, components, &path, None)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
     let mode = source_mode(source_path)?;
 
@@ -942,7 +984,7 @@ fn overlay_symlink(
         .map_err(|err| io_error("reading the overlay symlink", source_path, err))?;
     let target = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| entry_unsafe(&path, "the symlink target contains a NUL byte"))?;
-    let parent = open_parent(root, components, &path, &mut HashMap::new())?;
+    let parent = open_parent(root, components, &path, None)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
 
     create_replacing(
@@ -967,16 +1009,11 @@ fn source_mode(path: &Path) -> Result<u32, ProvisionError> {
 #[cfg(all(test, feature = "debian"))]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
     use std::os::unix::fs::PermissionsExt;
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ferroday-cage-overlay-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir(tag: &str) -> Scratch {
+        Scratch::new(&format!("overlay-{tag}"))
     }
 
     #[test]
@@ -1010,6 +1047,39 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(mode, 0o640, "the file mode is preserved");
+    }
+
+    #[test]
+    fn an_implied_parent_is_traversable_without_a_deferred_mode_pass() {
+        // `open_parent` creates a missing directory 0700 and leaves widening it
+        // to the caller's later mode pass. A caller with no such pass — the
+        // overlay walk — asks for the mode at once instead, or the directory
+        // would keep a mode that only its owner can traverse.
+        let base = tempdir("implied-parent");
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let fd = rustix::fs::open(
+            &root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        let components: Vec<Vec<u8>> = [&b"usr"[..], b"lib", b"file"]
+            .iter()
+            .map(|name| name.to_vec())
+            .collect();
+        open_parent(fd.as_fd(), &components, b"usr/lib/file", None)
+            .expect("the implied parents are created");
+
+        for path in ["usr", "usr/lib"] {
+            let mode = fs::symlink_metadata(root.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o755, "{path} kept its creation mode");
+        }
     }
 
     #[test]

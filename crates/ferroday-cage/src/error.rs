@@ -304,6 +304,17 @@ impl fmt::Display for OverlayLayer {
 pub enum ConfigError {
     /// No rootfs was provided.
     RootfsMissing,
+    /// A plain rootfs and an overlay root were both configured, where exactly
+    /// one root can be in force.
+    ///
+    /// The builder's setters keep the two exclusive — [`rootfs`] clears an
+    /// overlay and [`overlay`] clears a rootfs — so this arises from a profile
+    /// that carries both keys. Honoring either one silently would discard the
+    /// other's configuration.
+    ///
+    /// [`rootfs`]: crate::CageBuilder::rootfs
+    /// [`overlay`]: crate::CageBuilder::overlay
+    RootContradiction,
     /// The rootfs path could not be resolved and opened as a directory.
     #[non_exhaustive]
     RootfsUnusable {
@@ -414,6 +425,19 @@ pub enum ConfigError {
     LandlockPathInvalid {
         /// The grant path as it was given to the builder.
         path: PathBuf,
+    },
+    /// A Landlock grant names no access at all.
+    ///
+    /// An empty access set is not "grant nothing here": enrolling any grant
+    /// denies everything ungranted, and the kernel skips a rule that permits
+    /// nothing — so an empty grant is a total denial of the class it belongs
+    /// to. That is never what an author means by naming a path or a port, so
+    /// it is refused rather than silently applied.
+    #[non_exhaustive]
+    LandlockGrantEmpty {
+        /// The grant as it was written: the path of a filesystem grant, or
+        /// `tcp:<port>` for a network grant.
+        grant: String,
     },
     /// A restriction names no Landlock grant and no seccomp policy.
     ///
@@ -532,6 +556,12 @@ pub enum ConfigError {
         /// The offending path.
         path: PathBuf,
     },
+    /// An overlay root names no lower layer.
+    ///
+    /// The first lower is the base the overlay mounts over — the sandbox's root
+    /// filesystem — so an overlay carrying only an upper has nothing to merge;
+    /// [`Overlay::lower`](crate::Overlay::lower) is required.
+    OverlayLowerMissing,
     /// An overlay root names no upper layer.
     ///
     /// An overlay with only lowers is a read-only merge; the sandbox needs
@@ -588,6 +618,10 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::RootfsMissing => f.write_str("no rootfs was provided"),
+            ConfigError::RootContradiction => f.write_str(
+                "a rootfs and an overlay root are both configured, but exactly one root is \
+                 in force; drop one of the two",
+            ),
             ConfigError::RootfsUnusable { path, errno } => write!(
                 f,
                 "cannot use {} as the rootfs: {}",
@@ -661,6 +695,11 @@ impl fmt::Display for ConfigError {
                 f,
                 "the seccomp program is {len} instructions, over the kernel maximum of {max}",
             ),
+            ConfigError::LandlockGrantEmpty { grant } => write!(
+                f,
+                "the Landlock grant on {grant} names no access; enrolling a grant denies \
+                 everything ungranted, so an empty one denies the whole class",
+            ),
             ConfigError::LandlockPathInvalid { path } => write!(
                 f,
                 "the Landlock grant path {} is not a normal absolute path",
@@ -728,6 +767,9 @@ impl fmt::Display for ConfigError {
                  options cannot carry",
                 path.display(),
             ),
+            ConfigError::OverlayLowerMissing => {
+                f.write_str("the overlay root names no lower layer to mount over")
+            }
             ConfigError::OverlayUpperMissing => {
                 f.write_str("the overlay root names no upper layer for its writes")
             }
@@ -810,7 +852,9 @@ pub enum Error {
     /// The sandbox process outcome could not be collected.
     #[non_exhaustive]
     Wait {
-        /// The raw OS error from reading the setup-error pipe or waiting.
+        /// The raw OS error from collecting the outcome: reading the
+        /// setup-error, status, or capture pipes, waiting on them, or the wait
+        /// itself.
         errno: i32,
     },
     /// The sandbox supervisor exited without reporting the command's

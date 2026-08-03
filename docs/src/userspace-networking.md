@@ -23,15 +23,15 @@ stack's startup. The seam is a pause that removes the race.
 [`Cage::spawn_pending`] builds the sandbox — creating its namespaces — but
 holds the command at a gate just before it runs, returning a [`Pending`]
 handle instead of a running one. The handle exposes
-[`netns_pid`](Pending::netns_pid), a host pid of a process inside the
+[`netns_pid`][`Pending::netns_pid`], a host pid of a process inside the
 sandbox's network namespace. A stack attaches to that namespace, and
-[`proceed`](Pending::proceed) then releases the command and returns the usual
+[`proceed`][`Pending::proceed`] then releases the command and returns the usual
 [`Running`] handle. Because the stack is up before the command runs, the
 sandbox sees the network from its first instruction.
 
 Dropping a `Pending` without proceeding tears the launch down — the supervisor
 is killed and the launch stage reaped — so an aborted attach leaves no sandbox
-running. [`spawn_pending_with`](Cage::spawn_pending_with) is the streaming
+running. [`spawn_pending_with`][`Cage::spawn_pending_with`] is the streaming
 counterpart: it binds an observer that receives the command's output once
 `proceed` releases it.
 
@@ -83,13 +83,13 @@ network the stack always places the gateway at host 2 and the guest at host
 
 | Setting | Default | Builder method |
 |---|---|---|
-| IPv4 | on | [`ipv4`](NetStackBuilder::ipv4) |
-| IPv6 | on | [`ipv6`](NetStackBuilder::ipv6) |
-| IPv4 network | `10.0.2.0/24` (guest `.15`, gateway `.2`) | [`ipv4_cidr`](NetStackBuilder::ipv4_cidr) |
-| IPv6 network | `fd00::/64` (guest `::15`, gateway `::2`) | [`ipv6_cidr`](NetStackBuilder::ipv6_cidr) |
-| MTU | 1500 | [`mtu`](NetStackBuilder::mtu) |
-| Interface name | `tap0` | [`interface`](NetStackBuilder::interface) |
-| Host-loopback mapping | off | [`host_loopback`](NetStackBuilder::host_loopback) |
+| IPv4 | on | [`ipv4`][`NetStackBuilder::ipv4`] |
+| IPv6 | on | [`ipv6`][`NetStackBuilder::ipv6`] |
+| IPv4 network | `10.0.2.0/24` (guest `.15`, gateway `.2`) | [`ipv4_cidr`][`NetStackBuilder::ipv4_cidr`] |
+| IPv6 network | `fd00::/64` (guest `::15`, gateway `::2`) | [`ipv6_cidr`][`NetStackBuilder::ipv6_cidr`] |
+| MTU | 1500 | [`mtu`][`NetStackBuilder::mtu`] |
+| Interface name | `tap0` | [`interface`][`NetStackBuilder::interface`] |
+| Host-loopback mapping | off | [`host_loopback`][`NetStackBuilder::host_loopback`] |
 
 With the `serde` feature the builder is also the stack's profile format: it
 serializes and deserializes as the stack specification, for embedding in a
@@ -98,13 +98,13 @@ and the CIDR fields read and write as `"address/len"` strings.
 
 ### The handle owns the stack
 
-[`attach`](NetStack::attach) returns a [`NetStackHandle`] that owns the pump
+[`attach`][`NetStack::attach`] returns a [`NetStackHandle`] that owns the pump
 thread serving the tap. The pump holds the tap descriptor open, which pins the
 device and, through it, the sandbox's network namespace — so the pump never
 observes the sandbox's death on its own. Two rules follow:
 
 - **Wait, then stop.** Wait for the command to finish, then call
-  [`stop`](NetStackHandle::stop). `stop` signals the pump, joins it, and
+  [`stop`][`NetStackHandle::stop`]. `stop` signals the pump, joins it, and
   reports any error the pump ended on. Stopping before the command exits
   simply cuts the network early.
 - **Dropping the handle is safe.** A dropped handle stops the pump the same
@@ -112,7 +112,7 @@ observes the sandbox's death on its own. Two rules follow:
   command merely loses connectivity. The stack is an attachment, not a
   lifeline.
 
-[`is_running`](NetStackHandle::is_running) reports whether the pump is still
+[`is_running`][`NetStackHandle::is_running`] reports whether the pump is still
 serving the tap — false after `stop`, or on its own if the pump hit an
 unrecoverable error, which `stop` then reports.
 
@@ -138,8 +138,11 @@ system's rather than one shared address space's.
 
 The stack forwards where the guest could plausibly reach and refuses what it
 should not. Multicast, broadcast, unspecified, loopback, and link-local
-destinations are always refused; a refused destination answers the guest with
-a connection reset, so denial costs nothing. Refusing loopback keeps the
+destinations are always refused. A refused TCP connection is answered with a
+reset, so denial costs the guest nothing; a refused UDP datagram is simply
+dropped, and whether the guest also receives an ICMP port-unreachable depends
+on whether the stack happens to hold a socket on that port for another
+destination — read nothing into either outcome. Refusing loopback keeps the
 sandbox away from services bound to the host's `127.0.0.1`.
 
 Two refusals follow from the same principle. The IPv4 `0.0.0.0/8` block is
@@ -152,10 +155,29 @@ guest's on-link traffic to the host's view of those addresses, which collides
 with a real LAN wherever the default `10.0.2.0/24` overlaps one.
 
 The gateway address is the one deliberate exception. With
-[`host_loopback(true)`](NetStackBuilder::host_loopback), a connection to the
+[`host_loopback(true)`][`NetStackBuilder::host_loopback`], a connection to the
 gateway (`10.0.2.2` or `fd00::2` by default) is forwarded to the host's
 loopback, port preserved — the conventional way to reach a host-local service,
 granted explicitly rather than by opening the whole loopback range.
+
+### One datagram, one packet
+
+The stack does not fragment IP packets, in either direction. A UDP datagram
+therefore has to fit in a single packet: the MTU less the family's IP header
+and UDP's own eight bytes, so 1472 bytes over IPv4 and 1452 over IPv6 at the
+default 1500-byte MTU. A larger reply from a host peer is dropped rather than
+delivered in part, and a larger datagram from the guest never leaves it, since
+the guest's own kernel fragments what it cannot send whole.
+
+This matters mostly for DNS. A resolver that advertises a large EDNS receive
+buffer — 4096 bytes is a common default for diagnostic tools, and DNSSEC
+answers do reach that size — asks for answers the stack cannot carry, and the
+guest sees a timeout rather than an error. Raise the MTU with
+[`mtu`][`NetStackBuilder::mtu`] if the guest needs larger datagrams, or
+configure its resolver for a smaller EDNS buffer.
+
+TCP is unaffected: the stack terminates the guest's connections, so each side
+segments to its own path.
 
 ### DNS
 
@@ -167,7 +189,8 @@ provide. One case needs care: a host running systemd-resolved lists only
 `resolv.conf` only when it names a routable (non-loopback) nameserver, point
 the sandbox at a public resolver, or address services by IP. The
 [`fcage`](#the-command-line) command and the `fetch-sandbox` example both
-apply the first rule.
+apply the first rule. Large answers have a size ceiling of their own — see
+[One datagram, one packet](#one-datagram-one-packet).
 
 ### One namespace move, on a helper process
 
@@ -192,8 +215,11 @@ fcage --rootfs ./alpine --netstack /usr/bin/wget -qO- http://example.org
 `--netstack-host-loopback` maps the gateway address onto host loopback.
 `--netstack` composes the sandbox's `resolv.conf` from the host's routable
 nameservers, warning instead when the host offers only loopback resolvers;
-`--no-resolv-conf` opts out. The flag conflicts with `--share-net` and with
-`--restrict`.
+`--no-resolv-conf` opts out, and so does `--no-managed-mounts`, whose promise is
+that the sandbox carries exactly the binds the command line names. A rootfs that
+ships no `/etc/resolv.conf` gets one created to mount onto and taken away again
+afterwards, as every file bind target does. The flag conflicts with `--share-net`
+and with `--restrict`.
 
 ### A worked example
 

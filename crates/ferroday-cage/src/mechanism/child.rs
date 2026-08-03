@@ -17,9 +17,10 @@
 //! namespace down, so processes the command left running are terminated by
 //! the kernel.
 //!
-//! Without a PID namespace, stage A itself is the supervisor: it forks one
-//! process that performs the sandbox setup and becomes the command, and
-//! supervises it from outside.
+//! Without a PID namespace there is no init, and the command process is itself
+//! the supervisor the caller's handle anchors on. Stage A forks that one
+//! process, which performs the sandbox setup and becomes the command, and stays
+//! outside as its parent until the outcome arrives.
 //!
 //! A restriction launch (the fallback for hosts without user namespaces)
 //! takes the same outside-supervised shape, with the namespace and mount
@@ -442,11 +443,12 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 /// `dup2` clears close-on-exec on its target as a side effect, which is what
 /// lets the redirected stream survive `execve` while every original copy still
 /// closes. The one exception is `dup2(fd, fd)`, a kernel no-op that leaves the
-/// flag set: that arises when the caller closed its own standard stream before
-/// spawning and the capture pipe or the null descriptor took the freed number.
-/// Clearing close-on-exec explicitly there keeps the stream from closing at
-/// exec, which would otherwise leave the command with no stdout or stderr and
-/// no error.
+/// flag set. Only a caller-supplied [`StdinPlan::Fd`](super::StdinPlan::Fd) that
+/// already sits at file descriptor 0 can reach it: the launch creates six
+/// descriptors of its own before the null descriptor and the capture pipes, so
+/// those always land at 3 or above. Clearing close-on-exec explicitly keeps the
+/// stream from closing at exec, which would otherwise leave the command without
+/// it and without an error.
 fn wire_stdio(context: &Context<'_>) -> Result<(), Errno> {
     // The standard stream numbers `dup2` targets. A source descriptor already
     // at its target number needs close-on-exec cleared directly, since
@@ -915,10 +917,8 @@ pub(super) fn reset_signals() -> Result<(), Errno> {
 
 /// Closes every descriptor the launch does not own.
 ///
-/// Iterates `/proc/self/fd`, keeping the standard streams (the command may
-/// inherit them) and the launch channels. Entries arrive in ascending
-/// numeric order and procfs positions are keyed by descriptor number, so
-/// closing the entry just returned never perturbs the iteration.
+/// Keeps the standard streams (the command may inherit them) and the launch
+/// channels; [`sweep_fds_keeping`] does the work.
 fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
     // The kept set is the channel list mapped one for one, so it is exactly
     // as long as the list itself: adding a channel here cannot overrun a
@@ -937,7 +937,26 @@ fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
         context.stdin_fd,
     ]
     .map(|channel| channel.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
+    sweep_fds_keeping(&keep)
+}
 
+/// Closes every descriptor this process does not own: the standard streams and
+/// the entries of `keep` survive, everything else is closed.
+///
+/// Iterates `/proc/self/fd`. Entries arrive in ascending numeric order and
+/// procfs positions are keyed by descriptor number, so closing the entry just
+/// returned never perturbs the iteration.
+///
+/// Every forked child sweeps, not only the launch stage. A copied descriptor
+/// table is not inert: an inherited copy of a live sandbox's control socket
+/// holds that socket open, and the supervisor's hangup detection — the whole of
+/// [`stop_with_caller`](crate::CageBuilder::stop_with_caller) — waits on the
+/// last copy closing. A child that swept nothing would defer that for as long
+/// as it runs.
+///
+/// Post-fork safe: no allocation, no locking, and no syscall but the directory
+/// read and `close`.
+pub(super) fn sweep_fds_keeping(keep: &[RawFd]) -> Result<(), Errno> {
     let dir = rustix::fs::open(
         c"/proc/self/fd",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,

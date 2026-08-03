@@ -82,8 +82,10 @@ jobs:
       - name: Documentation (default features, warning-clean)
         # The crate documents its feature-gated sections behind the feature,
         # so a no-feature build is warning-clean too, not only the all-features
-        # one above.
-        run: cargo doc --workspace --no-deps
+        # one above. Scoped to the library: `--workspace` would build the CLI,
+        # which enables every feature, and unification would then document the
+        # library with them all on — the opposite of what this step tests.
+        run: cargo doc -p ferroday-cage --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -111,7 +113,13 @@ jobs:
         # interactions that actually break — `serde` without `hardening` is the
         # shape of problem this catches generally. A combination that stops
         # compiling is a breaking change for whoever selected it.
-        run: cargo hack check -p ferroday-cage --feature-powerset --depth 2
+        #
+        # `--all-targets` extends that to the tests and examples. A test target
+        # declaring `required-features` still compiles under a combination that
+        # satisfies them, so one reaching past what it declared is invisible to
+        # an ordinary package check and to every all-features command a
+        # contributor runs locally.
+        run: cargo hack check -p ferroday-cage --feature-powerset --depth 2 --all-targets
 
   api:
     name: Public API surface

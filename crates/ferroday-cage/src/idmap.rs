@@ -369,6 +369,11 @@ impl fmt::Display for IdMapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IdMapError::Unsatisfiable { reason } => f.write_str(reason),
+            // An errno of zero means the spawn failure carried no OS error at
+            // all; rendering it would read "Success (os error 0)".
+            IdMapError::HelperSpawn { helper, errno: 0 } => {
+                write!(f, "could not execute {helper}")
+            }
             IdMapError::HelperSpawn { helper, errno } => write!(
                 f,
                 "could not execute {helper}: {}",
@@ -421,11 +426,16 @@ fn validate_ranges(which: &str, ranges: &[IdRange]) -> Result<(), String> {
                 range.inside,
             ));
         }
-        if range.inside.checked_add(range.count - 1).is_none()
-            || range.outside.checked_add(range.count - 1).is_none()
+        // `start + count` rather than `start + count - 1`: the kernel rejects
+        // the id `(u32)-1`, so an extent ending exactly at `u32::MAX` is one the
+        // map cannot carry. Catching it here keeps the promise that an
+        // unrepresentable extent is a typed build error rather than a failure
+        // at apply time.
+        if range.inside.checked_add(range.count).is_none()
+            || range.outside.checked_add(range.count).is_none()
         {
             return Err(format!(
-                "the {which} extent at inside id {} wraps the id space",
+                "the {which} extent at inside id {} runs past the last usable id",
                 range.inside,
             ));
         }
@@ -515,7 +525,12 @@ fn write_map_file(path: &str, which: &'static str, data: &[u8]) -> Result<(), Id
         .map_err(map_write)?;
     match rustix::io::write(&fd, data) {
         Ok(n) if n == data.len() => Ok(()),
-        Ok(_) => Err(map_write(Errno::IO)),
+        // The kernel takes a map file's contents whole or not at all, so a
+        // short write is not an errno the kernel reported. Fabricating one
+        // would render as "Input/output error" and send a reader looking for a
+        // device fault; `EMSGSIZE` says what happened — the write did not
+        // carry the whole map.
+        Ok(_) => Err(map_write(Errno::MSGSIZE)),
         Err(errno) => Err(map_write(errno)),
     }
 }
@@ -975,6 +990,9 @@ mod subid {
             return Vec::new();
         };
         let mut ranges = Vec::new();
+        // The key the file turned out to be written under, fixed by the first
+        // entry that yielded a range.
+        let mut matching: Option<&String> = None;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -982,12 +1000,21 @@ mod subid {
             }
             let mut fields = line.split(':');
             let Some(owner) = fields.next() else { continue };
-            if !keys.iter().any(|key| key == owner) {
+            // The first key that answers owns the file, as `query_getsubids`
+            // has it: a host granting the same block under both the user name
+            // and the literal uid would otherwise yield each range twice, and
+            // the duplicate overlaps itself and fails the build with a message
+            // blaming a perfectly legal configuration.
+            let Some(answering) = keys.iter().find(|key| *key == owner) else {
+                continue;
+            };
+            if matching.is_some_and(|key| key != answering) {
                 continue;
             }
             if let (Some(start), Some(count)) = (fields.next(), fields.next())
                 && let (Ok(start), Ok(count)) = (start.parse(), count.parse())
             {
+                matching = Some(answering);
                 ranges.push((start, count));
             }
         }
@@ -1011,8 +1038,15 @@ mod subid {
         }];
         let mut inside = 1u32;
         for &(start, count) in allocation {
-            // An allocation vast enough to exhaust the 32-bit inside space
-            // is truncated at the boundary; ids beyond it are unaddressable.
+            // A zero-count entry contributes nothing but is a legal line in a
+            // subordinate file; skipping it keeps the entries after it, which
+            // stopping would silently drop.
+            if count == 0 {
+                continue;
+            }
+            // An allocation vast enough to exhaust the 32-bit inside space is
+            // truncated at the boundary; ids beyond it are unaddressable, and
+            // nothing after this entry can be addressed either.
             let count = count.min(u32::MAX - inside);
             if count == 0 {
                 break;
@@ -1049,6 +1083,30 @@ mod subid {
                     },
                     IdRange {
                         inside: 65537,
+                        outside: 300000,
+                        count: 1000
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn a_zero_count_allocation_entry_does_not_truncate_the_map() {
+            // `user:100000:0` parses fine and grants nothing. Stopping there
+            // would silently drop every range after it, leaving a map far
+            // smaller than the host allocated and a sandbox unable to reach
+            // ids it was granted.
+            let map = compose_subordinate(1000, &[(100000, 0), (300000, 1000)]);
+            assert_eq!(
+                map,
+                [
+                    IdRange {
+                        inside: 0,
+                        outside: 1000,
+                        count: 1
+                    },
+                    IdRange {
+                        inside: 1,
                         outside: 300000,
                         count: 1000
                     },
@@ -1094,14 +1152,42 @@ pub(crate) fn resolve_default_chain(
 }
 
 /// Whether the allocation covers the extent's whole outside range.
+///
+/// Adjoining entries count as one span, which is what shadow's own `have_range`
+/// does: a caller granted `100000:65536` and `165536:65536` may legally ask for
+/// a single extent across both, and refusing it would reject a map the delegate
+/// would have applied. (The kernel's own requirement, which [`DirectMapper`]
+/// checks against the parent's map, is different and genuinely per-extent.)
 #[cfg(feature = "subid")]
 fn maps_outside_range(allocation: &[(u32, u32)], range: &IdRange) -> bool {
     let Some(last) = range.outside.checked_add(range.count.saturating_sub(1)) else {
         return false;
     };
-    allocation
+    coalesce(allocation)
+        .into_iter()
+        .any(|(start, end)| range.outside >= start && last <= end)
+}
+
+/// The allocation as inclusive `(start, end)` spans, with adjoining and
+/// overlapping entries merged.
+#[cfg(feature = "subid")]
+fn coalesce(allocation: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut spans: Vec<(u32, u32)> = allocation
         .iter()
-        .any(|&(start, count)| range.outside >= start && last - start < count)
+        .filter(|&&(_, count)| count > 0)
+        .map(|&(start, count)| (start, start.saturating_add(count - 1)))
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            // `start - 1` is safe: a span starting at 0 sorts first and cannot
+            // follow another.
+            Some(last) if start <= last.1 || start - 1 == last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -1205,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn an_extent_wrapping_the_id_space_is_rejected() {
+    fn an_extent_running_past_the_last_usable_id_is_rejected() {
         let err = validate_request(&ranges_map(
             vec![range(0, 1000, 1), range(u32::MAX, 100000, 2)],
             vec![range(0, 1000, 1)],
@@ -1213,8 +1299,27 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::IdentityMapInvalid { reason } if reason.contains("wraps")
+            ConfigError::IdentityMapInvalid { reason } if reason.contains("past the last usable id")
         ));
+
+        // The bound is the kernel's, which reserves `(u32)-1`: an extent ending
+        // exactly there is refused here rather than at apply time, where the
+        // build error the docs promise is no longer available.
+        let ends_at_max = validate_request(&ranges_map(
+            vec![range(0, 1000, 1), range(1, u32::MAX - 1, 2)],
+            vec![range(0, 1000, 1)],
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            ends_at_max,
+            ConfigError::IdentityMapInvalid { reason } if reason.contains("past the last usable id")
+        ));
+        // One id short of it is fine.
+        validate_request(&ranges_map(
+            vec![range(0, 1000, 1), range(1, u32::MAX - 2, 2)],
+            vec![range(0, 1000, 1)],
+        ))
+        .expect("an extent ending one short of the reserved id is representable");
     }
 
     #[test]
@@ -1270,6 +1375,30 @@ mod tests {
             mapper.resolve(&IdentityMap::Subordinate),
             Err(IdMapError::Unsatisfiable { .. })
         ));
+    }
+
+    #[cfg(feature = "subid")]
+    #[test]
+    fn an_extent_is_checked_against_the_whole_allocation() {
+        // The containment check behind the `Ranges` refusal. An extent inside
+        // one entry passes; one running past every entry does not.
+        let allocation = [(100_000, 65_536), (300_000, 1_000)];
+        assert!(maps_outside_range(&allocation, &range(1, 100_000, 65_536)));
+        assert!(maps_outside_range(&allocation, &range(1, 165_535, 1)));
+        assert!(!maps_outside_range(&allocation, &range(1, 165_536, 1)));
+        assert!(!maps_outside_range(&allocation, &range(1, 99_999, 2)));
+        assert!(!maps_outside_range(&allocation, &range(1, 300_000, 1_001)));
+        // An extent spanning adjoining entries is legal — shadow's own
+        // `have_range` accepts it — so refusing it would reject a map the
+        // delegate would have applied.
+        let adjoining = [(100_000, 65_536), (165_536, 65_536)];
+        assert!(maps_outside_range(&adjoining, &range(1, 100_000, 131_072)));
+        // A gap of one id is still a gap.
+        let gapped = [(100_000, 65_536), (165_537, 65_536)];
+        assert!(!maps_outside_range(&gapped, &range(1, 100_000, 131_072)));
+        // An empty allocation covers nothing, and a zero-count entry is empty.
+        assert!(!maps_outside_range(&[], &range(1, 100_000, 1)));
+        assert!(!maps_outside_range(&[(100_000, 0)], &range(1, 100_000, 1)));
     }
 
     #[test]

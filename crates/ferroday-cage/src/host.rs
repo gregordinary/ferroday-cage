@@ -323,10 +323,13 @@ fn probe_name(prefix: &str) -> String {
 /// Sixteen hex digits distinguishing one call from every other, for naming a
 /// filesystem entry no concurrent caller may collide with.
 ///
-/// The pid seeds the buffer so that concurrent callers on a host where
-/// `getrandom` is unavailable still differ; where it works, it overwrites the
-/// seed, and a short read (which a request this small does not produce in
-/// practice) leaves a mixture that is no less unique.
+/// The pid seeds the buffer so that concurrent *processes* on a host where
+/// `getrandom` is unavailable still differ — threads of one process share a pid
+/// and would not — where it works, it overwrites the seed, and a short read
+/// (which a request this small does not produce in practice) leaves a mixture
+/// that is no less unique. Uniqueness is not what makes the naming safe in any
+/// case: every caller creates its entry with `O_EXCL` and treats a collision as
+/// a failure.
 pub(crate) fn unique_hex() -> String {
     let mut bytes = u64::from(std::process::id()).to_ne_bytes();
     let _ = rustix::rand::getrandom(&mut bytes, GetRandomFlags::empty());
@@ -680,6 +683,12 @@ enum HelperPrivilege {
     None,
 }
 
+/// The `VFS_CAP_FLAGS_EFFECTIVE` bit of a `security.capability` attribute's
+/// magic word: the file's capabilities are raised in the effective set at exec,
+/// rather than merely permitted for a program that raises them itself.
+#[cfg(feature = "subid")]
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x0000_0001;
+
 /// Determines a helper's privilege: the setuid bit, or the needed capability
 /// in its `security.capability` extended attribute. Podman's probe accepts
 /// either, and so does this one; a mode check alone would misreport
@@ -706,6 +715,15 @@ fn helper_privilege(
         return HelperPrivilege::None;
     };
     if len < 8 {
+        return HelperPrivilege::None;
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().expect("slice length is 4"));
+    // The effective bit rides in the magic word. Without it the capability is
+    // permitted but not raised at exec, so a helper that is not itself
+    // capability-aware — and `newuidmap` is not — runs without it and fails.
+    // Reporting such a helper as privileged would have the probe name no
+    // blocker where there is one.
+    if magic & VFS_CAP_FLAGS_EFFECTIVE == 0 {
         return HelperPrivilege::None;
     }
     let permitted_low = u32::from_le_bytes(buf[4..8].try_into().expect("slice length is 4"));
@@ -753,8 +771,7 @@ mod tests {
         // The result is host-dependent, but the probe — which forks a child and
         // creates temporary files and directories — must always be safe to call
         // and must leave nothing behind under the scratch directory.
-        let dir = std::env::temp_dir().join(format!("fcage-overlay-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::Scratch::new("overlay-probe");
         let _ = overlay_blocker(&dir);
         // No probe residue remains in the scratch directory.
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -766,7 +783,6 @@ mod tests {
             "the overlay probe left {} entries behind",
             leftovers.len(),
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -784,8 +800,7 @@ mod tests {
         // A neighbour who guesses the probe's name must not have the probe write
         // through what it finds there. Both plants are refused outright, and the
         // symlink's target survives intact.
-        let dir = std::env::temp_dir().join(probe_name("fcage-plant-"));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = crate::scratch::Scratch::new("plant");
         std::fs::write(dir.join("victim"), b"intact").unwrap();
         std::os::unix::fs::symlink("victim", dir.join("link")).unwrap();
         std::fs::write(dir.join("regular"), b"mine").unwrap();
@@ -806,8 +821,6 @@ mod tests {
             rustix::fs::mkdirat(&parent, "link", Mode::RWXU),
             Err(rustix::io::Errno::EXIST),
         );
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

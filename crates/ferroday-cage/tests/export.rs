@@ -32,13 +32,46 @@ fn userns_available() -> bool {
     }
 }
 
-/// A unique, empty scratch directory for one test.
-fn scratch(tag: &str) -> std::path::PathBuf {
+/// A unique, empty scratch directory for one test, removed when it drops.
+///
+/// The removal goes through [`provision::remove`] rather than
+/// `std::fs::remove_dir_all`: these trees hold subordinate-owned entries the
+/// calling user cannot unlink, which is the whole subject of the file.
+fn scratch(tag: &str) -> Scratch {
     let dir =
         std::env::temp_dir().join(format!("ferroday-cage-export-{tag}-{}", std::process::id()));
     let _ = provision::remove(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    Scratch { path: dir }
+}
+
+/// A scratch directory that takes its tree with it.
+///
+/// Dereferences to its [`Path`], so it stands in for one at a call site.
+struct Scratch {
+    path: std::path::PathBuf,
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    /// Best effort: a test that has already failed should report its own
+    /// assertion, not a cleanup failure raised while it unwinds.
+    fn drop(&mut self) {
+        let _ = provision::remove(&self.path);
+    }
 }
 
 /// One parsed tar entry, enough to assert ownership, type, and attributes.
@@ -687,6 +720,14 @@ fn a_launch_leaves_only_its_mount_points_in_the_exported_tree() {
     }
     let _ = std::fs::remove_file(root.join("etc/resolv.conf"));
 
+    // A caller's own binds alongside the managed profile: a file bind, whose
+    // target the launch creates and takes away again, and a directory bind,
+    // whose mount point is part of what the launch contributes and stays.
+    let bound_file = dir.join("bound-file");
+    let bound_dir = dir.join("bound-dir");
+    std::fs::write(&bound_file, b"caller content\n").expect("the bind source is writable");
+    std::fs::create_dir_all(&bound_dir).expect("the bind source is creatable");
+
     // Host networking is the only posture that binds resolv.conf, so it is the
     // one that creates a target to mount onto — and the one whose cleanup this
     // asserts. The command resolves a name, so the bind is exercised rather
@@ -696,6 +737,8 @@ fn a_launch_leaves_only_its_mount_points_in_the_exported_tree() {
         .command("/bin/busybox")
         .args(["nslookup", "example.com"])
         .network(ferroday_cage::Network::Host)
+        .bind_ro(&bound_file, "/etc/caller-bound")
+        .bind_ro(&bound_dir, "/mnt/caller-bound")
         .build()
         .expect("the cage builds");
     let bound = cage
@@ -750,18 +793,35 @@ fn a_launch_leaves_only_its_mount_points_in_the_exported_tree() {
         );
     }
 
-    // The one file the profile creates rather than mounts on something the
-    // rootfs ships. It exists for the sandbox's life and is taken away again
-    // afterwards, so the tree is as it was and the export holds no resolver
-    // configuration the rootfs never had.
-    assert!(
-        !index.contains_key(&b"./etc/resolv.conf"[..]),
-        "the launch left an empty ./etc/resolv.conf behind"
-    );
-    assert!(
-        !root.join("etc/resolv.conf").exists(),
-        "the resolv.conf mount target outlived the sandbox"
-    );
+    // The files a launch creates rather than mounts on something the rootfs
+    // ships. Each exists for the sandbox's life and is taken away again
+    // afterwards, so the tree is as it was: the export holds no resolver
+    // configuration the rootfs never had, and no empty file where a caller's
+    // bind was.
+    for (path, what) in [
+        (&b"./etc/resolv.conf"[..], "the managed resolv.conf bind"),
+        (b"./etc/caller-bound", "a caller's own file bind"),
+    ] {
+        assert!(
+            !index.contains_key(path),
+            "{what} left an empty {} behind",
+            bstr(path)
+        );
+    }
+    for path in ["etc/resolv.conf", "etc/caller-bound"] {
+        assert!(
+            !root.join(path).exists(),
+            "the {path} mount target outlived the sandbox"
+        );
+    }
+
+    // A directory mount point is the other half of the rule: the caller's
+    // directory bind leaves its mount point, as the managed profile's do.
+    let entry = index
+        .get(&b"./mnt/caller-bound/"[..])
+        .expect("a caller's directory bind leaves its mount point");
+    assert_eq!(entry.typeflag, b'5');
+    assert_eq!(entry.mode & 0o7777, 0o755);
 
     let _ = provision::remove(&dir);
 }
@@ -825,4 +885,361 @@ fn set_user_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
 /// Renders bytes for an assertion message.
 fn bstr(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
+}
+
+/// A tree copied into a single-mapped rootfs lands as root, whatever the source
+/// says: the child writes its own one-id map, so root inside is the caller
+/// outside and no other id is representable.
+#[test]
+fn a_single_map_copy_lands_everything_as_root() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-single");
+    let source = dir.join("source");
+    std::fs::create_dir_all(source.join("etc")).unwrap();
+    std::fs::write(source.join("etc/motd"), b"hello\n").unwrap();
+    std::os::unix::fs::symlink("motd", source.join("etc/greeting")).unwrap();
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+
+    assert_eq!(std::fs::read(rootfs.join("etc/motd")).unwrap(), b"hello\n");
+    assert_eq!(
+        std::fs::read_link(rootfs.join("etc/greeting")).unwrap(),
+        Path::new("motd"),
+    );
+    // Everything the copy created is owned by the caller on the host, which is
+    // what root inside a single map is.
+    let caller = rustix::process::geteuid().as_raw();
+    for entry in ["etc", "etc/motd", "etc/greeting"] {
+        let meta = std::fs::symlink_metadata(rootfs.join(entry)).unwrap();
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::uid(&meta),
+            caller,
+            "{entry} is not the caller's",
+        );
+    }
+    let _ = provision::remove(&dir);
+}
+
+/// Modes and directory structure survive the copy, and a mode that denies the
+/// owner write does not stop the directory's own contents being created.
+#[test]
+fn a_copy_preserves_modes_and_structure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-modes");
+    let source = dir.join("source");
+    std::fs::create_dir_all(source.join("locked")).unwrap();
+    std::fs::write(source.join("locked/inside"), b"read-only home\n").unwrap();
+    std::fs::write(source.join("script"), b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(source.join("script"), PermissionsExt::from_mode(0o755)).unwrap();
+    // Applied on the way out of the directory, after its contents exist.
+    std::fs::set_permissions(source.join("locked"), PermissionsExt::from_mode(0o555)).unwrap();
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+
+    let mode = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(mode(&rootfs.join("locked")), 0o555);
+    assert_eq!(mode(&rootfs.join("script")), 0o755);
+    assert_eq!(
+        std::fs::read(rootfs.join("locked/inside")).unwrap(),
+        b"read-only home\n",
+    );
+    let _ = provision::remove(&dir);
+}
+
+/// A symlink in the source pointing out of the tree is recreated as a symlink
+/// and never traversed, so nothing is written outside the destination.
+#[test]
+fn a_copy_recreates_an_escaping_symlink_without_following_it() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-escape");
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    // Both shapes: a relative escape and an absolute one.
+    std::os::unix::fs::symlink("../../outside", source.join("relative")).unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("absolute")).unwrap();
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+
+    // The links exist inside the destination, as links.
+    for name in ["relative", "absolute"] {
+        let meta = std::fs::symlink_metadata(rootfs.join(name)).unwrap();
+        assert!(meta.file_type().is_symlink(), "{name} is not a symlink");
+    }
+    // And nothing was written through them.
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        0,
+        "the copy wrote outside the destination",
+    );
+    let _ = provision::remove(&dir);
+}
+
+/// The assertion the whole thing exists for: a source entry naming a non-root
+/// uid lands as that uid inside the rootfs, which `cp` running as the caller
+/// cannot produce.
+#[cfg(feature = "subid")]
+#[test]
+fn a_copy_lands_a_file_owned_by_a_non_root_target_uid() {
+    use ferroday_cage::Cage;
+
+    if !userns_available() {
+        return;
+    }
+    if ferroday_cage::host::range_map_blocker().is_some() {
+        assert!(
+            std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
+            "a range map is required but unavailable"
+        );
+        eprintln!("skipping: no delegate can establish a range map");
+        return;
+    }
+    let Some(fixture) = fixture_rootfs() else {
+        return;
+    };
+
+    let dir = scratch("copyin-subordinate");
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("probe"), b"owned\n").unwrap();
+
+    // The source names uid 42 as an in-rootfs id. Setting it needs the map too,
+    // so the fixture rootfs stamps it through a bind, exactly as the export
+    // test's own fixture does.
+    let cage = Cage::builder()
+        .rootfs(fixture)
+        .bind(&source, "/work")
+        .command("/bin/sh")
+        .args(["-c", "chown 42:42 /work/probe"])
+        .identity_map(IdentityMap::Subordinate)
+        .build()
+        .expect("the sandbox should build");
+    assert!(
+        cage.run().expect("the sandbox should launch").success(),
+        "chown in the cage failed",
+    );
+
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    provision::CopyIn::new(&source, &rootfs)
+        .map(IdentityMap::Subordinate)
+        .run()
+        .expect("the copy succeeds");
+
+    // Read back through the map: the export is the instrument that reports what
+    // the rootfs itself means by the ownership on disk.
+    let mut out = Vec::new();
+    provision::export_tar(&rootfs, &mut out, IdentityMap::Subordinate)
+        .expect("the copied tree exports");
+    let probe = parse_tar(&out)
+        .into_iter()
+        .find(|entry| entry.path == b"./probe")
+        .expect("the copied file is in the archive");
+    assert_eq!(probe.uid, 42, "the target uid did not survive the copy");
+    assert_eq!(probe.gid, 42, "the target gid did not survive the copy");
+
+    provision::remove(&dir).expect("the range-mapped tree should be removable");
+}
+
+/// A copy into a rootfs needing a range map that no delegate can establish is
+/// reported as such, rather than as an unexplained failure inside the child.
+#[test]
+fn a_copy_whose_delegate_cannot_resolve_is_typed() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-unprivileged");
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("probe"), b"x").unwrap();
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    // A range the host cannot possibly have allocated: resolution fails before
+    // anything is forked.
+    let extent = vec![ferroday_cage::IdRange {
+        inside: 0,
+        outside: 4_000_000_000,
+        count: 1,
+    }];
+    let map = IdentityMap::ranges(extent.clone(), extent);
+    match provision::CopyIn::new(&source, &rootfs).map(map).run() {
+        Err(provision::ProvisionError::CopyUnprivileged { path, .. }) => {
+            assert_eq!(path, rootfs);
+        }
+        other => panic!("expected a typed refusal, got {other:?}"),
+    }
+    let _ = provision::remove(&dir);
+}
+
+/// Several names for one file arrive as one file with several names.
+///
+/// The round trip is the point: an `Export` coalesces hard links, so a `CopyIn`
+/// that did not would turn N names into N independent files with the data
+/// duplicated and the sharing gone. Debian rootfs trees carry these.
+#[test]
+fn a_copy_keeps_several_names_for_one_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-hardlink");
+    let source = dir.join("source");
+    // The links sit in three different directories, so the anchor the copy
+    // records is a path rather than a name, and the walk has to carry it out of
+    // the directory it was recorded in.
+    std::fs::create_dir_all(source.join("usr/bin")).unwrap();
+    std::fs::create_dir_all(source.join("usr/sbin")).unwrap();
+    std::fs::write(source.join("usr/bin/busybox"), b"#!/multi-call\n").unwrap();
+    std::fs::hard_link(source.join("usr/bin/busybox"), source.join("usr/bin/ls")).unwrap();
+    std::fs::hard_link(source.join("usr/bin/busybox"), source.join("usr/sbin/init")).unwrap();
+    // A file with a single name must not be recorded as an anchor, or the table
+    // would hold the whole tree.
+    std::fs::write(source.join("usr/bin/alone"), b"solo\n").unwrap();
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let report = provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+    let ino = |name: &str| {
+        std::fs::symlink_metadata(rootfs.join(name))
+            .unwrap_or_else(|err| panic!("{name}: {err}"))
+            .ino()
+    };
+    let anchor = ino("usr/bin/busybox");
+    assert_eq!(
+        ino("usr/bin/ls"),
+        anchor,
+        "a second name is a separate file"
+    );
+    assert_eq!(
+        ino("usr/sbin/init"),
+        anchor,
+        "a name in another directory is a separate file",
+    );
+    assert_ne!(ino("usr/bin/alone"), anchor);
+    assert_eq!(
+        std::fs::symlink_metadata(rootfs.join("usr/bin/busybox"))
+            .unwrap()
+            .nlink(),
+        3,
+        "the link count does not match the names",
+    );
+    assert_eq!(
+        std::fs::read(rootfs.join("usr/sbin/init")).unwrap(),
+        b"#!/multi-call\n",
+        "a linked name does not read back as the file",
+    );
+
+    // The data was streamed once. A copy that wrote each name independently
+    // would have sent it three times.
+    let mut source_names = 0;
+    for entry in std::fs::read_dir(rootfs.join("usr/bin")).unwrap() {
+        source_names += usize::from(entry.unwrap().file_name() != "alone");
+    }
+    assert_eq!(source_names, 2);
+}
+
+/// A named pipe is copied rather than dropped: an unprivileged process creates
+/// one perfectly well, and the extraction path already does.
+#[test]
+fn a_copy_creates_a_named_pipe() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-fifo");
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let fifo = source.join("initctl");
+    if !make_fifo(&fifo) {
+        eprintln!("skipping: this filesystem will not hold a named pipe");
+        return;
+    }
+    std::fs::set_permissions(&fifo, PermissionsExt::from_mode(0o600)).unwrap();
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let report = provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+    let meta = std::fs::symlink_metadata(rootfs.join("initctl")).expect("the pipe was created");
+    assert!(meta.file_type().is_fifo(), "{meta:?}");
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+}
+
+/// An entry the copy cannot create is named in the report rather than dropped
+/// in silence.
+#[test]
+fn a_copy_names_what_it_could_not_create() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-skipped");
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("kept"), b"ordinary\n").unwrap();
+    // A socket is the case an unprivileged process can create and the copy
+    // still declines, so it is the one that has to be reported rather than
+    // explained away by a missing privilege.
+    let socket = source.join("control.sock");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(&socket).expect("the socket is bindable");
+
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let report = provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+
+    assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+    assert_eq!(report.skipped[0].path, socket);
+    assert_eq!(report.skipped[0].kind, provision::SkippedKind::Socket);
+    // The reason travels with the entry, so a caller can log it without a
+    // match of its own.
+    assert!(
+        format!("{}", report.skipped[0].kind).contains("socket"),
+        "{}",
+        report.skipped[0].kind,
+    );
+    assert!(
+        rootfs.join("kept").exists(),
+        "the ordinary entry was copied"
+    );
+    assert!(!rootfs.join("control.sock").exists());
 }

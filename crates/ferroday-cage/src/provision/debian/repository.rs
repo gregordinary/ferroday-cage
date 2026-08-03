@@ -30,6 +30,19 @@ pub(crate) enum Trust {
     Unsigned,
 }
 
+impl fmt::Debug for Trust {
+    /// Names the anchor rather than dumping it. A keyring is bulky and its
+    /// bytes say nothing a reader of a rendering can act on; its length is kept
+    /// because a truncated or empty keyring is a real misconfiguration and is
+    /// otherwise indistinguishable from a whole one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Trust::Signed(keyring) => write!(f, "Signed({} bytes)", keyring.len()),
+            Trust::Unsigned => f.write_str("Unsigned"),
+        }
+    }
+}
+
 /// An archive source: a suite, its components, an ordered list of mirror URLs,
 /// and a trust anchor.
 ///
@@ -63,21 +76,14 @@ pub struct Repository {
 }
 
 impl fmt::Debug for Repository {
-    /// Renders the repository without dumping the keyring bytes, which are bulky
-    /// and uninformative; the trust posture is shown as `signed`/`unsigned`.
+    /// Renders the repository, naming its trust anchor by its form and length
+    /// rather than dumping it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Repository")
             .field("mirrors", &self.mirrors)
             .field("suite", &self.suite)
             .field("components", &self.components)
-            .field(
-                "trust",
-                &if self.trust_unsigned() {
-                    "unsigned"
-                } else {
-                    "signed"
-                },
-            )
+            .field("trust", &self.trust)
             .field("allow_stale", &self.allow_stale)
             .field("name", &self.name)
             .finish()
@@ -205,6 +211,10 @@ impl Repository {
 }
 
 /// Builder for a [`Repository`].
+///
+/// The keyring is held as the path it will be read from, so a rendering of a
+/// builder names the trust anchor without ever holding it.
+#[derive(Debug)]
 pub struct RepositoryBuilder {
     suite: String,
     mirror: Option<String>,
