@@ -81,11 +81,21 @@ process creates a gate immediately before it forks the command, writes the map
 when the command signals that it has unshared, and releases it. No delegate of
 the caller's is involved, and the `IdMapper` seam below is not consulted.
 
-Because the map files are reached by path, a container requires a procfs: a
-profile that mounts none is refused at `build` with
+The map files are reached by path, so establishing the nested map generally
+requires a procfs, and a profile that mounts none is refused at `build` with
 `ConfigError::NestedUsernsNeedsProcfs`. The managed profile mounts one by
 default, so this arises only for a profile that opts out of the managed mounts
 and supplies no procfs of its own.
+
+The requirement follows the route the map takes, not the fact of nesting. A
+self-written map — the single-identity tier — needs one, and any procfs serves,
+since a process reaches its own map files through `self`. A delegated map inside
+a PID namespace needs one too, and that one must be a *fresh* instance rather
+than a bind of the host's: the delegate names the command by a pid of the
+sandbox's own PID namespace, which a bound procfs from outside does not index.
+A delegated map with `pid_namespace(false)` needs none — the delegate is then
+the launch stage, outside the sandbox, which opens the host's `/proc` before the
+pivot — so a range map composes with `managed_mounts(false)`.
 
 ## Delegates
 

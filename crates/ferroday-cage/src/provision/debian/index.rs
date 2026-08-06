@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use super::available::Available;
+use super::pin::Pins;
 use super::version;
 
 /// One control-format stanza: its fields in file order.
@@ -82,6 +83,11 @@ pub(crate) struct Package {
     pub architecture: String,
     /// The pool path (`Filename:`), relative to the mirror root.
     pub filename: String,
+    /// The archive's `Size:` — the length of the `.deb` on the wire, in bytes —
+    /// when the stanza carries a usable one. It bounds what the download may
+    /// spend before its digest is checked, so it is read from the index whose
+    /// own digest the verified release records.
+    pub size: Option<u64>,
     pub sha256: String,
     pub depends: Vec<Dependency>,
     pub pre_depends: Vec<Dependency>,
@@ -185,6 +191,13 @@ impl Package {
         if !is_sha256_hex(&sha256) {
             return None;
         }
+        // A stanza that states no size, or states one that does not parse,
+        // leaves the download bounded by the fetcher's own ceiling rather than
+        // being dropped: the digest is what decides whether the bytes are the
+        // package, and a missing bound is a weaker fetch, not a wrong one.
+        let size = stanza
+            .get("Size")
+            .and_then(|value| value.parse::<u64>().ok());
         // Read before the literal below moves `name`, which the source name is
         // compared against. Neither field is required: a stanza missing or
         // malforming one is reported as carrying no value rather than dropped,
@@ -200,6 +213,7 @@ impl Package {
             version,
             architecture,
             filename,
+            size,
             sha256,
             depends: stanza
                 .get("Depends")
@@ -247,7 +261,8 @@ pub(super) fn is_sha256_hex(digest: &str) -> bool {
 
 /// Whether `filename` is a safe pool path: a non-empty relative path with no
 /// traversal component, no leading slash, and no byte outside the printable
-/// ASCII range.
+/// ASCII range — as written, and as a server that percent-decodes it would read
+/// it.
 ///
 /// A `Filename:` becomes a fetch URL suffix and, for a `file://` mirror, a local
 /// path, so this keeps an index-supplied pool path from escaping a mirror root.
@@ -259,11 +274,66 @@ pub(super) fn is_sha256_hex(digest: &str) -> bool {
 /// could end a request line or start a header of its own, no space to split the
 /// request line's three fields, and no NUL to truncate a local path. Real pool
 /// paths — `pool/main/h/hello/hello_2.10-3_amd64.deb` — are within it.
+///
+/// The decoded form is checked because the literal one is not what an HTTP
+/// server resolves: `pool/%2e%2e/%2e%2e/etc/passwd` carries no `..` component
+/// as written, and a server that decodes before resolving may serve something
+/// above the mirror root. Applying the same rules to the decoded bytes closes
+/// that without narrowing what a legitimate path may contain, since a real pool
+/// path decodes to itself. An escape that is malformed, or that decodes to
+/// another `%`, is refused outright: neither occurs in a real path, and
+/// refusing the second means no amount of re-encoding can hide a traversal from
+/// this single decoding pass.
 pub(super) fn is_safe_pool_path(filename: &str) -> bool {
-    !filename.is_empty()
-        && !filename.starts_with('/')
-        && filename.bytes().all(|byte| byte.is_ascii_graphic())
-        && !filename.split('/').any(|component| component == "..")
+    if !is_safe_pool_shape(filename.as_bytes()) {
+        return false;
+    }
+    match percent_decode(filename.as_bytes()) {
+        Some(decoded) => is_safe_pool_shape(&decoded),
+        None => false,
+    }
+}
+
+/// The shape rule both the written and the decoded form must satisfy.
+fn is_safe_pool_shape(path: &[u8]) -> bool {
+    !path.is_empty()
+        && path[0] != b'/'
+        && path.iter().all(u8::is_ascii_graphic)
+        && !path
+            .split(|byte| *byte == b'/')
+            .any(|component| component == b"..")
+}
+
+/// Percent-decodes `path`, or `None` where an escape is malformed or decodes to
+/// a `%` — the byte that would let a second decoding pass reveal something this
+/// one did not see.
+fn percent_decode(path: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'%' {
+            decoded.push(byte);
+            continue;
+        }
+        let high = hex_value(bytes.next()?)?;
+        let low = hex_value(bytes.next()?)?;
+        let value = high * 16 + low;
+        if value == b'%' {
+            return None;
+        }
+        decoded.push(value);
+    }
+    Some(decoded)
+}
+
+/// The value of one hexadecimal digit, either case.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// The package set of one suite: the highest version of each real name, plus
@@ -279,7 +349,7 @@ impl Index {
     /// package is tagged with origin zero.
     #[cfg(test)]
     pub(crate) fn parse(text: &str, architecture: &str) -> Index {
-        Index::merge(std::iter::once((0, text)), architecture)
+        Index::merge(std::iter::once((0, text)), architecture, &Pins::none())
     }
 
     /// Parses and merges several repositories' `Packages` indexes into one set,
@@ -291,9 +361,16 @@ impl Index {
     /// highest-version-wins, extended across repositories; an exact-version tie
     /// resolves to the first repository in that order, since the earlier origin
     /// is retained when a later one does not compare greater.
+    ///
+    /// A name `pins` holds selects the pinned version instead of the highest,
+    /// again taking the first repository that offers it. Where no repository
+    /// offers the pinned version the highest is kept, so [`Pins::check`] can
+    /// report what the archives carry rather than only that something is
+    /// missing; that check runs before anything resolves against the index.
     pub(crate) fn merge<'a>(
         inputs: impl IntoIterator<Item = (usize, &'a str)>,
         architecture: &str,
+        pins: &Pins,
     ) -> Index {
         let mut by_name: HashMap<String, Package> = HashMap::new();
         for (origin, text) in inputs {
@@ -305,13 +382,23 @@ impl Index {
                     continue;
                 }
                 package.origin = origin;
-                match by_name.get(&package.name) {
-                    Some(existing)
-                        if version::compare(&package.version, &existing.version)
-                            != std::cmp::Ordering::Greater => {}
-                    _ => {
-                        by_name.insert(package.name.clone(), package);
+                let higher = |candidate: &Package, existing: &Package| {
+                    version::compare(&candidate.version, &existing.version)
+                        == std::cmp::Ordering::Greater
+                };
+                let keep = match by_name.get(&package.name) {
+                    None => true,
+                    // A pin already satisfied is not displaced, by a higher
+                    // version or by a later repository offering the same one.
+                    Some(existing) if pins.names(&package.name) => {
+                        !pins.holds(&package.name, &existing.version)
+                            && (pins.holds(&package.name, &package.version)
+                                || higher(&package, existing))
                     }
+                    Some(existing) => higher(&package, existing),
+                };
+                if keep {
+                    by_name.insert(package.name.clone(), package);
                 }
             }
         }
@@ -490,10 +577,38 @@ mod tests {
     }
 
     #[test]
+    fn a_percent_encoded_traversal_is_refused() {
+        // The literal path carries no `..` component, but the server that
+        // resolves the request line decodes it first, so the check has to read
+        // it the way the server will. Encoding the separator is the same trick
+        // in another spelling, and `%25` is the one that would let a second
+        // decoding pass reveal what this one did not see.
+        for path in [
+            "pool/%2e%2e/%2e%2e/etc/passwd",
+            "pool/%2E%2E/etc/passwd",
+            "pool/..%2fetc/passwd",
+            "pool/%252e%252e/etc/passwd",
+            // A malformed escape reaches a decoder that may read it either way.
+            "pool/%2/x.deb",
+            "pool/%zz/x.deb",
+            "pool/x.deb%",
+            // Decoded control characters would split the request line as surely
+            // as literal ones.
+            "pool/p.deb%0d%0aX-Injected:%201",
+        ] {
+            assert!(!is_safe_pool_path(path), "{path} should be refused");
+        }
+        // A path that decodes to itself is unaffected, encoded bytes included:
+        // a pool path is free to carry an escape that names an ordinary
+        // character.
+        assert!(is_safe_pool_path("pool/p/pkg/pkg_1%3a2.0-1_amd64.deb"));
+    }
+
+    #[test]
     fn a_stanza_reports_its_installed_size_and_source_package() {
         let text = format!(
             "Package: bind9-dnsutils\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\n\
-             SHA256: {}\nInstalled-Size: 412\nSource: bind9 (1:9.20.4-1)\n",
+             SHA256: {}\nSize: 158742\nInstalled-Size: 412\nSource: bind9 (1:9.20.4-1)\n",
             "a".repeat(64),
         );
         let index = Index::parse(&text, "amd64");
@@ -501,6 +616,9 @@ mod tests {
         // The archive's own unit, kibibytes, rather than bytes: a value that
         // differs from the mirror's is one more thing that can disagree with it.
         assert_eq!(package.installed_size, Some(412));
+        // `Size:` is the wire length of the `.deb`, in bytes, and bounds what
+        // the download may spend before its digest is checked.
+        assert_eq!(package.size, Some(158_742));
         // The version belongs to the source package rather than to this binary
         // one, so only the name is kept.
         assert_eq!(package.source.as_deref(), Some("bind9"));
@@ -533,12 +651,14 @@ mod tests {
         let index = Index::parse(&base, "amd64");
         let package = index.get("p").expect("the stanza parses");
         assert_eq!(package.installed_size, None);
+        assert_eq!(package.size, None);
         assert_eq!(package.source, None);
 
-        let malformed = format!("{base}Installed-Size: unknown\n");
+        let malformed = format!("{base}Installed-Size: unknown\nSize: huge\n");
         let index = Index::parse(&malformed, "amd64");
         let package = index.get("p").expect("the stanza still parses");
         assert_eq!(package.installed_size, None);
+        assert_eq!(package.size, None);
     }
 
     #[test]
@@ -758,7 +878,7 @@ Architecture: amd64
 Filename: pool/newer_2.0.deb
 SHA256: 652d6e6577657200000000000000000000000000000000000000000000000000
 ";
-        let index = Index::merge([(0, primary), (1, extra)], "amd64");
+        let index = Index::merge([(0, primary), (1, extra)], "amd64", &Pins::none());
         // The tie retains origin 0's package (the primary), by its digest.
         let shared = index.get("shared").unwrap();
         assert_eq!(shared.origin, 0);
@@ -789,7 +909,7 @@ Architecture: amd64
 Filename: pool/pkg_2.0.deb
 SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
 ";
-        let index = Index::merge([(0, primary), (1, extra)], "amd64");
+        let index = Index::merge([(0, primary), (1, extra)], "amd64", &Pins::none());
         let pkg = index.get("pkg").unwrap();
         assert_eq!(pkg.version, "2.0");
         assert_eq!(pkg.origin, 1);

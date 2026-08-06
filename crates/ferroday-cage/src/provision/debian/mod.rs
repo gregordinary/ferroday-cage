@@ -47,6 +47,7 @@ mod fetch;
 mod http;
 mod index;
 mod layer;
+mod pin;
 mod plan;
 mod pool;
 mod release;
@@ -65,6 +66,7 @@ pub use fetch::{Fetch, FetchError, FetchRequest};
 pub use http::HttpFetch;
 pub use index::{Priority, build_depend_names};
 pub use layer::BuildLayer;
+pub use pin::{UnheldPin, UnheldReason};
 pub use plan::{Plan, PlannedPackage, ResolvedArchive};
 pub use pool::Pool;
 pub use repository::{Repository, RepositoryBuilder};
@@ -75,6 +77,7 @@ use crate::IdentityMap;
 use crate::status::ExitStatus;
 use bootstrap::{Installable, StatOverride};
 use index::{Index, Package};
+use pin::Pins;
 use release::{Keyring, Release};
 
 /// The mode a bootstrapped rootfs's own root directory takes.
@@ -119,18 +122,22 @@ pub struct Debian<'a> {
     /// [`DebianBuilder::plan`]. `None` for an ordinary bootstrap, which
     /// resolves against the archives.
     plan: Option<Plan>,
+    /// The versions a resolution is held to, set by [`DebianBuilder::pin`].
+    /// Empty for a resolution free to take whatever the archives now offer.
+    pin: Pins,
     /// The archive sources, the primary at index zero followed by any
     /// additional repositories, merged into one resolution.
     repositories: Vec<Repository>,
     fetcher: Box<dyn Fetch + 'a>,
 }
 
-/// Refuses a pinned plan that contradicts the rest of the configuration.
+/// Refuses a plan handed to `plan()` that contradicts the rest of the
+/// configuration.
 ///
 /// A plan describes a resolution that already happened, so a setting shaping a
 /// resolution is a contradiction rather than a refinement, and picking a silent
 /// precedence between the two would produce a rootfs matching neither.
-fn validate_pinned_plan(
+fn validate_plan(
     plan: &Plan,
     suite: &str,
     architecture: &str,
@@ -142,46 +149,46 @@ fn validate_pinned_plan(
     let contradiction = |reason: String| Err(DebianError::Config { reason });
     if !includes.is_empty() {
         return contradiction(
-            "a pinned plan already names every package to install, so include() has nothing \
-             to add; drop one of the two"
+            "a plan already names every package to install, so include() has nothing to \
+             add; drop one of the two"
                 .to_string(),
         );
     }
     if !excludes.is_empty() {
         return contradiction(
-            "a pinned plan already names every package to install, so exclude() has nothing \
-             to remove; drop one of the two"
+            "a plan already names every package to install, so exclude() has nothing to \
+             remove; drop one of the two"
                 .to_string(),
         );
     }
     if base_priority_set {
         return contradiction(
-            "a pinned plan already names its base system, so base_priority() has no seed to \
+            "a plan already names its base system, so base_priority() has no seed to \
              filter; drop one of the two"
                 .to_string(),
         );
     }
     if plan.suite != suite {
         return contradiction(format!(
-            "the pinned plan resolves suite {} but the bootstrap is configured for {suite}",
+            "the plan resolves suite {} but the bootstrap is configured for {suite}",
             plan.suite,
         ));
     }
     if plan.architecture != architecture {
         return contradiction(format!(
-            "the pinned plan resolves architecture {} but the bootstrap is configured for \
+            "the plan resolves architecture {} but the bootstrap is configured for \
              {architecture}",
             plan.architecture,
         ));
     }
-    // Each package names the archive it came from as an index, and a pinned
+    // Each package names the archive it came from as an index, and a verbatim
     // install fetches through the repository at that index, so a plan resolved
     // against more repositories than are configured has packages with nowhere
     // to be fetched from.
     if plan.archives.len() > repositories {
         return contradiction(format!(
-            "the pinned plan resolved against {} archives but only {repositories} \
-             repositories are configured, so some of its packages name no mirror",
+            "the plan resolved against {} archives but only {repositories} repositories \
+             are configured, so some of its packages name no mirror",
             plan.archives.len(),
         ));
     }
@@ -196,11 +203,50 @@ fn validate_pinned_plan(
     for package in &plan.packages {
         if package.archive >= repositories {
             return contradiction(format!(
-                "the pinned plan's package {} names archive {} but only {repositories} \
-                 repositories are configured, so it names no mirror",
+                "the plan's package {} names archive {} but only {repositories} repositories \
+                 are configured, so it names no mirror",
                 package.name, package.archive,
             ));
         }
+    }
+    Ok(())
+}
+
+/// Refuses a plan handed to `pin()` that contradicts the rest of the
+/// configuration.
+///
+/// Far less is a contradiction here than for `plan()`. A pin constrains a
+/// resolution rather than replacing one, so everything that shapes what is
+/// selected — the includes, the exclusions, the base seed's priority floor —
+/// composes with it, and the repository list is free to differ from the one the
+/// pin was resolved against. What remains is a pin that cannot mean anything: a
+/// resolution that will not happen, or one for a different coordinate.
+fn validate_pin(
+    pin: &Plan,
+    suite: &str,
+    architecture: &str,
+    plan_set: bool,
+) -> Result<(), DebianError> {
+    let contradiction = |reason: String| Err(DebianError::Config { reason });
+    if plan_set {
+        return contradiction(
+            "plan() installs a resolved plan instead of resolving, so there is no resolution \
+             for pin() to hold to versions; drop one of the two"
+                .to_string(),
+        );
+    }
+    if pin.suite != suite {
+        return contradiction(format!(
+            "the pin resolves suite {} but the bootstrap is configured for {suite}",
+            pin.suite,
+        ));
+    }
+    if pin.architecture != architecture {
+        return contradiction(format!(
+            "the pin resolves architecture {} but the bootstrap is configured for \
+             {architecture}",
+            pin.architecture,
+        ));
     }
     Ok(())
 }
@@ -217,6 +263,7 @@ impl fmt::Debug for Debian<'_> {
             .field("includes", &self.includes)
             .field("excludes", &self.excludes)
             .field("plan", &self.plan)
+            .field("pin", &self.pin)
             .field("extract_only", &self.extract_only)
             .field("identity_map", &self.identity_map)
             .field("cache_dir", &self.cache_dir)
@@ -241,6 +288,7 @@ impl<'a> Debian<'a> {
             includes: Vec::new(),
             excludes: Vec::new(),
             plan: None,
+            pin: None,
             extract_only: false,
             identity_map: IdentityMap::Single,
             cache_dir: None,
@@ -296,6 +344,7 @@ impl<'a> Debian<'a> {
             self.base_priority,
             &self.includes,
             &self.excludes,
+            &self.pin,
             progress,
         )?;
         Ok(Plan::project(
@@ -344,10 +393,14 @@ impl<'a> Debian<'a> {
         &mut self,
         progress: &mut dyn FnMut(DebianEvent<'_>),
     ) -> Result<Available, DebianError> {
+        // Unpinned whatever the builder holds: this reports what the archives
+        // offer, and a pin describes a selection from it rather than a bound on
+        // what may be asked about.
         let (index, _archives) = merged_index(
             self.fetcher.as_mut(),
             &self.repositories,
             &self.architecture,
+            &Pins::none(),
             progress,
         )?;
         Ok(index.into_available())
@@ -401,6 +454,7 @@ impl<'a> Debian<'a> {
             &self.includes,
             &self.excludes,
             &assume_installed,
+            &self.pin,
             progress,
         )?;
         Ok(Plan::project(
@@ -527,6 +581,7 @@ impl<'a> Debian<'a> {
             &self.includes,
             &self.excludes,
             &assume_installed,
+            &self.pin,
             progress,
         )
         .map_err(wrap)?;
@@ -590,6 +645,9 @@ pub struct DebianBuilder<'a> {
     excludes: Vec<String>,
     /// A previously resolved plan to install verbatim, in place of resolving.
     plan: Option<Plan>,
+    /// A previously resolved plan to hold a resolution's versions to, rather
+    /// than to install in place of one.
+    pin: Option<Plan>,
     extract_only: bool,
     identity_map: IdentityMap,
     cache_dir: Option<PathBuf>,
@@ -617,6 +675,8 @@ impl fmt::Debug for DebianBuilder<'_> {
             .field("base_priority", &self.base_priority)
             .field("includes", &self.includes)
             .field("excludes", &self.excludes)
+            .field("plan", &self.plan)
+            .field("pin", &self.pin)
             .field("extract_only", &self.extract_only)
             .field("identity_map", &self.identity_map)
             .field("cache_dir", &self.cache_dir)
@@ -779,6 +839,84 @@ impl<'a> DebianBuilder<'a> {
         self
     }
 
+    /// Holds a resolution to the versions a previously resolved [`Plan`]
+    /// recorded, resolving everything the plan does not name.
+    ///
+    /// Where [`plan`](Self::plan) replaces a resolution, this constrains one.
+    /// The bootstrap fetches and verifies every release and index as it always
+    /// does and computes the closure over what the archives offer now; each
+    /// package the pin names is selected at the pinned version rather than at
+    /// the highest offered, and its recorded digest must be the one the archive
+    /// records for that version. Everything else — a package added to the
+    /// closure since, a dependency the pinned version pulls in, a repository
+    /// the pin says nothing about — resolves normally.
+    ///
+    /// # When this is the one that fits
+    ///
+    /// A plan covering a build whose inputs are not all archives. Where some
+    /// packages are compiled by the build itself and published to a local
+    /// [`Pool`], [`plan`](Self::plan) requires those compiles to be
+    /// byte-reproducible, since it installs every package by a recorded digest
+    /// and a compile that differs by a timestamp no longer matches. Pinning
+    /// only the archive-sourced packages gives a document that fixes the half a
+    /// mirror controls and leaves the locally built half to resolve at whatever
+    /// the pool now holds.
+    ///
+    /// # The trust model does not change
+    ///
+    /// Unlike [`plan`](Self::plan), nothing here leaves the archive signature
+    /// chain: every digest installed is still read from an index whose own
+    /// digest a verified release records. The pin narrows which version is
+    /// selected; it never becomes the authority for what the bytes are. A pin
+    /// whose digest disagrees with the archive's for the same version is
+    /// refused rather than preferred, which is how one version published twice
+    /// over different bytes is caught.
+    ///
+    /// # Refused combinations
+    ///
+    /// A pin and a [`plan`](Self::plan) together are refused at
+    /// [`build`](Self::build) with [`DebianError::Config`]: a plan resolves
+    /// nothing, so there is no resolution for a pin to constrain. A pin whose
+    /// suite or architecture disagrees with the builder's is refused the same
+    /// way, as is one naming a package twice. [`include`](Self::include),
+    /// [`exclude`](Self::exclude), and [`base_priority`](Self::base_priority)
+    /// are *not* refused — a pin constrains the versions a selection resolves
+    /// to and says nothing about what is selected, which is the whole of what
+    /// separates it from a plan.
+    ///
+    /// # Errors at resolution
+    ///
+    /// A pin the archives cannot supply fails the resolve or the bootstrap with
+    /// [`DebianError::Pin`], naming every package at once: the archives have
+    /// published past the pinned version, dropped the package, or record
+    /// different bytes for it. A snapshot mirror is what holds a pin against an
+    /// archive that keeps moving.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use ferroday_cage::provision::debian::{Debian, Plan};
+    ///
+    /// // The committed document: the versions the mirror served, and nothing
+    /// // about the packages this build compiles for itself.
+    /// let kept = Plan::parse_document(&std::fs::read_to_string("archives.plan")?)?;
+    ///
+    /// let mut debian = Debian::builder("trixie")
+    ///     .repository(ferroday_cage::provision::debian::Repository::builder("trixie")
+    ///         .mirror("file:///srv/pool")
+    ///         .trust_unsigned(true)
+    ///         .build()?)
+    ///     .include(["build-essential", "kernel-image"])
+    ///     .pin(kept)
+    ///     .build()?;
+    /// # let _ = &mut debian;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn pin(mut self, pin: Plan) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
     /// Excludes packages from the resolved install closure.
     ///
     /// An excluded package is dropped from the base seed and skipped as a
@@ -919,9 +1057,10 @@ impl<'a> DebianBuilder<'a> {
     ///
     /// This is apt's `[trusted=yes]`: appropriate for a local or `file://`
     /// mirror under the caller's control, never for a remote one. Because it
-    /// drops the only authenticity check, [`build`](Self::build) refuses it
-    /// against an `http://` mirror, whose transport offers no authenticity in
-    /// its place.
+    /// drops the only authenticity check, authenticity rests on the transport
+    /// alone, so [`build`](Self::build) requires one that supplies some: every
+    /// mirror must be `file://` or `https://`, and any other scheme —
+    /// `http://` included — is refused.
     pub fn trust_unsigned(mut self, trust: bool) -> Self {
         self.trust_unsigned = trust;
         self
@@ -960,12 +1099,12 @@ impl<'a> DebianBuilder<'a> {
     /// # Errors
     ///
     /// Returns [`DebianError::Config`] for a configuration that contradicts
-    /// itself — a pinned plan alongside a setting that would reshape it, or one
-    /// resolved for a different suite or architecture — and for a suite,
-    /// component, or architecture the archive cannot be addressed by: an empty
-    /// value, one carrying whitespace or a control character, or one that would
-    /// resolve outside the mirror root through a leading `/`, a `..` segment, or
-    /// an empty or `.` segment. The suite and the component may otherwise
+    /// itself — a plan alongside a setting that would reshape it, a plan and a
+    /// pin at once, or either resolved for a different suite or architecture —
+    /// and for a suite, component, or architecture the archive cannot be
+    /// addressed by: an empty value, one carrying whitespace or a control
+    /// character, or one that would resolve outside the mirror root through a
+    /// leading `/`, a `..` segment, or an empty or `.` segment. The suite and the component may otherwise
     /// contain slashes, since both may name a subtree; the architecture may not.
     ///
     /// Returns [`DebianError::Io`] when a keyring named by
@@ -978,8 +1117,10 @@ impl<'a> DebianBuilder<'a> {
         }
         // A plan states which architecture it is for, so a builder that names
         // none adopts it: refusing a plan the caller never contradicted, over a
-        // default the caller never chose, would be a confusing rejection.
-        let architecture = match (&self.architecture, &self.plan) {
+        // default the caller never chose, would be a confusing rejection. A pin
+        // states one for the same reason and is adopted the same way.
+        let stated = self.plan.as_ref().or(self.pin.as_ref());
+        let architecture = match (&self.architecture, stated) {
             (Some(architecture), _) => architecture.clone(),
             (None, Some(plan)) => plan.architecture.clone(),
             (None, None) => arch::host_architecture(),
@@ -1030,7 +1171,7 @@ impl<'a> DebianBuilder<'a> {
         repository::validate_distinct_entries(&repositories)?;
 
         if let Some(plan) = &self.plan {
-            validate_pinned_plan(
+            validate_plan(
                 plan,
                 &self.suite,
                 &architecture,
@@ -1041,6 +1182,14 @@ impl<'a> DebianBuilder<'a> {
             )?;
         }
 
+        let pin = match &self.pin {
+            None => Pins::none(),
+            Some(pin) => {
+                validate_pin(pin, &self.suite, &architecture, self.plan.is_some())?;
+                Pins::of(pin)?
+            }
+        };
+
         Ok(Debian {
             suite: self.suite,
             architecture,
@@ -1048,6 +1197,7 @@ impl<'a> DebianBuilder<'a> {
             includes: self.includes,
             excludes: self.excludes,
             plan: self.plan,
+            pin,
             extract_only: self.extract_only,
             identity_map: self.identity_map,
             cache_dir: self.cache_dir,
@@ -1120,6 +1270,7 @@ impl<'a> Debian<'a> {
             &self.includes,
             &self.excludes,
             self.plan.as_ref(),
+            &self.pin,
             self.extract_only,
             &self.identity_map,
             self.cache_dir.as_deref(),
@@ -1202,7 +1353,8 @@ fn bootstrap_suite(
     base_priority: Priority,
     includes: &[String],
     excludes: &[String],
-    pinned: Option<&Plan>,
+    plan: Option<&Plan>,
+    pin: &Pins,
     extract_only: bool,
     identity_map: &IdentityMap,
     cache_dir: Option<&Path>,
@@ -1228,8 +1380,8 @@ fn bootstrap_suite(
         }
     }
 
-    let packages = match pinned {
-        // A pinned plan is the resolution: the release and the index are never
+    let packages = match plan {
+        // A plan is the resolution: the release and the index are never
         // fetched, which is the whole of what this saves. The plan is reported
         // as the resolved manifest so an observer sees the same event either
         // way, and it is reported as it stands rather than re-projected.
@@ -1247,6 +1399,7 @@ fn bootstrap_suite(
                 base_priority,
                 includes,
                 excludes,
+                pin,
                 progress,
             )
             .map_err(wrap)?;
@@ -1318,9 +1471,10 @@ fn resolve_packages(
     base_priority: Priority,
     includes: &[String],
     excludes: &[String],
+    pins: &Pins,
     progress: &mut dyn FnMut(DebianEvent<'_>),
 ) -> Result<(Vec<Package>, Vec<ResolvedArchive>), DebianError> {
-    let (index, archives) = merged_index(fetcher, repositories, architecture, progress)?;
+    let (index, archives) = merged_index(fetcher, repositories, architecture, pins, progress)?;
 
     progress(DebianEvent::Resolving);
     let mut base = index.base_seed(base_priority);
@@ -1340,6 +1494,7 @@ fn resolve_packages(
 /// already carry is selected. There is no base-system seed and no `apt`: the
 /// base supplies both. This is [`resolve_packages`]'s read-merge-and-report
 /// structure with the priority seed replaced by the base's installed set.
+#[allow(clippy::too_many_arguments)]
 fn resolve_delta(
     fetcher: &mut dyn Fetch,
     repositories: &[Repository],
@@ -1347,9 +1502,10 @@ fn resolve_delta(
     includes: &[String],
     excludes: &[String],
     assume_installed: &HashSet<String>,
+    pins: &Pins,
     progress: &mut dyn FnMut(DebianEvent<'_>),
 ) -> Result<(Vec<Package>, Vec<ResolvedArchive>), DebianError> {
-    let (index, archives) = merged_index(fetcher, repositories, architecture, progress)?;
+    let (index, archives) = merged_index(fetcher, repositories, architecture, pins, progress)?;
 
     progress(DebianEvent::Resolving);
     let packages = resolve::resolve_seeded(&index, &[], includes, excludes, assume_installed)
@@ -1372,6 +1528,7 @@ fn merged_index(
     fetcher: &mut dyn Fetch,
     repositories: &[Repository],
     architecture: &str,
+    pins: &Pins,
     progress: &mut dyn FnMut(DebianEvent<'_>),
 ) -> Result<(Index, Vec<ResolvedArchive>), DebianError> {
     // Each repository contributes one text block per component, tagged with the
@@ -1404,15 +1561,17 @@ fn merged_index(
         index_inputs.push((origin, text));
     }
 
-    Ok((
-        Index::merge(
-            index_inputs
-                .iter()
-                .map(|(origin, text)| (*origin, text.as_str())),
-            architecture,
-        ),
-        archives,
-    ))
+    let index = Index::merge(
+        index_inputs
+            .iter()
+            .map(|(origin, text)| (*origin, text.as_str())),
+        architecture,
+        pins,
+    );
+    // Before the closure is computed, so a pin the archives have moved past
+    // refuses the resolution rather than being quietly resolved around.
+    pins.check(&index)?;
+    Ok((index, archives))
 }
 
 /// Projects a resolved package set into a [`Plan`] and reports it through the
@@ -1582,12 +1741,17 @@ fn fetch_component_index(
 ) -> Result<String, DebianError> {
     // Prefer the smallest available index; every candidate is verified against
     // the release digest, so the choice is trust-neutral. Which compressions
-    // exist is a property of the release, the same across every mirror.
-    let candidates: Vec<(String, &str)> = ["Packages.xz", "Packages.gz", "Packages"]
+    // exist is a property of the release, the same across every mirror. The
+    // release states each index's length beside its digest, and that length
+    // travels with the fetch as its ceiling: it is signed, it is free, and it
+    // bounds what a mirror can spend before the digest check runs.
+    let candidates: Vec<(String, u64, &str)> = ["Packages.xz", "Packages.gz", "Packages"]
         .iter()
         .filter_map(|suffix| {
             let rel = format!("{component}/binary-{architecture}/{suffix}");
-            release.digest(&rel).map(|(_, digest)| (rel, digest))
+            release
+                .digest(&rel)
+                .map(|(size, digest)| (rel, size, digest))
         })
         .collect();
     if candidates.is_empty() {
@@ -1599,7 +1763,7 @@ fn fetch_component_index(
     let suite = &repository.suite;
     let mut last_missing = None;
     for mirror in &repository.mirrors {
-        for (rel, digest) in &candidates {
+        for (rel, size, digest) in &candidates {
             let url = if release.acquire_by_hash() {
                 format!(
                     "{}/dists/{suite}/{component}/binary-{architecture}/by-hash/SHA256/{digest}",
@@ -1609,7 +1773,7 @@ fn fetch_component_index(
                 format!("{}/dists/{suite}/{rel}", mirror.trim_end_matches('/'))
             };
             progress(DebianEvent::Fetching { url: &url });
-            match fetch_bytes(fetcher, &url) {
+            match fetch_bytes(fetcher, &url, Some(*size)) {
                 Ok(bytes) => {
                     verify_digest(rel, &bytes, digest)?;
                     return decompress_index(rel, &bytes);
@@ -1631,6 +1795,11 @@ fn fetch_component_index(
 /// it, advancing past a mirror that reports the resource missing or fails at
 /// the transport, and returning the last such error when every mirror is
 /// exhausted.
+///
+/// No size travels with these: this fetches a release file, which is the trust
+/// root and so has nothing signed to declare its length. The fetcher's own
+/// ceiling is the bound there, which is the right one — a release is small, and
+/// the alternative would be a ceiling of this module's invention.
 fn fetch_from_mirrors(
     fetcher: &mut dyn Fetch,
     mirrors: &[String],
@@ -1645,7 +1814,7 @@ fn fetch_from_mirrors(
             suffix.trim_start_matches('/'),
         );
         progress(DebianEvent::Fetching { url: &url });
-        match fetch_bytes(fetcher, &url) {
+        match fetch_bytes(fetcher, &url, None) {
             // The mirror that answered, not the whole list: a repository with a
             // snapshot backstop resolves against whichever one served, and a
             // record naming the list would describe a choice rather than the
@@ -1769,7 +1938,7 @@ fn download_deb(
             package.filename.trim_start_matches('/'),
         );
         progress(DebianEvent::Fetching { url: &url });
-        match fetch_verified(fetcher, &url, &package.sha256, dest) {
+        match fetch_verified(fetcher, &url, &package.sha256, package.size, dest) {
             Ok(()) => return Ok(()),
             Err(err) if is_failover(&err) => {
                 last_missing = Some(err);
@@ -1803,12 +1972,19 @@ fn download_deb(
 /// cheaper than syncing every download against a failure that costs only a
 /// repeat.
 ///
+/// `size` is the length the index recorded for the package, where one is known.
+/// It travels with the request and bounds the staging file, so a mirror that
+/// answers a request for a two-megabyte `.deb` with an endless body fills no
+/// more disk than the package weighs. The digest still decides whether the
+/// bytes are the package; this only decides how many of them are read.
+///
 /// Anything that fails takes the staging file with it, so a mirror that dies
 /// mid-body leaves nothing for the next one to trip over.
 fn fetch_verified(
     fetcher: &mut dyn Fetch,
     url: &str,
     expected: &str,
+    size: Option<u64>,
     dest: &Path,
 ) -> Result<(), DebianError> {
     let staged = staging_path(dest);
@@ -1826,7 +2002,14 @@ fn fetch_verified(
         .map_err(io("staging a package", &staged))?;
 
     let mut sink = deb::DigestWriter::new(file);
-    let fetched = fetcher.fetch(&FetchRequest::new(url), &mut sink);
+    let request = FetchRequest::new(url);
+    let fetched = match size {
+        Some(size) => {
+            let mut capped = http::LimitedWriter::new(&mut sink, size);
+            fetcher.fetch(&request.sized(size), &mut capped)
+        }
+        None => fetcher.fetch(&request, &mut sink),
+    };
     let digested = sink.finish().map_err(io("writing a package", &staged));
 
     let published = fetched
@@ -1911,7 +2094,7 @@ impl Drop for Archives {
 /// One `.deb` to acquire: what the download needs and nothing else.
 ///
 /// The two sources of an install set project onto this — a fresh resolution's
-/// [`Package`], and a pinned [`Plan`]'s [`PlannedPackage`] — so the download,
+/// [`Package`], and a [`Plan`]'s [`PlannedPackage`] — so the download,
 /// the digest check, and the cache reuse are one path whichever produced it.
 struct Wanted {
     /// The package name, for the progress report and the dpkg install order.
@@ -1921,6 +2104,9 @@ struct Wanted {
     sha256: String,
     /// The pool path, relative to the mirror root.
     filename: String,
+    /// The archive-recorded length of the `.deb`, which bounds what the
+    /// download may spend. `None` where nothing states it.
+    size: Option<u64>,
     /// Which repository serves it, as an index into the configured list.
     origin: usize,
 }
@@ -1932,19 +2118,26 @@ impl Wanted {
             name: package.name.clone(),
             sha256: package.sha256.clone(),
             filename: package.filename.clone(),
+            size: package.size,
             origin: package.origin,
         }
     }
 
-    /// Projects a package a plan pinned.
+    /// Projects a package a plan names.
     ///
     /// The plan's archive index is the repository index, which is what
-    /// [`validate_pinned_plan`] holds the configuration to.
+    /// [`validate_plan`] holds the configuration to.
+    ///
+    /// A plan carries no size, because installing from one fetches no index to
+    /// read it from — that omission is the whole of what a plan saves. Such a
+    /// download is bounded by the fetcher's own ceiling instead, and verified
+    /// against the plan's digest exactly as any other is.
     fn from_planned(package: &PlannedPackage) -> Wanted {
         Wanted {
             name: package.name.clone(),
             sha256: package.sha256.clone(),
             filename: package.filename.clone(),
+            size: None,
             origin: package.archive,
         }
     }
@@ -2120,10 +2313,32 @@ fn maintainer_env() -> Vec<(String, String)> {
     .collect()
 }
 
-/// Fetches a URL fully into memory.
-fn fetch_bytes(fetcher: &mut dyn Fetch, url: &str) -> Result<Vec<u8>, DebianError> {
+/// Fetches a URL fully into memory, bounded by the size a verified source
+/// declares for it where there is one.
+///
+/// The declared size travels with the request, so a transport that honours it
+/// refuses an oversized framing before reading a byte, *and* bounds the sink
+/// here, because a caller-supplied [`Fetch`] is free to ignore the request and
+/// the sink is the one place the bound cannot be ignored. Without it the only
+/// bound is the built-in fetcher's own `MAX_BODY` — two gigabytes — or nothing
+/// at all for a transport of the caller's, while the release that named the
+/// resource says it is a few megabytes. The digest check that follows catches
+/// the substitution either way, but only after the memory has been spent.
+fn fetch_bytes(
+    fetcher: &mut dyn Fetch,
+    url: &str,
+    size: Option<u64>,
+) -> Result<Vec<u8>, DebianError> {
     let mut bytes = Vec::new();
-    fetcher.fetch(&FetchRequest::new(url), &mut bytes)?;
+    let request = FetchRequest::new(url);
+    let result = match size {
+        Some(size) => {
+            let mut sink = http::LimitedWriter::new(&mut bytes, size);
+            fetcher.fetch(&request.sized(size), &mut sink)
+        }
+        None => fetcher.fetch(&request, &mut bytes),
+    };
+    result?;
     Ok(bytes)
 }
 
@@ -2391,6 +2606,14 @@ pub enum DebianError {
         /// What was wrong with it.
         reason: String,
     },
+    /// The archives could not supply what a
+    /// [`pin`](DebianBuilder::pin) holds the resolution to.
+    #[non_exhaustive]
+    Pin {
+        /// Every package the pin could not be held to, in name order, each
+        /// carrying what the archives offer instead.
+        unheld: Vec<UnheldPin>,
+    },
     /// A [`Plan`] document could not be read, or a [`Plan`] could not be
     /// written as one.
     #[non_exhaustive]
@@ -2455,6 +2678,14 @@ impl fmt::Display for DebianError {
                     "the .deb {} cannot be published: {reason}",
                     path.display()
                 )
+            }
+            DebianError::Pin { unheld } => {
+                let held = unheld
+                    .iter()
+                    .map(UnheldPin::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                write!(f, "the archives cannot hold the pin: {held}")
             }
             DebianError::PlanDocument { reason } => {
                 write!(f, "the install plan document is not usable: {reason}")
@@ -3010,6 +3241,7 @@ mod tests {
             &mut Canned(b"not what the archive recorded"),
             "file:///ignored-by-the-canned-transport",
             &deb::sha256_hex(b"the recorded bytes"),
+            None,
             &dest,
         )
         .expect_err("a mismatched download is refused");
@@ -3025,10 +3257,41 @@ mod tests {
             &mut Canned(b"the recorded bytes"),
             "file:///ignored-by-the-canned-transport",
             &deb::sha256_hex(b"the recorded bytes"),
+            Some(b"the recorded bytes".len() as u64),
             &dest,
         )
         .expect("a matching download publishes");
         assert_eq!(std::fs::read(&dest).unwrap(), b"the recorded bytes");
         assert_eq!(entries_of(&dir), ["package.deb"]);
+    }
+
+    #[test]
+    fn a_download_stops_at_the_size_the_index_recorded() {
+        // The index records what the package weighs, so a mirror answering with
+        // more is answering with something else. A transport of the caller's is
+        // free to ignore the size the request declares, so the bound is applied
+        // at the sink too — which is the one place it cannot be ignored — and
+        // the disk it would have filled is never written.
+        let dir = Scratch::new("download-capped");
+        let dest = dir.join("package.deb");
+
+        let err = fetch_verified(
+            &mut Canned(&[b'x'; 4096]),
+            "file:///ignored-by-the-canned-transport",
+            &deb::sha256_hex(&[b'x'; 4096]),
+            Some(16),
+            &dest,
+        )
+        .expect_err("a body over the recorded size is refused");
+        assert!(
+            matches!(err, DebianError::Fetch(FetchError::Io { .. })),
+            "{err}"
+        );
+        assert!(!dest.exists(), "an oversized download was published");
+        assert!(
+            entries_of(&dir).is_empty(),
+            "a refused download left its staging file behind: {:?}",
+            entries_of(&dir),
+        );
     }
 }

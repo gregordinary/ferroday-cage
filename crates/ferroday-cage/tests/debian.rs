@@ -1551,10 +1551,13 @@ fn hermetic_rejects_a_digest_mismatch() {
         "amd64",
         &[Pkg::required("base", deb(&good), "")],
     );
-    // Corrupt the published package so its bytes no longer match the index.
+    // Corrupt the published package so its bytes no longer match the index,
+    // without changing its length: the download is bounded by the size the
+    // index records, and a longer body would be refused at that bound before
+    // the digest was reached. This is the digest's own test.
     let pool_deb = repo.join("pool/base_1.0_amd64.deb");
     let mut bytes = std::fs::read(&pool_deb).unwrap();
-    bytes.extend_from_slice(b"tampered");
+    *bytes.last_mut().unwrap() ^= 0xff;
     std::fs::write(&pool_deb, &bytes).unwrap();
 
     let rootfs = dir.join("rootfs");
@@ -1576,6 +1579,60 @@ fn hermetic_rejects_a_digest_mismatch() {
         "a digest mismatch is reported: {inner}"
     );
     assert!(!rootfs.exists());
+}
+
+#[test]
+fn hermetic_stops_a_package_at_the_size_the_index_recorded() {
+    // The index records what the package weighs, so a mirror serving more is
+    // serving something else. The download stops at that bound rather than
+    // spending disk on the whole of it and discovering the substitution at the
+    // digest afterward.
+    let dir = common::scratch_dir("debian-oversized");
+    let repo = dir.join("repo");
+    let good = Tar::new().file("./usr/bin/x", 0o755, b"ok\n").finish();
+    write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", deb(&good), "")],
+    );
+    // Grow the published package well past its recorded size.
+    let pool_deb = repo.join("pool/base_1.0_amd64.deb");
+    let mut bytes = std::fs::read(&pool_deb).unwrap();
+    bytes.resize(bytes.len() + 4 * 1024 * 1024, b'x');
+    std::fs::write(&pool_deb, &bytes).unwrap();
+
+    let rootfs = dir.join("rootfs");
+    let cache = dir.join("cache");
+    let mirror = format!("file://{}", repo.display());
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(&cache)
+        .extract_only(true)
+        .build()
+        .expect("the builder validates");
+    let err = provision::ensure(&rootfs, &mut debian).unwrap_err();
+    let ProvisionError::Other { source: inner, .. } = &err else {
+        panic!("expected a boxed Debian error, got {err:?}");
+    };
+    assert!(
+        inner.to_string().contains("maximum size"),
+        "the oversized body is refused at the bound: {inner}"
+    );
+    assert!(!rootfs.exists());
+    // Nothing oversized was left in the cache, and nothing was published there.
+    let cached: u64 = std::fs::read_dir(&cache)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.metadata().unwrap().len())
+        .sum();
+    assert!(
+        cached < bytes.len() as u64,
+        "the whole oversized body reached the cache",
+    );
 }
 
 #[test]
@@ -2712,4 +2769,360 @@ fn a_plan_refuses_every_setting_that_would_shape_a_resolution() {
     edited.packages[0].archive = 7;
     let reason = refusal(base(edited));
     assert!(reason.contains("archive 7"), "{reason}");
+}
+
+/// A package at an explicit version, which [`Pkg::ordinary`] fixes at `1.0`.
+fn at_version(name: &str, version: &str, deb: Vec<u8>) -> Pkg {
+    Pkg {
+        version: version.to_string(),
+        ..Pkg::ordinary(name, deb)
+    }
+}
+
+/// A payload at a fixed path carrying the given bytes, so two builds of one
+/// package are told apart by what they installed rather than by where.
+fn payload_holding(contents: &[u8]) -> Vec<u8> {
+    deb(&Tar::new()
+        .dir("./usr", 0o755)
+        .dir("./usr/bin", 0o755)
+        .file("./usr/bin/x", 0o755, contents)
+        .finish())
+}
+
+#[test]
+fn hermetic_a_pin_selects_its_version_where_the_archive_offers_a_higher_one() {
+    // What a pin is for: the archive has published since the plan was taken and
+    // still offers both versions, as a snapshot mirror does. The unpinned
+    // resolution takes the newer one and the pinned resolution does not, from
+    // the same archive in the same test.
+    let dir = common::scratch_dir("debian-pin-selects");
+    let repo = dir.join("repo");
+    let old = payload_holding(b"one\n");
+    let new = payload_holding(b"two\n");
+    let mirror = write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[
+            Pkg {
+                priority: "required".to_string(),
+                ..at_version("base", "1.0", old.clone())
+            },
+            Pkg {
+                priority: "required".to_string(),
+                ..at_version("base", "2.0", new)
+            },
+        ],
+    );
+
+    let build = || {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(mirror.clone())
+            .trust_unsigned(true)
+            .cache_dir(dir.join("cache"))
+            .extract_only(true)
+    };
+
+    // Unpinned, the archive's newest wins.
+    let live = build().build().expect("the builder validates");
+    let live = live_resolve(live);
+    assert_eq!(live.packages[0].version, "2.0");
+
+    // Pinned to the older one, the resolution holds there — and reports the
+    // digest of the version it held to, not the one it passed over.
+    let mut pin = live.clone();
+    pin.packages[0].version = "1.0".to_string();
+    pin.packages[0].sha256 = common::deb_repo::sha256_hex(&old);
+    pin.packages[0].filename = "pool/base_1.0_amd64.deb".to_string();
+
+    let mut debian = build().pin(pin).build().expect("the pin validates");
+    let held = debian.resolve().expect("the pinned version is offered");
+    assert_eq!(held.packages[0].version, "1.0");
+    assert_eq!(held.packages[0].sha256, common::deb_repo::sha256_hex(&old));
+
+    // And the bootstrap installs what the pin held to, not what the archive
+    // would have chosen.
+    let rootfs = dir.join("rootfs");
+    assert_eq!(
+        provision::ensure(&rootfs, &mut debian).expect("the pinned bootstrap runs"),
+        Provisioned::Created,
+    );
+    assert_eq!(std::fs::read(rootfs.join("usr/bin/x")).unwrap(), b"one\n");
+}
+
+/// Resolves a bootstrap, taking it by value so a builder chain reads in one
+/// expression.
+fn live_resolve(mut debian: Debian<'_>) -> Plan {
+    debian.resolve().expect("the resolution runs")
+}
+
+#[test]
+fn hermetic_a_pin_the_archive_has_moved_past_names_what_it_offers() {
+    // The archive replaced the version rather than keeping both, which is what
+    // an ordinary suite does. The pin cannot be held, and the refusal says what
+    // is there instead rather than only that something is missing.
+    let dir = common::scratch_dir("debian-pin-moved");
+    let repo = dir.join("repo");
+    let mirror = write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[Pkg {
+            priority: "required".to_string(),
+            ..at_version("base", "1.0", payload_holding(b"one\n"))
+        }],
+    );
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let pin = debian.resolve().expect("the first resolution runs");
+
+    // The archive publishes 2.0 over 1.0, and drops the package `gone`
+    // entirely — the two failures a pin distinguishes.
+    write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[Pkg {
+            priority: "required".to_string(),
+            ..at_version("base", "2.0", payload_holding(b"two\n"))
+        }],
+    );
+
+    let mut dropped = pin.clone();
+    let mut gone = dropped.packages[0].clone();
+    gone.name = "gone".to_string();
+    dropped.packages.push(gone);
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .pin(dropped)
+        .build()
+        .expect("the pin validates against the configuration");
+
+    let refusal = debian.resolve().expect_err("the pin cannot be held");
+    let rendered = refusal.to_string();
+    assert!(rendered.contains("base is pinned to 1.0"), "{rendered}");
+    assert!(rendered.contains("offer 2.0"), "{rendered}");
+    assert!(
+        rendered.contains("gone is pinned to 1.0 and the archives offer no version of it"),
+        "{rendered}",
+    );
+    // Reported in name order, so a diff across two archive publishes is stable.
+    assert!(
+        rendered.find("base is pinned").unwrap() < rendered.find("gone is pinned").unwrap(),
+        "{rendered}",
+    );
+}
+
+#[test]
+fn hermetic_a_pin_holds_the_archive_half_and_lets_a_local_build_float() {
+    // The shape a pin exists for. The archive half of a build is fixed by a
+    // committed document; the half the build compiles for itself is published
+    // to a local repository and pinned by nothing, because a compile that is
+    // not byte-reproducible produces a different digest each time. Handing the
+    // whole plan to plan() refuses that build; pinning only the archive half
+    // resolves it.
+    let dir = common::scratch_dir("debian-pin-local");
+    let archive = write_repo(
+        &dir.join("archive"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", payload_holding(b"base\n"), "")],
+    );
+    let local = dir.join("local");
+    let built = write_repo(
+        &local,
+        "trixie",
+        "amd64",
+        &[at_version(
+            "kernel",
+            "6.12",
+            payload_holding(b"first compile\n"),
+        )],
+    );
+
+    let local_repo = Repository::builder("trixie")
+        .mirror(built.clone())
+        .trust_unsigned(true)
+        .name("local")
+        .build()
+        .expect("the local repository validates");
+    // A plan names every package to install, so the replay below composes with
+    // no include(); the selecting builds carry one and the replay does not.
+    let base = |repo: Repository| {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(archive.clone())
+            .trust_unsigned(true)
+            .repository(repo)
+            .cache_dir(dir.join("cache"))
+            .extract_only(true)
+    };
+    let build = |repo: Repository| base(repo).include(["kernel"]);
+
+    let mut debian = build(local_repo.clone())
+        .build()
+        .expect("the builder validates");
+    let plan = debian.resolve().expect("the first resolution runs");
+    assert_eq!(plan.packages.len(), 2, "{plan:?}");
+
+    // The kernel is compiled again and differs in a byte, as a build that is
+    // not byte-reproducible does.
+    write_repo(
+        &local,
+        "trixie",
+        "amd64",
+        &[at_version(
+            "kernel",
+            "6.12",
+            payload_holding(b"second compile\n"),
+        )],
+    );
+
+    // The whole plan replayed verbatim fetches by the digest of the first
+    // compile, which nothing now serves.
+    let mut verbatim = base(local_repo.clone())
+        .plan(plan.clone())
+        .build()
+        .expect("the plan validates against the configuration");
+    let rootfs = dir.join("replayed");
+    let refusal = provision::ensure(&rootfs, &mut verbatim)
+        .expect_err("the recompiled kernel does not match the recorded digest");
+    assert!(refusal.to_string().contains("recorded digest"), "{refusal}",);
+
+    // The same plan with the locally built half dropped holds the archive and
+    // resolves the kernel at whatever the local repository now serves.
+    let mut pin = plan;
+    pin.packages.retain(|package| package.name != "kernel");
+    let mut debian = build(local_repo)
+        .pin(pin)
+        .build()
+        .expect("the pin validates against the configuration");
+    let rootfs = dir.join("pinned");
+    assert_eq!(
+        provision::ensure(&rootfs, &mut debian).expect("the pinned bootstrap runs"),
+        Provisioned::Created,
+    );
+    assert_eq!(
+        std::fs::read(rootfs.join("usr/bin/x")).unwrap(),
+        b"second compile\n",
+    );
+}
+
+#[test]
+fn hermetic_one_version_published_twice_over_different_bytes_is_refused() {
+    // The version matches and the bytes do not, which is the event a recorded
+    // digest exists to catch. Nothing else in the resolution notices: the
+    // archive's own index is internally consistent and its release signs it.
+    let dir = common::scratch_dir("debian-pin-rebuilt");
+    let repo = dir.join("repo");
+    let mirror = write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", payload_holding(b"one\n"), "")],
+    );
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .build()
+        .expect("the builder validates");
+    let pin = debian.resolve().expect("the first resolution runs");
+
+    // Republished at the same version over different bytes.
+    write_repo(
+        &repo,
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", payload_holding(b"two\n"), "")],
+    );
+
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .pin(pin)
+        .build()
+        .expect("the pin validates against the configuration");
+    let refusal = debian
+        .resolve()
+        .expect_err("the archive records other bytes for the pinned version")
+        .to_string();
+    assert!(
+        refusal.contains("base 1.0 is pinned to the digest"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn hermetic_a_pin_composes_with_the_selection_a_plan_contradicts() {
+    // The whole of what separates a pin from a plan: a plan names every package
+    // to install, so include() has nothing to add and is refused; a pin names
+    // the versions a selection resolves to and says nothing about what is
+    // selected, so the same include() composes with it.
+    let dir = common::scratch_dir("debian-pin-composes");
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload_holding(b"base\n"), ""),
+            Pkg::ordinary("extra", payload_holding(b"extra\n")),
+        ],
+    );
+    let build = || {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(mirror.clone())
+            .trust_unsigned(true)
+    };
+    let mut debian = build().build().expect("the builder validates");
+    let plan = debian.resolve().expect("the base resolution runs");
+
+    // The same plan, the same include, and opposite outcomes.
+    let refusal = build()
+        .include(["extra"])
+        .plan(plan.clone())
+        .build()
+        .expect_err("a plan and an include contradict")
+        .to_string();
+    assert!(refusal.contains("include()"), "{refusal}");
+
+    let mut debian = build()
+        .include(["extra"])
+        .pin(plan.clone())
+        .build()
+        .expect("a pin and an include compose");
+    let resolved = debian.resolve().expect("the pinned resolution runs");
+    let names: Vec<_> = resolved.packages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["base", "extra"]);
+
+    // A plan and a pin at once are refused: a plan resolves nothing, so there
+    // is no resolution left for a pin to hold.
+    let refusal = build()
+        .plan(plan.clone())
+        .pin(plan.clone())
+        .build()
+        .expect_err("a plan and a pin contradict")
+        .to_string();
+    assert!(refusal.contains("drop one of the two"), "{refusal}");
+
+    // A pin resolved for another coordinate is refused where it cannot mean
+    // anything, exactly as a plan is.
+    let mut foreign = plan;
+    foreign.architecture = "riscv64".to_string();
+    let refusal = build()
+        .pin(foreign)
+        .build()
+        .expect_err("a pin for another architecture is refused")
+        .to_string();
+    assert!(refusal.contains("riscv64"), "{refusal}");
 }

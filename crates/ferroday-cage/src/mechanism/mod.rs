@@ -166,22 +166,47 @@ impl IdentityPlan {
     }
 }
 
-/// How the command's nested user namespace gets its identity map.
+/// How the command's nested user namespace gets its identity map, and the
+/// procfs paths that way of getting it names.
 ///
 /// The tier mirrors the sandbox's own: the single-identity map is one extent of
 /// one id and the command writes it in process, and a range map is written from
 /// outside the nested namespace by a delegate — here a delegate inside the
 /// sandbox, because the party that writes it must be root of the namespace the
 /// nested one is a child of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Each variant carries the paths its own route needs and no others, so a
+/// configuration that names none — a delegated map whose delegate is outside
+/// the sandbox — records that rather than a path nothing opens.
+#[derive(Debug, Clone)]
 pub(crate) enum NestedMap {
     /// The command writes its own map, under the kernel's unprivileged one-id
     /// exception: `setgroups` is denied first, which is what permits the write.
-    SelfWritten,
-    /// A delegate inside the sandbox — the process that forked the command —
-    /// writes the map while the command blocks at a gate. `setgroups` stays at
-    /// `allow`, so the supplementary groups a run-as identity names still work.
-    Delegated,
+    ///
+    /// The files are reached by path, after the pivot, so they are named
+    /// through the procfs the mount profile establishes.
+    SelfWritten {
+        /// `/proc/self/setgroups` as it is named inside the sandbox.
+        setgroups_path: CString,
+        /// `/proc/self/gid_map` as it is named inside the sandbox.
+        gid_map_path: CString,
+        /// `/proc/self/uid_map` as it is named inside the sandbox.
+        uid_map_path: CString,
+    },
+    /// A delegate — the process that forked the command — writes the map while
+    /// the command blocks at a gate. `setgroups` stays at `allow`, so the
+    /// supplementary groups a run-as identity names still work.
+    Delegated {
+        /// The procfs mount target, rootfs-relative, that a delegate inside the
+        /// sandbox opens during setup and writes the command's map files
+        /// through.
+        ///
+        /// `None` where the sandbox has no PID namespace: the delegate is then
+        /// the launch stage, which is outside and opens the host's `/proc`
+        /// before the pivot, so the profile's own procfs is never consulted and
+        /// a profile that mounts none still works.
+        procfs_target: Option<CString>,
+    },
 }
 
 /// The nested user namespace the command enters before the hardening layer,
@@ -203,27 +228,12 @@ pub(crate) enum NestedMap {
 /// creates no user namespace to nest inside.
 #[derive(Debug, Clone)]
 pub(crate) struct NestedPlan {
-    /// Who writes the map.
+    /// Who writes the map, and the procfs paths that route names.
     pub(crate) map: NestedMap,
     /// The `uid_map` content, formatted at build time.
     pub(crate) uid_lines: Vec<u8>,
     /// The `gid_map` content, formatted at build time.
     pub(crate) gid_lines: Vec<u8>,
-    /// `/proc/self/setgroups` as it is named inside the sandbox, through the
-    /// procfs the profile mounts. Written only by
-    /// [`SelfWritten`](NestedMap::SelfWritten).
-    pub(crate) setgroups_path: CString,
-    /// `/proc/self/gid_map` as it is named inside the sandbox.
-    pub(crate) gid_map_path: CString,
-    /// `/proc/self/uid_map` as it is named inside the sandbox.
-    pub(crate) uid_map_path: CString,
-    /// The procfs mount target, rootfs-relative, that the sandbox's own
-    /// delegate opens during setup and writes the command's map files through.
-    /// Used only by [`Delegated`](NestedMap::Delegated), and only where the
-    /// sandbox has a PID namespace and so a delegate inside it; without one the
-    /// delegate is the launch stage, which is outside and uses the host's
-    /// `/proc`.
-    pub(crate) procfs_target: CString,
 }
 
 /// How an overlay-rooted cage's root is assembled.

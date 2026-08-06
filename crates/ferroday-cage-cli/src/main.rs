@@ -81,8 +81,8 @@ Provisioning the root filesystem:
                         or extra
   --debian-trust-unsigned
                         Accept the archive without verifying its signature.
-                        Refused for an http:// mirror, which offers no
-                        authenticity of its own
+                        Every mirror must then be file:// or https://, the
+                        transports that authenticate what they serve
   --debian-allow-stale-release
                         Accept a signed release whose validity has expired
   --debian-pre-configure-overlay DIR

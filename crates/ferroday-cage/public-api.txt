@@ -129,6 +129,8 @@ pub ferroday_cage::provision::debian::DebianError::MalformedEntry::path: alloc::
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::NotConfigured
 pub ferroday_cage::provision::debian::DebianError::NotConfigured::packages: alloc::vec::Vec<alloc::string::String>
 pub ferroday_cage::provision::debian::DebianError::Overlay(ferroday_cage::provision::ProvisionError)
+#[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Pin
+pub ferroday_cage::provision::debian::DebianError::Pin::unheld: alloc::vec::Vec<ferroday_cage::provision::debian::UnheldPin>
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::PlanDocument
 pub ferroday_cage::provision::debian::DebianError::PlanDocument::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Release
@@ -228,6 +230,20 @@ impl core::marker::Unpin for ferroday_cage::provision::debian::Stream
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Stream
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Stream
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Stream
+#[non_exhaustive] pub enum ferroday_cage::provision::debian::UnheldReason
+pub ferroday_cage::provision::debian::UnheldReason::Absent
+pub ferroday_cage::provision::debian::UnheldReason::Digest
+pub ferroday_cage::provision::debian::UnheldReason::Digest::archive: alloc::string::String
+pub ferroday_cage::provision::debian::UnheldReason::Digest::pin: alloc::string::String
+pub ferroday_cage::provision::debian::UnheldReason::Version
+pub ferroday_cage::provision::debian::UnheldReason::Version::archive: alloc::string::String
+impl core::marker::Freeze for ferroday_cage::provision::debian::UnheldReason
+impl core::marker::Send for ferroday_cage::provision::debian::UnheldReason
+impl core::marker::Sync for ferroday_cage::provision::debian::UnheldReason
+impl core::marker::Unpin for ferroday_cage::provision::debian::UnheldReason
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::UnheldReason
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::UnheldReason
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::UnheldReason
 pub struct ferroday_cage::provision::debian::Available
 impl ferroday_cage::provision::debian::Available
 pub fn ferroday_cage::provision::debian::Available::contains(&self, &str) -> bool
@@ -290,6 +306,7 @@ pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::include<I, S>(self, 
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::keyring(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::mirror(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::pin(self, ferroday_cage::provision::debian::Plan) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::plan(self, ferroday_cage::provision::debian::Plan) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::pre_configure_overlay(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::repository(self, ferroday_cage::provision::debian::Repository) -> Self
@@ -306,6 +323,8 @@ impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::deb
 pub struct ferroday_cage::provision::debian::FetchRequest<'a>
 impl<'a> ferroday_cage::provision::debian::FetchRequest<'a>
 pub fn ferroday_cage::provision::debian::FetchRequest<'a>::new(&'a str) -> ferroday_cage::provision::debian::FetchRequest<'a>
+pub fn ferroday_cage::provision::debian::FetchRequest<'a>::size(&self) -> core::option::Option<u64>
+pub fn ferroday_cage::provision::debian::FetchRequest<'a>::sized(self, u64) -> ferroday_cage::provision::debian::FetchRequest<'a>
 pub fn ferroday_cage::provision::debian::FetchRequest<'a>::url(&self) -> &'a str
 impl<'a> core::marker::Freeze for ferroday_cage::provision::debian::FetchRequest<'a>
 impl<'a> core::marker::Send for ferroday_cage::provision::debian::FetchRequest<'a>
@@ -459,6 +478,19 @@ impl core::marker::Unpin for ferroday_cage::provision::debian::ResolvedArchive
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::ResolvedArchive
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::ResolvedArchive
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::ResolvedArchive
+#[non_exhaustive] pub struct ferroday_cage::provision::debian::UnheldPin
+pub ferroday_cage::provision::debian::UnheldPin::package: alloc::string::String
+pub ferroday_cage::provision::debian::UnheldPin::reason: ferroday_cage::provision::debian::UnheldReason
+pub ferroday_cage::provision::debian::UnheldPin::version: alloc::string::String
+impl core::fmt::Display for ferroday_cage::provision::debian::UnheldPin
+pub fn ferroday_cage::provision::debian::UnheldPin::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::debian::UnheldPin
+impl core::marker::Send for ferroday_cage::provision::debian::UnheldPin
+impl core::marker::Sync for ferroday_cage::provision::debian::UnheldPin
+impl core::marker::Unpin for ferroday_cage::provision::debian::UnheldPin
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::UnheldPin
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::UnheldPin
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::UnheldPin
 pub trait ferroday_cage::provision::debian::Fetch: core::marker::Send
 pub fn ferroday_cage::provision::debian::Fetch::fetch(&mut self, &ferroday_cage::provision::debian::FetchRequest<'_>, &mut dyn std::io::Write) -> core::result::Result<(), ferroday_cage::provision::debian::FetchError>
 impl ferroday_cage::provision::debian::Fetch for ferroday_cage::provision::debian::HttpFetch

@@ -10,11 +10,6 @@
 //! under `target` for the same reason.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Distinguishes two scratch directories made in one process, so tests that
-/// share a tag — or run in parallel threads — never collide.
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// An empty directory that removes itself and everything under it when
 /// dropped.
@@ -29,18 +24,23 @@ pub(crate) struct Scratch {
 impl Scratch {
     /// Creates an empty scratch directory named after `tag`.
     ///
+    /// The name carries [`host::unique_hex`](crate::host::unique_hex), so it is
+    /// unpredictable as well as unique: the system temporary directory is
+    /// shared with every other local user, and a guessable name is one a
+    /// neighbour can park a symbolic link at. `create_dir` then demands a
+    /// directory this call created itself, since `mkdirat` never follows a link
+    /// and fails on a name already taken. It is the rule the host probes next
+    /// door keep for their own entries in the same directory, and one that
+    /// clearing a fixed name and adopting it does not.
+    ///
     /// Panics if the directory cannot be created: a test that cannot lay out
     /// its tree has nothing left to assert.
     pub(crate) fn new(tag: &str) -> Scratch {
-        let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "ferroday-cage-test-{tag}-{}-{serial}",
-            std::process::id()
+            "ferroday-cage-test-{tag}-{}",
+            crate::host::unique_hex(),
         ));
-        // A previous run that was killed rather than unwound leaves its tree
-        // behind, and the name is only unique per process id.
-        crate::host::force_remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("the scratch directory is creatable");
+        std::fs::create_dir(&path).expect("the scratch directory is creatable");
         Scratch { path }
     }
 
@@ -110,5 +110,14 @@ mod tests {
             second.path(),
             "two scratch directories share a path, so one clears the other",
         );
+    }
+
+    #[test]
+    fn a_scratch_is_the_directory_it_created_itself() {
+        // The temporary directory is shared with every other local user, so the
+        // create has to refuse a name already taken rather than adopt what is
+        // there — including a symbolic link a neighbour aimed somewhere else.
+        let taken = Scratch::new("taken");
+        assert!(std::fs::create_dir(taken.path()).is_err());
     }
 }

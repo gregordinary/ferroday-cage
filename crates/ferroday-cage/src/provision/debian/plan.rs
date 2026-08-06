@@ -22,7 +22,13 @@ use super::index::{Package, parse_stanzas};
 /// trusting. The version is bumped only for a change a previous reader would
 /// misread; adding a field is not one, since a reader carries a field it does
 /// not know through untouched rather than refusing the document or dropping it.
-const FORMAT: &str = "ferroday-cage-plan 1";
+///
+/// A field that keeps its name and changes its meaning is the shape the
+/// carried-field rule cannot absorb, and version 2 is what one of them
+/// required: `Signed-By` names the verifying certificate, where version 1 named
+/// the key that made the signature. A reader accepting both would hand back a
+/// fingerprint without saying which of the two questions it answers.
+const FORMAT: &str = "ferroday-cage-plan 2";
 
 /// The packages a [`Debian`](super::Debian) bootstrap resolves for its suite,
 /// produced without downloading or unpacking anything.
@@ -802,7 +808,7 @@ mod tests {
     fn the_document_is_readable_deb822() {
         let document = sample().to_document().unwrap();
         assert!(
-            document.starts_with("Format: ferroday-cage-plan 1\n"),
+            document.starts_with("Format: ferroday-cage-plan 2\n"),
             "{document}",
         );
         // Every stanza is separated by a blank line and no field is folded, so
@@ -864,15 +870,22 @@ mod tests {
 
     #[test]
     fn a_document_from_a_format_this_library_does_not_read_is_refused() {
-        let document = sample()
-            .to_document()
-            .unwrap()
-            .replace("ferroday-cage-plan 1", "ferroday-cage-plan 2");
-        match Plan::parse_document(&document) {
-            Err(DebianError::PlanDocument { reason }) => {
-                assert!(reason.contains("format"), "{reason}");
+        // Both directions, because a superseded version is refused for the same
+        // reason a later one is: the reader cannot say what the fields mean. In
+        // version 1 `Signed-By` named the key that made the signature rather
+        // than the certificate, so reading one would answer a question the
+        // caller did not ask.
+        for version in ["ferroday-cage-plan 1", "ferroday-cage-plan 3"] {
+            let document = sample()
+                .to_document()
+                .unwrap()
+                .replace("ferroday-cage-plan 2", version);
+            match Plan::parse_document(&document) {
+                Err(DebianError::PlanDocument { reason }) => {
+                    assert!(reason.contains("format"), "{reason}");
+                }
+                other => panic!("expected a format refusal for {version:?}, got {other:?}"),
             }
-            other => panic!("expected a format refusal, got {other:?}"),
         }
     }
 

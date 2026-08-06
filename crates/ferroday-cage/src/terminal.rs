@@ -107,7 +107,7 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// A terminal 80 columns wide and 24 rows tall.
+    /// A terminal 24 rows tall and 80 columns wide.
     ///
     /// The value for a caller with nothing better to say, and a stated constant
     /// rather than anything read from the host. An interactive caller passes
@@ -118,7 +118,7 @@ impl Terminal {
         Terminal { rows: 24, cols: 80 }
     }
 
-    /// Sets the window size the command starts with.
+    /// Sets the window size the command starts with, as (rows, columns).
     ///
     /// The size is established on the replica before the command exists, so the
     /// command cannot observe a 0x0 window during startup.
@@ -232,8 +232,8 @@ impl Pty {
         Pty { primary }
     }
 
-    /// Sets the terminal's window size and delivers `SIGWINCH` to the sandbox's
-    /// foreground process group.
+    /// Sets the terminal's window size, as (rows, columns), and delivers
+    /// `SIGWINCH` to the sandbox's foreground process group.
     ///
     /// Takes `&self`, so a `SIGWINCH` handler can call it while a reader thread
     /// holds the same `Pty` through an `Arc`. An interactive caller calls this

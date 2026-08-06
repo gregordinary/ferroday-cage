@@ -129,8 +129,10 @@ before, under the same names. It is established the same way the sandbox's own
 is — written in process under the single-identity map, and written by a
 delegate under a [range map](identity-maps.md), the delegate here being the
 sandbox init rather than the caller, since only a process inside the sandbox's
-namespace is root of it. Either way it goes through a procfs, by path, which is
-why a sandbox that mounts none is refused at build time.
+namespace is root of it. It is reached through a procfs, by path, which is why a
+sandbox that mounts none is refused at build time — except where the delegate is
+outside the sandbox and reads the host's own, which [Identity
+maps](identity-maps.md) sets out.
 
 The entry sits where it does because the kernel re-derives the whole credential
 for a new user namespace: securebits return to their defaults, the capability
@@ -339,3 +341,31 @@ The default profile is a rootless convenience for code you trust: a
 controlled filesystem view, isolated namespaces, and a clean environment.
 Hostile code calls for [the hardening layer](hardening.md); the default
 profile alone is not a boundary against it.
+
+### What the sandbox does not hide
+
+Isolation is about what the command can *reach*, not about what it can learn.
+The command reads its own mount table — `/proc/self/mountinfo`, and the
+`/proc/mounts` symlink to it — and every line carries the host path the mount
+came from:
+
+```text
+263 191 252:1 /home/alice/build/alpine-rootfs / rw,nosuid,noatime - ext4 ...
+408 263 252:1 /tmp/build-inputs         /ro    ro,noatime         - ext4 ...
+```
+
+So a sandboxed command can read the calling user's name, the layout of the
+build that started it, and the host path behind each bind. This is what every
+bind-mount-based sandbox exposes — Docker and bubblewrap alike — and it follows
+from binding host paths at all; closing it would take a mount over `mountinfo`
+in a `/proc` of the sandbox's own, which is a larger mechanism than the
+disclosure warrants.
+
+It is called out because the rest of the crate leans the other way. A
+[`Terminal`](terminal.md) refuses to read the host's window size, `base_env`
+exists so that no host variable reaches the command unasked, and `TERM` is the
+caller's to state. None of that extends to the mount table: a command that wants
+to know where it is running can find out. Where that matters — a build whose
+output must not embed a path, code whose behaviour should not vary with one —
+bind the inputs at stable in-sandbox paths and treat the mount table as one more
+thing the command may read.

@@ -14,18 +14,61 @@ use std::io::{self, Write};
 #[derive(Debug, Clone, Copy)]
 pub struct FetchRequest<'a> {
     url: &'a str,
+    size: Option<u64>,
 }
 
 impl<'a> FetchRequest<'a> {
     /// Returns a request for `url`.
     pub fn new(url: &'a str) -> FetchRequest<'a> {
-        FetchRequest { url }
+        FetchRequest { url, size: None }
+    }
+
+    /// Records the size the body is expected to be, in bytes.
+    ///
+    /// The provisioner states it wherever a verified source declares it: the
+    /// signed release records the length of every index alongside its digest,
+    /// and the index records the length of every package. Both are known before
+    /// the request is made and are as trustworthy as the signature they hang
+    /// from.
+    pub fn sized(mut self, bytes: u64) -> FetchRequest<'a> {
+        self.size = Some(bytes);
+        self
     }
 
     /// The URL to fetch.
     pub fn url(&self) -> &'a str {
         self.url
     }
+
+    /// The size the body is expected to be, or `None` where nothing declares
+    /// one — a release file, which is the trust root and so has no signed
+    /// length of its own.
+    ///
+    /// An implementation that honours it refuses a body larger than the stated
+    /// size, and may refuse a declared framing larger than it before reading
+    /// anything: a mirror that answers a request for a few megabytes with
+    /// gigabytes is not serving the resource that was asked for, and the digest
+    /// check that would catch the substitution runs only after the bytes have
+    /// been spent. It is a ceiling, not a promise — an implementation is free
+    /// to ignore it, and the provisioner bounds its own sink regardless.
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+}
+
+/// The scheme `url` names, or `None` for a reference that names none.
+///
+/// The scheme is the text before `://`, and RFC 3986 §3.1 spells it
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` — so a path reference that
+/// happens to contain `://` does not read as one. It is returned as written;
+/// schemes are case-insensitive, so a comparison against it must be too.
+pub(super) fn scheme_of(url: &str) -> Option<&str> {
+    let (scheme, _) = url.split_once("://")?;
+    let mut bytes = scheme.bytes();
+    let first = bytes.next()?;
+    (first.is_ascii_alphabetic()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')))
+    .then_some(scheme)
 }
 
 /// Fetches the contents of a URL.

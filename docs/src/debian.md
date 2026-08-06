@@ -252,7 +252,7 @@ snapshot.
 
 Multiplying repositories does not dilute trust. Every authenticity check — the
 signature against the repository's keyring, the release bound to its suite, the
-refusal of `trust_unsigned` over `http://` — simply runs once per repository.
+transport `trust_unsigned` requires — simply runs once per repository.
 The `deb-multirepo` example provisions a root from the archive mirror plus a
 local trusted pool, auditing the repository builder end to end.
 
@@ -741,7 +741,7 @@ and a `Packages` index are written in — so it reads in a terminal and diffs in
 review:
 
 ```text
-Format: ferroday-cage-plan 1
+Format: ferroday-cage-plan 2
 Suite: trixie
 Architecture: arm64
 
@@ -822,6 +822,15 @@ written by a later version of the library still reads here as long as the
 `Format` version is unchanged — that version is bumped only for a change an
 older reader would misread. Adding a field is not one.
 
+A field that keeps its name and changes its meaning is, and version 2 is what
+one of them required. In version 1, `Signed-By` named the key that made the
+release signature; in version 2 it names the verifying certificate, and the
+signing key has a field of its own. A version 1 document is therefore refused
+rather than read: the fingerprint under `Signed-By` answers a different
+question, and a consumer comparing it against a recorded one would read the
+difference as the archive having rotated its key. Re-resolving against the same
+archive writes a version 2 document.
+
 Carried on the way in does not mean dropped on the way out. A field this version
 does not know is carried with its stanza and re-emitted after the ones it does,
 so reading a plan and writing it back preserves every field. That matters
@@ -831,11 +840,13 @@ discarded whatever a newer writer had added would corrupt exactly the record it
 was kept for.
 
 Within one version a round trip is byte-identical, carried fields included, so
-re-emitting does not churn a committed file. Across versions of this library it
-is byte-identical too, because a field added to the format is written after
-every field the older readers knew — which is exactly where those readers put a
-field they do not know back. `Installed-Size` and `Source` sit after `Archive`
-for that reason rather than beside the fields they describe.
+re-emitting does not churn a committed file. Between two versions of this
+library that share a `Format` version it is byte-identical too, in both
+directions: a document the newer writes reads and re-writes unchanged through
+the older, because a field added to the format is written after every field the
+older readers knew — which is exactly where those readers put a field they do
+not know back. `Installed-Size` and `Source` sit after `Archive` for that reason
+rather than beside the fields they describe.
 
 What no round trip can promise is byte identity across *writers*: another
 implementation of this format may interleave its fields with the known ones
@@ -853,6 +864,90 @@ package naming an archive the document does not carry, archive stanzas numbered
 out of order, a missing required field, and, on the writing side, a value the
 format cannot carry on one line or one whose own leading or trailing whitespace
 a reader would strip.
+
+## Holding a resolution to a plan's versions
+
+[`pin`] takes the same `Plan` and does something else with it. Where [`plan`]
+*replaces* a resolution, `pin` *constrains* one: the bootstrap fetches and
+verifies every release and index as it always does and computes the closure over
+what the archives offer now, and each package the pin names is selected at the
+pinned version rather than at the highest offered.
+
+```rust,no_run
+use ferroday_cage::provision::debian::{Debian, Plan, Repository};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// The committed document, covering the archives and nothing else.
+let kept = Plan::parse_document(&std::fs::read_to_string("archives.plan")?)?;
+
+let mut debian = Debian::builder("trixie")
+    .repository(Repository::builder("trixie")
+        .mirror("file:///srv/pool")
+        .trust_unsigned(true)
+        .build()?)
+    .include(["build-essential", "kernel-image"])
+    .pin(kept)
+    .build()?;
+# let _ = &mut debian;
+# Ok(())
+# }
+```
+
+### When this is the one that fits
+
+A build whose inputs are not all archives. Where some of the packages are
+compiled by the build itself and published to a local [pool](#publishing-a-local-pool),
+`plan` requires those compiles to be byte-reproducible: it installs every
+package by a recorded digest, and a compile that differs by a timestamp no
+longer matches its own plan. Where the compile is not reproducible, replaying
+becomes unavailable for exactly the builds that most want it, for a reason that
+has nothing to do with the archive.
+
+Pinning only the archive-sourced packages splits the two apart. The document
+fixes the half a mirror controls — the versions it served, which is what a plan
+exists to record and what a source-level lock cannot pin — and the locally built
+half resolves at whatever the pool now holds, its digest read from the pool's own
+index as any other package's is.
+
+### The trust model does not change
+
+Nothing here leaves the archive signature chain. Every digest installed is still
+read from an index whose own digest a verified release records, so a pinned
+bootstrap has the trust properties of an ordinary one — which is the difference
+from `plan`, where the plan becomes the anchor. The pin narrows which version is
+selected; it never becomes the authority for what the bytes are.
+
+A pin whose recorded digest disagrees with the archive's for the same version is
+refused rather than preferred. That is one version published twice over
+different bytes, which is the event a recorded digest exists to catch.
+
+### What composes, and what is refused
+
+`include`, `exclude`, and `base_priority` all compose with a pin, where a plan
+refuses them. That is the whole of what separates the two: a plan names every
+package to install, so a selection has nothing to add to it, while a pin names
+the versions a selection resolves to and says nothing about what is selected.
+The repository list is free to differ from the one the pin was resolved against,
+and the pin's own archive records are not read — a pin constrains packages.
+
+A pin alongside a `plan` is refused at `build` with `DebianError::Config`: a
+plan resolves nothing, so there is no resolution left to constrain. So is a pin
+whose suite or architecture disagrees with the builder's, and one naming the
+same package twice, which states two versions to hold it at. Where the builder
+names no architecture the pin's is adopted, as a plan's is.
+
+### When the archives have moved past it
+
+A pin the archives cannot supply fails the resolve or the bootstrap with
+`DebianError::Pin`, before the closure is computed and before anything is
+downloaded. It names every package that could not be held at once, in name
+order, since one archive publish moves many together — and for each of them
+which of the three happened: the archives offer another version, offer no
+version of it at all, or record different bytes for the one pinned.
+
+A live mirror serving a single version per suite will move past a pin as soon as
+it publishes. A [snapshot mirror](#installing-a-plan-without-resolving-again) is
+what holds one open, and it is the same configuration a replayed plan uses.
 
 ## Asking what an archive carries
 
@@ -1015,7 +1110,13 @@ that signature. A different keyring is supplied with
 [`keyring`], and
 [`trust_unsigned`] accepts an unsigned `Release`
 for a local mirror under the caller's control — the equivalent of apt's
-`trusted=yes`.
+`trusted=yes`. It removes the only authenticity check, leaving the transport to
+supply one, so `build` requires a transport that does: every mirror of an
+unsigned repository must be `file://` or `https://`. Any other scheme is
+refused, `http://` among them. The rule is an allow-list rather than a refusal
+of `http://` because a refusal names only the plaintext scheme it was written
+for, and a caller-supplied transport can speak any of them; schemes are
+compared case-insensitively, as [RFC 3986 §3.1] defines them.
 
 The signature alone does not say which suite was delivered — a single archive
 key signs every suite — so the release is also bound to the request: its
@@ -1229,6 +1330,7 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`resolve`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.resolve
 [`available`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.available
 [`plan`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.plan
+[`pin`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.pin
 [`foreign_interpreter`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/fn.foreign_interpreter.html
 [`pre_configure_overlay`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.pre_configure_overlay
 [`Repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Repository.html
@@ -1247,3 +1349,4 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`BuildLayer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.BuildLayer.html
 [`overlay_rootfs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_rootfs
 [`host::overlay_blocker`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.overlay_blocker.html
+[RFC 3986 §3.1]: https://www.rfc-editor.org/rfc/rfc3986#section-3.1

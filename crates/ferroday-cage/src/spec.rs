@@ -1639,12 +1639,17 @@ impl CageBuilder {
     /// Either way, `/proc/net` and `/proc/sys/net` resolve through the
     /// sandbox's own network namespace.
     ///
-    /// A container needs a procfs from somewhere: the nested user namespace the
-    /// command enters — which is what locks the sandbox's mount flags —
-    /// establishes its identity map through one, by path. Setting this to
-    /// `false` therefore obliges the profile to mount a procfs of its own, and
-    /// [`build`](Self::build) refuses one that does not with
+    /// A container usually needs a procfs from somewhere: the nested user
+    /// namespace the command enters — which is what locks the sandbox's mount
+    /// flags — establishes its identity map through one, by path. Setting this
+    /// to `false` therefore obliges the profile to mount a procfs of its own,
+    /// and [`build`](Self::build) refuses one that does not with
     /// [`ConfigError::NestedUsernsNeedsProcfs`](crate::ConfigError::NestedUsernsNeedsProcfs).
+    /// The exception is a range
+    /// [`identity_map`](Self::identity_map) with
+    /// [`pid_namespace(false)`](Self::pid_namespace), whose nested map is
+    /// written from outside the sandbox through the host's own `/proc`: that
+    /// combination reads no procfs of the profile's and needs none.
     pub fn mount_proc(mut self, mount: bool) -> Self {
         self.mount_proc = Some(mount);
         self
@@ -2517,59 +2522,80 @@ fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan
 /// the kernel's one-id exception is what lets a process write its own map and
 /// nothing richer.
 ///
-/// A container needs a procfs for this: the map files are reached by path, and
-/// the paths that name them are inside the sandbox by the time the command
-/// writes them. A profile that mounts none is refused here rather than at
-/// launch, where the failure would be an `ENOENT` on a path nobody asked for.
+/// A procfs is required exactly where the chosen route reaches for one, and a
+/// profile that mounts none is then refused here rather than at launch, where
+/// the failure would be an `ENOENT` on a path nobody asked for. Two of the
+/// three routes reach for one: a self-written map, whose command names its own
+/// map files by path after the pivot, and a delegated map inside a PID
+/// namespace, whose delegate is inside the sandbox. The third — a delegated map
+/// without a PID namespace — is written by the launch stage, outside, through
+/// the host's own `/proc`, and needs nothing of the profile.
 fn build_nested_plan(
     identity: &IdentityPlan,
     ops: &[MountOp],
     pid_namespace: bool,
 ) -> Result<NestedPlan, Error> {
-    // Only a delegated map inside a PID namespace of the sandbox's own needs a
-    // *fresh* procfs; see `procfs_op_target`.
-    let needs_fresh_procfs = pid_namespace && matches!(identity, IdentityPlan::Ranged { .. });
-    let procfs_target =
-        visible_procfs(ops, needs_fresh_procfs).ok_or(ConfigError::NestedUsernsNeedsProcfs)?;
-
-    // The map files as the command names them after the pivot: absolute, under
-    // the profile's own procfs target.
-    let under_procfs = |leaf: &str| -> Result<CString, ConfigError> {
-        let target = procfs_target.to_bytes();
-        let mut path = Vec::with_capacity(target.len() + leaf.len() + 2);
-        path.push(b'/');
-        path.extend_from_slice(target);
-        path.push(b'/');
-        path.extend_from_slice(leaf.as_bytes());
-        CString::new(path).map_err(|_| ConfigError::EmbeddedNul)
-    };
-
     let (map, uid, gid) = match identity {
         // The single-identity tier collapses to one extent of one id, which is
-        // all it ever had, and which the command may write for itself.
+        // all it ever had, and which the command may write for itself. Any
+        // procfs serves: a process writing its own map reaches it through
+        // `self`, which every instance resolves for its reader.
         IdentityPlan::Single => {
+            let procfs_target =
+                visible_procfs(ops, false).ok_or(ConfigError::NestedUsernsNeedsProcfs)?;
+            // The map files as the command names them after the pivot:
+            // absolute, under the profile's own procfs target.
+            let under_procfs = |leaf: &str| -> Result<CString, ConfigError> {
+                let target = procfs_target.to_bytes();
+                let mut path = Vec::with_capacity(target.len() + leaf.len() + 2);
+                path.push(b'/');
+                path.extend_from_slice(target);
+                path.push(b'/');
+                path.extend_from_slice(leaf.as_bytes());
+                CString::new(path).map_err(|_| ConfigError::EmbeddedNul)
+            };
             let root = [idmap::IdRange {
                 inside: 0,
                 outside: 0,
                 count: 1,
             }];
-            (NestedMap::SelfWritten, root.to_vec(), root.to_vec())
+            (
+                NestedMap::SelfWritten {
+                    setgroups_path: under_procfs("self/setgroups")?,
+                    gid_map_path: under_procfs("self/gid_map")?,
+                    uid_map_path: under_procfs("self/uid_map")?,
+                },
+                root.to_vec(),
+                root.to_vec(),
+            )
         }
-        IdentityPlan::Ranged { map, .. } => (
-            NestedMap::Delegated,
-            idmap::reflect_inside(map.uid()),
-            idmap::reflect_inside(map.gid()),
-        ),
+        IdentityPlan::Ranged { map, .. } => {
+            // Inside a PID namespace the delegate is the sandbox's own init and
+            // reads the profile's procfs, which must then exist and be a *fresh*
+            // instance: the delegate names the command's map files by the pid
+            // its `fork` returned, an in-namespace pid a bound procfs from
+            // outside does not index. See `procfs_op_target`.
+            let procfs_target = if pid_namespace {
+                Some(
+                    visible_procfs(ops, true)
+                        .ok_or(ConfigError::NestedUsernsNeedsProcfs)?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            (
+                NestedMap::Delegated { procfs_target },
+                idmap::reflect_inside(map.uid()),
+                idmap::reflect_inside(map.gid()),
+            )
+        }
     };
 
     Ok(NestedPlan {
         map,
         uid_lines: idmap::format_map(&uid),
         gid_lines: idmap::format_map(&gid),
-        setgroups_path: under_procfs("self/setgroups")?,
-        gid_map_path: under_procfs("self/gid_map")?,
-        uid_map_path: under_procfs("self/uid_map")?,
-        procfs_target: procfs_target.to_owned(),
     })
 }
 
@@ -4360,6 +4386,42 @@ mod tests {
         assert!(matches!(
             err,
             Error::Config(ConfigError::NestedUsernsNeedsProcfs),
+        ));
+    }
+
+    #[test]
+    fn a_delegated_map_outside_a_pid_namespace_needs_no_procfs() {
+        // The requirement follows the route the map actually takes. A range map
+        // without a PID namespace is written by the launch stage, outside the
+        // sandbox, through the host's own `/proc` — opened before the pivot,
+        // and never named through the profile — so a profile that mounts no
+        // procfs serves it. Refusing this configuration would rule out
+        // `managed_mounts(false)`, the reproducibility opt-out, alongside a
+        // range map for no reason the code has.
+        let cage = sh_in("/tmp")
+            .mount_proc(false)
+            .pid_namespace(false)
+            .identity_map(IdentityMap::ranges(
+                vec![crate::IdRange {
+                    inside: 0,
+                    outside: 1000,
+                    count: 1,
+                }],
+                vec![crate::IdRange {
+                    inside: 0,
+                    outside: 1000,
+                    count: 1,
+                }],
+            ))
+            .id_mapper(FakeMapper)
+            .build()
+            .expect("no procfs is needed where no in-sandbox delegate reads one");
+        let nested = cage.plan.nested.as_ref().expect("a container nests");
+        assert!(matches!(
+            nested.map,
+            crate::mechanism::NestedMap::Delegated {
+                procfs_target: None
+            },
         ));
     }
 

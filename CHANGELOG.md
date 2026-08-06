@@ -40,17 +40,347 @@ affected.
   source's flags, since a caller who binds a host tree in order to run what is
   in it is entitled to a different answer.
 
+- The Debian bootstrap's host-side steps are contained to the tree they write
+  into. They interleave with the dpkg waves — a statoverride seed, the ownership
+  stubs, the finished rootfs's apt sources — so most of them run after arbitrary
+  maintainer scripts have executed inside a cage rooted at that tree, as root of
+  its namespace. Each composed a host path and handed it to `std::fs`, which
+  resolves every component against the *host's* root: a script that left an
+  absolute symbolic link at one of those paths redirected the write, the read,
+  or the removal that followed out of the tree entirely, performed as the
+  calling user. The primitives were overwriting a caller's file with the sources
+  line or the keyring bytes, creating host directories, deleting a caller's
+  file, and — through a layered build's base tree — reading one into the tree
+  the caller then exports.
+
+  Every one of them now goes through a descriptor for the tree, with `openat2`
+  and `RESOLVE_IN_ROOT`: an absolute link inside the tree resolves within the
+  tree, which is what the same link means to dpkg reading it from inside the
+  cage, and nothing resolves outside it. Leaves are opened `O_NOFOLLOW`, so a
+  link occupying a name is replaced rather than written through. It is the
+  discipline the launch side already applied to the placeholders it removes and
+  the extractor to every entry it writes. A layered build's base tree is read
+  the same way, so a link there cannot make the base's dpkg status database or
+  statoverride an arbitrary host-file read.
+
+  Reaching this through `Debian::ensure` against the archive meant the
+  signature had already been defeated, but three shapes did not: the layered
+  build the `deb-layer-pipeline` example ships, where a hostile *source*
+  package's `postinst` crosses no signature at all; `trust_unsigned` over a
+  local pool, which is that shape stated directly; and a caller-supplied base
+  layer.
+
+- **Breaking.** `trust_unsigned` requires a transport that authenticates what it
+  serves: every mirror of an unsigned repository must be `file://` or
+  `https://`, compared case-insensitively, and any other scheme is refused at
+  `build`. The guard previously refused the literal prefix `http://`. URI
+  schemes are case-insensitive (RFC 3986 §3.1), so `HTTP://` named the same
+  plaintext transport and passed — and a caller-supplied `Fetch`, which is the
+  configuration this guard exists for and the one the docs recommend for HTTPS,
+  will typically normalize the scheme and speak plain HTTP. It was also a
+  deny-list of one scheme: any other
+  unauthenticated transport a caller's fetcher spoke passed unremarked. An
+  unsigned repository over a scheme neither this crate nor the caller can vouch
+  for now fails at `build` rather than installing unverified packages over an
+  unauthenticated wire.
+
+- No caller descriptor survives the command's `execve`. A `Stdio::Fd`
+  disposition's descriptor is deliberately kept through the launch's sweep so
+  the command stage can copy it onto a standard stream, and it was then left as
+  it was — surviving the exec at whatever number the caller held it at, which
+  contradicts both the crate's "a descriptor table holding only its standard
+  streams" and the sweep's own contract. It gains the command no access it did
+  not already have through 0, 1 and 2, but a command that closes and reopens its
+  standard output still held a second handle to the caller's file. Each such
+  descriptor is now marked close-on-exec after the copy; the caller's own copy
+  is untouched, descriptor flags being per-descriptor and the child's own since
+  the fork.
+
+- A fetch is bounded by the size its verified source declares. The signed
+  release records the length of every index and the index the length of every
+  package, and both were discarded: an index fetch was bounded only by the
+  built-in fetcher's two-gigabyte ceiling, or by nothing at all for a
+  caller-supplied transport, while the release that named it said it was a few
+  megabytes. A mirror could drive that much allocation per index request, and
+  the digest check that catches the substitution runs only after the bytes are
+  spent. The declared size now travels with the request, through the new
+  `FetchRequest::sized` and `FetchRequest::size`, and bounds the provisioner's
+  own sink as well — a
+  transport is free to ignore the request, and the sink is the one place the
+  bound cannot be ignored. A release file carries no size, being the trust root,
+  and keeps the fetcher's own ceiling.
+
+- An index-supplied pool path may not percent-encode a traversal.
+  `pool/%2e%2e/%2e%2e/etc/passwd` is non-empty, relative, all-graphic and
+  carries no `..` component as written, so it passed a check whose documented
+  claim is that a `Filename:` cannot escape a mirror root — and a server that
+  decodes before resolving may serve something above that root. The same rules
+  now run over the decoded form, so a real pool path is unaffected while an
+  encoded traversal, an encoded separator, a malformed escape, and an encoded
+  `%` are all refused. Nothing unverified could enter the tree either way, since
+  whatever comes back is checked against the signed index's digest; the check
+  now means what it says.
+
+### Added
+
+- `FetchRequest::sized` states the size a resource is expected to be, and
+  `FetchRequest::size` reports it. The provisioner sets it wherever a verified
+  source declares one — the signed release for an index, the index for a
+  package — so a transport can refuse an oversized framing before reading a
+  byte. It is a ceiling rather than a promise: an implementation is free to
+  ignore it, and the provisioner bounds its own sink regardless. The built-in
+  `HttpFetch` honours it on both the `http://` and `file://` paths.
+
+- `DebianBuilder::pin` holds a resolution to the versions a previously resolved
+  `Plan` recorded, where `plan` replaces the resolution outright. The bootstrap
+  fetches and verifies every release and index as it always does and computes
+  the closure over what the archives offer now; a package the pin names is
+  selected at the pinned version rather than at the highest offered, and its
+  recorded digest must be the one the archive records for that version.
+  Everything else resolves normally.
+
+  This is the shape a build needs when its inputs are not all archives. Where
+  some packages are compiled by the build itself and published to a local
+  `Pool`, `plan` requires those compiles to be byte-reproducible, since it
+  installs every package by a recorded digest; pinning only the archive-sourced
+  packages fixes the half a mirror controls and leaves the locally built half
+  to resolve at whatever the pool now holds.
+
+  Unlike `plan`, the trust model is unchanged: every digest installed is still
+  read from an index whose own digest a verified release records, so the pin
+  narrows which version is selected without becoming the authority for what the
+  bytes are. `include`, `exclude`, and `base_priority` compose with a pin where
+  they contradict a plan, since a pin constrains the versions a selection
+  resolves to rather than naming the selection. A pin the archives cannot supply
+  fails with the new `DebianError::Pin` before anything is downloaded, naming
+  every package that could not be held at once and, through the new `UnheldPin`
+  and `UnheldReason`, which of the three happened: another version offered, no
+  version offered, or the pinned version recorded over different bytes.
+
+- A plan reports what the archive says each package weighs and which source
+  package it was built from. `PlannedPackage::installed_size` carries the
+  archive's `Installed-Size` in the kibibytes Debian Policy defines it in,
+  rather than normalized to bytes, so it can be compared against a mirror's
+  value directly; it is the archive's build-time estimate of a staged tree, not
+  a measurement of an installed filesystem, and a sum over a plan should be
+  presented as one. `PlannedPackage::source` carries the `Source` field's
+  package name with any parenthesized source version dropped, and is `None` for
+  the common case of a binary package whose source shares its name, so the
+  several binary packages of one source can be attributed to the thing that was
+  built. Both are optional, and both are written to a plan document and read
+  back. They are written after every field the format's first readers knew,
+  which is where those readers put an unknown field back, so between two
+  readers of one `Format` version they cost nothing in either direction: a
+  document written without them reads with every field intact, and a document
+  written with them reads through the older reader and re-writes byte-identical.
+
+- A tree written under the single-identity map is removed through that map when
+  the plain removal is refused. `provision::remove` escalated a range map only,
+  so a single-mapped tree holding a directory whose own mode denies the write
+  the deletion needs — a read-only directory an archive carried in — reported
+  that no delegate could establish the map, which is neither the reason nor
+  something the caller can act on. The removal child now writes the
+  single-identity map itself, as the export and copy-in children already did,
+  and deletes the tree with the capabilities root of that namespace holds.
+
+- A pseudoterminal of the sandbox's own. `Cage::spawn_terminal` starts the
+  command on one and returns the caller's end beside the running handle;
+  `Cage::spawn_pending_terminal` does the same at the userspace-network seam,
+  handing the primary over before the command is released, and
+  `Restriction::spawn_terminal` gives the fallback the same interactive story. A
+  `Terminal` states the window size — 80x24 by default, a stated constant rather
+  than anything read from the host — and a `Pty` is the primary, with `Read` and
+  `Write` on both `Pty` and `&Pty`, `resize`, and `size`, so an `Arc<Pty>` serves
+  a reader thread and a `SIGWINCH` handler at once.
+
+  The replica is wired onto file descriptors 0, 1 and 2 and the launch owns its
+  session, so the pseudoterminal is the sandbox's controlling terminal: `isatty`
+  is deterministically true, a full-screen program behaves, `/dev/tty` resolves
+  to the sandbox's own terminal, and a shell inside the sandbox runs jobs of its
+  own — against a terminal the caller does not share. It is the only posture
+  under which an interactive sandbox both works completely and reaches nothing
+  of the caller's terminal.
+
+  The pseudoterminal is allocated on the host before the fork rather than in the
+  sandbox's own `devpts` instance. What that gives up is path resolution:
+  `ttyname` fails inside the sandbox, so `tty(1)`, `who`, and `GPG_TTY` do not
+  work. Everything that operates on the descriptor does.
+
+  A terminal is a launch mode rather than builder state, so it is not a profile
+  key and `resolved_inputs()` does not report one: the record reports the plan,
+  and a launch-time attachment supersedes it at the call site that made it.
+  Hangup on the primary is reported as end-of-file rather than the `EIO` Linux
+  returns, so a drain terminates the way it would from a pipe.
+
+- `Error::Terminal` and `Error::TerminalsExhausted`, the latter for a host that
+  has run out — `/proc/sys/kernel/pty/max` states the ceiling — and
+  `SetupStep::SetControllingTerminal`.
+
+- `fcage`: `--terminal`, which allocates a pseudoterminal for the sandbox,
+  copies this terminal's current size into it, and relays the two. Interactive
+  programs work — a shell, an editor, a pager, debconf — and the sandbox reaches
+  nothing of the terminal `fcage` was started from: a typed `^C` is a byte the
+  relay forwards, which the *sandbox's* line discipline turns into the sandbox's
+  own `SIGINT`. It composes with `--restrict` and with `--netstack`, which takes
+  the pending path and hands the terminal over before the command runs;
+  `--terminal` with `--stdin null` is refused at parse time, naming both flags.
+  From a script, where `fcage`'s own input is not a terminal, it degrades to a
+  plain byte relay around a sandbox that still has a real terminal of its own,
+  at 80x24.
+
+  The relay reads its signals as poll data from a descriptor rather than in
+  signal context, forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` to the
+  sandbox, follows `SIGWINCH` with a resize, and restores this terminal on every
+  exit it can observe: a guard, a panic hook that restores before the backtrace
+  prints, and the stop path, which restores before `SIGTSTP` and re-enters raw
+  mode on `SIGCONT`.
+
+- `CageBuilder::stdout` and `CageBuilder::stderr`, with `get_stdout` and
+  `get_stderr` beside them, and the same pair on `RestrictionBuilder`. They take
+  the same `Stdio` the standard-input setter does, so an output stream is
+  discarded with `Stdio::Null` or sent to a caller's descriptor with
+  `Stdio::from_fd`. A profile carries them as the `stdout` and `stderr` keys,
+  which accept the same two names `stdin` does.
+
+- `ConfigError::StreamAttachmentConflict`, for a launch that attaches a conduit
+  of its own to a stream the sandbox directs elsewhere. `Stdio::Inherit` states
+  no destination, so a capturing launch composes with it and this never arises
+  against the default; `Stdio::Null` and `Stdio::from_fd` state one, and a
+  capturing launch of such a sandbox is refused rather than silently overriding
+  it. Reported by the launch, so the same sandbox still launches through an
+  entry point that attaches nothing.
+
+- `ResolvedInputs::streams`, reporting where each of the three standard streams
+  is wired, as the new `ResolvedStreams` and `ResolvedStdio` types. What a build
+  produces depends on it: `isatty` on the standard streams steers debconf's
+  frontend choice, a compiler's color diagnostics, and every progress display. A
+  descriptor is reported by kind alone, since it names a live resource of the
+  caller's rather than anything a record could carry forward.
+
+- `ConfigError::OverlayDirUnowned`, for an overlay layer directory already
+  occupied by something other than a directory the calling user owns, and
+  `ConfigError::OverlayUpperIsRoot`, for an upper at the filesystem root — which
+  has no parent for the work directory beside it, and would put the sandbox's
+  writes over the whole host root. The latter replaces
+  `ConfigError::OverlayPathInvalid` for that case, whose message describes the
+  `,`/`:` refusal it is actually for.
+
+- `RangeMapBlocker::SubordinateAllocationUnknown`, for a host where the
+  subordinate allocation could not be determined at all — `getsubids` failing,
+  or `nsswitch.conf` sourcing subordinate ids from a module beyond `files` with
+  `getsubids` not installed. That was previously reported as
+  `NoSubordinateAllocation`, whose remedy is wrong twice over on such a host:
+  the user may well have an allocation, and adding `/etc/subuid` entries does
+  not help, because the files are not the authority there.
+
+- `SetupStep::NewSession`, naming the launch's session change in a setup error.
+
+- `ProvisionError::EntryRefused`, for an entry that cannot be handled for a
+  reason that is not a containment failure: a malformed archive (a path
+  component that is not a directory, a symbolic link with no target), a source
+  tree past a limit the copy protocol carries, or a source id the destination's
+  identity map has no place for. `ProvisionError::EntryUnsafe` reads "the archive
+  entry reaches outside the extraction root", which none of those did — the worst
+  of them told a caller whose tree carried an unmapped id that the tree had tried
+  to escape. `EntryUnsafe` now means an escape and nothing else.
+
+- A repository's suite and components, and a bootstrap's architecture, are
+  checked when the repository or the builder is built. Each becomes a path
+  segment of every URL the archive is fetched through and a word of the `deb`
+  line written into the finished rootfs, so a `..` segment would climb out of the
+  mirror root — for a `file://` mirror, a local read — and a control character
+  would split the request line the value is interpolated into, or add a source
+  line the caller never wrote. It is the check `Pool` already made of the
+  coordinates it publishes under, so the side that writes an archive and the side
+  that reads one now agree on what an archive may be called.
+
+- A signing subkey is admitted only when its binding carries the subkey's own
+  back signature, as RFC 9580 requires. The binding alone is the primary's claim
+  over the subkey; without the counter-signature a certificate could adopt a
+  signing subkey it does not hold and present that key's signatures as its own.
+  The back signature must carry a creation time and must not predate either key
+  it speaks about, and one the subkey holder gave an expiration bounds the
+  subkey's authority as the binding's own key expiration does: consent that
+  cannot be placed in time is not consent, and consent that has lapsed leaves
+  the binding unilateral again. The requirement is applied to whichever binding
+  governs rather than used to choose one, so a defective newest binding refuses
+  the subkey instead of handing authority back to a superseded binding.
+
+- A release signature made with a public-key algorithm below the floor is
+  refused: DSA outright, and RSA under 2048 bits. The rule covers the signing key
+  and the primary key of the certificate vouching for it, and names the accepted
+  algorithms rather than the refused ones, so key material the crate cannot
+  assess is refused rather than admitted by default. It is the companion to the
+  hash floor — a signature is worth no more than the weaker of the digest it
+  covers and the key material that binds it — and is not applied where the hash
+  floor is not, for the same reason.
+
+- A signature carrying a critical subpacket that cannot be interpreted is
+  refused, as RFC 9580 requires. Only the hashed area is read, so a relay
+  appending one to an `InRelease` in transit cannot fail the fetch. rPGP applies
+  the rule only to subpackets of an unknown type and only while signing, which
+  leaves critical notations and the experimental range to this crate.
+
+- A release signature dated before its signing key existed is refused, closing
+  the key's validity window at the end the expiry check does not.
+
+- Release signatures, subkey bindings and back signatures made with MD5, SHA-1
+  or RIPEMD-160 are refused. The floor is not applied to revocations, nor to the
+  self-signatures a key's expiry is read from, where discarding a signature
+  would extend a key's life rather than curtail it.
+
+- `ResolvedArchive` records the component key that made the release signature in
+  a new `signing_key` field, written to a plan document as `Signing-Key`.
+
 ### Changed
 
-- **Breaking.** A container requires a procfs. The nested user namespace's
-  identity map is established through one, by path, from inside the sandbox, so
-  a profile that mounts none is refused at build time with the new
+- The Debian bootstrap's host-side steps state the modes they write rather than
+  taking them from the process umask: `0755` for a directory it creates, `0644`
+  for a file, and the mode already stated for a script or a shadow file. Two
+  runs of one build under different umasks previously produced trees that
+  differed in those bits.
+
+- The guide gains [what the sandbox does not
+  hide](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#what-the-sandbox-does-not-hide).
+  A sandboxed command reads its own `/proc/self/mountinfo`, whose mount-root
+  field carries the host path of the rootfs and of every bind source — the
+  calling user's name and the build's layout with it. That is what every
+  bind-mount-based sandbox exposes, and no code changed, but it sits at odds
+  with the determinism the rest of the crate keeps, so it is now stated rather
+  than left to be discovered.
+
+- **Breaking.** `ResolvedArchive::signed_by`, and a plan document's `Signed-By`,
+  name the verifying certificate's primary key rather than the subkey that made
+  the signature. It is the identity a keyring entry is named by and the one to
+  pin a repository against, and unlike the signing key it survives an archive
+  rotating its subkey. The subkey is still reported, as `signing_key`.
+
+  A plan document's `Format` version moves to `ferroday-cage-plan 2` for it, and
+  a version 1 document is refused rather than read. A field that keeps its name
+  and changes its meaning is the one shape the format's carried-field rule
+  cannot absorb: a reader accepting both versions would hand a fingerprint back
+  without saying which of the two questions it answers, and a consumer comparing
+  one against a recorded value would see a mismatch it could not tell apart from
+  the archive having rotated its key — the event such a comparison exists to
+  catch. A kept plan moves across by being resolved again against the same
+  archive.
+
+- **Breaking.** A container requires a procfs wherever its nested user
+  namespace's identity map is established through one, by path, and a profile
+  that mounts none is then refused at build time with the new
   `ConfigError::NestedUsernsNeedsProcfs`. The managed profile mounts one by
   default; this is reachable only from a profile that sets `managed_mounts(false)`
-  or `mount_proc(false)` and declares no procfs of its own. A bind of the host's
-  procfs serves, except under the one combination that needs the sandbox's own
-  pids to index it — a range identity map inside a PID namespace of the
-  sandbox's own — where a fresh instance is required.
+  or `mount_proc(false)` and declares no procfs of its own.
+
+  The requirement follows the route the map takes. A self-written map — the
+  single-identity tier — needs one, and a bind of the host's procfs serves,
+  since a process reaches its own map files through `self`. A range identity map
+  inside a PID namespace of the sandbox's own needs a *fresh* instance: its
+  delegate names the command by an in-namespace pid a bound procfs does not
+  index. A range identity map with `pid_namespace(false)` needs none, because
+  its delegate is the launch stage, outside the sandbox, reading the host's own
+  `/proc` — so a range map composes with `managed_mounts(false)`, the
+  reproducibility opt-out, and with `mount_proc(false)`.
 
 - **Breaking.** The command holds no capability over the namespaces the sandbox
   created, because it is now root of a *child* of the user namespace that owns
@@ -74,7 +404,106 @@ affected.
   `NosuidRootfs`. They are named apart from the outer namespace's steps so a
   failure says which of the two the launch was establishing.
 
+- **Breaking.** `Stdin` is renamed `Stdio`, and `CageBuilder::stdin`,
+  `CageBuilder::get_stdin`, and `RestrictionBuilder::stdin` take and return it.
+  One enum now serves all three standard streams, so the name no longer claims
+  less than the type covers, and the session rule and the descriptor-sharing
+  semantics have one home rather than two. The wire format is unchanged: the
+  keys are `stdin`, `stdout`, and `stderr`, and the unit variants still
+  serialize as `"inherit"` and `"null"`, so every existing profile loads
+  unchanged.
+
+- The curated seccomp policy denies `ioctl` for the `TIOCSTI` and `TIOCLINUX`
+  requests, the two that write to a terminal's input queue, and allows it
+  otherwise. Denied by request rather than by syscall, because `ioctl` is the
+  ordinary way to ask anything of a device.
+
+- An overlay work directory on a different filesystem from the upper is refused
+  at build time, naming the work directory, rather than failing the mount with a
+  bare `EXDEV` from a syscall the caller never issued. The overlay moves files
+  between the two, so the kernel requires them on one filesystem.
+
+- The subordinate-id helpers are resolved to an absolute path by the same lookup
+  `host::range_map_blocker` uses to judge their privilege, and that path is what
+  executes. `Command::new("newuidmap")` re-resolved the bare name on its own
+  terms, so the probe's verdict could describe a different binary from the one
+  that ran. The lookup also skips relative `PATH` entries, which name the
+  process's working directory — not somewhere to resolve a privileged helper
+  from — matching what `path_lookup` already does for the sandbox's own `PATH`.
+  The two auxiliary tools the delegate consults, `id` for the caller's user name
+  and `getsubids` for the allocation, go through the same lookup for the same
+  reason.
+
+- `Terminal::size` leaves a zero dimension at its default rather than passing it
+  through. Zero is what a terminal reports when its size is *unknown* — a
+  pseudoterminal nobody has sized — and the kernel accepts it silently, leaving
+  the sandbox a terminal that answers "no size" to everything that asks: `stty
+  size` refuses it and a full-screen program has nothing to draw into. `fcage`
+  already guarded against exactly this before calling `size`; a library caller
+  plumbing the same reading in now lands in the same place.
+
+- **`fcage`.** The `--terminal` relay blocks `SIGTTOU`. A `tcsetattr` from a
+  background process group raises it and its default action stops the process,
+  so a backgrounded relay would stop inside the restoration and leave the
+  caller's terminal in raw mode with nothing left to fix it. Blocked, the call
+  succeeds and the restoration holds from the background as it does from the
+  foreground. `SIGTTIN` is deliberately not blocked: a backgrounded relay
+  stopping when it tries to read the terminal is the conventional behavior.
+
+- The overlay documentation no longer steers callers at `/var/tmp`, which is
+  mode `1777` everywhere. `Overlay::upper`, `Overlay::work`, `overlay`, and
+  `overlay_rootfs` carry the parent-directory requirement `rootfs` already
+  stated.
+
+- A package is downloaded and installed without ever being held in memory. The
+  bytes are written to a staging file as they arrive and digested on the way
+  through, and the file is renamed into the cache only once the digest matches
+  the one the archive recorded; installing reads it back the same way, streaming
+  the `data.tar` through the decompressor into the extractor. Downloading and
+  unpacking a 90 MB kernel package now costs what a shell script costs, the
+  property `Pool::publish` and the cache's own validation already kept. Nothing
+  unverified is ever visible at a cache path either, since the rename is what
+  puts it there.
+
+- A self-signature dated in the future no longer governs a key's expiry. Recency
+  decides which self-signature is authoritative, so one dated ahead of the clock
+  would win outright, and because an absent key-expiration subpacket means "does
+  not expire" it would lift a live expiry rather than postpone it.
+
+- A signature refused by a validity gate — a hash or public-key algorithm below
+  the floor, a missing creation time, a retired signing key, a signature that has
+  itself expired — is now a `DebianError::Signature` rather than a
+  `DebianError::Release`. `Release` describes what is wrong with the release
+  body; these are statements that the signature over it was not acceptable.
+
+- A subkey that could not verify a release now says why. A subkey carrying no
+  valid binding, no counter-signature, no signing capability, or a refused
+  algorithm used to surface as the generic "no signature verified against the
+  archive keyring", because it never became a candidate and so never recorded a
+  reason.
+
+- The zstd decoder bounds each frame's window through `ruzstd` rather than
+  reading the window out of the frame header itself. `ruzstd` now refuses a
+  declared window over a configurable limit before it allocates, so the
+  provisioner sets its 128 MiB bound on every frame's decoder and drops its own
+  copy of the frame-header arithmetic. The bound is unchanged and the same
+  archives are admitted, including those compressed with a window log of 27.
+
+- `flate2`'s backend is named in the manifest rather than left to the crate's
+  default, so a build without the `debian` feature reaches gzip through
+  `miniz_oxide`, which forbids unsafe code outright. The resolved backend is
+  unchanged; naming it keeps a future change to flate2's default from moving it.
+
+- `lzma-rust2` moves to 0.18, `ruzstd` to 0.9, and `sha2` to 0.11. `fcage` reads
+  profiles through `toml` 1.1. No public API changes.
+
 ### Fixed
+
+- The built-in fetcher reads a response's status line only from a line that
+  begins `HTTP/`. It previously took the second word of any first line that
+  parsed as a number, so a mail or SSH server's greeting read as a response.
+  The digest chain made that harmless, but a mirror URL pointed at the wrong
+  port failed somewhere further along instead of saying what it found.
 
 - A run-as identity sets no-new-privileges, in every build of the library and
   whatever else the sandbox requests. The flag was set only by the hardening
@@ -354,284 +783,6 @@ affected.
 - A signature expiration of zero seconds no longer expires a signature at the
   instant it was made. Zero and an absent subpacket are the two wire forms of
   "does not expire", as they already were for a key expiration.
-
-### Added
-
-- A plan reports what the archive says each package weighs and which source
-  package it was built from. `PlannedPackage::installed_size` carries the
-  archive's `Installed-Size` in the kibibytes Debian Policy defines it in,
-  rather than normalized to bytes, so it can be compared against a mirror's
-  value directly; it is the archive's build-time estimate of a staged tree, not
-  a measurement of an installed filesystem, and a sum over a plan should be
-  presented as one. `PlannedPackage::source` carries the `Source` field's
-  package name with any parenthesized source version dropped, and is `None` for
-  the common case of a binary package whose source shares its name, so the
-  several binary packages of one source can be attributed to the thing that was
-  built. Both are optional, both are written to a plan document and read back,
-  and neither changes the document's `Format` version: a document written
-  without them still reads. They are written after every field the format's
-  first readers knew, which is where those readers put an unknown field back, so
-  a plan that makes the round trip through an older reader of this library
-  returns byte-identical.
-
-- A tree written under the single-identity map is removed through that map when
-  the plain removal is refused. `provision::remove` escalated a range map only,
-  so a single-mapped tree holding a directory whose own mode denies the write
-  the deletion needs — a read-only directory an archive carried in — reported
-  that no delegate could establish the map, which is neither the reason nor
-  something the caller can act on. The removal child now writes the
-  single-identity map itself, as the export and copy-in children already did,
-  and deletes the tree with the capabilities root of that namespace holds.
-
-- A pseudoterminal of the sandbox's own. `Cage::spawn_terminal` starts the
-  command on one and returns the caller's end beside the running handle;
-  `Cage::spawn_pending_terminal` does the same at the userspace-network seam,
-  handing the primary over before the command is released, and
-  `Restriction::spawn_terminal` gives the fallback the same interactive story. A
-  `Terminal` states the window size — 80x24 by default, a stated constant rather
-  than anything read from the host — and a `Pty` is the primary, with `Read` and
-  `Write` on both `Pty` and `&Pty`, `resize`, and `size`, so an `Arc<Pty>` serves
-  a reader thread and a `SIGWINCH` handler at once.
-
-  The replica is wired onto file descriptors 0, 1 and 2 and the launch owns its
-  session, so the pseudoterminal is the sandbox's controlling terminal: `isatty`
-  is deterministically true, a full-screen program behaves, `/dev/tty` resolves
-  to the sandbox's own terminal, and a shell inside the sandbox runs jobs of its
-  own — against a terminal the caller does not share. It is the only posture
-  under which an interactive sandbox both works completely and reaches nothing
-  of the caller's terminal.
-
-  The pseudoterminal is allocated on the host before the fork rather than in the
-  sandbox's own `devpts` instance. What that gives up is path resolution:
-  `ttyname` fails inside the sandbox, so `tty(1)`, `who`, and `GPG_TTY` do not
-  work. Everything that operates on the descriptor does.
-
-  A terminal is a launch mode rather than builder state, so it is not a profile
-  key and `resolved_inputs()` does not report one: the record reports the plan,
-  and a launch-time attachment supersedes it at the call site that made it.
-  Hangup on the primary is reported as end-of-file rather than the `EIO` Linux
-  returns, so a drain terminates the way it would from a pipe.
-
-- `Error::Terminal` and `Error::TerminalsExhausted`, the latter for a host that
-  has run out — `/proc/sys/kernel/pty/max` states the ceiling — and
-  `SetupStep::SetControllingTerminal`.
-
-- `fcage`: `--terminal`, which allocates a pseudoterminal for the sandbox,
-  copies this terminal's current size into it, and relays the two. Interactive
-  programs work — a shell, an editor, a pager, debconf — and the sandbox reaches
-  nothing of the terminal `fcage` was started from: a typed `^C` is a byte the
-  relay forwards, which the *sandbox's* line discipline turns into the sandbox's
-  own `SIGINT`. It composes with `--restrict` and with `--netstack`, which takes
-  the pending path and hands the terminal over before the command runs;
-  `--terminal` with `--stdin null` is refused at parse time, naming both flags.
-  From a script, where `fcage`'s own input is not a terminal, it degrades to a
-  plain byte relay around a sandbox that still has a real terminal of its own,
-  at 80x24.
-
-  The relay reads its signals as poll data from a descriptor rather than in
-  signal context, forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` to the
-  sandbox, follows `SIGWINCH` with a resize, and restores this terminal on every
-  exit it can observe: a guard, a panic hook that restores before the backtrace
-  prints, and the stop path, which restores before `SIGTSTP` and re-enters raw
-  mode on `SIGCONT`.
-
-- `CageBuilder::stdout` and `CageBuilder::stderr`, with `get_stdout` and
-  `get_stderr` beside them, and the same pair on `RestrictionBuilder`. They take
-  the same `Stdio` the standard-input setter does, so an output stream is
-  discarded with `Stdio::Null` or sent to a caller's descriptor with
-  `Stdio::from_fd`. A profile carries them as the `stdout` and `stderr` keys,
-  which accept the same two names `stdin` does.
-
-- `ConfigError::StreamAttachmentConflict`, for a launch that attaches a conduit
-  of its own to a stream the sandbox directs elsewhere. `Stdio::Inherit` states
-  no destination, so a capturing launch composes with it and this never arises
-  against the default; `Stdio::Null` and `Stdio::from_fd` state one, and a
-  capturing launch of such a sandbox is refused rather than silently overriding
-  it. Reported by the launch, so the same sandbox still launches through an
-  entry point that attaches nothing.
-
-- `ResolvedInputs::streams`, reporting where each of the three standard streams
-  is wired, as the new `ResolvedStreams` and `ResolvedStdio` types. What a build
-  produces depends on it: `isatty` on the standard streams steers debconf's
-  frontend choice, a compiler's color diagnostics, and every progress display. A
-  descriptor is reported by kind alone, since it names a live resource of the
-  caller's rather than anything a record could carry forward.
-
-- `ConfigError::OverlayDirUnowned`, for an overlay layer directory already
-  occupied by something other than a directory the calling user owns, and
-  `ConfigError::OverlayUpperIsRoot`, for an upper at the filesystem root — which
-  has no parent for the work directory beside it, and would put the sandbox's
-  writes over the whole host root. The latter replaces
-  `ConfigError::OverlayPathInvalid` for that case, whose message describes the
-  `,`/`:` refusal it is actually for.
-
-- `RangeMapBlocker::SubordinateAllocationUnknown`, for a host where the
-  subordinate allocation could not be determined at all — `getsubids` failing,
-  or `nsswitch.conf` sourcing subordinate ids from a module beyond `files` with
-  `getsubids` not installed. That was previously reported as
-  `NoSubordinateAllocation`, whose remedy is wrong twice over on such a host:
-  the user may well have an allocation, and adding `/etc/subuid` entries does
-  not help, because the files are not the authority there.
-
-- `SetupStep::NewSession`, naming the launch's session change in a setup error.
-
-- `ProvisionError::EntryRefused`, for an entry that cannot be handled for a
-  reason that is not a containment failure: a malformed archive (a path
-  component that is not a directory, a symbolic link with no target), a source
-  tree past a limit the copy protocol carries, or a source id the destination's
-  identity map has no place for. `ProvisionError::EntryUnsafe` reads "the archive
-  entry reaches outside the extraction root", which none of those did — the worst
-  of them told a caller whose tree carried an unmapped id that the tree had tried
-  to escape. `EntryUnsafe` now means an escape and nothing else.
-
-- A repository's suite and components, and a bootstrap's architecture, are
-  checked when the repository or the builder is built. Each becomes a path
-  segment of every URL the archive is fetched through and a word of the `deb`
-  line written into the finished rootfs, so a `..` segment would climb out of the
-  mirror root — for a `file://` mirror, a local read — and a control character
-  would split the request line the value is interpolated into, or add a source
-  line the caller never wrote. It is the check `Pool` already made of the
-  coordinates it publishes under, so the side that writes an archive and the side
-  that reads one now agree on what an archive may be called.
-
-- A signing subkey is admitted only when its binding carries the subkey's own
-  back signature, as RFC 9580 requires. The binding alone is the primary's claim
-  over the subkey; without the counter-signature a certificate could adopt a
-  signing subkey it does not hold and present that key's signatures as its own.
-  The back signature must carry a creation time and must not predate either key
-  it speaks about, and one the subkey holder gave an expiration bounds the
-  subkey's authority as the binding's own key expiration does: consent that
-  cannot be placed in time is not consent, and consent that has lapsed leaves
-  the binding unilateral again. The requirement is applied to whichever binding
-  governs rather than used to choose one, so a defective newest binding refuses
-  the subkey instead of handing authority back to a superseded binding.
-
-- A release signature made with a public-key algorithm below the floor is
-  refused: DSA outright, and RSA under 2048 bits. The rule covers the signing key
-  and the primary key of the certificate vouching for it, and names the accepted
-  algorithms rather than the refused ones, so key material the crate cannot
-  assess is refused rather than admitted by default. It is the companion to the
-  hash floor — a signature is worth no more than the weaker of the digest it
-  covers and the key material that binds it — and is not applied where the hash
-  floor is not, for the same reason.
-
-- A signature carrying a critical subpacket that cannot be interpreted is
-  refused, as RFC 9580 requires. Only the hashed area is read, so a relay
-  appending one to an `InRelease` in transit cannot fail the fetch. rPGP applies
-  the rule only to subpackets of an unknown type and only while signing, which
-  leaves critical notations and the experimental range to this crate.
-
-- A release signature dated before its signing key existed is refused, closing
-  the key's validity window at the end the expiry check does not.
-
-- Release signatures, subkey bindings and back signatures made with MD5, SHA-1
-  or RIPEMD-160 are refused. The floor is not applied to revocations, nor to the
-  self-signatures a key's expiry is read from, where discarding a signature
-  would extend a key's life rather than curtail it.
-
-- `ResolvedArchive` records the component key that made the release signature in
-  a new `signing_key` field, written to a plan document as `Signing-Key`.
-
-### Changed
-
-- **Breaking.** `Stdin` is renamed `Stdio`, and `CageBuilder::stdin`,
-  `CageBuilder::get_stdin`, and `RestrictionBuilder::stdin` take and return it.
-  One enum now serves all three standard streams, so the name no longer claims
-  less than the type covers, and the session rule and the descriptor-sharing
-  semantics have one home rather than two. The wire format is unchanged: the
-  keys are `stdin`, `stdout`, and `stderr`, and the unit variants still
-  serialize as `"inherit"` and `"null"`, so every existing profile loads
-  unchanged.
-
-- The curated seccomp policy denies `ioctl` for the `TIOCSTI` and `TIOCLINUX`
-  requests, the two that write to a terminal's input queue, and allows it
-  otherwise. Denied by request rather than by syscall, because `ioctl` is the
-  ordinary way to ask anything of a device.
-
-- An overlay work directory on a different filesystem from the upper is refused
-  at build time, naming the work directory, rather than failing the mount with a
-  bare `EXDEV` from a syscall the caller never issued. The overlay moves files
-  between the two, so the kernel requires them on one filesystem.
-
-- The subordinate-id helpers are resolved to an absolute path by the same lookup
-  `host::range_map_blocker` uses to judge their privilege, and that path is what
-  executes. `Command::new("newuidmap")` re-resolved the bare name on its own
-  terms, so the probe's verdict could describe a different binary from the one
-  that ran. The lookup also skips relative `PATH` entries, which name the
-  process's working directory — not somewhere to resolve a privileged helper
-  from — matching what `path_lookup` already does for the sandbox's own `PATH`.
-  The two auxiliary tools the delegate consults, `id` for the caller's user name
-  and `getsubids` for the allocation, go through the same lookup for the same
-  reason.
-
-- `Terminal::size` leaves a zero dimension at its default rather than passing it
-  through. Zero is what a terminal reports when its size is *unknown* — a
-  pseudoterminal nobody has sized — and the kernel accepts it silently, leaving
-  the sandbox a terminal that answers "no size" to everything that asks: `stty
-  size` refuses it and a full-screen program has nothing to draw into. `fcage`
-  already guarded against exactly this before calling `size`; a library caller
-  plumbing the same reading in now lands in the same place.
-
-- **`fcage`.** The `--terminal` relay blocks `SIGTTOU`. A `tcsetattr` from a
-  background process group raises it and its default action stops the process,
-  so a backgrounded relay would stop inside the restoration and leave the
-  caller's terminal in raw mode with nothing left to fix it. Blocked, the call
-  succeeds and the restoration holds from the background as it does from the
-  foreground. `SIGTTIN` is deliberately not blocked: a backgrounded relay
-  stopping when it tries to read the terminal is the conventional behavior.
-
-- The overlay documentation no longer steers callers at `/var/tmp`, which is
-  mode `1777` everywhere. `Overlay::upper`, `Overlay::work`, `overlay`, and
-  `overlay_rootfs` carry the parent-directory requirement `rootfs` already
-  stated.
-
-- A package is downloaded and installed without ever being held in memory. The
-  bytes are written to a staging file as they arrive and digested on the way
-  through, and the file is renamed into the cache only once the digest matches
-  the one the archive recorded; installing reads it back the same way, streaming
-  the `data.tar` through the decompressor into the extractor. Downloading and
-  unpacking a 90 MB kernel package now costs what a shell script costs, the
-  property `Pool::publish` and the cache's own validation already kept. Nothing
-  unverified is ever visible at a cache path either, since the rename is what
-  puts it there.
-
-- `ResolvedArchive::signed_by`, and a plan document's `Signed-By`, now name the
-  verifying certificate's primary key rather than the subkey that made the
-  signature. It is the identity a keyring entry is named by and the one to pin a
-  repository against, and unlike the signing key it survives an archive rotating
-  its subkey. The subkey is still reported, as `signing_key`.
-
-- A self-signature dated in the future no longer governs a key's expiry. Recency
-  decides which self-signature is authoritative, so one dated ahead of the clock
-  would win outright, and because an absent key-expiration subpacket means "does
-  not expire" it would lift a live expiry rather than postpone it.
-
-- A signature refused by a validity gate — a hash or public-key algorithm below
-  the floor, a missing creation time, a retired signing key, a signature that has
-  itself expired — is now a `DebianError::Signature` rather than a
-  `DebianError::Release`. `Release` describes what is wrong with the release
-  body; these are statements that the signature over it was not acceptable.
-
-- A subkey that could not verify a release now says why. A subkey carrying no
-  valid binding, no counter-signature, no signing capability, or a refused
-  algorithm used to surface as the generic "no signature verified against the
-  archive keyring", because it never became a candidate and so never recorded a
-  reason.
-
-- The zstd decoder bounds each frame's window through `ruzstd` rather than
-  reading the window out of the frame header itself. `ruzstd` now refuses a
-  declared window over a configurable limit before it allocates, so the
-  provisioner sets its 128 MiB bound on every frame's decoder and drops its own
-  copy of the frame-header arithmetic. The bound is unchanged and the same
-  archives are admitted, including those compressed with a window log of 27.
-
-- `flate2`'s backend is named in the manifest rather than left to the crate's
-  default, so a build without the `debian` feature reaches gzip through
-  `miniz_oxide`, which forbids unsafe code outright. The resolved backend is
-  unchanged; naming it keeps a future change to flate2's default from moving it.
-
-- `lzma-rust2` moves to 0.18, `ruzstd` to 0.9, and `sha2` to 0.11. `fcage` reads
-  profiles through `toml` 1.1. No public API changes.
 
 ## [0.1.4] - 2026-08-03
 

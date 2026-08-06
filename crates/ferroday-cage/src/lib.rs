@@ -55,6 +55,14 @@
 //! the working directory, environment, and stream dispositions chosen, and
 //! unmodeled mounts expressed through the [`RawMount`] escape hatch.
 //!
+//! The isolation bounds what the command can reach, not what it can learn. Its
+//! own mount table — `/proc/self/mountinfo` — names the host path of the rootfs
+//! and of every bind source, so a command can read the calling user's name and
+//! the layout of the build that started it. That is what a bind-mount-based
+//! sandbox exposes; the guide's [what the sandbox does not
+//! hide](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#what-the-sandbox-does-not-hide)
+//! sets out the whole of it.
+//!
 //! [`run`](Cage::run) returns the command's [`ExitStatus`] whenever the
 //! command was executed — a non-zero exit is data, not an error. [`Error`]
 //! is reserved for the library failing, and a setup failure inside the

@@ -190,12 +190,20 @@ impl Repository {
     /// the coordinates it publishes under, so a pool this crate writes and a
     /// repository this crate reads agree on what an archive may be called.
     ///
-    /// `trust_unsigned` skips the archive signature, so authenticity would rest
-    /// on the transport alone. An `http://` mirror offers none, so the two
-    /// together install fully unverified packages. A `file://` mirror is local
-    /// and under the caller's control; any other scheme is a caller-supplied
-    /// fetcher's responsibility. The check is per-URL: every mirror of an
-    /// unsigned repository must be non-`http://`.
+    /// `trust_unsigned` skips the archive signature, so authenticity rests on
+    /// the transport alone, and the check is that the transport provides some:
+    /// every mirror of an unsigned repository must be `file://` — local, under
+    /// the caller's control — or `https://`, which authenticates the server it
+    /// came from. The check is per-URL.
+    ///
+    /// It is an allow-list rather than a refusal of `http://`, because a
+    /// refusal names only the plaintext scheme the crate happened to think of:
+    /// a caller-supplied fetcher speaking any other unauthenticated transport
+    /// would pass, and the pairing would install wholly unverified packages
+    /// over an unauthenticated wire. Schemes are case-insensitive (RFC 3986
+    /// §3.1), so the comparison is too — a refusal that read `http://`
+    /// literally would let `HTTP://` name the same plaintext transport and slip
+    /// past.
     fn validate(&self) -> Result<(), DebianError> {
         if self.mirrors.is_empty() {
             return Err(DebianError::Config {
@@ -208,12 +216,13 @@ impl Repository {
         }
         if self.trust_unsigned() {
             for mirror in &self.mirrors {
-                if mirror.starts_with("http://") {
+                if !is_authenticated_transport(mirror) {
                     return Err(DebianError::Config {
                         reason: format!(
-                            "trust_unsigned cannot be used with the http:// mirror {mirror}: skipping \
-                         the archive signature over an unauthenticated transport installs \
-                         unverified packages; use a file:// mirror, or drop trust_unsigned so the \
+                            "trust_unsigned cannot be used with the mirror {mirror}: skipping the \
+                         archive signature leaves authenticity to the transport alone, and only \
+                         file:// (local, under your control) and https:// (which authenticates the \
+                         server) supply any; use one of those, or drop trust_unsigned so the \
                          signature is checked"
                         ),
                     });
@@ -299,8 +308,10 @@ impl RepositoryBuilder {
     ///
     /// Appropriate for a local or `file://` repository under the caller's
     /// control — a build's own freshly-signed-nothing `.deb` pool — never for a
-    /// remote one. [`build`](Self::build) refuses it against an `http://`
-    /// mirror, which offers no authenticity in the signature's place.
+    /// remote one. With no signature, authenticity rests on the transport
+    /// alone, so [`build`](Self::build) requires one that supplies some: every
+    /// mirror must be `file://` or `https://`, and any other scheme —
+    /// `http://` included — is refused.
     pub fn trust_unsigned(mut self, trust: bool) -> Self {
         self.trust_unsigned = trust;
         self
@@ -391,6 +402,28 @@ impl RepositoryBuilder {
         repository.validate()?;
         Ok(repository)
     }
+}
+
+/// The mirror schemes that authenticate what they serve, and so are the ones an
+/// unsigned repository may be reached through.
+///
+/// `file://` is a local path under the caller's own control; `https://`
+/// authenticates the server the bytes came from. Nothing else does, whether it
+/// is `http://` or a scheme this crate has never heard of, so nothing else may
+/// carry an archive whose signature is not checked.
+const AUTHENTICATED_SCHEMES: [&str; 2] = ["file", "https"];
+
+/// Whether `url` names a transport that authenticates what it serves.
+///
+/// A URL naming no scheme at all is not one: the built-in fetcher and every
+/// caller-supplied one address a mirror by scheme, so a bare path is a
+/// misconfiguration rather than a transport with a known posture.
+fn is_authenticated_transport(url: &str) -> bool {
+    super::fetch::scheme_of(url).is_some_and(|scheme| {
+        AUTHENTICATED_SCHEMES
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+    })
 }
 
 /// Rejects a repository name that is not a portable file-name stem, so it
@@ -502,19 +535,53 @@ mod tests {
     }
 
     #[test]
-    fn an_unsigned_http_repository_is_refused() {
-        let err = Repository::builder("trixie")
-            .mirror("http://example.invalid/debian")
-            .trust_unsigned(true)
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, DebianError::Config { .. }));
+    fn an_unsigned_repository_on_an_unauthenticated_transport_is_refused() {
+        // Only file:// and https:// authenticate what they serve. Everything
+        // else is refused by name, including a scheme spelled in a case the
+        // guard is not written in — URI schemes are case-insensitive, so a
+        // literal `http://` comparison would let `HTTP://` name the same
+        // plaintext transport and pass — and including a scheme only a
+        // caller-supplied fetcher would speak.
+        for mirror in [
+            "http://example.invalid/debian",
+            "HTTP://example.invalid/debian",
+            "Http://example.invalid/debian",
+            "ftp://example.invalid/debian",
+            "s3://bucket/debian",
+            "/srv/debs",
+        ] {
+            let err = Repository::builder("trixie")
+                .mirror(mirror)
+                .trust_unsigned(true)
+                .build()
+                .unwrap_err();
+            assert!(matches!(err, DebianError::Config { .. }), "{mirror}");
+        }
     }
 
     #[test]
-    fn an_unsigned_http_fallback_is_refused() {
-        // The transport check is per-URL: a non-http primary does not excuse an
-        // http backstop.
+    fn an_unsigned_repository_on_an_authenticated_transport_is_accepted() {
+        for mirror in [
+            "file:///srv/debs",
+            "FILE:///srv/debs",
+            "https://packages.example/debian",
+            "HTTPS://packages.example/debian",
+        ] {
+            assert!(
+                Repository::builder("trixie")
+                    .mirror(mirror)
+                    .trust_unsigned(true)
+                    .build()
+                    .is_ok(),
+                "{mirror}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsigned_unauthenticated_fallback_is_refused() {
+        // The transport check is per-URL: an authenticated primary does not
+        // excuse a plaintext backstop.
         let err = Repository::builder("trixie")
             .mirror("file:///srv/debs")
             .mirror_fallback("http://example.invalid/debian")

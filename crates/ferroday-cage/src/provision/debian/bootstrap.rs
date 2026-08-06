@@ -15,15 +15,25 @@
 //! the difference — a statoverride seed, ownership stubs, and shadow-file
 //! pre-creation, each documented where it happens — at the cost of
 //! flattening the affected ownership to root in the finished tree.
+//!
+//! Every host-side step goes through [`Rooted`] rather than through a path
+//! composed with the tree's own. The steps interleave with the waves, so most
+//! of them run after arbitrary maintainer scripts have executed inside a cage
+//! rooted at the tree, as root of its namespace; a script that leaves a
+//! symbolic link where a step is about to write would otherwise redirect that
+//! write out of the tree, resolved against the host's root and performed as the
+//! calling user. Anchored to a descriptor for the tree, the same link resolves
+//! within the tree — which is what it means to dpkg reading it from inside the
+//! cage — and the write lands there.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io;
 use std::path::Path;
 
 use super::index::parse_stanzas;
 use super::repository::{Repository, Trust};
 use super::{DebianError, DebianEvent, Stream};
+use crate::provision::rooted::Rooted;
 use crate::{Cage, CageBuilder, IdentityMap, Observer, Stdio};
 
 /// The core packages configured before the rest, in dependency order, so the
@@ -50,6 +60,27 @@ const OWNERSHIP_STUB: &str = "#!/bin/sh\nexit 0\n";
 /// verify the release without the `debian-archive-keyring` package, which the
 /// base closure does not pull in.
 pub(crate) const TRUST_ANCHOR: &str = "/usr/share/keyrings/debian-archive-keyring.gpg";
+
+/// The dpkg statoverride: one record per path whose ownership or mode differs
+/// from what its package shipped.
+const STATOVERRIDE: &str = "var/lib/dpkg/statoverride";
+
+/// The dpkg status database, which records what is installed and configured.
+pub(super) const STATUS: &str = "var/lib/dpkg/status";
+
+/// dpkg's access-method selection.
+const CMETHOPT: &str = "var/lib/dpkg/cmethopt";
+
+/// The daemon-startup policy that suppresses service starts while the rootfs is
+/// half-built.
+const POLICY_RC_D: &str = "usr/sbin/policy-rc.d";
+
+/// The temporary `awk` the core install resolves the virtual dependency
+/// through, before the real mawk is configured.
+const AWK: &str = "usr/bin/awk";
+
+/// The apt configuration the single-identity map needs.
+const APT_SANDBOX_USER: &str = "etc/apt/apt.conf.d/00fcage-single-identity";
 
 /// The mount point the downloaded packages are bound to inside the cage.
 ///
@@ -173,14 +204,20 @@ pub(crate) fn configure(
     // map, where no id but root can be represented.
     let single = matches!(identity_map, IdentityMap::Single);
 
+    // Every host-side step below is anchored to this descriptor, so a symbolic
+    // link a maintainer script leaves behind cannot redirect one out of the
+    // tree. The cages are rooted by path, which the kernel resolves once, at
+    // the pivot.
+    let tree = open_tree(staging)?;
+
     // Suppress daemon startup and, under the single-identity map, neutralize
     // direct chown/chgrp for the whole configuration, before any maintainer
     // script runs.
-    write_policy_rc_d(staging)?;
+    write_policy_rc_d(&tree)?;
     if single {
-        install_ownership_stubs(staging)?;
+        install_ownership_stubs(&tree)?;
     }
-    symlink_awk(staging)?;
+    symlink_awk(&tree)?;
 
     // base-passwd is configured first: it creates /etc/passwd, so the
     // statoverride can name `root` when it is written, which dpkg reads on
@@ -197,8 +234,8 @@ pub(crate) fn configure(
         progress,
     )?;
     if single {
-        write_statoverride(staging, statoverride)?;
-        precreate_shadow(staging)?;
+        write_statoverride(&tree, statoverride)?;
+        precreate_shadow(&tree)?;
     }
 
     // The rest of the base system.
@@ -214,7 +251,7 @@ pub(crate) fn configure(
         )?;
     }
     // The real mawk replaces the temporary awk symlink.
-    remove_awk_symlink(staging)?;
+    remove_awk_symlink(&tree)?;
     core_install(
         installables,
         "mawk",
@@ -228,7 +265,7 @@ pub(crate) fn configure(
     // Unpack registers every package in the database and lays its files;
     // this re-lays coreutils, so the ownership stubs are reinstalled before
     // configuration runs the maintainer scripts.
-    write_dselect_method(staging)?;
+    write_dselect_method(&tree)?;
     let mut unpack: Vec<&str> = vec!["--force-depends", "--unpack"];
     unpack.extend(installables.iter().map(|p| p.deb_path.as_str()));
     run_dpkg(
@@ -242,7 +279,7 @@ pub(crate) fn configure(
     )?;
 
     if single {
-        install_ownership_stubs(staging)?;
+        install_ownership_stubs(&tree)?;
     }
 
     // Every package is now unpacked and no maintainer script has run. Lay the
@@ -273,16 +310,16 @@ pub(crate) fn configure(
     // Restore the real tools and remove the bootstrap-only files, then write
     // the finished rootfs's apt sources.
     if single {
-        restore_ownership_stubs(staging)?;
+        restore_ownership_stubs(&tree)?;
     }
-    remove_policy_rc_d(staging)?;
-    write_repository_sources(staging, repositories)?;
+    remove_policy_rc_d(&tree)?;
+    write_repository_sources(&tree, repositories)?;
     if single {
-        write_apt_sandbox_user(staging)?;
+        write_apt_sandbox_user(&tree)?;
     }
 
     verify_installed(
-        staging,
+        &tree,
         &installables
             .iter()
             .map(|p| p.name.clone())
@@ -322,14 +359,18 @@ pub(crate) fn configure_delta(
 ) -> Result<(), DebianError> {
     let single = matches!(identity_map, IdentityMap::Single);
 
+    // The increment's own tree, which every host-side step below is anchored
+    // to; the base is opened where it is read.
+    let tree = open_tree(upper)?;
+
     // Suppress daemon startup and, under the single-identity map, neutralize
     // direct chown/chgrp and seed the merged statoverride, before any maintainer
     // script runs. The base's own base-passwd is already configured, so `root`
     // resolves from the start; no shadow pre-creation or awk shim is needed.
-    write_policy_rc_d(upper)?;
+    write_policy_rc_d(&tree)?;
     if single {
-        install_delta_ownership_stubs(upper)?;
-        write_delta_statoverride(lower, upper, statoverride)?;
+        install_delta_ownership_stubs(&tree)?;
+        write_delta_statoverride(lower, &tree, statoverride)?;
     }
 
     // Register the increment against the base's database, seen through the
@@ -375,15 +416,15 @@ pub(crate) fn configure_delta(
     // Reveal the base's real ownership tools through the overlay again and drop
     // the daemon-startup policy from the increment.
     if single {
-        restore_delta_ownership_stubs(upper)?;
+        restore_delta_ownership_stubs(&tree)?;
     }
-    remove_policy_rc_d(upper)?;
+    remove_policy_rc_d(&tree)?;
 
     // dpkg copied the base's status database up into the upper on its first
     // write, so the merged database — base plus increment — is read from the
     // upper. Verify the increment's own packages reached the installed state.
     verify_installed(
-        upper,
+        &tree,
         &installables
             .iter()
             .map(|p| p.name.clone())
@@ -400,18 +441,18 @@ pub(crate) fn configure_delta(
 /// base's real tools through the overlay — [`restore_delta_ownership_stubs`]
 /// removes the shadow to reveal them again, since the base's copies persist in
 /// the read-only lower.
-fn install_delta_ownership_stubs(upper: &Path) -> Result<(), DebianError> {
+fn install_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        write_script(&upper.join(format!("usr/bin/{tool}")), OWNERSHIP_STUB)?;
+        write_script(upper, &format!("usr/bin/{tool}"), OWNERSHIP_STUB)?;
     }
     Ok(())
 }
 
 /// Removes the ownership-tool stubs from the upper, revealing the base's real
 /// tools through the overlay again.
-fn restore_delta_ownership_stubs(upper: &Path) -> Result<(), DebianError> {
+fn restore_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        remove_if_present(&upper.join(format!("usr/bin/{tool}")))?;
+        remove_if_present(upper, &format!("usr/bin/{tool}"))?;
     }
     Ok(())
 }
@@ -428,28 +469,30 @@ fn restore_delta_ownership_stubs(upper: &Path) -> Result<(), DebianError> {
 /// count dpkg accepts.
 fn write_delta_statoverride(
     lower: &Path,
-    upper: &Path,
+    upper: &Rooted,
     delta: &StatOverride,
 ) -> Result<(), DebianError> {
-    let base_path = lower.join("var/lib/dpkg/statoverride");
-    let base = match fs::read_to_string(&base_path) {
+    // The base is a caller-supplied tree, so its statoverride is read through a
+    // descriptor for it: a symbolic link at that path would otherwise make this
+    // an arbitrary host-file read whose contents are written into the tree the
+    // caller goes on to export.
+    let base_tree = open_tree(lower)?;
+    let base = match read_text(&base_tree, STATOVERRIDE) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(source) => {
             return Err(DebianError::Io {
                 op: "reading the base statoverride",
-                path: base_path,
+                path: base_tree.path(STATOVERRIDE),
                 source,
             });
         }
     };
     let mut merged = StatOverride::read(&base);
     merged.layer(delta);
-    let path = upper.join("var/lib/dpkg/statoverride");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(io("creating", parent))?;
-    }
-    fs::write(&path, merged.render()).map_err(io("writing", &path))
+    upper
+        .write(STATOVERRIDE, merged.render().as_bytes())
+        .map_err(at("writing", upper, STATOVERRIDE))
 }
 
 /// Forwards a wave's dpkg output to the progress callback.
@@ -499,9 +542,9 @@ fn core_install(
 
 /// Writes the derived dpkg statoverride. Called after base-passwd so `root`
 /// resolves.
-fn write_statoverride(staging: &Path, overrides: &StatOverride) -> Result<(), DebianError> {
-    let path = staging.join("var/lib/dpkg/statoverride");
-    fs::write(&path, overrides.render()).map_err(io("writing", &path))
+fn write_statoverride(tree: &Rooted, overrides: &StatOverride) -> Result<(), DebianError> {
+    tree.write(STATOVERRIDE, overrides.render().as_bytes())
+        .map_err(at("writing", tree, STATOVERRIDE))
 }
 
 /// Pre-creates `/etc/shadow` and `/etc/gshadow` as empty root-owned files,
@@ -520,16 +563,11 @@ fn write_statoverride(staging: &Path, overrides: &StatOverride) -> Result<(), De
 /// delegated allocation; making those succeed would take a syscall-level
 /// ownership fake — one that records the intended ownership rather than
 /// enacting it — which is complementary future work, not this mechanism.
-fn precreate_shadow(staging: &Path) -> Result<(), DebianError> {
+fn precreate_shadow(tree: &Rooted) -> Result<(), DebianError> {
     for file in ["etc/shadow", "etc/gshadow"] {
-        let path = staging.join(file);
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(io("creating", parent))?;
-            }
-            fs::write(&path, "").map_err(io("writing", &path))?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
-                .map_err(io("setting the mode of", &path))?;
+        if !tree.exists(file).map_err(at("inspecting", tree, file))? {
+            tree.write_mode(file, b"", 0o640)
+                .map_err(at("writing", tree, file))?;
         }
     }
     Ok(())
@@ -630,11 +668,10 @@ fn run_dpkg_in(
 }
 
 /// Verifies every selected package reached `install ok installed`.
-fn verify_installed(staging: &Path, selected: &[String]) -> Result<(), DebianError> {
-    let path = staging.join("var/lib/dpkg/status");
-    let text = fs::read_to_string(&path).map_err(|source| DebianError::Io {
+fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianError> {
+    let text = read_text(tree, STATUS).map_err(|source| DebianError::Io {
         op: "reading the dpkg status database",
-        path: path.clone(),
+        path: tree.path(STATUS),
         source,
     })?;
     let mut installed = HashSet::new();
@@ -660,28 +697,36 @@ fn verify_installed(staging: &Path, selected: &[String]) -> Result<(), DebianErr
 
 /// Writes `/usr/sbin/policy-rc.d` returning 101, so package installation does
 /// not start services in the half-built rootfs.
-fn write_policy_rc_d(staging: &Path) -> Result<(), DebianError> {
-    let path = staging.join("usr/sbin/policy-rc.d");
-    write_script(&path, "#!/bin/sh\nexit 101\n")
+fn write_policy_rc_d(tree: &Rooted) -> Result<(), DebianError> {
+    write_script(tree, POLICY_RC_D, "#!/bin/sh\nexit 101\n")
 }
 
 /// Removes the daemon-startup policy after configuration.
-fn remove_policy_rc_d(staging: &Path) -> Result<(), DebianError> {
-    remove_if_present(&staging.join("usr/sbin/policy-rc.d"))
+fn remove_policy_rc_d(tree: &Rooted) -> Result<(), DebianError> {
+    remove_if_present(tree, POLICY_RC_D)
 }
 
 /// Replaces the ownership tools with stubs that succeed.
 ///
 /// The real tool is preserved beside the stub on first call; a second call
 /// (after an unpack wave re-lays the real tool) only rewrites the stub.
-fn install_ownership_stubs(staging: &Path) -> Result<(), DebianError> {
+///
+/// Presence is asked of the name rather than of what it resolves to, so a
+/// symbolic link occupying either path counts as the tool being there and is
+/// moved aside as one, never followed.
+fn install_ownership_stubs(tree: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        let path = staging.join(format!("usr/bin/{tool}"));
-        let saved = staging.join(format!("usr/bin/{tool}.fcage-real"));
-        if path.exists() && !saved.exists() {
-            fs::rename(&path, &saved).map_err(io("moving aside", &path))?;
+        let path = format!("usr/bin/{tool}");
+        let saved = format!("{path}.fcage-real");
+        if tree.exists(&path).map_err(at("inspecting", tree, &path))?
+            && !tree
+                .exists(&saved)
+                .map_err(at("inspecting", tree, &saved))?
+        {
+            tree.rename(&path, &saved)
+                .map_err(at("moving aside", tree, &path))?;
         }
-        write_script(&path, OWNERSHIP_STUB)?;
+        write_script(tree, &path, OWNERSHIP_STUB)?;
     }
     Ok(())
 }
@@ -692,15 +737,23 @@ fn install_ownership_stubs(staging: &Path) -> Result<(), DebianError> {
 /// deleted rather than left behind: a `chown` that silently succeeds is a
 /// worse outcome in a finished rootfs than no `chown` at all. The deletion is
 /// conditional on the file still holding the stub body, so a real tool that
-/// arrived after the last stub was written survives.
-fn restore_ownership_stubs(staging: &Path) -> Result<(), DebianError> {
+/// arrived after the last stub was written survives — as does anything the read
+/// refuses to follow, a symbolic link at the path among them.
+fn restore_ownership_stubs(tree: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        let path = staging.join(format!("usr/bin/{tool}"));
-        let saved = staging.join(format!("usr/bin/{tool}.fcage-real"));
-        if saved.exists() {
-            fs::rename(&saved, &path).map_err(io("restoring", &path))?;
-        } else if fs::read(&path).is_ok_and(|body| body == OWNERSHIP_STUB.as_bytes()) {
-            remove_if_present(&path)?;
+        let path = format!("usr/bin/{tool}");
+        let saved = format!("{path}.fcage-real");
+        if tree
+            .exists(&saved)
+            .map_err(at("inspecting", tree, &saved))?
+        {
+            tree.rename(&saved, &path)
+                .map_err(at("restoring", tree, &path))?;
+        } else if tree
+            .read(&path)
+            .is_ok_and(|body| body == OWNERSHIP_STUB.as_bytes())
+        {
+            remove_if_present(tree, &path)?;
         }
     }
     Ok(())
@@ -708,21 +761,19 @@ fn restore_ownership_stubs(staging: &Path) -> Result<(), DebianError> {
 
 /// Points `/usr/bin/awk` at mawk for the core install, so the base packages'
 /// dependency on the virtual `awk` is satisfiable before mawk is configured.
-fn symlink_awk(staging: &Path) -> Result<(), DebianError> {
-    let path = staging.join("usr/bin/awk");
-    remove_if_present(&path)?;
-    std::os::unix::fs::symlink("mawk", &path).map_err(io("linking", &path))
+fn symlink_awk(tree: &Rooted) -> Result<(), DebianError> {
+    tree.symlink("mawk", AWK).map_err(at("linking", tree, AWK))
 }
 
 /// Removes the temporary awk symlink before the real mawk is installed.
-fn remove_awk_symlink(staging: &Path) -> Result<(), DebianError> {
-    remove_if_present(&staging.join("usr/bin/awk"))
+fn remove_awk_symlink(tree: &Rooted) -> Result<(), DebianError> {
+    remove_if_present(tree, AWK)
 }
 
 /// Selects apt as dpkg's access method, as `debootstrap` does.
-fn write_dselect_method(staging: &Path) -> Result<(), DebianError> {
-    let path = staging.join("var/lib/dpkg/cmethopt");
-    fs::write(&path, "apt apt\n").map_err(io("writing", &path))
+fn write_dselect_method(tree: &Rooted) -> Result<(), DebianError> {
+    tree.write(CMETHOPT, b"apt apt\n")
+        .map_err(at("writing", tree, CMETHOPT))
 }
 
 /// Writes every repository's apt source into the finished rootfs.
@@ -737,10 +788,7 @@ fn write_dselect_method(staging: &Path) -> Result<(), DebianError> {
 /// posture for a source under the caller's control. Each source names the
 /// repository's primary mirror; a snapshot backstop is a fetch-time concern and
 /// is not written into the installed system.
-fn write_repository_sources(
-    staging: &Path,
-    repositories: &[Repository],
-) -> Result<(), DebianError> {
+fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Result<(), DebianError> {
     for (index, repository) in repositories.iter().enumerate() {
         let (list_path, keyring_path) = if index == 0 {
             ("etc/apt/sources.list".to_string(), TRUST_ANCHOR.to_string())
@@ -756,7 +804,7 @@ fn write_repository_sources(
 
         let options = match &repository.trust {
             Trust::Signed(keyring) => {
-                write_keyring(staging, &keyring_path, keyring)?;
+                write_keyring(tree, &keyring_path, keyring)?;
                 format!("[signed-by={keyring_path}]")
             }
             Trust::Unsigned => "[trusted=yes]".to_string(),
@@ -770,19 +818,16 @@ fn write_repository_sources(
             repository.suite,
             repository.components.join(" "),
         );
-        write_sources_file(staging, &list_path, &line)?;
+        write_sources_file(tree, &list_path, &line)?;
     }
     Ok(())
 }
 
 /// Writes a keyring into the finished rootfs at an absolute in-rootfs path,
 /// creating the keyrings directory as needed.
-fn write_keyring(staging: &Path, rootfs_path: &str, keyring: &[u8]) -> Result<(), DebianError> {
-    let path = staging.join(rootfs_path.trim_start_matches('/'));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(io("creating", parent))?;
-    }
-    fs::write(&path, keyring).map_err(io("writing", &path))
+fn write_keyring(tree: &Rooted, rootfs_path: &str, keyring: &[u8]) -> Result<(), DebianError> {
+    tree.write(rootfs_path, keyring)
+        .map_err(at("writing", tree, rootfs_path))
 }
 
 /// Configures apt to run its download methods as root, for the single-identity
@@ -795,59 +840,77 @@ fn write_keyring(staging: &Path, rootfs_path: &str, keyring: &[u8]) -> Result<()
 /// uid, the drop would isolate nothing anyway, so disabling it costs no
 /// separation. A range map maps `_apt` to a real id, keeps the sandbox, and
 /// needs no such file.
-fn write_apt_sandbox_user(staging: &Path) -> Result<(), DebianError> {
-    let path = staging.join("etc/apt/apt.conf.d/00fcage-single-identity");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(io("creating", parent))?;
-    }
-    fs::write(&path, "APT::Sandbox::User \"root\";\n").map_err(io("writing", &path))
+fn write_apt_sandbox_user(tree: &Rooted) -> Result<(), DebianError> {
+    tree.write(APT_SANDBOX_USER, b"APT::Sandbox::User \"root\";\n")
+        .map_err(at("writing", tree, APT_SANDBOX_USER))
 }
 
 /// Writes a single apt sources file (`sources.list` or a `sources.list.d`
 /// entry) at a rootfs-relative path, creating its parent directory as needed.
-fn write_sources_file(staging: &Path, rootfs_path: &str, line: &str) -> Result<(), DebianError> {
-    let path = staging.join(rootfs_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(io("creating", parent))?;
-    }
-    fs::write(&path, line).map_err(io("writing", &path))
+fn write_sources_file(tree: &Rooted, rootfs_path: &str, line: &str) -> Result<(), DebianError> {
+    tree.write(rootfs_path, line.as_bytes())
+        .map_err(at("writing", tree, rootfs_path))
 }
 
 /// Writes an executable script.
-fn write_script(path: &Path, contents: &str) -> Result<(), DebianError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(io("creating", parent))?;
-    }
-    fs::write(path, contents).map_err(io("writing", path))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .map_err(io("setting the mode of", path))
+fn write_script(tree: &Rooted, rootfs_path: &str, contents: &str) -> Result<(), DebianError> {
+    tree.write_mode(rootfs_path, contents.as_bytes(), 0o755)
+        .map_err(at("writing", tree, rootfs_path))
 }
 
 /// Removes a path if it exists, treating an already-absent path as success.
-fn remove_if_present(path: &Path) -> Result<(), DebianError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(DebianError::Io {
-            op: "removing",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
+fn remove_if_present(tree: &Rooted, rootfs_path: &str) -> Result<(), DebianError> {
+    tree.remove(rootfs_path)
+        .map_err(at("removing", tree, rootfs_path))
 }
 
-/// Builds an I/O error closure for a host-side step.
-fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> DebianError {
-    let path = path.to_path_buf();
+/// Reads the dpkg status database of a caller-supplied base tree, anchored to
+/// that tree so nothing in it can redirect the read.
+///
+/// The failure is the raw one, so the layered build can tell an absent database
+/// — which it reports as a misconfigured base — from a read that failed.
+pub(super) fn read_base_status(base: &Path) -> io::Result<String> {
+    read_text(&Rooted::open(base)?, STATUS)
+}
+
+/// Opens a tree for the host-side steps that read and write inside it.
+fn open_tree(root: &Path) -> Result<Rooted, DebianError> {
+    Rooted::open(root).map_err(|source| DebianError::Io {
+        op: "opening the tree",
+        path: root.to_path_buf(),
+        source,
+    })
+}
+
+/// Reads a file of the tree as text, as [`std::fs::read_to_string`] would:
+/// invalid UTF-8 is an `InvalidData` failure rather than lossily decoded.
+fn read_text(tree: &Rooted, rootfs_path: &str) -> io::Result<String> {
+    let bytes = tree.read(rootfs_path)?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
+}
+
+/// Builds an I/O error closure for a host-side step, naming the host path the
+/// tree-relative one would compose to.
+fn at(op: &'static str, tree: &Rooted, rootfs_path: &str) -> impl FnOnce(io::Error) -> DebianError {
+    let path = tree.path(rootfs_path);
     move |source| DebianError::Io { op, path, source }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
-    fn tempdir(tag: &str) -> crate::scratch::Scratch {
-        crate::scratch::Scratch::new(&format!("bootstrap-{tag}"))
+    /// A scratch tree, and a [`Rooted`] anchored to it.
+    fn tempdir(tag: &str) -> (crate::scratch::Scratch, Rooted) {
+        let scratch = crate::scratch::Scratch::new(&format!("bootstrap-{tag}"));
+        let tree = open_tree(&scratch).expect("the scratch tree opens");
+        (scratch, tree)
     }
 
     /// A signed repository over the given mirror, suite, and components.
@@ -873,7 +936,7 @@ mod tests {
         // The primary owns sources.list and the canonical keyring path; the deb
         // line must carry a signed-by naming it, or apt would reject the release
         // for want of a trusted keyring.
-        let staging = tempdir("sources-list");
+        let (staging, tree) = tempdir("sources-list");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -881,7 +944,7 @@ mod tests {
             b"keyring-bytes",
             None,
         );
-        write_repository_sources(&staging, &[primary]).expect("the sources are written");
+        write_repository_sources(&tree, &[primary]).expect("the sources are written");
 
         // The keyring lands at the canonical anchor path.
         let anchor = staging.join(TRUST_ANCHOR.trim_start_matches('/'));
@@ -903,7 +966,7 @@ mod tests {
     fn an_additional_signed_repository_writes_its_own_entry_and_anchor() {
         // The second repository writes a named sources.list.d entry signed by
         // its own keyring, distinct from the primary's anchor.
-        let staging = tempdir("sources-additional");
+        let (staging, tree) = tempdir("sources-additional");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -918,7 +981,7 @@ mod tests {
             b"feature-keyring",
             Some("features"),
         );
-        write_repository_sources(&staging, &[primary, feature]).expect("the sources are written");
+        write_repository_sources(&tree, &[primary, feature]).expect("the sources are written");
 
         let entry = fs::read_to_string(staging.join("etc/apt/sources.list.d/features.list"))
             .expect("the additional entry exists");
@@ -937,7 +1000,7 @@ mod tests {
     fn an_unsigned_repository_writes_a_trusted_line_and_no_keyring() {
         // A trust_unsigned repository writes [trusted=yes] and lays down no
         // keyring, apt's posture for a source under the caller's control.
-        let staging = tempdir("sources-unsigned");
+        let (staging, tree) = tempdir("sources-unsigned");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -953,7 +1016,7 @@ mod tests {
             allow_stale: false,
             name: Some("local".to_string()),
         };
-        write_repository_sources(&staging, &[primary, local]).expect("the sources are written");
+        write_repository_sources(&tree, &[primary, local]).expect("the sources are written");
 
         let entry = fs::read_to_string(staging.join("etc/apt/sources.list.d/local.list"))
             .expect("the local entry exists");
@@ -971,12 +1034,81 @@ mod tests {
     fn the_single_identity_apt_config_runs_methods_as_root() {
         // Under the single-identity map apt cannot drop to _apt, so the
         // written config points its sandbox user at root instead.
-        let staging = tempdir("apt-sandbox-user");
-        write_apt_sandbox_user(&staging).expect("the apt config is written");
+        let (staging, tree) = tempdir("apt-sandbox-user");
+        write_apt_sandbox_user(&tree).expect("the apt config is written");
 
         let conf = fs::read_to_string(staging.join("etc/apt/apt.conf.d/00fcage-single-identity"))
             .expect("the apt config exists");
         assert_eq!(conf, "APT::Sandbox::User \"root\";\n");
+    }
+
+    #[test]
+    fn a_planted_link_cannot_redirect_a_host_side_step_out_of_the_tree() {
+        // Most host-side steps run after a wave has executed every selected
+        // package's maintainer scripts inside a cage rooted at the tree, so a
+        // script is free to leave an absolute link where one of them writes.
+        // The write must land in the tree, and the host file it names must be
+        // untouched.
+        let (staging, tree) = tempdir("planted-link");
+        let victim = staging.join("victim");
+        fs::write(&victim, b"host contents\n").unwrap();
+        for path in [
+            "etc/apt/sources.list",
+            "usr/sbin/policy-rc.d",
+            "usr/bin/awk",
+        ] {
+            let planted = staging.join(path);
+            fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        }
+
+        let primary = signed_repo("file:///srv/pool", "trixie", &["main"], b"anchor", None);
+        write_repository_sources(&tree, &[primary]).expect("the sources are written");
+        symlink_awk(&tree).expect("the awk shim is linked");
+        remove_policy_rc_d(&tree).expect("the policy is removed");
+
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"host contents\n",
+            "a step wrote through the planted link",
+        );
+        let sources = staging.join("etc/apt/sources.list");
+        assert!(
+            !fs::symlink_metadata(&sources)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&sources).unwrap(),
+            format!("deb [signed-by={TRUST_ANCHOR}] file:///srv/pool trixie main\n"),
+        );
+        assert_eq!(
+            fs::read_link(staging.join("usr/bin/awk")).unwrap(),
+            Path::new("mawk"),
+        );
+        assert!(fs::symlink_metadata(staging.join("usr/sbin/policy-rc.d")).is_err());
+    }
+
+    #[test]
+    fn a_link_in_the_base_cannot_leak_a_host_file_into_the_increment() {
+        // The base of a layered build is a caller-supplied tree whose
+        // statoverride is read and carried into the upper. A link there would
+        // otherwise make the read an arbitrary host-file read, published in the
+        // tree the caller exports.
+        let (base, _) = tempdir("delta-base");
+        let (upper, upper_tree) = tempdir("delta-upper");
+        let secret = base.join("secret");
+        fs::write(&secret, b"root root 4755 /host/secret\n").unwrap();
+        fs::create_dir_all(base.join("var/lib/dpkg")).unwrap();
+        std::os::unix::fs::symlink(&secret, base.join(STATOVERRIDE)).unwrap();
+
+        let mut delta = StatOverride::default();
+        delta.record(0o2755, "/usr/bin/new".to_string());
+        let err = write_delta_statoverride(&base, &upper_tree, &delta)
+            .expect_err("a link at the base's statoverride is not read through");
+        assert!(matches!(err, DebianError::Io { .. }));
+        assert!(!upper.join(STATOVERRIDE).exists());
     }
 
     #[test]

@@ -37,10 +37,14 @@ use crate::IdentityMap;
 /// rather than treated as an empty base, which would draw the whole base system
 /// into the increment.
 ///
+/// The base is a caller-supplied tree, so the read is anchored to a descriptor
+/// for it: a symbolic link at the status path would otherwise be followed
+/// against the host's root, turning this into a read of an arbitrary host file
+/// whose contents decide what the increment resolves against.
+///
 /// [`Debian::stage_layer`]: super::Debian::stage_layer
 pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianError> {
-    let status_path = base.join("var/lib/dpkg/status");
-    let text = match std::fs::read_to_string(&status_path) {
+    let text = match super::bootstrap::read_base_status(base) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(DebianError::Config {
@@ -54,7 +58,7 @@ pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianE
         Err(source) => {
             return Err(DebianError::Io {
                 op: "reading the base layer's dpkg status database",
-                path: status_path,
+                path: base.join(super::bootstrap::STATUS),
                 source,
             });
         }

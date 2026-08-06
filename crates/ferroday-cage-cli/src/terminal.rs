@@ -166,9 +166,9 @@ impl Signals {
             mask |= 1u64 << (signal.as_raw() - 1);
         }
         // SAFETY: `blocked` is a live local of exactly the type the call takes.
-        // Blocking these seven interferes with nothing in the process: the
+        // Blocking the relayed set interferes with nothing in the process: the
         // standard library installs handlers only for SIGPIPE and the
-        // stack-overflow SIGSEGV, neither of which is in the set.
+        // stack-overflow SIGSEGV, neither of which is in it.
         unsafe { rustix::runtime::kernel_sigprocmask(How::BLOCK, Some(&blocked)) }?;
 
         // SAFETY: `mask` is a live local `u64`, whose size is passed alongside

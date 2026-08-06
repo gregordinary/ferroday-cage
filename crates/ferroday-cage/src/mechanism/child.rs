@@ -181,7 +181,10 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // stages are forked from the post-sweep table, so the command starts
     // with exactly its standard streams — no caller descriptor leaks into
     // the sandbox, and no caller resource is pinned by the supervisor for
-    // the sandbox's lifetime.
+    // the sandbox's lifetime. A caller's own `Stdio::Fd` descriptor is kept
+    // here, because the command stage still has to copy it onto a standard
+    // stream; `wire_stdio` marks it close-on-exec once it has, so it is gone
+    // by the time the command image starts.
     sweep_fds(context).map_err(|errno| (SetupStep::SweepFds, errno, 0))?;
 
     // Establish the identity map, after the sweep so the map gate survives
@@ -640,7 +643,9 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 ///
 /// `dup2` clears close-on-exec on its target as a side effect, which is what
 /// lets the redirected stream survive `execve` while every original copy still
-/// closes.
+/// closes. A caller-supplied source is the one copy the sweep had to keep, so
+/// it is marked close-on-exec here once it has been copied — see the end of the
+/// body.
 ///
 /// Every source is moved above the standard-stream numbers first, so no source
 /// is ever also a target. Only a caller-supplied
@@ -724,6 +729,26 @@ fn wire_stdio(context: &Context<'_>) -> Result<(), Errno> {
     }
     if let Some(stderr) = stderr {
         rustix::stdio::dup2_stderr(stderr)?;
+    }
+
+    // The sweep kept the caller's own descriptors so the `dup2`s above had
+    // something to copy from, and a caller holds one at whatever number it
+    // happened to get — 21, say, well clear of the standard streams the sweep
+    // also keeps. Copied onto 0, 1 or 2 and left otherwise alone, the original
+    // would survive the exec at that number: the command would start holding a
+    // second handle to the caller's file, one it keeps after closing and
+    // reopening its standard output, and one neither the crate's "a descriptor
+    // table holding only its standard streams" nor `sweep_fds_keeping`'s own
+    // contract admits. Marking it close-on-exec closes it, and only it: the
+    // `dup2` targets were cleared of the flag by the copy, and descriptor flags
+    // are per-descriptor and this process's own since the fork, so the caller's
+    // copy is untouched.
+    for caller in [context.stdin_fd, context.stdout_fd, context.stderr_fd] {
+        if let Some(caller) = caller
+            && caller.as_raw_fd() > STDERR
+        {
+            rustix::io::fcntl_setfd(caller, rustix::io::FdFlags::CLOEXEC)?;
+        }
     }
     Ok(())
 }
@@ -1043,19 +1068,23 @@ fn enter_nested_namespace(context: &Context<'_>, gate: Option<OwnedFd>) -> Resul
     unsafe { thread::unshare_unsafe(thread::UnshareFlags::NEWUSER | thread::UnshareFlags::NEWNS) }
         .map_err(|errno| (SetupStep::NestedUnshare, errno, 0))?;
 
-    let duty = match nested.map {
-        super::NestedMap::SelfWritten => MapDuty::Write {
+    let duty = match &nested.map {
+        super::NestedMap::SelfWritten {
+            setgroups_path,
+            gid_map_path,
+            uid_map_path,
+        } => MapDuty::Write {
             // The root was swapped before this stage ran, so the map files are
             // named through the procfs the mount profile established.
             paths: MapPaths {
-                setgroups: nested.setgroups_path.as_c_str(),
-                gid_map: nested.gid_map_path.as_c_str(),
-                uid_map: nested.uid_map_path.as_c_str(),
+                setgroups: setgroups_path.as_c_str(),
+                gid_map: gid_map_path.as_c_str(),
+                uid_map: uid_map_path.as_c_str(),
             },
             uid_line: &nested.uid_lines,
             gid_line: &nested.gid_lines,
         },
-        super::NestedMap::Delegated => MapDuty::Await,
+        super::NestedMap::Delegated { .. } => MapDuty::Await,
     };
     establish_map(duty, gate.as_ref().map(AsFd::as_fd)).map_err(|failure| match failure {
         // The delegate closed the gate without writing: it failed, and reports
@@ -1139,8 +1168,27 @@ fn nested_seam(procfs: Option<OwnedFd>) -> Result<Option<NestedSeam>, Failure> {
 fn delegates_nested_map(context: &Context<'_>) -> bool {
     matches!(
         &context.plan.nested,
-        Some(nested) if nested.map == super::NestedMap::Delegated
+        Some(nested) if matches!(nested.map, super::NestedMap::Delegated { .. })
     )
+}
+
+/// The rootfs-relative procfs target a delegate inside the sandbox writes the
+/// command's map files through, or `None` where this stage is not that
+/// delegate.
+///
+/// Only a delegated map inside a PID namespace has its delegate in here; a
+/// self-written map has no delegate at all, and a delegated map without a PID
+/// namespace is written by the launch stage, outside, through the host's own
+/// `/proc`. The build composes a target for that one case and for no other, so
+/// a `None` here is the same condition as the build having required no procfs.
+fn nested_procfs_target<'a>(context: &'a Context<'_>) -> Option<&'a CStr> {
+    if !context.plan.pid_namespace {
+        return None;
+    }
+    match &context.plan.nested.as_ref()?.map {
+        super::NestedMap::Delegated { procfs_target } => procfs_target.as_deref(),
+        super::NestedMap::SelfWritten { .. } => None,
+    }
 }
 
 /// Writes the command's nested identity map from inside the sandbox, releasing
@@ -1333,19 +1381,13 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     // The procfs the command's nested identity map will be written through,
     // opened only where this stage is the delegate for it. The mount profile
     // has just established it, and the build refused a profile that establishes
-    // none.
-    let procfs = if plan.pid_namespace && delegates_nested_map(context) {
-        let target = plan
-            .nested
-            .as_ref()
-            .map(|nested| nested.procfs_target.as_c_str())
-            .unwrap_or(c"");
-        Some(
+    // none for a configuration that reaches here.
+    let procfs = match nested_procfs_target(context) {
+        Some(target) => Some(
             open_in_root(newroot.as_fd(), target, OFlags::RDONLY | OFlags::DIRECTORY)
                 .map_err(|errno| (SetupStep::OpenSandboxProcfs, errno, 0))?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
 
     process::fchdir(&newroot).map_err(|errno| (SetupStep::EnterRootfs, errno, 0))?;

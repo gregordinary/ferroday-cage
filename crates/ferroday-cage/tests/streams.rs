@@ -3,6 +3,7 @@
 mod common;
 
 use std::io::Write;
+use std::os::fd::RawFd;
 
 use ferroday_cage::{Cage, Observer, Progress, Stdio};
 
@@ -226,6 +227,89 @@ fn a_descriptor_stdin_survives_the_descriptor_sweep() {
     let output = cage.output().expect("the sandbox launches");
     assert!(output.status.success());
     assert_eq!(output.stdout.trim_ascii(), b"10");
+}
+
+/// Duplicates `fd` onto a number at or above `floor`, leaving close-on-exec
+/// clear.
+///
+/// Clear is `dup`'s own behaviour, and the state a descriptor is in when a
+/// caller placed it by hand — `dup2`d onto a fixed number, or inherited from
+/// its own parent. A descriptor `std` opened carries close-on-exec already, so
+/// it could not show whether the launch closes what it was handed. The number
+/// is pushed clear of the low ones so that nothing the command opens for itself
+/// can land on it.
+fn duplicate_above(fd: std::os::fd::BorrowedFd<'_>, floor: RawFd) -> std::os::fd::OwnedFd {
+    use std::os::fd::AsRawFd;
+    let mut ladder = Vec::new();
+    loop {
+        let duplicate = rustix::io::dup(fd).expect("the descriptor duplicates");
+        if duplicate.as_raw_fd() >= floor {
+            return duplicate;
+        }
+        ladder.push(duplicate);
+    }
+}
+
+#[test]
+fn a_caller_descriptor_does_not_survive_the_exec_at_its_own_number() {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The sweep keeps a caller's descriptor so the command stage can copy it
+    // onto a standard stream, and the caller holds it at whatever number it
+    // has. Left as it was it would survive the exec there, handing the command
+    // a second handle to the caller's file — one it keeps after closing and
+    // reopening the standard stream — where the contract is a descriptor table
+    // holding only the standard streams.
+    let (reader, mut writer) = std::io::pipe().expect("a pipe");
+    let (out_reader, out_writer) = std::io::pipe().expect("a pipe");
+    // Each duplicate replaces its original outright, so the cage holds the only
+    // copy of the write end and the read below ends when the cage is dropped.
+    let reader = duplicate_above(reader.as_fd(), 20);
+    let out_writer = {
+        let duplicate = duplicate_above(out_writer.as_fd(), 20);
+        drop(out_writer);
+        duplicate
+    };
+    let (stdin_number, stdout_number) = (reader.as_raw_fd(), out_writer.as_raw_fd());
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .stdin(Stdio::from_fd(reader))
+        .stdout(Stdio::from_fd(out_writer))
+        .command("/bin/sh")
+        // The listing goes to the caller's own pipe through standard output,
+        // which is a descriptor the command was given and is meant to hold.
+        .args(["-c", "ls /proc/self/fd"])
+        .build()
+        .expect("a valid sandbox configuration");
+    writer.write_all(b"unread\n").unwrap();
+    drop(writer);
+
+    let status = cage.run().expect("the sandbox launches");
+    assert!(status.success());
+    // The cage holds the only remaining copies of the write end, so the read
+    // below sees end-of-file once it is gone.
+    drop(cage);
+    let mut listing = String::new();
+    std::io::Read::read_to_string(&mut { out_reader }, &mut listing).expect("the listing arrives");
+    let held: Vec<RawFd> = listing
+        .split_ascii_whitespace()
+        .filter_map(|entry| entry.parse().ok())
+        .collect();
+    for number in [stdin_number, stdout_number] {
+        assert!(
+            !held.contains(&number),
+            "the caller's descriptor {number} survived the exec: {listing:?}",
+        );
+    }
+    // `ls` opens the listed directory itself, so one entry above the standard
+    // streams is its own and anything more is a leak.
+    assert!(
+        held.iter().filter(|number| **number > 2).count() <= 1,
+        "a descriptor beyond the standard streams survived the exec: {listing:?}",
+    );
 }
 
 #[test]

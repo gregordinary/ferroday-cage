@@ -39,9 +39,9 @@
 //! without a signature, apt's `[trusted=yes]`. That is the shape a build
 //! produces when it regenerates a pool of its own `.deb`s each run, so no
 //! signing ceremony and no flat-repository parser stand between the build and
-//! the bootstrap. The provisioner refuses `trust_unsigned` over `http://`,
-//! where the transport offers no authenticity in the signature's place, but a
-//! `file://` pool under the caller's control is exactly its intended use.
+//! the bootstrap. With no signature, authenticity rests on the transport, so
+//! the provisioner requires one that supplies some — `file://` or `https://` —
+//! and a `file://` pool under the caller's control is exactly its intended use.
 //!
 //! Each additional repository writes its own
 //! `/etc/apt/sources.list.d/<name>.list` into the finished rootfs, so an

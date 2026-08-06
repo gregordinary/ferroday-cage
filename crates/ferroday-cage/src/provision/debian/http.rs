@@ -108,12 +108,19 @@ impl Fetch for HttpFetch {
         sink: &mut dyn Write,
     ) -> Result<(), FetchError> {
         let url = request.url();
+        // The signed release states the length of every index, and the index
+        // the length of every package, so most requests arrive with a ceiling
+        // far below `MAX_BODY`. Where one does, it is what the body is held to:
+        // a mirror that answers a request for a few megabytes with gigabytes is
+        // not serving the resource that was asked for, and the digest check
+        // that catches the substitution runs only after the bytes are spent.
+        let cap = request.size().map_or(MAX_BODY, |size| size.min(MAX_BODY));
         if let Some(path) = url.strip_prefix("file://") {
-            return fetch_file(url, path, sink);
+            return fetch_file(url, path, sink, cap);
         }
         let mut current = url.to_string();
         for _ in 0..=self.max_redirects {
-            match self.request(&current, sink)? {
+            match self.request(&current, sink, cap)? {
                 Step::Done => return Ok(()),
                 Step::Redirect(next) => current = next,
             }
@@ -157,8 +164,9 @@ impl HttpUrl {
 }
 
 impl HttpFetch {
-    /// Performs one HTTP request, streaming a 2xx body to `sink`.
-    fn request(&self, url: &str, sink: &mut dyn Write) -> Result<Step, FetchError> {
+    /// Performs one HTTP request, streaming a 2xx body to `sink` and refusing
+    /// one that runs past `cap` bytes.
+    fn request(&self, url: &str, sink: &mut dyn Write, cap: u64) -> Result<Step, FetchError> {
         let parsed = parse_http_url(url)?;
         let io = |op: &'static str| move |source: io::Error| FetchError::io(url, op, source);
 
@@ -216,17 +224,18 @@ impl HttpFetch {
             }
         }
 
-        // Every body path streams through a writer capped at `MAX_BODY`, so a
-        // hostile mirror cannot drive unbounded buffering by announcing a huge
-        // framing or never closing the connection.
-        let mut sink = LimitedWriter::new(sink, MAX_BODY);
+        // Every body path streams through a writer capped at what this resource
+        // may weigh — the signed length where one is stated, `MAX_BODY`
+        // otherwise — so a hostile mirror cannot drive unbounded buffering by
+        // announcing a huge framing or never closing the connection.
+        let mut sink = LimitedWriter::new(sink, cap);
         if headers.chunked {
             read_chunked(&mut reader, &mut sink).map_err(io("reading the body"))?;
         } else if let Some(length) = headers.content_length {
-            if length > MAX_BODY {
+            if length > cap {
                 return Err(FetchError::url(
                     url,
-                    format!("the response is {length} bytes, over the {MAX_BODY}-byte cap"),
+                    format!("the response is {length} bytes, over the {cap}-byte cap"),
                 ));
             }
             read_sized(&mut reader, length, &mut sink).map_err(io("reading the body"))?;
@@ -293,8 +302,9 @@ impl HttpFetch {
     }
 }
 
-/// Reads a local file for a `file://` URL.
-fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write) -> Result<(), FetchError> {
+/// Reads a local file for a `file://` URL, refusing one that runs past `cap`
+/// bytes.
+fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write, cap: u64) -> Result<(), FetchError> {
     let path = local_file_path(url, rest)?;
     let mut file = File::open(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
@@ -303,7 +313,9 @@ fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write) -> Result<(), FetchEr
             FetchError::io(url, "opening the file", source)
         }
     })?;
-    io::copy(&mut file, sink).map_err(|source| FetchError::io(url, "reading the file", source))?;
+    let mut sink = LimitedWriter::new(sink, cap);
+    io::copy(&mut file, &mut sink)
+        .map_err(|source| FetchError::io(url, "reading the file", source))?;
     Ok(())
 }
 
@@ -351,16 +363,7 @@ fn local_file_path<'a>(url: &str, rest: &'a str) -> Result<&'a str, FetchError> 
 /// Whether `s` is an absolute URL — a scheme followed by `://` — rather than a
 /// path reference. A relative `Location` has no scheme.
 fn is_absolute_url(s: &str) -> bool {
-    match s.split_once("://") {
-        Some((scheme, _)) => {
-            !scheme.is_empty()
-                && !scheme.contains('/')
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        }
-        None => false,
-    }
+    super::fetch::scheme_of(s).is_some()
 }
 
 /// Resolves a redirect `location` against the `base` URL it was returned for.
@@ -474,13 +477,30 @@ fn read_line_limited<R: BufRead>(reader: &mut R, line: &mut String) -> io::Resul
 }
 
 /// Reads and parses the status line, returning the status code.
+///
+/// The version token is checked, not merely skipped over. Reading the second
+/// word of any line that happens to parse as a number would take a mail or SSH
+/// server's greeting for a response — the digest chain makes that harmless, but
+/// a mirror URL pointed at the wrong port then fails somewhere further on
+/// instead of saying what it found. `HTTP/` is the whole of the check: the
+/// version that follows is a thing this client neither negotiates nor acts on.
 fn read_status<R: BufRead>(reader: &mut R) -> io::Result<u16> {
     let mut line = String::new();
     read_line_limited(reader, &mut line)?;
-    line.split_whitespace()
-        .nth(1)
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed status line");
+    let mut words = line.split_whitespace();
+    // Compared as bytes: the token is arbitrary input, and slicing a `str` at a
+    // fixed index would panic where that index is not a character boundary.
+    if !words.next().is_some_and(|version| {
+        let bytes = version.as_bytes();
+        bytes.len() > 5 && bytes[..5].eq_ignore_ascii_case(b"HTTP/")
+    }) {
+        return Err(malformed());
+    }
+    words
+        .next()
         .and_then(|code| code.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed status line"))
+        .ok_or_else(malformed)
 }
 
 /// Reads headers up to the blank separator line.
@@ -614,15 +634,21 @@ impl<R: Read> Read for DeadlineReader<R> {
 }
 
 /// A writer that forwards to an inner writer until a byte ceiling is crossed,
-/// then fails. It bounds the memory a fetch buffers regardless of what the
-/// server's framing claims.
-struct LimitedWriter<'a> {
+/// then fails. It bounds what a fetch spends regardless of what the server's
+/// framing claims.
+///
+/// The provisioner wraps its own sinks in one as well, because a
+/// caller-supplied [`Fetch`] is free to ignore the size a request declares, and
+/// the sink is the one place the bound cannot be ignored.
+pub(super) struct LimitedWriter<'a> {
     inner: &'a mut dyn Write,
     remaining: u64,
 }
 
 impl<'a> LimitedWriter<'a> {
-    fn new(inner: &'a mut dyn Write, limit: u64) -> LimitedWriter<'a> {
+    /// Wraps `inner`, failing the write that would carry it past `limit` bytes
+    /// in total.
+    pub(super) fn new(inner: &'a mut dyn Write, limit: u64) -> LimitedWriter<'a> {
         LimitedWriter {
             inner,
             remaining: limit,
@@ -845,6 +871,35 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_size_caps_the_body_below_the_default_ceiling() {
+        // The signed release states the length of every index and the index the
+        // length of every package, so a request usually arrives with a ceiling
+        // far below `MAX_BODY`. A source that answers with more must fail at
+        // the stated length rather than at two gigabytes. The `file://` path
+        // carries the same cap as the HTTP one, and is the one a unit test can
+        // reach without a server.
+        let dir = crate::scratch::Scratch::new("http-cap");
+        let path = dir.join("index");
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+        let url = format!("file://{}", path.display());
+
+        let mut out = Vec::new();
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new(&url).sized(16), &mut out)
+            .expect_err("a body over the declared size is refused");
+        assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
+        assert!(out.len() <= 16, "more than the ceiling was written");
+
+        // The whole resource arrives when the declared size admits it, and a
+        // request with no declared size is bounded by `MAX_BODY` alone.
+        for request in [FetchRequest::new(&url).sized(4096), FetchRequest::new(&url)] {
+            let mut out = Vec::new();
+            HttpFetch::new().fetch(&request, &mut out).unwrap();
+            assert_eq!(out.len(), 4096);
+        }
+    }
+
+    #[test]
     fn an_oversized_framing_line_is_rejected() {
         // A line longer than the cap with no newline is refused rather than
         // buffered without bound.
@@ -865,6 +920,29 @@ mod tests {
         let mut reader = BufReader::new(body.as_bytes());
         let err = read_headers(&mut reader).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn only_an_http_status_line_is_read_as_one() {
+        assert_eq!(read_status(&mut &b"HTTP/1.1 200 OK\r\n"[..]).unwrap(), 200);
+        // The version is compared case-insensitively and its number is not
+        // acted on, since this client negotiates none.
+        assert_eq!(read_status(&mut &b"http/1.0 404 x\r\n"[..]).unwrap(), 404);
+        for line in [
+            // A greeting whose second word parses as a number is not a status
+            // line; a mirror URL pointed at the wrong port should say so here
+            // rather than fail somewhere further on.
+            &b"220 587 ESMTP ready\r\n"[..],
+            &b"SSH-2.0-OpenSSH_9.9\r\n"[..],
+            &b"HTTP/ 200 OK\r\n"[..],
+            &b"HTTP/1.1\r\n"[..],
+            &b"\r\n"[..],
+            // A non-ASCII first token must be refused, not panicked on.
+            "\u{e9}\u{e9}\u{e9} 200 OK\r\n".as_bytes(),
+        ] {
+            let err = read_status(&mut { line }).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{line:?}");
+        }
     }
 
     #[test]

@@ -625,17 +625,22 @@ pub enum ConfigError {
     /// Every container enters a nested user namespace before it hardens, which
     /// is what locks the flags of the mounts it inherited — without it the
     /// command is root of the namespace those mounts belong to and may lift any
-    /// restriction they carry. The nested namespace's map is written through
-    /// `/proc`, by path, from inside the sandbox, so a sandbox with no procfs
-    /// has no way to establish one.
+    /// restriction they carry. Establishing that namespace's map reaches for a
+    /// procfs by path from inside the sandbox, so a sandbox with no procfs has
+    /// no way to establish one.
     ///
     /// Reachable only from a profile that opts out of the managed mounts with
     /// [`managed_mounts(false)`](crate::CageBuilder::managed_mounts) (or
     /// [`mount_proc(false)`](crate::CageBuilder::mount_proc)) and mounts no
-    /// procfs of its own. A bind of the host's procfs serves, except under the
-    /// one combination that needs the sandbox's own pids to index it: a range
-    /// [`identity_map`](crate::CageBuilder::identity_map), whose nested map a
-    /// delegate writes, inside a PID namespace of the sandbox's own.
+    /// procfs of its own, and then only where the map's route reads one. The
+    /// single-identity map's command writes its own map files, and a bind of
+    /// the host's procfs serves it — every instance resolves `self` for its
+    /// reader. A range [`identity_map`](crate::CageBuilder::identity_map) is
+    /// written by a delegate, and where the sandbox has a PID namespace that
+    /// delegate is inside it and needs a *fresh* procfs, since it names the
+    /// command by an in-namespace pid a bound procfs does not index. Where the
+    /// sandbox has no PID namespace the delegate is outside it and reads the
+    /// host's own `/proc`, so no procfs is required at all.
     NestedUsernsNeedsProcfs,
     /// A retained set-id capability alongside a non-root run-as identity.
     ///
@@ -900,7 +905,8 @@ impl fmt::Display for ConfigError {
                  flags can establish its identity map through; mount one, or leave the \
                  managed profile's own in place. A range identity map inside a PID namespace \
                  of the sandbox's own needs a fresh procfs rather than a bind of the host's, \
-                 which the sandbox's pids do not index",
+                 which the sandbox's pids do not index; without a PID namespace it needs none, \
+                 because its map is written from outside",
             ),
             ConfigError::SetidCapWithNonRootIdentity { capability } => write!(
                 f,

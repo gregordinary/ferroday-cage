@@ -54,6 +54,8 @@ mod export;
 #[cfg(feature = "tarball")]
 mod extract;
 mod identity;
+#[cfg(feature = "debian")]
+mod rooted;
 #[cfg(feature = "tarball")]
 mod tar;
 #[cfg(feature = "tarball")]
