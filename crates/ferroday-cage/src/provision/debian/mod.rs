@@ -17,6 +17,13 @@
 //! rootfs before its maintainer scripts run, and [`Pool`] writes a local
 //! trusted pool a later bootstrap resolves against.
 //!
+//! No `.deb` is ever held in memory. A download is written to a staging file as
+//! it arrives and digested on the way through, and published with a rename only
+//! once the digest matches; installing reads it back the same way, streaming the
+//! `data.tar` through the decompressor into the extractor; and [`Pool`] reaches a
+//! control member by seeking to it. So a 90 MB kernel package costs what a shell
+//! script costs, whichever direction it is moving in.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -34,6 +41,7 @@
 mod arch;
 mod available;
 mod bootstrap;
+mod coordinate;
 mod deb;
 mod fetch;
 mod http;
@@ -65,9 +73,16 @@ use super::extract::Extraction;
 use super::{Delegate, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, io_error};
 use crate::IdentityMap;
 use crate::status::ExitStatus;
-use bootstrap::Installable;
+use bootstrap::{Installable, StatOverride};
 use index::{Index, Package};
 use release::{Keyring, Release};
+
+/// The mode a bootstrapped rootfs's own root directory takes.
+///
+/// The mode `base-files` ships `/` as, applied to the tree being assembled
+/// rather than read off whichever package was extracted last; see
+/// [`extract_packages`].
+const ROOTFS_ROOT_MODE: u32 = 0o755;
 
 /// The Debian archive keyring shipped with the crate, the binary
 /// `debian-archive-keyring`. A caller can substitute their own with
@@ -169,6 +184,23 @@ fn validate_pinned_plan(
              repositories are configured, so some of its packages name no mirror",
             plan.archives.len(),
         ));
+    }
+    // The archive count bounds a plan whose packages agree with its own archive
+    // list, which is every plan a document produced: reading one refuses a
+    // package naming an archive the document does not carry. `Plan` is public
+    // and `Clone`, though, so a caller can take one from `resolve()` and edit
+    // it, and the index is what a bootstrap slices the repository list with.
+    // It is checked here, where the configuration is frozen, rather than left to
+    // panic mid-download; `Plan::to_document` makes the same check on the way
+    // out.
+    for package in &plan.packages {
+        if package.archive >= repositories {
+            return contradiction(format!(
+                "the pinned plan's package {} names archive {} but only {repositories} \
+                 repositories are configured, so it names no mirror",
+                package.name, package.archive,
+            ));
+        }
     }
     Ok(())
 }
@@ -398,6 +430,13 @@ impl<'a> Debian<'a> {
     /// pre-configure overlay configured on the builder all apply, exactly as to a
     /// full bootstrap; the map must match the one the base was built under.
     ///
+    /// A call that fails leaves nothing behind: the upper and its work directory
+    /// are disposed of exactly as dropping the returned layer would dispose of
+    /// them, since a failure hands the caller no handle to drop. So is the
+    /// package cache, unless the builder named a
+    /// [`cache_dir`](DebianBuilder::cache_dir), which is the caller's and
+    /// survives either way.
+    ///
     /// # Preconditions
     ///
     /// The increment's configure wave runs the target's binaries, so a foreign
@@ -458,6 +497,11 @@ impl<'a> Debian<'a> {
         // filesystem, so its scratch files land beside the upper.
         std::fs::create_dir_all(upper)
             .map_err(|err| io_error("creating the overlay upper", upper, err))?;
+        // The handle that owns the upper is taken as soon as the upper exists,
+        // not on the way out, so a failure below disposes of a partly-installed
+        // increment instead of orphaning it: there is no handle in an `Err` for
+        // the caller to drop.
+        let layer = BuildLayer::new(upper, self.identity_map.clone());
         let scratch = upper
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -469,17 +513,8 @@ impl<'a> Debian<'a> {
         }
 
         // The archives cache: the caller's shared one, or a sibling of the
-        // upper. A sibling, not a child: an extracted package's entries land
-        // under the upper, so a cache beneath it could be overwritten before it
-        // is read.
-        let archives_host = match self.cache_dir.as_deref() {
-            Some(dir) => dir.to_path_buf(),
-            None => {
-                let mut sibling = upper.as_os_str().to_os_string();
-                sibling.push(".fcage-debs");
-                PathBuf::from(sibling)
-            }
-        };
+        // upper, which goes with this frame however it ends.
+        let archives = Archives::beside(upper, self.cache_dir.as_deref());
 
         // Resolve the increment against the base's installed set, download it,
         // extract it into the upper, and configure it through the overlay.
@@ -500,14 +535,14 @@ impl<'a> Debian<'a> {
         // stands. Skipping here also keeps dpkg from being handed an empty
         // unpack wave, which it refuses.
         if packages.is_empty() {
-            return Ok(BuildLayer::new(upper, self.identity_map.clone()));
+            return Ok(layer);
         }
         let wanted: Vec<Wanted> = packages.iter().map(Wanted::from_package).collect();
         let installables = acquire_debs(
             self.fetcher.as_mut(),
             &self.repositories,
             &wanted,
-            &archives_host,
+            archives.path(),
             progress,
             cancelled,
         )?;
@@ -515,7 +550,7 @@ impl<'a> Debian<'a> {
             upper,
             &self.architecture,
             &installables,
-            &archives_host,
+            archives.path(),
             progress,
             cancelled,
         )?;
@@ -524,7 +559,7 @@ impl<'a> Debian<'a> {
         bootstrap::configure_delta(
             base,
             upper,
-            &archives_host,
+            archives.path(),
             &installables,
             &statoverride,
             &self.identity_map,
@@ -536,11 +571,8 @@ impl<'a> Debian<'a> {
 
         // The read-only archives bind left an empty mount point in the upper.
         let _ = std::fs::remove_dir_all(upper.join(bootstrap::ARCHIVES.trim_start_matches('/')));
-        if self.cache_dir.is_none() {
-            let _ = std::fs::remove_dir_all(&archives_host);
-        }
 
-        Ok(BuildLayer::new(upper, self.identity_map.clone()))
+        Ok(layer)
     }
 }
 
@@ -805,7 +837,12 @@ impl<'a> DebianBuilder<'a> {
 
     /// Sets a directory to cache downloaded packages in, content-addressed
     /// and reused across bootstraps. Without one, packages are downloaded to
-    /// a temporary directory and discarded.
+    /// a directory beside the tree being built and discarded when the run ends,
+    /// whether it succeeded or failed.
+    ///
+    /// A cache directory set here is the caller's and is never removed, which is
+    /// what makes it a cache: it is created if absent, and both it and its
+    /// contents outlive the run.
     ///
     /// Concurrent bootstraps may share one cache directory, including ones in
     /// separate processes and ones whose package sets overlap. Each entry is
@@ -919,6 +956,20 @@ impl<'a> DebianBuilder<'a> {
     }
 
     /// Validates the configuration and freezes it into a [`Debian`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DebianError::Config`] for a configuration that contradicts
+    /// itself — a pinned plan alongside a setting that would reshape it, or one
+    /// resolved for a different suite or architecture — and for a suite,
+    /// component, or architecture the archive cannot be addressed by: an empty
+    /// value, one carrying whitespace or a control character, or one that would
+    /// resolve outside the mirror root through a leading `/`, a `..` segment, or
+    /// an empty or `.` segment. The suite and the component may otherwise
+    /// contain slashes, since both may name a subtree; the architecture may not.
+    ///
+    /// Returns [`DebianError::Io`] when a keyring named by
+    /// [`keyring`](Self::keyring) or by an additional repository cannot be read.
     pub fn build(self) -> Result<Debian<'a>, DebianError> {
         if self.suite.trim().is_empty() {
             return Err(DebianError::Config {
@@ -933,6 +984,15 @@ impl<'a> DebianBuilder<'a> {
             (None, Some(plan)) => plan.architecture.clone(),
             (None, None) => arch::host_architecture(),
         };
+        // The architecture is a path segment of every index URL and of the
+        // merged-usr layout, so it passes the same check the suite and the
+        // components do at repository construction. It is a single segment: the
+        // archive spells it `binary-<architecture>`, one directory deep.
+        coordinate::check(
+            "the bootstrap's architecture",
+            &architecture,
+            coordinate::Nesting::Single,
+        )?;
         let keyring = match &self.keyring_path {
             Some(path) => std::fs::read(path).map_err(|source| DebianError::Io {
                 op: "reading the keyring",
@@ -1197,23 +1257,14 @@ fn bootstrap_suite(
         }
     };
 
-    let archives_host = match cache_dir {
-        Some(dir) => dir.to_path_buf(),
-        // A sibling of the staging root, not a child of it: an extracted
-        // package's entries land under `staging`, so a cache beneath `staging`
-        // could be overwritten before it is read, but a sibling is out of the
-        // extraction's contained reach.
-        None => {
-            let mut sibling = staging.as_os_str().to_os_string();
-            sibling.push(".fcage-debs");
-            PathBuf::from(sibling)
-        }
-    };
+    // The cache disposes of itself when this frame ends, on the failure paths
+    // below as on the success path.
+    let archives = Archives::beside(staging, cache_dir);
     let installables = acquire_debs(
         fetcher,
         repositories,
         &packages,
-        &archives_host,
+        archives.path(),
         progress,
         cancelled,
     )?;
@@ -1222,7 +1273,7 @@ fn bootstrap_suite(
         staging,
         architecture,
         &installables,
-        &archives_host,
+        archives.path(),
         progress,
         cancelled,
     )?;
@@ -1231,7 +1282,7 @@ fn bootstrap_suite(
         let env = maintainer_env();
         bootstrap::configure(
             staging,
-            &archives_host,
+            archives.path(),
             &installables,
             &statoverride,
             identity_map,
@@ -1245,9 +1296,6 @@ fn bootstrap_suite(
         let _ = std::fs::remove_dir_all(staging.join(bootstrap::ARCHIVES.trim_start_matches('/')));
     }
 
-    if cache_dir.is_none() {
-        let _ = std::fs::remove_dir_all(&archives_host);
-    }
     Ok(())
 }
 
@@ -1350,6 +1398,7 @@ fn merged_index(
             release.date().map(str::to_string),
             release.valid_until().map(str::to_string),
             served.signed_by,
+            served.signing_key,
         ));
         let text = fetch_index(fetcher, repository, architecture, &release, progress)?;
         index_inputs.push((origin, text));
@@ -1418,6 +1467,7 @@ fn fetch_release(
                 Served {
                     mirror,
                     signed_by: Vec::new(),
+                    signing_key: Vec::new(),
                 },
             )
         }
@@ -1433,7 +1483,8 @@ fn fetch_release(
                 verified.body,
                 Served {
                     mirror,
-                    signed_by: vec![verified.signed_by],
+                    signed_by: vec![verified.certificate],
+                    signing_key: vec![verified.signing_key],
                 },
             )
         }
@@ -1451,9 +1502,12 @@ struct Served {
     /// The mirror that served the release, which is the one the packages are
     /// fetched from.
     mirror: String,
-    /// The verifying key's fingerprint, or empty for a trusted-unsigned
-    /// repository.
+    /// The verifying certificate's primary-key fingerprint, or empty for a
+    /// trusted-unsigned repository.
     signed_by: Vec<String>,
+    /// The fingerprint of the component key within that certificate which made
+    /// the signature, or empty for a trusted-unsigned repository.
+    signing_key: Vec<String>,
 }
 
 /// Fetches, verifies, and decompresses a repository's package index for every
@@ -1668,8 +1722,9 @@ fn acquire_debs(
 
         // Whether the cache entry is intact, decided by streaming its digest:
         // validating a cached kernel package costs the memory of validating a
-        // shell script, the same property `Pool::publish` was reworked for. A
-        // corrupt or truncated entry is simply re-downloaded.
+        // shell script, which is the property every read and write of a `.deb`
+        // in this crate keeps. A corrupt or truncated entry is simply
+        // re-downloaded.
         let cached = std::fs::File::open(&dest)
             .and_then(|mut file| deb::sha256_stream(&mut file))
             .is_ok_and(|(digest, _)| digest == package.sha256);
@@ -1680,16 +1735,7 @@ fn acquire_debs(
                 total: packages.len(),
             });
             let mirrors = &repositories[package.origin].mirrors;
-            let (bytes, _mirror) =
-                fetch_from_mirrors(fetcher, mirrors, &package.filename, progress).map_err(wrap)?;
-            verify_digest(&package.filename, &bytes, &package.sha256).map_err(wrap)?;
-            write_atomically(&dest, &bytes).map_err(|source| {
-                wrap(DebianError::Io {
-                    op: "writing a package",
-                    path: dest.clone(),
-                    source,
-                })
-            })?;
+            download_deb(fetcher, mirrors, package, &dest, progress).map_err(wrap)?;
         }
 
         installables.push(Installable {
@@ -1699,6 +1745,167 @@ fn acquire_debs(
         });
     }
     Ok(installables)
+}
+
+/// Downloads one package into the cache, walking its repository's mirrors.
+///
+/// The walk is [`fetch_from_mirrors`]'s: a mirror that reports the package
+/// missing or fails at the transport advances to the next, and the last such
+/// failure is reported once none is left. A digest mismatch is not one of those
+/// — it says the bytes are wrong rather than absent — so it fails the download
+/// where it happens, as it does everywhere else in the module.
+fn download_deb(
+    fetcher: &mut dyn Fetch,
+    mirrors: &[String],
+    package: &Wanted,
+    dest: &Path,
+    progress: &mut dyn FnMut(DebianEvent<'_>),
+) -> Result<(), DebianError> {
+    let mut last_missing = None;
+    for mirror in mirrors {
+        let url = format!(
+            "{}/{}",
+            mirror.trim_end_matches('/'),
+            package.filename.trim_start_matches('/'),
+        );
+        progress(DebianEvent::Fetching { url: &url });
+        match fetch_verified(fetcher, &url, &package.sha256, dest) {
+            Ok(()) => return Ok(()),
+            Err(err) if is_failover(&err) => {
+                last_missing = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_missing.unwrap_or_else(|| {
+        DebianError::Fetch(FetchError::NotFound {
+            url: package.filename.clone(),
+        })
+    }))
+}
+
+/// Fetches `url` into `dest`, verified and atomically.
+///
+/// The body is written to a staging file beside the destination as it arrives,
+/// digested on the way through, and renamed onto the destination only once the
+/// digest is `expected`. Two things fall out of doing it in that order. A `.deb`
+/// never exists in memory as one buffer, so downloading a 90 MB kernel package
+/// costs what downloading a shell script costs — the property the cache check
+/// above and [`Pool::publish`] are both written for. And nothing unverified is
+/// ever visible at the destination, because the rename is what puts it there;
+/// the staging name is unique to this call, so a concurrent download of the same
+/// package publishes its own file rather than consuming this one.
+///
+/// The staging file is not synced before the rename, for the reason
+/// [`write_atomically`] gives: what is read back is verified against a digest,
+/// so an entry left short by a crash is rejected and fetched again, which is
+/// cheaper than syncing every download against a failure that costs only a
+/// repeat.
+///
+/// Anything that fails takes the staging file with it, so a mirror that dies
+/// mid-body leaves nothing for the next one to trip over.
+fn fetch_verified(
+    fetcher: &mut dyn Fetch,
+    url: &str,
+    expected: &str,
+    dest: &Path,
+) -> Result<(), DebianError> {
+    let staged = staging_path(dest);
+    let io = |op: &'static str, path: &Path| {
+        let path = path.to_path_buf();
+        move |source: std::io::Error| DebianError::Io { op, path, source }
+    };
+
+    // Created exclusively, which establishes that the name is this call's alone
+    // and refuses a symlink pre-planted at it rather than writing through it.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(io("staging a package", &staged))?;
+
+    let mut sink = deb::DigestWriter::new(file);
+    let fetched = fetcher.fetch(&FetchRequest::new(url), &mut sink);
+    let digested = sink.finish().map_err(io("writing a package", &staged));
+
+    let published = fetched
+        .map_err(DebianError::Fetch)
+        .and(digested)
+        .and_then(|(actual, _size)| {
+            if actual == expected {
+                Ok(())
+            } else {
+                Err(DebianError::HashMismatch {
+                    path: url.to_string(),
+                    expected: expected.to_string(),
+                    actual,
+                })
+            }
+        })
+        .and_then(|()| std::fs::rename(&staged, dest).map_err(io("publishing a package", dest)));
+
+    if published.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    published
+}
+
+/// The directory a run downloads its `.deb`s into, and whether the run owns it.
+///
+/// A caller that names a [`cache_dir`](DebianBuilder::cache_dir) owns it: it
+/// survives the run, which is the whole point of naming one. A run that names
+/// none downloads into a derived sibling of the tree it is building, and that
+/// directory is the run's own.
+///
+/// A derived cache is removed when the value is dropped rather than at the end
+/// of the successful path, so a failure disposes of it exactly as a success
+/// does. Every `?` between creating the cache and finishing the bootstrap would
+/// otherwise leave a base system's worth of `.deb`s beside a rootfs that was
+/// never published, and nothing later clears it: the publication's own cleanup
+/// removes the staging tree, and [`provision::remove`](super::remove) removes
+/// the destination and its lock, neither of which this is.
+struct Archives {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl Archives {
+    /// The cache for a run building `tree`: the caller's, or a sibling of the
+    /// tree named after it.
+    ///
+    /// A sibling, not a child: an extracted package's entries land under the
+    /// tree, so a cache beneath it could be overwritten before it is read, but a
+    /// sibling is out of the extraction's contained reach.
+    fn beside(tree: &Path, cache_dir: Option<&Path>) -> Archives {
+        match cache_dir {
+            Some(dir) => Archives {
+                path: dir.to_path_buf(),
+                owned: false,
+            },
+            None => {
+                let mut sibling = tree.as_os_str().to_os_string();
+                sibling.push(".fcage-debs");
+                Archives {
+                    path: PathBuf::from(sibling),
+                    owned: true,
+                }
+            }
+        }
+    }
+
+    /// The directory itself, to download into and to bind into the cages.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Archives {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// One `.deb` to acquire: what the download needs and nothing else.
@@ -1746,12 +1953,11 @@ impl Wanted {
 /// Stage one: lay out the merged-usr farm and every package's files, and
 /// initialize the dpkg database.
 ///
-/// Returns the derived statoverride content — one `root root <mode> <path>`
-/// line per file a package ships with non-root ownership. The file is not
-/// written here: dpkg rejects a statoverride naming `root` until
-/// `base-passwd` has created `/etc/passwd`, so configuration writes it after
-/// the base-passwd wave. An extract-only rootfs, which never configures,
-/// does not carry it.
+/// Returns the derived [`StatOverride`] — one record per file a package ships
+/// with non-root ownership. The file is not written here: dpkg rejects a
+/// statoverride naming `root` until `base-passwd` has created `/etc/passwd`, so
+/// configuration writes it after the base-passwd wave. An extract-only rootfs,
+/// which never configures, does not carry it.
 fn stage_extract(
     staging: &Path,
     architecture: &str,
@@ -1759,7 +1965,7 @@ fn stage_extract(
     archives_host: &Path,
     progress: &mut dyn FnMut(DebianEvent<'_>),
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<String, ProvisionError> {
+) -> Result<StatOverride, ProvisionError> {
     let statoverride = extract_packages(
         staging,
         architecture,
@@ -1773,7 +1979,7 @@ fn stage_extract(
 }
 
 /// Lays out the merged-usr farm and every package's files into `staging`,
-/// returning the derived statoverride content.
+/// returning the derived [`StatOverride`].
 ///
 /// The extraction half of [`stage_extract`], without the dpkg database
 /// initialization. A layered build reuses it to extract an increment into an
@@ -1788,11 +1994,16 @@ fn extract_packages(
     archives_host: &Path,
     progress: &mut dyn FnMut(DebianEvent<'_>),
     cancelled: &mut dyn FnMut() -> bool,
-) -> Result<String, ProvisionError> {
+) -> Result<StatOverride, ProvisionError> {
     create_merged_usr(staging, architecture)?;
 
-    let mut extraction = Extraction::new(staging)?;
-    let mut statoverride = String::new();
+    // Every `.deb` ships a `./` entry, so the tree being assembled would
+    // otherwise take the mode and modification time of whichever package
+    // happened to be extracted last. A rootfs root is `0755`, the mode
+    // `base-files` itself ships, and stating it keeps the published directory
+    // independent of both the package set and the caller's umask.
+    let mut extraction = Extraction::new(staging)?.root_mode(ROOTFS_ROOT_MODE);
+    let mut statoverride = StatOverride::default();
     // A statoverride record is one newline-terminated line; a path component
     // carrying an embedded newline would split into a second, forged record
     // (a setuid grant on an unrelated path, say). A conforming .deb never
@@ -1815,12 +2026,20 @@ fn extract_packages(
             .rsplit('/')
             .next()
             .expect("the deb path has a file name");
-        let deb = std::fs::read(archives_host.join(filename))
-            .map_err(|err| io_error("reading the package", &archives_host.join(filename), err))?;
+        let path = archives_host.join(filename);
+        let mut file = std::fs::File::open(&path)
+            .map_err(|err| io_error("reading the package", &path, err))?;
         // Re-verify against the digest the package was acquired under, rather
         // than trust the bytes on disk: the download and this read are separate
         // steps, and the cache may share a filesystem with untrusted writers.
-        let actual = deb::sha256_hex(&deb);
+        //
+        // Streamed, and the extraction that follows streams too, so installing a
+        // kernel package costs the memory of installing a shell script — the
+        // property the download and `Pool::publish` both keep, held to here as
+        // well. `extract_deb` rewinds before it seeks to the data member, so the
+        // digest pass leaving the file at its end costs nothing.
+        let (actual, _) = deb::sha256_stream(&mut file)
+            .map_err(|err| io_error("reading the package", &path, err))?;
         if actual != installable.sha256 {
             return Err(wrap(DebianError::HashMismatch {
                 path: filename.to_string(),
@@ -1830,7 +2049,7 @@ fn extract_packages(
         }
         deb::extract_deb(
             &installable.name,
-            &deb,
+            &mut file,
             &mut extraction,
             &mut |entry, components| {
                 if entry.uid != 0 || entry.gid != 0 {
@@ -1841,11 +2060,7 @@ fn extract_packages(
                         malformed.get_or_insert_with(|| components.to_vec());
                         return Ok(());
                     }
-                    statoverride.push_str(&format!(
-                        "root root {:o} {}\n",
-                        entry.mode,
-                        absolute_path(components),
-                    ));
+                    statoverride.record(entry.mode, absolute_path(components));
                 }
                 Ok(())
             },
@@ -1977,10 +2192,10 @@ fn staging_path(dest: &Path) -> PathBuf {
 /// this call's alone and refuses a symlink pre-planted at it rather than writing
 /// through it. [`staging_path`] describes why the name is unique per call.
 ///
-/// The staging file is not synced before the rename. Both callers verify what
-/// they read against a digest, so an entry left short by a crash is rejected
-/// and written again, which is cheaper than syncing every write against a
-/// failure that costs only a repeat.
+/// The staging file is not synced before the rename. What a reader takes from
+/// these files is verified against a digest, so a file left short by a crash is
+/// rejected and written again, which is cheaper than syncing every write against
+/// a failure that costs only a repeat.
 ///
 /// Errors name the staging file only when the failure is the staging file's
 /// own; the caller wraps them against the destination it asked for.
@@ -2107,10 +2322,11 @@ pub enum DebianError {
     },
     /// Fetching a resource failed.
     Fetch(FetchError),
-    /// The archive signature did not verify.
+    /// The archive signature was not accepted: it did not verify against the
+    /// keyring, or the key or signature was refused on its own terms.
     #[non_exhaustive]
     Signature {
-        /// Why verification failed.
+        /// Why the signature was not accepted.
         reason: String,
     },
     /// The release is malformed, expired, or does not offer what was asked.
@@ -2205,7 +2421,7 @@ impl fmt::Display for DebianError {
                 write!(f, "the Debian bootstrap could not fetch a resource: {err}")
             }
             DebianError::Signature { reason } => {
-                write!(f, "the archive signature did not verify: {reason}")
+                write!(f, "the archive signature was not accepted: {reason}")
             }
             DebianError::Release { reason } => write!(f, "the release file is unusable: {reason}"),
             DebianError::Index { reason } => write!(f, "a package index is unusable: {reason}"),
@@ -2626,5 +2842,193 @@ mod tests {
         append_component(&mut with_empty, "Package: a\nVersion: 1\n");
         append_component(&mut with_empty, "   \n");
         assert_eq!(with_empty, "Package: a\nVersion: 1\n");
+    }
+
+    /// Writes a NUL-terminated octal tar header field.
+    fn octal(field: &mut [u8], value: u64) {
+        let width = field.len() - 1;
+        field[..width].copy_from_slice(format!("{value:0width$o}").as_bytes());
+    }
+
+    /// An uncompressed tar of `(path, mode, uid, gid)` entries: the shape of a
+    /// `.deb`'s `data.tar`. A path ending in `/` is a directory, which is how
+    /// the oldest writers marked one and how the parser reads it.
+    fn data_tar(entries: &[(&str, u32, u32, u32)]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        for (path, mode, uid, gid) in entries {
+            let mut block = [0u8; 512];
+            block[..path.len()].copy_from_slice(path.as_bytes());
+            octal(&mut block[100..108], u64::from(*mode));
+            octal(&mut block[108..116], u64::from(*uid));
+            octal(&mut block[116..124], u64::from(*gid));
+            octal(&mut block[124..136], 0);
+            octal(&mut block[136..148], 0);
+            block[156] = b'0';
+            block[257..263].copy_from_slice(b"ustar\0");
+            block[263..265].copy_from_slice(b"00");
+            block[148..156].copy_from_slice(b"        ");
+            let sum: u64 = block.iter().map(|byte| u64::from(*byte)).sum();
+            octal(&mut block[148..156], sum);
+            tar.extend_from_slice(&block);
+        }
+        // The two zero blocks that terminate the archive.
+        tar.extend_from_slice(&[0u8; 1024]);
+        tar
+    }
+
+    /// A `.deb` around a `data.tar`, with the `debian-binary` member that
+    /// precedes it. No control member: extraction never reads one.
+    fn deb_of(data: &[u8]) -> Vec<u8> {
+        let mut archive = b"!<arch>\n".to_vec();
+        for (name, bytes) in [("debian-binary", &b"2.0\n"[..]), ("data.tar", data)] {
+            let mut header = [b' '; 60];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            let size = bytes.len().to_string();
+            header[48..48 + size.len()].copy_from_slice(size.as_bytes());
+            header[58] = b'`';
+            header[59] = b'\n';
+            archive.extend_from_slice(&header);
+            archive.extend_from_slice(bytes);
+            if bytes.len() % 2 == 1 {
+                archive.push(b'\n');
+            }
+        }
+        archive
+    }
+
+    /// Writes each `.deb` into `archives` under its digest, as the download
+    /// does, and returns the install set naming them.
+    fn installables(archives: &Path, debs: &[(&str, Vec<u8>)]) -> Vec<Installable> {
+        std::fs::create_dir_all(archives).expect("the archive directory is creatable");
+        debs.iter()
+            .map(|(name, bytes)| {
+                let sha256 = deb::sha256_hex(bytes);
+                std::fs::write(archives.join(format!("{sha256}.deb")), bytes)
+                    .expect("the package is writable");
+                Installable {
+                    name: (*name).to_string(),
+                    deb_path: format!("{}/{sha256}.deb", bootstrap::ARCHIVES),
+                    sha256,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_packages_shipping_one_owned_path_derive_one_statoverride_record() {
+        // dpkg treats two records for one path as an unrecoverable fatal error,
+        // and a closure reaches that honestly: the resolver reads no Conflicts,
+        // so two packages that a real archive expects never to be unpacked
+        // together can both be selected, and tar permits one data.tar to list a
+        // path twice besides. Both shapes are here, and both have to collapse.
+        let dir = Scratch::new("statoverride-duplicate");
+        let archives = dir.join("archives");
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
+
+        let first = deb_of(&data_tar(&[("./usr/sbin/helper", 0o2755, 0, 42)]));
+        let second = deb_of(&data_tar(&[
+            // The same path a second package already shipped, at another mode.
+            ("./usr/sbin/helper", 0o4755, 0, 42),
+            // And a path this one lists twice within its own data member.
+            ("./usr/bin/tool", 0o2755, 0, 42),
+            ("./usr/bin/tool", 0o755, 0, 42),
+        ]));
+        let install = installables(&archives, &[("first", first), ("second", second)]);
+
+        let overrides = extract_packages(
+            &staging,
+            "amd64",
+            &install,
+            &archives,
+            &mut |_| {},
+            &mut || false,
+        )
+        .expect("both packages extract");
+
+        // One record per path, each carrying the mode of the file that survived
+        // — the last entry to describe it, which is the extraction's own rule.
+        assert_eq!(
+            overrides.render(),
+            "root root 755 /usr/bin/tool\nroot root 4755 /usr/sbin/helper\n",
+        );
+    }
+
+    #[test]
+    fn the_rootfs_root_takes_the_bootstrap_s_mode_and_not_a_package_s() {
+        // Every `.deb` ships a `./` entry, so a tree assembled from several
+        // would otherwise take the mode of whichever was extracted last — an
+        // arbitrary choice among packages that describe their own contents and
+        // say nothing about the tree being assembled from them. A package
+        // shipping `./` as 0700 would leave a rootfs the caller has to chmod
+        // before anything can traverse it.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = Scratch::new("rootfs-root-mode");
+        let archives = dir.join("archives");
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
+
+        let closed = deb_of(&data_tar(&[
+            ("./", 0o700, 0, 0),
+            ("./usr/bin/x", 0o755, 0, 0),
+        ]));
+        let install = installables(&archives, &[("closed", closed)]);
+        extract_packages(
+            &staging,
+            "amd64",
+            &install,
+            &archives,
+            &mut |_| {},
+            &mut || false,
+        )
+        .expect("the package extracts");
+
+        let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, ROOTFS_ROOT_MODE, "the package chose the root's mode");
+    }
+
+    /// The names a directory holds, sorted.
+    fn entries_of(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("the directory is readable")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_download_publishes_only_what_matches_the_recorded_digest() {
+        // The bytes are written to a staging file as they arrive and digested on
+        // the way through, so nothing is held in memory and nothing unverified
+        // is ever visible at the destination: the rename is what puts it there.
+        let dir = Scratch::new("download-verified");
+        let dest = dir.join("package.deb");
+
+        let err = fetch_verified(
+            &mut Canned(b"not what the archive recorded"),
+            "file:///ignored-by-the-canned-transport",
+            &deb::sha256_hex(b"the recorded bytes"),
+            &dest,
+        )
+        .expect_err("a mismatched download is refused");
+        assert!(matches!(err, DebianError::HashMismatch { .. }), "{err}");
+        assert!(!dest.exists(), "unverified bytes were published");
+        assert!(
+            entries_of(&dir).is_empty(),
+            "a failed download left its staging file behind: {:?}",
+            entries_of(&dir),
+        );
+
+        fetch_verified(
+            &mut Canned(b"the recorded bytes"),
+            "file:///ignored-by-the-canned-transport",
+            &deb::sha256_hex(b"the recorded bytes"),
+            &dest,
+        )
+        .expect("a matching download publishes");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the recorded bytes");
+        assert_eq!(entries_of(&dir), ["package.deb"]);
     }
 }

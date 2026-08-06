@@ -966,6 +966,11 @@ pub enum SeccompPolicy {
     /// A curated default-deny of dangerous and rarely-legitimate syscalls,
     /// allowing the rest. A convenience posture, not a boundary claim; its
     /// exact roster is documented and grows only additively.
+    ///
+    /// Two entries are conditioned on an argument rather than naming a whole
+    /// syscall: `ioctl` is denied for the `TIOCSTI` and `TIOCLINUX` requests,
+    /// which write to a terminal's input queue, and allowed for everything
+    /// else.
     Curated,
     /// A caller-authored allow- or denylist.
     Rules(SeccompRules),
@@ -1094,6 +1099,43 @@ fn curated_denylist() -> Vec<i64> {
     base.into_iter()
         .chain(arch_specific)
         .map(|sysno| sysno.id() as i64)
+        .collect()
+}
+
+/// `TIOCSTI`: push one character into a terminal's input queue, as though it
+/// had been typed.
+const TIOCSTI: u64 = 0x5412;
+/// `TIOCLINUX`: the Linux console multiplexer, whose `TIOCL_SETSEL`/
+/// `TIOCL_PASTESEL` subcommands paste a console selection into the input queue
+/// and so reach the same place `TIOCSTI` does.
+const TIOCLINUX: u64 = 0x541C;
+
+/// The curated denylist's argument-conditioned entries: the two `ioctl`
+/// requests that write to a terminal's input queue.
+///
+/// Denied by request rather than by syscall, because `ioctl` itself is the
+/// ordinary way to ask anything of a device and a sandboxed command needs it.
+/// A command that holds a descriptor for the caller's terminal — an inherited
+/// standard stream, or `/dev/tty` while it shares the caller's session — can
+/// otherwise use these to enqueue characters that the caller's shell reads and
+/// runs once the sandbox exits. Modern kernels gate `TIOCSTI` behind the
+/// `dev.tty.legacy_tiocsti` sysctl, which defaults to off, and grant it only
+/// for the process's own controlling terminal; this denies it outright, on
+/// every kernel, whichever terminal is named. See
+/// [`Stdio`](crate::Stdio), which decides whether the sandbox has a terminal to
+/// aim them at in the first place.
+///
+/// The comparison is on the low 32 bits because `ioctl`'s request argument
+/// reaches the kernel as an `unsigned int`: the high half is discarded before
+/// dispatch, so comparing all 64 bits would let a request with anything set
+/// above bit 31 pass the filter and still be honoured.
+fn curated_ioctl_rules() -> Vec<SyscallRule> {
+    [TIOCSTI, TIOCLINUX]
+        .into_iter()
+        .map(|request| SyscallRule {
+            syscall: syscalls::Sysno::ioctl.id() as i64,
+            conditions: vec![SeccompArg::eq_dword(1, request)],
+        })
         .collect()
 }
 
@@ -1596,6 +1638,7 @@ fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigErro
             let rules: Vec<SyscallRule> = curated_denylist()
                 .into_iter()
                 .map(SyscallRule::unconditional)
+                .chain(curated_ioctl_rules())
                 .collect();
             compile_filter(SeccompAction::Allow, SeccompAction::Errno(EPERM), &rules)?
         }
@@ -2640,6 +2683,36 @@ mod tests {
     fn curated_profile_compiles() {
         let program = compile_seccomp(&SeccompPolicy::Curated).unwrap();
         assert!(!program.is_empty());
+    }
+
+    #[test]
+    fn the_curated_denylist_denies_the_terminal_injection_ioctls_by_request() {
+        use syscalls::Sysno;
+
+        // `ioctl` is denied by request, not outright: a sandboxed command asks
+        // devices for things the ordinary way, and only the two requests that
+        // write to a terminal's input queue are refused.
+        let ioctl = Sysno::ioctl.id() as i64;
+        assert!(
+            !curated_denylist().contains(&ioctl),
+            "ioctl is denied by request, so it must not be listed unconditionally",
+        );
+        let rules = curated_ioctl_rules();
+        assert!(rules.iter().all(|rule| rule.syscall == ioctl));
+        let requests: Vec<u64> = rules
+            .iter()
+            .flat_map(|rule| rule.conditions.iter())
+            .map(|arg| arg.value)
+            .collect();
+        assert_eq!(requests, [TIOCSTI, TIOCLINUX]);
+        // The low 32 bits alone: the kernel takes the request as an
+        // `unsigned int`, so a 64-bit comparison would miss a request carrying
+        // anything above bit 31 that is nonetheless dispatched as this one.
+        for arg in rules.iter().flat_map(|rule| rule.conditions.iter()) {
+            assert_eq!(arg.index, 1);
+            assert!(matches!(arg.len, SeccompArgLen::Dword));
+            assert!(matches!(arg.compare, SeccompCompare::Eq));
+        }
     }
 
     #[test]

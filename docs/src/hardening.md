@@ -100,8 +100,11 @@ available through [`SeccompPolicy`]:
 
 - `Curated` — a built-in deny-list of dangerous and rarely-legitimate syscalls
   (mounting, kernel modules, the keyring, tracing, time-setting, and similar),
-  answering each with `EPERM` and allowing the rest. A convenience posture, not
-  a boundary claim; its roster grows as new syscalls warrant denial.
+  answering each with `EPERM` and allowing the rest. Two entries name an
+  argument rather than a whole syscall: `ioctl` is denied for the `TIOCSTI` and
+  `TIOCLINUX` requests, which write to a terminal's input queue, and allowed for
+  everything else. A convenience posture, not a boundary claim; its roster grows
+  as new syscalls warrant denial.
 - `Rules` — a caller-authored [`SeccompRules`] allow-list or deny-list. An
   allow-list names the syscalls the command may make and denies the rest, so it
   must include every syscall the command needs. A deny-list names the syscalls

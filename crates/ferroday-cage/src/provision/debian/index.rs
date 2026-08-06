@@ -213,11 +213,12 @@ impl Package {
 }
 
 /// Whether `digest` has the shape of a SHA-256: exactly 64 lowercase hex
-/// characters. This is the only form a package digest is ever used in — a
-/// cache filename and the fetch verifier's expected value — so an index stanza
-/// carrying anything else is malformed, and rejecting it here keeps an
-/// index-supplied digest from reaching a filesystem path as, say, a traversal.
-fn is_sha256_hex(digest: &str) -> bool {
+/// characters. This is the only form an archive-supplied digest is ever used in
+/// — a cache filename, a `by-hash` URL segment, and the fetch verifier's
+/// expected value — so an index or release line carrying anything else is
+/// malformed, and rejecting it keeps an archive-supplied digest from reaching a
+/// filesystem path or a request line as, say, a traversal.
+pub(super) fn is_sha256_hex(digest: &str) -> bool {
     digest.len() == 64
         && digest
             .bytes()
@@ -238,7 +239,7 @@ fn is_sha256_hex(digest: &str) -> bool {
 /// could end a request line or start a header of its own, no space to split the
 /// request line's three fields, and no NUL to truncate a local path. Real pool
 /// paths — `pool/main/h/hello/hello_2.10-3_amd64.deb` — are within it.
-fn is_safe_pool_path(filename: &str) -> bool {
+pub(super) fn is_safe_pool_path(filename: &str) -> bool {
     !filename.is_empty()
         && !filename.starts_with('/')
         && filename.bytes().all(|byte| byte.is_ascii_graphic())

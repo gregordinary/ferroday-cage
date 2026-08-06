@@ -34,6 +34,8 @@ network = "host"            # "isolated" (default) | "host" | "none"
 hostname = "builder"
 workdir = "/build"
 stdin = "null"              # "inherit" (default) | "null"
+stdout = "inherit"          # "inherit" (default) | "null"; "null" discards
+stderr = "null"             # the same, per stream
 
 pid-namespace = true        # default true
 mount-proc = true           # default true
@@ -88,8 +90,8 @@ command = "/usr/bin/make"
 
 [overlay]
 lower = ["/srv/base", "/srv/patches"]  # ordered, base first; at least one
-upper = "/var/tmp/scratch"             # required; created if absent
-work = "/var/tmp/work"                 # optional; defaults beside the upper
+upper = "/srv/scratch/run-1"           # required; created if absent
+work = "/srv/scratch/run-1-work"       # optional; defaults beside the upper
 ```
 
 The first `lower` is the base the overlay mounts over and the rest stack on it,

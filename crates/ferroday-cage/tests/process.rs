@@ -301,3 +301,36 @@ fn an_unlimited_soft_limit_needs_an_unlimited_hard_limit() {
         "{err:?}"
     );
 }
+
+#[test]
+fn a_command_that_leaves_the_supervisors_process_group_is_still_waited_for() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // A sandboxed command is free to start a session of its own, which takes it
+    // out of the supervisor's process group. The supervisor's reaping wait must
+    // be for any child, not for any child of its own group: a group-scoped wait
+    // answers ECHILD for a child sitting there exited, and the supervisor then
+    // exits without a status record, which the caller reads as a lost
+    // supervisor rather than the exit code the command actually produced.
+    //
+    // Both process shapes are checked: with a PID namespace the supervisor is
+    // the in-namespace init, and without one it is the launch stage outside.
+    for pid_namespace in [true, false] {
+        let status = Cage::builder()
+            .rootfs(rootfs)
+            .pid_namespace(pid_namespace)
+            .command("/bin/busybox")
+            .args(["setsid", "/bin/busybox", "sh", "-c", "exit 7"])
+            .build()
+            .expect("a valid sandbox configuration")
+            .run()
+            .expect("the sandbox launches");
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the command's own session must not hide its outcome \
+             (pid_namespace = {pid_namespace})",
+        );
+    }
+}

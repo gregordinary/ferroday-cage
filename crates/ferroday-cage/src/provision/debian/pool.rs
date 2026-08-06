@@ -76,6 +76,7 @@ use flate2::write::GzEncoder;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
+use super::coordinate::{self, Nesting};
 use super::index::parse_stanzas;
 use super::{DebianError, arch, deb, release, staging_path, version, write_atomically};
 
@@ -329,7 +330,7 @@ impl Pool {
                 reason: "no suite was given for the pool".to_string(),
             });
         };
-        checked_field("suite", suite, Nesting::Nested)?;
+        coordinate::check("the pool's suite", suite, Nesting::Nested)?;
         Ok(suite)
     }
 
@@ -405,9 +406,14 @@ impl Pool {
     /// at a newline, so a value holding one would continue into the release as
     /// further fields.
     ///
-    /// Returns [`DebianError::Deb`] for a `.deb` that cannot be read, whose
-    /// architecture belongs in neither this pool nor `all`, or that was
-    /// rewritten into a different package while it was being published; and
+    /// Returns [`DebianError::Deb`] for a `.deb` the pool cannot index: one that
+    /// cannot be read; one whose architecture belongs in neither this pool nor
+    /// `all`; one whose `Package` or `Version` is outside the alphabet Debian
+    /// policy gives it, since both decide where in the pool the file is written;
+    /// one whose control file holds more than one paragraph or names `Filename`,
+    /// `Size`, or `SHA256`, which the pool supplies from the file it published
+    /// and a package may not claim for itself; and one that was rewritten into a
+    /// different package while it was being published. Returns
     /// [`DebianError::Io`] for a failure writing, locking, or scanning the pool.
     pub fn publish<P: AsRef<Path>>(
         &self,
@@ -418,8 +424,8 @@ impl Pool {
             Some(architecture) => architecture,
             None => arch::host_architecture(),
         };
-        checked_field("component", &self.component, Nesting::Nested)?;
-        checked_field("architecture", &architecture, Nesting::Single)?;
+        coordinate::check("the pool's component", &self.component, Nesting::Nested)?;
+        coordinate::check("the pool's architecture", &architecture, Nesting::Single)?;
         for (label, value) in [
             ("origin", &self.origin),
             ("label", &self.label),
@@ -484,77 +490,6 @@ fn checked_identity(label: &str, value: &str) -> Result<(), DebianError> {
                  the release field it is written into",
             ),
         });
-    }
-    Ok(())
-}
-
-/// How many path segments one of the pool's settings may name.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Nesting {
-    /// A suite or a component, either of which may name a subtree: Debian's
-    /// security archive published `dists/buster/updates/Release` for years, and
-    /// `main/debian-installer` is a component laid out the same way. An
-    /// interior slash is part of the name rather than a separator to refuse.
-    Nested,
-    /// An architecture, which is always exactly one directory name.
-    Single,
-}
-
-/// Checks one of the pool's settings, each of which becomes a path under the
-/// pool root and a field in the emitted `Release`.
-///
-/// The check refuses a value that would write outside the suite it belongs to,
-/// or that the release format cannot name. It is deliberately narrow: it
-/// refuses traversal rather than the separator, because a slashed suite and a
-/// slashed component are both legitimate layouts and apt reads them.
-///
-/// What is refused, and why each one is not merely unusual:
-///
-/// - An empty or blank value, which names no directory at all.
-/// - A `..` segment, which writes outside the suite, and a leading `/`, which
-///   writes outside the pool. These are the two that make the check worth
-///   having.
-/// - An empty interior or trailing segment, which is a path that does not say
-///   what it means, and the shape a leading `/` would otherwise be caught as.
-/// - A `.` segment, which the filesystem discards, so the directory written
-///   would not be the one the caller spelled and the scanned release would name
-///   a component the caller never asked for.
-/// - Whitespace, which the release format cannot express: `Architectures` and
-///   `Components` are whitespace-delimited lists, so a component named `my
-///   thing` would be read back as two components, neither of them the one that
-///   was published.
-/// - An ASCII control character, for the same reason a newline cannot appear in
-///   a deb822 field without ending it.
-fn checked_field(label: &str, value: &str, nesting: Nesting) -> Result<(), DebianError> {
-    let refuse = |reason: &str| {
-        Err(DebianError::Config {
-            reason: format!("the pool's {label} {value:?} {reason}"),
-        })
-    };
-    if value.trim().is_empty() {
-        return Err(DebianError::Config {
-            reason: format!("the pool's {label} is empty"),
-        });
-    }
-    if value.chars().any(|character| character.is_ascii_control()) {
-        return refuse("contains a control character");
-    }
-    if value.chars().any(char::is_whitespace) {
-        return refuse("contains whitespace, which a release field cannot name");
-    }
-    if value.starts_with('/') {
-        return refuse("is an absolute path, which would write outside the pool");
-    }
-    if nesting == Nesting::Single && value.contains('/') {
-        return refuse("is not a single path segment");
-    }
-    for segment in value.split('/') {
-        match segment {
-            "" => return refuse("has an empty path segment"),
-            "." => return refuse("has a `.` segment"),
-            ".." => return refuse("has a `..` segment, which would write outside the pool"),
-            _ => {}
-        }
     }
     Ok(())
 }
@@ -764,20 +699,63 @@ struct Identity {
     architecture: String,
 }
 
-/// Reads the identity a control stanza carries, checking that the package
-/// belongs in a pool indexing `architecture`.
+/// The fields the pool appends to a control stanza to make a `Packages` entry.
+///
+/// A control member carrying one of these would shadow the appended value: the
+/// index reader resolves a field by its first occurrence, so the package's own
+/// text would win over the archive's. See [`identity`].
+const APPENDED_FIELDS: [&str; 3] = ["Filename", "Size", "SHA256"];
+
+/// Reads the identity a control stanza carries, checking that the `.deb` is one
+/// the pool can index.
+///
+/// Three things are established here, all before the `.deb`'s bytes influence
+/// anything the pool writes.
 ///
 /// A pool is per-architecture; an arch-independent package (`all`) belongs in
 /// every architecture's index, but a package built for a different architecture
 /// does not belong here at all.
 ///
+/// `Package` and `Version` decide where in the pool the `.deb` is stored and
+/// what its `Filename` field records, so both are held to the alphabet Debian
+/// policy gives them; [`checked_name`] and [`checked_version`] say what each
+/// admits and why the path question rests on it.
+///
+/// The control member is one stanza, and it carries none of the fields the pool
+/// appends. Both would otherwise let a `.deb` write its own index entry:
+/// [`Stanza::get`](super::index::Stanza::get) resolves a field by its first
+/// occurrence, so a control file carrying `SHA256` would shadow the digest taken
+/// from the bytes on disk and a control file carrying `Filename` would name any
+/// other file in the pool; and a control member of two paragraphs would be
+/// emitted whole, with the appended fields landing on the second — which then
+/// reads back as the index entry, under whatever name and version that paragraph
+/// declares, while the dedupe that placed it keyed on the first. A pool is
+/// consumed as `[trusted=yes]` and resolution is highest-version-wins across
+/// repositories, so an entry a package chose for itself supersedes the primary
+/// archive's.
+///
 /// The failure is a bare reason, which the caller attributes to whichever file
 /// it read the stanza from.
 fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
-    let stanza = parse_stanzas(control)
+    let stanzas = parse_stanzas(control);
+    if stanzas.len() > 1 {
+        return Err(format!(
+            "its control file holds {} paragraphs, and a control file is one",
+            stanzas.len(),
+        ));
+    }
+    let stanza = stanzas
         .into_iter()
         .next()
         .ok_or_else(|| "the control file has no stanza".to_string())?;
+    for appended in APPENDED_FIELDS {
+        if stanza.get(appended).is_some() {
+            return Err(format!(
+                "its control file carries a {appended} field, which the pool supplies from the \
+                 file it published and a package may not name for itself",
+            ));
+        }
+    }
     let field = |name: &str| {
         stanza
             .get(name)
@@ -789,6 +767,8 @@ fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
         version: field("Version")?,
         architecture: field("Architecture")?,
     };
+    checked_name(&found.name)?;
+    checked_version(&found.version)?;
     if found.architecture != architecture && found.architecture != "all" {
         return Err(format!(
             "its architecture {} is neither {architecture} nor all",
@@ -798,13 +778,80 @@ fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
     Ok(found)
 }
 
+/// Checks a control file's `Package` against the alphabet Debian policy gives a
+/// package name.
+///
+/// The name is a path segment of [`pool_path`] twice over — the prefix
+/// directory and the package directory — and `Path::join` does not normalize, so
+/// a `..` there would survive into the syscall and the kernel would resolve it:
+/// a `.deb` naming itself `../../..` would create directories and write a file
+/// outside the pool root, as the publishing user. The consume side validates an
+/// archive-supplied pool path for exactly this reason
+/// ([`is_safe_pool_path`](super::index::is_safe_pool_path)); this is the produce
+/// side of it.
+///
+/// The rule is policy 5.6.1 rather than a traversal filter: lowercase letters,
+/// digits, `+`, `-`, and `.`, at least two characters, starting with a letter or
+/// a digit. That admits every name the archive holds and excludes `.` and `..`
+/// outright, along with the separator, whitespace, and every control character —
+/// so checking the alphabet settles the path question and rejects a `.deb` no
+/// archive would accept in the same step.
+fn checked_name(name: &str) -> Result<(), String> {
+    let refuse = || {
+        Err(format!(
+            "its package name {name:?} is not one Debian policy permits: at least two characters \
+             of lowercase letters, digits, `+`, `-`, and `.`, starting with a letter or a digit",
+        ))
+    };
+    if name.len() < 2 || !name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        return refuse();
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
+    {
+        return refuse();
+    }
+    Ok(())
+}
+
+/// Checks a control file's `Version` against the alphabet Debian policy gives a
+/// version.
+///
+/// The version is interpolated into the file name [`pool_path`] stores the
+/// `.deb` under, so a `/` in it would make the single name a path and put the
+/// file wherever the rest of it led. Policy 5.6.12's alphabet — alphanumerics
+/// and `.`, `+`, `-`, `:`, `~` — is what dpkg itself enforces, and it contains
+/// no separator, no whitespace, and no control character, so the file name stays
+/// one component. The version is never a segment of its own, so the `.` and `..`
+/// cases the name has do not arise here.
+///
+/// The grammar around the alphabet — where an epoch's colon and a revision's
+/// hyphen may fall — is dpkg's to enforce at install time and is not repeated.
+fn checked_version(version: &str) -> Result<(), String> {
+    if version.is_empty()
+        || !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | ':' | '~'))
+    {
+        return Err(format!(
+            "its version {version:?} is not one Debian policy permits: alphanumerics and `.`, \
+             `+`, `-`, `:`, `~`",
+        ));
+    }
+    Ok(())
+}
+
 /// Copies one `.deb` into the pool and builds its `Packages` stanza.
 ///
 /// The stanza is the `.deb`'s control file verbatim — preserving deb822 folding,
 /// so a multi-line `Description` round-trips exactly — with the archive-supplied
 /// `Filename`, `Size`, and `SHA256` appended. Carrying the whole control stanza
 /// rather than a curated subset keeps every relation the resolver reads
-/// (`Depends`, `Pre-Depends`, `Provides`) intact.
+/// (`Depends`, `Pre-Depends`, `Provides`) intact. What makes carrying it
+/// verbatim safe is that [`identity`] has already refused a control file that
+/// would read back as something other than what it says: one of several
+/// paragraphs, or one naming a field the pool appends.
 ///
 /// Nothing here holds a `.deb` in memory. The control member is read by seeking
 /// to it, the digest is taken in chunks, and the payload is cloned or streamed
@@ -890,6 +937,13 @@ fn index_deb(
 
 /// The `Packages` stanza for a pool file: its control stanza verbatim, with the
 /// archive-supplied fields appended.
+///
+/// Appending is what preserves the control file's own folding, and it is well
+/// defined only because [`identity`] refused a control file carrying any of
+/// [`APPENDED_FIELDS`] or more than one paragraph: a reader resolves a field by
+/// its first occurrence and reads an entry from the paragraph that carries
+/// `Filename`, so either shape would let the package decide what the index says
+/// about it.
 fn stanza_text(control: &str, rel: &str, size: u64, digest: &str) -> String {
     format!(
         "{}\nFilename: {rel}\nSize: {size}\nSHA256: {digest}",

@@ -682,6 +682,30 @@ fn a_v7_entry_is_held_to_the_same_containment_rules() {
 }
 
 #[test]
+fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
+    // EntryUnsafe asserts that an entry reached outside the extraction root,
+    // which is a claim about the caller's input worth keeping true. An archive
+    // that ships `foo` as a file and `foo/bar` after it is an ordinary malformed
+    // archive, and so is a symlink entry with no target; neither tried to escape
+    // anything, and both are refused as what they are.
+    let mut through_a_file = TarBuilder::new();
+    through_a_file
+        .file("foo", 0o644, b"a file, not a directory")
+        .file("foo/bar", 0o644, b"beneath it");
+    let err = provision_err("malformed-parent-not-a-dir", &through_a_file.finish());
+    assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+    assert!(
+        err.to_string().contains("not a directory"),
+        "the reason is carried through: {err}",
+    );
+
+    let mut empty_target = TarBuilder::new();
+    empty_target.symlink("link", "");
+    let err = provision_err("malformed-empty-symlink", &empty_target.finish());
+    assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+}
+
+#[test]
 fn garbage_is_reported_as_unrecognized() {
     let err = provision_err(
         "extract-garbage",
@@ -998,6 +1022,51 @@ fn a_reader_source_reports_progress_without_a_total() {
         totals.iter().all(Option::is_none),
         "a reader's length is unknown, so no total is claimed"
     );
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A single-identity map is worth re-entering too: the tree's ids are the
+/// caller's own, but a directory whose mode denies the write the deletion
+/// needs refuses the plain path, and root of the mapped namespace holds the
+/// `CAP_DAC_OVERRIDE` that clears it.
+///
+/// The counterpart of the range-mapped removal in the identity tests, and the
+/// case that arises without any sandbox at all: an extraction of an archive
+/// carrying a read-only directory leaves exactly this shape behind.
+#[test]
+fn a_single_mapped_removal_clears_a_directory_its_own_mode_locks() {
+    if let Some(blocker) = ferroday_cage::host::userns_blocker() {
+        assert!(
+            std::env::var_os("FERRODAY_CAGE_REQUIRE_USERNS").is_none(),
+            "unprivileged user namespaces are required but unavailable: {blocker}"
+        );
+        eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
+        return;
+    }
+
+    let dir = common::scratch_dir("single-map-remove");
+    let tree = dir.join("tree");
+    let locked = tree.join("locked");
+    fs::create_dir_all(&locked).expect("the scratch tree is creatable");
+    fs::write(locked.join("file"), b"x").expect("the entry is creatable");
+    // Readable and searchable but not writable: the entry inside it cannot be
+    // unlinked, so the tree cannot be removed by its own owner.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).expect("the mode is settable");
+
+    if fs::remove_dir_all(&tree).is_ok() {
+        // A privileged runner overrides the mode outright, leaving nothing for
+        // the escalation to do.
+        eprintln!("skipping: the caller can remove a mode-0500 directory's contents outright");
+        fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+
+    ferroday_cage::provision::Remove::new(&tree)
+        .map(ferroday_cage::IdentityMap::Single)
+        .run()
+        .expect("the map-assisted removal succeeds");
+    assert!(!tree.exists(), "the tree is gone");
 
     fs::remove_dir_all(&dir).unwrap();
 }

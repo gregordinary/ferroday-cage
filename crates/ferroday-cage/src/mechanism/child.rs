@@ -68,7 +68,7 @@ use rustix::thread;
 use syscalls::Sysno;
 
 use super::{
-    IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdinPlan,
+    IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdioPlan,
 };
 use crate::error::SetupStep;
 
@@ -98,9 +98,9 @@ pub(super) struct Context<'a> {
     /// the supervisor's own stdio.
     pub(super) null_fd: BorrowedFd<'a>,
     /// Write end of the captured standard output, when observing.
-    pub(super) stdout_fd: Option<BorrowedFd<'a>>,
+    pub(super) capture_stdout_fd: Option<BorrowedFd<'a>>,
     /// Write end of the captured standard error, when observing.
-    pub(super) stderr_fd: Option<BorrowedFd<'a>>,
+    pub(super) capture_stderr_fd: Option<BorrowedFd<'a>>,
     /// Read end of the proceed pipe, when the launch is gated: the command
     /// stage blocks on it before `execve` until the caller releases it, the
     /// window in which a userspace network stack is attached.
@@ -113,6 +113,15 @@ pub(super) struct Context<'a> {
     /// through the descriptor sweep and duplicated onto the command's file
     /// descriptor 0 alongside the capture pipes.
     pub(super) stdin_fd: Option<BorrowedFd<'a>>,
+    /// The caller-supplied standard output, when the plan names one, on the
+    /// same terms as [`stdin_fd`](Self::stdin_fd).
+    pub(super) stdout_fd: Option<BorrowedFd<'a>>,
+    /// The caller-supplied standard error, when the plan names one.
+    pub(super) stderr_fd: Option<BorrowedFd<'a>>,
+    /// The replica of the pseudoterminal allocated for this launch, when it is
+    /// a terminal launch: made the session's controlling terminal in the first
+    /// process of the sandbox proper, and wired onto all three standard streams.
+    pub(super) terminal_fd: Option<BorrowedFd<'a>>,
 }
 
 /// A failed setup step: the step, the errno, and the 1-based index of the
@@ -240,9 +249,59 @@ fn publish_supervised(context: &Context<'_>, child: Pid) -> Result<OwnedFd, Errn
     }
 }
 
+/// Starts a session of this sandbox's own, when the plan asks for one.
+///
+/// A controlling terminal is reached through the session rather than through
+/// the filesystem, so neither a namespace nor a swapped root affects it: without
+/// this, a sandbox whose caller redirected every standard stream can still open
+/// the caller's terminal through `/dev/tty` — the character device `5:0`, whose
+/// open returns whatever the opening process's controlling terminal is — read
+/// what is typed at it, and push characters into its input queue with `TIOCSTI`
+/// for the caller's shell to run afterwards. In a session of its own the sandbox
+/// has no controlling terminal at all: `/dev/tty` fails with `ENXIO`, and
+/// `TIOCSTI` is refused on every terminal descriptor, since the kernel grants it
+/// only for the caller's own controlling terminal.
+///
+/// Called by the first process of the sandbox proper — the namespace init, or
+/// the command stage where there is none — so the whole sandbox shares the
+/// session and every process it starts inherits it. That process is a fresh
+/// fork and so not a process group leader, which is the one thing that would
+/// fail the call.
+///
+/// The plan asks for this exactly when the command does not inherit the
+/// caller's standard input; see
+/// [`LaunchPlan::own_session`](super::LaunchPlan::own_session). A terminal
+/// launch asks for it too, whatever the plan says: the pseudoterminal must be
+/// the controlling terminal of a session the sandbox owns, and the default
+/// standard-input disposition would otherwise leave the launch in the caller's.
+///
+/// The controlling terminal is taken here rather than in `exec_command`, and it
+/// has to be. `TIOCSCTTY` succeeds only for a session leader, and with a PID
+/// namespace the command is a *fork* of the process that called `setsid`, which
+/// is not one. A controlling terminal is a property of the session, so setting
+/// it here covers the command this stage forks. Without a PID namespace the
+/// same process does the `setsid` and the exec, and both calls sit together
+/// here too.
+fn start_own_session(context: &Context<'_>) -> Result<(), Failure> {
+    if context.plan.own_session || context.terminal_fd.is_some() {
+        process::setsid()
+            .map(|_| ())
+            .map_err(|errno| (SetupStep::NewSession, errno, 0))?;
+    }
+    if let Some(replica) = context.terminal_fd {
+        process::ioctl_tiocsctty(replica)
+            .map_err(|errno| (SetupStep::SetControllingTerminal, errno, 0))?;
+    }
+    Ok(())
+}
+
 /// Stage init: PID 1 of the new PID namespace. Sets the sandbox up, forks
 /// the command as PID 2, and supervises it from inside.
 fn stage_init(context: &Context<'_>) -> ! {
+    if let Err((step, errno, detail)) = start_own_session(context) {
+        report(context.report_fd, step, errno, detail);
+        runtime::exit_group(127)
+    }
     if let Err((step, errno, detail)) = setup_sandbox(context) {
         report(context.report_fd, step, errno, detail);
         runtime::exit_group(127)
@@ -278,11 +337,11 @@ fn stage_init(context: &Context<'_>) -> ! {
 /// sandbox sequence; in a restriction there is nothing to build and only the
 /// working directory changes.
 fn stage_command(context: &Context<'_>) -> ! {
-    let setup = match context.plan.confinement {
+    let setup = start_own_session(context).and_then(|()| match context.plan.confinement {
         super::Confinement::Container => setup_sandbox(context),
         #[cfg(feature = "hardening")]
         super::Confinement::Restriction => setup_restriction(context),
-    };
+    });
     if let Err((step, errno, detail)) = setup {
         report(context.report_fd, step, errno, detail);
         runtime::exit_group(127)
@@ -438,58 +497,90 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 }
 
 /// Redirects the command's standard streams per the plan: `/dev/null` for a
-/// null stdin, the capture pipes when observing.
+/// null disposition, a caller-supplied descriptor for a descriptor one, and the
+/// capture pipes on the output pair when observing.
+///
+/// A capture pipe wins over the plan's own output disposition because the two
+/// never coexist: the launch refuses an observer against a disposition that
+/// names a destination of its own, so a plan reaching this point with a capture
+/// pipe present carries `Inherit`, which names none.
 ///
 /// `dup2` clears close-on-exec on its target as a side effect, which is what
 /// lets the redirected stream survive `execve` while every original copy still
-/// closes. The one exception is `dup2(fd, fd)`, a kernel no-op that leaves the
-/// flag set. Only a caller-supplied [`StdinPlan::Fd`](super::StdinPlan::Fd) that
-/// already sits at file descriptor 0 can reach it: the launch creates six
-/// descriptors of its own before the null descriptor and the capture pipes, so
-/// those always land at 3 or above. Clearing close-on-exec explicitly keeps the
-/// stream from closing at exec, which would otherwise leave the command without
-/// it and without an error.
+/// closes.
+///
+/// Every source is moved above the standard-stream numbers first, so no source
+/// is ever also a target. Only a caller-supplied
+/// [`StdioPlan::Fd`](super::StdioPlan::Fd) can be low — the launch creates six
+/// descriptors of its own before the null descriptor, the capture pipes, and the
+/// terminal replica, so all of those land at 3 or above — and with three streams
+/// to wire, a low one is not merely the `dup2(fd, fd)` no-op that leaves
+/// close-on-exec set: wiring one stream would *destroy* the source another had
+/// not been copied from yet. With standard input on the caller's descriptor 1
+/// and standard output somewhere else, the `dup2` onto 1 would take standard
+/// input's source with it.
 fn wire_stdio(context: &Context<'_>) -> Result<(), Errno> {
-    // The standard stream numbers `dup2` targets. A source descriptor already
-    // at its target number needs close-on-exec cleared directly, since
-    // `dup2(fd, fd)` is a no-op that leaves the flag set.
-    const STDIN: RawFd = 0;
-    const STDOUT: RawFd = 1;
+    /// The highest standard stream number: the ceiling a source must be above
+    /// before anything is wired, and the floor it is moved to.
     const STDERR: RawFd = 2;
-    let stdin = match &context.plan.stdin {
-        StdinPlan::Inherit => None,
-        StdinPlan::Null => Some(context.null_fd),
-        // The caller's descriptor, kept through the sweep and carried here.
-        StdinPlan::Fd(_) => context.stdin_fd,
+    /// The descriptor a stream's plan names, or `None` where it names no
+    /// destination and the launch leaves the inherited one in place.
+    fn wired<'fd>(
+        plan: &StdioPlan,
+        caller: Option<BorrowedFd<'fd>>,
+        null: BorrowedFd<'fd>,
+    ) -> Option<BorrowedFd<'fd>> {
+        match plan {
+            StdioPlan::Inherit => None,
+            StdioPlan::Null => Some(null),
+            // The caller's descriptor, kept through the sweep and carried here.
+            StdioPlan::Fd(_) => caller,
+        }
+    }
+    // A terminal launch wires the replica onto all three: a terminal is one
+    // stream, and saying so here is more honest than saying it in the observer
+    // contract. Nothing contradicts it — the launch refuses a terminal against
+    // any stated disposition, and the terminal entry points take no observer —
+    // so this is a substitution rather than a precedence rule.
+    let (stdin, stdout, stderr) = match context.terminal_fd {
+        Some(replica) => (Some(replica), Some(replica), Some(replica)),
+        None => (
+            wired(&context.plan.stdin, context.stdin_fd, context.null_fd),
+            context
+                .capture_stdout_fd
+                .or_else(|| wired(&context.plan.stdout, context.stdout_fd, context.null_fd)),
+            context
+                .capture_stderr_fd
+                .or_else(|| wired(&context.plan.stderr, context.stderr_fd, context.null_fd)),
+        ),
     };
+    // Move any source that sits on a standard-stream number above them, and wire
+    // from the relocation instead. The copies are close-on-exec and are closed
+    // as this function returns, which is after every `dup2` has taken what it
+    // needs; the wired streams are separate descriptors and keep what they were
+    // given.
+    let mut moved: [Option<OwnedFd>; 3] = [None, None, None];
+    for (slot, source) in moved.iter_mut().zip([stdin, stdout, stderr]) {
+        if let Some(source) = source
+            && source.as_raw_fd() <= STDERR
+        {
+            *slot = Some(rustix::io::fcntl_dupfd_cloexec(source, STDERR + 1)?);
+        }
+    }
+    let stdin = moved[0].as_ref().map(AsFd::as_fd).or(stdin);
+    let stdout = moved[1].as_ref().map(AsFd::as_fd).or(stdout);
+    let stderr = moved[2].as_ref().map(AsFd::as_fd).or(stderr);
+
     if let Some(stdin) = stdin {
-        if stdin.as_raw_fd() == STDIN {
-            clear_cloexec(stdin)?;
-        } else {
-            rustix::stdio::dup2_stdin(stdin)?;
-        }
+        rustix::stdio::dup2_stdin(stdin)?;
     }
-    if let Some(stdout) = context.stdout_fd {
-        if stdout.as_raw_fd() == STDOUT {
-            clear_cloexec(stdout)?;
-        } else {
-            rustix::stdio::dup2_stdout(stdout)?;
-        }
+    if let Some(stdout) = stdout {
+        rustix::stdio::dup2_stdout(stdout)?;
     }
-    if let Some(stderr) = context.stderr_fd {
-        if stderr.as_raw_fd() == STDERR {
-            clear_cloexec(stderr)?;
-        } else {
-            rustix::stdio::dup2_stderr(stderr)?;
-        }
+    if let Some(stderr) = stderr {
+        rustix::stdio::dup2_stderr(stderr)?;
     }
     Ok(())
-}
-
-/// Clears close-on-exec on `fd` so it survives `execve`. `FD_CLOEXEC` is the
-/// only file-descriptor flag, so an empty flag set clears it.
-fn clear_cloexec(fd: BorrowedFd<'_>) -> Result<(), Errno> {
-    rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())
 }
 
 /// Switches to the configured run-as identity, immediately before the
@@ -542,63 +633,195 @@ fn await_proceed(fd: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
     }
 }
 
-/// Establishes the new user namespace's identity map, from stage A.
+/// The child's side of the identity-map protocol: what a process that has
+/// just unshared must do to have a map in force.
+///
+/// The caller's side is [`ChildMap`](super::ChildMap), which also names the
+/// delegate a range map is applied by. That delegate runs in the caller, so
+/// the child never sees it, and this is the whole of what the child does.
+pub(super) enum MapDuty<'a> {
+    /// Write the single-identity map in process.
+    Write {
+        /// The `uid_map` line.
+        uid_line: &'a [u8],
+        /// The `gid_map` line.
+        gid_line: &'a [u8],
+    },
+    /// Signal ready on the map gate and block until the caller's delegate has
+    /// written a range map from outside.
+    Await,
+}
+
+/// A step of a child's entry into a user namespace of its own.
+///
+/// Each caller names these steps in its own vocabulary — a launch reports a
+/// [`SetupStep`], the provisioning children report their own — so the shared
+/// sequence reports the step it reached and leaves the naming to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MapStep {
+    /// Resetting the inherited signal dispositions.
+    ResetSignals,
+    /// Closing the inherited descriptors.
+    SweepFds,
+    /// Unsharing the user namespace.
+    Unshare,
+    /// Writing `deny` to `/proc/self/setgroups`.
+    DenySetgroups,
+    /// Writing the gid map.
+    WriteGidMap,
+    /// Writing the uid map.
+    WriteUidMap,
+    /// Signalling ready at the map gate, or waiting there.
+    AwaitMap,
+}
+
+/// Why a child did not reach its mapped user namespace.
+pub(super) enum MapFailure {
+    /// A step failed with an OS error.
+    Step(MapStep, Errno),
+    /// The caller closed the map gate without applying the map: it abandoned
+    /// this child, and its own error is the diagnostic. Nothing is reported
+    /// back, because the gate that would carry the report is the thing that
+    /// closed.
+    Abandoned,
+}
+
+/// Takes a freshly forked child into a user namespace of its own, with the
+/// identity map in force: the sequence every provisioning child performs
+/// before it touches the tree it was forked for.
+///
+/// `keep` is the descriptors the child needs — its channels to the caller;
+/// everything else the fork copied is closed. The sweep matters beyond
+/// hygiene: a provisioning child runs for as long as the tree is large, and
+/// an inherited copy of a live sandbox's control socket would hold that
+/// sandbox's supervisor open for all of it, since hangup detection — the
+/// whole of [`stop_with_caller`](crate::CageBuilder::stop_with_caller) —
+/// waits on the last copy closing.
+///
+/// `SIGPIPE` is put back to ignored after the scrub, whose default for it is
+/// termination: a child killed the instant the caller stopped reading could
+/// neither report the failure nor exit on its own terms.
+///
+/// The namespace is the only thing unshared. The work runs on the caller's
+/// own mount view, through real paths, as root of the mapped namespace.
+///
+/// Post-fork safe: no allocation, no locking, and no panic.
+pub(super) fn enter_mapped_namespace(
+    keep: &[RawFd],
+    duty: MapDuty<'_>,
+    gate: Option<BorrowedFd<'_>>,
+) -> Result<(), MapFailure> {
+    reset_signals().map_err(|errno| MapFailure::Step(MapStep::ResetSignals, errno))?;
+    ignore_sigpipe().map_err(|errno| MapFailure::Step(MapStep::ResetSignals, errno))?;
+    sweep_fds_keeping(keep).map_err(|errno| MapFailure::Step(MapStep::SweepFds, errno))?;
+    // SAFETY: the flags never include the descriptor table, and this process
+    // is a freshly forked single-threaded child besides.
+    unsafe { thread::unshare_unsafe(thread::UnshareFlags::NEWUSER) }
+        .map_err(|errno| MapFailure::Step(MapStep::Unshare, errno))?;
+    establish_map(duty, gate)
+}
+
+/// Establishes a freshly unshared user namespace's identity map.
 ///
 /// The single-identity map is written in process: denying `setgroups` first
-/// is what permits an unprivileged process to write its own gid map, and
-/// the one-id exception permits nothing more. Any range map is written from
-/// outside by the caller's delegate — a process that has just unshared
-/// cannot write its own range map even if it was privileged before, because
+/// is what permits an unprivileged process to write its own gid map, and the
+/// one-id exception permits nothing more. Any range map is written from
+/// outside by the caller's delegate — a process that has just unshared cannot
+/// write its own range map even if it was privileged before, because
 /// capabilities extend to a namespace's descendants and never to its
-/// ancestors — so this stage signals ready on the map gate and blocks until
-/// the caller releases it. End-of-file on the gate means the caller
-/// abandoned the launch (its delegate failed); the failure is reported for
-/// form, though the caller prefers the delegate's own error. The gate
-/// descriptor is closed before the stage forks, so no sandbox stage
-/// inherits it.
+/// ancestors — so the child signals ready on the map gate and blocks until
+/// the caller releases it.
 ///
 /// For a range map `setgroups` stays at `allow`: that is what makes
 /// supplementary groups (and a later `setgroups` inside) possible, and a
 /// privileged delegate's gid-map write does not need the denial.
-fn establish_identity_map(context: &Context<'_>) -> Result<(), Failure> {
-    match &context.plan.identity {
-        IdentityPlan::Single => {
+///
+/// The gate is left open. What it is worth keeping differs by caller — a
+/// launch closes it so no sandbox stage inherits it, a provisioning child
+/// carries its outcome back over the same descriptor — so the decision stays
+/// with them.
+///
+/// Post-fork safe: no allocation, no locking, and no panic.
+pub(super) fn establish_map(
+    duty: MapDuty<'_>,
+    gate: Option<BorrowedFd<'_>>,
+) -> Result<(), MapFailure> {
+    match duty {
+        MapDuty::Write { uid_line, gid_line } => {
             write_file(c"/proc/self/setgroups", b"deny")
-                .map_err(|errno| (SetupStep::DenySetgroups, errno, 0))?;
-            write_file(c"/proc/self/gid_map", context.gid_line)
-                .map_err(|errno| (SetupStep::WriteGidMap, errno, 0))?;
-            write_file(c"/proc/self/uid_map", context.uid_line)
-                .map_err(|errno| (SetupStep::WriteUidMap, errno, 0))?;
+                .map_err(|errno| MapFailure::Step(MapStep::DenySetgroups, errno))?;
+            write_file(c"/proc/self/gid_map", gid_line)
+                .map_err(|errno| MapFailure::Step(MapStep::WriteGidMap, errno))?;
+            write_file(c"/proc/self/uid_map", uid_line)
+                .map_err(|errno| MapFailure::Step(MapStep::WriteUidMap, errno))?;
         }
-        IdentityPlan::Ranged { .. } => {
-            let Some(gate) = context.map_gate_fd else {
-                // fork_launch pairs every ranged plan with a gate; a missing
+        MapDuty::Await => {
+            let Some(gate) = gate else {
+                // Every caller pairs a delegated map with a gate; a missing
                 // one is a defect reported as a bad descriptor, since this
                 // process must not panic.
-                return Err((SetupStep::AwaitIdentityMap, Errno::BADF, 0));
+                return Err(MapFailure::Step(MapStep::AwaitMap, Errno::BADF));
             };
             loop {
                 match rustix::io::write(gate, &[super::MAP_READY_BYTE]) {
                     Ok(_) => break,
                     Err(Errno::INTR) => continue,
-                    Err(errno) => return Err((SetupStep::AwaitIdentityMap, errno, 0)),
+                    Err(errno) => return Err(MapFailure::Step(MapStep::AwaitMap, errno)),
                 }
             }
             let mut byte = [0u8; 1];
             loop {
                 match rustix::io::read(gate, &mut byte) {
-                    Ok(0) => return Err((SetupStep::AwaitIdentityMap, Errno::CANCELED, 0)),
+                    Ok(0) => return Err(MapFailure::Abandoned),
                     Ok(_) => break,
                     Err(Errno::INTR) => continue,
-                    Err(errno) => return Err((SetupStep::AwaitIdentityMap, errno, 0)),
+                    Err(errno) => return Err(MapFailure::Step(MapStep::AwaitMap, errno)),
                 }
             }
-            // SAFETY: the raw descriptor is this process's own gate end,
-            // closed exactly once here and never used again in this process.
-            unsafe { rustix::io::close(gate.as_raw_fd()) };
         }
     }
     Ok(())
+}
+
+/// Establishes the new user namespace's identity map, from stage A.
+///
+/// End-of-file on the gate means the caller abandoned the launch (its
+/// delegate failed); the failure is reported for form, though the caller
+/// prefers the delegate's own error. The gate descriptor is closed before the
+/// stage forks, so no sandbox stage inherits it.
+fn establish_identity_map(context: &Context<'_>) -> Result<(), Failure> {
+    let ranged = matches!(context.plan.identity, IdentityPlan::Ranged { .. });
+    let duty = if ranged {
+        MapDuty::Await
+    } else {
+        MapDuty::Write {
+            uid_line: context.uid_line,
+            gid_line: context.gid_line,
+        }
+    };
+    let outcome = establish_map(duty, context.map_gate_fd);
+    if let (true, Some(gate)) = (ranged, context.map_gate_fd) {
+        // SAFETY: the raw descriptor is this process's own gate end, closed
+        // exactly once here and never used again in this process.
+        unsafe { rustix::io::close(gate.as_raw_fd()) };
+    }
+    outcome.map_err(|failure| match failure {
+        MapFailure::Abandoned => (SetupStep::AwaitIdentityMap, Errno::CANCELED, 0),
+        MapFailure::Step(step, errno) => (setup_step(step), errno, 0),
+    })
+}
+
+/// The [`SetupStep`] a launch reports for a shared map step.
+fn setup_step(step: MapStep) -> SetupStep {
+    match step {
+        MapStep::ResetSignals => SetupStep::ResetSignals,
+        MapStep::SweepFds => SetupStep::SweepFds,
+        MapStep::Unshare => SetupStep::Unshare,
+        MapStep::DenySetgroups => SetupStep::DenySetgroups,
+        MapStep::WriteGidMap => SetupStep::WriteGidMap,
+        MapStep::WriteUidMap => SetupStep::WriteUidMap,
+        MapStep::AwaitMap => SetupStep::AwaitIdentityMap,
+    }
 }
 
 /// The sandbox setup sequence: the identity-dependent namespace
@@ -703,11 +926,17 @@ enum Role {
 /// Detaches the supervisor from the caller's streams before the long watch:
 /// the report-pipe copy closes (the exec convention needs every copy gone),
 /// the capture-pipe copies close (their end-of-file must track the command,
-/// not this process), a caller-supplied standard input closes (the supervisor
-/// must not pin a caller resource for the sandbox's lifetime), stdio repoints
-/// at `/dev/null` (a pipeline reading the caller's stdout must not wait for
-/// the supervisor), and SIGPIPE becomes ignored so a status write after the
+/// not this process), a caller-supplied standard stream closes (the supervisor
+/// must not pin a caller resource for the sandbox's lifetime), a terminal
+/// launch's replica closes (end-of-file on the primary arrives only when the
+/// last replica anywhere is gone, and this process is not the command), stdio
+/// repoints at `/dev/null` (a pipeline reading the caller's stdout must not wait
+/// for the supervisor), and SIGPIPE becomes ignored so a status write after the
 /// handle is dropped fails with `EPIPE` instead of killing the supervisor.
+///
+/// Dropping the replica costs the session nothing: the controlling-terminal
+/// association `TIOCSCTTY` established is a property of the session and survives
+/// every descriptor to the terminal closing.
 ///
 /// Everything here is best-effort: past this point there is no report pipe
 /// to fail through, and none of these operations can fail in a way that
@@ -718,18 +947,31 @@ fn supervisor_hygiene(context: &Context<'_>) {
     // this process.
     unsafe {
         rustix::io::close(context.report_fd.as_raw_fd());
-        if let Some(stdout) = context.stdout_fd {
+        if let Some(stdout) = context.capture_stdout_fd {
             rustix::io::close(stdout.as_raw_fd());
         }
-        if let Some(stderr) = context.stderr_fd {
+        if let Some(stderr) = context.capture_stderr_fd {
             rustix::io::close(stderr.as_raw_fd());
         }
-        // A caller-supplied standard input, if it landed anywhere but on the
-        // standard-stream numbers the repoint below covers.
-        if let Some(stdin) = context.stdin_fd
-            && stdin.as_raw_fd() > 2
-        {
-            rustix::io::close(stdin.as_raw_fd());
+        // The caller-supplied standard streams, each if it landed anywhere but
+        // on the standard-stream numbers the repoint below covers. One
+        // descriptor may serve more than one stream — a caller is free to hand
+        // the same open file to standard output and standard error — so a
+        // number already closed here is skipped rather than closed twice, which
+        // would risk closing whatever the kernel had since handed that number
+        // to.
+        let caller = [
+            context.stdin_fd,
+            context.stdout_fd,
+            context.stderr_fd,
+            context.terminal_fd,
+        ]
+        .map(|fd| fd.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
+        for index in 0..caller.len() {
+            let fd = caller[index];
+            if fd > 2 && !caller[..index].contains(&fd) {
+                rustix::io::close(fd);
+            }
         }
     }
     let _ = rustix::stdio::dup2_stdin(context.null_fd);
@@ -738,13 +980,28 @@ fn supervisor_hygiene(context: &Context<'_>) {
     // SAFETY: the null descriptor's job ends with the stdio repoint above;
     // closed exactly once and never used again in this process.
     unsafe { rustix::io::close(context.null_fd.as_raw_fd()) };
+    let _ = ignore_sigpipe();
+}
+
+/// Ignores `SIGPIPE`, so a write to a channel whose reader is gone fails with
+/// `EPIPE` rather than terminating the process.
+///
+/// [`reset_signals`] puts every disposition back to the default, which for
+/// `SIGPIPE` is termination. A process that keeps writing to the caller after
+/// that — the supervisor with its status record, and each helper child with its
+/// frame stream or outcome record — needs the errno instead: its write paths are
+/// written to observe a failed write, report what they can, and end on their own
+/// terms. Restored here rather than left out of the scrub, so the window between
+/// the two carries no inherited disposition at all.
+pub(super) fn ignore_sigpipe() -> Result<(), Errno> {
     let ignore = KernelSigaction {
         sa_handler_kernel: runtime::kernel_sig_ign(),
         ..Default::default()
     };
     // SAFETY: installing SIG_IGN carries no handler address and so none of
     // `kernel_sigaction`'s trampoline hazards.
-    let _ = unsafe { runtime::kernel_sigaction(Signal::PIPE, Some(ignore)) };
+    unsafe { runtime::kernel_sigaction(Signal::PIPE, Some(ignore)) }?;
+    Ok(())
 }
 
 /// How often the in-namespace init wakes to collect orphaned descendants.
@@ -838,8 +1095,17 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
         // Collect zombies on every wake — control traffic, the tick, or
         // the supervised process's exit, which ends supervision: its wait
         // status goes out over the status pipe.
+        //
+        // `wait` rather than `waitpid(None, ...)`: rustix renders the latter as
+        // pid 0, which is "any child in *this process's* process group" and not
+        // the "any child" this loop needs. The supervised process leaves that
+        // group whenever the sandbox has a session of its own, and a command
+        // free to call `setsid` itself can leave it at any time; either way a
+        // group-scoped wait answers `ECHILD` for a child that is sitting there
+        // exited, and the loop below reads that as "something else reaped it"
+        // and exits without a status.
         loop {
-            match process::waitpid(None, WaitOptions::NOHANG) {
+            match process::wait(WaitOptions::NOHANG) {
                 Ok(Some((pid, status))) if pid == child => {
                     report_status(context.status_fd, status);
                     runtime::exit_group(0)
@@ -930,11 +1196,14 @@ fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
         Some(context.status_fd),
         Some(context.control_fd),
         Some(context.null_fd),
-        context.stdout_fd,
-        context.stderr_fd,
+        context.capture_stdout_fd,
+        context.capture_stderr_fd,
         context.proceed_fd,
         context.map_gate_fd,
         context.stdin_fd,
+        context.stdout_fd,
+        context.stderr_fd,
+        context.terminal_fd,
     ]
     .map(|channel| channel.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
     sweep_fds_keeping(&keep)
@@ -1014,6 +1283,43 @@ fn create_mount_dir(dir: BorrowedFd<'_>, leaf: &CStr, mode: Mode) -> Result<(), 
     }
 }
 
+/// The mode a file bind's created target carries. It exists for its mount to
+/// cover and is taken away with the sandbox, so the value matters only for the
+/// window before the mount and for a caller inspecting the tree in between.
+const FILE_TARGET_MODE: fs::RawMode = 0o644;
+
+/// Creates a file bind's target, empty and at exactly `mode`, leaving an entry
+/// the root already ships — of any kind — untouched.
+///
+/// `O_EXCL` is what keeps the created file at the path the caller side
+/// recorded. `RESOLVE_IN_ROOT` scopes symlink resolution to the root but does
+/// not suppress it, so a plain `O_CREAT` on a root that ships this target as a
+/// symlink would create the file at the link's destination instead — a path the
+/// caller side does not know, so a file the root never had would be left behind
+/// when the sandbox is gone (see [`LaunchPlan::managed_placeholders`]). With
+/// `O_EXCL` an entry already at the path, symbolic link included, answers
+/// `EEXIST`: there is nothing to create, and the bind that follows resolves the
+/// path as the root intends.
+///
+/// The mode is set again after the create for the reason
+/// [`create_mount_dir`] sets it again after the `mkdir`: `O_CREAT` narrows it by
+/// the process umask. Only a file this call just created is chmod-ed, so a mode
+/// the root ships is never rewritten.
+///
+/// [`LaunchPlan::managed_placeholders`]: super::LaunchPlan::managed_placeholders
+fn create_mount_file(root: BorrowedFd<'_>, path: &CStr, mode: Mode) -> Result<(), Errno> {
+    match open_in_root_with(
+        root,
+        path,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+        mode,
+    ) {
+        Ok(file) => fs::fchmod(&file, mode),
+        Err(Errno::EXIST) => Ok(()),
+        Err(errno) => Err(errno),
+    }
+}
+
 /// Executes one frozen mount op against the new root.
 fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errno)> {
     // Create missing mount-target directories, one component at a time.
@@ -1033,15 +1339,10 @@ fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errn
     }
 
     // The target of a file bind must exist before a file can be bound onto
-    // it; create it empty. An existing file is opened and left as it is.
+    // it; create it empty where the root ships nothing at that path.
     if let Some(file) = &op.create_file {
-        open_in_root_with(
-            root,
-            file,
-            OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o644),
-        )
-        .map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
+        create_mount_file(root, file, Mode::from_raw_mode(FILE_TARGET_MODE))
+            .map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
     }
 
     match &op.action {
@@ -1425,6 +1726,100 @@ mod tests {
                 "{observed:?}",
             );
         }
+    }
+
+    /// Opens a directory the way the sandbox stage holds its new root.
+    fn open_root(path: &std::path::Path) -> OwnedFd {
+        fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("the scratch directory opens")
+    }
+
+    /// The mode of an entry, without following a symbolic link.
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::symlink_metadata(path)
+            .expect("the entry exists")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn a_file_bind_target_is_created_at_exactly_its_mode() {
+        // The umask must not decide a mode the sandbox contributes, for the
+        // reason a mount point's mode is set again after the `mkdir`. 0666 is
+        // the value that shows it: a umask conventionally clears write bits, so
+        // an `O_CREAT` left to decide the mode lands on 0644 under the usual
+        // `022` and on 0664 under the `002` of a user-private-group host.
+        let dir = crate::scratch::Scratch::new("mount-file-mode");
+        let root = open_root(dir.path());
+
+        create_mount_file(root.as_fd(), c"created", Mode::from_raw_mode(0o666))
+            .expect("a target the root does not ship is created");
+
+        assert_eq!(mode_of(&dir.join("created")), 0o666);
+        assert_eq!(
+            std::fs::read(dir.join("created")).expect("the target is readable"),
+            b"",
+            "a bind's target is created empty"
+        );
+    }
+
+    #[test]
+    fn a_file_bind_target_the_root_ships_is_left_exactly_as_it_is() {
+        // The root owns what it ships. A target already present is one the
+        // caller side never recorded for removal, so rewriting its mode here
+        // would change a tree the launch has no claim on.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::scratch::Scratch::new("mount-file-shipped");
+        let root = open_root(dir.path());
+        std::fs::write(dir.join("shipped"), b"the root's own").expect("the entry is writable");
+        std::fs::set_permissions(dir.join("shipped"), std::fs::Permissions::from_mode(0o600))
+            .expect("the entry's mode is settable");
+
+        create_mount_file(root.as_fd(), c"shipped", Mode::from_raw_mode(0o666))
+            .expect("a target the root ships is not an error");
+
+        assert_eq!(mode_of(&dir.join("shipped")), 0o600);
+        assert_eq!(
+            std::fs::read(dir.join("shipped")).expect("the entry is readable"),
+            b"the root's own",
+        );
+    }
+
+    #[test]
+    fn a_file_bind_target_the_root_ships_as_a_symlink_is_not_created_through() {
+        // `RESOLVE_IN_ROOT` scopes symlink resolution to the root but does not
+        // suppress it, so a plain `O_CREAT` would create the file at the link's
+        // destination — a path the caller side does not record and therefore
+        // never takes away, leaving the root holding content it never shipped.
+        // `O_EXCL` refuses the link instead.
+        let dir = crate::scratch::Scratch::new("mount-file-symlink");
+        let root = open_root(dir.path());
+        std::os::unix::fs::symlink("../absent", dir.join("linked"))
+            .expect("the symbolic link is creatable");
+
+        create_mount_file(root.as_fd(), c"linked", Mode::from_raw_mode(0o644))
+            .expect("an entry the root ships is not an error, whatever kind it is");
+
+        assert!(
+            std::fs::symlink_metadata(dir.join("linked"))
+                .expect("the link is still there")
+                .is_symlink(),
+            "the root's own symbolic link was replaced",
+        );
+        // `..` is clamped to the root, so the destination the link names is
+        // inside it. Nothing was created there.
+        assert!(
+            !dir.join("absent").exists(),
+            "a file was created through the link",
+        );
     }
 
     #[test]

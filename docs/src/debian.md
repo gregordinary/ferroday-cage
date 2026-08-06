@@ -44,6 +44,10 @@ A bootstrap runs in stages:
    and extracts its files into a staging tree with the same kernel-enforced
    containment the tarball provisioner uses. The merged-usr symlink layout is
    created first, so packages that ship `/usr`-native paths resolve correctly.
+   The staging tree's own directory is mode `0755`, the mode `base-files` gives
+   `/`: every `.deb` describes the root it is unpacked into as well as its
+   contents, so taking the root's mode from one of them would make it a property
+   of whichever package happened to be extracted last.
 4. **Configuration.** It configures the packages by running dpkg inside a cage
    rooted at the staging tree, in waves modeled on a second-stage bootstrap.
    Because configuration runs in the sandbox, it needs no privilege on the
@@ -87,8 +91,20 @@ for a tree that goes on to be exported.
 bootstrap that resolves the same version reuses the file instead of fetching it
 again. Entries are content-addressed by digest, and every reuse verifies the
 file against that digest, so a truncated or altered entry is downloaded again
-rather than trusted. Without a cache directory, packages are downloaded to a
-temporary directory and discarded with the bootstrap.
+rather than trusted. A cache directory is the caller's: it is created if absent
+and never removed, which is what makes it a cache.
+
+Without one, packages are downloaded into a directory beside the tree being
+built and discarded when the run ends — whether the run succeeded or failed, so
+a bootstrap that fails partway leaves nothing beside the rootfs it did not
+publish.
+
+A package is never held in memory. The bytes are written to a staging file as
+they arrive and digested on the way through, and the file is renamed into the
+cache only once the digest matches the one the archive recorded; installing
+reads it back the same way, streaming the `data.tar` through the decompressor
+into the extractor. So a 90 MB kernel package costs what a shell script costs,
+and nothing unverified is ever visible at a cache path.
 
 One cache directory serves any number of concurrent bootstraps, in one process
 or several, whether or not their package sets overlap. Each entry is staged
@@ -335,6 +351,43 @@ whitespace-delimited lists, so a component with a space in it would read back as
 two components, neither of them the one published. Each refusal is a
 configuration error naming the field and the value.
 
+The same rule holds on the reading side. A [`Repository`]'s suite and components
+and a bootstrap's architecture become path segments of every URL the archive is
+fetched through and words of the `deb` line written into the finished rootfs, so
+each is checked when the repository or the builder is built: a `..` segment
+would climb out of the mirror root, which for a `file://` mirror is a local
+read, and a control character would split the request line the value is
+interpolated into.
+
+### What a published `.deb` must declare
+
+`publish` derives the path a package is stored at, and the `Filename` the index
+records, from the package's own control stanza. Two things follow.
+
+`Package` and `Version` are held to the alphabet Debian policy gives them — a
+name of lowercase letters, digits, `+`, `-`, and `.`, at least two characters and
+starting with a letter or a digit; a version of alphanumerics and `.`, `+`, `-`,
+`:`, `~`. Neither alphabet contains a separator, so the derived path stays where
+the pool put it: without the check a package naming itself `../../..` would
+create directories and write a file outside the pool root, as the publishing
+user.
+
+The control file must be one paragraph and must not itself carry `Filename`,
+`Size`, or `SHA256`. A pool entry is the control file verbatim with those three
+appended, and a deb822 reader resolves a field by its first occurrence, so a
+package carrying one would shadow the archive's value — a digest it chose rather
+than one taken from the bytes on disk, or a `Filename` naming another package's
+file. A second paragraph does the same by another route: the appended fields
+land on the last paragraph, which is then the one that reads back as the entry,
+under whatever name and version it declares. A pool is consumed as
+`[trusted=yes]` and resolution is highest-version-wins across repositories, so an
+entry a package wrote for itself would supersede the primary archive's.
+
+Both are `DebianError::Deb`, naming the file and what is wrong with it. No
+conforming `.deb` is affected: `dpkg-deb` builds a one-paragraph control file,
+and the three appended names are archive fields that a control file has no
+reason to carry.
+
 ### The pool's own layout
 
 A pool reports the paths it owns, so nothing outside it needs to know how an
@@ -575,10 +628,17 @@ the choice made.
 The **release digest** is of the body that was verified — for a signed
 repository, the cleartext the signature covers, not the `InRelease` armor around
 it and not a re-fetch. So it identifies the exact archive state the signature
-vouched for. `signed_by` is the fingerprint of the key that verified it, in the
-uppercase hex the OpenPGP tools print, and is empty for a repository configured
-as [`trust_unsigned`] — where nothing was verified, which is a fact worth
-recording rather than an omission.
+vouched for.
+
+Two fingerprints record **who vouched for it**, both in the uppercase hex the
+OpenPGP tools print, and both empty for a repository configured as
+[`trust_unsigned`] — where nothing was verified, which is a fact worth recording
+rather than an omission. `signed_by` is the certificate's primary-key
+fingerprint: the identity a keyring entry is named by, and the one to pin a
+repository against. `signing_key` is the component key that actually made the
+signature. Debian's archive keys sign with a dedicated signing subkey, so the
+two normally differ, and only `signed_by` stays put when an archive rotates that
+subkey.
 
 `package.archive` indexes into `plan.archives`. Resolution is
 highest-version-wins across the merged repositories, so with more than one
@@ -692,7 +752,8 @@ Components: main
 Release-SHA256: 9f3a...
 Date: Sat, 02 Aug 2026 08:14:33 UTC
 Valid-Until: Sat, 09 Aug 2026 08:14:33 UTC
-Signed-By: 4CB50190207B4758
+Signed-By: 04B54C3CDCA79751B16BC6B5225629DF75B188BD
+Signing-Key: B8E5F13176D2A7A75220028078DBA3BC47EF2265
 
 Archive: 1
 Mirror: file:///srv/pool
@@ -701,6 +762,7 @@ Components: main
 Release-SHA256: 1c0f...
 Date: Sat, 02 Aug 2026 09:02:11 UTC
 Signed-By:
+Signing-Key:
 
 Package: base-files
 Version: 13.6
@@ -717,10 +779,12 @@ Filename: pool/main/l/local-tool/local-tool_2.4-1_all.deb
 Archive: 1
 ```
 
-Archive 1 is a locally published [pool](#publishing-a-local-pool) configured with
-`trust_unsigned`, so nothing verified its release and `Signed-By` is empty —
-written bare, with nothing after the colon, because a line ending in whitespace
-would not survive the editors and hooks that strip it. It carries no
+Archive 0 names both the archive certificate and the signing subkey that made
+the signature. Archive 1 is a locally published
+[pool](#publishing-a-local-pool) configured with `trust_unsigned`, so nothing
+verified its release and both fields are empty — written bare, with nothing
+after the colon, because a line ending in whitespace would not survive the
+editors and hooks that strip it. It carries no
 `Valid-Until` either, an absent optional field being absent rather than empty.
 `local-tool` names `Archive: 1`, which is what says it will be fetched from the
 pool rather than from the Debian mirror.
@@ -863,7 +927,8 @@ lower and the layer's `path()` as the writable upper, and the build sees the
 merged view; every write lands in the upper, and the base is never mutated.
 Dropping the `BuildLayer` removes the upper — and the overlay work directory
 beside it — reverting the increment and leaving the base ready for the next
-component.
+component. A `stage_layer` that fails disposes of them itself, since it hands the
+caller no handle to drop, so a failed staging leaves nothing behind either.
 
 The base must be a full, configured bootstrap, not an
 [`extract_only`](#extract-only-and-foreign-architectures) tree: the overlay's
@@ -926,10 +991,32 @@ The signature alone does not say which suite was delivered — a single archive
 key signs every suite — so the release is also bound to the request: its
 `Suite` or `Codename` must equal the requested suite, which stops a mirror
 from answering a request for one suite with a genuine, validly-signed release
-for another. Key validity is enforced beyond the cryptographic check: a
-revoked archive key is dropped from the keyring, and a signature made after
-its signing key expired is rejected, so a retired key cannot vouch for a
-release.
+for another.
+
+Key validity is enforced beyond the cryptographic check, which on its own
+accepts a signature from any key whose material fits. A revoked archive key is
+dropped from the keyring, and a signature made outside its signing key's
+validity window — before the key existed, or after it expired — is rejected, so
+a retired key cannot vouch for a release. Debian's archive keys sign with a
+dedicated signing subkey rather than the primary, and a subkey is admitted only
+on the terms OpenPGP sets for one: the primary must have bound it with the
+signing capability, the subkey must have counter-signed that binding, and the
+binding must not be revoked. A subkey's authority is delegated from its primary,
+so it lapses when the primary's does — the expiry that governs is whichever of
+the certificate's, the binding's and the counter-signature's comes first. A
+keyring holding several keys is searched in full, and every signature a key made
+is judged, so a release is accepted whenever any of its signatures is
+acceptable.
+
+Beyond the key, the signature itself has to be worth resting a decision on. It
+carries a creation time, every check being relative to it. Its digest is not
+MD5, SHA-1 or RIPEMD-160, whose collisions are within reach, and neither the
+signing key nor the certificate behind it is DSA or an RSA key narrower than
+2048 bits: a signature is worth no more than the weaker of the digest it covers
+and the key material that binds it. And it carries no critical subpacket that
+cannot be interpreted, which RFC 9580 requires a verifier meeting one to treat
+as invalidating. Only the signed part of a signature is searched for such a
+subpacket, so a relay cannot append one in transit and fail every fetch.
 
 The release must also be fresh. A `Valid-Until` the release carries must be
 parseable and in the future, and the archive signature must not itself have
@@ -947,7 +1034,10 @@ The transport is a trait. The built-in fetcher speaks plain HTTP and
 `file://`, addressing a mirror by DNS name, IPv4 literal, or bracketed IPv6
 literal (`http://[::1]:8080/debian`); a consumer that needs HTTPS, a proxy, or a
 private mirror protocol supplies their own through
-[`fetcher`]. A transport is `Send`, because the provisioner owns it and is
+[`fetcher`]. A `file://` URL names a path on the machine it is read on, in either
+of RFC 8089's spellings for that — `file:///srv/pool` and
+`file://localhost/srv/pool`. One naming any other host is refused rather than
+read as a path relative to the current directory. A transport is `Send`, because the provisioner owns it and is
 itself `Send` — see [thread bounds](stability.md#thread-bounds). Fetches run on
 the thread that called into the provisioner, so a transport is never used from
 two threads at once.
@@ -969,6 +1059,14 @@ result is a working userland whose files are uniformly root-owned: exactly
 right for a build or run environment consumed back inside single-identity
 cages, which cannot observe the flattening, and whose caller-owned output
 needs no extra host support to copy or delete.
+
+The overrides are recorded one per path. dpkg treats two records for one path as
+an unrecoverable fatal error, and an install set reaches that honestly: two
+selected packages can ship one path, since the resolver reads `Depends` and
+`Provides` and never `Conflicts`. Where that happens the last record wins, which
+is the extraction's own rule — a later entry supersedes an earlier one — so the
+record describes the file that survived. A layered build lays the increment's
+records over the base's the same way.
 
 A rootfs that is itself the product — deployed, exported, or run under a
 range map — wants real ownership, and

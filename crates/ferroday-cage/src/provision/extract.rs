@@ -91,8 +91,12 @@ pub(crate) struct Extraction {
     /// later directory entry for a path replaces an earlier one, so the
     /// last archive to describe a directory wins.
     dir_meta: HashMap<Vec<u8>, DirMeta>,
-    /// Metadata from a `./` entry describing the root itself, if any.
+    /// The root directory's own metadata, applied by [`finalize`](Self::finalize)
+    /// once every entry is written. `None` until something states it.
     root_meta: Option<DirMeta>,
+    /// Whether [`root_mode`](Self::root_mode) stated it, in which case a `./`
+    /// entry does not replace it.
+    root_mode_fixed: bool,
 }
 
 impl Extraction {
@@ -108,7 +112,29 @@ impl Extraction {
             root_fd,
             dir_meta: HashMap::new(),
             root_meta: None,
+            root_mode_fixed: false,
         })
+    }
+
+    /// Fixes the extraction root's own mode, in place of taking it from a `./`
+    /// entry.
+    ///
+    /// An archive that describes the whole tree it is unpacked into describes
+    /// the root as well, and its `./` entry is that description; by default it
+    /// is applied, which is what `tar -C dir -x` does. Several archives unpacked
+    /// into one root each carry their own, so the root would take the mode and
+    /// modification time of whichever was extracted last — a choice among
+    /// archives that say nothing about the tree being assembled from them, and
+    /// one nothing in the result records.
+    ///
+    /// A caller assembling such a root states the mode instead. `./` entries are
+    /// then ignored, and the root's modification time is left as the filesystem
+    /// set it.
+    #[cfg(feature = "debian")]
+    pub(crate) fn root_mode(mut self, mode: u32) -> Extraction {
+        self.root_meta = Some(DirMeta { mode, mtime: None });
+        self.root_mode_fixed = true;
+        self
     }
 
     /// Extracts every entry of `archive` into the root.
@@ -144,15 +170,18 @@ impl Extraction {
 
             let components = validate_path(&entry.path, &entry.path, "path")?;
             if components.is_empty() {
-                // The `./` entry: metadata for the extraction root itself.
+                // The `./` entry: metadata for the extraction root itself,
+                // unless the caller fixed the root's mode instead.
                 if entry.typeflag == b'5' {
-                    self.root_meta = Some(DirMeta {
-                        mode: entry.mode,
-                        mtime: Some(entry.mtime),
-                    });
+                    if !self.root_mode_fixed {
+                        self.root_meta = Some(DirMeta {
+                            mode: entry.mode,
+                            mtime: Some(entry.mtime),
+                        });
+                    }
                     continue;
                 }
-                return Err(entry_unsafe(&entry.path, "the entry path is empty"));
+                return Err(entry_refused(&entry.path, "the entry path is empty"));
             }
 
             on_entry(&entry, &components)?;
@@ -302,7 +331,7 @@ fn open_parent(
             }
         }
         if open_dir_at(root, &parent[..depth]).is_err() {
-            return Err(entry_unsafe(
+            return Err(entry_refused(
                 entry_path,
                 "a parent component is not a directory",
             ));
@@ -384,6 +413,13 @@ fn classify_existing_dir(
 }
 
 /// Maps a parent-resolution failure onto the typed error surface.
+///
+/// `EXDEV` and `ELOOP` are the kernel refusing to leave the root — the second
+/// covers a magic link as well as a loop, and the errno does not distinguish
+/// them — so both are containment failures. `ENOTDIR` is not: an archive that
+/// ships `foo` as a file and `foo/bar` after it is an ordinary malformed
+/// archive, and calling that an escape attempt would tell a caller something
+/// untrue about their input.
 fn resolve_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
     match errno {
         Errno::XDEV => entry_unsafe(entry_path, "the path resolves outside the extraction root"),
@@ -391,7 +427,7 @@ fn resolve_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
             entry_path,
             "the path resolves through a symlink loop or a magic link",
         ),
-        Errno::NOTDIR => entry_unsafe(entry_path, "a parent component is not a directory"),
+        Errno::NOTDIR => entry_refused(entry_path, "a parent component is not a directory"),
         errno => io_error("resolving", &bytes_to_path(entry_path), errno.into()),
     }
 }
@@ -507,7 +543,7 @@ fn extract_symlink(
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
     if entry.link_target.is_empty() {
-        return Err(entry_unsafe(&entry.path, "the symlink target is empty"));
+        return Err(entry_refused(&entry.path, "the symlink target is empty"));
     }
     let target = CString::new(entry.link_target.clone())
         .map_err(|_| entry_unsafe(&entry.path, "the symlink target contains a NUL byte"))?;
@@ -770,9 +806,20 @@ fn component_cstr(component: &[u8], entry_path: &[u8]) -> Result<CString, Provis
         .map_err(|_| entry_unsafe(entry_path, "the path contains a NUL byte"))
 }
 
-/// Builds [`ProvisionError::EntryUnsafe`].
+/// Builds [`ProvisionError::EntryUnsafe`], for an entry that tried to reach
+/// outside the extraction root.
 fn entry_unsafe(path: &[u8], reason: impl Into<String>) -> ProvisionError {
     ProvisionError::EntryUnsafe {
+        path: bytes_to_path(path),
+        reason: reason.into(),
+    }
+}
+
+/// Builds [`ProvisionError::EntryRefused`], for an entry the extractor cannot
+/// write for a reason that is not a containment failure — a malformed archive,
+/// rather than one reaching for the host.
+fn entry_refused(path: &[u8], reason: impl Into<String>) -> ProvisionError {
+    ProvisionError::EntryRefused {
         path: bytes_to_path(path),
         reason: reason.into(),
     }

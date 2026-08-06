@@ -1,10 +1,10 @@
-//! Integration tests for output streaming and the stdin disposition.
+//! Integration tests for output streaming and the stream dispositions.
 
 mod common;
 
 use std::io::Write;
 
-use ferroday_cage::{Cage, Observer, Progress, Stdin};
+use ferroday_cage::{Cage, Observer, Progress, Stdio};
 
 /// Collects the launch milestones for assertions. The command's own output is
 /// what `Cage::output` returns, so only the milestones need an observer.
@@ -166,7 +166,7 @@ fn a_null_stdin_reads_immediate_end_of_file() {
     };
     let output = Cage::builder()
         .rootfs(rootfs)
-        .stdin(Stdin::Null)
+        .stdin(Stdio::Null)
         .command("/bin/sh")
         .args(["-c", "wc -c"])
         .build()
@@ -185,7 +185,7 @@ fn a_descriptor_stdin_feeds_the_command() {
     let (reader, mut writer) = std::io::pipe().expect("a pipe");
     let cage = Cage::builder()
         .rootfs(rootfs)
-        .stdin(Stdin::from_fd(reader.into()))
+        .stdin(Stdio::from_fd(reader.into()))
         .command("/bin/sh")
         .args(["-c", "cat"])
         .build()
@@ -215,7 +215,7 @@ fn a_descriptor_stdin_survives_the_descriptor_sweep() {
     let (reader, mut writer) = std::io::pipe().expect("a pipe");
     let cage = Cage::builder()
         .rootfs(rootfs)
-        .stdin(Stdin::from_fd(reader.into()))
+        .stdin(Stdio::from_fd(reader.into()))
         .command("/bin/sh")
         .args(["-c", "wc -c"])
         .build()
@@ -241,7 +241,7 @@ fn a_shared_stdin_descriptor_serves_repeated_launches() {
     let (reader, mut writer) = std::io::pipe().expect("a pipe");
     let cage = Cage::builder()
         .rootfs(rootfs)
-        .stdin(Stdin::from_fd(reader.into()))
+        .stdin(Stdio::from_fd(reader.into()))
         .command("/bin/sh")
         .args(["-c", "dd bs=1 count=5 2>/dev/null"])
         .build()
@@ -253,4 +253,201 @@ fn a_shared_stdin_descriptor_serves_repeated_launches() {
     assert_eq!(first.stdout, b"first");
     let second = cage.output().expect("the second launch");
     assert_eq!(second.stdout, b"secon");
+}
+
+/// The controlling-terminal number from `/proc/self/stat`: field 7, read from
+/// after the closing parenthesis so a `comm` holding spaces cannot shift it.
+/// The remainder opens with a separator, so `tty_nr` is the sixth `cut` field
+/// of it. Zero means the process has no controlling terminal.
+const TTY_NR: &str = "cut -d')' -f2- /proc/self/stat | cut -d' ' -f6";
+
+#[test]
+fn a_sandbox_that_inherits_stdin_keeps_the_callers_controlling_terminal() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The test process is the caller here. Under `cargo test` it usually has no
+    // controlling terminal of its own, in which case there is nothing for the
+    // sandbox to inherit and the assertion below would hold vacuously; skip
+    // rather than pretend to have proved something.
+    let Ok(caller) = std::fs::read_to_string("/proc/self/stat") else {
+        return;
+    };
+    let caller_tty = caller
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(4))
+        .expect("/proc/self/stat has a tty_nr field");
+    if caller_tty == "0" {
+        eprintln!("skipping: the test process has no controlling terminal to share");
+        return;
+    }
+
+    // Inheriting standard input hands the sandbox the caller's terminal, so it
+    // stays in the caller's session and keeps that terminal.
+    let output = Cage::builder()
+        .rootfs(rootfs)
+        .stdin(Stdio::Inherit)
+        .command("/bin/sh")
+        .args(["-c", TTY_NR])
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox launches");
+    assert_eq!(
+        output.stdout.trim_ascii(),
+        caller_tty.as_bytes(),
+        "an inheriting sandbox shares the caller's controlling terminal",
+    );
+}
+
+#[test]
+fn a_sandbox_that_does_not_inherit_stdin_has_no_controlling_terminal() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // A command the caller has not handed its standard input to runs in a
+    // session of its own, where there is no controlling terminal to reach: no
+    // `/dev/tty` to open, and no terminal `TIOCSTI` is granted for. This holds
+    // whether or not the caller has a terminal at all, so it needs no skip.
+    for stdin in [Stdio::Null, Stdio::from_fd(open_null())] {
+        let output = Cage::builder()
+            .rootfs(rootfs)
+            .stdin(stdin)
+            .command("/bin/sh")
+            .args(["-c", TTY_NR])
+            .build()
+            .expect("a valid sandbox configuration")
+            .output()
+            .expect("the sandbox launches");
+        assert_eq!(
+            output.stdout.trim_ascii(),
+            b"0",
+            "a sandbox in its own session has no controlling terminal",
+        );
+    }
+}
+
+#[test]
+fn a_sandbox_in_its_own_session_cannot_open_dev_tty() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // `/dev/tty` is still bound — it is the magic device 5:0, which conveys no
+    // terminal of its own — and opening it now fails, because the sandbox's
+    // session has no controlling terminal for it to resolve to.
+    let output = Cage::builder()
+        .rootfs(rootfs)
+        .stdin(Stdio::Null)
+        .command("/bin/sh")
+        .args(["-c", "exec 3</dev/tty"])
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox launches");
+    assert!(
+        !output.status.success(),
+        "opening /dev/tty must fail without a controlling terminal",
+    );
+}
+
+/// An owned descriptor for `/dev/null`, for the caller-supplied stdin case.
+fn open_null() -> std::os::fd::OwnedFd {
+    std::fs::File::open("/dev/null")
+        .expect("/dev/null is openable")
+        .into()
+}
+
+#[test]
+fn a_null_output_stream_is_discarded() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Each output stream is directed on its own, so a sandbox can discard its
+    // results and keep its diagnostics. The command reports what its standard
+    // output was wired to — `/proc/self/fd` resolves a redirected stream to the
+    // file behind it — and writes a line of its own; both go to standard error,
+    // which the caller supplies as a pipe.
+    let (mut reader, writer) = std::io::pipe().expect("a pipe");
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        // Standard output is saved onto file descriptor 3 first: `>&2` on the
+        // `readlink` itself would put the pipe on file descriptor 1 for the
+        // duration of that command, and the link read back would name the pipe.
+        .args([
+            "-c",
+            "exec 3>&1; readlink /proc/self/fd/3 >&2; echo err >&2",
+        ])
+        .stdout(Stdio::Null)
+        .stderr(Stdio::from_fd(writer.into()))
+        .build()
+        .expect("a valid sandbox configuration");
+    let status = cage.run().expect("the sandbox launches");
+    assert!(status.success());
+    // The plan holds the caller's descriptor for its whole life, so the write
+    // end closes only once the cage is gone — which is what lets the read below
+    // reach end-of-file rather than block.
+    drop(cage);
+
+    let mut captured = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut captured)
+        .expect("the pipe reads to end-of-file");
+    let mut lines = captured.lines();
+    assert_eq!(
+        lines.next(),
+        Some("/dev/null"),
+        "a null standard output resolves to the null device: {captured:?}",
+    );
+    assert_eq!(
+        lines.next(),
+        Some("err"),
+        "the descriptor disposition carries what the command wrote: {captured:?}",
+    );
+}
+
+#[test]
+fn a_directed_output_stream_refuses_a_capturing_launch() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Capture supplies a pipe for each output stream, so a sandbox that already
+    // directs one somewhere is a contradiction the launch refuses rather than
+    // resolves. Standard input is untouched by capture and so never conflicts.
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "echo out"])
+        .stdout(Stdio::Null)
+        .build()
+        .expect("a valid sandbox configuration");
+    let err = cage.output().expect_err("a capturing launch is refused");
+    assert!(
+        matches!(
+            err,
+            ferroday_cage::Error::Config(
+                ferroday_cage::ConfigError::StreamAttachmentConflict { .. }
+            )
+        ),
+        "{err:?}",
+    );
+    // The same sandbox launches through an entry point that attaches nothing.
+    let status = cage.run().expect("a non-capturing launch is not refused");
+    assert!(status.success());
+}
+
+#[test]
+fn the_resolved_record_reports_each_stream_by_kind() {
+    use ferroday_cage::ResolvedStdio;
+
+    let cage = Cage::builder()
+        .rootfs("/tmp")
+        .command("/bin/sh")
+        .stdin(Stdio::from_fd(open_null()))
+        .stderr(Stdio::Null)
+        .build()
+        .expect("a valid sandbox configuration");
+    let streams = cage.resolved_inputs().streams;
+    assert_eq!(streams.stdin, ResolvedStdio::Fd);
+    assert_eq!(streams.stdout, ResolvedStdio::Inherit);
+    assert_eq!(streams.stderr, ResolvedStdio::Null);
 }

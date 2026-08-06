@@ -20,10 +20,14 @@
 //! The binary is built with every library feature enabled, so any profile the
 //! library accepts loads here, and every capability the builder offers has a
 //! flag. Two library seams have no command-line form, because neither is
-//! expressible as an argument: `Stdin::Fd`, which hands the command an open
+//! expressible as an argument: `Stdio::Fd`, which hands the command an open
 //! descriptor, and `CageBuilder::id_mapper`, which supplies an identity-map
 //! delegate as code. `--stdin` therefore offers the two dispositions a profile
-//! can name, and `--identity-map` the delegates the library bundles.
+//! can name, and `--identity-map` the delegates the library bundles. The output
+//! pair has no flag at all: a shell already spells both of its dispositions,
+//! and a profile carries `stdout` and `stderr` where they belong.
+
+mod terminal;
 
 use std::ffi::{OsStr, OsString};
 use std::net::Ipv4Addr;
@@ -37,7 +41,7 @@ use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ExitStatus, FsAccess, IdRange, Identity,
     IdentityMap, Limit, Mount, NetAccess, NetStack, Network, Overlay, RawMount, Resource,
     RestrictedProfile, Restriction, Running, SeccompArg, SeccompArgLen, SeccompCompare,
-    SeccompPolicy, SeccompRules, SetupStep, Stdin,
+    SeccompPolicy, SeccompRules, SetupStep, Stdio,
 };
 use serde::Deserialize as _;
 
@@ -176,7 +180,21 @@ The command and its process:
   --setenv NAME VALUE   Set an environment variable for the command
   --hostname NAME       Set the hostname inside the sandbox
   --chdir DIR           Working directory inside the sandbox (default /)
-  --stdin MODE          Standard input: inherit (default) or null
+  --stdin MODE          Standard input: inherit (default) or null. With null
+                        the command also runs in a session of its own, so the
+                        terminal fcage was started from is not its controlling
+                        terminal; an interrupt there stops fcage, which stops
+                        the sandbox. Standard output and standard error still
+                        reach that terminal unless redirected, which a shell
+                        already spells and a profile carries as stdout/stderr
+  --terminal            Give the sandbox a pseudoterminal of its own and relay
+                        this terminal to it: interactive programs work, and the
+                        sandbox reaches nothing of the terminal fcage was
+                        started from. TERM passes through as ever, so set it
+                        with --setenv TERM to override. From a script, where
+                        fcage's own input is not a terminal, this degrades to a
+                        plain byte relay around a sandbox that still has a real
+                        terminal of its own, at 80x24
   --timeout SECS        Terminate the command after SECS seconds, kill it
                         --kill-after seconds later, and exit 124
   --kill-after SECS     Grace between terminate and kill (default 10)
@@ -213,8 +231,8 @@ Hardening:
                         unprivileged user namespaces; requires at least one
                         --landlock-* or --seccomp flag, and accepts only
                         those plus --setenv, --no-base-env, --chdir,
-                        --stdin, --timeout, --kill-after, --rlimit, and
-                        --stop-with-caller
+                        --stdin, --terminal, --timeout, --kill-after,
+                        --rlimit, and --stop-with-caller
   --landlock-ro PATH    Grant the command read and execute beneath PATH under
                         a Landlock ruleset (repeatable; enrolling any grant
                         denies all filesystem access not granted)
@@ -356,7 +374,9 @@ struct Options {
     setenv: Vec<(OsString, OsString)>,
     hostname: Option<OsString>,
     chdir: Option<PathBuf>,
-    stdin: Option<Stdin>,
+    stdin: Option<Stdio>,
+    /// Whether to allocate a pseudoterminal for the sandbox and relay it.
+    terminal: bool,
     timeout: Option<Duration>,
     kill_after: Duration,
     /// Whether `--kill-after` was given explicitly, to reject it without a
@@ -682,6 +702,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         hostname: None,
         chdir: None,
         stdin: None,
+        terminal: false,
         timeout: None,
         kill_after: Duration::from_secs(10),
         kill_after_given: false,
@@ -829,6 +850,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             options.stdin = Some(parse_stdin(&value_for("--stdin", &mut args)?)?);
         } else if let Some(value) = flag_value(&arg, b"--stdin=") {
             options.stdin = Some(parse_stdin(&value)?);
+        } else if arg == "--terminal" {
+            options.terminal = true;
         } else if arg == "--timeout" {
             options.timeout = Some(parse_seconds(
                 "--timeout",
@@ -1109,6 +1132,14 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     // silently ignored.
     if options.kill_after_given && options.timeout.is_none() {
         return Err("--kill-after requires --timeout".to_string());
+    }
+
+    // A terminal is all three of the command's standard streams, so a stated
+    // disposition for any of them means two different things were asked for.
+    // The library refuses the same combination at the launch; naming it here
+    // makes it the usage error it is, and names both flags.
+    if options.terminal && matches!(options.stdin, Some(Stdio::Null)) {
+        return Err("--terminal cannot be used with --stdin null".to_string());
     }
 
     if options.restrict {
@@ -1764,11 +1795,11 @@ fn flag_value(arg: &OsStr, prefix: &[u8]) -> Option<OsString> {
 }
 
 /// Parses a `--stdin` mode.
-fn parse_stdin(value: &OsStr) -> Result<Stdin, String> {
+fn parse_stdin(value: &OsStr) -> Result<Stdio, String> {
     if value == "inherit" {
-        Ok(Stdin::Inherit)
+        Ok(Stdio::Inherit)
     } else if value == "null" {
-        Ok(Stdin::Null)
+        Ok(Stdio::Null)
     } else {
         Err(format!(
             "--stdin accepts 'inherit' or 'null', not {}",
@@ -2346,9 +2377,14 @@ fn run(options: Options) -> ExitCode {
             options.netstack_cidr,
             options.netstack_mtu,
             options.netstack_host_loopback,
+            options.terminal,
             options.timeout,
             options.kill_after,
         );
+    }
+
+    if options.terminal {
+        return run_on_a_terminal(builder, options.timeout, options.kill_after);
     }
 
     let outcome = builder
@@ -2356,6 +2392,51 @@ fn run(options: Options) -> ExitCode {
         .and_then(|cage| cage.spawn())
         .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
     conclude(outcome)
+}
+
+/// Runs a sandbox on a pseudoterminal of its own and relays the caller's
+/// terminal to it.
+///
+/// The signals the relay reads are blocked first, before anything else the run
+/// may start, so no thread of this process is left able to take one; raw mode is
+/// entered last, inside the relay, so every failure up to that point leaves the
+/// caller's terminal untouched.
+fn run_on_a_terminal(
+    builder: CageBuilder,
+    timeout: Option<Duration>,
+    kill_after: Duration,
+) -> ExitCode {
+    let signals = match terminal::Signals::install() {
+        Ok(signals) => signals,
+        Err(error) => return conclude_relay(Err(error)),
+    };
+    let launched = builder
+        .build()
+        .and_then(|cage| cage.spawn_terminal(&terminal::terminal_for_caller()));
+    let (running, pty) = match launched {
+        Ok(launched) => launched,
+        Err(error) => {
+            eprintln!("fcage: {error}");
+            return ExitCode::from(error_exit_code(&error));
+        }
+    };
+    conclude_relay(terminal::relay(running, pty, signals, timeout, kill_after))
+}
+
+/// Maps a relay's outcome onto the process exit status.
+///
+/// The library's own failures go through [`conclude`], so a launch that fails
+/// the same way with and without a terminal exits the same way. The relay's own
+/// plumbing failing is a `fcage` failure, which is 125.
+fn conclude_relay(outcome: Result<Option<ExitStatus>, terminal::RelayError>) -> ExitCode {
+    match outcome {
+        Ok(outcome) => conclude(Ok(outcome)),
+        Err(terminal::RelayError::Cage(error)) => conclude(Err(error)),
+        Err(terminal::RelayError::Io(error)) => {
+            eprintln!("fcage: the terminal relay failed: {error}");
+            ExitCode::from(125)
+        }
+    }
 }
 
 /// Builds and runs a sandbox with the native network stack attached at the
@@ -2366,9 +2447,21 @@ fn run_with_netstack(
     cidr: Option<(Ipv4Addr, u8)>,
     mtu: Option<u16>,
     host_loopback: bool,
+    terminal: bool,
     timeout: Option<Duration>,
     kill_after: Duration,
 ) -> ExitCode {
+    // Blocked before the stack's own thread exists, so that thread inherits the
+    // mask and no process-directed signal can be delivered behind the relay's
+    // back. Nothing is allocated for a run without a terminal.
+    let signals = if terminal {
+        match terminal::Signals::install() {
+            Ok(signals) => Some(signals),
+            Err(error) => return conclude_relay(Err(error)),
+        }
+    } else {
+        None
+    };
     let cage = match builder.build() {
         Ok(cage) => cage,
         Err(error) => {
@@ -2395,8 +2488,19 @@ fn run_with_netstack(
     // Hold the command at the gate, attach the stack to the sandbox's
     // namespace, then release the command. A failed attach drops the
     // pending launch, which tears the sandbox down.
-    let pending = match cage.spawn_pending() {
-        Ok(pending) => pending,
+    //
+    // With a terminal, the primary comes back here rather than out of
+    // `proceed`: the pseudoterminal is allocated before the fork and the gate
+    // sits after its controlling terminal is established, so the stack is
+    // attached with the primary already in hand.
+    let held = if terminal {
+        cage.spawn_pending_terminal(&terminal::terminal_for_caller())
+            .map(|(pending, pty)| (pending, Some(pty)))
+    } else {
+        cage.spawn_pending().map(|pending| (pending, None))
+    };
+    let (pending, pty) = match held {
+        Ok(held) => held,
         Err(error) => {
             eprintln!("fcage: {error}");
             return ExitCode::from(error_exit_code(&error));
@@ -2417,13 +2521,19 @@ fn run_with_netstack(
         }
     };
 
-    let outcome = wait_with_deadline(running, timeout, kill_after);
+    // The relay when a terminal was allocated, the plain wait otherwise. Both
+    // return the same outcome; only the driving differs.
+    let outcome = match (pty, signals) {
+        (Some(pty), Some(signals)) => terminal::relay(running, pty, signals, timeout, kill_after),
+        _ => wait_with_deadline(running, timeout, kill_after).map_err(Into::into),
+    };
     // The stack is torn down after the command; a failure here loses no
-    // data, so it is a warning, not the run's outcome.
+    // data, so it is a warning, not the run's outcome. Printed after the relay
+    // has restored the caller's terminal, so it is not stair-stepped.
     if let Err(error) = handle.stop() {
         eprintln!("fcage: the network stack did not stop cleanly: {error}");
     }
-    conclude(outcome)
+    conclude_relay(outcome)
 }
 
 /// Composes the sandbox's `resolv.conf` for a native-stack run: binds the
@@ -2510,6 +2620,32 @@ fn run_restricted(options: Options) -> ExitCode {
     }
     if let Some(policy) = options.seccomp {
         builder = builder.seccomp(policy);
+    }
+
+    if options.terminal {
+        // A host-allocated pseudoterminal needs no devpts instance, so the
+        // fallback gets the same interactive story a cage does.
+        let signals = match terminal::Signals::install() {
+            Ok(signals) => signals,
+            Err(error) => return conclude_relay(Err(error)),
+        };
+        let launched = builder
+            .build()
+            .and_then(|restriction| restriction.spawn_terminal(&terminal::terminal_for_caller()));
+        let (running, pty) = match launched {
+            Ok(launched) => launched,
+            Err(error) => {
+                eprintln!("fcage: {error}");
+                return ExitCode::from(error_exit_code(&error));
+            }
+        };
+        return conclude_relay(terminal::relay(
+            running,
+            pty,
+            signals,
+            options.timeout,
+            options.kill_after,
+        ));
     }
 
     let outcome = builder
@@ -3667,6 +3803,61 @@ mod tests {
             .err()
             .expect("a sub-flag without --netstack is a usage error");
         assert!(err.contains("require --netstack"), "{err}");
+    }
+
+    #[test]
+    fn terminal_conflicts_with_a_null_stdin() {
+        // A terminal is all three of the command's standard streams, so a
+        // stated disposition for one means two different things were asked for.
+        // Named here rather than left to the launch, so the message names both
+        // flags.
+        let err = parse_run(&[
+            "--rootfs",
+            "/r",
+            "--terminal",
+            "--stdin",
+            "null",
+            "/bin/true",
+        ])
+        .err()
+        .expect("a directed stream contradicts a terminal");
+        assert!(err.contains("--terminal"), "{err}");
+        assert!(err.contains("--stdin"), "{err}");
+    }
+
+    #[test]
+    fn terminal_conflicts_with_a_null_stdin_under_restrict() {
+        // The restriction fallback supports a terminal too, so the same
+        // contradiction has to be caught on that path — which returns before
+        // the launch checks below it.
+        let err = parse_run(&[
+            "--restrict",
+            "--seccomp",
+            "curated",
+            "--terminal",
+            "--stdin=null",
+            "/bin/true",
+        ])
+        .err()
+        .expect("a directed stream contradicts a terminal here too");
+        assert!(err.contains("--terminal"), "{err}");
+    }
+
+    #[test]
+    fn terminal_composes_with_a_restriction_and_with_the_native_stack() {
+        // Both are advertised independently, so both compose: a restriction
+        // allocates its own pseudoterminal, and a native-stack run takes the
+        // pending path and hands the primary over before the command runs.
+        parse_run(&[
+            "--restrict",
+            "--seccomp",
+            "curated",
+            "--terminal",
+            "/bin/true",
+        ])
+        .expect("a restriction takes a terminal");
+        parse_run(&["--rootfs", "/r", "--netstack", "--terminal", "/bin/true"])
+            .expect("the native stack takes a terminal");
     }
 
     #[test]

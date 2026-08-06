@@ -112,12 +112,18 @@ pub enum SetupStep {
     MountOverlayRoot = 43,
     /// Apply a resource limit to the command.
     SetRlimit = 44,
+    /// Start the sandbox's own session, detaching it from the caller's
+    /// controlling terminal.
+    NewSession = 45,
+    /// Make the launch's pseudoterminal the controlling terminal of the
+    /// sandbox's session.
+    SetControllingTerminal = 46,
 }
 
 impl SetupStep {
     /// Every step, in wire order. Used by the wire-protocol tests.
     #[cfg(test)]
-    pub(crate) const ALL: [SetupStep; 44] = [
+    pub(crate) const ALL: [SetupStep; 46] = [
         SetupStep::Unshare,
         SetupStep::DenySetgroups,
         SetupStep::WriteGidMap,
@@ -162,6 +168,8 @@ impl SetupStep {
         SetupStep::SetUid,
         SetupStep::MountOverlayRoot,
         SetupStep::SetRlimit,
+        SetupStep::NewSession,
+        SetupStep::SetControllingTerminal,
     ];
 
     /// Decodes a step from its setup-error-pipe wire value.
@@ -211,6 +219,8 @@ impl SetupStep {
             42 => SetupStep::SetUid,
             43 => SetupStep::MountOverlayRoot,
             44 => SetupStep::SetRlimit,
+            45 => SetupStep::NewSession,
+            46 => SetupStep::SetControllingTerminal,
             _ => return None,
         })
     }
@@ -263,6 +273,10 @@ impl fmt::Display for SetupStep {
             SetupStep::SetUid => "switching to the command uid",
             SetupStep::MountOverlayRoot => "mounting the overlay root",
             SetupStep::SetRlimit => "applying a resource limit",
+            SetupStep::NewSession => "starting the sandbox's own session",
+            SetupStep::SetControllingTerminal => {
+                "making the sandbox's pseudoterminal its controlling terminal"
+            }
         })
     }
 }
@@ -490,6 +504,29 @@ pub enum ConfigError {
         /// The forbidden operation, as a short phrase.
         operation: &'static str,
     },
+    /// A launch attaches a conduit to a standard stream the sandbox was built
+    /// to send somewhere else.
+    ///
+    /// [`Stdio::Inherit`](crate::Stdio::Inherit) states no destination, so a
+    /// launch is free to supply one and this never arises against it.
+    /// [`Stdio::Null`](crate::Stdio::Null) and
+    /// [`Stdio::from_fd`](crate::Stdio::from_fd) state one, and a launch that
+    /// would supply its own — an [`Observer`](crate::Observer)'s capture pipes
+    /// — is refused rather than silently overriding what the caller said.
+    ///
+    /// Reported by the launch rather than by
+    /// [`build`](crate::CageBuilder::build): the contradiction is between the
+    /// frozen sandbox and one particular launch of it, and the same sandbox
+    /// launches without contradiction through an entry point that attaches
+    /// nothing.
+    #[non_exhaustive]
+    StreamAttachmentConflict {
+        /// The stream whose disposition the attachment contradicts:
+        /// `"standard output"` or `"standard error"`.
+        stream: &'static str,
+        /// What the launch attaches to it, as a short phrase.
+        attachment: &'static str,
+    },
     /// An identity map's ranges are structurally invalid.
     ///
     /// The kernel's rules are enforced here so an unwritable map is a typed
@@ -584,6 +621,35 @@ pub enum ConfigError {
         path: PathBuf,
         /// The raw OS error the preparation failed with.
         errno: i32,
+    },
+    /// An overlay layer directory the library would have created was already
+    /// there, and is not a directory the calling user owns.
+    ///
+    /// The upper and work directories are created if absent, and the caller may
+    /// name them under a directory it shares with other local users. An entry
+    /// already at the path is adopted only when it is a directory belonging to
+    /// the calling user: a symbolic link — which would send every write the
+    /// sandbox makes to a destination of whoever planted it, and hand that
+    /// destination back to the caller as the layer its run produced — or a
+    /// directory owned by someone else is refused instead of used.
+    #[non_exhaustive]
+    OverlayDirUnowned {
+        /// Which layer directory was refused.
+        layer: OverlayLayer,
+        /// The path that was already occupied.
+        path: PathBuf,
+    },
+    /// An overlay's upper layer is the filesystem root.
+    ///
+    /// The upper needs a parent directory: the work directory the library
+    /// derives is a sibling of the upper, and the host overlay preflight runs in
+    /// that parent so its scratch entries land beside the upper rather than
+    /// inside it. `/` has no parent — and an upper there would put the sandbox's
+    /// writes over the whole host root.
+    #[non_exhaustive]
+    OverlayUpperIsRoot {
+        /// The offending path.
+        path: PathBuf,
     },
     /// An overlay-rooted cage was requested on a host that cannot establish an
     /// unprivileged overlay mount.
@@ -734,6 +800,11 @@ impl fmt::Display for ConfigError {
                 "this profile uses {operation}, which the restricted policy reserves for a \
                  trusted profile"
             ),
+            ConfigError::StreamAttachmentConflict { stream, attachment } => write!(
+                f,
+                "this launch attaches {attachment} to the command's {stream}, which the sandbox \
+                 directs elsewhere"
+            ),
             ConfigError::RestrictionEmpty => {
                 f.write_str("the restriction names no Landlock grant or seccomp policy")
             }
@@ -778,6 +849,20 @@ impl fmt::Display for ConfigError {
                 "cannot use {} as the overlay {layer} directory: {}",
                 path.display(),
                 std::io::Error::from_raw_os_error(*errno),
+            ),
+            ConfigError::OverlayDirUnowned { layer, path } => write!(
+                f,
+                "cannot use {} as the overlay {layer} directory: something is already there that \
+                 is not a directory the calling user owns; the layer directories are created \
+                 fresh, and adopting an entry another user could have planted would send the \
+                 sandbox's writes wherever it pointed",
+                path.display(),
+            ),
+            ConfigError::OverlayUpperIsRoot { path } => write!(
+                f,
+                "cannot use {} as the overlay upper directory: the upper needs a parent \
+                 directory, for the work directory beside it and for the host preflight",
+                path.display(),
             ),
             ConfigError::OverlayUnavailable { blocker } => {
                 write!(f, "an overlay-rooted cage cannot be established: {blocker}")
@@ -880,6 +965,21 @@ pub enum Error {
     /// The delegate runs caller-side against the gated launch, so its own
     /// error is the diagnostic; the gated sandbox is torn down.
     IdentityMap(crate::IdMapError),
+    /// A pseudoterminal operation failed: allocating one for the sandbox, or
+    /// reading or setting its window size.
+    #[non_exhaustive]
+    Terminal {
+        /// The raw OS error the operation failed with.
+        errno: i32,
+    },
+    /// The host has no free pseudoterminal to allocate.
+    ///
+    /// Pseudoterminals are a bounded resource — `/proc/sys/kernel/pty/max`
+    /// states the ceiling — so a host running many sandboxes at once can
+    /// exhaust them. Distinct from [`Terminal`](Self::Terminal) because it is
+    /// the one allocation failure that says nothing is wrong with the request:
+    /// the same launch succeeds once something releases a terminal.
+    TerminalsExhausted,
 }
 
 impl fmt::Display for Error {
@@ -938,6 +1038,15 @@ impl fmt::Display for Error {
             Error::IdentityMap(err) => {
                 write!(f, "could not establish the identity map: {err}")
             }
+            Error::Terminal { errno } => write!(
+                f,
+                "a pseudoterminal operation failed: {}",
+                std::io::Error::from_raw_os_error(*errno),
+            ),
+            Error::TerminalsExhausted => f.write_str(
+                "the host has no free pseudoterminal to allocate; \
+                 /proc/sys/kernel/pty/max states the ceiling",
+            ),
         }
     }
 }

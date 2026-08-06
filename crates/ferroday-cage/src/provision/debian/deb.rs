@@ -6,15 +6,16 @@
 //! extracts through the same hardened extractor once unwrapped from the `ar`
 //! container.
 //!
-//! A `.deb` is read either whole or a member at a time. [`extract_deb`] takes
-//! the bytes it was given, because the installing side already holds them: it
-//! verified their digest against the archive's index before writing them down.
-//! A caller that only needs the control stanza reads it through
-//! [`read_control_from`], which seeks over the members around it, and takes the
-//! digest through [`sha256_stream`], which reads in chunks. Together those two
-//! let the pool writer describe a package without ever holding one.
+//! Nothing here holds a `.deb`. Every read reaches its member by seeking on the
+//! container's declared sizes, so the members before the one wanted are stepped
+//! over and the members after it are never touched: [`extract_deb`] streams the
+//! `data.tar` through the decompressor into the extractor, and
+//! [`read_control_from`] reads only the control member. Digests are taken in
+//! chunks on the way past — [`sha256_stream`] on a read, [`DigestWriter`] on a
+//! write. So installing or publishing a 90 MB kernel package costs what a shell
+//! script costs.
 
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -71,6 +72,55 @@ pub(crate) fn sha256_stream(reader: &mut impl Read) -> io::Result<(String, u64)>
     Ok((hex(&hasher.finalize()), size))
 }
 
+/// A writer that digests everything written through it on its way to `inner`.
+///
+/// The write-side counterpart of [`sha256_stream`]. A [`Fetch`](super::Fetch)
+/// writes a resource to a sink as it arrives, so a download that digests at the
+/// sink learns what it received without holding it: the bytes go to their file
+/// and to the hasher in one pass, and the caller decides whether to publish the
+/// file only after the digest is known.
+pub(crate) struct DigestWriter<W> {
+    inner: W,
+    hasher: Sha256,
+    written: u64,
+}
+
+impl<W: Write> DigestWriter<W> {
+    /// Wraps `inner`, digesting what passes through.
+    pub(crate) fn new(inner: W) -> DigestWriter<W> {
+        DigestWriter {
+            inner,
+            hasher: Sha256::new(),
+            written: 0,
+        }
+    }
+
+    /// Flushes the wrapped writer and reports the lowercase hex digest of
+    /// everything written through it, with the number of bytes that was.
+    ///
+    /// The count comes from what was actually written rather than from a stat,
+    /// so it describes the same bytes the digest does.
+    pub(crate) fn finish(mut self) -> io::Result<(String, u64)> {
+        self.inner.flush()?;
+        Ok((hex(&self.hasher.finalize()), self.written))
+    }
+}
+
+impl<W: Write> Write for DigestWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Only what the inner writer accepted is digested, so a short write
+        // cannot put the digest and the file out of step.
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Formats a digest as lowercase hex.
 fn hex(digest: &[u8]) -> String {
     let mut text = String::with_capacity(digest.len() * 2);
@@ -86,24 +136,112 @@ fn hex(digest: &[u8]) -> String {
 /// the caller can record ownership for the dpkg statoverride. Extraction
 /// shares the caller's [`Extraction`], so directory metadata is applied once
 /// across every package rather than per package.
-pub(crate) fn extract_deb(
+///
+/// The member is streamed rather than buffered: the container is seeked to it,
+/// and the decompressor and the tar reader are stacked directly on the file. So
+/// unpacking a package costs the extractor's own buffers whatever the package
+/// weighs, which is the property the whole module keeps.
+pub(crate) fn extract_deb<R: Read + Seek>(
     package: &str,
-    deb: &[u8],
+    deb: &mut R,
     extraction: &mut Extraction,
     on_entry: &mut OnEntry<'_>,
 ) -> Result<(), ProvisionError> {
-    let members = parse_ar(deb).map_err(|reason| deb_error(package, &reason))?;
-    let data = members
-        .iter()
-        .find(|member| member.name.starts_with("data.tar"))
-        .ok_or_else(|| deb_error(package, "no data.tar member"))?;
-
-    let mut cursor = Cursor::new(data.bytes);
-    let head = compress::sniff_head(&mut cursor)
+    let size = seek_to_member(deb, "data.tar", None, &|reason: String| {
+        deb_error(package, &reason)
+    })?;
+    // Bounded by the member's declared size, so the tar stream ends where the
+    // member ends instead of running on into the container's next header.
+    let mut member = deb.take(size);
+    let head = compress::sniff_head(&mut member)
         .map_err(|err| io_error("reading the data member of", Path::new(package), err))?;
-    let decoded = compress::decompress(&head, cursor)?;
+    let decoded = compress::decompress(&head, member)?;
     let mut archive = TarReader::new(decoded);
     extraction.extract(&mut archive, on_entry)
+}
+
+/// Positions `deb` at the data of its first member whose name begins with
+/// `member`, and returns that member's declared size.
+///
+/// The name is matched as a prefix because a `.deb`'s compressed members carry
+/// the compression as a suffix — `control.tar.xz`, `data.tar.zst` — and which
+/// one a package used is not the caller's concern.
+///
+/// The `ar` container records each member's size in its header, so the members
+/// before the one wanted are seeked over rather than read, and the members after
+/// it are never touched. Seeking rather than scanning also keeps the read
+/// indifferent to member order, which a reader that stopped at the first member
+/// it streamed past would not be.
+///
+/// `limit` bounds what the member may declare, for a caller that will read it
+/// into memory rather than stream it. It is checked against the declared size
+/// before that size is used for anything, so a header claiming more than any
+/// real member holds is refused rather than acted on.
+///
+/// A structural problem is reported through `bad`, which names the `.deb` the
+/// caller is reading; an I/O failure is reported against the member being sought.
+fn seek_to_member<R: Read + Seek>(
+    deb: &mut R,
+    member: &str,
+    limit: Option<u64>,
+    bad: &dyn Fn(String) -> ProvisionError,
+) -> Result<u64, ProvisionError> {
+    let io = |err: io::Error| io_error("reading a member of the package", Path::new(member), err);
+
+    // The end offset bounds every member size, so a header claiming more than
+    // the file holds is refused before anything is read on its word.
+    let length = deb.seek(SeekFrom::End(0)).map_err(io)?;
+    deb.rewind().map_err(io)?;
+
+    let mut magic = [0u8; AR_MAGIC.len()];
+    deb.read_exact(&mut magic)
+        .map_err(|_| bad("not an ar archive (bad magic)".to_string()))?;
+    if magic != AR_MAGIC {
+        return Err(bad("not an ar archive (bad magic)".to_string()));
+    }
+
+    let mut offset = AR_MAGIC.len() as u64;
+    while offset < length {
+        // A trailing newline padding byte between the last member and the
+        // end of the archive is tolerated.
+        let remaining = length - offset;
+        if remaining < AR_HEADER as u64 {
+            let mut tail = vec![0u8; remaining as usize];
+            deb.read_exact(&mut tail).map_err(io)?;
+            if tail.iter().all(|byte| *byte == b'\n') {
+                break;
+            }
+            return Err(bad("a truncated member header".to_string()));
+        }
+
+        let mut header = [0u8; AR_HEADER];
+        deb.read_exact(&mut header).map_err(io)?;
+        if &header[58..60] != b"`\n" {
+            return Err(bad("a member header lacks its magic".to_string()));
+        }
+        let name = ar_name(&header[0..16]);
+        let size: u64 = ascii_field(&header[48..58])
+            .parse()
+            .map_err(|_| bad("a member size is not a number".to_string()))?;
+
+        let wanted = name.starts_with(member);
+        if wanted && limit.is_some_and(|limit| size > limit) {
+            return Err(bad(format!("the {member} member is implausibly large")));
+        }
+        let end = (offset + AR_HEADER as u64)
+            .checked_add(size)
+            .filter(|end| *end <= length)
+            .ok_or_else(|| bad("a member size runs past the archive".to_string()))?;
+
+        if wanted {
+            return Ok(size);
+        }
+
+        // Members are padded to an even offset with a single newline.
+        offset = end + (size & 1);
+        deb.seek(SeekFrom::Start(offset)).map_err(io)?;
+    }
+    Err(bad(format!("no {member} member")))
 }
 
 /// Reads a `.deb`'s control stanza: the `control` member of its `control.tar`.
@@ -120,82 +258,26 @@ pub(crate) fn extract_deb(
 /// `Packages` index without reconstructing deb822 folding, appending only the
 /// archive-supplied `Filename`, `Size`, and `SHA256`.
 ///
-/// Only the control member is read. The `ar` container records each member's
-/// size in its header, so the members before the one wanted are seeked over
-/// rather than read, and the members after it are never touched. That keeps the
-/// cost proportional to the control member — a few kilobytes in a typical
-/// package — rather than to the `.deb`, which for a kernel package is four
-/// orders of magnitude larger. Seeking rather than scanning also keeps the read
-/// indifferent to member order, which a reader that stopped at the first
-/// `control.tar` it streamed past would not be.
+/// Only the control member is read, and [`seek_to_member`] describes what that
+/// costs: reaching it is proportional to the members before it — a few hundred
+/// bytes — rather than to the `.deb`, which for a kernel package is four orders
+/// of magnitude larger.
 pub(crate) fn read_control_from<R: Read + Seek>(deb: &mut R) -> Result<String, ProvisionError> {
-    let io = |err: io::Error| {
+    let size = seek_to_member(
+        deb,
+        "control.tar",
+        Some(CONTROL_MEMBER_LIMIT),
+        &|reason: String| control_error(&reason),
+    )?;
+    let mut member = vec![0u8; size as usize];
+    deb.read_exact(&mut member).map_err(|err| {
         io_error(
             "reading the control member of the package",
             Path::new("control.tar"),
             err,
         )
-    };
-
-    // The end offset bounds every member size, the same check the whole-buffer
-    // parse makes against the buffer's length.
-    let length = deb.seek(SeekFrom::End(0)).map_err(io)?;
-    deb.rewind().map_err(io)?;
-
-    let mut magic = [0u8; AR_MAGIC.len()];
-    deb.read_exact(&mut magic)
-        .map_err(|_| control_error("not an ar archive (bad magic)"))?;
-    if magic != AR_MAGIC {
-        return Err(control_error("not an ar archive (bad magic)"));
-    }
-
-    let mut offset = AR_MAGIC.len() as u64;
-    while offset < length {
-        // A trailing newline padding byte between the last member and the
-        // end of the archive is tolerated.
-        let remaining = length - offset;
-        if remaining < AR_HEADER as u64 {
-            let mut tail = vec![0u8; remaining as usize];
-            deb.read_exact(&mut tail).map_err(io)?;
-            if tail.iter().all(|byte| *byte == b'\n') {
-                break;
-            }
-            return Err(control_error("a truncated member header"));
-        }
-
-        let mut header = [0u8; AR_HEADER];
-        deb.read_exact(&mut header).map_err(io)?;
-        if &header[58..60] != b"`\n" {
-            return Err(control_error("a member header lacks its magic"));
-        }
-        let name = ar_name(&header[0..16]);
-        let size: u64 = ascii_field(&header[48..58])
-            .parse()
-            .map_err(|_| control_error("a member size is not a number"))?;
-
-        // The cap is checked against the declared size, before anything is
-        // sized from it, so an implausible header is refused rather than acted
-        // on.
-        let is_control = name.starts_with("control.tar");
-        if is_control && size > CONTROL_MEMBER_LIMIT {
-            return Err(control_error("the control member is implausibly large"));
-        }
-        let end = (offset + AR_HEADER as u64)
-            .checked_add(size)
-            .filter(|end| *end <= length)
-            .ok_or_else(|| control_error("a member size runs past the archive"))?;
-
-        if is_control {
-            let mut member = vec![0u8; size as usize];
-            deb.read_exact(&mut member).map_err(io)?;
-            return control_from_tar(&member);
-        }
-
-        // Members are padded to an even offset with a single newline.
-        offset = end + (size & 1);
-        deb.seek(SeekFrom::Start(offset)).map_err(io)?;
-    }
-    Err(control_error("no control.tar member"))
+    })?;
+    control_from_tar(&member)
 }
 
 /// Reads the `control` entry out of a `.deb`'s `control.tar` member.
@@ -244,56 +326,11 @@ fn control_error(reason: &str) -> ProvisionError {
     ProvisionError::other(format!("the .deb control member is unreadable: {reason}"))
 }
 
-/// One member of an `ar` archive: its name and a slice of its data.
-struct ArMember<'a> {
-    name: String,
-    bytes: &'a [u8],
-}
-
-/// Parses the members of an `ar` archive.
+/// Trims an `ar` member name: trailing spaces and the GNU terminator slash.
 ///
 /// Only the fixed-name short form is handled, which is all a `.deb` uses; the
 /// GNU long-name table and BSD extensions are not needed and are not
 /// implemented.
-fn parse_ar(archive: &[u8]) -> Result<Vec<ArMember<'_>>, String> {
-    let rest = archive
-        .strip_prefix(AR_MAGIC)
-        .ok_or("not an ar archive (bad magic)")?;
-    let mut offset = 0;
-    let mut members = Vec::new();
-    while offset < rest.len() {
-        // A trailing newline padding byte between the last member and the
-        // end of the archive is tolerated.
-        if rest.len() - offset < AR_HEADER {
-            if rest[offset..].iter().all(|byte| *byte == b'\n') {
-                break;
-            }
-            return Err("a truncated member header".to_string());
-        }
-        let header = &rest[offset..offset + AR_HEADER];
-        if &header[58..60] != b"`\n" {
-            return Err("a member header lacks its magic".to_string());
-        }
-        let name = ar_name(&header[0..16]);
-        let size: usize = ascii_field(&header[48..58])
-            .parse()
-            .map_err(|_| "a member size is not a number".to_string())?;
-        let start = offset + AR_HEADER;
-        let end = start
-            .checked_add(size)
-            .filter(|end| *end <= rest.len())
-            .ok_or("a member size runs past the archive")?;
-        members.push(ArMember {
-            name,
-            bytes: &rest[start..end],
-        });
-        // Members are padded to an even offset with a single newline.
-        offset = end + (size & 1);
-    }
-    Ok(members)
-}
-
-/// Trims an `ar` member name: trailing spaces and the GNU terminator slash.
 fn ar_name(field: &[u8]) -> String {
     let text = String::from_utf8_lossy(field);
     text.trim_end().trim_end_matches('/').to_string()
@@ -336,24 +373,64 @@ mod tests {
         );
     }
 
+    /// Seeks to `member`, reporting the reason rather than a typed error, and
+    /// returns it with the bytes the member holds.
+    fn member_of(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
+        let mut cursor = Cursor::new(archive);
+        let size = seek_to_member(&mut cursor, member, None, &|reason: String| {
+            ProvisionError::other(reason)
+        })
+        .map_err(|err| err.to_string())?;
+        let mut bytes = vec![0u8; size as usize];
+        cursor
+            .read_exact(&mut bytes)
+            .map_err(|err| err.to_string())?;
+        Ok(bytes)
+    }
+
     #[test]
-    fn ar_members_parse_with_padding() {
+    fn a_member_is_reached_across_the_padding_before_it() {
+        // An odd-length member is followed by a padding byte, so a walk that
+        // did not step over it would find the next header one byte late.
         let mut archive = AR_MAGIC.to_vec();
-        // An odd-length member forces a padding byte before the next one.
         ar_member(&mut archive, "debian-binary", b"2.0\n");
         ar_member(&mut archive, "control.tar.gz", b"odd");
         ar_member(&mut archive, "data.tar.xz", b"payload!");
-        let members = parse_ar(&archive).unwrap();
-        assert_eq!(
-            members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
-            ["debian-binary", "control.tar.gz", "data.tar.xz"]
-        );
-        assert_eq!(members[2].bytes, b"payload!");
+        assert_eq!(member_of(&archive, "control.tar").unwrap(), b"odd");
+        assert_eq!(member_of(&archive, "data.tar").unwrap(), b"payload!");
+        // The name is matched as a prefix, because the compression suffix is
+        // the package's choice and not the reader's concern.
+        assert_eq!(member_of(&archive, "debian-binary").unwrap(), b"2.0\n");
+    }
+
+    #[test]
+    fn a_member_the_archive_does_not_carry_is_reported_by_name() {
+        let mut archive = AR_MAGIC.to_vec();
+        ar_member(&mut archive, "debian-binary", b"2.0\n");
+        let reason = member_of(&archive, "data.tar").unwrap_err();
+        assert!(reason.contains("no data.tar member"), "{reason}");
     }
 
     #[test]
     fn a_non_ar_input_is_rejected() {
-        assert!(parse_ar(b"not an ar archive at all").is_err());
+        let reason = member_of(b"not an ar archive at all", "data.tar").unwrap_err();
+        assert!(reason.contains("bad magic"), "{reason}");
+    }
+
+    #[test]
+    fn a_member_size_running_past_the_archive_is_rejected() {
+        // The container's own end bounds every declared size, so a header
+        // claiming more than the file holds is refused before anything is read
+        // or allocated on its word.
+        let mut archive = AR_MAGIC.to_vec();
+        let mut header = [b' '; AR_HEADER];
+        header[.."data.tar".len()].copy_from_slice(b"data.tar");
+        header[48..58].copy_from_slice(b"9999999999");
+        header[58] = b'`';
+        header[59] = b'\n';
+        archive.extend_from_slice(&header);
+        let reason = member_of(&archive, "data.tar").unwrap_err();
+        assert!(reason.contains("runs past the archive"), "{reason}");
     }
 
     /// Writes an octal header field: digits padded to the field width, NUL

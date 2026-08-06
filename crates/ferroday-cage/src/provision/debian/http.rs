@@ -294,9 +294,8 @@ impl HttpFetch {
 }
 
 /// Reads a local file for a `file://` URL.
-fn fetch_file(url: &str, path: &str, sink: &mut dyn Write) -> Result<(), FetchError> {
-    // file://localhost/path and file:///path both name an absolute path.
-    let path = path.strip_prefix("localhost").unwrap_or(path);
+fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write) -> Result<(), FetchError> {
+    let path = local_file_path(url, rest)?;
     let mut file = File::open(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             FetchError::not_found(url)
@@ -306,6 +305,47 @@ fn fetch_file(url: &str, path: &str, sink: &mut dyn Write) -> Result<(), FetchEr
     })?;
     io::copy(&mut file, sink).map_err(|source| FetchError::io(url, "reading the file", source))?;
     Ok(())
+}
+
+/// The local path a `file://` URL names, refusing one that names another
+/// machine.
+///
+/// `rest` is the URL with `file://` already stripped, so it is an authority
+/// followed by the path. RFC 8089 gives the authority two spellings for the
+/// machine the URL is read on — empty, as in `file:///srv/pool`, and
+/// `localhost`, as in `file://localhost/srv/pool` — and anything else names a
+/// different host.
+///
+/// This library has no way to read a file from another machine, so such a URL is
+/// refused rather than reinterpreted. Without the check the authority stays on
+/// the front of the string and `File::open` resolves what is left relative to
+/// the process's current directory, so `file://otherhost/srv/pool` would quietly
+/// read `./otherhost/srv/pool` — a different file, on this machine, reported as
+/// though the URL had been honoured.
+///
+/// The authority is split at the first `/` rather than matched by prefix, so
+/// `file://localhostile/x` is the remote host `localhostile` and not the
+/// relative path `ile/x`.
+fn local_file_path<'a>(url: &str, rest: &'a str) -> Result<&'a str, FetchError> {
+    let (authority, path) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        // No separator at all: the whole of it is the authority, and the URL
+        // names no path.
+        None => (rest, ""),
+    };
+    if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+        return Err(FetchError::url(
+            url,
+            format!(
+                "the authority {authority:?} names another host, and a file:// URL this library \
+                 reads names a path on this one",
+            ),
+        ));
+    }
+    if path.is_empty() {
+        return Err(FetchError::url(url, "the URL names no path"));
+    }
+    Ok(path)
 }
 
 /// Whether `s` is an absolute URL — a scheme followed by `://` — rather than a
@@ -771,6 +811,37 @@ mod tests {
             HttpFetch::new().fetch(&FetchRequest::new(&missing), &mut Vec::new()),
             Err(FetchError::NotFound { .. })
         ));
+
+        // The other spelling of this machine reads the same file.
+        let localhost = format!("file://localhost{}", path.display());
+        let mut out = Vec::new();
+        HttpFetch::new()
+            .fetch(&FetchRequest::new(&localhost), &mut out)
+            .unwrap();
+        assert_eq!(out, b"contents");
+    }
+
+    #[test]
+    fn a_file_url_naming_another_host_is_refused_rather_than_read_relative() {
+        // The authority sits between `file://` and the path. Left on the front
+        // of the string it is not an authority at all: `File::open` resolves
+        // what remains against the process's current directory, so a URL naming
+        // a remote host would quietly read a different file on this one and
+        // report it as though the URL had been honoured.
+        for url in [
+            "file://otherhost/srv/pool/Release",
+            // The `localhost` prefix is matched as a whole authority, not as a
+            // prefix of one: this is the host `localhostile`, and reading it as
+            // the relative path `ile/x` is exactly the confusion above.
+            "file://localhostile/x",
+            "file://localhost",
+            "file://",
+        ] {
+            match HttpFetch::new().fetch(&FetchRequest::new(url), &mut Vec::new()) {
+                Err(FetchError::Url { .. }) => {}
+                other => panic!("{url} should be refused, got {other:?}"),
+            }
+        }
     }
 
     #[test]

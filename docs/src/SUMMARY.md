@@ -9,6 +9,7 @@
 - [The process model](process-model.md)
 - [Identity maps](identity-maps.md)
 - [Streaming output](streaming.md)
+- [A terminal of the sandbox's own](terminal.md)
 - [Embedding in a runtime](embedding.md)
 - [Profiles](profiles.md)
 - [Building an orchestrator](building-an-orchestrator.md)

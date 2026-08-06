@@ -21,6 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
+use super::identity::compose_child_map;
 use super::{Delegate, ProvisionError, io_error};
 use crate::IdentityMap;
 use crate::idmap::{IdMapper, IdRange};
@@ -179,8 +180,10 @@ impl<'a> CopyIn<'a> {
     /// # Errors
     ///
     /// [`ProvisionError::CopyUnprivileged`] when the rootfs needs a range map
-    /// and no delegate can establish one; [`ProvisionError::EntryUnsafe`] for a
-    /// source entry that cannot be represented as a contained rootfs entry;
+    /// and no delegate can establish one; [`ProvisionError::EntryRefused`] for a
+    /// source entry the copy cannot carry — a tree deeper than the walk
+    /// descends, a name or a link target longer than a frame holds, or an
+    /// ownership the rootfs's identity map has no id for;
     /// [`ProvisionError::SourceChanged`] for a file that changed size while it
     /// was being read; and [`ProvisionError::Io`] for a failure of the copy
     /// machinery, of the walk, or of the in-map writer.
@@ -278,49 +281,12 @@ fn copy_in_inner(
         ));
     }
 
-    // Compose the child's map, exactly as the export composes its own: the
-    // single map it writes itself, a range map a delegate applies.
-    let uid_line;
-    let gid_line;
-    let default_chain;
-    let resolved;
-    let child_map = match map {
-        IdentityMap::Single => {
-            let euid = rustix::process::geteuid().as_raw();
-            let egid = rustix::process::getegid().as_raw();
-            uid_line = format!("0 {euid} 1\n").into_bytes();
-            gid_line = format!("0 {egid} 1\n").into_bytes();
-            ChildMap::SelfMap {
-                uid_line: &uid_line,
-                gid_line: &gid_line,
-            }
-        }
-        IdentityMap::Ranges { .. } | IdentityMap::Subordinate => {
-            let unprivileged = |reason: String| ProvisionError::CopyUnprivileged {
-                path: rootfs.to_path_buf(),
-                reason,
-            };
-            match mapper {
-                Some(mapper) => {
-                    resolved = mapper
-                        .resolve(map)
-                        .map_err(|err| unprivileged(err.to_string()))?;
-                    ChildMap::Delegated {
-                        mapper,
-                        map: &resolved,
-                    }
-                }
-                None => {
-                    default_chain =
-                        crate::idmap::resolve_default_chain(map).map_err(unprivileged)?;
-                    ChildMap::Delegated {
-                        mapper: default_chain.0.as_ref(),
-                        map: &default_chain.1,
-                    }
-                }
-            }
-        }
-    };
+    let map_source =
+        compose_child_map(map, mapper).map_err(|reason| ProvisionError::CopyUnprivileged {
+            path: rootfs.to_path_buf(),
+            reason,
+        })?;
+    let child_map = map_source.child_map();
 
     // The extents the source's ids are read through, as host-to-inside pairs.
     // See `Translation`.
@@ -331,11 +297,19 @@ fn copy_in_inner(
     // The walk writes to the child's stream. A failure part-way leaves the
     // child mid-tree, so it is killed rather than left to read an input that
     // will never end.
+    //
+    // The child's own account comes first where it left one. The walk's most
+    // common failure is a frame write, and a frame write fails only because the
+    // child has already died — of a step this side cannot see, an id the map
+    // refuses or an entry the destination will not take — so this side's broken
+    // pipe would name the symptom and drop the cause.
     let report = match walk(child.stream(), source, &translation) {
         Ok(report) => report,
         Err(err) => {
-            child.abandon();
-            return Err(err);
+            return Err(match child.abandon() {
+                Some(reported) => failure(reported, rootfs),
+                None => err,
+            });
         }
     };
     child.finish().map_err(|err| failure(err, rootfs))?;
@@ -353,6 +327,11 @@ fn failure(err: CopyFailure, rootfs: &Path) -> ProvisionError {
             op: step.describe(),
             path: rootfs.to_path_buf(),
             source: io::Error::from_raw_os_error(errno),
+        },
+        CopyFailure::Malformed => ProvisionError::Io {
+            op: "reading the copy process's outcome",
+            path: rootfs.to_path_buf(),
+            source: io::Error::from_raw_os_error(rustix::io::Errno::PROTO.raw_os_error()),
         },
     }
 }
@@ -414,7 +393,7 @@ impl Walk<'_> {
         depth: usize,
     ) -> Result<(), ProvisionError> {
         if depth >= MAX_DEPTH {
-            return Err(ProvisionError::EntryUnsafe {
+            return Err(ProvisionError::EntryRefused {
                 path: dir.to_path_buf(),
                 reason: format!("the source tree is deeper than {MAX_DEPTH} levels"),
             });
@@ -429,7 +408,7 @@ impl Walk<'_> {
         for path in entries {
             let name = path
                 .file_name()
-                .ok_or_else(|| ProvisionError::EntryUnsafe {
+                .ok_or_else(|| ProvisionError::EntryRefused {
                     path: path.clone(),
                     reason: "the entry has no final component".to_string(),
                 })?
@@ -439,13 +418,13 @@ impl Walk<'_> {
             // component, but refusing here too means the caller gets a path in
             // the message rather than an errno from a forked process.
             if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
-                return Err(ProvisionError::EntryUnsafe {
+                return Err(ProvisionError::EntryRefused {
                     path: path.clone(),
                     reason: "the entry name is not a single path component".to_string(),
                 });
             }
             if name.len() > u16::from(u8::MAX) as usize {
-                return Err(ProvisionError::EntryUnsafe {
+                return Err(ProvisionError::EntryRefused {
                     path: path.clone(),
                     reason: "the entry name is longer than NAME_MAX".to_string(),
                 });
@@ -478,7 +457,7 @@ impl Walk<'_> {
                 let target = fs::read_link(&path).map_err(|err| io_error("reading", &path, err))?;
                 let target = target.as_os_str().as_bytes();
                 if target.len() > u16::MAX as usize {
-                    return Err(ProvisionError::EntryUnsafe {
+                    return Err(ProvisionError::EntryRefused {
                         path: path.clone(),
                         reason: "the symlink target is longer than a frame can carry".to_string(),
                     });
@@ -538,7 +517,7 @@ impl Walk<'_> {
         // The child resolves the anchor into a fixed buffer, so a path it
         // could not hold is refused here, with the path that carries it.
         if anchor.len() > LINK_BUF {
-            return Err(ProvisionError::EntryUnsafe {
+            return Err(ProvisionError::EntryRefused {
                 path: path.to_path_buf(),
                 reason: "the path of a multiply-linked file is longer than a frame can carry"
                     .to_string(),
@@ -634,20 +613,36 @@ impl Translation {
 /// A host id outside every extent is one the rootfs cannot hold, and the copy
 /// says so with the path that carries it rather than letting the child fail
 /// with an `EINVAL` naming nothing.
+///
+/// The whole calculation runs in `u64`. An extent is three `u32`s, so both the
+/// containment test and the id it produces can pass `u32::MAX` — a wrapped id in
+/// a release build, a panic in a debug one — and an id is only an id once it
+/// fits back in the width the kernel names it in.
 fn inside(extents: &[IdRange], host: u32, which: &str, path: &Path) -> Result<u32, ProvisionError> {
+    let refuse = |reason: String| {
+        Err(ProvisionError::EntryRefused {
+            path: path.to_path_buf(),
+            reason,
+        })
+    };
     for extent in extents {
-        let end = u64::from(extent.outside) + u64::from(extent.count);
-        if u64::from(host) >= u64::from(extent.outside) && u64::from(host) < end {
-            return Ok(extent.inside + (host - extent.outside));
+        let outside = u64::from(extent.outside);
+        let end = outside + u64::from(extent.count);
+        if u64::from(host) >= outside && u64::from(host) < end {
+            let mapped = u64::from(extent.inside) + (u64::from(host) - outside);
+            return match u32::try_from(mapped) {
+                Ok(inside) => Ok(inside),
+                Err(_) => refuse(format!(
+                    "the source entry's {which} {host} maps to {mapped}, which is past the \
+                     largest id the kernel names",
+                )),
+            };
         }
     }
-    Err(ProvisionError::EntryUnsafe {
-        path: path.to_path_buf(),
-        reason: format!(
-            "the source entry's {which} {host} is outside the identity map, so the rootfs \
-             has no id for it"
-        ),
-    })
+    refuse(format!(
+        "the source entry's {which} {host} is outside the identity map, so the rootfs \
+         has no id for it",
+    ))
 }
 
 /// Streams exactly `size` bytes of `path` to the child, and refuses to call a
@@ -788,6 +783,48 @@ mod tests {
             Err(ProvisionError::SourceChanged { recorded, .. }) => assert_eq!(recorded, 4),
             other => panic!("expected a source-changed refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_host_id_maps_back_through_the_extent_that_covers_it() {
+        // The ordinary reading: a subordinate tree's 100042 is uid 42 inside,
+        // and a host id no extent covers is one the rootfs has no name for.
+        let extents = [IdRange {
+            inside: 0,
+            outside: 100_000,
+            count: 65_536,
+        }];
+        let path = Path::new("/src/file");
+        assert_eq!(inside(&extents, 100_042, "uid", path).unwrap(), 42);
+        assert_eq!(inside(&extents, 100_000, "uid", path).unwrap(), 0);
+        // The extent is half-open: its last id maps, the one past it does not.
+        assert_eq!(inside(&extents, 165_535, "uid", path).unwrap(), 65_535);
+        let err = inside(&extents, 165_536, "uid", path).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the identity map"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_mapped_id_that_would_not_fit_a_u32_is_refused_rather_than_wrapped() {
+        // An extent is three `u32`s, so `inside + count` can pass `u32::MAX`.
+        // Computed in `u32` the sum wraps in a release build and panics in a
+        // debug one; computed in `u64` it is simply an id the kernel cannot
+        // name, and the copy says so with the path that carries it.
+        let extents = [IdRange {
+            inside: u32::MAX - 1,
+            outside: 1_000,
+            count: 10,
+        }];
+        let path = Path::new("/src/file");
+        // Still within `u32`: the last id that fits maps.
+        assert_eq!(inside(&extents, 1_001, "uid", path).unwrap(), u32::MAX);
+        let err = inside(&extents, 1_002, "gid", path).unwrap_err();
+        assert!(
+            err.to_string().contains("largest id the kernel names"),
+            "{err}",
+        );
     }
 
     #[test]

@@ -179,31 +179,96 @@ caller combining `pid_namespace(false)` with capture should prefer
 `wait_deadline` or `wait_timeout` when the command may leave such
 descendants behind.
 
-## Standard input
+## Stream dispositions
 
-Stdin has a disposition of its own, independent of capture:
+Each of the three standard streams has a disposition of its own, set with
+`stdin`, `stdout`, and `stderr` and spelled by one enum:
 
-- **`Stdin::Inherit`** (default) — the command reads the caller's standard
-  input.
-- **`Stdin::Null`** — the command reads `/dev/null`: immediate end-of-file,
-  for batch runs that must not compete with the caller for input.
-- **[`Stdin::from_fd`]** — the command reads a descriptor the caller supplies.
+- **`Stdio::Inherit`** (default, all three) — the stream is left as the launch
+  inherited it. On standard input the command reads the caller's; on the output
+  pair it writes wherever the caller's own output goes.
+- **`Stdio::Null`** — `/dev/null`: immediate end-of-file on standard input, for
+  a batch run that must not compete with the caller for input, and a discard on
+  the output pair.
+- **[`Stdio::from_fd`]** — a descriptor the caller supplies.
+
+`Inherit` states no *destination*. It is the absence of a choice rather than a
+choice of the caller's descriptors, which is what lets a capturing launch supply
+its own pipes for the output pair. `Null` and `from_fd` do state one, so a
+capturing launch of a sandbox that names either is refused rather than silently
+overriding it — the caller meant one of the two, and the library will not guess
+which.
 
 ```rust,no_run
-# use ferroday_cage::{Cage, Stdin};
+# use ferroday_cage::{Cage, Stdio};
 # fn main() -> ferroday_cage::Result<()> {
 let cage = Cage::builder()
     .rootfs("/srv/rootfs/alpine")
-    .stdin(Stdin::Null)
+    .stdin(Stdio::Null)
+    .stderr(Stdio::Null)
     .command("/usr/bin/build")
     .build()?;
 # Ok(())
 # }
 ```
 
+### The dispositions and the caller's terminal
+
+They also decide what the sandbox reaches of the caller's terminal. A
+controlling terminal is reached through the *session*, not through the
+filesystem, so no namespace and no swapped root affects it; an inherited
+descriptor is reached through neither. The rule the library follows is that a
+sandboxed command reaches the caller's terminal exactly through the standard
+streams the caller handed it — and closing it therefore takes all three.
+
+**Standard input decides the session.** `Stdio::Inherit` hands the command the
+caller's standard input, so it stays in the caller's session, where the terminal
+is reachable as file descriptor 0 and equally as `/dev/tty`, the same terminal
+by another name. `Stdio::Null` and `Stdio::from_fd` do not, so the command runs
+in a session of its own with no controlling terminal at all: `/dev/tty` fails
+with `ENXIO`, and `TIOCSTI` — the ioctl that pushes characters into a terminal's
+input queue for the caller's shell to run afterwards — is refused on every
+terminal descriptor, since the kernel grants it only for the process's own
+controlling terminal.
+
+**The session does not close the output pair.** Run from a shell with no
+redirection, file descriptors 1 and 2 are dups of one read-write open of the
+caller's terminal, and a session of the sandbox's own does not take them away. A
+command holding them can read what is typed at it, leave the caller's terminal
+without echo with `tcsetattr`, and resize it with `TIOCSWINSZ`, which delivers
+`SIGWINCH` to the caller's foreground process group. `stdout` and `stderr` are
+what close that, and a capturing launch closes it too by supplying pipes of its
+own.
+
+**Job control has two senses**, and the dispositions decide where each happens.
+*Caller-session job control* is the caller's shell managing the sandbox as one
+of its own jobs: an interrupt typed at the caller's terminal reaches it, `^Z`
+suspends it, `fg` resumes it. *Sandbox-session job control* is a shell inside
+the sandbox running jobs of its own, which takes `tcsetpgrp` on a terminal whose
+session that shell shares.
+
+Under `Stdio::Inherit` both work, and both work by reaching into the caller's
+session — the second by the sandbox taking the caller's terminal's foreground
+process group, a shell inside the sandbox competing with the caller's own shell
+for one terminal. Under `Stdio::Null` or `Stdio::from_fd` neither does: the
+sandbox is outside the caller's session, and the session it has instead owns no
+terminal to run jobs against. A caller that wants to stop such a sandbox on an
+interrupt calls [`Running::terminate`] or [`Running::kill`], or ties the sandbox
+to its own life with
+[`stop_with_caller`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.stop_with_caller).
+
+`/dev/tty` is bound into the sandbox either way, and dropping the `/dev` mount
+would not change any of this: `/dev/tty` is the character device `5:0`, whose
+open returns whatever the *opening process's* controlling terminal is, so it
+conveys no terminal of its own — and an inherited terminal descriptor is still
+an inherited terminal whether or not `/dev/tty` has a name.
+
+[`Running::terminate`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.terminate
+[`Running::kill`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.kill
+
 ### Feeding the command input
 
-`Stdin::from_fd` takes anything readable — the read end of a pipe the caller
+`Stdio::from_fd` takes anything readable — the read end of a pipe the caller
 writes, an open file, a pseudoterminal replica — and duplicates it onto the
 command's file descriptor 0. It is how a command is handed input that wants to
 be a stream rather than a file:
@@ -211,13 +276,13 @@ be a stream rather than a file:
 ```rust,no_run
 use std::io::Write;
 
-use ferroday_cage::{Cage, Stdin};
+use ferroday_cage::{Cage, Stdio};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (reader, mut writer) = std::io::pipe()?;
     let cage = Cage::builder()
         .rootfs("/srv/rootfs/alpine")
-        .stdin(Stdin::from_fd(reader.into()))
+        .stdin(Stdio::from_fd(reader.into()))
         .command("/usr/bin/python3")
         .build()?;
 
@@ -245,14 +310,37 @@ Two things to know about the shape:
   the second launch reads whatever the first left. A cage feeding distinct
   input per launch is built per launch.
 
+The same constructor serves the output pair, where anything writable does: a
+log file each launch appends to, or a pipe a caller drains itself rather than
+through an observer.
+
+```rust,no_run
+# use ferroday_cage::{Cage, Stdio};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let log = std::fs::File::create("/var/log/build.log")?;
+let cage = Cage::builder()
+    .rootfs("/srv/rootfs/alpine")
+    .stdout(Stdio::from_fd(log.into()))
+    .stderr(Stdio::Null)
+    .command("/usr/bin/make")
+    .build()?;
+# Ok(())
+# }
+```
+
 There is no conversational form on top of this — no way to write a statement,
-read the reply, and write another to a process that is already running, and no
-pseudoterminal the library sets up for you. A caller can build the first
-half itself with two pipes and a thread; the second needs a PTY the caller
-opens and passes here as the stdin descriptor. An interactive model with the
-library's own PTY handling is a later, additive entry point.
+read the reply, and write another to a process that is already running. A caller
+can build one with two pipes and a thread.
+
+Do not reach for a caller-opened pseudoterminal here. Passing its replica as the
+standard-input descriptor puts the sandbox in a session of its own, and nothing
+makes the replica that session's *controlling* terminal, so a shell inside
+reports `cannot set terminal process group` and runs without job control.
+[A terminal of the sandbox's own](terminal.md) is the answer to that: the
+library allocates the pseudoterminal, wires it onto all three streams, and makes
+it the sandbox's controlling terminal.
 
 [`kill`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.kill
 [`output`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.output
 [`ExitStatus`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.ExitStatus.html
-[`Stdin::from_fd`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Stdin.html#method.from_fd
+[`Stdio::from_fd`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Stdio.html#method.from_fd

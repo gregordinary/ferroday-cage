@@ -1,23 +1,28 @@
 //! The running-sandbox handle: wait, deadline, terminate, kill.
 
+use std::ffi::CString;
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::Timespec;
 use rustix::event::{PollFd, PollFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 use rustix::net::SendFlags;
 use rustix::process;
 use rustix::process::Signal;
 
 use crate::error::Error;
-use crate::mechanism::{self, CONTROL_TERMINATE, LaunchPlan};
+use crate::mechanism::{self, CONTROL_TERMINATE, LaunchPlan, ManagedPlaceholders};
 use crate::observer::Observer;
+use crate::spec;
 use crate::status::ExitStatus;
+use crate::terminal::{Pty, Terminal};
 
 /// The pump's read buffer size: one read per poll wake per stream.
 const PUMP_BUF: usize = 8192;
@@ -118,18 +123,50 @@ impl<'obs> Running<'obs> {
         mut observer: Option<&'obs mut dyn Observer>,
     ) -> Result<Running<'obs>, Error> {
         let observe = observer.is_some();
+        if observe {
+            check_capture_composes(plan)?;
+        }
+        // The guard is built before the spawn, not after it. `spawn` reports
+        // every setup step through its return, and the mount ops run well
+        // before the last of them: a launch that creates `/etc/resolv.conf` and
+        // then fails at the pivot, the working-directory change, or the exec —
+        // the case a caller getting a configuration right hits repeatedly —
+        // would otherwise leave that file behind, which is the residue this
+        // mechanism exists to prevent. Built here, the `?` below drops the
+        // guard and takes the placeholders with it.
+        let placeholders = PlaceholderGuard {
+            placeholders: plan.managed_placeholders.clone(),
+        };
         // The progress sink borrows the observer only for the launch; the
         // borrow ends with the statement, leaving the observer to move into
         // the handle for the output pump.
-        let launched = mechanism::spawn(plan, observe, &mut |event| {
+        let (launched, primary) = mechanism::spawn(plan, observe, None, &mut |event| {
             if let Some(observer) = observer.as_deref_mut() {
                 observer.progress(event);
             }
         })?;
-        Ok(Running::from_launched(
-            launched,
-            observer,
-            plan.managed_placeholders.clone(),
+        debug_assert!(primary.is_none(), "a launch with no terminal returns none");
+        Ok(Running::from_launched(launched, observer, placeholders))
+    }
+
+    /// Launches the plan on a pseudoterminal of its own, returning the handle
+    /// and the caller's end of the terminal.
+    ///
+    /// No observer, so no progress milestone is reported and nothing is
+    /// captured: the terminal is the command's output, and the caller reads it.
+    pub(crate) fn launch_terminal(
+        plan: &LaunchPlan,
+        terminal: &Terminal,
+    ) -> Result<(Running<'static>, Pty), Error> {
+        check_terminal_composes(plan)?;
+        let placeholders = PlaceholderGuard {
+            placeholders: plan.managed_placeholders.clone(),
+        };
+        let (launched, primary) = mechanism::spawn(plan, false, Some(terminal), &mut |_| {})?;
+        let primary = primary.ok_or_else(|| wait_error(Errno::PROTO))?;
+        Ok((
+            Running::from_launched(launched, None, placeholders),
+            Pty::new(primary),
         ))
     }
 
@@ -137,7 +174,7 @@ impl<'obs> Running<'obs> {
     pub(crate) fn from_launched(
         launched: mechanism::Launched,
         observer: Option<&'obs mut dyn Observer>,
-        placeholders: Vec<PathBuf>,
+        placeholders: PlaceholderGuard,
     ) -> Running<'obs> {
         let buf = if observer.is_some() {
             vec![0; PUMP_BUF]
@@ -158,9 +195,7 @@ impl<'obs> Running<'obs> {
             kill_sent: Arc::new(AtomicBool::new(false)),
             reap: launched.reap,
             buf,
-            _placeholders: PlaceholderGuard {
-                paths: placeholders,
-            },
+            _placeholders: placeholders,
         }
     }
 
@@ -196,7 +231,14 @@ impl<'obs> Running<'obs> {
     pub fn wait(&mut self) -> Result<ExitStatus, Error> {
         match self.pump(None)? {
             Some(status) => Ok(status),
-            None => unreachable!("ferroday-cage: an unbounded wait returned no outcome"),
+            // The pump reports no outcome only where a deadline expired, and
+            // there is none here, so this is unreachable today. It is an error
+            // rather than a panic because the invariant lives in another
+            // function: a future early return added to `pump` would break it
+            // with no compiler assistance, and a library whose error type is
+            // otherwise exhaustive should not answer that with an abort. Same
+            // treatment `drain_status` gives a record it cannot decode.
+            None => Err(wait_error(Errno::PROTO)),
         }
     }
 
@@ -364,16 +406,23 @@ impl<'obs> Running<'obs> {
         let Some(fd) = slot else {
             return Ok(());
         };
+        // The observer is checked before the read, not after it. The read buffer
+        // is sized only when capturing, so a captured stream arriving without an
+        // observer would read into a zero-length buffer, take the resulting
+        // `Ok(0)` for end-of-file, and retire the stream with its output
+        // discarded — masking the very mismatch a check after the read is meant
+        // to catch. The pairing is established at launch, so a mismatch is a
+        // library defect, reported the way `drain_status` reports a record it
+        // cannot decode.
+        let Some(observer) = self.observer.as_deref_mut() else {
+            return Err(wait_error(Errno::PROTO));
+        };
         match rustix::io::read(&*fd, &mut self.buf) {
             Ok(0) => {
                 *slot = None;
             }
             Ok(n) => {
                 let chunk = &self.buf[..n];
-                let observer = self
-                    .observer
-                    .as_deref_mut()
-                    .expect("ferroday-cage: captured streams always have an observer");
                 match channel {
                     Channel::Stdout => observer.stdout(chunk),
                     Channel::Stderr => observer.stderr(chunk),
@@ -439,21 +488,38 @@ impl fmt::Debug for Running<'_> {
 /// there would stop a caller from reading its own observer after waiting — the
 /// ordinary way to collect captured output. The guard borrows nothing, so
 /// dropping it observes nothing.
-struct PlaceholderGuard {
-    /// The paths to remove, taken when they are handed on instead.
-    paths: Vec<PathBuf>,
+pub(crate) struct PlaceholderGuard {
+    /// The root and the root-relative paths to remove; taken when they are
+    /// handed on instead.
+    pub(crate) placeholders: ManagedPlaceholders,
 }
 
 impl Drop for PlaceholderGuard {
     fn drop(&mut self) {
-        for path in &self.paths {
-            remove_managed_placeholder(path);
+        if self.placeholders.is_empty() {
+            return;
+        }
+        // One descriptor for the root, which every path below is resolved
+        // against; nothing here walks the host's own tree.
+        let Some(root) = spec::open_root(&self.placeholders.root) else {
+            return;
+        };
+        for path in &self.placeholders.paths {
+            remove_managed_placeholder(&root, path);
         }
     }
 }
 
 /// Removes a mount target the launch created in the root, once the sandbox
 /// that needed it is gone.
+///
+/// `path` is relative to `root` and is resolved against it with `openat2` and
+/// `RESOLVE_IN_ROOT` — the containment the sandbox stage gives every mount
+/// target, for the same reason. A rootfs is entitled to hold an absolute
+/// symbolic link (`./etc -> /etc` in an unpacked tarball, an `/etc/resolv.conf`
+/// pointing into a resolver's runtime directory), and joining the two into one
+/// host path would have that link resolve against the *host's* root on this side
+/// of the fork, which is where the unlink below would then land.
 ///
 /// Only an empty regular file is removed. The placeholder a launch creates is
 /// empty and stays that way — the bind covers it for the sandbox's whole life,
@@ -469,10 +535,36 @@ impl Drop for PlaceholderGuard {
 ///
 /// Best-effort, like the teardown around it. A failure leaves a file the rootfs
 /// did not ship, which is untidy but not a failure of the launch itself.
-fn remove_managed_placeholder(path: &Path) {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() && meta.len() == 0 => {
-            let _ = std::fs::remove_file(path);
+fn remove_managed_placeholder(root: &OwnedFd, path: &Path) {
+    // The parent is resolved inside the root and the leaf is then addressed by
+    // name under it, so the `AT_SYMLINK_NOFOLLOW` stat and the unlink name one
+    // and the same entry, and neither follows a link out of the tree.
+    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let Ok(parent) = CString::new(parent.as_os_str().as_bytes()) else {
+        return;
+    };
+    let Ok(dir) = rustix::fs::openat2(
+        root,
+        parent.as_c_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT,
+    ) else {
+        return;
+    };
+    match rustix::fs::statat(&dir, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat)
+            if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                && stat.st_size == 0 =>
+        {
+            let _ = rustix::fs::unlinkat(&dir, leaf, AtFlags::empty());
         }
         _ => {}
     }
@@ -559,18 +651,52 @@ impl<'obs> Pending<'obs> {
         mut observer: Option<&'obs mut dyn Observer>,
     ) -> Result<Pending<'obs>, Error> {
         let observe = observer.is_some();
-        let inner = mechanism::spawn_pending(plan, observe, &mut |event| {
+        if observe {
+            check_capture_composes(plan)?;
+        }
+        // Built before the spawn so a setup failure after the mount ops takes
+        // the placeholders with it; see `Running::launch`.
+        let placeholders = PlaceholderGuard {
+            placeholders: plan.managed_placeholders.clone(),
+        };
+        let (inner, primary) = mechanism::spawn_pending(plan, observe, None, &mut |event| {
             if let Some(observer) = observer.as_deref_mut() {
                 observer.progress(event);
             }
         })?;
+        debug_assert!(primary.is_none(), "a launch with no terminal returns none");
         Ok(Pending {
             inner: Some(inner),
             observer,
-            placeholders: PlaceholderGuard {
-                paths: plan.managed_placeholders.clone(),
-            },
+            placeholders,
         })
+    }
+
+    /// Launches the plan gated and on a pseudoterminal of its own.
+    ///
+    /// The primary comes back beside the handle rather than out of
+    /// [`proceed`](Self::proceed): the pseudoterminal is allocated before the
+    /// fork, the gate sits after the controlling terminal is established, and
+    /// nothing writes to the terminal while the launch is held, so the caller
+    /// attaches its network stack and proceeds with the primary already in hand.
+    pub(crate) fn launch_terminal(
+        plan: &LaunchPlan,
+        terminal: &Terminal,
+    ) -> Result<(Pending<'static>, Pty), Error> {
+        check_terminal_composes(plan)?;
+        let placeholders = PlaceholderGuard {
+            placeholders: plan.managed_placeholders.clone(),
+        };
+        let (inner, primary) = mechanism::spawn_pending(plan, false, Some(terminal), &mut |_| {})?;
+        let primary = primary.ok_or_else(|| wait_error(Errno::PROTO))?;
+        Ok((
+            Pending {
+                inner: Some(inner),
+                observer: None,
+                placeholders,
+            },
+            Pty::new(primary),
+        ))
     }
 
     /// A host pid of a process in the sandbox's network namespace.
@@ -612,7 +738,9 @@ impl<'obs> Pending<'obs> {
         Ok(Running::from_launched(
             launched,
             observer,
-            std::mem::take(&mut self.placeholders.paths),
+            PlaceholderGuard {
+                placeholders: std::mem::take(&mut self.placeholders.placeholders),
+            },
         ))
     }
 }
@@ -637,6 +765,58 @@ impl Drop for Pending<'_> {
         }
         // The guard field removes the placeholders as this drops.
     }
+}
+
+/// Refuses a capturing launch of a sandbox whose output pair is directed
+/// somewhere else.
+///
+/// Capture supplies a pipe for each output stream, which is a destination; a
+/// plan that names one of its own contradicts it, and the caller meant one of
+/// the two. [`Stdio::Inherit`](crate::Stdio::Inherit) names none, so it composes
+/// with capture and is what every sandbox carries unless the caller said
+/// otherwise.
+///
+/// Standard input is not part of this: capture never touches it, so no
+/// disposition of it can contradict a capturing launch.
+fn check_capture_composes(plan: &LaunchPlan) -> Result<(), Error> {
+    for (stream, disposition) in [
+        ("standard output", &plan.stdout),
+        ("standard error", &plan.stderr),
+    ] {
+        if disposition.names_a_destination() {
+            return Err(crate::ConfigError::StreamAttachmentConflict {
+                stream,
+                attachment: "an observer's capture pipe",
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a terminal launch of a sandbox whose streams are directed somewhere
+/// else.
+///
+/// The replica is all three streams, so a disposition naming a different
+/// destination is a contradiction: the caller asked for two things. As with
+/// capture, [`Stdio::Inherit`](crate::Stdio::Inherit) names no destination and
+/// is therefore no contradiction — the launch is free to supply one, and the
+/// terminal overrides nothing the caller said.
+fn check_terminal_composes(plan: &LaunchPlan) -> Result<(), Error> {
+    for (stream, disposition) in [
+        ("standard input", &plan.stdin),
+        ("standard output", &plan.stdout),
+        ("standard error", &plan.stderr),
+    ] {
+        if disposition.names_a_destination() {
+            return Err(crate::ConfigError::StreamAttachmentConflict {
+                stream,
+                attachment: "a terminal",
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Sends the termination request byte; a sandbox that already exited took

@@ -176,6 +176,20 @@ pub enum RangeMapBlocker {
     },
     /// The calling user has no subordinate id allocation.
     NoSubordinateAllocation,
+    /// The caller's subordinate allocation could not be determined at all.
+    ///
+    /// Distinct from [`NoSubordinateAllocation`](Self::NoSubordinateAllocation),
+    /// which is the query answering that there is none. This is the query
+    /// failing to answer: `getsubids` exists but did not report, or
+    /// `nsswitch.conf` sources subordinate ids from a module beyond `files` and
+    /// `getsubids` — the only tool that consults it — is not installed. On such
+    /// a host the subordinate files are not the authority, so the remedy is to
+    /// install `getsubids`, not to add entries to them.
+    #[non_exhaustive]
+    SubordinateAllocationUnknown {
+        /// What the query could not do, and what would let it.
+        reason: String,
+    },
 }
 
 impl fmt::Display for RangeMapBlocker {
@@ -214,6 +228,10 @@ impl fmt::Display for RangeMapBlocker {
                 "the calling user has no subordinate id allocation; grant one with \
                  usermod --add-subuids and --add-subgids, or entries in /etc/subuid and \
                  /etc/subgid",
+            ),
+            RangeMapBlocker::SubordinateAllocationUnknown { reason } => write!(
+                f,
+                "the calling user's subordinate id allocation could not be determined: {reason}",
             ),
         }
     }
@@ -323,17 +341,42 @@ fn probe_name(prefix: &str) -> String {
 /// Sixteen hex digits distinguishing one call from every other, for naming a
 /// filesystem entry no concurrent caller may collide with.
 ///
-/// The pid seeds the buffer so that concurrent *processes* on a host where
-/// `getrandom` is unavailable still differ — threads of one process share a pid
-/// and would not — where it works, it overwrites the seed, and a short read
-/// (which a request this small does not produce in practice) leaves a mixture
-/// that is no less unique. Uniqueness is not what makes the naming safe in any
-/// case: every caller creates its entry with `O_EXCL` and treats a collision as
-/// a failure.
+/// The kernel's randomness is combined with, rather than substituted for, a seed
+/// that is already unique per call: the process id in the high half distinguishes
+/// concurrent processes, and a process-wide counter in the low half distinguishes
+/// calls within one process, which threads sharing a pid would not be. Combining
+/// the two by exclusive-or keeps the claim in the first sentence true on a host
+/// where `getrandom` fails or returns short — the outcome is then the seed
+/// itself, still unique — where the earlier code kept only whatever `getrandom`
+/// happened to write, and on a failure returned the same string for every call
+/// in a process.
+///
+/// Uniqueness is not what makes the naming safe in any case: every caller
+/// creates its entry with `O_EXCL` or `mkdirat` and treats a collision as a
+/// failure. What it buys is that a neighbour cannot park a squatter at a name
+/// this is bound to choose.
 pub(crate) fn unique_hex() -> String {
-    let mut bytes = u64::from(std::process::id()).to_ne_bytes();
-    let _ = rustix::rand::getrandom(&mut bytes, GetRandomFlags::empty());
-    format!("{:016x}", u64::from_ne_bytes(bytes))
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Distinguishes calls within one process, where the pid cannot.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut random = [0u8; 8];
+    let mut filled = 0;
+    while filled < random.len() {
+        match rustix::rand::getrandom(&mut random[filled..], GetRandomFlags::empty()) {
+            // A short read is resumed rather than accepted; `Ok(0)` would
+            // otherwise spin, so it ends the loop with the seed carrying the
+            // remainder.
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(Errno::INTR) => {}
+            Err(_) => break,
+        }
+    }
+    let seed = (u64::from(std::process::id()) << 32)
+        | (COUNTER.fetch_add(1, Ordering::Relaxed) & u64::from(u32::MAX));
+    format!("{:016x}", seed ^ u64::from_ne_bytes(random))
 }
 
 /// Whether the filesystem hosting `dir` refuses a `user.*` extended attribute,
@@ -664,8 +707,23 @@ fn delegated_blocker() -> Option<RangeMapBlocker> {
         }
     }
 
-    if crate::idmap::probe_allocation_is_empty() {
-        return Some(RangeMapBlocker::NoSubordinateAllocation);
+    match crate::idmap::probe_allocation() {
+        None => {}
+        Some((_, crate::idmap::AllocationUnusable::Empty)) => {
+            return Some(RangeMapBlocker::NoSubordinateAllocation);
+        }
+        // The query could not answer, which is a different diagnosis from an
+        // empty allocation and has a different remedy — most often "install
+        // getsubids", on a host whose subordinate ids come from a directory
+        // service rather than from the files. Reporting the empty-allocation
+        // blocker here would advise adding /etc/subuid entries, which on such a
+        // host is wrong twice over: the user may well have an allocation, and
+        // the files are not the authority.
+        Some((kind, unusable)) => {
+            return Some(RangeMapBlocker::SubordinateAllocationUnknown {
+                reason: unusable.to_string(kind),
+            });
+        }
     }
 
     None
@@ -734,14 +792,25 @@ fn helper_privilege(
     HelperPrivilege::FileCaps { setfcap }
 }
 
-/// Finds an executable on `PATH`.
+/// Finds an executable on `PATH`, returning its absolute path.
+///
+/// Shared by the probe above and by the delegate that executes the helper, so
+/// the binary whose privilege the probe judged is the one chosen by the same
+/// rules — a probe describing a different binary from the one that runs is a
+/// verdict about nothing.
+///
+/// Only absolute `PATH` entries are searched. An empty or relative entry names
+/// the process's working directory, and resolving a privileged helper against
+/// whatever directory the process happens to be in is not a lookup this should
+/// perform; [`spec::search_candidates`](crate::spec) takes the same position for
+/// the sandbox's own path lookup, for the same reason.
 #[cfg(feature = "subid")]
-fn find_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
+        if !dir.is_absolute() {
             continue;
         }
         let candidate = dir.join(name);
@@ -783,6 +852,18 @@ mod tests {
             "the overlay probe left {} entries behind",
             leftovers.len(),
         );
+    }
+
+    #[test]
+    fn unique_hex_distinguishes_calls_within_one_process() {
+        // The doc comment promises a name no concurrent caller collides with,
+        // and the promise has to hold when `getrandom` is unavailable — where
+        // the entropy is the seed alone. A pid seed cannot distinguish two calls
+        // in one process, so the process-wide counter is what makes this true
+        // rather than the randomness.
+        let names: std::collections::HashSet<String> = (0..1000).map(|_| unique_hex()).collect();
+        assert_eq!(names.len(), 1000, "unique_hex repeated a name");
+        assert!(names.iter().all(|name| name.len() == 16));
     }
 
     #[test]

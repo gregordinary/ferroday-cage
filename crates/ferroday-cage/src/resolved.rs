@@ -99,6 +99,8 @@ pub struct ResolvedInputs {
         doc = "namespace the sandbox creates, not what may later be plugged into it."
     )]
     pub network: Network,
+    /// Where the command's three standard streams are wired.
+    pub streams: ResolvedStreams,
     /// The resource limits applied to the command process, in the order they
     /// are applied.
     pub rlimits: Vec<ResolvedRlimit>,
@@ -181,6 +183,58 @@ pub enum ResolvedIdentity {
         /// The gid extents, in the order they are written.
         gid: Vec<IdRange>,
     },
+}
+
+/// Where a built sandbox wires the command's three standard streams.
+///
+/// What a build produces depends on what the command sees, and these are that:
+/// `isatty` on the standard streams steers debconf's frontend choice, a
+/// compiler's color diagnostics, and every progress display, and the
+/// standard-input disposition additionally decides whether the command runs in
+/// the caller's session.
+///
+/// # What this reports
+///
+/// The plan — what every launch of the sandbox shares. A launch that attaches a
+/// conduit of its own supersedes it at that one call site: a capturing launch
+/// ([`Cage::run_with`](crate::Cage::run_with),
+/// [`Cage::output`](crate::Cage::output)) puts a pipe on the output pair. That
+/// act belongs to the caller that made it, and recording it does too. The
+/// dispositions here are refused against a launch that would contradict them,
+/// so a record and a launch cannot disagree about a stream the caller directed
+/// somewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ResolvedStreams {
+    /// Where the command's standard input reads from.
+    pub stdin: ResolvedStdio,
+    /// Where the command's standard output is written.
+    pub stdout: ResolvedStdio,
+    /// Where the command's standard error is written.
+    pub stderr: ResolvedStdio,
+}
+
+/// One standard stream's disposition, by kind.
+///
+/// The counterpart of [`Stdio`](crate::Stdio), reduced to the kind of wiring: a
+/// descriptor is reported as [`Fd`](Self::Fd) and not otherwise described,
+/// because it names a live resource of the caller's rather than anything a
+/// record could carry forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum ResolvedStdio {
+    /// The stream is left as the launch inherited it.
+    Inherit,
+    /// The stream is wired to `/dev/null`.
+    Null,
+    /// The stream is wired to a descriptor the caller supplied.
+    Fd,
 }
 
 /// One resource limit a built sandbox applies to the command process.
@@ -386,6 +440,11 @@ impl ResolvedInputs {
                 .collect(),
             identity: project_identity(plan),
             network: plan.network,
+            streams: ResolvedStreams {
+                stdin: project_stdio(&plan.stdin),
+                stdout: project_stdio(&plan.stdout),
+                stderr: project_stdio(&plan.stderr),
+            },
             rlimits: plan.rlimits.iter().map(project_rlimit).collect(),
             hardening: project_hardening(plan),
         }
@@ -411,6 +470,15 @@ fn project_root(plan: &LaunchPlan) -> ResolvedRoot {
         },
         #[cfg(feature = "hardening")]
         Confinement::Restriction => ResolvedRoot::Host,
+    }
+}
+
+/// Projects one stream's disposition onto its kind.
+fn project_stdio(plan: &crate::mechanism::StdioPlan) -> ResolvedStdio {
+    match plan {
+        crate::mechanism::StdioPlan::Inherit => ResolvedStdio::Inherit,
+        crate::mechanism::StdioPlan::Null => ResolvedStdio::Null,
+        crate::mechanism::StdioPlan::Fd(_) => ResolvedStdio::Fd,
     }
 }
 
@@ -700,6 +768,11 @@ mod serde_tests {
              \n\
              [identity]\n\
              kind = \"single\"\n\
+             \n\
+             [streams]\n\
+             stdin = \"inherit\"\n\
+             stdout = \"inherit\"\n\
+             stderr = \"inherit\"\n\
              \n"
             .to_string()
                 + hardening,

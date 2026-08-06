@@ -172,10 +172,13 @@ older line replaces the crate page with that line's metadata.
 - **Documentation is part of the change.** Public items carry rustdoc, and
   internal items carry it wherever the behavior is not obvious. Comments
   explain *why*, not *what*.
-- **`unsafe` is confined** to the launch mechanism and the network stack's tap
-  layer. Both crates deny it by default; each block that needs it carries a
-  `SAFETY:` comment stating the invariant it relies on, which is enforced by
-  `clippy::undocumented_unsafe_blocks`.
+- **`unsafe` is confined** to three modules: the library's launch mechanism and
+  the network stack's tap layer, and `fcage`'s terminal relay, which blocks its
+  signals and opens the descriptor they arrive on. Both crates deny it by
+  default; each block that needs it carries a `SAFETY:` comment stating the
+  invariant it relies on, which is enforced by
+  `clippy::undocumented_unsafe_blocks`. Every consumer of the *library* is safe
+  Rust: nothing in its public API requires a caller to write `unsafe`.
 - **The post-fork stages must not allocate, lock, panic, or call libc.** They
   run between `fork` and `exec` in a process copied from a possibly
   multithreaded caller. Everything they need is marshaled by the caller

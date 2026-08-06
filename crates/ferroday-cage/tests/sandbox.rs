@@ -489,6 +489,54 @@ fn a_missing_bind_target_is_created_in_the_rootfs() {
 }
 
 #[test]
+fn a_file_bind_target_the_rootfs_ships_as_a_symlink_creates_nothing() {
+    let Some(rootfs) = common::scratch_rootfs("linked-bind-target") else {
+        return;
+    };
+    // A rootfs shipping its target as a symbolic link to a path it does not
+    // have — the shape a resolver's `/etc/resolv.conf` takes on a systemd host.
+    std::fs::create_dir_all(rootfs.join("var")).unwrap();
+    std::os::unix::fs::symlink("../var/absent", rootfs.join("etc/linked")).unwrap();
+    let source = common::scratch_dir("linked-bind-source").join("file");
+    std::fs::write(&source, b"caller content\n").unwrap();
+
+    // The launch creates a bind target only where the rootfs has nothing, and
+    // only at the path the caller side recorded for removal. Creating one
+    // through the link would leave the rootfs holding a file it never shipped,
+    // at a path nothing takes away.
+    let err = Cage::builder()
+        .rootfs(&rootfs)
+        .bind_ro(&source, "/etc/linked")
+        .command("/bin/sh")
+        .args(["-c", "true"])
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect_err("a bind onto a link that resolves to nothing has no target");
+    match err {
+        Error::Setup {
+            step,
+            detail: Some(detail),
+            ..
+        } => {
+            assert_eq!(step, SetupStep::OpenMountTarget);
+            assert!(detail.contains("/etc/linked"), "{detail}");
+        }
+        other => panic!("expected a detailed Setup error, got {other:?}"),
+    }
+    assert!(
+        !rootfs.join("var/absent").exists(),
+        "a file was created through the link"
+    );
+    assert!(
+        std::fs::symlink_metadata(rootfs.join("etc/linked"))
+            .expect("the link is still there")
+            .is_symlink(),
+        "the rootfs's own symbolic link was replaced"
+    );
+}
+
+#[test]
 fn a_failed_mount_op_names_the_mount() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
@@ -1033,11 +1081,51 @@ fn a_builder_reads_back_what_it_was_given() {
 #[test]
 fn an_overlay_root_reads_back_through_the_overlay_accessor() {
     let builder = Cage::builder()
-        .overlay_rootfs("/srv/base", "/var/tmp/scratch")
+        .overlay_rootfs("/srv/base", "/srv/scratch/run-1")
         .command("/bin/sh");
     assert!(builder.get_rootfs().is_none());
     let overlay = builder.get_overlay().expect("an overlay root is set");
     assert_eq!(overlay.get_lowers(), [Path::new("/srv/base")]);
-    assert_eq!(overlay.get_upper(), Some(Path::new("/var/tmp/scratch")));
+    assert_eq!(overlay.get_upper(), Some(Path::new("/srv/scratch/run-1")));
     assert_eq!(overlay.get_work(), None);
+}
+
+#[test]
+fn a_launch_that_fails_after_the_mounts_leaves_no_placeholder_behind() {
+    let Some(rootfs) = common::scratch_rootfs("failed-launch-residue") else {
+        return;
+    };
+    let source = common::scratch_dir("failed-launch-source").join("file");
+    std::fs::write(&source, b"caller content\n").unwrap();
+
+    // A working directory that does not exist inside the sandbox fails the
+    // launch at ChdirWorkdir — after every mount op has run, so the bind's
+    // target file has already been created in the rootfs. That empty file is
+    // exactly the residue the placeholder mechanism exists to prevent, and a
+    // failed launch is the case a caller getting a configuration right hits
+    // repeatedly.
+    let err = Cage::builder()
+        .rootfs(&rootfs)
+        .bind_ro(&source, "/etc/created")
+        .current_dir("/no/such/directory")
+        .command("/bin/sh")
+        .args(["-c", "true"])
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect_err("a missing working directory fails the launch");
+    assert!(
+        matches!(
+            err,
+            Error::Setup {
+                step: SetupStep::ChdirWorkdir,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        !rootfs.join("etc/created").exists(),
+        "a failed launch left its bind target behind",
+    );
 }

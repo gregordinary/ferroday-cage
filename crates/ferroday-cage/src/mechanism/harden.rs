@@ -376,6 +376,19 @@ struct SockFprog {
     filter: *const super::SockFilter,
 }
 
+// The layout must match the kernel's, or the install would read a program
+// length and a program address the caller never wrote. The size is stated
+// against the pointer's own, since the padding between the two fields is the
+// pointer's alignment: sixteen bytes on a 64-bit target, eight on a 32-bit
+// one. The offsets pin the fields inside it, so a field added or widened
+// fails the build even where the total happens to come out the same.
+const _: () = {
+    let pointer = size_of::<*const super::SockFilter>();
+    assert!(size_of::<SockFprog>() == 2 * pointer);
+    assert!(std::mem::offset_of!(SockFprog, len) == 0);
+    assert!(std::mem::offset_of!(SockFprog, filter) == pointer);
+};
+
 /// Installs the compiled seccomp filter on the command process.
 fn install_seccomp(program: &[super::SockFilter]) -> Result<(), Errno> {
     // The program length fits a u16: `compile_seccomp` rejected anything over

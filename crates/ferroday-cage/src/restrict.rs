@@ -44,16 +44,56 @@
 //!   `ptrace` of other same-uid host processes is possible where the host's
 //!   Yama policy permits it. The curated seccomp denylist blocks `ptrace`
 //!   outright.
-//! - **Terminal injection.** A command that inherits the caller's controlling
-//!   terminal can push input into it with the `TIOCSTI` ioctl. Three things
-//!   close it: the `dev.tty.legacy_tiocsti` sysctl, which modern kernels
-//!   default to off; a seccomp filter on `ioctl`; or not sharing the terminal.
-//!   Landlock does not, whatever the ABI: its rights bind a descriptor when it
-//!   is opened, and an inherited terminal was opened before the ruleset
-//!   existed.
+//! - **The caller's terminal.** A command holding a descriptor onto the
+//!   caller's terminal can read what is typed at it, change its settings, and —
+//!   where the terminal is the command's own controlling terminal — push input
+//!   into it with the `TIOCSTI` ioctl. Landlock does not close this, whatever
+//!   the ABI: its rights bind a descriptor when it is opened, and an inherited
+//!   terminal was opened before the ruleset existed. Neither does a namespace or
+//!   a swapped root: a controlling terminal is reached through the session, not
+//!   through the filesystem, and an inherited descriptor is reached through
+//!   neither. What closes it is not handing the terminal over — see below — the
+//!   `dev.tty.legacy_tiocsti` sysctl, which modern kernels default to off, or a
+//!   seccomp filter on `ioctl`, which the curated denylist provides.
 //!
-//! A cage closes all four through its namespaces and swapped root; a
-//! restriction closes each only through the control that covers it.
+//! A cage closes the first three through its namespaces and swapped root; a
+//! restriction closes each of those only through the control that covers it.
+//!
+//! # The caller's terminal
+//!
+//! The fourth surface is not a namespace question, so a cage and a restriction
+//! answer it the same way: **a sandboxed command reaches the caller's terminal
+//! exactly through the standard streams the caller handed it.** Closing it
+//! therefore takes all three streams, and each closes a different part.
+//!
+//! **Standard input decides the session.** A command that inherits it
+//! ([`Stdio::Inherit`](crate::Stdio::Inherit), the default) has been given the
+//! caller's terminal along with it, so it stays in the caller's session. There
+//! the terminal is reachable through file descriptor 0 and through `/dev/tty`,
+//! which is the same terminal by a different name. A command that does not
+//! inherit it — [`Stdio::Null`](crate::Stdio::Null) or
+//! [`Stdio::Fd`](crate::Stdio::Fd) — runs in a session of its own, with no
+//! controlling terminal at all: `/dev/tty` fails with `ENXIO`, and `TIOCSTI` is
+//! refused on every terminal descriptor, because the kernel grants it only for
+//! the caller's own controlling terminal.
+//!
+//! **The output pair is not closed by the session.** Run from a shell with no
+//! redirection, file descriptors 1 and 2 are dups of one read-write open of the
+//! caller's terminal, and a session of the sandbox's own does not take them
+//! away. A command holding them can still read what is typed, leave the
+//! terminal without echo with `tcsetattr`, and resize it with `TIOCSWINSZ`.
+//! [`stdout`](RestrictionBuilder::stdout) and
+//! [`stderr`](RestrictionBuilder::stderr) are what close that, and a capturing
+//! launch closes it too by supplying pipes of its own.
+//!
+//! **What it costs.** A sandbox in a session of its own is outside the caller's
+//! job control, so a caller that wants to stop it on an interrupt uses
+//! [`Running::terminate`](crate::Running::terminate) or
+//! [`Running::kill`](crate::Running::kill). It also has no job control of its
+//! own, since the session it holds owns no terminal — and under
+//! [`Stdio::Inherit`](crate::Stdio::Inherit) it does, but only by taking the
+//! caller's terminal's foreground process group, a shell inside the sandbox
+//! competing with the caller's own shell for one terminal.
 //!
 //! A restriction is a deliberately weaker boundary with its own
 //! configuration, not an automatic downgrade of a cage: its paths are host
@@ -65,8 +105,9 @@
 //!
 //! Beyond the confinement, a restriction shares the cage's process model:
 //! the clean deterministic environment, the standard-stream dispositions,
-//! output streaming to an [`Observer`], and the [`Running`] handle with
-//! waiting, deadlines, termination, and kill. Because there is no PID
+//! output streaming to an [`Observer`], a pseudoterminal of its own through
+//! [`spawn_terminal`](Restriction::spawn_terminal), and the [`Running`] handle
+//! with waiting, deadlines, termination, and kill. Because there is no PID
 //! namespace, the same caveats as [`CageBuilder::pid_namespace`]`(false)`
 //! apply: descendants of the command can outlive it, and a kill reaches only
 //! the command process itself.
@@ -78,17 +119,16 @@
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::path::Path;
-use std::sync::Arc;
 
 use rustix::thread::UnshareFlags;
 
 use crate::error::{ConfigError, Error};
 use crate::hardening::{FsAccess, NetAccess, Request, SeccompPolicy};
 use crate::limits::{Limit, Resource};
-use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, StdinPlan};
+use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, StdioPlan};
 use crate::observer::{Collect, Observer, Output};
 use crate::running::Running;
-use crate::spec::{self, Stdin};
+use crate::spec::{self, Stdio};
 use crate::status::ExitStatus;
 
 /// The base environment every restricted command starts with.
@@ -164,7 +204,8 @@ impl Restriction {
     /// library failing: spawning the process, a setup step (a Landlock rule
     /// that cannot apply, a rejected filter), or collecting the outcome.
     ///
-    /// The command runs with inherited standard streams.
+    /// The command runs with the stream dispositions the restriction carries,
+    /// which are inherited unless the builder said otherwise.
     pub fn run(&self) -> Result<ExitStatus, Error> {
         self.spawn()?.wait()
     }
@@ -197,7 +238,8 @@ impl Restriction {
     /// `spawn` blocks until the restriction is applied and the command is
     /// executing, so a setup failure is reported here, as the same typed
     /// error [`run`](Self::run) would return. The command runs with
-    /// inherited standard streams; the returned [`Running`] waits for,
+    /// the stream dispositions the restriction carries; the returned [`Running`]
+    /// waits for,
     /// signals, or kills it.
     pub fn spawn(&self) -> Result<Running<'static>, Error> {
         Running::launch(&self.plan, None)
@@ -215,6 +257,22 @@ impl Restriction {
         observer: &'obs mut dyn Observer,
     ) -> Result<Running<'obs>, Error> {
         Running::launch(&self.plan, Some(observer))
+    }
+
+    /// Starts the command on a pseudoterminal of its own, returning a handle to
+    /// it and the caller's end of the terminal.
+    ///
+    /// The counterpart of
+    /// [`Cage::spawn_terminal`](crate::Cage::spawn_terminal), and the fallback
+    /// supports it in full: a host-allocated pseudoterminal needs no `devpts`
+    /// instance, so a restriction gets the same interactive story a cage does.
+    /// The command process is the session leader here, since a restriction has
+    /// no PID namespace and so no init above it.
+    pub fn spawn_terminal(
+        &self,
+        terminal: &crate::Terminal,
+    ) -> Result<(Running<'static>, crate::Pty), Error> {
+        Running::launch_terminal(&self.plan, terminal)
     }
 }
 
@@ -246,7 +304,9 @@ pub struct RestrictionBuilder {
     /// a hand-written `Default` rather than deriving one.
     base_env: bool,
     workdir: Option<std::path::PathBuf>,
-    stdin: Stdin,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
     stop_with_caller: bool,
     rlimits: BTreeMap<Resource, (Limit, Limit)>,
     hardening: Request,
@@ -260,7 +320,9 @@ impl Default for RestrictionBuilder {
             env: Vec::new(),
             base_env: true,
             workdir: None,
-            stdin: Stdin::default(),
+            stdin: Stdio::default(),
+            stdout: Stdio::default(),
+            stderr: Stdio::default(),
             stop_with_caller: false,
             rlimits: BTreeMap::new(),
             hardening: Request::default(),
@@ -368,9 +430,32 @@ impl RestrictionBuilder {
 
     /// Selects the disposition of the command's standard input.
     ///
-    /// The default is [`Stdin::Inherit`].
-    pub fn stdin(mut self, stdin: Stdin) -> Self {
+    /// The default is [`Stdio::Inherit`], which also keeps the command in the
+    /// caller's session; see [`Stdio`] for the whole rule. It applies here
+    /// unchanged: a restriction has no namespace to close the caller's terminal
+    /// with, so the standard streams are the only thing that can.
+    pub fn stdin(mut self, stdin: Stdio) -> Self {
         self.stdin = stdin;
+        self
+    }
+
+    /// Selects the disposition of the command's standard output.
+    ///
+    /// The counterpart of [`CageBuilder::stdout`](crate::CageBuilder::stdout),
+    /// with the same default and the same interaction with a capturing launch.
+    /// It matters at least as much here: a restriction's command inherits the
+    /// caller's file descriptors exactly as a cage's does, and closing the
+    /// caller's terminal to it takes the output pair as well as standard input.
+    pub fn stdout(mut self, stdout: Stdio) -> Self {
+        self.stdout = stdout;
+        self
+    }
+
+    /// Selects the disposition of the command's standard error.
+    ///
+    /// The counterpart of [`stdout`](Self::stdout).
+    pub fn stderr(mut self, stderr: Stdio) -> Self {
+        self.stderr = stderr;
         self
     }
 
@@ -520,11 +605,14 @@ impl RestrictionBuilder {
                 overlay: None,
                 unshare: UnshareFlags::empty(),
                 pid_namespace: false,
-                stdin: match &self.stdin {
-                    Stdin::Inherit => StdinPlan::Inherit,
-                    Stdin::Null => StdinPlan::Null,
-                    Stdin::Fd(fd) => StdinPlan::Fd(Arc::clone(fd)),
-                },
+                stdin: StdioPlan::of(&self.stdin),
+                stdout: StdioPlan::of(&self.stdout),
+                stderr: StdioPlan::of(&self.stderr),
+                // The same rule a cage follows: the command joins the caller's
+                // session only to inherit its standard input. A restriction has
+                // no namespace to close the terminal, so the session and the
+                // output dispositions are the only things that can.
+                own_session: !matches!(self.stdin, Stdio::Inherit),
                 stop_with_caller: self.stop_with_caller,
                 hostname: None,
                 configure_loopback: false,
@@ -535,7 +623,7 @@ impl RestrictionBuilder {
                 ops: Vec::new(),
                 op_labels: Vec::new(),
                 // A restriction establishes no mount, so it creates no target.
-                managed_placeholders: Vec::new(),
+                managed_placeholders: ManagedPlaceholders::default(),
                 exec_label,
                 rlimits,
                 rlimit_labels,
@@ -695,7 +783,7 @@ mod tests {
     fn the_plan_creates_no_namespaces_and_mounts_nothing() {
         let restriction = restricted_true()
             .current_dir("/tmp")
-            .stdin(Stdin::Null)
+            .stdin(Stdio::Null)
             .stop_with_caller(true)
             .build()
             .unwrap();
@@ -707,7 +795,7 @@ mod tests {
         assert!(plan.hostname.is_none());
         assert!(plan.ops.is_empty() && plan.op_labels.is_empty());
         assert!(plan.rootfs_path.is_empty());
-        assert!(matches!(plan.stdin, StdinPlan::Null));
+        assert!(matches!(plan.stdin, StdioPlan::Null));
         assert!(plan.stop_with_caller);
         assert_eq!(plan.workdir.as_deref(), Some(c"/tmp"));
         // The lowered hardening carries the compiled policy and always the

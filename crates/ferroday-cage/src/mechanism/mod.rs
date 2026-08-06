@@ -119,6 +119,7 @@ use crate::host;
 use crate::idmap::{IdMapper, ResolvedMap};
 use crate::observer::Progress;
 use crate::status::ExitStatus;
+use crate::terminal::Terminal;
 
 /// What the launch stages build around the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,19 +185,51 @@ pub(crate) struct OverlayPlan {
     pub(crate) work: PathBuf,
 }
 
-/// How the command stage wires standard input, frozen at build time.
+/// How the command stage wires one standard stream, frozen at build time.
 ///
 /// The descriptor form holds the caller's descriptor for the plan's lifetime,
 /// shared so a clonable plan can launch repeatedly against it.
 #[derive(Debug, Clone, Default)]
-pub(crate) enum StdinPlan {
-    /// Leave file descriptor 0 as the launch inherited it.
+pub(crate) enum StdioPlan {
+    /// Leave the stream's descriptor as the launch inherited it.
     #[default]
     Inherit,
-    /// Redirect file descriptor 0 to `/dev/null`.
+    /// Redirect the stream to `/dev/null`.
     Null,
-    /// Redirect file descriptor 0 to a caller-supplied descriptor.
+    /// Redirect the stream to a caller-supplied descriptor.
     Fd(Arc<OwnedFd>),
+}
+
+impl StdioPlan {
+    /// Lowers a public disposition into the plan's own form.
+    pub(crate) fn of(stdio: &crate::Stdio) -> StdioPlan {
+        match stdio {
+            crate::Stdio::Inherit => StdioPlan::Inherit,
+            crate::Stdio::Null => StdioPlan::Null,
+            crate::Stdio::Fd(fd) => StdioPlan::Fd(Arc::clone(fd)),
+        }
+    }
+
+    /// The caller's descriptor, for the one variant that names one.
+    ///
+    /// The launch keeps these through the descriptor sweep and wires them onto
+    /// the command's standard streams; every other variant names no descriptor
+    /// of the caller's.
+    pub(crate) fn caller_fd(&self) -> Option<BorrowedFd<'_>> {
+        match self {
+            StdioPlan::Fd(fd) => Some(fd.as_fd()),
+            StdioPlan::Inherit | StdioPlan::Null => None,
+        }
+    }
+
+    /// Whether this disposition names a destination of its own, which a
+    /// launch-time attachment — capture pipes — would contradict.
+    ///
+    /// [`Inherit`](Self::Inherit) states no destination, so it is not a
+    /// contradiction: the launch is free to supply one.
+    pub(crate) fn names_a_destination(&self) -> bool {
+        !matches!(self, StdioPlan::Inherit)
+    }
 }
 
 /// One frozen resource limit, in the kernel's own terms.
@@ -224,6 +257,49 @@ pub(crate) struct RunAsPlan {
     /// The supplementary groups, set verbatim — an empty list clears the
     /// caller's inherited groups.
     pub(crate) groups: Vec<rustix::thread::Gid>,
+}
+
+/// The mount targets a launch has to create as empty files in the root, and the
+/// writable layer they are created in.
+///
+/// A file bind needs its target to exist before anything can be mounted onto it,
+/// so a root shipping none gets an empty file created. Left behind, that file is
+/// content the root did not have — a resolver configuration, an empty binary —
+/// which an export carries into whatever is made of the tree. The caller side
+/// removes each one after the launch instead: the sandbox owns what it creates.
+///
+/// Only the targets the caller side can name are listed: one under an earlier
+/// mount is created inside that mount rather than in the root, and one the root
+/// already ships — an entry of any kind at the path — is not the launch's to
+/// remove.
+///
+/// The paths are held root-relative, with the root named once, so the removal
+/// can resolve them the way the sandbox stage resolves its mount targets:
+/// against a descriptor for the root, with `RESOLVE_IN_ROOT`. Joined into
+/// absolute host paths instead, a rootfs-internal symbolic link — which an
+/// untrusted unpacked tree is entitled to contain — would resolve against the
+/// *host's* root on this side of the fork, and the removal could land outside
+/// the rootfs entirely.
+///
+/// Caller-side only, and never touched by the sandbox stages: inside the sandbox
+/// each path is under its bind, where unlinking it is `EBUSY`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ManagedPlaceholders {
+    /// The root's writable layer — the rootfs itself, or an overlay's upper —
+    /// which is where the launch creates the targets below. Canonical, so a root
+    /// the caller named relatively does not re-resolve against whatever
+    /// directory the process happens to be in when the handle drops. Empty when
+    /// there are no placeholders.
+    pub(crate) root: PathBuf,
+    /// The targets, as paths relative to [`root`](Self::root).
+    pub(crate) paths: Vec<PathBuf>,
+}
+
+impl ManagedPlaceholders {
+    /// Whether the launch creates no mount target the caller side has to remove.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
 }
 
 /// The frozen launch plan: everything the sandbox stages need, marshaled by
@@ -276,7 +352,26 @@ pub(crate) struct LaunchPlan {
     /// library init and namespace-wide teardown.
     pub(crate) pid_namespace: bool,
     /// How the command's standard input is wired.
-    pub(crate) stdin: StdinPlan,
+    pub(crate) stdin: StdioPlan,
+    /// How the command's standard output is wired, when the launch captures
+    /// nothing. A capturing launch supplies its own pipe, and a plan that names
+    /// a destination of its own is refused against one.
+    pub(crate) stdout: StdioPlan,
+    /// How the command's standard error is wired, on the same terms as
+    /// [`stdout`](Self::stdout).
+    pub(crate) stderr: StdioPlan,
+    /// Whether the launch stage starts a new session, so the sandbox has no
+    /// controlling terminal.
+    ///
+    /// Derived from [`stdin`](Self::stdin) alone: it is the stream whose
+    /// inheritance carries the caller's session with it. A command that
+    /// inherits the caller's standard input has been handed the caller's
+    /// terminal along with it and stays in the caller's session; one that does
+    /// not inherit it gets a session of its own, in which `/dev/tty` names
+    /// nothing and `TIOCSTI` is refused. That closes what is reached through
+    /// the session; the output pair is closed by its own disposition. See
+    /// [`Stdio`](crate::Stdio).
+    pub(crate) own_session: bool,
     /// Whether the supervisor stops the sandbox when the control socket
     /// hangs up — the caller exited or dropped the last handle.
     pub(crate) stop_with_caller: bool,
@@ -302,25 +397,9 @@ pub(crate) struct LaunchPlan {
     /// Caller-side labels parallel to `ops`, naming each mount in a setup
     /// error. Never touched by the sandbox stages.
     pub(crate) op_labels: Vec<String>,
-    /// The mount targets the launch has to create as empty files, as absolute
-    /// host paths, removed once the sandbox that needed them is gone.
-    ///
-    /// A file bind needs its target to exist before anything can be mounted
-    /// onto it, so a root shipping none gets an empty file created. Left
-    /// behind, that file is content the root did not have — a resolver
-    /// configuration, an empty binary — which an export carries into whatever
-    /// is made of the tree. The caller side removes each one after the launch
-    /// instead: the sandbox owns what it creates.
-    ///
-    /// Only the targets whose host path is known are listed: one under an
-    /// earlier mount is created inside that mount rather than in the root, and
-    /// one the root already ships is not the launch's to remove. The path is
-    /// the root's writable layer — the rootfs itself, or an overlay's upper —
-    /// joined with the rootfs-relative target.
-    ///
-    /// Caller-side only, and never touched by the sandbox stages: inside the
-    /// sandbox each path is under its bind, where unlinking it is `EBUSY`.
-    pub(crate) managed_placeholders: Vec<std::path::PathBuf>,
+    /// The mount targets the launch has to create as empty files, removed once
+    /// the sandbox that needed them is gone.
+    pub(crate) managed_placeholders: ManagedPlaceholders,
     /// The caller-side label naming the command in a failed exec step: the
     /// program path, or the bare name and the candidates a path lookup tried.
     /// Never touched by the sandbox stages.
@@ -355,6 +434,12 @@ pub struct SockFilter {
     /// The generic argument.
     pub k: u32,
 }
+
+// The kernel reads a program as an array of these, so a layout that drifts
+// from `struct sock_filter` must fail the build rather than misissue every
+// instruction of every filter.
+#[cfg(feature = "hardening")]
+const _: () = assert!(size_of::<SockFilter>() == 8);
 
 /// One frozen Landlock grant: an absolute sandbox path and the kernel
 /// `LANDLOCK_ACCESS_FS_*` bitmask allowed beneath it. The command stage masks
@@ -507,7 +592,8 @@ pub(crate) struct MountOp {
     /// entries are left alone.
     pub(crate) dirs: Vec<MountDir>,
     /// A rootfs-relative file to create (empty, mode 0644) as the target of
-    /// a file bind.
+    /// a file bind. An entry the root already ships at that path is left
+    /// exactly as it is, whatever kind it is.
     ///
     /// Unlike a mount point directory, it does not outlive the sandbox: see
     /// [`LaunchPlan::managed_placeholders`], which the caller side removes.
@@ -681,14 +767,16 @@ struct ParentSide {
     /// stage A signals ready on it after unsharing, the caller applies the
     /// map against stage A's pid, and the go byte releases the stage.
     map_gate: Option<OwnedFd>,
+    /// The primary of the pseudoterminal allocated for a terminal launch. The
+    /// caller's end, and the only descriptor to this terminal that stays on
+    /// this side.
+    primary: Option<OwnedFd>,
 }
 
 /// The go byte written to the proceed pipe to release a gated command. Its
 /// value is immaterial; the child treats any byte as the signal to proceed.
 const PROCEED_BYTE: u8 = b'G';
 
-/// The ready byte stage A sends on the map gate once it has unshared and is
-/// blocked waiting for the identity map.
 /// How a forked helper child's identity map is established.
 ///
 /// Shared by the export child, which reads a tree as root of the mapped
@@ -715,6 +803,25 @@ pub(crate) enum ChildMap<'a> {
     },
 }
 
+impl ChildMap<'_> {
+    /// The child's half of this map: what the forked process itself must do.
+    ///
+    /// The delegate a range map is applied by runs in the caller, so it does
+    /// not cross the fork.
+    pub(in crate::mechanism) fn duty(&self) -> child::MapDuty<'_> {
+        match self {
+            ChildMap::SelfMap { uid_line, gid_line } => {
+                child::MapDuty::Write { uid_line, gid_line }
+            }
+            ChildMap::Delegated { .. } => child::MapDuty::Await,
+        }
+    }
+}
+
+/// The ready byte a stage sends on its map gate once it has unshared and is
+/// blocked waiting for the identity map. Every child that waits for a
+/// delegated map sends it: stage A, the export child, the copy-in child, and
+/// the removal child.
 pub(super) const MAP_READY_BYTE: u8 = b'R';
 
 /// The go byte the caller sends on the map gate once the identity map is
@@ -728,8 +835,15 @@ pub(super) const MAP_GO_BYTE: u8 = b'M';
 /// runs [`child::stage_a`], which ends in `execve` or `exit_group`. In the
 /// parent it returns the caller's ends of the channels. A `gated` launch
 /// additionally carries a proceed pipe, whose read end the command stage
-/// blocks on before `execve`.
-fn fork_launch(plan: &LaunchPlan, observe: bool, gated: bool) -> Result<ParentSide, Error> {
+/// blocks on before `execve`; a `terminal` launch additionally allocates a
+/// pseudoterminal, whose replica the sandbox wires onto all three standard
+/// streams and whose primary comes back to the caller.
+fn fork_launch(
+    plan: &LaunchPlan,
+    observe: bool,
+    gated: bool,
+    terminal: Option<&Terminal>,
+) -> Result<ParentSide, Error> {
     // Pre-fork marshaling, caller side. The pointer arrays and identity-map
     // lines are the last pieces the sandbox stages need; they are assembled
     // here, where allocation is still permitted, and only read after the
@@ -805,6 +919,10 @@ fn fork_launch(plan: &LaunchPlan, observe: bool, gated: bool) -> Result<ParentSi
     } else {
         None
     };
+    // The pseudoterminal, last of the launch's own descriptors. Allocated after
+    // them so its replica cannot land on a standard-stream number: the six
+    // channel descriptors above are already taken, whatever the caller left open.
+    let terminal = terminal.map(crate::terminal::allocate).transpose()?;
 
     // SAFETY: the child-process branch only constructs a struct of references
     // on its own stack and runs `child::stage_a`, which performs raw rustix
@@ -823,14 +941,14 @@ fn fork_launch(plan: &LaunchPlan, observe: bool, gated: bool) -> Result<ParentSi
                 status_fd: status_write.as_fd(),
                 control_fd: cage_sock.as_fd(),
                 null_fd: null.as_fd(),
-                stdout_fd: stdout_pipe.as_ref().map(|(_, write)| write.as_fd()),
-                stderr_fd: stderr_pipe.as_ref().map(|(_, write)| write.as_fd()),
+                capture_stdout_fd: stdout_pipe.as_ref().map(|(_, write)| write.as_fd()),
+                capture_stderr_fd: stderr_pipe.as_ref().map(|(_, write)| write.as_fd()),
                 proceed_fd: proceed.as_ref().map(|(read, _)| read.as_fd()),
                 map_gate_fd: map_gate.as_ref().map(|(_, stage)| stage.as_fd()),
-                stdin_fd: match &plan.stdin {
-                    StdinPlan::Fd(fd) => Some(fd.as_fd()),
-                    StdinPlan::Inherit | StdinPlan::Null => None,
-                },
+                stdin_fd: plan.stdin.caller_fd(),
+                stdout_fd: plan.stdout.caller_fd(),
+                stderr_fd: plan.stderr.caller_fd(),
+                terminal_fd: terminal.as_ref().map(|(_, replica)| replica.as_fd()),
             };
             child::stage_a(&context)
         }
@@ -858,6 +976,22 @@ fn fork_launch(plan: &LaunchPlan, observe: bool, gated: bool) -> Result<ParentSi
                 drop(stage);
                 caller
             });
+            // The replica goes as soon as the fork returns. End-of-file on the
+            // primary arrives only when the last replica descriptor anywhere
+            // closes, so every process that is not the command drops its own
+            // copy — this one, `stage_init`'s, and the supervisor's.
+            //
+            // The one copy no launch controls is a sibling's: `kernel_fork`
+            // copies the whole descriptor table, so a child this caller forked
+            // between the replica's open just above and this close inherits one,
+            // exactly as the map gate records. Each of those children sweeps its
+            // inherited table early, which bounds the exposure to that sweep
+            // rather than to the sibling's life, and the replica is opened
+            // close-on-exec so no exec'd descendant can hold one at all.
+            let primary = terminal.map(|(primary, replica)| {
+                drop(replica);
+                primary
+            });
             Ok(ParentSide {
                 stage_a,
                 host_sock,
@@ -867,6 +1001,7 @@ fn fork_launch(plan: &LaunchPlan, observe: bool, gated: bool) -> Result<ParentSi
                 stderr,
                 proceed_write,
                 map_gate,
+                primary,
             })
         }
     }
@@ -994,14 +1129,17 @@ pub(crate) fn reap_via_pidfd(pidfd: BorrowedFd<'_>) -> Result<(), Errno> {
 ///
 /// Returns once the report pipe settles: end-of-file means every setup step
 /// succeeded and `execve` replaced the command process's image, and a record
-/// means a step failed and is returned as the typed error.
+/// means a step failed and is returned as the typed error. A terminal launch
+/// returns the caller's end of the pseudoterminal beside the launched sandbox;
+/// every other launch returns `None` for it.
 pub(crate) fn spawn(
     plan: &LaunchPlan,
     observe: bool,
+    terminal: Option<&Terminal>,
     progress: &mut dyn FnMut(Progress),
-) -> Result<Launched, Error> {
+) -> Result<(Launched, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
-    let mut parent = fork_launch(plan, observe, false)?;
+    let mut parent = fork_launch(plan, observe, false, terminal)?;
     // A range map is established before the supervisor is published, so a
     // published sandbox always has a fully mapped user namespace.
     establish_identity_map(plan, &mut parent)?;
@@ -1015,15 +1153,18 @@ pub(crate) fn spawn(
         // The command is running and the supervisor is published.
         (Ok(Report::ExecSucceeded), Ok((pidfd, pid))) => {
             progress(Progress::Executing);
-            Ok(Launched {
-                pidfd,
-                pid,
-                control: parent.host_sock,
-                status: parent.status_read,
-                stdout: parent.stdout,
-                stderr: parent.stderr,
-                reap: reap_after(plan.pid_namespace, parent.stage_a),
-            })
+            Ok((
+                Launched {
+                    pidfd,
+                    pid,
+                    control: parent.host_sock,
+                    status: parent.status_read,
+                    stdout: parent.stdout,
+                    stderr: parent.stderr,
+                    reap: reap_after(plan.pid_namespace, parent.stage_a),
+                },
+                parent.primary,
+            ))
         }
         // A setup step failed. Every stage at or below the failure has
         // exited, and a supervisor above it exits as soon as it observes the
@@ -1111,10 +1252,11 @@ pub(crate) struct PendingLaunch {
 pub(crate) fn spawn_pending(
     plan: &LaunchPlan,
     observe: bool,
+    terminal: Option<&Terminal>,
     progress: &mut dyn FnMut(Progress),
-) -> Result<PendingLaunch, Error> {
+) -> Result<(PendingLaunch, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
-    let mut parent = fork_launch(plan, observe, true)?;
+    let mut parent = fork_launch(plan, observe, true, terminal)?;
     // The map precedes the supervisor's publication, so by the time the
     // caller holds a Pending, /proc/<pid>/ns/user is fully mapped — the
     // ordering the network stack's helper relies on when it enters the
@@ -1127,21 +1269,29 @@ pub(crate) fn spawn_pending(
     match receive_supervisor(&parent.host_sock) {
         Ok((pidfd, pid)) => {
             progress(Progress::Supervised);
-            Ok(PendingLaunch {
-                stage_a: parent.stage_a,
-                pidfd,
-                pid,
-                host_sock: parent.host_sock,
-                report_read: parent.report_read,
-                status_read: parent.status_read,
-                stdout: parent.stdout,
-                stderr: parent.stderr,
-                proceed_write,
-                pid_namespace: plan.pid_namespace,
-                op_labels: plan.op_labels.clone(),
-                exec_label: plan.exec_label.clone(),
-                rlimit_labels: plan.rlimit_labels.clone(),
-            })
+            // The primary comes back here rather than out of `proceed`: the
+            // pseudoterminal is allocated before the fork and the gate sits
+            // after the controlling terminal is established, so the caller
+            // attaches its network stack and proceeds with the primary already
+            // in hand. Nothing writes to the terminal while the launch is held.
+            Ok((
+                PendingLaunch {
+                    stage_a: parent.stage_a,
+                    pidfd,
+                    pid,
+                    host_sock: parent.host_sock,
+                    report_read: parent.report_read,
+                    status_read: parent.status_read,
+                    stdout: parent.stdout,
+                    stderr: parent.stderr,
+                    proceed_write,
+                    pid_namespace: plan.pid_namespace,
+                    op_labels: plan.op_labels.clone(),
+                    exec_label: plan.exec_label.clone(),
+                    rlimit_labels: plan.rlimit_labels.clone(),
+                },
+                parent.primary,
+            ))
         }
         // The supervisor was never published: a setup step failed before the
         // command reached the gate. The child reported it and exited; read
@@ -1196,9 +1346,12 @@ impl PendingLaunch {
                 detail,
             }) => {
                 let _ = wait_for_exit(self.stage_a);
-                // Field-by-field rather than through `labels()`: the proceed
-                // pipe was already moved out of `self` above, so `self` as a
-                // whole can no longer be borrowed.
+                // Assembled field by field rather than from `&self`: the
+                // proceed pipe was moved out of `self` above, so `self` as a
+                // whole can no longer be borrowed — which is what a helper
+                // taking `&self` would need. `Labels::of` does not apply
+                // either; it reads a plan, and this side holds only the labels
+                // the plan was built with.
                 Err(setup_error(
                     step,
                     errno,

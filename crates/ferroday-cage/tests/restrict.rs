@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use ferroday_cage::{
     Error, FsAccess, NetAccess, Restriction, RestrictionBuilder, SeccompAction, SeccompArg,
-    SeccompPolicy, SeccompRules, SetupStep, Stdin,
+    SeccompPolicy, SeccompRules, SetupStep, Stdio, Terminal,
 };
 
 /// Skips a Landlock test when the kernel offers no Landlock LSM.
@@ -159,7 +159,7 @@ fn landlock_net_gates_a_tcp_connection() {
             .command(nc)
             .args(["-w", "2", "127.0.0.1", &port.to_string()])
             .landlock_net(NetAccess::CONNECT, granted)
-            .stdin(Stdin::Null)
+            .stdin(Stdio::Null)
             .build()
             .expect("a valid restriction configuration")
             .run()
@@ -493,4 +493,121 @@ fn a_missing_command_is_an_exec_setup_error() {
         Err(Error::Setup { step, .. }) => assert_eq!(step, SetupStep::Exec),
         other => panic!("expected an exec setup error, got {other:?}"),
     }
+}
+
+#[test]
+fn a_restriction_directs_its_output_streams() {
+    if !seccomp_supported() {
+        return;
+    }
+    // A restriction's command inherits the caller's descriptors exactly as a
+    // cage's does, so closing the caller's terminal to it takes the output pair
+    // as well as standard input. Standard output is discarded and standard
+    // error goes to a pipe the caller supplies; the command reports what each
+    // was wired to, taking a copy of standard output onto file descriptor 3
+    // first so the redirection cannot answer for it.
+    let Some(shell) = ["/bin/sh", "/usr/bin/sh"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("skipping: no shell on this host");
+        return;
+    };
+    let (mut reader, writer) = std::io::pipe().expect("a pipe");
+    let restriction = grant_system_trees(Restriction::builder())
+        .landlock_fs(FsAccess::READ, "/proc")
+        .command(shell)
+        .args([
+            "-c",
+            "exec 3>&1; readlink /proc/self/fd/3 >&2; echo err >&2",
+        ])
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::from_fd(writer.into()))
+        .build()
+        .expect("a valid restriction configuration");
+    let status = restriction.run().expect("the restriction launches");
+    assert!(status.success());
+    // The plan shares the caller's descriptor for its whole life, so the write
+    // end closes only once the restriction is gone.
+    drop(restriction);
+
+    let mut captured = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut captured)
+        .expect("the pipe reads to end-of-file");
+    let mut lines = captured.lines();
+    assert_eq!(
+        lines.next(),
+        Some("/dev/null"),
+        "a null standard output resolves to the null device: {captured:?}",
+    );
+    assert_eq!(
+        lines.next(),
+        Some("err"),
+        "the descriptor disposition carries what the command wrote: {captured:?}",
+    );
+}
+
+#[test]
+fn a_restriction_runs_on_a_terminal_of_its_own() {
+    if !seccomp_supported() {
+        return;
+    }
+    // A host-allocated pseudoterminal needs no devpts instance, so the fallback
+    // gets the same interactive story a cage does: isatty holds on all three
+    // streams, the command has a controlling terminal, and it is not the
+    // caller's. The command process is the session leader here, there being no
+    // PID namespace and so no init above it.
+    let Some(shell) = ["/bin/sh", "/usr/bin/sh"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("skipping: no shell on this host");
+        return;
+    };
+    let restriction = grant_system_trees(Restriction::builder())
+        .landlock_fs(FsAccess::READ, "/proc")
+        .command(shell)
+        .args([
+            "-c",
+            "for fd in 0 1 2; do [ -t $fd ] || exit 1; done; stty size",
+        ])
+        .build()
+        .expect("a valid restriction configuration");
+    let (mut running, mut pty) = restriction
+        .spawn_terminal(&Terminal::new().size(30, 100))
+        .expect("the restriction launches on a terminal");
+
+    let mut written = Vec::new();
+    std::io::Read::read_to_end(&mut pty, &mut written).expect("the primary drains to end-of-file");
+    let status = running.wait().expect("the outcome is collected");
+    let written = String::from_utf8_lossy(&written);
+    assert!(status.success(), "isatty must hold on all three: {written}");
+    assert!(
+        written.contains("30 100"),
+        "the command sees the stated size: {written}",
+    );
+}
+
+#[test]
+fn a_restricted_terminal_launch_is_refused_against_a_directed_stream() {
+    if !seccomp_supported() {
+        return;
+    }
+    let restriction = Restriction::builder()
+        .command("/bin/true")
+        .seccomp(SeccompPolicy::Curated)
+        .stdin(Stdio::Null)
+        .build()
+        .expect("the restriction itself is valid");
+    let err = restriction
+        .spawn_terminal(&Terminal::new())
+        .expect_err("a terminal launch is refused");
+    assert!(
+        matches!(
+            err,
+            Error::Config(ferroday_cage::ConfigError::StreamAttachmentConflict { .. })
+        ),
+        "{err:?}",
+    );
 }

@@ -66,7 +66,8 @@ environment plus the caller's variables. The base is `PATH` alone — unlike
 the cage's, it carries no `HOME`, because the command runs as the real
 calling user, for whom `/root` would be wrong; set `HOME` explicitly if the
 command needs one. Standard streams, the [`stdin`] disposition, output
-streaming through an observer, and the [`Running`] handle — wait, deadline,
+streaming through an observer, a pseudoterminal of its own (see [A terminal of
+the sandbox's own](terminal.md)), and the [`Running`] handle — wait, deadline,
 terminate, kill, [`stop_with_caller`] — all work as they do for a cage.
 
 The command starts with no capabilities. A restriction always drops to the
@@ -81,10 +82,20 @@ Because a restriction runs a host process with no namespace or root-swap
 isolation, some host-reaching surfaces remain, governed only by the Landlock
 and seccomp the caller configured: abstract-socket services such as D-Bus and
 the X server (a Landlock network grant governs TCP alone), same-user `/proc`
-under a seccomp-only restriction, same-user `ptrace` under a Landlock-only
-restriction (the curated seccomp policy blocks it), and `TIOCSTI` terminal
-injection on an inherited controlling terminal. A cage closes all of these
+under a seccomp-only restriction, and same-user `ptrace` under a Landlock-only
+restriction (the curated seccomp policy blocks it). A cage closes these three
 through its namespaces and swapped root.
+
+The caller's terminal is not among them, because it is not a namespace question:
+a controlling terminal is reached through the session, so a cage and a
+restriction answer it identically, by the rule described in
+[The dispositions and the caller's
+terminal](streaming.md#the-dispositions-and-the-callers-terminal). A command that
+inherits the caller's standard input shares the caller's terminal deliberately;
+one that does not runs in a session of its own and cannot reach it at all.
+Independently of the session, the curated seccomp policy denies `ioctl` for the
+`TIOCSTI` and `TIOCLINUX` requests, the two that write to a terminal's input
+queue.
 
 ## Falling back from a cage
 

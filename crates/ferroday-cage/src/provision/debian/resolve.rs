@@ -344,6 +344,28 @@ mod tests {
     }
 
     #[test]
+    fn two_packages_a_real_archive_conflicts_both_enter_the_closure() {
+        // The resolver reads Depends, Pre-Depends, and Provides, and no other
+        // relation: a coherent suite is internally consistent, and dpkg runs
+        // with --force-depends. So Conflicts and Replaces are not consulted, and
+        // a closure can legitimately hold two packages a real archive expects
+        // never to be unpacked together.
+        //
+        // Pinned because it is what makes a duplicate statoverride reachable
+        // without anything malformed — two selected packages shipping one path.
+        // The collapsing is the accumulator's job, not the resolver's, and it
+        // has to stay that way while this rule holds.
+        let text = format!(
+            "{}{}{}",
+            stanza("base", "left, right", ""),
+            stanza("left", "", "Conflicts: right\nReplaces: right"),
+            stanza("right", "", "Conflicts: left\nReplaces: left"),
+        );
+        let selected = resolve(&index(&text), &["base".into()], &[], &[]).unwrap();
+        assert_eq!(names(&selected), ["base", "left", "right"]);
+    }
+
+    #[test]
     fn an_unknown_include_is_an_error() {
         let text = stanza("a", "", "");
         let err = resolve(&index(&text), &[], &["nonesuch".into()], &[]).unwrap_err();

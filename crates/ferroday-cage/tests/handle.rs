@@ -6,7 +6,7 @@ mod common;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, Observer, Stdin};
+use ferroday_cage::{Cage, Observer, Stdio};
 
 /// Builds a cage running `/bin/sh -c <script>` in the fixture rootfs.
 fn sh(rootfs: &Path, script: &str) -> Cage {
@@ -170,7 +170,7 @@ fn helper_spawn_and_abandon() {
     let running = Cage::builder()
         .rootfs(rootfs)
         .stop_with_caller(mode == "stop")
-        .stdin(Stdin::Null)
+        .stdin(Stdio::Null)
         .command("/bin/sleep")
         .arg("86399")
         .build()

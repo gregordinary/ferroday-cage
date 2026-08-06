@@ -141,6 +141,28 @@ enum Step {
 }
 
 impl Step {
+    /// Every step, in wire order. Used by the wire-protocol test.
+    #[cfg(test)]
+    const ALL: [Step; 17] = [
+        Step::JoinUser,
+        Step::JoinNet,
+        Step::OpenTun,
+        Step::CreateTap,
+        Step::OpenInet,
+        Step::SetHwaddr,
+        Step::SetMtu,
+        Step::SetV4Addr,
+        Step::SetV4Mask,
+        Step::ReadFlags,
+        Step::RaiseFlags,
+        Step::AddV4Route,
+        Step::ReadIndex,
+        Step::OpenInet6,
+        Step::SetV6Addr,
+        Step::AddV6Route,
+        Step::SendTap,
+    ];
+
     /// Decodes a step from its record wire value.
     fn from_wire(value: u32) -> Option<Step> {
         Some(match value {
@@ -756,4 +778,27 @@ fn add_v6_default_route(inet6: &OwnedFd, index: i32, v6: &PlanV6) -> Result<(), 
     // `In6Rtmsg` lays out its fields — the `unsigned long` member as
     // `usize` — at the kernel's offsets, with the size asserted above.
     unsafe { ioctl::ioctl(inet6, ioctl::Setter::<SIOCADDRT, In6Rtmsg>::new(request)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The helper writes the discriminant and its parent decodes it from a
+    /// table written out by hand; a step inserted mid-enum renumbers every
+    /// step after it, and nothing but this test makes the two agree.
+    #[test]
+    fn step_wire_round_trip() {
+        for step in Step::ALL {
+            assert_eq!(Step::from_wire(step as u32), Some(step));
+        }
+    }
+
+    /// Zero is the success record, and nothing past the last step is a step.
+    #[test]
+    fn unknown_wire_values_are_rejected() {
+        assert_eq!(Step::from_wire(0), None);
+        assert_eq!(Step::from_wire(Step::ALL.len() as u32 + 1), None);
+        assert_eq!(Step::from_wire(u32::MAX), None);
+    }
 }

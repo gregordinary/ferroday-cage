@@ -26,10 +26,11 @@ use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use super::identity::compose_child_map;
 use super::{Delegate, ProvisionError, io_error};
 use crate::mechanism::{
-    ChildMap, ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE,
-    FRAME_SYMLINK, StartError, kill_export, start_export,
+    ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
+    StartError, kill_export, start_export,
 };
 use crate::{IdMapper, IdentityMap};
 
@@ -217,52 +218,13 @@ fn export_inner<W: Write>(
         )
     })?;
 
-    // Compose the child's map: the single map it writes itself, a range map a
-    // delegate applies. The self-map lines are formatted here, before the fork,
-    // as a launch formats its own.
-    let uid_line;
-    let gid_line;
-    let default_chain;
-    let resolved;
-    let export_map = match map {
-        IdentityMap::Single => {
-            let euid = rustix::process::geteuid().as_raw();
-            let egid = rustix::process::getegid().as_raw();
-            uid_line = format!("0 {euid} 1\n").into_bytes();
-            gid_line = format!("0 {egid} 1\n").into_bytes();
-            ChildMap::SelfMap {
-                uid_line: &uid_line,
-                gid_line: &gid_line,
-            }
-        }
-        IdentityMap::Ranges { .. } | IdentityMap::Subordinate => {
-            let unprivileged = |reason: String| ProvisionError::ExportUnprivileged {
-                path: rootfs.to_path_buf(),
-                reason,
-            };
-            match mapper {
-                Some(mapper) => {
-                    resolved = mapper
-                        .resolve(map)
-                        .map_err(|err| unprivileged(err.to_string()))?;
-                    ChildMap::Delegated {
-                        mapper,
-                        map: &resolved,
-                    }
-                }
-                None => {
-                    default_chain =
-                        crate::idmap::resolve_default_chain(map).map_err(unprivileged)?;
-                    ChildMap::Delegated {
-                        mapper: default_chain.0.as_ref(),
-                        map: &default_chain.1,
-                    }
-                }
-            }
-        }
-    };
+    let source =
+        compose_child_map(map, mapper).map_err(|reason| ProvisionError::ExportUnprivileged {
+            path: rootfs.to_path_buf(),
+            reason,
+        })?;
 
-    let child = match start_export(&rootfs_c, export_map) {
+    let child = match start_export(&rootfs_c, source.child_map()) {
         Ok(child) => child,
         Err(StartError::Spawn(errno)) => {
             return Err(io_error("exporting", rootfs, errno.into()));
@@ -329,7 +291,14 @@ fn drive<W: Write>(
             }
             FRAME_ERROR => {
                 let (step, errno) = read_error(&mut reader).map_err(read_err)?;
-                let step = ExportStep::from_wire(step);
+                let Some(step) = ExportStep::from_wire(step) else {
+                    // The child is this same build, so a step it does not
+                    // carry means the stream is malformed rather than newer.
+                    return Err(read_err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected export failure step {step}"),
+                    )));
+                };
                 return Err(io_error(
                     step.describe(),
                     rootfs,

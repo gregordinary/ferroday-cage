@@ -151,6 +151,13 @@ Remove::new("/var/lib/myapp/rootfs")
 `provision::remove(dest)` is the shorthand for the common case: the bundled
 chain, and nothing to configure.
 
+A tree written under the single-identity map escalates too, named with
+`Remove::map(IdentityMap::Single)`, and there the child writes the map itself
+with no delegate involved. Its ids are the caller's own either way, so the
+escalation looks redundant and is not: root of the mapped namespace holds the
+capabilities that clear a directory whose own mode denies the write the
+deletion needs — a read-only directory an archive carried in, for one.
+
 At a shell prompt, `fcage --remove-rootfs DIR` is the same removal. It takes
 `--identity-map` for the map the tree was provisioned under, defaulting to the
 subordinate one, and is a mode of its own that accepts no other option:
@@ -272,9 +279,10 @@ needs its target to exist, so the `/etc/resolv.conf` bind that host networking
 performs creates an empty file when the rootfs ships none — and removes it once
 the sandbox is gone, leaving the tree without the resolver configuration it never
 had. A caller's own file bind is treated the same way: the empty `0644` target it
-needs is present for the mount to cover and for nothing else. A rootfs that does
-ship the file keeps it untouched: the bind covers it for the sandbox's life and
-reveals it again afterwards.
+needs is present for the mount to cover and for nothing else, and its mode is
+exact, independent of the launching process's umask. A rootfs that does ship an
+entry at that path keeps it untouched, whether it is a file or a symbolic link:
+the bind covers it for the sandbox's life and reveals it again afterwards.
 
 A caller's own `bind` or `raw_mount` is the case where a *directory* target is
 created and stays, as `0755`. That is worth knowing when the tree being written
@@ -289,7 +297,7 @@ than in the base:
 # use ferroday_cage::Cage;
 # fn main() -> ferroday_cage::Result<()> {
 Cage::builder()
-    .overlay_rootfs("/var/lib/myapp/rootfs", "/var/tmp/build-42")
+    .overlay_rootfs("/var/lib/myapp/rootfs", "/var/lib/myapp/build-42")
     .command("/usr/bin/make")
     .build()?
     .run()?;
@@ -341,7 +349,9 @@ the rootfs already carries is kept and descended into, a file, symlink, or named
 pipe is replaced.
 
 Directories, regular files, symbolic links, and named pipes are copied, with
-their modes and modification times. Several names for one file are copied as
+their modes and modification times. A symbolic link's modification time is its
+own rather than its target's; its mode is the one thing not carried, the kernel
+fixing every symbolic link's at `0777`. Several names for one file are copied as
 hard links onto the first name, so a tree keeps the sharing it was written with
 and its data is streamed once; that is what lets a tree exported by `Export`,
 which coalesces hard links of its own, come back through `CopyIn` unchanged.
@@ -424,7 +434,10 @@ filesystem:
   relative symlinks resolve normally — a merged-usr archive whose `bin`
   is a symlink to `usr/bin` extracts correctly — while an entry that
   reaches outside through `..`, an absolute path, or a symlink chain fails
-  with `ProvisionError::EntryUnsafe` before anything is written.
+  with `ProvisionError::EntryUnsafe` before anything is written. That error
+  means an escape and nothing else; an entry refused for another reason — a
+  path component that is not a directory, a symbolic link with no target —
+  is a `ProvisionError::EntryRefused`.
 - **Ownership maps to the calling user.** Every extracted entry belongs to the
   calling user, whom the sandbox's identity map presents as root, so
   extracted files appear root-owned inside the sandbox. Ownership recorded
@@ -477,7 +490,7 @@ use ferroday_cage::Cage;
 
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
-    .overlay_rootfs("/var/cache/myapp/alpine-rootfs", "/var/tmp/run-42")
+    .overlay_rootfs("/var/cache/myapp/alpine-rootfs", "/var/cache/myapp/run-42")
     .bind("/home/user/project", "/work")
     .command("/usr/bin/make")
     .build()?
@@ -488,7 +501,7 @@ let status = Cage::builder()
 ```
 
 The mount points, the command's writes, and anything a build leaves behind all
-land in `/var/tmp/run-42`; the provisioned root is untouched and byte-identical
+land in `/var/cache/myapp/run-42`; the provisioned root is untouched and byte-identical
 to what `ensure` published. Discarding the upper reverts the run, which is also
 what makes the pattern a clean-root-per-build — see [the ebuild
 sandbox](ebuild-sandbox.md#a-note-on-clean-builds). Keeping the upper instead
@@ -502,6 +515,16 @@ falling back to writing into the base. The kernel creates a directory in the
 overlay's work area with mode `0`, so discard the upper with
 `provision::remove`, which restores traversable permissions as it descends,
 rather than a plain `rm -rf`.
+
+Put the upper under a directory the calling user controls, not a world-writable
+one such as `/var/tmp` — the same requirement `rootfs` carries, and for a
+sharper reason: the upper is where the sandbox's writes land and where the
+caller reads its result back afterwards. The library creates the upper and its
+work directory with `mkdirat` against their parent and adopts an existing entry
+only when it is a directory the calling user owns, so a symbolic link another
+local user planted at the path is refused rather than followed. That closes the
+create; it does not make a shared parent safe, because the mount options name
+the layers as paths and the kernel resolves them again at mount time.
 
 On the command line, `--overlay-lower` and `--overlay-upper` stand in for
 `--rootfs`.

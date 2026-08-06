@@ -241,3 +241,47 @@ fn a_missing_stacked_lower_names_its_role() {
         "the message should name the layer: {err}"
     );
 }
+
+#[test]
+fn a_work_directory_on_another_filesystem_is_refused_by_name() {
+    let Some(lower) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("overlay-work-xdev");
+    // `/dev/shm` is a tmpfs on every ordinary Linux host, and the scratch
+    // directory lives under `target`, so the two are on different filesystems.
+    // Without one, the premise of the test does not hold and there is nothing
+    // to assert.
+    let elsewhere = Path::new("/dev/shm");
+    let (Ok(here), Ok(there)) = (
+        std::fs::metadata(&dir).map(|meta| std::os::unix::fs::MetadataExt::dev(&meta)),
+        std::fs::metadata(elsewhere).map(|meta| std::os::unix::fs::MetadataExt::dev(&meta)),
+    ) else {
+        eprintln!("skipping: no second filesystem to place the work directory on");
+        return;
+    };
+    if here == there {
+        eprintln!("skipping: the scratch directory and /dev/shm share a filesystem");
+        return;
+    }
+
+    // The overlay moves files between the upper and the work directory, so the
+    // kernel requires them on one filesystem. The build says so, naming the
+    // work directory, rather than letting the mount fail with a bare EXDEV.
+    let work = elsewhere.join(format!("fcage-work-{}", std::process::id()));
+    let err = Cage::builder()
+        .overlay(
+            ferroday_cage::Overlay::new()
+                .lower(lower)
+                .upper(dir.join("upper"))
+                .work(&work),
+        )
+        .command("/bin/sh")
+        .build()
+        .expect_err("a work directory on another filesystem must be refused");
+    let _ = std::fs::remove_dir(&work);
+    assert!(
+        err.to_string().contains("overlay work directory"),
+        "the refusal must name the work directory: {err}"
+    );
+}

@@ -52,9 +52,9 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::process::{Pid, Signal};
 use rustix::runtime::{self, Fork};
-use rustix::thread::UnshareFlags;
 
 use super::ChildMap;
+use super::child::{MapFailure, MapStep};
 use crate::idmap::{IdMapError, IdMapper, ResolvedMap};
 
 /// Frame tag: a directory is entered.
@@ -72,36 +72,42 @@ pub(crate) const FRAME_ERROR: u8 = 6;
 
 /// What the export child was doing when a syscall failed, carried in a
 /// [`FRAME_ERROR`] frame and by [`StartError`].
+///
+/// The explicit discriminants are the frame's wire encoding, which both ends
+/// of a single build write and read. They are not a stable protocol: a step
+/// inserted in a later release may renumber the ones after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub(crate) enum ExportStep {
-    /// Forking the export process or speaking to it.
-    Spawn,
+    /// Forking the export process or speaking to it. Reported by the caller
+    /// alone: the child has no channel to report it on.
+    Spawn = 0,
     /// The child could not reset its inherited signal dispositions.
-    ResetSignals,
+    ResetSignals = 1,
     /// The child could not close the descriptors it inherited.
-    SweepFds,
+    SweepFds = 2,
     /// The child could not unshare its user namespace.
-    Unshare,
+    Unshare = 3,
     /// The child could not write its own single-identity map.
-    SelfMap,
+    SelfMap = 4,
     /// The child was abandoned at the map gate.
-    AwaitMap,
+    AwaitMap = 5,
     /// Reading a directory's entries failed.
-    ReadDir,
+    ReadDir = 6,
     /// Stat-ing an entry failed.
-    Stat,
+    Stat = 7,
     /// Opening an entry failed.
-    Open,
+    Open = 8,
     /// Reading a symlink target failed.
-    ReadLink,
+    ReadLink = 9,
     /// Reading an entry's extended attributes failed.
-    Xattr,
+    Xattr = 10,
     /// Reading a file's data failed.
-    ReadData,
+    ReadData = 11,
     /// The tree is nested deeper than the export walks.
-    Depth,
+    Depth = 12,
     /// Streaming a frame to the parent failed; the parent is gone.
-    Stream,
+    Stream = 13,
 }
 
 impl ExportStep {
@@ -125,15 +131,38 @@ impl ExportStep {
         }
     }
 
+    /// Every step, in wire order. Used by the wire-protocol tests.
+    #[cfg(test)]
+    pub(crate) const ALL: [ExportStep; 14] = [
+        ExportStep::Spawn,
+        ExportStep::ResetSignals,
+        ExportStep::SweepFds,
+        ExportStep::Unshare,
+        ExportStep::SelfMap,
+        ExportStep::AwaitMap,
+        ExportStep::ReadDir,
+        ExportStep::Stat,
+        ExportStep::Open,
+        ExportStep::ReadLink,
+        ExportStep::Xattr,
+        ExportStep::ReadData,
+        ExportStep::Depth,
+        ExportStep::Stream,
+    ];
+
     /// The wire discriminant carried in a [`FRAME_ERROR`] frame.
     fn wire(self) -> u32 {
         self as u32
     }
 
-    /// Decodes a wire discriminant, defaulting to [`ExportStep::Stream`] for an
-    /// unrecognized value (a defect that still must not panic post-fork).
-    pub(crate) fn from_wire(wire: u32) -> ExportStep {
-        match wire {
+    /// Decodes a wire discriminant, or `None` for a value no step carries.
+    ///
+    /// Both ends of the frame are the same build, so an unrecognized value is
+    /// a malformed frame rather than a step from another version. It is
+    /// reported as one instead of being read as a step the child did not
+    /// name.
+    pub(crate) fn from_wire(wire: u32) -> Option<ExportStep> {
+        Some(match wire {
             0 => ExportStep::Spawn,
             1 => ExportStep::ResetSignals,
             2 => ExportStep::SweepFds,
@@ -147,8 +176,9 @@ impl ExportStep {
             10 => ExportStep::Xattr,
             11 => ExportStep::ReadData,
             12 => ExportStep::Depth,
-            _ => ExportStep::Stream,
-        }
+            13 => ExportStep::Stream,
+            _ => return None,
+        })
     }
 }
 
@@ -175,18 +205,26 @@ impl ExportChild {
         self.stream.as_fd()
     }
 
-    /// Reaps the child once its stream is drained.
+    /// Reaps the child once its stream is drained, reporting only whether the
+    /// wait itself succeeded.
+    ///
+    /// The wait status is deliberately not judged. What the child made of the
+    /// tree is carried by the stream — [`FRAME_END`] for a completed walk,
+    /// [`FRAME_ERROR`] for a failed one — and the parent has already read it by
+    /// the time this is called. A status is the weaker evidence besides: the
+    /// terminator is written before `exit_group`, so a child signalled between
+    /// the two produced a complete archive and would be reported as a failure,
+    /// while a child killed mid-walk truncated the stream and is reported by the
+    /// reader that ran into the end of it.
     pub(crate) fn finish(self) -> Result<(), Errno> {
         drop(self.stream);
         super::wait_for_exit(self.pid).map(|_| ())
     }
 }
 
-/// The ready byte the child sends on the map gate once it has unshared and is
-/// blocked waiting for the delegate. Distinct value from the launch gate's,
-/// though the protocol is the same shape.
-const EXPORT_READY_BYTE: u8 = b'r';
-/// The go byte the caller sends once the delegate has applied the map.
+/// The go byte the caller sends once the delegate has applied the map. The
+/// child's ready byte is the shared [`MAP_READY_BYTE`](super::MAP_READY_BYTE),
+/// as every map gate's is.
 const EXPORT_GO_BYTE: u8 = b'g';
 
 /// Forks the export child and establishes its identity map.
@@ -288,7 +326,7 @@ fn drive_gate(
             Err(errno) => return Err(StartError::Spawn(errno)),
         }
     };
-    if ready == 0 || byte[0] != EXPORT_READY_BYTE {
+    if ready == 0 || byte[0] != super::MAP_READY_BYTE {
         // The child is gone or malfunctioning; its stream reports why.
         return Ok(());
     }
@@ -307,6 +345,19 @@ fn drive_gate(
     }
 }
 
+/// The step an export reports for a shared map step. The three writes of a
+/// single-identity map are one step here: the export names what it was doing,
+/// and it was writing its own map.
+fn export_step(step: MapStep) -> ExportStep {
+    match step {
+        MapStep::ResetSignals => ExportStep::ResetSignals,
+        MapStep::SweepFds => ExportStep::SweepFds,
+        MapStep::Unshare => ExportStep::Unshare,
+        MapStep::DenySetgroups | MapStep::WriteGidMap | MapStep::WriteUidMap => ExportStep::SelfMap,
+        MapStep::AwaitMap => ExportStep::AwaitMap,
+    }
+}
+
 /// The child: unshare, establish the map, walk, and stream. Never returns.
 ///
 /// Takes the gate by value so the handshake can close it: past the go byte the
@@ -322,72 +373,24 @@ fn export_child(
         runtime::exit_group(1)
     };
 
-    // A caller signal handler must never run in this constrained copy; the
-    // scrub is the same one every launch performs first.
-    if let Err(errno) = super::child::reset_signals() {
-        fail(ExportStep::ResetSignals, errno);
-    }
-
-    // Close the rest of the caller's descriptor table. An export of a large
-    // rootfs runs for minutes, and an inherited copy of a live sandbox's
-    // control socket would hold that sandbox's supervisor open for all of it.
     let keep = [
         stream.as_raw_fd(),
         gate.as_ref().map_or(-1 as RawFd, |gate| gate.as_raw_fd()),
     ];
-    if let Err(errno) = super::child::sweep_fds_keeping(&keep) {
-        fail(ExportStep::SweepFds, errno);
-    }
-
-    // The user namespace alone: the walk works on the caller's own mount view,
-    // through real paths, as root of the mapped namespace.
-    // SAFETY: the flags never include the descriptor table, and this process is
-    // a freshly forked single-threaded child besides.
-    if let Err(errno) = unsafe { rustix::thread::unshare_unsafe(UnshareFlags::NEWUSER) } {
-        fail(ExportStep::Unshare, errno);
-    }
-
-    match (map, gate) {
-        (ChildMap::SelfMap { uid_line, gid_line }, _) => {
-            // Deny setgroups first, as the one-id exception requires, then write
-            // the maps in process — exactly as stage A does for a single map.
-            if let Err(errno) = super::child::write_file(c"/proc/self/setgroups", b"deny") {
-                fail(ExportStep::SelfMap, errno);
-            }
-            if let Err(errno) = super::child::write_file(c"/proc/self/gid_map", gid_line) {
-                fail(ExportStep::SelfMap, errno);
-            }
-            if let Err(errno) = super::child::write_file(c"/proc/self/uid_map", uid_line) {
-                fail(ExportStep::SelfMap, errno);
-            }
-        }
-        (ChildMap::Delegated { .. }, Some(gate)) => {
-            // Signal ready, then block until the delegate has written the map.
-            loop {
-                match rustix::io::write(&gate, &[EXPORT_READY_BYTE]) {
-                    Ok(_) => break,
-                    Err(Errno::INTR) => continue,
-                    Err(errno) => fail(ExportStep::AwaitMap, errno),
-                }
-            }
-            let mut byte = [0u8; 1];
-            loop {
-                match rustix::io::read(&gate, &mut byte) {
-                    Ok(0) => runtime::exit_group(1),
-                    Ok(_) => break,
-                    Err(Errno::INTR) => continue,
-                    Err(errno) => fail(ExportStep::AwaitMap, errno),
-                }
-            }
-            // The map is in force and the gate has served its purpose; the walk
-            // below carries the rest of the conversation on the stream.
-            drop(gate);
-        }
-        (ChildMap::Delegated { .. }, None) => {
-            // start_export pairs every delegated map with a gate.
-            fail(ExportStep::AwaitMap, Errno::BADF);
+    if let Err(failure) =
+        super::child::enter_mapped_namespace(&keep, map.duty(), gate.as_ref().map(OwnedFd::as_fd))
+    {
+        match failure {
+            // The caller left without applying the map; its own error is the
+            // diagnostic, and it is no longer reading the stream a report
+            // would travel on.
+            MapFailure::Abandoned => runtime::exit_group(1),
+            MapFailure::Step(step, errno) => fail(export_step(step), errno),
         }
     }
+    // The map is in force and the gate has served its purpose; the walk below
+    // carries the rest of the conversation on the stream, and it is long.
+    drop(gate);
 
     let root = match fs::open(
         rootfs,
@@ -794,6 +797,24 @@ mod tests {
     use rustix::event::{PollFd, PollFlags, Timespec};
 
     use super::*;
+
+    /// The encoding and the decoding are two tables that have to agree, and
+    /// nothing but this test makes them: a step inserted mid-enum renumbers
+    /// every step after it, and the child would then name one step while the
+    /// caller read another.
+    #[test]
+    fn export_step_wire_round_trip() {
+        for step in ExportStep::ALL {
+            assert_eq!(ExportStep::from_wire(step.wire()), Some(step));
+        }
+    }
+
+    #[test]
+    fn export_step_unknown_wire_value_is_rejected() {
+        let past_the_end = ExportStep::ALL.len() as u32;
+        assert_eq!(ExportStep::from_wire(past_the_end), None);
+        assert_eq!(ExportStep::from_wire(u32::MAX), None);
+    }
 
     /// The export child closes every descriptor it inherited but its own two.
     ///

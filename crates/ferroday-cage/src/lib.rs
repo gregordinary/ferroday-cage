@@ -52,7 +52,7 @@
 //! streams, and a deterministic base environment (`PATH` and `HOME`) plus
 //! the caller's variables. Every part of that profile is a builder call
 //! away: mounts can be dropped, the host network shared, the hostname set,
-//! the working directory, environment, and stdin disposition chosen, and
+//! the working directory, environment, and stream dispositions chosen, and
 //! unmodeled mounts expressed through the [`RawMount`] escape hatch.
 //!
 //! [`run`](Cage::run) returns the command's [`ExitStatus`] whenever the
@@ -73,6 +73,15 @@
 //! defined behavior around caller signals and caller exit is documented
 //! in the guide, with [`stop_with_caller`](CageBuilder::stop_with_caller)
 //! tying the sandbox's lifetime to the caller's when asked.
+//!
+//! # Terminals
+//!
+//! [`spawn_terminal`](Cage::spawn_terminal) starts the command on a
+//! pseudoterminal allocated for it and returns the caller's end as a [`Pty`]
+//! beside the running handle. `isatty` is true on all three of the command's
+//! standard streams, a full-screen program behaves, and a shell inside the
+//! sandbox runs jobs of its own — against a terminal the caller does not
+//! share, and reaching nothing of the caller's own. See [`Terminal`].
 //!
 //! # Userspace networking
 //!
@@ -274,6 +283,7 @@ mod running;
 mod scratch;
 mod spec;
 mod status;
+mod terminal;
 
 pub use error::{ConfigError, Error, OverlayLayer, SetupStep};
 #[cfg(feature = "hardening")]
@@ -292,15 +302,16 @@ pub use netstack::{NetStack, NetStackBuilder, NetStackError, NetStackHandle};
 pub use observer::{Observer, Output, Progress};
 pub use resolved::{
     ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs, ResolvedLandlockNet,
-    ResolvedMount, ResolvedRlimit, ResolvedRoot,
+    ResolvedMount, ResolvedRlimit, ResolvedRoot, ResolvedStdio, ResolvedStreams,
 };
 #[cfg(feature = "hardening")]
 pub use restrict::{Restriction, RestrictionBuilder};
 pub use running::{KillHandle, Pending, Running};
 #[cfg(feature = "serde")]
 pub use spec::RestrictedProfile;
-pub use spec::{Bind, Cage, CageBuilder, Mount, Network, Overlay, RawMount, Stdin};
+pub use spec::{Bind, Cage, CageBuilder, Mount, Network, Overlay, RawMount, Stdio};
 pub use status::ExitStatus;
+pub use terminal::{Pty, Terminal};
 
 /// Shorthand for a result whose error is [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;

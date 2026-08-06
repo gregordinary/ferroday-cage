@@ -128,7 +128,14 @@ can be disabled:
   nodes, which `nodev` would render inoperable. This is deliberate and safe
   in the sandbox's user namespace — the bound nodes are the host's own, not
   fresh nodes the sandbox could use to reach an arbitrary device, and access
-  to them is governed by the namespace.
+  to them is governed by the namespace. `tty` is the exception to "the host's
+  own": it is the character device `5:0`, whose open returns the *opening
+  process's* controlling terminal rather than the inode the bind carries, so
+  what the sandbox reaches through it follows from the sandbox's session. See
+  [The dispositions and the caller's
+  terminal](streaming.md#the-dispositions-and-the-callers-terminal), and
+  [A terminal of the sandbox's own](terminal.md) for the posture where it
+  resolves to a terminal the caller does not share.
 - **`/tmp`** is a fresh tmpfs.
 
 The caller's own mounts apply after the managed profile, in configuration
@@ -155,13 +162,21 @@ shipped, rather than one the mount's own mode happened to hide.
 
 A missing *file* target is content the root never had — an empty
 `/etc/resolv.conf`, an empty file where a binary is bound — present only for
-its mount to cover. It does not survive the sandbox: the paths are recorded
-at build time, and dropping the handle removes each one, whether the sandbox
-ran to completion or the launch never proceeded. Only an empty regular file
-is removed, so anything that gained content or changed type in the meantime
-belongs to whoever put it there. The rule covers the managed `resolv.conf`
-bind and the caller's own file binds alike, and a target the root already
-ships is never touched.
+its mount to cover. It is created at `0644` exactly, independent of the
+launching process's umask, and does not survive the sandbox: the paths are
+recorded at build time, and dropping the handle removes each one, whether the
+sandbox ran to completion or the launch never proceeded. Only an empty regular
+file is removed, so anything that gained content or changed type in the
+meantime belongs to whoever put it there. The rule covers the managed
+`resolv.conf` bind and the caller's own file binds alike.
+
+A target the root already ships is never touched, whatever kind of entry it
+is. A symbolic link is one such entry, and it is left as it is rather than
+created through: the mount resolves it as the root intends. A root that ships
+a link to a path it does not have — the shape `/etc/resolv.conf` takes on a
+host running a resolver daemon — therefore has no target to bind onto, and the
+launch reports a failed mount naming that bind rather than creating a file
+somewhere the root did not ask for.
 
 Two targets are outside the rule, because neither is a file in the root: one
 created inside an earlier mount — under the `/tmp` tmpfs, or under a bind of

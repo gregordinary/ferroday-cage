@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rustix::fs::{Mode, OFlags, RawMode};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode, ResolveFlags};
 use rustix::io::Errno;
 use rustix::mount::MountFlags;
 use rustix::thread::UnshareFlags;
@@ -16,13 +16,14 @@ use crate::error::{ConfigError, Error, OverlayLayer};
 use crate::idmap::{self, IdMapper, Identity, IdentityMap};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
-    Confinement, IdentityPlan, LaunchPlan, MountAction, MountDir, MountOp, OverlayPlan, RlimitPlan,
-    RunAsPlan, StdinPlan,
+    Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction, MountDir, MountOp,
+    OverlayPlan, RlimitPlan, RunAsPlan, StdioPlan,
 };
 use crate::observer::{Collect, Observer, Output};
 use crate::resolved::ResolvedInputs;
 use crate::running::{Pending, Running};
 use crate::status::ExitStatus;
+use crate::terminal::{Pty, Terminal};
 
 /// The deterministic base `PATH`, shared by the cage's and the restriction's
 /// base environments.
@@ -39,6 +40,11 @@ const BASE_ENV: [(&str, &str); 2] = [("PATH", BASE_PATH), ("HOME", "/root")];
 ///
 /// `mknod` for character devices is denied in an unprivileged user
 /// namespace, so the minimal device set is bind-mounted from the host.
+///
+/// `tty` is device `5:0`, whose open returns the opening process's controlling
+/// terminal rather than the inode the bind carries, so binding it conveys no
+/// terminal of its own: what a sandbox reaches through it follows from its
+/// session. See [`Stdio`], which decides that.
 const DEV_DEVICES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
 
 /// The mode a mount point the sandbox creates is given, and the mode of any
@@ -92,22 +98,100 @@ pub enum Network {
     None,
 }
 
-/// The disposition of the command's standard input.
+/// The disposition of one of the command's standard streams.
 ///
-/// The two unit variants are dispositions a profile can express;
+/// One enum serves all three, through [`stdin`](CageBuilder::stdin),
+/// [`stdout`](CageBuilder::stdout), and [`stderr`](CageBuilder::stderr). The
+/// two unit variants are dispositions a profile can express;
 /// [`Fd`](Self::Fd) hands the command an open descriptor and is therefore code,
 /// not configuration. See [`from_fd`](Self::from_fd) for the descriptor form.
+///
+/// The variants read per position. On standard input,
+/// [`Inherit`](Self::Inherit) hands the command the caller's own standard input
+/// and [`Null`](Self::Null) is immediate end-of-file; on the output pair,
+/// `Inherit` sends what the command writes wherever the caller's own output
+/// goes and `Null` discards it.
+///
+/// `Inherit` states no destination: it is the absence of a choice rather than a
+/// choice of the caller's descriptors, and what the command actually receives
+/// follows from the launch. A capturing launch — [`run_with`](Cage::run_with),
+/// [`output`](Cage::output), [`spawn_with`](Cage::spawn_with) — supplies the
+/// output pair itself, and `Inherit` leaves it free to. `Null` and `Fd` state a
+/// destination, so a launch that would supply its own is refused rather than
+/// silently overriding what the caller said.
+///
+/// # The caller's terminal
+///
+/// Closing the caller's terminal to the sandbox takes all three streams, not
+/// standard input alone. A controlling terminal is reached through the session
+/// rather than through the filesystem — no namespace and no swapped root
+/// affects it — and the rule is that a sandboxed command reaches the caller's
+/// terminal exactly through the standard streams the caller handed it.
+///
+/// **The session follows standard input alone.**
+/// [`Inherit`](Self::Inherit) there hands the command the caller's standard
+/// input, so the command stays in the caller's session, where the terminal is
+/// reachable through file descriptor 0 and equally through `/dev/tty`, which
+/// names the same terminal. [`Null`](Self::Null) and [`Fd`](Self::Fd) do not,
+/// so the command runs in a session of its own with no controlling terminal at
+/// all: `/dev/tty` fails with `ENXIO`, and `TIOCSTI` — the ioctl that pushes
+/// characters into a terminal's input queue, which the caller's shell would
+/// then run — is refused on every terminal descriptor, since the kernel grants
+/// it only for the caller's own controlling terminal.
+///
+/// **A session of the sandbox's own does not close the output pair.** It closes
+/// what is reached *through the session*; a descriptor the caller handed over
+/// is reached directly. Run from a shell with no redirection, file descriptors
+/// 1 and 2 are dups of one read-write open of the caller's terminal, so a
+/// command that inherits them can read what is typed at it, leave the caller's
+/// terminal without echo with `tcsetattr`, and resize it with `TIOCSWINSZ`,
+/// which delivers `SIGWINCH` to the caller's foreground process group. `Null`
+/// or `Fd` on the output pair is what closes that, and a capturing launch
+/// closes it too by supplying pipes of its own.
+///
+/// # Job control
+///
+/// Job control has two senses, and the disposition decides where each happens.
+///
+/// *Caller-session job control* is the caller's shell managing the sandbox as
+/// one of its own jobs: an interrupt typed at the caller's terminal reaches the
+/// sandbox, `^Z` suspends it, `fg` resumes it. *Sandbox-session job control* is
+/// a shell inside the sandbox running jobs of its own, which takes `tcsetpgrp`
+/// on a terminal whose session that shell shares.
+///
+/// Under `Inherit` on standard input both work, and both work by reaching into
+/// the caller's session — the second by the sandbox taking the caller's
+/// terminal's foreground process group, a shell inside the sandbox competing
+/// with the caller's own shell for one terminal. Under `Null` or `Fd` neither
+/// works: the sandbox is outside the caller's session, and the session it has
+/// instead owns no terminal to run jobs against. A caller that wants to stop
+/// such a command on an interrupt uses
+/// [`Running::terminate`](crate::Running::terminate) or
+/// [`Running::kill`](crate::Running::kill).
+///
+/// [`Cage::spawn_terminal`] is the posture where the second sense works without
+/// the first's cost: the sandbox gets a terminal of its own, so a shell inside
+/// it takes *that* terminal's foreground process group and the caller's is not
+/// involved at all.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub enum Stdin {
-    /// The command inherits the caller's standard input. This is the
-    /// default.
+pub enum Stdio {
+    /// The stream is left as the launch inherited it: what the caller's own
+    /// stream is wired to, unless the launch supplies its own destination.
+    /// This is the default for all three.
+    ///
+    /// On standard input it also keeps the command in the caller's session,
+    /// and with it the caller's controlling terminal.
     #[default]
     Inherit,
-    /// The command's standard input reads from `/dev/null`: immediate
-    /// end-of-file.
+    /// The stream is wired to `/dev/null`: immediate end-of-file on standard
+    /// input, and a discard on the output pair.
+    ///
+    /// On standard input the command also runs in a session of its own.
     Null,
-    /// The command's standard input is a descriptor the caller supplies.
+    /// The stream is a descriptor the caller supplies.
+    ///
+    /// On standard input the command also runs in a session of its own.
     ///
     /// Built with [`from_fd`](Self::from_fd). The descriptor is shared rather
     /// than owned outright because a [`Cage`] is a clonable frozen plan that
@@ -115,18 +199,22 @@ pub enum Stdin {
     Fd(Arc<OwnedFd>),
 }
 
-impl Stdin {
-    /// The command's standard input reads from `fd`.
+impl Stdio {
+    /// The stream is wired to `fd`.
     ///
-    /// The descriptor is duplicated onto the command's file descriptor 0 after
-    /// the pivot and survives `execve`; the caller's own copy is unaffected.
-    /// Anything readable serves — the read end of a pipe the caller writes, an
-    /// open file, a pseudoterminal replica.
+    /// The descriptor is duplicated onto the command's own file descriptor
+    /// after the pivot and survives `execve`; the caller's own copy is
+    /// unaffected. What serves follows from the position: anything readable on
+    /// standard input — the read end of a pipe the caller writes, an open file,
+    /// a pseudoterminal replica — and anything writable on the output pair.
     ///
     /// The descriptor is *shared*, not consumed: a [`Cage`] is a frozen plan
     /// that can launch repeatedly, and every launch wires the same descriptor.
-    /// For a pipe that means the second launch reads whatever the first left,
-    /// so a cage feeding distinct input per launch is built per launch.
+    /// For a pipe on standard input that means the second launch reads whatever
+    /// the first left, so a cage feeding distinct input per launch is built per
+    /// launch; for a file on an output stream it means the second launch appends
+    /// where the first stopped, since the offset is a property of the open file
+    /// description both share.
     ///
     /// The caller owns both ends of whatever it supplies. Feeding a pipe from
     /// the same thread that waits for the command deadlocks once the write
@@ -139,13 +227,13 @@ impl Stdin {
     /// ```no_run
     /// use std::io::Write;
     ///
-    /// use ferroday_cage::{Cage, Stdin};
+    /// use ferroday_cage::{Cage, Stdio};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let (reader, mut writer) = std::io::pipe()?;
     /// let cage = Cage::builder()
     ///     .rootfs("/srv/rootfs/alpine")
-    ///     .stdin(Stdin::from_fd(reader.into()))
+    ///     .stdin(Stdio::from_fd(reader.into()))
     ///     .command("/bin/sh")
     ///     .args(["-c", "wc -l"])
     ///     .build()?;
@@ -160,8 +248,8 @@ impl Stdin {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn from_fd(fd: OwnedFd) -> Stdin {
-        Stdin::Fd(Arc::new(fd))
+    pub fn from_fd(fd: OwnedFd) -> Stdio {
+        Stdio::Fd(Arc::new(fd))
     }
 }
 
@@ -169,25 +257,25 @@ impl Stdin {
 // serialize as their lowercase names and `Fd` is refused outright rather than
 // serialized as something a reader would take for a disposition it is not.
 #[cfg(feature = "serde")]
-impl serde::Serialize for Stdin {
+impl serde::Serialize for Stdio {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Stdin::Inherit => serializer.serialize_str("inherit"),
-            Stdin::Null => serializer.serialize_str("null"),
-            Stdin::Fd(_) => Err(serde::ser::Error::custom(
-                "a standard-input descriptor cannot be represented in a profile",
+            Stdio::Inherit => serializer.serialize_str("inherit"),
+            Stdio::Null => serializer.serialize_str("null"),
+            Stdio::Fd(_) => Err(serde::ser::Error::custom(
+                "a standard-stream descriptor cannot be represented in a profile",
             )),
         }
     }
 }
 
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Stdin {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Stdin, D::Error> {
+impl<'de> serde::Deserialize<'de> for Stdio {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Stdio, D::Error> {
         let name = String::deserialize(deserializer)?;
         match name.as_str() {
-            "inherit" => Ok(Stdin::Inherit),
-            "null" => Ok(Stdin::Null),
+            "inherit" => Ok(Stdio::Inherit),
+            "null" => Ok(Stdio::Null),
             other => Err(serde::de::Error::unknown_variant(
                 other,
                 &["inherit", "null"],
@@ -367,7 +455,8 @@ impl Cage {
     /// library failing: spawning the sandbox process, a setup step inside it,
     /// or collecting its outcome.
     ///
-    /// The command runs with inherited standard streams.
+    /// The command runs with the stream dispositions the sandbox carries,
+    /// which are inherited unless the builder said otherwise.
     pub fn run(&self) -> Result<ExitStatus, Error> {
         self.spawn()?.wait()
     }
@@ -423,7 +512,7 @@ impl Cage {
     /// `spawn` blocks until the sandbox is set up and the command is
     /// executing, so a setup failure is reported here, as the same typed
     /// error [`run`](Self::run) would return. The command runs with
-    /// inherited standard streams; the returned [`Running`] waits for,
+    /// the stream dispositions the sandbox carries; the returned [`Running`] waits for,
     /// signals, or kills it.
     pub fn spawn(&self) -> Result<Running<'static>, Error> {
         Running::launch(&self.plan, None)
@@ -478,6 +567,65 @@ impl Cage {
         observer: &'obs mut dyn Observer,
     ) -> Result<Pending<'obs>, Error> {
         Pending::launch(&self.plan, Some(observer))
+    }
+
+    /// Starts the command on a pseudoterminal of its own, returning a handle to
+    /// it and the caller's end of the terminal.
+    ///
+    /// The replica is wired onto the command's file descriptors 0, 1 and 2 — a
+    /// terminal is one stream — and the launch owns its session, so the
+    /// pseudoterminal is the sandbox's controlling terminal whatever the
+    /// standard-input disposition would otherwise have decided. `isatty` is
+    /// deterministically true inside, a full-screen program behaves, and a shell
+    /// inside the sandbox runs jobs of its own. Nothing of the *caller's*
+    /// terminal is reachable.
+    ///
+    /// The two values come back together because the caller holds both at once
+    /// and drives them against each other — reading the primary while waiting on
+    /// the command. See [`Pty`] for what that takes, including the one ordering
+    /// that deadlocks.
+    ///
+    /// Nothing is captured, so no [`Observer`] is involved and no
+    /// [`Progress`](crate::Progress) milestone is reported. A terminal composes
+    /// with [`Stdio::Inherit`] on all three streams and is refused against a
+    /// disposition that names a destination of its own, since the replica is
+    /// already all three.
+    ///
+    /// ```no_run
+    /// use ferroday_cage::{Cage, Terminal};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cage = Cage::builder()
+    ///     .rootfs("/srv/rootfs/alpine")
+    ///     .command("/bin/sh")
+    ///     .env("TERM", "xterm-256color")
+    ///     .build()?;
+    ///
+    /// let (mut running, mut pty) = cage.spawn_terminal(&Terminal::new())?;
+    /// std::io::copy(&mut pty, &mut std::io::stdout())?;
+    /// let status = running.wait()?;
+    /// # let _ = status;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn spawn_terminal(&self, terminal: &Terminal) -> Result<(Running<'static>, Pty), Error> {
+        Running::launch_terminal(&self.plan, terminal)
+    }
+
+    /// [`spawn_terminal`](Self::spawn_terminal), held at the gate before the
+    /// command runs — the userspace-network seam with a terminal.
+    ///
+    /// The composition an interactive session needs: a shell with outbound
+    /// networking. The primary comes back here rather than out of
+    /// [`proceed`](Pending::proceed), because the pseudoterminal is allocated
+    /// before the fork and the gate sits after its controlling terminal is
+    /// established; nothing writes to the terminal while the launch is held, so
+    /// the caller attaches its stack and proceeds with the primary in hand.
+    pub fn spawn_pending_terminal(
+        &self,
+        terminal: &Terminal,
+    ) -> Result<(Pending<'static>, Pty), Error> {
+        Pending::launch_terminal(&self.plan, terminal)
     }
 }
 
@@ -597,7 +745,7 @@ impl Mount {
 ///         Overlay::new()
 ///             .lower("/srv/base")
 ///             .lower("/srv/patches")
-///             .upper("/var/tmp/scratch"),
+///             .upper("/srv/scratch/run-1"),
 ///     )
 ///     .command("/bin/sh")
 ///     .build()?;
@@ -605,6 +753,22 @@ impl Mount {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Where the upper lives
+///
+/// The upper and its work directory are the one part of an overlay root the
+/// library creates on the host, and they should live under a directory the
+/// calling user controls, not a world-writable one such as `/var/tmp` — the same
+/// requirement [`CageBuilder::rootfs`] states for a plain root.
+///
+/// An entry already at either path is adopted only when it is a directory
+/// belonging to the calling user, and is otherwise refused with
+/// [`ConfigError::OverlayDirUnowned`], so a symbolic link another user planted
+/// there is never followed. That check closes the create; it does not make a
+/// shared parent safe, since the mount options name the layers as paths and the
+/// kernel resolves them again at mount time.
+///
+/// [`ConfigError::OverlayDirUnowned`]: crate::ConfigError::OverlayDirUnowned
 ///
 /// # Layer order
 ///
@@ -662,6 +826,11 @@ impl Overlay {
     /// is the caller's to keep or discard. Its filesystem must record `user.*`
     /// extended attributes, so an on-disk filesystem (ext4, xfs, btrfs) works on
     /// Linux 5.11 and later, while a tmpfs upper needs Linux 6.6.
+    ///
+    /// It must live under a directory the calling user controls, not a
+    /// world-writable one — see [Where the upper lives](Overlay#where-the-upper-lives).
+    /// The upper is also not the filesystem root: it needs a parent directory
+    /// for the work directory beside it.
     pub fn upper(mut self, path: impl AsRef<Path>) -> Overlay {
         self.upper = Some(path.as_ref().to_path_buf());
         self
@@ -671,7 +840,10 @@ impl Overlay {
     ///
     /// By default the library manages a hidden sibling of the upper. A caller
     /// naming its own must place it on the same filesystem as the upper, which
-    /// the overlay requires so it can move files between them.
+    /// the overlay requires so it can move files between them; a work directory
+    /// on another filesystem is refused at build time rather than at the mount.
+    /// It carries the same parent-directory requirement the upper does — see
+    /// [Where the upper lives](Overlay#where-the-upper-lives).
     ///
     /// The work area holds a directory the kernel creates mode `0`, so a plain
     /// recursive delete cannot descend into it: discard it with a removal that
@@ -783,7 +955,7 @@ impl Overlay {
 /// for review. Two things do not survive that, both because they are code or a
 /// resource rather than configuration: an [`id_mapper`](Self::id_mapper)
 /// delegate is simply absent from the output, and a builder holding a
-/// [`Stdin::from_fd`](crate::Stdin::from_fd) disposition fails to serialize at
+/// [`Stdio::from_fd`](crate::Stdio::from_fd) disposition fails to serialize at
 /// all, since a descriptor names nothing a profile could carry. Everything else
 /// round-trips.
 // Scalar fields precede the env table and the bind and raw-mount table
@@ -817,7 +989,11 @@ pub struct CageBuilder {
     #[cfg_attr(feature = "serde", serde(rename = "workdir"))]
     workdir: Option<PathBuf>,
     #[cfg_attr(feature = "serde", serde(rename = "stdin"))]
-    stdin: Stdin,
+    stdin: Stdio,
+    #[cfg_attr(feature = "serde", serde(rename = "stdout"))]
+    stdout: Stdio,
+    #[cfg_attr(feature = "serde", serde(rename = "stderr"))]
+    stderr: Stdio,
     #[cfg_attr(feature = "serde", serde(rename = "pid-namespace"))]
     pid_namespace: bool,
     // The managed mounts are `Option<bool>` rather than `bool` so that "left at
@@ -962,7 +1138,9 @@ impl Default for CageBuilder {
             network: Network::default(),
             hostname: None,
             workdir: None,
-            stdin: Stdin::default(),
+            stdin: Stdio::default(),
+            stdout: Stdio::default(),
+            stderr: Stdio::default(),
             pid_namespace: true,
             managed_mounts: None,
             mount_proc: None,
@@ -1022,7 +1200,10 @@ impl CageBuilder {
     /// `lower` must exist and be a directory, exactly as [`rootfs`](Self::rootfs)
     /// requires. `upper` is created if absent, along with a sibling work
     /// directory the overlay requires on the same filesystem; both persist on the
-    /// host after the sandbox exits and are the caller's to keep or discard. The
+    /// host after the sandbox exits and are the caller's to keep or discard, and
+    /// both should live under a directory the calling user controls rather than a
+    /// world-writable one, for the reason `rootfs` gives and for the one in
+    /// [Where the upper lives](Overlay#where-the-upper-lives). The
     /// overlay's work area holds a directory the kernel creates mode `0`, so a
     /// plain recursive delete cannot descend into it: discard the upper and its
     /// work directory with a removal that restores traversable permissions as it
@@ -1058,7 +1239,9 @@ impl CageBuilder {
     /// namespace, which the host must support: [`build`](Self::build) refuses a
     /// host that cannot establish one, and
     /// [`host::overlay_blocker`](crate::host::overlay_blocker) reports what is
-    /// missing.
+    /// missing. The upper and work directories should live under a directory the
+    /// calling user controls; see
+    /// [Where the upper lives](Overlay#where-the-upper-lives).
     pub fn overlay(mut self, overlay: Overlay) -> Self {
         self.rootfs = None;
         self.overlay = Some(overlay);
@@ -1233,9 +1416,36 @@ impl CageBuilder {
 
     /// Selects the disposition of the command's standard input.
     ///
-    /// The default is [`Stdin::Inherit`].
-    pub fn stdin(mut self, stdin: Stdin) -> Self {
+    /// The default is [`Stdio::Inherit`], which also keeps the command in the
+    /// caller's session; see [`Stdio`] for the whole rule.
+    pub fn stdin(mut self, stdin: Stdio) -> Self {
         self.stdin = stdin;
+        self
+    }
+
+    /// Selects the disposition of the command's standard output.
+    ///
+    /// The default is [`Stdio::Inherit`], under which the command writes
+    /// wherever the caller's own standard output goes — which at a shell
+    /// prompt is the caller's terminal, readable and writable both.
+    /// [`Stdio::Null`] discards the output, and [`Stdio::from_fd`] sends it to
+    /// a descriptor the caller supplies.
+    ///
+    /// A launch that captures — [`Cage::run_with`], [`Cage::output`],
+    /// [`Cage::spawn_with`] — supplies its own pipe for this stream, so it
+    /// composes with [`Stdio::Inherit`] alone and is refused against a
+    /// disposition that names a different destination.
+    pub fn stdout(mut self, stdout: Stdio) -> Self {
+        self.stdout = stdout;
+        self
+    }
+
+    /// Selects the disposition of the command's standard error.
+    ///
+    /// The counterpart of [`stdout`](Self::stdout), with the same default and
+    /// the same interaction with a capturing launch.
+    pub fn stderr(mut self, stderr: Stdio) -> Self {
+        self.stderr = stderr;
         self
     }
 
@@ -1414,6 +1624,17 @@ impl CageBuilder {
     /// `full`, `random`, `urandom`, and `tty` devices, the standard-stream
     /// and `fd` symlinks, a fresh `devpts` instance on `/dev/pts`, and a
     /// tmpfs on `/dev/shm`.
+    ///
+    /// `/dev/tty` is not an ordinary device node. It is the character device
+    /// `5:0`, whose open returns *the opening process's controlling terminal*,
+    /// whatever that happens to be — so what the sandbox reaches through it is
+    /// decided by the sandbox's session, not by the bind. With the default
+    /// [`Stdio::Inherit`] that is the caller's terminal, which the command was
+    /// handed anyway as file descriptor 0; with any other standard-input
+    /// disposition the sandbox has a session of its own and `/dev/tty` fails
+    /// with `ENXIO`. See [`Stdio`] for the whole rule. Dropping this mount does
+    /// not change any of that: it removes `/dev/tty` as a *name*, while an
+    /// inherited terminal descriptor is still an inherited terminal.
     pub fn mount_dev(mut self, mount: bool) -> Self {
         self.mount_dev = Some(mount);
         self
@@ -1630,8 +1851,18 @@ impl CageBuilder {
     }
 
     /// The command's standard-input disposition.
-    pub fn get_stdin(&self) -> &Stdin {
+    pub fn get_stdin(&self) -> &Stdio {
         &self.stdin
+    }
+
+    /// The command's standard-output disposition.
+    pub fn get_stdout(&self) -> &Stdio {
+        &self.stdout
+    }
+
+    /// The command's standard-error disposition.
+    pub fn get_stderr(&self) -> &Stdio {
+        &self.stderr
     }
 
     /// Whether the sandbox's lifetime is tied to the caller's.
@@ -1943,13 +2174,14 @@ impl CageBuilder {
                 overlay,
                 unshare,
                 pid_namespace: self.pid_namespace,
-                // Lower the disposition into the plan's own form; the descriptor variant
-                // carries the shared descriptor through unchanged.
-                stdin: match &self.stdin {
-                    Stdin::Inherit => StdinPlan::Inherit,
-                    Stdin::Null => StdinPlan::Null,
-                    Stdin::Fd(fd) => StdinPlan::Fd(Arc::clone(fd)),
-                },
+                // Lower each disposition into the plan's own form; the descriptor
+                // variant carries the shared descriptor through unchanged.
+                stdin: StdioPlan::of(&self.stdin),
+                stdout: StdioPlan::of(&self.stdout),
+                stderr: StdioPlan::of(&self.stderr),
+                // The session follows standard input alone: it is the stream
+                // whose inheritance carries the caller's session with it.
+                own_session: !matches!(self.stdin, Stdio::Inherit),
                 stop_with_caller: self.stop_with_caller,
                 hostname,
                 configure_loopback,
@@ -2082,7 +2314,13 @@ impl CageBuilder {
             args: _,
             hostname: _,
             workdir: _,
+            // A stream disposition reaches no host resource a profile could not
+            // already reach: `Inherit` is what a launch does anyway, `Null` only
+            // narrows, and `Fd` has no serial form and so cannot appear in a
+            // profile at all.
             stdin: _,
+            stdout: _,
+            stderr: _,
             mount_proc: _,
             mount_dev: _,
             mount_tmp: _,
@@ -2425,25 +2663,49 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     };
 
     // Create and resolve the upper. A relative or non-existent upper is created;
-    // canonicalization then proves it is a usable directory and yields the
-    // absolute path the mount options name.
-    std::fs::create_dir_all(upper).map_err(|err| overlay_io(OverlayLayer::Upper, upper, err))?;
-    let upper =
-        std::fs::canonicalize(upper).map_err(|err| overlay_io(OverlayLayer::Upper, upper, err))?;
+    // the result is the absolute path the mount options name.
+    let upper = prepare_layer_dir(OverlayLayer::Upper, upper)?;
+
+    // The upper needs a parent directory: the work directory the library
+    // derives is a sibling of the upper, and the host preflight below runs in
+    // the parent so its scratch entries land beside the upper rather than inside
+    // it. The upper is canonical here, so the only path without one is `/` —
+    // which an overlay could not use anyway, since its writes would land over
+    // the whole host root.
+    let Some(scratch) = upper.parent().map(Path::to_path_buf) else {
+        return Err(ConfigError::OverlayUpperIsRoot { path: upper }.into());
+    };
 
     // The work directory sits beside the upper, on the same filesystem, so the
     // overlay can move files between them. A hidden sibling keyed to the upper's
     // name keeps it out of the way and distinct per upper; a caller may name its
-    // own instead, and is then responsible for the same-filesystem requirement.
+    // own instead.
     let work = match overlay.work.as_deref() {
         Some(work) => work.to_path_buf(),
-        None => overlay_work_dir(&upper).ok_or(ConfigError::OverlayPathInvalid {
+        None => overlay_work_dir(&upper).ok_or(ConfigError::OverlayUpperIsRoot {
             path: upper.clone(),
         })?,
     };
-    std::fs::create_dir_all(&work).map_err(|err| overlay_io(OverlayLayer::Work, &work, err))?;
-    let work =
-        std::fs::canonicalize(&work).map_err(|err| overlay_io(OverlayLayer::Work, &work, err))?;
+    let work = prepare_layer_dir(OverlayLayer::Work, &work)?;
+
+    // The overlay moves files between the upper and the work directory, so the
+    // kernel requires them on one filesystem. A caller that named its own work
+    // directory can have put it elsewhere; comparing the two devices refuses
+    // that here, with the layer named, rather than at the mount as a bare
+    // EXDEV from a syscall the caller never issued.
+    let device = |layer, path: &Path| {
+        rustix::fs::stat(path)
+            .map(|stat| stat.st_dev)
+            .map_err(|errno| overlay_errno(layer, path, errno))
+    };
+    if device(OverlayLayer::Upper, &upper)? != device(OverlayLayer::Work, &work)? {
+        return Err(ConfigError::OverlayDirUnusable {
+            layer: OverlayLayer::Work,
+            path: work,
+            errno: Errno::XDEV.raw_os_error(),
+        }
+        .into());
+    }
 
     // The option string is comma-separated and colon-delimited; a layer path
     // bearing either character would misparse, so refuse it rather than build a
@@ -2466,11 +2728,8 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     // lives on this filesystem, before any fork — the same fail-early posture
     // the identity-map validation takes. The probe runs on the upper's parent
     // (its own filesystem, since the upper is a directory within it), so its
-    // scratch files land beside the upper rather than inside it. The upper is
-    // canonical here, and `overlay_work_dir` above returned a work path only when
-    // the upper had a parent, so this parent is present.
-    let scratch = upper.parent().unwrap_or_else(|| Path::new("."));
-    if let Some(blocker) = crate::host::overlay_blocker(scratch) {
+    // scratch files land beside the upper rather than inside it.
+    if let Some(blocker) = crate::host::overlay_blocker(&scratch) {
         return Err(ConfigError::OverlayUnavailable { blocker }.into());
     }
 
@@ -2514,6 +2773,97 @@ pub(crate) fn overlay_work_dir(upper: &Path) -> Option<PathBuf> {
     Some(parent.join(work_name))
 }
 
+/// The mode an overlay layer directory the library creates is given.
+///
+/// Stated rather than left to the process umask, for the same reason
+/// [`DIR_MODE`] is: the directory outlives the sandbox on the host, and whether
+/// the layer a build keeps is readable is not a property worth taking from
+/// whatever umask the build happened to run under. A layer directory that was
+/// already there is left at the mode its owner gave it.
+const OVERLAY_DIR_MODE: RawMode = 0o755;
+
+/// Creates an overlay layer directory if it is absent and returns its absolute
+/// path, refusing to adopt an entry the calling user does not own.
+///
+/// The layer directories are the one part of an overlay root the library
+/// creates on the host, and the caller may well name them under a directory it
+/// shares — a scratch area, a build tree several jobs write to. A plain
+/// `create_dir_all` would succeed against anything already at the path that
+/// *resolves* to a directory, a symbolic link to one included, and the resolved
+/// destination is what would then go into `upperdir=`: every write the sandbox
+/// makes would land wherever the link pointed, and the caller would read that
+/// back afterwards as the increment its build produced.
+///
+/// So the leaf is created with `mkdirat` against a descriptor for its parent,
+/// which refuses a name that exists rather than following it, and an `EEXIST` is
+/// adopted only when `fstatat` — with `AT_SYMLINK_NOFOLLOW`, so a link is a link
+/// and not its destination — reports a directory belonging to the calling user.
+/// The same discipline [`host::overlay_blocker`](crate::host::overlay_blocker)
+/// already applies to its throwaway probe entries in the same directory.
+///
+/// Ancestors above the leaf are created with `create_dir_all`, as before: the
+/// caller named them, so reaching them through a symbolic link is the caller's
+/// business, the same position [`open_dir`] takes. The absolute path is composed
+/// from the *parent's* canonical path and the leaf's own name, so the leaf is
+/// never resolved as a link that the checks above just established it is not.
+fn prepare_layer_dir(layer: OverlayLayer, path: &Path) -> Result<PathBuf, Error> {
+    // A path with no file name is `/` or a `..` chain; neither is a directory
+    // this can create, and `/` as a layer is refused by name below.
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(ConfigError::OverlayUpperIsRoot {
+            path: path.to_path_buf(),
+        }
+        .into());
+    };
+    // An empty parent means a bare relative name: the working directory.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    std::fs::create_dir_all(parent).map_err(|err| overlay_io(layer, parent, err))?;
+    let dirfd = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| overlay_errno(layer, parent, errno))?;
+
+    match rustix::fs::mkdirat(&dirfd, name, Mode::from_raw_mode(OVERLAY_DIR_MODE)) {
+        // The mode is set again, because `mkdir` narrows it by the process
+        // umask and the layer outlives the sandbox on the host: a build under
+        // `umask 077` would otherwise leave a `0700` upper for whatever consumes
+        // it next. Only the directory this call just created is chmod-ed, so an
+        // adopted one keeps the mode its owner gave it — the same rule the
+        // sandbox stage follows for a mount point it creates.
+        Ok(()) => {
+            rustix::fs::chmodat(
+                &dirfd,
+                name,
+                Mode::from_raw_mode(OVERLAY_DIR_MODE),
+                AtFlags::empty(),
+            )
+            .map_err(|errno| overlay_errno(layer, path, errno))?;
+        }
+        Err(Errno::EXIST) => {
+            let stat = rustix::fs::statat(&dirfd, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|errno| overlay_errno(layer, path, errno))?;
+            let is_dir = FileType::from_raw_mode(stat.st_mode) == FileType::Directory;
+            if !is_dir || stat.st_uid != rustix::process::geteuid().as_raw() {
+                return Err(ConfigError::OverlayDirUnowned {
+                    layer,
+                    path: path.to_path_buf(),
+                }
+                .into());
+            }
+        }
+        Err(errno) => return Err(overlay_errno(layer, path, errno)),
+    }
+
+    let parent = std::fs::canonicalize(parent).map_err(|err| overlay_io(layer, parent, err))?;
+    Ok(parent.join(name))
+}
+
 /// Builds the configuration error for a host I/O failure preparing an overlay
 /// layer directory, naming which of the two the failure was.
 fn overlay_io(layer: OverlayLayer, path: &Path, err: std::io::Error) -> Error {
@@ -2521,6 +2871,17 @@ fn overlay_io(layer: OverlayLayer, path: &Path, err: std::io::Error) -> Error {
         layer,
         path: path.to_path_buf(),
         errno: err.raw_os_error().unwrap_or(Errno::IO.raw_os_error()),
+    }
+    .into()
+}
+
+/// [`overlay_io`] for the raw-syscall paths, which report an [`Errno`] rather
+/// than an [`std::io::Error`].
+fn overlay_errno(layer: OverlayLayer, path: &Path, errno: Errno) -> Error {
+    ConfigError::OverlayDirUnusable {
+        layer,
+        path: path.to_path_buf(),
+        errno: errno.raw_os_error(),
     }
     .into()
 }
@@ -2807,7 +3168,9 @@ impl Lowering {
 /// at a path this can name:
 ///
 /// - one already present in any layer, which the root ships and the launch
-///   therefore does not create;
+///   therefore does not create. Presence is any entry at the path, a symbolic
+///   link included: the launch creates the target with `O_EXCL`, so an entry of
+///   any kind is one it leaves alone;
 /// - one under the target of an earlier op, which is created inside that mount
 ///   — a tmpfs that vanishes with the namespace, or a caller's own bind source
 ///   — rather than in the root directory on the host.
@@ -2815,23 +3178,101 @@ impl Lowering {
 /// Directories the launch creates are not placeholders: a mount point directory
 /// is part of what a launch contributes to a tree, created at the mode of the
 /// directory it stands for, and is left in place.
-fn created_file_targets(ops: &[MountOp], writable: &Path, layers: &[PathBuf]) -> Vec<PathBuf> {
+fn created_file_targets(
+    ops: &[MountOp],
+    writable: &Path,
+    layers: &[PathBuf],
+) -> ManagedPlaceholders {
     let mut mounted: Vec<PathBuf> = Vec::new();
-    let mut created = Vec::new();
+    let mut paths = Vec::new();
+    let layers: Vec<Option<OwnedFd>> = layers.iter().map(|layer| open_root(layer)).collect();
     for op in ops {
         if let Some(file) = &op.create_file {
             let relative = Path::new(OsStr::from_bytes(file.to_bytes()));
             let covered = mounted.iter().any(|mount| relative.starts_with(mount));
-            let present = layers.iter().any(|layer| layer.join(relative).exists());
+            let present = layers
+                .iter()
+                .any(|layer| entry_in_root(layer.as_ref(), relative) != Presence::Absent);
             if !covered && !present {
-                created.push(writable.join(relative));
+                paths.push(relative.to_path_buf());
             }
         }
         if let Some(target) = op.action.target() {
             mounted.push(PathBuf::from(OsStr::from_bytes(target.to_bytes())));
         }
     }
-    created
+    ManagedPlaceholders {
+        root: if paths.is_empty() {
+            PathBuf::new()
+        } else {
+            writable.to_path_buf()
+        },
+        paths,
+    }
+}
+
+/// What a root-relative lookup found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Presence {
+    /// Nothing is at the path.
+    Absent,
+    /// An entry of some kind is at the path.
+    Present,
+    /// The lookup could not reach a verdict — a permission refusal, an
+    /// unreadable root. Treated as [`Present`](Self::Present) everywhere here:
+    /// what the answer decides is whether the launch created an entry that this
+    /// side may later unlink, and "not sure" must not become "mine to remove".
+    Unknown,
+}
+
+/// Opens a root directory for the root-relative lookups below, or `None` when it
+/// cannot be opened at all.
+///
+/// `O_PATH`: this descriptor is only ever the anchor of an `openat2`, so it needs
+/// no read access to the directory itself.
+pub(crate) fn open_root(root: &Path) -> Option<OwnedFd> {
+    rustix::fs::open(
+        root,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()
+}
+
+/// Whether `relative` names an entry inside the tree rooted at `root`.
+///
+/// Resolved with `openat2` and `RESOLVE_IN_ROOT`, the same way the sandbox stage
+/// resolves every mount target against the new-root descriptor, so that an
+/// absolute symbolic link inside the tree — `./etc -> /etc` in an untrusted
+/// unpacked tarball, or the `/etc/resolv.conf -> /run/systemd/resolve/…` any
+/// image taken from a resolved host ships — resolves *within the tree* rather
+/// than against the host's own root. Joining the two paths and asking the host
+/// instead would answer a question about the host's filesystem, and would let a
+/// later removal keyed to the same path land outside the tree entirely.
+///
+/// `O_NOFOLLOW` on the final component, so an entry is an entry whatever its
+/// kind: the launch creates its target with `O_EXCL` and leaves anything already
+/// there alone, dangling symbolic link included.
+pub(crate) fn entry_in_root(root: Option<&OwnedFd>, relative: &Path) -> Presence {
+    let Some(root) = root else {
+        return Presence::Unknown;
+    };
+    let Ok(relative) = CString::new(relative.as_os_str().as_bytes()) else {
+        return Presence::Unknown;
+    };
+    match rustix::fs::openat2(
+        root,
+        relative.as_c_str(),
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT,
+    ) {
+        Ok(_) => Presence::Present,
+        // Nothing at the path, or a non-directory where a directory would have
+        // to be for anything to sit under it: either way the entry is absent.
+        Err(Errno::NOENT | Errno::NOTDIR) => Presence::Absent,
+        Err(_) => Presence::Unknown,
+    }
 }
 
 /// Splits an absolute sandbox path into its normal components, rejecting
@@ -3517,7 +3958,7 @@ mod tests {
         let cage = sh_in("/tmp").build().unwrap();
         assert!(cage.plan.pid_namespace);
         assert!(cage.plan.unshare.contains(UnshareFlags::NEWPID));
-        assert!(matches!(cage.plan.stdin, StdinPlan::Inherit));
+        assert!(matches!(cage.plan.stdin, StdioPlan::Inherit));
         assert!(!cage.plan.stop_with_caller);
         let proc_op = &cage.plan.ops[cage
             .plan
@@ -3545,12 +3986,90 @@ mod tests {
     #[test]
     fn stdin_and_lifetime_options_reach_the_plan() {
         let cage = sh_in("/tmp")
-            .stdin(Stdin::Null)
+            .stdin(Stdio::Null)
             .stop_with_caller(true)
             .build()
             .unwrap();
-        assert!(matches!(cage.plan.stdin, StdinPlan::Null));
+        assert!(matches!(cage.plan.stdin, StdioPlan::Null));
         assert!(cage.plan.stop_with_caller);
+    }
+
+    #[test]
+    fn each_stream_lowers_into_its_own_plan_field() {
+        // Three independent dispositions, so a sandbox that discards its
+        // standard error keeps whatever the other two were set to.
+        let cage = sh_in("/tmp")
+            .stdin(Stdio::from_fd(open_null()))
+            .stderr(Stdio::Null)
+            .build()
+            .unwrap();
+        assert!(matches!(cage.plan.stdin, StdioPlan::Fd(_)));
+        assert!(matches!(cage.plan.stdout, StdioPlan::Inherit));
+        assert!(matches!(cage.plan.stderr, StdioPlan::Null));
+    }
+
+    #[test]
+    fn the_session_follows_standard_input_alone() {
+        // The output pair is closed by its own disposition, not by the session,
+        // so directing it elsewhere must not start one: a command that still
+        // inherits standard input is still in the caller's session, where its
+        // job control lives.
+        let cage = sh_in("/tmp")
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .build()
+            .unwrap();
+        assert!(!cage.plan.own_session);
+
+        let cage = sh_in("/tmp").stdin(Stdio::Null).build().unwrap();
+        assert!(cage.plan.own_session);
+    }
+
+    #[test]
+    fn a_capturing_launch_is_refused_against_a_directed_output_stream() {
+        // Capture supplies a pipe, which is a destination; a plan naming one of
+        // its own means the caller asked for two different things. Refused at
+        // the launch rather than at build, because the same sandbox launches
+        // without contradiction through an entry point that captures nothing —
+        // and refused before anything is forked, which is what lets this assert
+        // it without a rootfs to launch into.
+        for builder in [
+            sh_in("/tmp").stdout(Stdio::Null),
+            sh_in("/tmp").stderr(Stdio::from_fd(open_null())),
+        ] {
+            let cage = builder.build().expect("the sandbox itself is valid");
+            let err = cage.output().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::Config(ConfigError::StreamAttachmentConflict { .. })
+                ),
+                "{err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_capturing_launch_is_indifferent_to_standard_input() {
+        // Capture never touches standard input, so no disposition of it
+        // contradicts a capturing launch. The launch below gets as far as
+        // trying to build a sandbox over `/tmp`, which is exactly the point:
+        // whatever it fails with, it is not the stream refusal.
+        let cage = sh_in("/tmp")
+            .stdin(Stdio::from_fd(open_null()))
+            .build()
+            .unwrap();
+        assert!(!matches!(
+            cage.output(),
+            Err(Error::Config(ConfigError::StreamAttachmentConflict { .. })),
+        ));
+    }
+
+    /// An owned descriptor for `/dev/null`, for the descriptor disposition.
+    fn open_null() -> OwnedFd {
+        std::fs::File::open("/dev/null")
+            .expect("/dev/null is openable")
+            .into()
     }
 
     #[test]
@@ -3958,10 +4477,13 @@ mod tests {
 
         let created = sh_in(rootfs).network(Network::Host).build().unwrap();
         assert!(binds_resolv_conf(&created));
-        let canonical = std::fs::canonicalize(&dir).unwrap().join("etc/resolv.conf");
+        let canonical = std::fs::canonicalize(&dir).unwrap();
         assert_eq!(
-            created.plan.managed_placeholders,
-            std::slice::from_ref(&canonical),
+            (
+                created.plan.managed_placeholders.root.as_path(),
+                created.plan.managed_placeholders.paths.as_slice(),
+            ),
+            (canonical.as_path(), &[PathBuf::from("etc/resolv.conf")][..]),
             "a target the launch creates must be recorded for removal"
         );
 
@@ -3975,9 +4497,8 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            named_relatively.plan.managed_placeholders,
-            [canonical],
-            "a relatively named rootfs must still record an absolute path"
+            named_relatively.plan.managed_placeholders.root, canonical,
+            "a relatively named rootfs must still record an absolute root"
         );
 
         std::fs::write(dir.join("etc/resolv.conf"), b"nameserver 192.0.2.1\n").unwrap();
@@ -4027,10 +4548,14 @@ mod tests {
         };
         assert!(binds_resolv_conf(&cage));
         assert_eq!(
-            cage.plan.managed_placeholders,
-            [std::fs::canonicalize(&upper)
-                .unwrap()
-                .join("etc/resolv.conf")],
+            (
+                cage.plan.managed_placeholders.root.as_path(),
+                cage.plan.managed_placeholders.paths.as_slice(),
+            ),
+            (
+                std::fs::canonicalize(&upper).unwrap().as_path(),
+                &[PathBuf::from("etc/resolv.conf")][..],
+            ),
             "an overlay root's placeholder belongs to the upper"
         );
 
@@ -4063,11 +4588,17 @@ mod tests {
         let placeholders =
             |builder: CageBuilder| builder.build().unwrap().plan.managed_placeholders;
 
-        let cage = Cage::builder()
-            .rootfs(&rootfs)
-            .command("/bin/sh")
-            .bind_ro(&source, "/etc/created");
-        assert_eq!(placeholders(cage), [canonical.join("etc/created")]);
+        // The paths are recorded relative to the root's writable layer, and
+        // resolved against a descriptor for it when the time comes to remove
+        // them; the root is named once, canonically.
+        let recorded = placeholders(
+            Cage::builder()
+                .rootfs(&rootfs)
+                .command("/bin/sh")
+                .bind_ro(&source, "/etc/created"),
+        );
+        assert_eq!(recorded.root, canonical);
+        assert_eq!(recorded.paths, [Path::new("etc/created")]);
 
         // A target the rootfs ships is not the launch's to create or remove.
         let cage = Cage::builder()
@@ -4075,6 +4606,24 @@ mod tests {
             .command("/bin/sh")
             .bind_ro(&source, "/etc/shipped");
         assert!(placeholders(cage).is_empty());
+
+        // A symbolic link is an entry the rootfs ships, dangling or not: the
+        // launch creates the target with `O_EXCL` and so leaves it alone. Read
+        // as an absent file, a dangling one would record a placeholder for a
+        // path the launch never wrote to, while the file it did create — at the
+        // link's destination — went unrecorded and stayed.
+        std::os::unix::fs::symlink("../var/absent", rootfs.join("etc/linked")).unwrap();
+        std::os::unix::fs::symlink("shipped", rootfs.join("etc/resolvable")).unwrap();
+        for target in ["/etc/linked", "/etc/resolvable"] {
+            let cage = Cage::builder()
+                .rootfs(&rootfs)
+                .command("/bin/sh")
+                .bind_ro(&source, target);
+            assert!(
+                placeholders(cage).is_empty(),
+                "{target} is an entry the rootfs ships"
+            );
+        }
 
         // A target under an earlier mount is created inside that mount, not in
         // the rootfs directory on the host: in the managed tmpfs on /tmp, which
@@ -4095,6 +4644,57 @@ mod tests {
             .command("/bin/sh")
             .bind_ro(dir.join("host-etc"), "/mnt/data");
         assert!(placeholders(cage).is_empty());
+    }
+
+    #[test]
+    fn a_root_internal_absolute_symlink_is_judged_inside_the_root() {
+        // A rootfs may hold an absolute symbolic link — an unpacked tarball is
+        // entitled to ship `./absolute -> /etc`, and any image taken from a
+        // systemd-resolved host ships `/etc/resolv.conf` as one. The launch
+        // resolves its mount targets against the new-root descriptor with
+        // RESOLVE_IN_ROOT, so such a link lands inside the rootfs; the
+        // bookkeeping here has to agree, or it records a path the launch never
+        // wrote to and answers a question about the host's filesystem instead.
+        let dir = crate::scratch::Scratch::new("placeholder-in-root");
+        let rootfs = dir.join("rootfs");
+        let source = dir.join("source");
+        std::fs::create_dir_all(rootfs.join("real")).unwrap();
+        std::fs::write(&source, b"contents").unwrap();
+        // `/absolute` inside the rootfs points at `/real` inside the rootfs.
+        std::os::unix::fs::symlink("/real", rootfs.join("absolute")).unwrap();
+        // The same name exists on the host and holds a file, so a judgement
+        // made against the host's root would read the target as already
+        // shipped and record nothing.
+        std::fs::create_dir_all(dir.join("host-side/real")).unwrap();
+        std::fs::write(dir.join("host-side/real/entry"), b"host").unwrap();
+
+        let placeholders =
+            |builder: CageBuilder| builder.build().unwrap().plan.managed_placeholders;
+        let recorded = placeholders(
+            Cage::builder()
+                .rootfs(&rootfs)
+                .command("/bin/sh")
+                .bind_ro(&source, "/absolute/entry"),
+        );
+        assert_eq!(
+            recorded.paths,
+            [Path::new("absolute/entry")],
+            "a target behind a root-internal absolute symlink is the launch's to create"
+        );
+
+        // And once the rootfs ships it — at the path the link resolves to
+        // inside the rootfs — there is nothing for the launch to create.
+        std::fs::write(rootfs.join("real/entry"), b"shipped").unwrap();
+        assert!(
+            placeholders(
+                Cage::builder()
+                    .rootfs(&rootfs)
+                    .command("/bin/sh")
+                    .bind_ro(&source, "/absolute/entry"),
+            )
+            .is_empty(),
+            "the link must resolve inside the rootfs, where the entry now is"
+        );
     }
 
     #[test]
@@ -4200,7 +4800,7 @@ read-only = true
         assert_eq!(builder.network, Network::Host);
         assert_eq!(builder.hostname.as_deref(), Some(OsStr::new("builder")));
         assert_eq!(builder.workdir.as_deref(), Some(Path::new("/build")));
-        assert!(matches!(builder.stdin, Stdin::Null));
+        assert!(matches!(builder.stdin, Stdio::Null));
         assert!(!builder.pid_namespace);
         // The profile states all four explicitly, so each reads back as an
         // explicit choice rather than as the default.
@@ -4268,7 +4868,7 @@ read-only = true
         assert!(builder.get_mount_proc() && builder.get_mount_dev() && builder.get_mount_tmp());
         assert!(builder.get_managed_mounts() && builder.get_base_env());
         assert_eq!(builder.network, Network::Isolated);
-        assert!(matches!(builder.stdin, Stdin::Inherit));
+        assert!(matches!(builder.stdin, Stdio::Inherit));
         assert!(!builder.stop_with_caller);
     }
 
@@ -4495,7 +5095,7 @@ read-only = true
             .network(Network::Host)
             .hostname("box")
             .current_dir("/build")
-            .stdin(Stdin::Null)
+            .stdin(Stdio::Null)
             .pid_namespace(false)
             .mount_proc(false)
             .mount_dev(false)
@@ -4564,7 +5164,9 @@ read-only = true
                 "rlimit",
                 "rootfs",
                 "run-as",
+                "stderr",
                 "stdin",
+                "stdout",
                 "stop-with-caller",
                 "workdir",
             ],
@@ -4668,6 +5270,87 @@ read-only = true
     }
 
     #[test]
+    fn an_overlay_layer_directory_is_created_fresh_and_owned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = crate::scratch::Scratch::new("overlay-layer-dir");
+
+        // A layer directory the library creates: made here, at the stated mode.
+        // (The umask is not set here to prove the chmod that follows the
+        // `mkdir`: it is process-global, and this suite runs its tests in
+        // parallel threads, so narrowing it would reach every directory another
+        // test created meanwhile.)
+        let fresh = scratch.join("nested/fresh");
+        let prepared = prepare_layer_dir(OverlayLayer::Upper, &fresh).unwrap();
+        assert_eq!(prepared, std::fs::canonicalize(&fresh).unwrap());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&fresh), OVERLAY_DIR_MODE);
+
+        // Preparing it a second time adopts it: it is a directory this user
+        // owns, which is exactly what the first call left. An adopted directory
+        // keeps the mode its owner gave it — only a directory this created is
+        // chmod-ed, so a caller reusing a layer of its own does not find the
+        // mode changed underneath it.
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            prepare_layer_dir(OverlayLayer::Upper, &fresh).unwrap(),
+            prepared,
+        );
+        assert_eq!(mode(&fresh), 0o700, "an adopted layer keeps its own mode");
+
+        // A symbolic link at the path is refused rather than followed. Left
+        // followed, `upperdir=` would name the destination and every write the
+        // sandbox made would land there instead.
+        let destination = scratch.join("elsewhere");
+        std::fs::create_dir(&destination).unwrap();
+        let planted = scratch.join("planted");
+        std::os::unix::fs::symlink(&destination, &planted).unwrap();
+        let err = prepare_layer_dir(OverlayLayer::Upper, &planted).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Config(ConfigError::OverlayDirUnowned {
+                    layer: OverlayLayer::Upper,
+                    ..
+                })
+            ),
+            "{err}"
+        );
+
+        // So is an entry that is not a directory at all.
+        let file = scratch.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let err = prepare_layer_dir(OverlayLayer::Work, &file).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Config(ConfigError::OverlayDirUnowned {
+                    layer: OverlayLayer::Work,
+                    ..
+                })
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_overlay_upper_at_the_filesystem_root_is_refused() {
+        // `/` has no parent, so there is nowhere for the work directory beside
+        // the upper or for the host preflight's scratch entries — and an upper
+        // there would put the sandbox's writes over the whole host root.
+        let lower = crate::scratch::Scratch::new("overlay-upper-root");
+        let err = Cage::builder()
+            .overlay_rootfs(&*lower, "/")
+            .command("/bin/sh")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::OverlayUpperIsRoot { .. })),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn overriding_the_rootfs_clears_an_overlay() {
         // A consumer overriding an untrusted profile's rootfs must not be left
         // with the overlay that profile configured; the last root call wins.
@@ -4717,7 +5400,7 @@ read-only = true
         let profile = "rootfs = \"/tmp\"\ncommand = \"/bin/sh\"\nstdin = \"null\"\n";
         let builder: CageBuilder = toml::from_str(profile).unwrap();
         let cage = builder.build().unwrap();
-        assert!(matches!(cage.plan.stdin, StdinPlan::Null));
+        assert!(matches!(cage.plan.stdin, StdioPlan::Null));
     }
 
     #[test]

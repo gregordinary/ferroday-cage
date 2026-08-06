@@ -98,6 +98,16 @@ fn probe_child(merged: &CStr, options: &CStr, uid_line: &[u8], gid_line: &[u8]) 
         return EXIT_SETUP_FAILED;
     }
 
+    // Close the caller's descriptor table, keeping nothing: the probe needs no
+    // channel, only the two paths frozen above. The reason is every other
+    // forked child's — an inherited copy of a live sandbox's control socket
+    // holds that socket open, and the supervisor's hangup detection waits on
+    // the last copy closing — and it applies here for as long as the probe
+    // runs, which is one unshare, three `/proc` writes, and a mount.
+    if super::child::sweep_fds_keeping(&[]).is_err() {
+        return EXIT_SETUP_FAILED;
+    }
+
     // SAFETY: `unshare_unsafe` is unsafe only because `UnshareFlags::FILES`
     // could invalidate descriptors observed by other threads; these flags omit
     // it, and this is a freshly forked single-threaded child besides.

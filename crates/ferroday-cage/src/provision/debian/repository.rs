@@ -19,6 +19,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::DebianError;
+use super::coordinate::{self, Nesting};
 
 /// A repository's trust anchor: the keyring its signature is verified against,
 /// or an explicit decision to trust it unsigned.
@@ -176,9 +177,18 @@ impl Repository {
         !self.trust_unsigned() && !self.allow_stale
     }
 
-    /// Rejects a configuration that would install unauthenticated packages: an
-    /// unsigned repository reached over a transport that offers no authenticity
-    /// of its own.
+    /// Rejects a configuration the repository cannot be addressed by, or that
+    /// would install unauthenticated packages.
+    ///
+    /// The suite and each component become path segments of every URL this
+    /// repository is fetched through, and words of the `deb` line written into
+    /// the finished rootfs's apt sources, so both pass the archive-coordinate
+    /// check: a `..` segment climbs out of the mirror root — a local read for a
+    /// `file://` mirror — and a control character splits the request line the
+    /// value is interpolated into, or adds a source line to the rootfs that the
+    /// caller never wrote. It is the same check [`Pool`](super::Pool) makes of
+    /// the coordinates it publishes under, so a pool this crate writes and a
+    /// repository this crate reads agree on what an archive may be called.
     ///
     /// `trust_unsigned` skips the archive signature, so authenticity would rest
     /// on the transport alone. An `http://` mirror offers none, so the two
@@ -191,6 +201,10 @@ impl Repository {
             return Err(DebianError::Config {
                 reason: "a repository needs at least one mirror URL".to_string(),
             });
+        }
+        coordinate::check("the repository's suite", &self.suite, Nesting::Nested)?;
+        for component in &self.components {
+            coordinate::check("the repository's component", component, Nesting::Nested)?;
         }
         if self.trust_unsigned() {
             for mirror in &self.mirrors {
@@ -323,8 +337,13 @@ impl RepositoryBuilder {
     ///
     /// Returns a [`DebianError::Config`] when no mirror was set, when a signed
     /// repository names no keyring, when the keyring cannot be read, when an
-    /// unsigned repository is reached over `http://`, or when a supplied name
-    /// is not a portable file-name stem.
+    /// unsigned repository is reached over `http://`, when a supplied name is
+    /// not a portable file-name stem, or when the suite or a component is one
+    /// the repository cannot be addressed by: an empty value, one carrying
+    /// whitespace or a control character, or one that would resolve outside the
+    /// mirror root through a leading `/`, a `..` segment, or an empty or `.`
+    /// segment. Either may otherwise contain slashes, since both may name a
+    /// subtree.
     pub fn build(self) -> Result<Repository, DebianError> {
         let Some(primary) = self.mirror else {
             return Err(DebianError::Config {

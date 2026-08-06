@@ -1105,6 +1105,63 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
 }
 
 #[test]
+fn hermetic_a_failed_stage_layer_disposes_of_the_upper_it_created() {
+    // stage_layer creates the upper before it resolves, and a failure hands the
+    // caller no BuildLayer to drop — so the upper it created has to go with the
+    // failure, or a partly-installed increment (and the download cache beside
+    // it) is orphaned with nothing that knows to remove it.
+    //
+    // The failure is an include the archive does not carry, which is refused
+    // after the upper exists and before anything is downloaded.
+    let dir = common::scratch_dir("debian-failed-layer");
+    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&dir) {
+        eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
+        return;
+    }
+    let base_data = Tar::new().file("./usr/bin/x", 0o755, b"ok\n").finish();
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", deb(&base_data), "")],
+    );
+
+    let base_dir = dir.join("base");
+    let dpkg = base_dir.join("var/lib/dpkg");
+    std::fs::create_dir_all(&dpkg).unwrap();
+    std::fs::write(
+        dpkg.join("status"),
+        "Package: base\nStatus: install ok installed\nVersion: 1.0\n",
+    )
+    .unwrap();
+
+    let upper = dir.join("upper");
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .base_layer(&base_dir)
+        .include(["nonesuch"])
+        .build()
+        .expect("the builder validates");
+    debian
+        .stage_layer(&upper)
+        .expect_err("an unknown include fails the staging");
+
+    assert!(!upper.exists(), "a failed staging left its upper behind");
+    assert!(
+        !dir.join("upper.fcage-debs").exists(),
+        "a failed staging left its package cache behind",
+    );
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["base", "repo"]);
+}
+
+#[test]
 fn hermetic_mirror_fallback_serves_a_missing_primary() {
     // The primary mirror points at a directory that does not exist, so every
     // fetch 404s there and falls through to the backstop, which serves the whole
@@ -1139,6 +1196,62 @@ fn hermetic_mirror_fallback_serves_a_missing_primary() {
         Provisioned::Created,
     );
     assert!(rootfs.join("usr/bin/x").is_file());
+}
+
+#[test]
+fn an_archive_coordinate_the_repository_cannot_be_addressed_by_is_refused() {
+    // The suite, the components, and the architecture become path segments of
+    // every URL a repository is fetched through, and words of the `deb` line
+    // written into the finished rootfs. A `..` segment climbs out of the mirror
+    // root — for a file:// mirror, a local read — and a control character splits
+    // the request line the value is interpolated into, or adds a source line the
+    // caller never wrote. They pass the same check the pool holds its own
+    // coordinates to, so an archive this crate writes and one it reads agree on
+    // what an archive may be called.
+    let refused = |what: &str, build: Result<Debian<'_>, _>| match build {
+        Err(ferroday_cage::provision::debian::DebianError::Config { reason, .. }) => {
+            assert!(reason.contains(what), "{what}: {reason}");
+        }
+        other => panic!("{what} should be refused, got {other:?}"),
+    };
+    let base = || {
+        Debian::builder("trixie")
+            .mirror("file:///srv/debs")
+            .trust_unsigned(true)
+    };
+
+    for suite in ["../../etc", "/etc", "a//b", "with space", "a\r\nX: 1"] {
+        refused(
+            "suite",
+            Debian::builder(suite)
+                .mirror("file:///srv/debs")
+                .trust_unsigned(true)
+                .build(),
+        );
+    }
+    refused(
+        "component",
+        base().components(["main", "../../etc"]).build(),
+    );
+    refused("architecture", base().architecture("../../etc").build());
+    // An architecture is one directory name; the other two may name a subtree.
+    refused("architecture", base().architecture("linux/amd64").build());
+    Debian::builder("buster/updates")
+        .mirror("file:///srv/debs")
+        .trust_unsigned(true)
+        .components(["main/debian-installer"])
+        .build()
+        .expect("a slashed suite and component are real layouts");
+
+    // An additional repository is held to the same rule, at its own build.
+    assert!(
+        Repository::builder("../../etc")
+            .mirror("file:///srv/debs")
+            .trust_unsigned(true)
+            .build()
+            .is_err(),
+        "an additional repository's suite is unchecked",
+    );
 }
 
 #[test]
@@ -1202,6 +1315,227 @@ fn hermetic_rejects_an_escaping_deb_entry() {
         "an escaping entry is rejected: {err:?}"
     );
     assert!(!rootfs.exists(), "a failed bootstrap publishes nothing");
+}
+
+/// A control stanza for `name` at `version`, with the fields every `.deb`
+/// carries and nothing else.
+fn control_of(name: &str, version: &str) -> String {
+    format!(
+        "Package: {name}\nVersion: {version}\nArchitecture: amd64\nMaintainer: test\n\
+         Description: a test package\n",
+    )
+}
+
+/// The names of every file under `dir`, recursively, in no particular order.
+fn files_under(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.extend(files_under(&entry.path()));
+        } else {
+            found.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    found
+}
+
+#[test]
+fn hermetic_a_deb_cannot_choose_where_in_the_pool_it_is_written() {
+    // The pool path a `.deb` is stored at is derived from the package's own
+    // control stanza, and `Path::join` does not normalize: a `..` in the name
+    // survives into the syscall and the kernel resolves it, so a publish would
+    // create directories and write a file outside the pool root, as the
+    // publishing user. The version reaches the same path through the file-name
+    // component. Both are held to the alphabet Debian policy gives them before
+    // any path is built from them.
+    //
+    // The pool is nested several levels inside the scratch directory so that a
+    // regression here writes there rather than somewhere a test has no business
+    // touching.
+    let dir = common::scratch_dir("debian-pool-traversal");
+    let pool = dir.join("a/b/c/d/e/pool");
+    let data = Tar::new().file("./usr/bin/x", 0o755, b"ok\n").finish();
+
+    let refused = |control: String, note: &str| {
+        let path = dir.join("candidate.deb");
+        std::fs::write(&path, deb_with_control(&control, &data)).unwrap();
+        let reason = trixie_pool(&pool)
+            .publish([&path])
+            .expect_err(note)
+            .to_string();
+        assert!(
+            reason.contains("Debian policy permits"),
+            "{note} was refused for the wrong reason: {reason}",
+        );
+    };
+
+    refused(control_of("../../../../escaped", "1.0"), "a climbing name");
+    refused(control_of("..", "1.0"), "a name that is `..`");
+    refused(control_of(".", "1.0"), "a name that is `.`");
+    refused(control_of("evil/../../x", "1.0"), "a name with a separator");
+    refused(control_of("Evil", "1.0"), "an upper-case name");
+    refused(control_of("x", "1.0"), "a one-character name");
+    refused(control_of("-lead", "1.0"), "a name starting with a dash");
+    refused(control_of("tool", "1.0/../../evil"), "a slashed version");
+    refused(control_of("tool", "1.0 2.0"), "a spaced version");
+    refused(control_of("tool", ""), "an empty version");
+
+    // Nothing was created along the way to any of those paths: the pool tree a
+    // published package lives in was never opened.
+    assert!(
+        !pool.join("pool").exists(),
+        "a refused publish created a pool tree",
+    );
+    let stray: Vec<String> = files_under(&dir)
+        .into_iter()
+        .filter(|name| name.contains("escaped") || name.contains("evil"))
+        .collect();
+    assert!(stray.is_empty(), "a refused publish wrote {stray:?}");
+
+    // An ordinary package still publishes, epoch and all: the check is of the
+    // alphabet, not of the punctuation a real version uses.
+    let path = dir.join("ok.deb");
+    let control = control_of("tool", "2:1.3-1~bpo12+1");
+    std::fs::write(&path, deb_with_control(&control, &data)).unwrap();
+    trixie_pool(&pool)
+        .publish([&path])
+        .expect("an ordinary package publishes");
+    assert!(
+        pool.join("pool/main/t/tool/tool_1.3-1~bpo12+1_amd64.deb")
+            .is_file(),
+        "the published file is not where the archive convention puts it",
+    );
+}
+
+#[test]
+fn hermetic_a_deb_cannot_write_its_own_index_entry() {
+    // A pool entry is the control file verbatim with Filename, Size, and SHA256
+    // appended, and a deb822 reader resolves a field by its first occurrence. A
+    // control file carrying one of those would shadow the archive's value: the
+    // recorded digest would be one the package chose rather than one taken from
+    // the bytes on disk, and the recorded Filename could name another package's
+    // file in the same pool.
+    //
+    // A control file of several paragraphs reaches the same place by another
+    // route: the appended fields land on the last, which is then the paragraph
+    // that reads back as the entry — under whatever name and version it
+    // declares, while the dedupe that placed it keyed on the first. A pool is
+    // consumed as [trusted=yes] and resolution is highest-version-wins across
+    // repositories, so an entry a package wrote for itself supersedes the
+    // primary archive's.
+    let dir = common::scratch_dir("debian-pool-shadowing");
+    let pool = dir.join("pool");
+    let data = Tar::new().file("./usr/bin/x", 0o755, b"ok\n").finish();
+
+    let refused = |control: String, expected: &str, note: &str| {
+        let path = dir.join("candidate.deb");
+        std::fs::write(&path, deb_with_control(&control, &data)).unwrap();
+        let reason = trixie_pool(&pool)
+            .publish([&path])
+            .expect_err(note)
+            .to_string();
+        assert!(
+            reason.contains(expected),
+            "{note} was refused for the wrong reason: {reason}",
+        );
+    };
+
+    for field in ["Filename", "Size", "SHA256"] {
+        refused(
+            format!(
+                "{}{field}: pool/main/o/other/other_1.0_amd64.deb\n",
+                control_of("tool", "1.0")
+            ),
+            field,
+            &format!("a control file carrying {field}"),
+        );
+    }
+    refused(
+        format!(
+            "{}\n{}",
+            control_of("tool", "1.0"),
+            control_of("libc6", "99.0"),
+        ),
+        "paragraphs",
+        "a control file of two paragraphs",
+    );
+
+    assert!(
+        !pool.join("pool").exists(),
+        "a refused publish created a pool tree",
+    );
+
+    // The well-formed case still publishes, and the index it writes carries the
+    // archive's own values: the digest of the bytes in the pool, and the path
+    // the pool chose.
+    let path = dir.join("ok.deb");
+    let deb = deb_with_control(&control_of("tool", "1.0"), &data);
+    std::fs::write(&path, &deb).unwrap();
+    trixie_pool(&pool)
+        .publish([&path])
+        .expect("a well-formed package publishes");
+    let index =
+        std::fs::read_to_string(pool.join("dists/trixie/main/binary-amd64/Packages")).unwrap();
+    assert!(
+        index.contains(&format!("SHA256: {}", common::deb_repo::sha256_hex(&deb))),
+        "the index does not record the digest of the published bytes: {index}",
+    );
+    assert!(
+        index.contains("Filename: pool/main/t/tool/tool_1.0_amd64.deb"),
+        "the index does not record the path the pool chose: {index}",
+    );
+}
+
+#[test]
+fn hermetic_a_failed_bootstrap_leaves_no_package_cache_behind() {
+    // Without a cache directory the packages are downloaded into a sibling of
+    // the staging tree — a sibling because an extracted package's entries land
+    // under the staging root, so a cache beneath it could be overwritten before
+    // it is read. Nothing else clears that sibling: the publication's own
+    // cleanup removes the staging tree, and provision::remove removes the
+    // destination and its lock. So a failure partway has to take it, or a failed
+    // bootstrap leaves a base system's worth of .debs beside a rootfs that was
+    // never published.
+    //
+    // The failure is an escaping archive entry, which happens after the download
+    // has populated the cache.
+    let dir = common::scratch_dir("debian-failed-cache");
+    let evil = Tar::new().file("../escape", 0o644, b"pwned\n").finish();
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("evil", deb(&evil), "")],
+    );
+
+    let rootfs = dir.join("rootfs");
+    let mut debian = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .extract_only(true)
+        .build()
+        .expect("the builder validates");
+    provision::ensure(&rootfs, &mut debian).expect_err("an escaping entry fails the bootstrap");
+
+    assert!(!rootfs.exists(), "a failed bootstrap publishes nothing");
+    // The staging tree and the cache beside it, by the names the run derives.
+    assert!(!dir.join(".rootfs.staging").exists(), "the staging tree");
+    assert!(
+        !dir.join(".rootfs.staging.fcage-debs").exists(),
+        "the package cache",
+    );
+    // And nothing else either: what is left is the repository the test wrote
+    // and the publication lock, which `provision::remove` clears.
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["repo", "rootfs.lock"]);
 }
 
 #[test]
@@ -2363,8 +2697,19 @@ fn a_plan_refuses_every_setting_that_would_shape_a_resolution() {
 
     // And a plan resolved against more archives than there are repositories has
     // packages naming a mirror that is not configured.
-    let mut wider = plan;
+    let mut wider = plan.clone();
     let extra = wider.archives[0].clone();
     wider.archives.push(extra);
     assert!(refusal(base(wider)).contains("2 archives"));
+
+    // The archive count bounds a plan whose packages agree with its own archive
+    // list, which is every plan a document produced. `Plan` is public and
+    // `Clone`, though, so a caller can take one from `resolve()` and edit a
+    // package's archive index past the end — and the index is what a bootstrap
+    // slices the repository list with, so an unchecked one is a panic partway
+    // through a download rather than a refusal at build time.
+    let mut edited = plan;
+    edited.packages[0].archive = 7;
+    let reason = refusal(base(edited));
+    assert!(reason.contains("archive 7"), "{reason}");
 }

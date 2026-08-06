@@ -16,7 +16,7 @@
 //! pre-creation, each documented where it happens — at the cost of
 //! flattening the affected ownership to root in the finished tree.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -24,7 +24,7 @@ use std::path::Path;
 use super::index::parse_stanzas;
 use super::repository::{Repository, Trust};
 use super::{DebianError, DebianEvent, Stream};
-use crate::{Cage, CageBuilder, IdentityMap, Observer, Stdin};
+use crate::{Cage, CageBuilder, IdentityMap, Observer, Stdio};
 
 /// The core packages configured before the rest, in dependency order, so the
 /// base system (accounts, directories, the C library, dpkg itself) is in
@@ -67,6 +67,87 @@ pub(crate) struct Installable {
     pub sha256: String,
 }
 
+/// The dpkg statoverride a bootstrap derives: one `<user> <group> <mode>
+/// <path>` record per path a package ships with non-root ownership.
+///
+/// Records are keyed on the path, because dpkg treats two records for one path
+/// as an unrecoverable fatal error: `dpkg-statoverride --list` aborts on the
+/// duplicate, and so does every dpkg invocation the bootstrap makes after the
+/// file is written, with a message that says nothing about which package
+/// produced it. A closure reaches a duplicate honestly — two selected packages
+/// shipping one path, since the resolver reads `Depends` and `Provides` and
+/// never `Conflicts` or `Replaces`; a `data.tar` listing a path twice, which tar
+/// permits; or an increment re-shipping a path its base already overrode — so
+/// the duplicate is collapsed here rather than handed to dpkg.
+///
+/// The last record for a path wins, which is the extraction's own rule: a later
+/// entry supersedes an earlier one, so the surviving record describes the file
+/// that survived.
+///
+/// A record is held as its whole line, so one read back from a file dpkg or a
+/// maintainer script wrote keeps the owner it names; only the derived ones are
+/// `root root`. Rendering is in path order, so the file a bootstrap writes is a
+/// function of what it extracted rather than of the order it extracted in.
+#[derive(Default)]
+pub(crate) struct StatOverride {
+    records: BTreeMap<String, String>,
+}
+
+impl StatOverride {
+    /// Records `path` as root-owned at `mode`, replacing any record already held
+    /// for that path.
+    pub(super) fn record(&mut self, mode: u32, path: String) {
+        self.records
+            .insert(path.clone(), format!("root root {mode:o} {path}"));
+    }
+
+    /// Reads the records an existing statoverride file holds.
+    ///
+    /// A line that is not a record — blank, or missing one of the four fields —
+    /// is dropped rather than carried forward, since it is not something dpkg
+    /// would read either.
+    fn read(text: &str) -> StatOverride {
+        let mut overrides = StatOverride::default();
+        for line in text.lines() {
+            if let Some(path) = record_path(line) {
+                overrides.records.insert(path.to_string(), line.to_string());
+            }
+        }
+        overrides
+    }
+
+    /// Lays `later`'s records over these, `later` winning wherever both name a
+    /// path.
+    fn layer(&mut self, later: &StatOverride) {
+        for (path, record) in &later.records {
+            self.records.insert(path.clone(), record.clone());
+        }
+    }
+
+    /// The file's content: one newline-terminated record per line, in path
+    /// order. Empty when nothing was recorded.
+    pub(super) fn render(&self) -> String {
+        let mut text = String::new();
+        for record in self.records.values() {
+            text.push_str(record);
+            text.push('\n');
+        }
+        text
+    }
+}
+
+/// The path a statoverride record names: everything after the user, group, and
+/// mode fields, so a path containing a space survives.
+///
+/// Returns `None` for a line that does not carry all four fields.
+fn record_path(line: &str) -> Option<&str> {
+    let mut rest = line;
+    for _ in 0..3 {
+        rest = rest.split_once(' ')?.1;
+    }
+    (!rest.is_empty()).then_some(rest)
+}
+
 /// Configures every unpacked package, leaving a consistent dpkg database.
 ///
 /// `env` is the maintainer-script environment; `repositories` compose the
@@ -80,7 +161,7 @@ pub(crate) fn configure(
     staging: &Path,
     archives_host: &Path,
     installables: &[Installable],
-    statoverride: &str,
+    statoverride: &StatOverride,
     identity_map: &IdentityMap,
     env: &[(String, String)],
     repositories: &[Repository],
@@ -233,7 +314,7 @@ pub(crate) fn configure_delta(
     upper: &Path,
     archives_host: &Path,
     installables: &[Installable],
-    statoverride: &str,
+    statoverride: &StatOverride,
     identity_map: &IdentityMap,
     env: &[(String, String)],
     overlay_source: Option<&Path>,
@@ -336,15 +417,22 @@ fn restore_delta_ownership_stubs(upper: &Path) -> Result<(), DebianError> {
 }
 
 /// Writes the increment's statoverride into the upper, carrying the base's
-/// entries as well.
+/// records as well.
 ///
 /// The upper's statoverride shadows the base's copy in the lower through the
-/// overlay, so it must hold the base's entries as well as the increment's or the
+/// overlay, so it must hold the base's records as well as the increment's or the
 /// merged view would lose the base's overrides. The base's file is read (an
-/// absent one is treated as empty) and the increment's lines appended.
-fn write_delta_statoverride(lower: &Path, upper: &Path, delta: &str) -> Result<(), DebianError> {
+/// absent one is treated as empty) and the increment's records laid over it, so
+/// a path both describe carries the increment's mode — the mode of the file the
+/// upper now shadows the base's with — and carries it once, which is the only
+/// count dpkg accepts.
+fn write_delta_statoverride(
+    lower: &Path,
+    upper: &Path,
+    delta: &StatOverride,
+) -> Result<(), DebianError> {
     let base_path = lower.join("var/lib/dpkg/statoverride");
-    let mut merged = match fs::read_to_string(&base_path) {
+    let base = match fs::read_to_string(&base_path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(source) => {
@@ -355,12 +443,13 @@ fn write_delta_statoverride(lower: &Path, upper: &Path, delta: &str) -> Result<(
             });
         }
     };
-    merged.push_str(delta);
+    let mut merged = StatOverride::read(&base);
+    merged.layer(delta);
     let path = upper.join("var/lib/dpkg/statoverride");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io("creating", parent))?;
     }
-    fs::write(&path, merged).map_err(io("writing", &path))
+    fs::write(&path, merged.render()).map_err(io("writing", &path))
 }
 
 /// Forwards a wave's dpkg output to the progress callback.
@@ -410,9 +499,9 @@ fn core_install(
 
 /// Writes the derived dpkg statoverride. Called after base-passwd so `root`
 /// resolves.
-fn write_statoverride(staging: &Path, content: &str) -> Result<(), DebianError> {
+fn write_statoverride(staging: &Path, overrides: &StatOverride) -> Result<(), DebianError> {
     let path = staging.join("var/lib/dpkg/statoverride");
-    fs::write(&path, content).map_err(io("writing", &path))
+    fs::write(&path, overrides.render()).map_err(io("writing", &path))
 }
 
 /// Pre-creates `/etc/shadow` and `/etc/gshadow` as empty root-owned files,
@@ -514,7 +603,7 @@ fn run_dpkg_in(
         .command("/usr/bin/dpkg")
         .args(args)
         .bind_ro(archives_host, ARCHIVES)
-        .stdin(Stdin::Null)
+        .stdin(Stdio::Null)
         // The wave exists only to serve this bootstrap. Tie it to the caller so
         // that a caller killed mid-bootstrap does not leave dpkg writing into a
         // staging tree that `provision::ensure`'s error path is removing.
@@ -883,5 +972,71 @@ mod tests {
         let conf = fs::read_to_string(staging.join("etc/apt/apt.conf.d/00fcage-single-identity"))
             .expect("the apt config exists");
         assert_eq!(conf, "APT::Sandbox::User \"root\";\n");
+    }
+
+    #[test]
+    fn a_path_recorded_twice_produces_one_record() {
+        // dpkg treats two records for one path as an unrecoverable fatal error:
+        // `dpkg-statoverride --list` aborts, and with it every dpkg wave that
+        // follows the file being written. Two packages shipping one path, or one
+        // data.tar listing it twice, is reachable without anything malformed, so
+        // the second record supersedes the first rather than joining it — the
+        // extraction's own last-wins rule, describing the file that survived.
+        let mut overrides = StatOverride::default();
+        overrides.record(0o2755, "/usr/bin/x".to_string());
+        overrides.record(0o4755, "/usr/bin/x".to_string());
+        assert_eq!(overrides.render(), "root root 4755 /usr/bin/x\n");
+    }
+
+    #[test]
+    fn records_are_rendered_in_path_order() {
+        // The file is then a function of what was extracted rather than of the
+        // order it was extracted in.
+        let mut overrides = StatOverride::default();
+        for path in ["/var/log/x", "/usr/bin/a", "/etc/z"] {
+            overrides.record(0o2755, path.to_string());
+        }
+        assert_eq!(
+            overrides.render(),
+            "root root 2755 /etc/z\nroot root 2755 /usr/bin/a\nroot root 2755 /var/log/x\n",
+        );
+        // Nothing recorded is an empty file, not a blank line.
+        assert_eq!(StatOverride::default().render(), "");
+    }
+
+    #[test]
+    fn a_base_statoverride_is_carried_and_the_increment_wins() {
+        // The upper's file shadows the base's through the overlay, so it has to
+        // hold the base's records too. Where both name a path the increment's
+        // record is the one that describes what the merged view shows — and it
+        // has to appear once, whatever the base said.
+        let base = "root root 2755 /usr/bin/shared\n\
+                    games games 2755 /usr/games/keep\n\
+                    \n\
+                    not-a-record\n";
+        let mut delta = StatOverride::default();
+        delta.record(0o4755, "/usr/bin/shared".to_string());
+        delta.record(0o2755, "/usr/bin/new".to_string());
+
+        let mut merged = StatOverride::read(base);
+        merged.layer(&delta);
+        assert_eq!(
+            merged.render(),
+            "root root 2755 /usr/bin/new\n\
+             root root 4755 /usr/bin/shared\n\
+             games games 2755 /usr/games/keep\n",
+        );
+    }
+
+    #[test]
+    fn a_record_path_may_carry_a_space() {
+        // dpkg's fourth field runs to the end of the line, so a path with a
+        // space in it is one record and not a malformed two.
+        assert_eq!(
+            record_path("root root 2755 /usr/lib/my tool"),
+            Some("/usr/lib/my tool"),
+        );
+        assert_eq!(record_path("root root 2755"), None);
+        assert_eq!(record_path(""), None);
     }
 }

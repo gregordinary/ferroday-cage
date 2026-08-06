@@ -647,10 +647,24 @@ fn read_own_map(path: &str) -> Option<Vec<(u32, u32)>> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut ranges = Vec::new();
     for line in text.lines() {
+        // A line this does not recognize is skipped, not taken as grounds to
+        // abandon the file: "unreadable" is what leaves the kernel as the
+        // arbiter, and one unexpected line is a different thing. Giving up here
+        // would drop the check for both id spaces and turn a named extent at
+        // build time into a bare EPERM at apply time.
         let mut fields = line.split_whitespace();
-        let inside: u32 = fields.next()?.parse().ok()?;
-        let _outside: u64 = fields.next()?.parse().ok()?;
-        let count: u32 = fields.next()?.parse().ok()?;
+        let (Some(inside), Some(outside), Some(count)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(inside), Ok(_outside), Ok(count)) = (
+            inside.parse::<u32>(),
+            outside.parse::<u64>(),
+            count.parse::<u32>(),
+        ) else {
+            continue;
+        };
         ranges.push((inside, count));
     }
     if ranges.is_empty() {
@@ -707,7 +721,7 @@ mod profile {
 #[cfg(feature = "subid")]
 pub use subid::SubidMapper;
 #[cfg(feature = "subid")]
-pub(crate) use subid::probe_allocation_is_empty;
+pub(crate) use subid::{AllocationUnusable, probe_allocation};
 
 /// The subordinate-id delegate: `newuidmap` and `newgidmap`.
 #[cfg(feature = "subid")]
@@ -734,6 +748,16 @@ mod subid {
     /// helpers themselves follow, so the fallback can never invent an
     /// allocation an NSS module would deny. [`apply`](IdMapper::apply)
     /// executes the helpers against the gated sandbox process.
+    ///
+    /// *Which* helpers is decided by the ambient `PATH`, which is worth knowing
+    /// for a consumer running this from a daemon with an inherited environment.
+    /// They are looked up by name among the absolute `PATH` entries — a relative
+    /// entry is skipped rather than resolved against the process's working
+    /// directory — and the resolved absolute path is what executes.
+    /// [`host::range_map_blocker`](crate::host::range_map_blocker) judges a
+    /// helper's privilege through the same lookup, so the two agree on the same
+    /// `PATH`; a `PATH` that changes between the probe and the launch is the
+    /// caller's to keep still.
     ///
     /// [`host::range_map_blocker`](crate::host::range_map_blocker) explains
     /// a host on which this delegate cannot work.
@@ -800,8 +824,19 @@ mod subid {
     }
 
     /// Executes one helper with the extent triples for one map file.
+    ///
+    /// The helper is resolved to an absolute path first, by the same lookup
+    /// [`host::range_map_blocker`](crate::host::range_map_blocker) uses to judge
+    /// its privilege, rather than handed to `Command` as a bare name for it to
+    /// resolve again on its own terms. The two would otherwise be free to differ
+    /// — `Command` searches every `PATH` entry, this lookup only the absolute
+    /// ones — and the probe's verdict would describe a binary that is not the
+    /// one that runs.
     fn run_helper(helper: &'static str, pid: u32, ranges: &[IdRange]) -> Result<(), IdMapError> {
-        let mut command = Command::new(helper);
+        let resolved = crate::host::find_on_path(helper).ok_or_else(|| {
+            IdMapError::helper_spawn(helper, rustix::io::Errno::NOENT.raw_os_error())
+        })?;
+        let mut command = Command::new(resolved);
         command.arg(pid.to_string());
         for range in ranges {
             command
@@ -855,6 +890,42 @@ mod subid {
     /// authority and reading them could silently miss (or invent) an
     /// allocation, so the query fails naming the missing tool instead.
     pub(crate) fn subordinate_ranges(kind: Kind) -> Result<Vec<(u32, u32)>, IdMapError> {
+        allocation(kind).map_err(|unusable| IdMapError::unsatisfiable(unusable.to_string(kind)))
+    }
+
+    /// Why the caller's subordinate allocation cannot be used.
+    ///
+    /// The two are different diagnoses with different remedies, and the host
+    /// probe reports whichever applies rather than collapsing both into "no
+    /// allocation": on a host whose `nsswitch.conf` sources subordinate ids
+    /// from a directory service, the user may well have an allocation, and
+    /// adding `/etc/subuid` entries would not help because the files are not
+    /// the authority there.
+    pub(crate) enum AllocationUnusable {
+        /// The query answered, and the answer is that there is no allocation.
+        Empty,
+        /// The query could not answer at all; the reason names what to do.
+        Unknown(String),
+    }
+
+    impl AllocationUnusable {
+        /// The reason as a message, `kind` naming the id space.
+        pub(crate) fn to_string(&self, kind: Kind) -> String {
+            match self {
+                AllocationUnusable::Empty => format!(
+                    "the calling user has no subordinate {} allocation; grant one with \
+                     usermod --add-sub{}s or an entry in {}",
+                    kind.noun(),
+                    kind.noun(),
+                    kind.file(),
+                ),
+                AllocationUnusable::Unknown(reason) => reason.clone(),
+            }
+        }
+    }
+
+    /// The caller's allocation for one id space, or why it could not be had.
+    pub(crate) fn allocation(kind: Kind) -> Result<Vec<(u32, u32)>, AllocationUnusable> {
         // The helpers match a subordinate entry by user name or by literal
         // uid string, so the query tries both. The name lookup is delegated
         // to `id`, whose NSS-aware resolution covers directory-service
@@ -872,37 +943,31 @@ mod subid {
         keys.push(rustix::process::geteuid().as_raw().to_string());
 
         match query_getsubids(kind, &keys) {
-            Ok(ranges) => return finish(kind, ranges),
+            Ok(ranges) => return finish(ranges),
             Err(GetsubidsUnusable::Absent) => {}
             Err(GetsubidsUnusable::Failed(detail)) => {
-                return Err(IdMapError::unsatisfiable(format!(
+                return Err(AllocationUnusable::Unknown(format!(
                     "getsubids could not report the allocation: {detail}"
                 )));
             }
         }
 
         if let Some(modules) = non_files_subid_modules() {
-            return Err(IdMapError::unsatisfiable(format!(
+            return Err(AllocationUnusable::Unknown(format!(
                 "nsswitch.conf sources subordinate ids from `{modules}` and getsubids is \
                      not installed, so the allocation cannot be determined; install getsubids \
                      (shadow 4.10 or later)",
             )));
         }
 
-        finish(kind, parse_subid_file(kind.file(), &keys))
+        finish(parse_subid_file(kind.file(), &keys))
     }
 
     /// Wraps an allocation query result, turning an empty allocation into
     /// the typed refusal.
-    fn finish(kind: Kind, ranges: Vec<(u32, u32)>) -> Result<Vec<(u32, u32)>, IdMapError> {
+    fn finish(ranges: Vec<(u32, u32)>) -> Result<Vec<(u32, u32)>, AllocationUnusable> {
         if ranges.is_empty() {
-            Err(IdMapError::unsatisfiable(format!(
-                "the calling user has no subordinate {} allocation; grant one with \
-                     usermod --add-sub{}s or an entry in {}",
-                kind.noun(),
-                kind.noun(),
-                kind.file(),
-            )))
+            Err(AllocationUnusable::Empty)
         } else {
             Ok(ranges)
         }
@@ -1021,11 +1086,19 @@ mod subid {
         ranges
     }
 
-    /// Whether the caller has no subordinate allocation at all, for the host
-    /// probe. Query failures count as empty: the probe reports conditions,
-    /// it does not fail.
-    pub(crate) fn probe_allocation_is_empty() -> bool {
-        subordinate_ranges(Kind::Uid).is_err() || subordinate_ranges(Kind::Gid).is_err()
+    /// Why the caller's subordinate allocation cannot be used, for the host
+    /// probe, or `None` when both id spaces answer with one.
+    ///
+    /// The reason is carried rather than reduced to "no allocation": the probe
+    /// reports conditions, and the condition it reports has to be the one whose
+    /// remedy is right. See [`AllocationUnusable`].
+    pub(crate) fn probe_allocation() -> Option<(Kind, AllocationUnusable)> {
+        for kind in [Kind::Uid, Kind::Gid] {
+            if let Err(unusable) = allocation(kind) {
+                return Some((kind, unusable));
+            }
+        }
+        None
     }
 
     /// Composes the subordinate map: the caller's own id as inside id 0,
@@ -1049,6 +1122,14 @@ mod subid {
             // nothing after this entry can be addressed either.
             let count = count.min(u32::MAX - inside);
             if count == 0 {
+                break;
+            }
+            // A map file carries at most MAX_EXTENTS lines, and an
+            // administrator is free to grant more separate ranges than that.
+            // Truncating keeps a legal host configuration working with a
+            // smaller map, where emitting them all would fail the build with a
+            // message blaming the delegate for the host's allocation.
+            if ranges.len() == super::MAX_EXTENTS {
                 break;
             }
             ranges.push(IdRange {
@@ -1088,6 +1169,26 @@ mod subid {
                     },
                 ]
             );
+        }
+
+        #[test]
+        fn an_allocation_beyond_the_extent_ceiling_is_truncated_to_it() {
+            // A user granted more separate subordinate ranges than a map file
+            // can carry is unusual but entirely legal. Emitting them all would
+            // fail `validate_resolved` with a message blaming the bundled
+            // delegate for the host's allocation; truncating keeps the
+            // configuration working with a smaller map, as the u32-exhaustion
+            // case above it already does.
+            let allocation: Vec<(u32, u32)> = (0..super::super::MAX_EXTENTS + 20)
+                .map(|i| (100_000 + (i as u32) * 10, 5))
+                .collect();
+            let map = compose_subordinate(1000, &allocation);
+            assert_eq!(map.len(), super::super::MAX_EXTENTS);
+            // Still a map the kernel accepts, with the caller's own id at
+            // inside id 0 where every map this library builds has it.
+            let resolved = ResolvedMap::new(map.clone(), map);
+            crate::idmap::validate_resolved(&resolved)
+                .expect("a truncated map is still a valid one");
         }
 
         #[test]
@@ -1193,6 +1294,36 @@ fn coalesce(allocation: &[(u32, u32)]) -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unparsable_map_line_is_skipped_rather_than_abandoning_the_file() {
+        // The coverage check exists so that a requested outside id the caller's
+        // namespace does not hold is named at build time instead of arriving as
+        // a bare EPERM from the kernel at apply time. Abandoning the file on one
+        // line the parser did not expect would drop that check silently — and
+        // drop it for both id spaces, since the failure is per-file.
+        let dir = crate::scratch::Scratch::new("own-map");
+        let path = dir.join("uid_map");
+        std::fs::write(
+            &path,
+            b"         0       1000          1\n\
+              this line is not a map entry\n\
+              1 100000 65536\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_own_map(path.to_str().unwrap()),
+            Some(vec![(0, 1), (1, 65536)]),
+            "the entries around an unparsable line must survive it"
+        );
+
+        // A file with nothing parsable in it is still "no map to check
+        // against", which leaves the kernel as the arbiter.
+        std::fs::write(&path, b"not a map at all\n").unwrap();
+        assert_eq!(read_own_map(path.to_str().unwrap()), None);
+        // As is a file that cannot be read.
+        assert_eq!(read_own_map("/proc/self/no-such-map"), None);
+    }
 
     fn range(inside: u32, outside: u32, count: u32) -> IdRange {
         IdRange {

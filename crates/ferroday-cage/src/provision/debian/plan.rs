@@ -111,7 +111,13 @@ pub struct ResolvedArchive {
     pub date: Option<String>,
     /// The release's `Valid-Until` field, as written, when it carries one.
     pub valid_until: Option<String>,
-    /// The fingerprint of the key that verified the release, uppercase hex.
+    /// The fingerprint of the certificate that verified the release, uppercase
+    /// hex.
+    ///
+    /// The archive key's primary-key fingerprint, which is the identity a
+    /// keyring entry is named by and the one a policy pinning an archive would
+    /// pin. It is stable across a certificate rotating its signing subkey,
+    /// which [`signing_key`](Self::signing_key) is not.
     ///
     /// Empty for a repository configured as
     /// [`trust_unsigned`](super::RepositoryBuilder::trust_unsigned), where
@@ -119,6 +125,17 @@ pub struct ResolvedArchive {
     /// verification stops at the first valid one, so this names the key that
     /// was actually used rather than every key that could have been.
     pub signed_by: Vec<String>,
+    /// The fingerprint of the component key that made the signature, uppercase
+    /// hex.
+    ///
+    /// Debian's archive keys sign with a dedicated signing subkey, so this is
+    /// usually a subkey of the certificate [`signed_by`](Self::signed_by)
+    /// names, and equal to it only when a primary signed directly. Recorded
+    /// because the two answer different questions: which archive vouched for
+    /// the release, and which key material actually produced the signature.
+    ///
+    /// Empty exactly when [`signed_by`](Self::signed_by) is.
+    pub signing_key: Vec<String>,
     /// Fields this archive's stanza carried that this version does not know.
     carried: Carried,
 }
@@ -205,6 +222,7 @@ impl Plan {
             // the plan's trust, not an absence of information, and a reader
             // that saw no key at all could not tell the two apart.
             stanza.put_allowing_empty("Signed-By", &archive.signed_by.join(" "));
+            stanza.put_allowing_empty("Signing-Key", &archive.signing_key.join(" "));
             stanza.put_carried(&archive.carried);
             stanza.render(&mut out)?;
         }
@@ -325,6 +343,7 @@ impl Plan {
                 date: stanza.get("Date").map(str::to_string),
                 valid_until: stanza.get("Valid-Until").map(str::to_string),
                 signed_by: list(stanza.get("Signed-By")),
+                signing_key: list(stanza.get("Signing-Key")),
                 carried: carried(stanza, ARCHIVE_FIELDS),
             });
         }
@@ -369,6 +388,7 @@ impl ResolvedArchive {
         date: Option<String>,
         valid_until: Option<String>,
         signed_by: Vec<String>,
+        signing_key: Vec<String>,
     ) -> ResolvedArchive {
         ResolvedArchive {
             mirror,
@@ -378,6 +398,7 @@ impl ResolvedArchive {
             date,
             valid_until,
             signed_by,
+            signing_key,
             carried: Carried::new(),
         }
     }
@@ -558,6 +579,7 @@ const ARCHIVE_FIELDS: &[&str] = &[
     "Date",
     "Valid-Until",
     "Signed-By",
+    "Signing-Key",
 ];
 /// The package-stanza fields this version writes and reads.
 const PACKAGE_FIELDS: &[&str] = &[
@@ -628,7 +650,10 @@ mod tests {
                     release_sha256: "9f3a".repeat(16),
                     date: Some("Sat, 02 Aug 2026 08:14:33 UTC".to_string()),
                     valid_until: Some("Sat, 09 Aug 2026 08:14:33 UTC".to_string()),
-                    signed_by: vec!["4CB50190207B4758".to_string()],
+                    // A real archive key pair: the trixie certificate, and the
+                    // dedicated signing subkey it signs releases with.
+                    signed_by: vec!["04B54C3CDCA79751B16BC6B5225629DF75B188BD".to_string()],
+                    signing_key: vec!["B8E5F13176D2A7A75220028078DBA3BC47EF2265".to_string()],
                     carried: Carried::new(),
                 },
                 ResolvedArchive {
@@ -639,6 +664,7 @@ mod tests {
                     date: None,
                     valid_until: None,
                     signed_by: Vec::new(),
+                    signing_key: Vec::new(),
                     carried: Carried::new(),
                 },
             ],

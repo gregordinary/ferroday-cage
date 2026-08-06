@@ -25,7 +25,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # `rand` is the kernel's getrandom: the host probes name their scratch entries
 # from it, and the native network stack seeds its TCP sequence numbers from it.
-rustix = { version = "1.1.4", features = ["runtime", "mount", "process", "fs", "pipe", "thread", "net", "system", "event", "stdio", "rand"] }
+rustix = { version = "1.1.4", features = ["runtime", "mount", "process", "fs", "pipe", "thread", "net", "system", "event", "stdio", "rand", "pty", "termios"] }
 # A no_std, libc-free inline-assembly conduit for the syscalls rustix does not
 # wrap: mount_setattr, for recursively read-only bind mounts (core), and the
 # Landlock and seccomp-install calls (the hardening layer). The crate owns the
@@ -33,13 +33,24 @@ rustix = { version = "1.1.4", features = ["runtime", "mount", "process", "fs", "
 # crate is needed.
 syscalls = { version = "0.8", default-features = false }
 serde = { version = "1.0", features = ["derive"], optional = true }
-flate2 = { version = "1.1", optional = true }
-lzma-rust2 = { version = "0.16", optional = true, default-features = false, features = ["std", "xz"] }
-ruzstd = { version = "0.8", optional = true }
+# gzip. The backend is named rather than left to flate2's default so that it
+# cannot move without this line moving: `miniz_oxide` carries
+# `#![forbid(unsafe_code)]`, which is the property being selected for, and a
+# `tarball` build reaches gzip through this crate alone.
+#
+# A `debian` build resolves differently and cannot be made to do otherwise:
+# `pgp` requires `flate2/zlib-rs`, features unify across the graph, and flate2
+# prefers zlib-rs wherever both are selected. Such a build therefore compiles
+# `miniz_oxide` unreachably and decodes through zlib-rs. That is the price of
+# the OpenPGP dependency, not of this line, and it leaves the narrower
+# configurations on a backend that forbids unsafe outright.
+flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
+lzma-rust2 = { version = "0.18", optional = true, default-features = false, features = ["std", "xz"] }
+ruzstd = { version = "0.9", optional = true }
 # The Debian userland add-on: OpenPGP verification of the archive signature
 # (pure Rust, no C backend) and SHA-256 hashing of the release chain.
 pgp = { version = "0.20", optional = true, default-features = false }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 # The hardening add-on: seccomp-BPF compilation, pure Rust (the syscall conduit
 # it installs through is the always-present `syscalls` above).
 seccompiler = { version = "0.5", optional = true }
@@ -101,6 +112,13 @@ required-features = ["tarball"]
 
 [[test]]
 name = "handle"
+required-features = ["tarball"]
+
+# The terminal tests launch real sandboxes against the rootfs fixture; the
+# run-as case additionally needs a range-map delegate and is gated on `subid`
+# within the binary.
+[[test]]
+name = "terminal"
 required-features = ["tarball"]
 
 [[test]]
@@ -196,13 +214,13 @@ required-features = ["netstack", "tarball"]
 
 [dev-dependencies]
 rustix = "1.1.4"
-toml = "0.8"
+toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"
 # The provisioning tests generate compressed fixtures.
-lzma-rust2 = { version = "0.16", default-features = false, features = ["std", "xz", "encoder"] }
+lzma-rust2 = { version = "0.18", default-features = false, features = ["std", "xz", "encoder"] }
 # The Debian tests build fixture repositories with correct digests.
-sha2 = "0.10"
+sha2 = "0.11"
 # The Debian signature tests generate a throwaway signing key and sign an
 # InRelease with it, to exercise the verification path adversarially. rPGP is
 # already pulled in by the `debian` feature; this adds the RNG it needs.

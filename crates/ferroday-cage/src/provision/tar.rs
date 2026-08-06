@@ -419,12 +419,14 @@ fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
         }
     }
 
-    let mode = numeric_field(&block[100..108])? as u32;
-    // An id is unsigned. The base-256 form is two's complement and can carry a
-    // negative value, which `as u32` would wrap into a plausible-looking id;
-    // refusing it keeps a malformed header from silently assigning ownership.
-    let uid = id_field(&block[108..116])?;
-    let gid = id_field(&block[116..124])?;
+    // A mode and an id are both unsigned. The base-256 form is two's complement
+    // and can carry a negative value, which a cast would wrap into a
+    // plausible-looking permission set — the setuid, setgid, and sticky bits
+    // included — or into an unrelated id; refusing it keeps a malformed header
+    // from silently deciding either.
+    let mode = unsigned_field(&block[100..108])?;
+    let uid = unsigned_field(&block[108..116])?;
+    let gid = unsigned_field(&block[116..124])?;
     let size = u64::try_from(numeric_field(&block[124..136])?).map_err(|_| HeaderFlaw::Numeric)?;
     let mtime = numeric_field(&block[136..148])?;
     let mut typeflag = match block[156] {
@@ -507,10 +509,13 @@ fn numeric_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
     Ok(value)
 }
 
-/// Decodes a numeric header field as a user or group id: the same decoding as
-/// [`numeric_field`], refusing a negative value rather than wrapping it into an
-/// unrelated id.
-fn id_field(field: &[u8]) -> Result<u32, HeaderFlaw> {
+/// Decodes a numeric header field that cannot be negative — a mode, a user id, a
+/// group id: the same decoding as [`numeric_field`], refusing a negative value
+/// rather than wrapping it into an unrelated one.
+///
+/// No capability is lost by refusing: an archive that means `0o7777`, or uid
+/// 4294967295, spells it in octal or in the positive base-256 form directly.
+fn unsigned_field(field: &[u8]) -> Result<u32, HeaderFlaw> {
     u32::try_from(numeric_field(field)?).map_err(|_| HeaderFlaw::Numeric)
 }
 
@@ -704,16 +709,35 @@ mod tests {
     }
 
     #[test]
-    fn a_negative_id_field_is_refused_rather_than_wrapped() {
+    fn a_negative_unsigned_field_is_refused_rather_than_wrapped() {
         // The base-256 form is two's complement. Casting a negative value to
         // `u32` would produce a plausible-looking id — `-1` becomes 4294967295,
         // the kernel's overflow id — and assign ownership from a malformed
         // header without a word.
         let field = [0xffu8; 8];
         assert_eq!(numeric_field(&field).unwrap(), -1);
-        assert!(id_field(&field).is_err());
+        assert!(unsigned_field(&field).is_err());
         // The ordinary octal form still decodes.
-        assert_eq!(id_field(b"0001750\0").unwrap(), 0o1750);
+        assert_eq!(unsigned_field(b"0001750\0").unwrap(), 0o1750);
+    }
+
+    #[test]
+    fn a_negative_mode_is_refused_alongside_the_ids_it_sits_beside() {
+        // The mode takes the same decoding as the ids beside it, so a negative
+        // base-256 value is refused there too. Wrapped, `-1 as u32 & 0o7777`
+        // would be `0o7777`: every permission bit plus setuid, setgid, and
+        // sticky, granted by a header no archive can have meant.
+        let mut block = ustar_header(b"file.txt", b"");
+        block[100..108].copy_from_slice(&[0xffu8; 8]);
+        checksum(&mut block);
+        assert_eq!(parse_header(&block).unwrap_err(), HeaderFlaw::Numeric);
+
+        // The same header with an ordinary octal mode parses, so what is refused
+        // is the sign and not the field.
+        assert_eq!(
+            parse_header(&ustar_header(b"file.txt", b"")).unwrap().mode,
+            0o644,
+        );
     }
 
     #[test]

@@ -53,6 +53,7 @@ mod copyin;
 mod export;
 #[cfg(feature = "tarball")]
 mod extract;
+mod identity;
 #[cfg(feature = "tarball")]
 mod tar;
 #[cfg(feature = "tarball")]
@@ -352,15 +353,37 @@ pub enum ProvisionError {
     },
     /// An archive entry attempted to reach outside the extraction root.
     ///
-    /// The entry's path or link target is absolute, contains `..`, or
-    /// resolves through a symlink to a location outside the rootfs being
-    /// extracted. Containment is enforced by the kernel during path
-    /// resolution, not by inspecting the path text.
+    /// The entry's path or link target is absolute, contains `..`, carries a
+    /// NUL byte that would truncate it, or resolves through a symlink to a
+    /// location outside the rootfs being extracted. Containment is enforced by
+    /// the kernel during path resolution, not by inspecting the path text.
+    ///
+    /// This variant asserts a containment failure and nothing else. An entry
+    /// refused for any other reason is [`EntryRefused`](Self::EntryRefused).
     #[non_exhaustive]
     EntryUnsafe {
         /// The entry's path as recorded in the archive.
         path: PathBuf,
         /// What was unsafe about it.
+        reason: String,
+    },
+    /// An entry cannot be handled as it stands, for a reason that is not a
+    /// containment failure.
+    ///
+    /// A malformed archive — a path component that is not a directory, an empty
+    /// symlink target — a source tree past a limit the copy protocol can carry
+    /// (its depth, an entry name, a link target), or a source id the
+    /// destination's identity map has no place for.
+    ///
+    /// Distinct from [`EntryUnsafe`](Self::EntryUnsafe), which means an entry
+    /// tried to reach outside the tree it was being written into. Nothing here
+    /// did.
+    #[non_exhaustive]
+    EntryRefused {
+        /// The entry's path: as recorded in the archive, or as it sits in the
+        /// source tree.
+        path: PathBuf,
+        /// Why it was refused.
         reason: String,
     },
     /// An archive entry has a type the extractor does not support.
@@ -523,6 +546,9 @@ impl fmt::Display for ProvisionError {
                 "the archive entry {} reaches outside the extraction root: {reason}",
                 path.display(),
             ),
+            ProvisionError::EntryRefused { path, reason } => {
+                write!(f, "the entry {} was refused: {reason}", path.display())
+            }
             ProvisionError::EntryUnsupported { path, kind } => write!(
                 f,
                 "the archive entry {} has unsupported type {:?}",
@@ -1036,9 +1062,15 @@ fn remove_lock(dest: &Path) -> Result<(), ProvisionError> {
 /// Removes a directory tree: plain removal first, escalated through the
 /// identity map when ownership refuses the plain path.
 ///
-/// The escalation re-enters `map` through `mapper` when one is supplied, and
-/// otherwise resolves the bundled delegate chain for `map`. Also used by
-/// [`ensure`]'s staging cleanup, so a crashed range-mapped provisioning run
+/// The escalation re-enters `map`: a range map through `mapper` when one is
+/// supplied and the bundled delegate chain otherwise, and a single-identity
+/// map written by the removal child itself. The single map is worth
+/// re-entering even though its ids are the caller's own already, because the
+/// child holds `CAP_DAC_OVERRIDE` and `CAP_FOWNER` over them there: a
+/// directory whose own mode denies the search or write the deletion needs
+/// refuses the plain path and yields to the mapped one.
+///
+/// Also used by [`ensure`]'s staging cleanup, so a crashed provisioning run
 /// cannot wedge the destination.
 fn remove_tree(
     dest: &Path,
@@ -1061,24 +1093,12 @@ fn remove_tree(
         reason,
     };
 
-    // The delegate to re-apply and the extents to write: a caller-supplied
-    // mapper directly, or the bundled delegate chain otherwise. The default
-    // chain's `Arc` is held in `default_chain` so `delegate` can borrow it.
-    let default_chain;
-    let (delegate, resolved): (&dyn crate::idmap::IdMapper, crate::idmap::ResolvedMap) =
-        match mapper {
-            Some(mapper) => match mapper.resolve(map) {
-                Ok(resolved) => (mapper, resolved),
-                Err(err) => return Err(unprivileged(denied, err.to_string())),
-            },
-            None => match crate::idmap::resolve_default_chain(map) {
-                Ok(chain) => {
-                    default_chain = chain;
-                    (default_chain.0.as_ref(), default_chain.1.clone())
-                }
-                Err(reason) => return Err(unprivileged(denied, reason)),
-            },
-        };
+    // The map to re-enter: the single map the child writes itself, or the
+    // delegate and extents a range map is applied through.
+    let map_source = match identity::compose_child_map(map, mapper) {
+        Ok(source) => source,
+        Err(reason) => return Err(unprivileged(denied, reason)),
+    };
 
     let parent = match dest.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -1099,12 +1119,17 @@ fn remove_tree(
     let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(nul)?;
     let leaf_c = std::ffi::CString::new(leaf.as_bytes()).map_err(nul)?;
 
-    crate::mechanism::remove_tree_mapped(&parent_c, &leaf_c, delegate, &resolved).map_err(
+    crate::mechanism::remove_tree_mapped(&parent_c, &leaf_c, map_source.child_map()).map_err(
         |failure| match failure {
             crate::mechanism::RemoveFailure::Step { step, errno } => {
                 io_error(step.describe(), dest, io::Error::from_raw_os_error(errno))
             }
             crate::mechanism::RemoveFailure::Map(err) => unprivileged(denied, err.to_string()),
+            crate::mechanism::RemoveFailure::Malformed => io_error(
+                "reading the removal process's outcome",
+                dest,
+                io::Error::from_raw_os_error(Errno::PROTO.raw_os_error()),
+            ),
         },
     )
 }

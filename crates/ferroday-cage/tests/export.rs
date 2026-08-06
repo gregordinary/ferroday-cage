@@ -1099,6 +1099,55 @@ fn a_copy_whose_delegate_cannot_resolve_is_typed() {
     let _ = provision::remove(&dir);
 }
 
+/// A copy the in-map child refuses is reported as the step the child failed at,
+/// however far through the tree the walk had got.
+///
+/// The two sides fail in different terms. The child stops at the entry it could
+/// not create; the parent, still streaming, learns of it only as a frame write
+/// that could not be delivered. Which one the caller was told used to depend on
+/// the size of the tree: one that fit the pipe's buffer let the walk run to the
+/// end and the child's record be read, while anything larger blocked, took the
+/// broken pipe, and reported that instead — the wrong way round, since the large
+/// tree is where the diagnostic is worth most.
+#[test]
+fn a_copy_the_child_refuses_reports_the_childs_own_step() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-child-step");
+    let source = dir.join("source");
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(source.join("a-dir")).unwrap();
+    std::fs::create_dir_all(&rootfs).unwrap();
+    // The destination holds a regular file where the source holds a directory,
+    // so the child's `openat` of the directory it just tried to create answers
+    // ENOTDIR and it exits at once.
+    std::fs::write(rootfs.join("a-dir"), b"not a directory\n").unwrap();
+    // Sorted after the refused entry and larger than a pipe's 64 KiB buffer, so
+    // the walk is still writing long after the child is gone and the parent
+    // takes the broken pipe rather than reaching the end of the tree.
+    std::fs::write(source.join("z-large"), vec![b'x'; 256 * 1024]).unwrap();
+
+    match provision::CopyIn::new(&source, &rootfs).run() {
+        Err(provision::ProvisionError::Io {
+            op,
+            path,
+            source: cause,
+            ..
+        }) => {
+            assert_eq!(op, "opening a directory just created");
+            assert_eq!(path, rootfs);
+            assert_eq!(
+                cause.raw_os_error(),
+                Some(rustix::io::Errno::NOTDIR.raw_os_error()),
+                "the child's errno is carried through: {cause}"
+            );
+        }
+        other => panic!("expected the child's own step, got {other:?}"),
+    }
+    let _ = provision::remove(&dir);
+}
+
 /// Several names for one file arrive as one file with several names.
 ///
 /// The round trip is the point: an `Export` coalesces hard links, so a `CopyIn`
