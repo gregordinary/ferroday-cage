@@ -196,13 +196,23 @@ pub enum ResolvedIdentity {
 /// # What this reports
 ///
 /// The plan — what every launch of the sandbox shares. A launch that attaches a
-/// conduit of its own supersedes it at that one call site: a capturing launch
-/// ([`Cage::run_with`](crate::Cage::run_with),
-/// [`Cage::output`](crate::Cage::output)) puts a pipe on the output pair. That
-/// act belongs to the caller that made it, and recording it does too. The
+/// conduit of its own supersedes it at that one call site, in two ways:
+///
+/// - a capturing launch ([`Cage::run_with`](crate::Cage::run_with),
+///   [`Cage::output`](crate::Cage::output)) puts a pipe on the output pair;
+/// - a terminal launch
+///   ([`Cage::spawn_terminal`](crate::Cage::spawn_terminal),
+///   [`Cage::spawn_pending_terminal`](crate::Cage::spawn_pending_terminal))
+///   wires a pseudoterminal replica onto all three, because a terminal is one
+///   stream rather than three.
+///
+/// That act belongs to the caller that made it, and recording it does too. The
 /// dispositions here are refused against a launch that would contradict them,
 /// so a record and a launch cannot disagree about a stream the caller directed
-/// somewhere.
+/// somewhere. [`Inherit`](ResolvedStdio::Inherit) states no destination and so
+/// contradicts nothing: a record reading `Inherit` on all three is what a cage
+/// launched with a terminal reports, and it is a true statement about the plan
+/// rather than about what that launch's command saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -720,7 +730,9 @@ mod serde_tests {
     fn the_record_renders_as_a_provenance_document() {
         // Both opt-outs, which is the combination a reproducibility-focused
         // consumer runs and which keeps the document short enough to assert
-        // whole. The managed profile's own contribution is covered below.
+        // whole. The managed profile's own contribution is covered below. The
+        // raw mount is the procfs the nested user namespace's identity map is
+        // established through, which an opted-out profile declares for itself.
         let cage = Cage::builder()
             .rootfs("/tmp")
             .managed_mounts(false)
@@ -728,7 +740,7 @@ mod serde_tests {
             .command("/bin/sh")
             .env("SOURCE_DATE_EPOCH", "1700000000")
             .bind_ro("/etc", "/usr/src")
-            .raw_mount(RawMount::new("/dev").fstype("tmpfs").flags(2))
+            .raw_mount(RawMount::new("/proc").fstype("proc").flags(2))
             .build()
             .expect("a valid sandbox configuration");
         let rendered = toml::to_string(&cage.resolved_inputs()).expect("the record serializes");
@@ -762,8 +774,8 @@ mod serde_tests {
              \n\
              [[mounts]]\n\
              kind = \"raw\"\n\
-             target = \"/dev\"\n\
-             fstype = \"tmpfs\"\n\
+             target = \"/proc\"\n\
+             fstype = \"proc\"\n\
              flags = 2\n\
              \n\
              [identity]\n\
@@ -794,6 +806,9 @@ mod serde_tests {
         let plain = Cage::builder()
             .rootfs(&base)
             .managed_mounts(false)
+            // The procfs the nested user namespace's identity map is
+            // established through, which an opted-out profile declares itself.
+            .bind("/proc", "/proc")
             .command("/bin/sh")
             .build()
             .expect("a plain root over the same base builds")
@@ -806,6 +821,9 @@ mod serde_tests {
                     .upper(scratch.join("upper")),
             )
             .managed_mounts(false)
+            // The procfs the nested user namespace's identity map is
+            // established through, which an opted-out profile declares itself.
+            .bind("/proc", "/proc")
             .command("/bin/sh")
             .build();
         let Ok(cage) = built else {
@@ -841,6 +859,9 @@ mod serde_tests {
             .rootfs("/tmp")
             .command("/bin/sh")
             .managed_mounts(false)
+            // The procfs the nested user namespace's identity map is
+            // established through, which an opted-out profile declares itself.
+            .bind("/proc", "/proc")
             .base_env(false)
             .network(crate::Network::Host)
             .rlimit(crate::limits::Resource::OpenFiles, 1024, 4096)
@@ -884,6 +905,9 @@ mod serde_tests {
             .rootfs("/tmp")
             .command("/bin/sh")
             .managed_mounts(false)
+            // The procfs the nested user namespace's identity map is
+            // established through, which an opted-out profile declares itself.
+            .bind("/proc", "/proc")
             .landlock_fs(FsAccess::READ, "/usr")
             .landlock_net(NetAccess::CONNECT, 443)
             .seccomp(SeccompPolicy::Curated)
@@ -922,6 +946,9 @@ mod serde_tests {
             .rootfs("/tmp")
             .command("/bin/sh")
             .managed_mounts(false)
+            // The procfs the nested user namespace's identity map is
+            // established through, which an opted-out profile declares itself.
+            .bind("/proc", "/proc")
             .build()
             .expect("a valid sandbox configuration")
             .resolved_inputs();
@@ -940,6 +967,9 @@ mod serde_tests {
             .rootfs("/tmp")
             .command("/bin/sh")
             .managed_mounts(false)
+            // The procfs the nested user namespace's identity map is
+            // established through, which an opted-out profile declares itself.
+            .bind("/proc", "/proc")
             .build()
             .expect("a valid sandbox configuration")
             .resolved_inputs();

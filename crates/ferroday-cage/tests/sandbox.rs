@@ -80,25 +80,22 @@ fn the_calling_user_is_root_inside() {
 
 #[test]
 fn the_visible_root_is_the_rootfs() {
-    let Some(rootfs) = common::fixture_rootfs() else {
+    let Some(rootfs) = common::scratch_rootfs("visible-root") else {
         return;
     };
-    // The fixture marker must be present at /. With the procfs mount
-    // disabled, the rootfs's own empty /proc shows through, so a path
-    // present on any ordinary host root — /proc/cmdline — must not be.
+    // A marker only this rootfs carries: `/etc/alpine-release` would also be
+    // there on a host that happens to run Alpine, and the discriminator has to
+    // be one no host root can satisfy.
+    std::fs::write(rootfs.join("this-rootfs-and-no-other"), b"").expect("the marker is writable");
     let status = Cage::builder()
-        .rootfs(rootfs)
-        .mount_proc(false)
+        .rootfs(&rootfs)
         .command("/bin/sh")
-        .args([
-            "-c",
-            "test -f /etc/alpine-release && test ! -e /proc/cmdline",
-        ])
+        .args(["-c", "test -f /this-rootfs-and-no-other"])
         .build()
         .expect("a valid sandbox configuration")
         .run()
         .expect("the sandbox launches");
-    assert!(status.success(), "expected the fixture rootfs at /");
+    assert!(status.success(), "expected the named rootfs at /");
 }
 
 #[test]
@@ -468,6 +465,98 @@ fn a_read_only_bind_refuses_writes() {
 }
 
 #[test]
+fn a_read_only_bind_cannot_be_remounted_read_write() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The boundary the nested user namespace exists for. A read-only bind is
+    // established by the sandbox setup inside the user namespace that setup
+    // created, and root of the namespace that owns a mount may lift any
+    // restriction on it — so without the nested entry the command remounts its
+    // own read-only bind read-write and writes through to the host. Entering a
+    // nested user namespace has the kernel copy the mount tree and lock every
+    // restriction it carries: the remount answers EPERM, and a write to the
+    // still-read-only mount answers EROFS.
+    let host_dir = common::scratch_dir("ro-bind-locked");
+    std::fs::write(host_dir.join("marker"), "present\n").unwrap();
+    let status = Cage::builder()
+        .rootfs(rootfs)
+        .bind_ro(&host_dir, "/mnt")
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "! /bin/busybox mount -o remount,bind,rw /mnt 2>/dev/null && \
+             ! echo scribbled > /mnt/marker 2>/dev/null",
+        ])
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect("the sandbox launches");
+    assert!(
+        status.success(),
+        "expected the read-only bind to be locked against the sandbox's own root",
+    );
+    assert_eq!(
+        std::fs::read_to_string(host_dir.join("marker")).unwrap(),
+        "present\n",
+        "the sandbox wrote through a read-only bind",
+    );
+}
+
+#[test]
+fn the_root_mount_is_nosuid_and_locked() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The root is bound from a host tree and inherits that mount's flags, and
+    // the provisioners apply a tree's permission bits verbatim, so a rootfs
+    // ships set-user-ID binaries owned by in-namespace uid 0. `nosuid` is what
+    // makes them inert — and the nested user namespace is what makes `nosuid`
+    // worth setting, since without the lock the command could clear it as
+    // readily as it could clear a read-only bind.
+    let script = "\
+        grep -q ' / .*[ ,]nosuid[ ,]' /proc/self/mountinfo || exit 1; \
+        ! /bin/busybox mount -o remount,bind,suid / 2>/dev/null || exit 2; \
+        grep -q ' / .*[ ,]nosuid[ ,]' /proc/self/mountinfo || exit 3";
+    let status = run_sh(rootfs, script);
+    assert!(
+        status.success(),
+        "expected the root mount nosuid, and locked against the sandbox's own root",
+    );
+}
+
+#[test]
+fn the_command_runs_one_user_namespace_deeper_than_the_sandbox() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // A map file states its outside ids in the *parent* namespace's terms, so
+    // the command's own map is the discriminator: the sandbox's map is root
+    // inside to the calling user outside and never reads `0 0 1`, while the
+    // nested map — the reflection of that inside id onto itself — always does.
+    //
+    // The second check is the kernel's own account of the same fact. Reading
+    // another process's `ns/user` link needs either the same user namespace or
+    // `CAP_SYS_PTRACE` over that process's namespace, and a child namespace
+    // holds no capability over its parent's; the init, which never nests, is
+    // therefore out of reach in a way it was not before.
+    //
+    // The rest asserts what does *not* change: the command is still root
+    // inside, and the root filesystem is still its own.
+    let script = "\
+        set -- $(cat /proc/self/uid_map); [ \"$1 $2 $3\" = \"0 0 1\" ] || exit 1; \
+        /bin/busybox readlink /proc/self/ns/user >/dev/null || exit 2; \
+        /bin/busybox readlink /proc/1/ns/user >/dev/null 2>&1 && exit 3; \
+        [ \"$(/bin/busybox id -u)\" = 0 ] || exit 4; \
+        [ -O / ] || exit 5";
+    let status = run_sh(rootfs, script);
+    assert!(
+        status.success(),
+        "expected the command one namespace deeper, and otherwise unchanged",
+    );
+}
+
+#[test]
 fn a_missing_bind_target_is_created_in_the_rootfs() {
     let Some(rootfs) = common::scratch_rootfs("bind-target") else {
         return;
@@ -630,18 +719,30 @@ fn a_refused_raw_mount_names_the_mount() {
     }
 }
 
+/// A shell script that starts a loopback listener and connects to it, exiting
+/// zero only when the connection is carried.
+///
+/// Loopback connectivity is proven over TCP rather than with `ping`, because
+/// ICMP needs `CAP_NET_RAW` over the network namespace and the command holds no
+/// capability over a namespace its own user namespace does not own; see
+/// [`the_nested_namespace_costs_the_command_its_network_capabilities`].
+const LOOPBACK_TCP: &str = "\
+    busybox nc -l -p 9000 -e /bin/true >/dev/null 2>&1 & \
+    sleep 1; \
+    busybox nc -w 2 127.0.0.1 9000 </dev/null >/dev/null 2>&1";
+
 #[test]
 fn the_isolated_network_has_only_a_working_loopback() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
     // /proc/net/dev lists interfaces from line 3 on; loopback must be the
-    // only one, and it must be up: ping needs it to carry packets.
-    let script = "\
-        [ \"$(sed -n '3,$p' /proc/net/dev | wc -l)\" = 1 ] && \
-        grep -q 'lo:' /proc/net/dev && \
-        ping -c 1 127.0.0.1 > /dev/null";
-    let status = run_sh(rootfs, script);
+    // only one, and it must be up to carry the connection.
+    let script = format!(
+        "[ \"$(sed -n '3,$p' /proc/net/dev | wc -l)\" = 1 ] && \
+         grep -q 'lo:' /proc/net/dev && {LOOPBACK_TCP}",
+    );
+    let status = run_sh(rootfs, &script);
     assert!(
         status.success(),
         "expected an isolated loopback-only network"
@@ -657,14 +758,42 @@ fn the_denied_network_has_no_loopback_connectivity() {
     // is unreachable.
     let status = Cage::builder()
         .rootfs(rootfs)
-        .command("/bin/busybox")
-        .args(["ping", "-c", "1", "-W", "1", "127.0.0.1"])
+        .command("/bin/sh")
+        .args(["-c", LOOPBACK_TCP])
         .network(Network::None)
         .build()
         .expect("a valid sandbox configuration")
         .run()
         .expect("the sandbox launches");
     assert!(!status.success(), "a denied network cannot reach loopback");
+}
+
+#[test]
+fn the_nested_namespace_costs_the_command_its_network_capabilities() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // A capability is held over a namespace only by a process whose user
+    // namespace owns it, or an ancestor of that one. The sandbox's network
+    // namespace is owned by the sandbox's user namespace, and the command
+    // enters a *child* of that namespace before it execs, so it holds no
+    // capability over the network namespace it runs in.
+    //
+    // The consequence is worth pinning rather than leaving to be discovered:
+    // ICMP (CAP_NET_RAW) and binding a port below 1024 (CAP_NET_BIND_SERVICE)
+    // are both refused inside, where before the nested entry they were not.
+    // Ordinary sockets are unaffected, which the loopback tests above assert.
+    let script = "\
+        busybox ping -c 1 -W 1 127.0.0.1 >/dev/null 2>&1; \
+        [ $? -ne 0 ] || exit 1; \
+        busybox nc -l -p 80 -e /bin/true >/dev/null 2>&1; \
+        [ $? -ne 0 ] || exit 2; \
+        exit 0";
+    let status = run_sh(rootfs, script);
+    assert!(
+        status.success(),
+        "expected the command to hold no capability over its network namespace",
+    );
 }
 
 #[test]
@@ -872,6 +1001,11 @@ fn the_resolved_inputs_follow_the_opt_outs() {
         .managed_mounts(false)
         .base_env(false)
         .env("ONLY", "this")
+        // The one mount even an opted-out profile declares for itself: the
+        // nested user namespace that locks the sandbox's mount flags
+        // establishes its identity map through a procfs, so a profile that
+        // suppresses the managed one supplies its own.
+        .bind("/proc", "/proc")
         .bind("/etc", "/host-etc")
         .command("/bin/true")
         .build()
@@ -885,9 +1019,9 @@ fn the_resolved_inputs_follow_the_opt_outs() {
             std::ffi::OsString::from("this"),
         )],
     );
-    assert_eq!(inputs.mounts.len(), 1);
+    assert_eq!(inputs.mounts.len(), 2);
     assert!(matches!(
-        &inputs.mounts[0],
+        &inputs.mounts[1],
         ResolvedMount::Bind { target, .. } if target == Path::new("/host-etc")
     ));
 }

@@ -47,6 +47,15 @@ const BASELINE_SPEED: u32 = 38400;
 /// the sandbox's own pseudoterminal, and `TIOCSTI` on it pushes characters into
 /// the sandbox's own input queue.
 ///
+/// `/dev/tty` is the one entry on that list that is a *node* rather than a
+/// descriptor operation, and the node comes from the managed `/dev` profile:
+/// [`mount_dev(false)`](crate::CageBuilder::mount_dev) or
+/// [`managed_mounts(false)`](crate::CageBuilder::managed_mounts) removes it, and
+/// a rootfs that ships no `/dev/tty` of its own then has none. Everything else
+/// here — `isatty`, `tcgetattr`, `tcsetattr`, the line discipline, the window
+/// size, job control — acts on the descriptors the launch wired and is
+/// unconditional.
+///
 /// # What does not work
 ///
 /// **Path resolution for the terminal fails; descriptor operations work.**
@@ -113,9 +122,32 @@ impl Terminal {
     ///
     /// The size is established on the replica before the command exists, so the
     /// command cannot observe a 0x0 window during startup.
+    ///
+    /// A zero dimension leaves that dimension as it was, which for a terminal
+    /// that has not been sized before is [`new`](Self::new)'s value. Zero is not a small
+    /// terminal: it is what a terminal reports when its size is *unknown* — a
+    /// pseudoterminal nobody has sized, which is what a multiplexer or
+    /// `script(1)` hands on when it was itself started without one — and the
+    /// kernel accepts it silently, leaving the sandbox a terminal that answers
+    /// "no size" to everything that asks. `stty size` refuses it and a
+    /// full-screen program has nothing to draw into. A caller plumbing a real
+    /// terminal's reported dimensions into this therefore gets 24 or 80 for a
+    /// dimension its own terminal could not report, rather than propagating the
+    /// non-answer.
+    ///
+    /// ```
+    /// use ferroday_cage::Terminal;
+    ///
+    /// assert_eq!(Terminal::new().size(50, 0).get_size(), (50, 80));
+    /// assert_eq!(Terminal::new().size(0, 0).get_size(), (24, 80));
+    /// ```
     pub fn size(mut self, rows: u16, cols: u16) -> Terminal {
-        self.rows = rows;
-        self.cols = cols;
+        if rows != 0 {
+            self.rows = rows;
+        }
+        if cols != 0 {
+            self.cols = cols;
+        }
         self
     }
 
@@ -283,6 +315,19 @@ impl io::Write for &Pty {
     /// which hangs the terminal up and cannot be mistaken for data, or does not
     /// use a terminal at all: [`Stdio::from_fd`](crate::Stdio::from_fd) on a pipe
     /// closes for real.
+    ///
+    /// # After the hangup
+    ///
+    /// A write once every replica is closed still succeeds rather than failing.
+    /// Linux puts a write to the primary into the replica's input queue whether
+    /// or not a replica is open, and there it stays.
+    ///
+    /// The consequence for a caller: end-of-file on the [`Read`] side is the
+    /// hangup detector, and a successful write is not evidence of anything. A
+    /// caller that has drained to end-of-file should stop writing rather than
+    /// read the success as a live session.
+    ///
+    /// [`Read`]: std::io::Read
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         rustix::io::write(&self.primary, buf).map_err(Into::into)
     }
@@ -424,6 +469,22 @@ mod tests {
         assert_eq!(Terminal::new().size(50, 200).get_size(), (50, 200));
     }
 
+    /// Zero is what a terminal reports when its size is unknown, not a terminal
+    /// with no rows. A caller passing along what its own terminal said should
+    /// land on the default rather than hand the sandbox a terminal that answers
+    /// "no size" to everything that asks.
+    #[test]
+    fn a_zero_dimension_leaves_that_dimension_alone() {
+        assert_eq!(Terminal::new().size(0, 0).get_size(), (24, 80));
+        assert_eq!(Terminal::new().size(50, 0).get_size(), (50, 80));
+        assert_eq!(Terminal::new().size(0, 200).get_size(), (24, 200));
+        // Only the zero dimension is left alone; a stated one still applies.
+        assert_eq!(
+            Terminal::new().size(50, 200).size(0, 132).get_size(),
+            (50, 132),
+        );
+    }
+
     #[test]
     fn an_allocated_terminal_carries_the_size_and_the_baseline() {
         let terminal = Terminal::new().size(43, 132);
@@ -487,8 +548,27 @@ mod tests {
         // `ONLCR` is in force, so the newline the replica wrote arrives as CRLF.
         assert_eq!(drained, b"held\r\n");
         assert_eq!(pty.read(&mut [0u8; 8]).expect("end-of-file repeats"), 0);
-        // The write side still answers, so a caller cannot mistake a hangup for
-        // a broken `Pty`; what it writes has nowhere to go.
-        let _ = pty.write(b"x");
+        // The write side keeps accepting bytes after the hangup rather than
+        // failing: Linux puts a write to the primary into the replica's input
+        // queue whether or not a replica is open. So the read side is the
+        // hangup detector and the write side is not — a successful write says
+        // nothing about whether anyone is there.
+        assert_eq!(pty.write(b"x").expect("the write is accepted"), 1);
+
+        // What a read finds after that write is timing, and is deliberately not
+        // asserted. `ECHO` is in force, so the line discipline copies the byte
+        // the primary wrote onto the output queue the primary reads from: a
+        // read that beats the echo answers end-of-file, and one that does not
+        // answers the echoed byte. What holds either way is that the read side
+        // stays usable — a hangup already reported never becomes an error.
+        let mut echo = [0u8; 8];
+        let read = pty
+            .read(&mut echo)
+            .expect("the read side stays usable after a write");
+        assert!(
+            read == 0 || &echo[..read] == b"x",
+            "a read after the hangup found neither end-of-file nor the echo: {:?}",
+            &echo[..read],
+        );
     }
 }

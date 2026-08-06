@@ -285,13 +285,15 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
                     // nothing the caller will read, so it is killed and reaped.
                     //
                     // Killed rather than released by closing the gate:
-                    // `kernel_fork` copies the whole descriptor table, so a
-                    // sibling process this caller forked concurrently — another
-                    // export or removal child — holds its own copy of this
-                    // gate's caller end and keeps the peer open however
-                    // promptly this one closes. The end-of-file the child waits
-                    // on might then never arrive, and the reap below would
-                    // block forever.
+                    // `kernel_fork` copies the whole descriptor table, so any
+                    // process this caller forked concurrently holds its own
+                    // copy of this gate's caller end and keeps the peer open
+                    // however promptly this one closes. The library's own
+                    // children sweep, but each only after its fork has returned
+                    // in it, and a child the consumer forked never sweeps at
+                    // all. The end-of-file the child waits on is therefore not
+                    // something this caller can make arrive, and the reap below
+                    // would block on it.
                     let _ = rustix::process::kill_process(pid, Signal::KILL);
                     drop(caller);
                     let _ = super::wait_for_exit(pid);

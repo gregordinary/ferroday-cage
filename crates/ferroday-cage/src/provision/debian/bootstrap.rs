@@ -602,6 +602,11 @@ fn run_dpkg_in(
     let cage = root
         .command("/usr/bin/dpkg")
         .args(args)
+        // Read-only so a wave cannot rewrite the caller's package cache, in the
+        // ordinary course of unpacking or otherwise. The command enters a nested
+        // user namespace before it execs, which locks the flag, so this holds
+        // even though dpkg runs as namespace root — as a maintainer script needs
+        // it to. See `CageBuilder::bind_ro`.
         .bind_ro(archives_host, ARCHIVES)
         .stdin(Stdio::Null)
         // The wave exists only to serve this bootstrap. Tie it to the caller so

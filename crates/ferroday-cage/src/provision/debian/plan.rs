@@ -20,7 +20,8 @@ use super::index::{Package, parse_stanzas};
 /// A document carries its own version because the plan is a trust anchor: a
 /// reader that cannot tell which shape it is holding cannot say what it is
 /// trusting. The version is bumped only for a change a previous reader would
-/// misread; adding a field is not one, since an unknown field is ignored.
+/// misread; adding a field is not one, since a reader carries a field it does
+/// not know through untouched rather than refusing the document or dropping it.
 const FORMAT: &str = "ferroday-cage-plan 1";
 
 /// The packages a [`Debian`](super::Debian) bootstrap resolves for its suite,
@@ -60,8 +61,8 @@ const FORMAT: &str = "ferroday-cage-plan 1";
 ///
 /// A document written by a later version of this library reads back here as
 /// long as its format version is unchanged: a field this version does not know
-/// is ignored rather than refused, which is what lets a plan outlive the
-/// program that wrote it.
+/// is carried rather than refused, and written back out, which is what lets a
+/// plan outlive the program that wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Plan {
@@ -162,6 +163,43 @@ pub struct PlannedPackage {
     /// with more than one configured this is the only thing that says where a
     /// package will actually be fetched from.
     pub archive: usize,
+    /// The archive's estimate of the space this package occupies once
+    /// installed, in kibibytes, when the archive states one.
+    ///
+    /// An estimate, and reported as one: Debian Policy 5.6.20 defines
+    /// `Installed-Size` as the size in bytes divided by 1024 and rounded up,
+    /// produced at package build time from the staged tree. It is not measured
+    /// against an installed filesystem and does not account for the target's
+    /// block size, so a sum over a plan describes the archive's own accounting
+    /// rather than what a built image will weigh.
+    ///
+    /// Kept in the archive's unit rather than normalized to bytes, so the value
+    /// is the one the mirror publishes and can be compared against it directly.
+    ///
+    /// `None` when the stanza carried no `Installed-Size`, which Debian Policy
+    /// permits, or when a plan document written before this field existed is
+    /// read back.
+    pub installed_size: Option<u64>,
+    /// The source package this binary package was built from, when it differs
+    /// from [`name`](Self::name).
+    ///
+    /// `None` means the source package carries the same name — the common case,
+    /// and the one Debian encodes by omitting the field. A source version the
+    /// stanza states in parentheses is dropped, since it describes the source
+    /// package rather than this binary one.
+    ///
+    /// Several binary packages of one source share this name, which is what
+    /// makes it the key to attribute a plan's weight to the thing that was
+    /// built rather than to each of its outputs.
+    ///
+    /// A plan this library resolved holds the invariant: the field is `None`
+    /// wherever the source name matches. A plan read back from a document holds
+    /// it only as far as the document does — the reader takes the `Source`
+    /// field verbatim, so a hand-written document stating a source equal to the
+    /// package's own name reads as `Some(name)` and is written back unchanged.
+    /// A consumer grouping by source should key on `source.unwrap_or(name)`
+    /// rather than on the field alone, which is correct for both.
+    pub source: Option<String>,
     /// Fields this package's stanza carried that this version does not know.
     carried: Carried,
 }
@@ -243,6 +281,17 @@ impl Plan {
             stanza.put("SHA256", &package.sha256);
             stanza.put("Filename", &package.filename);
             stanza.put("Archive", &package.archive.to_string());
+            // Written after every field the format's first readers knew, which
+            // is where those readers put them back. A reader carries a field it
+            // does not know and re-emits it after the ones it does, so a field
+            // added between the older ones would return from such a round trip
+            // moved to the end — different bytes for an unchanged plan, which a
+            // consumer pinning a plan's digest reads as the plan having
+            // changed. Anything added later belongs below these, for the same
+            // reason.
+            let installed_size = package.installed_size.map(|kib| kib.to_string());
+            stanza.put_optional("Installed-Size", installed_size.as_deref());
+            stanza.put_optional("Source", package.source.as_deref());
             stanza.put_carried(&package.carried);
             stanza.render(&mut out)?;
         }
@@ -252,8 +301,9 @@ impl Plan {
     /// Reads a plan back from a document [`to_document`](Self::to_document)
     /// wrote.
     ///
-    /// A field the reader does not know is ignored, so a document written by a
-    /// later version of this library still reads. A stanza order other than
+    /// A field the reader does not know is carried rather than refused, so a
+    /// document written by a later version of this library still reads, and
+    /// writing it back keeps what it carried. A stanza order other than
     /// header, archives, packages is not: the archive index each package refers
     /// to is resolved as the document is read.
     ///
@@ -312,6 +362,12 @@ impl Plan {
                     sha256: required(stanza.get("SHA256"), "SHA256", &at_package)?,
                     filename: required(stanza.get("Filename"), "Filename", &at_package)?,
                     archive: at,
+                    installed_size: kibibytes(stanza.get("Installed-Size"), &at_package)?,
+                    // Read verbatim rather than folded against the package's own
+                    // name: the writer never states a source that matches, so a
+                    // document that does was written by hand, and echoing it back
+                    // unchanged is what keeps the round trip byte-faithful.
+                    source: stanza.get("Source").map(str::to_string),
                     carried: carried(stanza, PACKAGE_FIELDS),
                 });
                 continue;
@@ -416,6 +472,8 @@ impl PlannedPackage {
             // The index tags each retained package with the repository it came
             // from, which is exactly this list's ordering.
             archive: package.origin,
+            installed_size: package.installed_size,
+            source: package.source.clone(),
             carried: Carried::new(),
         }
     }
@@ -589,6 +647,8 @@ const PACKAGE_FIELDS: &[&str] = &[
     "SHA256",
     "Filename",
     "Archive",
+    "Installed-Size",
+    "Source",
 ];
 
 /// Collects the stanza's fields that `known` does not name, in document order.
@@ -615,6 +675,23 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Debian
         Some(value) if !value.is_empty() => Ok(value.to_string()),
         Some(_) => Err(document(format!("{at} has an empty {field} field"))),
         None => Err(document(format!("{at} has no {field} field"))),
+    }
+}
+
+/// Reads an optional size field, absent giving no value.
+///
+/// A value that is not a number refuses the document rather than reading as
+/// absent. Reading it as absent would drop it on the way out, and a document
+/// that came back missing a line it was given is the one failure the carried
+/// fields exist to prevent.
+fn kibibytes(value: Option<&str>, at: &str) -> Result<Option<u64>, DebianError> {
+    match value {
+        Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
+            document(format!(
+                "{at} has an Installed-Size of {value:?}, which is not a size in kibibytes",
+            ))
+        }),
+        None => Ok(None),
     }
 }
 
@@ -676,6 +753,9 @@ mod tests {
                     sha256: "aa".repeat(32),
                     filename: "pool/main/b/base-files/base-files_13.6_arm64.deb".to_string(),
                     archive: 0,
+                    installed_size: Some(340),
+                    // Its own source, as most packages are.
+                    source: None,
                     carried: Carried::new(),
                 },
                 PlannedPackage {
@@ -686,6 +766,10 @@ mod tests {
                     sha256: "bb".repeat(32),
                     filename: "pool/main/l/local-tool/local-tool_2.4-1_all.deb".to_string(),
                     archive: 1,
+                    // A package the archive states no size for, which Debian
+                    // Policy permits.
+                    installed_size: None,
+                    source: Some("local-suite".to_string()),
                     carried: Carried::new(),
                 },
             ],
@@ -905,6 +989,103 @@ mod tests {
                 assert!(reason.contains("out of order"), "{reason}");
             }
             other => panic!("expected an ordering refusal, got {other:?}"),
+        }
+    }
+
+    /// The package-stanza fields the format's first readers knew, before
+    /// `Installed-Size` and `Source` joined them.
+    const PACKAGE_FIELDS_AS_FIRST_WRITTEN: &[&str] = &[
+        "Package",
+        "Version",
+        "Architecture",
+        "SHA256",
+        "Filename",
+        "Archive",
+    ];
+
+    /// Rewrites a document the way a reader holding an older field list would:
+    /// each stanza's known fields in that reader's own order, then every other
+    /// field in document order, which is where `put_carried` appends what it
+    /// carried.
+    fn as_an_older_reader_rewrites(document: &str) -> String {
+        let mut out = String::new();
+        for stanza in parse_stanzas(document) {
+            let known: &[&str] = if stanza.get("Package").is_some() {
+                PACKAGE_FIELDS_AS_FIRST_WRITTEN
+            } else if stanza.get("Archive").is_some() {
+                ARCHIVE_FIELDS
+            } else {
+                HEADER_FIELDS
+            };
+            let line = |name: &str, value: &str| {
+                if value.is_empty() {
+                    format!("{name}:\n")
+                } else {
+                    format!("{name}: {value}\n")
+                }
+            };
+            for name in known {
+                if let Some(value) = stanza.get(name) {
+                    out.push_str(&line(name, value));
+                }
+            }
+            for (name, value) in stanza
+                .fields()
+                .iter()
+                .filter(|(name, _)| !known.iter().any(|known| known.eq_ignore_ascii_case(name)))
+            {
+                out.push_str(&line(name, value));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn a_field_added_since_the_format_was_first_written_survives_an_older_reader() {
+        // Why Installed-Size and Source are written after Archive rather than
+        // beside the fields they describe. An older reader carries a field it
+        // does not know and re-emits it after the ones it does, so a field
+        // written between the older ones comes back from that reader with the
+        // stanza's lines reordered -- and a record pinning the document's
+        // digest reports a change to a plan that did not change. Written last,
+        // the two renderings agree byte for byte.
+        let document = sample().to_document().unwrap();
+        assert!(document.contains("\nInstalled-Size: 340\n"), "{document}");
+        assert!(document.contains("\nSource: local-suite\n"), "{document}");
+        assert_eq!(as_an_older_reader_rewrites(&document), document);
+    }
+
+    #[test]
+    fn a_document_written_before_these_fields_existed_still_reads() {
+        // Every plan document written so far lacks both fields, and one pinned
+        // by digest in a record that vouches for it cannot be regenerated to
+        // add them. Neither field may become required.
+        let mut plan = sample();
+        for package in &mut plan.packages {
+            package.installed_size = None;
+            package.source = None;
+        }
+        let document = plan.to_document().unwrap();
+        assert!(!document.contains("Installed-Size"), "{document}");
+        assert!(!document.contains("Source"), "{document}");
+        assert_eq!(Plan::parse_document(&document).unwrap(), plan);
+    }
+
+    #[test]
+    fn a_malformed_installed_size_is_refused_rather_than_read_as_absent() {
+        // Reading it as absent would drop the line on the way out, which is
+        // the loss the carried fields exist to prevent.
+        let document = sample()
+            .to_document()
+            .unwrap()
+            .replace("Installed-Size: 340", "Installed-Size: 340 kB");
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("base-files"), "{reason}");
+                assert!(reason.contains("kibibytes"), "{reason}");
+            }
+            other => panic!("expected a size refusal, got {other:?}"),
         }
     }
 

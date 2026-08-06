@@ -25,6 +25,7 @@ common configurations disable it:
 | --- | --- |
 | `kernel.unprivileged_userns_clone = 0` | Denies creation outright. An out-of-tree sysctl found on Debian-derived kernels. |
 | `user.max_user_namespaces = 0` | Denies creation outright by setting the namespace limit to zero. |
+| `user.max_user_namespaces = 1` | Admits the sandbox's own user namespace and refuses the nested one its command enters. Every launch holds two; see [The nested user namespace](how-the-sandbox-is-built.md#the-nested-user-namespace). |
 | `kernel.apparmor_restrict_unprivileged_userns = 1` | Restricts creation to programs granted the capability by an AppArmor profile. The default on Ubuntu 23.10 and later. |
 | Container seccomp profiles | Container runtimes commonly deny `unshare` with `EPERM` in their default seccomp profiles, so sandboxes nested inside such containers fail unless the profile permits it. |
 
@@ -40,6 +41,12 @@ the first blocking configuration it identifies. Test suites use it to skip
 sandbox tests explicitly on hosts that cannot run them. The probe is
 best-effort: a clear result does not guarantee creation succeeds, since a
 seccomp filter or LSM policy can deny it invisibly.
+
+The namespace budget is the clearest case of that. A ceiling of `1` is
+reportable, because it cannot admit the two namespaces a launch holds; a
+ceiling of four with three namespaces already live cannot be, because only the
+launch can know how many are in use. That one surfaces at launch as
+`Error::NestedUsernsBudgetExhausted`, which names the sysctl.
 
 A host that cannot be unblocked is not entirely without options: with the
 `hardening` feature, [the restriction fallback](restriction-fallback.md)

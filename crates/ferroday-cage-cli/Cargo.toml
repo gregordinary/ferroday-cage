@@ -5,7 +5,7 @@ description = "Run a command inside an unprivileged Linux sandbox from a shell p
 # its flags, exit codes, and output format, which a library release does not
 # necessarily change — and a library release that does break its own API need
 # not break the CLI's.
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,6 +14,11 @@ homepage.workspace = true
 readme = "README.md"
 categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
 keywords = ["sandbox", "container", "rootless", "chroot", "debootstrap"]
+# The integration tests drive the built binary against the library crate's
+# rootfs fixture, which they reach by workspace-relative path. They cannot run
+# from a published tarball, where that path does not exist, so they are not part
+# of it.
+exclude = ["tests"]
 
 [[bin]]
 name = "fcage"
@@ -36,6 +41,12 @@ syscalls = { version = "0.8", default-features = false }
 # The terminal relay: termios, poll, and the blocked-signal descriptor. The
 # library already builds rustix; this is the same build, named directly.
 rustix = { version = "1.1.4", features = ["event", "fs", "process", "runtime", "stdio", "termios"] }
+
+[dev-dependencies]
+# The relay's integration tests drive the built binary through a pseudoterminal
+# of their own, which is the only way to reach raw mode, the size copy, and the
+# restoration. `pty` is needed for that and by nothing the binary does.
+rustix = { version = "1.1.4", features = ["pty"] }
 
 [lints]
 workspace = true

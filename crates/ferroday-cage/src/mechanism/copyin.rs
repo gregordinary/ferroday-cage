@@ -450,10 +450,12 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
                 // The delegate failed. The child is blocked at the gate in an
                 // unmapped namespace and has created nothing, so it is killed
                 // and reaped. Killed rather than released by closing the gate:
-                // `kernel_fork` copies the whole descriptor table, so a sibling
-                // this caller forked concurrently holds its own copy of the
-                // peer and the end-of-file the child waits on might never
-                // arrive.
+                // `kernel_fork` copies the whole descriptor table, so any
+                // process this caller forked concurrently holds its own copy of
+                // the peer — the library's own children until their sweep, a
+                // child the consumer forked until it execs or exits — and the
+                // end-of-file the child waits on is not something this caller
+                // can make arrive.
                 let _ = rustix::process::kill_process(pid, Signal::KILL);
                 drop(gate_caller);
                 drop(stream_write);

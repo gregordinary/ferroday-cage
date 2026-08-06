@@ -20,6 +20,29 @@
 //! reasoning, and no shared flags — a signal is a poll event handled by
 //! ordinary code.
 //!
+//! # The two directions are not symmetric
+//!
+//! The sandbox-bound direction cannot stall the loop: the primary is set
+//! non-blocking and what it will not take waits in a pending buffer behind
+//! `POLLOUT`, so a command that stops reading its terminal never blocks the
+//! signal channel. The caller-bound direction is a plain blocking `write_all`
+//! to descriptor 1, outside the poll, and that is deliberate.
+//!
+//! The symmetric treatment would need `O_NONBLOCK` on descriptor 1. That flag
+//! lives on the open file description, not on the descriptor, so setting it
+//! sets it for everything sharing that description — the caller's shell, and
+//! every other process in the pipeline `fcage` was started from, which would
+//! begin seeing `EAGAIN` from writes they have no reason to expect it on, and
+//! would keep seeing it if `fcage` exited without restoring the flag. That is a
+//! worse failure than the one it prevents, and it is a failure in someone
+//! else's process.
+//!
+//! What is given up: with `fcage`'s standard output on a pipe whose reader has
+//! stopped, a write blocks the whole loop, so a `SIGINT` or a `--timeout`
+//! expiry is not observed until the reader drains. `ssh` has the same shape for
+//! the same reason. For the interactive session this mode exists for, standard
+//! output is the caller's terminal, which does not stop reading.
+//!
 //! # `unsafe`
 //!
 //! This is the one module of `fcage` that needs it, and it needs exactly two
@@ -52,7 +75,17 @@ use syscalls::Sysno;
 /// delivered to a handler. `SIGQUIT` earns its place by being blocked alone: its
 /// default action would dump core and take the process down with the caller's
 /// terminal still in raw mode.
-const RELAYED: [Signal; 7] = [
+///
+/// `SIGTTOU` is blocked for the effect of blocking it rather than for anything
+/// read back. A `tcsetattr` from a background process group raises it, and its
+/// default action stops the process — so a relay put into the background would
+/// stop inside [`enter_raw`] or, worse, inside [`restore`], leaving the
+/// caller's terminal raw with nothing left to fix it. Blocked, the call
+/// succeeds instead, and the restoration discipline holds from the background
+/// as it does from the foreground. `SIGTTIN` is deliberately *not* blocked: a
+/// backgrounded relay stopping when it tries to read the terminal is the
+/// conventional behavior, and the one the caller's shell reports.
+const RELAYED: [Signal; 8] = [
     Signal::WINCH,
     Signal::INT,
     Signal::TERM,
@@ -60,11 +93,12 @@ const RELAYED: [Signal; 7] = [
     Signal::QUIT,
     Signal::TSTP,
     Signal::CONT,
+    Signal::TTOU,
 ];
 
 /// The size of one `struct signalfd_siginfo`, whose first field is the signal
-/// number as a little-endian `u32`. The struct is padded to a fixed size the
-/// kernel promises not to change.
+/// number as a `__u32` in the host's own byte order. The struct is padded to a
+/// fixed size the kernel promises not to change.
 const SIGINFO_LEN: usize = 128;
 
 /// The relay's read buffer, per direction and per wake.
@@ -161,23 +195,33 @@ impl Signals {
     ///
     /// The descriptor is non-blocking, so this is safe to call until it answers
     /// `None` — which is what drains a wake that carried several at once.
+    ///
+    /// A record naming a number this build has no name for is skipped rather
+    /// than answered with `None`: `None` means "the descriptor is drained" to
+    /// the loop, so returning it for an unrecognized record would leave
+    /// everything queued behind that record waiting for the next wake — which,
+    /// with nothing else ready, is however long the deadline is. Unreachable
+    /// today, since only the blocked set can arrive and all of it is named.
     fn next(&self) -> Result<Option<Signal>, RelayError> {
         let mut record = [0u8; SIGINFO_LEN];
-        match rustix::io::read(&self.fd, &mut record) {
-            Ok(0) => Ok(None),
-            Ok(_) => {
-                let number = i32::from_le_bytes(
-                    record[0..4]
-                        .try_into()
-                        .expect("a four-byte slice converts to an array"),
-                );
-                // `from_named_raw` refuses a number this build has no name for,
-                // which is exactly right here: only the blocked set can arrive,
-                // and anything else is a record to ignore rather than act on.
-                Ok(Signal::from_named_raw(number))
+        loop {
+            match rustix::io::read(&self.fd, &mut record) {
+                Ok(0) => return Ok(None),
+                Ok(_) => {
+                    // `ssi_signo` is a `__u32` the kernel fills in the host's
+                    // own byte order, so the decode is native-endian.
+                    let number = i32::from_ne_bytes(
+                        record[0..4]
+                            .try_into()
+                            .expect("a four-byte slice converts to an array"),
+                    );
+                    if let Some(signal) = Signal::from_named_raw(number) {
+                        return Ok(Some(signal));
+                    }
+                }
+                Err(Errno::AGAIN | Errno::INTR) => return Ok(None),
+                Err(errno) => return Err(errno.into()),
             }
-            Err(Errno::AGAIN | Errno::INTR) => Ok(None),
-            Err(errno) => Err(errno.into()),
         }
     }
 }
@@ -214,6 +258,10 @@ fn caller_is_terminal() -> bool {
 /// sandbox a terminal that answers "no size" to everything that asks. Programs
 /// treat that as an error rather than as a default: `stty size` refuses it
 /// outright, and a full-screen program has nothing to draw into.
+///
+/// [`Terminal::size`] takes the same position, so the allocation would be sound
+/// either way. This answers `None` because the same reading also decides
+/// whether a `SIGWINCH` resizes the sandbox's terminal, where a zero must not.
 pub fn caller_size() -> Option<(u16, u16)> {
     let size = termios::tcgetwinsize(rustix::stdio::stdin()).ok()?;
     (size.ws_row != 0 && size.ws_col != 0).then_some((size.ws_row, size.ws_col))
@@ -289,11 +337,22 @@ impl Drop for RawMode {
     }
 }
 
-/// Which channel a poll slot watches. The order is fixed so a slot's index is
-/// stable whether or not the channel behind it is still live.
-const STDIN: usize = 0;
-const PRIMARY: usize = 1;
-const SIGNALS: usize = 2;
+/// Which channel a poll slot watches.
+///
+/// Standard input is last because it is the one channel that retires: a
+/// retired slot is dropped from the polled slice rather than muted, which is
+/// what keeps the loop from spinning. `poll` reports `POLLHUP`, `POLLERR`, and
+/// `POLLNVAL` whatever the requested events are, so a muted slot on a hung-up
+/// pipe — `producer | fcage --terminal ...` after the producer exits — is ready
+/// on every pass and the loop never blocks again. Putting the droppable
+/// channel last is the discipline the library's own supervisor loop follows,
+/// for the same reason.
+///
+/// The other two indices stay stable across the change, and an unpolled slot's
+/// `revents` stays as `PollFd::new` left it: empty.
+const PRIMARY: usize = 0;
+const SIGNALS: usize = 1;
+const STDIN: usize = 2;
 
 /// How far the timeout escalation has gone.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -383,20 +442,20 @@ fn pump(
             primary_events |= PollFlags::OUT;
         }
         let mut slots = [
-            PollFd::new(
-                &stdin,
-                if watch_stdin {
-                    PollFlags::IN
-                } else {
-                    PollFlags::empty()
-                },
-            ),
             PollFd::new(pty, primary_events),
             PollFd::new(&signals.fd, PollFlags::IN),
+            PollFd::new(&stdin, PollFlags::IN),
         ];
+        // The retired standard-input slot leaves the polled slice rather than
+        // being muted; see the slot constants for why muting does not work.
+        let watched = if watch_stdin {
+            &mut slots[..]
+        } else {
+            &mut slots[..STDIN]
+        };
 
         let wait = deadline.map(timespec_until);
-        match rustix::event::poll(&mut slots, wait.as_ref()) {
+        match rustix::event::poll(watched, wait.as_ref()) {
             Ok(0) => {
                 // The deadline passed. Escalate, and keep relaying: the
                 // sandbox's exit closes the replicas, end-of-file ends the loop,
@@ -474,12 +533,23 @@ fn pump(
         if ready[PRIMARY].intersects(PollFlags::OUT) {
             flush_pending(pty, &mut pending)?;
         }
-        if watch_stdin && ready[STDIN].intersects(PollFlags::IN | PollFlags::HUP) {
+        // Every way the slot can be ready leads into the read: readable, hung
+        // up, in error, or naming no open description at all. The last is
+        // `fcage --terminal ... 0<&-`, which reports `POLLNVAL` and would
+        // otherwise be ready forever without anything acting on it.
+        if ready[STDIN]
+            .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
+        {
             match rustix::io::read(stdin, &mut buf) {
-                Ok(0) => {
-                    // End-of-input. There is no way to close a pseudoterminal's
-                    // write side, so this is sent as the replica's own VEOF
-                    // character, and the channel retires.
+                // End-of-input. There is no way to close a pseudoterminal's
+                // write side, so this is sent as the replica's own VEOF
+                // character, and the channel retires.
+                //
+                // An invalid standard input takes the same path: there is no
+                // input to relay and never will be, which is the same thing
+                // end-of-input says, and the session continues on the
+                // caller-bound direction alone.
+                Ok(0) | Err(Errno::BADF) => {
                     let veof = replica_veof(pty);
                     pending.push(veof);
                     flush_pending(pty, &mut pending)?;
@@ -499,6 +569,9 @@ fn pump(
                 // End-of-file on the primary is the session-over signal.
                 Ok(0) => return Ok(expired),
                 Ok(read) => {
+                    // Blocking, and outside the poll; see the module's "The two
+                    // directions are not symmetric" for why descriptor 1 is not
+                    // given the non-blocking treatment the primary gets.
                     let mut out = io::stdout();
                     out.write_all(&buf[..read])?;
                     out.flush()?;

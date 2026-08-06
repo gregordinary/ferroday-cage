@@ -38,7 +38,7 @@ stdout = "inherit"          # "inherit" (default) | "null"; "null" discards
 stderr = "null"             # the same, per stream
 
 pid-namespace = true        # default true
-mount-proc = true           # default true
+mount-proc = true           # default true; see below before turning it off
 mount-dev = true            # default true
 mount-tmp = true            # default true
 resolv-conf = true          # default true; binds the host resolv.conf with
@@ -109,6 +109,13 @@ toggles: each reduces the library's contribution to nothing, including
 anything it may contribute in a later release. Setting `managed-mounts =
 false` alongside an explicit `mount-dev = true` is a contradiction and is
 refused at build time.
+
+A profile that suppresses the managed `/proc` — with `managed-mounts = false`
+or `mount-proc = false` — must mount a procfs of its own, as a `[[mount]]`
+entry. The nested user namespace the command enters establishes its identity
+map through one, by path, so a container that has none is refused at build
+time. See [The nested user
+namespace](how-the-sandbox-is-built.md#the-nested-user-namespace).
 
 `[[mount]]` entries apply in the order they appear, after the managed mount
 profile. The `kind` selects which fields the entry carries:

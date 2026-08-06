@@ -517,6 +517,29 @@ pub(crate) fn format_map(ranges: &[IdRange]) -> Vec<u8> {
     text.into_bytes()
 }
 
+/// The map a namespace nested inside one these extents describe must carry to
+/// leave the inside view unchanged: each extent reproduced as an identity
+/// mapping of its own inside ids.
+///
+/// A nested user namespace maps against its parent's id space, not the host's,
+/// so the parent's outside ids are not the ids to name. Reproducing each
+/// extent as `inside inside count` gives the nested namespace exactly the ids
+/// the outer one has, under the same names, and a process inside sees no
+/// change at all.
+///
+/// The extent count is preserved, so a map within the kernel's
+/// [`MAX_EXTENTS`] ceiling reflects to one that is too.
+pub(crate) fn reflect_inside(ranges: &[IdRange]) -> Vec<IdRange> {
+    ranges
+        .iter()
+        .map(|range| IdRange {
+            inside: range.inside,
+            outside: range.inside,
+            count: range.count,
+        })
+        .collect()
+}
+
 /// Opens `path` and writes `data` in a single `write`, as the map files
 /// require: they accept the whole map in one write and nothing else.
 fn write_map_file(path: &str, which: &'static str, data: &[u8]) -> Result<(), IdMapError> {
@@ -757,7 +780,9 @@ mod subid {
     /// [`host::range_map_blocker`](crate::host::range_map_blocker) judges a
     /// helper's privilege through the same lookup, so the two agree on the same
     /// `PATH`; a `PATH` that changes between the probe and the launch is the
-    /// caller's to keep still.
+    /// caller's to keep still. The two auxiliary tools [`resolve`](IdMapper::resolve)
+    /// consults — `id` for the caller's user name, and `getsubids` for the
+    /// allocation itself — are resolved by the same rule.
     ///
     /// [`host::range_map_blocker`](crate::host::range_map_blocker) explains
     /// a host on which this delegate cannot work.
@@ -930,8 +955,14 @@ mod subid {
         // uid string, so the query tries both. The name lookup is delegated
         // to `id`, whose NSS-aware resolution covers directory-service
         // users that /etc/passwd does not list.
+        //
+        // Resolved through `find_on_path` rather than by bare name, for the
+        // reason that lookup exists: `Command`'s own search is `execvp`'s, which
+        // honours a relative or empty `PATH` entry and so would run whatever
+        // binary of that name the process's working directory happens to hold.
         let mut keys: Vec<String> = Vec::new();
-        if let Ok(output) = Command::new("id").arg("-un").output()
+        if let Some(id) = crate::host::find_on_path("id")
+            && let Ok(output) = Command::new(id).arg("-un").output()
             && output.status.success()
             && let Ok(name) = String::from_utf8(output.stdout)
         {
@@ -985,10 +1016,21 @@ mod subid {
     /// Queries `getsubids` for each key until one answers with ranges.
     ///
     /// Output lines have the shape `index: owner start count`.
+    ///
+    /// The tool is resolved through
+    /// [`find_on_path`](crate::host::find_on_path), the same lookup the helpers
+    /// themselves go through, so only absolute `PATH` entries are searched: what
+    /// this query answers decides what allocation the delegate believes the
+    /// caller has, and it is not a question to put to a binary found in whatever
+    /// directory the process happens to be in. A lookup that finds nothing is
+    /// the tool being absent, which is the case the files may still answer.
     fn query_getsubids(kind: Kind, keys: &[String]) -> Result<Vec<(u32, u32)>, GetsubidsUnusable> {
+        let Some(getsubids) = crate::host::find_on_path("getsubids") else {
+            return Err(GetsubidsUnusable::Absent);
+        };
         let mut ranges = Vec::new();
         for key in keys {
-            let mut command = Command::new("getsubids");
+            let mut command = Command::new(&getsubids);
             if kind == Kind::Gid {
                 command.arg("-g");
             }
@@ -1493,6 +1535,28 @@ mod tests {
     fn format_map_emits_one_line_per_extent() {
         let text = format_map(&[range(0, 1000, 1), range(1, 100000, 65536)]);
         assert_eq!(text, b"0 1000 1\n1 100000 65536\n");
+    }
+
+    #[test]
+    fn a_reflected_map_names_the_inside_ids_on_both_sides() {
+        // The nested namespace maps against the outer one's id space, so the
+        // map that leaves the inside view unchanged names each extent's inside
+        // ids twice. The outside column of the outer map — the host's ids — has
+        // no meaning one namespace deeper.
+        let outer = [range(0, 1000, 1), range(1, 100000, 65536)];
+        assert_eq!(reflect_inside(&outer), [range(0, 0, 1), range(1, 1, 65536)],);
+        assert_eq!(format_map(&reflect_inside(&outer)), b"0 0 1\n1 1 65536\n",);
+
+        // The reflection preserves the extent count, so a map the kernel
+        // accepts reflects to one it accepts. Checked at the ceiling, where a
+        // reflection that split or merged extents would show.
+        let ceiling: Vec<IdRange> = (0..MAX_EXTENTS as u32)
+            .map(|i| range(i * 2, 100_000 + i * 2, 1))
+            .collect();
+        let reflected = reflect_inside(&ceiling);
+        assert_eq!(reflected.len(), MAX_EXTENTS);
+        validate_resolved(&ResolvedMap::new(reflected.clone(), reflected))
+            .expect("a reflected map at the ceiling is still a valid one");
     }
 
     #[test]

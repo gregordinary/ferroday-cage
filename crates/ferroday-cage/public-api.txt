@@ -36,6 +36,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::host::RangeMapBl
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::host::RangeMapBlocker
 #[non_exhaustive] pub enum ferroday_cage::host::UsernsBlocker
 pub ferroday_cage::host::UsernsBlocker::ApparmorRestrictsUnprivilegedUserns
+pub ferroday_cage::host::UsernsBlocker::MaxUserNamespacesBelowNesting
 pub ferroday_cage::host::UsernsBlocker::MaxUserNamespacesIsZero
 pub ferroday_cage::host::UsernsBlocker::UnprivilegedUsernsCloneDisabled
 impl core::fmt::Display for ferroday_cage::host::UsernsBlocker
@@ -379,8 +380,10 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::
 pub ferroday_cage::provision::debian::PlannedPackage::architecture: alloc::string::String
 pub ferroday_cage::provision::debian::PlannedPackage::archive: usize
 pub ferroday_cage::provision::debian::PlannedPackage::filename: alloc::string::String
+pub ferroday_cage::provision::debian::PlannedPackage::installed_size: core::option::Option<u64>
 pub ferroday_cage::provision::debian::PlannedPackage::name: alloc::string::String
 pub ferroday_cage::provision::debian::PlannedPackage::sha256: alloc::string::String
+pub ferroday_cage::provision::debian::PlannedPackage::source: core::option::Option<alloc::string::String>
 pub ferroday_cage::provision::debian::PlannedPackage::version: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::debian::PlannedPackage
 impl core::marker::Send for ferroday_cage::provision::debian::PlannedPackage
@@ -759,6 +762,7 @@ pub ferroday_cage::ConfigError::ManagedMountsContradiction::toggle: &'static str
 pub ferroday_cage::ConfigError::MountFlagsInvalid::flags: u64
 #[non_exhaustive] pub ferroday_cage::ConfigError::MountTargetInvalid
 pub ferroday_cage::ConfigError::MountTargetInvalid::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::NestedUsernsNeedsProcfs
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayDirUnowned
 pub ferroday_cage::ConfigError::OverlayDirUnowned::layer: ferroday_cage::OverlayLayer
 pub ferroday_cage::ConfigError::OverlayDirUnowned::path: std::path::PathBuf
@@ -824,6 +828,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ConfigError
 #[non_exhaustive] pub enum ferroday_cage::Error
 pub ferroday_cage::Error::Config(ferroday_cage::ConfigError)
 pub ferroday_cage::Error::IdentityMap(ferroday_cage::IdMapError)
+pub ferroday_cage::Error::NestedUsernsBudgetExhausted
 #[non_exhaustive] pub ferroday_cage::Error::Setup
 pub ferroday_cage::Error::Setup::detail: core::option::Option<alloc::string::String>
 pub ferroday_cage::Error::Setup::errno: i32
@@ -1149,6 +1154,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::SeccompPolicy
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SeccompPolicy
 #[non_exhaustive] #[repr(u32)] pub enum ferroday_cage::SetupStep
 pub ferroday_cage::SetupStep::AwaitIdentityMap = 38
+pub ferroday_cage::SetupStep::AwaitNestedIdentityMap = 51
 pub ferroday_cage::SetupStep::AwaitNetworkStack = 37
 pub ferroday_cage::SetupStep::BindMount = 14
 pub ferroday_cage::SetupStep::BindRootfs = 8
@@ -1173,8 +1179,15 @@ pub ferroday_cage::SetupStep::MountOverlayRoot = 43
 pub ferroday_cage::SetupStep::MountProc = 25
 pub ferroday_cage::SetupStep::MountRaw = 26
 pub ferroday_cage::SetupStep::MountTmpfs = 12
+pub ferroday_cage::SetupStep::NestedDenySetgroups = 48
+pub ferroday_cage::SetupStep::NestedMapGate = 53
+pub ferroday_cage::SetupStep::NestedUnshare = 47
+pub ferroday_cage::SetupStep::NestedWriteGidMap = 49
+pub ferroday_cage::SetupStep::NestedWriteUidMap = 50
 pub ferroday_cage::SetupStep::NewSession = 45
+pub ferroday_cage::SetupStep::NosuidRootfs = 54
 pub ferroday_cage::SetupStep::OpenMountTarget = 11
+pub ferroday_cage::SetupStep::OpenSandboxProcfs = 52
 pub ferroday_cage::SetupStep::PivotRoot = 17
 pub ferroday_cage::SetupStep::PrivatizeMounts = 7
 pub ferroday_cage::SetupStep::RemountReadOnly = 15

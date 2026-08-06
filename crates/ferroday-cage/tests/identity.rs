@@ -202,6 +202,234 @@ fn run_as_is_the_identity_the_command_observes() {
     assert_eq!(stdout.trim(), "250 250 250 100", "{stdout}");
 }
 
+/// The nested user namespace's map under the range tier: the whole of the
+/// sandbox's map, reflected onto its own inside ids.
+///
+/// The command cannot write this for itself — the kernel's one-id exception
+/// covers a single extent of the writer's own id and nothing richer — and
+/// neither can the host caller, which owns the sandbox's user namespace but is
+/// not inside it. It is written by the process that forked the command, which
+/// is root of the namespace the nested one is a child of. That a run-as
+/// identity with supplementary groups still works is the other half of the
+/// assertion: a delegated map leaves `setgroups` at `allow`, where the
+/// single-identity tier has to deny it.
+#[cfg(feature = "subid")]
+#[test]
+fn a_delegated_nested_map_reflects_the_sandbox_map() {
+    let Some(rootfs) = rootfs() else { return };
+    if !range_map_available() {
+        return;
+    }
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "cat /proc/self/uid_map | tr -s ' ' | tr '\\n' ';'; echo; id -u; id -G",
+        ])
+        .identity_map(IdentityMap::Subordinate)
+        .run_as(Identity::new(250, 250).groups([250, 100]))
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    let mut lines = stdout.lines();
+    let map = lines.next().unwrap_or_default();
+    // The subordinate map is root plus the allocation, so its reflection is
+    // `0 0 1` followed by one extent per allocated range, each naming its
+    // inside ids on both sides. The allocation's own extents are the host's to
+    // decide, so only the first is asserted exactly.
+    assert!(
+        map.starts_with(" 0 0 1;") && map.matches(';').count() >= 2,
+        "expected a reflected multi-extent map, got {map:?}",
+    );
+    for extent in map.split(';').filter(|extent| !extent.trim().is_empty()) {
+        let fields: Vec<&str> = extent.split_whitespace().collect();
+        assert_eq!(
+            fields.first(),
+            fields.get(1),
+            "an extent names different ids on the two sides: {extent:?}",
+        );
+    }
+    assert_eq!(lines.next(), Some("250"), "{stdout}");
+    assert_eq!(lines.next(), Some("250 100"), "{stdout}");
+}
+
+/// The lock a delegated nested map buys, which is the whole point of entering
+/// the namespace: a read-only bind cannot be remounted read-write by the
+/// sandbox's own root, and a write to it answers `EROFS`.
+#[cfg(feature = "subid")]
+#[test]
+fn a_delegated_nested_map_locks_a_read_only_bind() {
+    let Some(rootfs) = rootfs() else { return };
+    if !range_map_available() {
+        return;
+    }
+    let host_dir = common::scratch_dir("ro-bind-locked-ranged");
+    std::fs::write(host_dir.join("marker"), "present\n").unwrap();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .bind_ro(&host_dir, "/mnt")
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "! /bin/busybox mount -o remount,bind,rw /mnt 2>/dev/null && \
+             ! echo scribbled > /mnt/marker 2>/dev/null",
+        ])
+        .identity_map(IdentityMap::Subordinate)
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    assert!(output.status.success(), "{}", stdout_of(&output));
+    assert_eq!(
+        std::fs::read_to_string(host_dir.join("marker")).unwrap(),
+        "present\n",
+        "the sandbox wrote through a read-only bind",
+    );
+}
+
+/// Without a PID namespace the delegate is the launch stage rather than the
+/// sandbox init, and it reaches the command's map files through the host's own
+/// procfs; the two shapes must reach the same place.
+#[cfg(feature = "subid")]
+#[test]
+fn a_delegated_nested_map_works_without_a_pid_namespace() {
+    let Some(rootfs) = rootfs() else { return };
+    if !range_map_available() {
+        return;
+    }
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .pid_namespace(false)
+        .command("/bin/sh")
+        .args(["-c", "head -1 /proc/self/uid_map | tr -s ' '; id -u"])
+        .identity_map(IdentityMap::Subordinate)
+        .run_as(Identity::new(250, 250))
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(stdout.lines().next(), Some(" 0 0 1"), "{stdout}");
+    assert_eq!(stdout.lines().nth(1), Some("250"), "{stdout}");
+}
+
+/// A set-user-ID binary in the rootfs confers nothing, while still executing.
+///
+/// `nosuid` on the root is what does it, and the contrast is drawn against the
+/// same inode reached through a caller's own bind, which keeps its source's
+/// flags: a caller who binds a host tree in order to run what is in it is
+/// entitled to a different answer than the rootfs gets.
+///
+/// The command runs as root inside with no hardening, so no-new-privileges is
+/// clear and the mount flag is the only thing that can account for the
+/// difference. The same flag suppresses file capabilities, which cannot be
+/// observed the same way: a root-inside command already holds every capability,
+/// and every shape that reduces them sets no-new-privileges, which suppresses
+/// file capabilities on its own.
+#[cfg(feature = "subid")]
+#[test]
+fn a_set_user_id_binary_in_the_rootfs_confers_nothing() {
+    let Some(rootfs) = common::scratch_rootfs("nosuid-rootfs") else {
+        return;
+    };
+    if !range_map_available() {
+        return;
+    }
+    // The binary is owned by a mapped non-root id, which only a process inside
+    // the range map can arrange: root inside executing it would gain uid 250
+    // were the mount to allow it.
+    let source = common::scratch_dir("nosuid-source");
+    let prepare = Cage::builder()
+        .rootfs(&rootfs)
+        .identity_map(IdentityMap::Subordinate)
+        .bind(&source, "/source")
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "mkdir -p /suid && for dir in /suid /source; do \
+               cp /bin/busybox $dir/id && chown 250:250 $dir/id && chmod 4755 $dir/id; \
+             done",
+        ])
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&prepare);
+    assert!(
+        output.status.success(),
+        "preparing the set-user-ID binaries failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let cage = Cage::builder()
+        .rootfs(&rootfs)
+        .identity_map(IdentityMap::Subordinate)
+        .bind(&source, "/bound")
+        .command("/bin/sh")
+        .args(["-c", "/suid/id -u; /bound/id -u"])
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("0"),
+        "a set-user-ID binary in the rootfs conferred its owner's id: {stdout}",
+    );
+    assert_eq!(
+        lines.next(),
+        Some("250"),
+        "the same binary under a caller's bind should still confer it: {stdout}",
+    );
+}
+
+/// A command that dies before it reaches the gate leaves the delegate at a
+/// read that answers end-of-file, not at one that blocks forever.
+///
+/// The gate is created by the delegate immediately before it forks the command,
+/// inside the sandbox and after the descriptor sweep, so it has exactly two
+/// holders and end-of-file means what it says. The failure is induced one step
+/// above the nested entry, where raising a hard resource limit the caller does
+/// not hold answers `EPERM`: what must come back is that typed error rather
+/// than a launch that never returns.
+#[test]
+fn a_command_that_dies_before_the_gate_does_not_hang_the_delegate() {
+    use ferroday_cage::{Error, Limit, Resource, SetupStep};
+
+    let Some(rootfs) = rootfs() else { return };
+    let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .maximum
+        .unwrap_or(u64::MAX);
+    if hard == u64::MAX {
+        eprintln!("skipping: the caller's file-descriptor hard limit is already unlimited");
+        return;
+    }
+    let err = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/true")
+        .rlimit(
+            Resource::OpenFiles,
+            Limit::of(hard + 1),
+            Limit::of(hard + 1),
+        )
+        .build()
+        .expect("the sandbox should build")
+        .run()
+        .expect_err("raising a hard limit the caller does not hold is refused");
+    assert!(
+        matches!(
+            err,
+            Error::Setup {
+                step: SetupStep::SetRlimit,
+                ..
+            }
+        ),
+        "expected the rlimit step to be reported, got {err:?}",
+    );
+}
+
 /// A non-root identity writes where its ids permit and nowhere else: root's
 /// files inside the sandbox refuse it.
 #[cfg(feature = "subid")]
@@ -260,6 +488,64 @@ fn run_as_without_kept_caps_holds_no_capabilities() {
             "expected empty capability sets: {stdout}"
         );
     }
+}
+
+/// A run-as identity sets no-new-privileges, with nothing else configured.
+///
+/// The cleared capability set is only half of the boundary a non-root identity
+/// draws. The rootfs bind inherits the host mount's flags rather than adding
+/// `nosuid`, and the provisioners apply a tree's permission bits verbatim, so
+/// the sandbox holds set-user-ID binaries owned by in-namespace uid 0; without
+/// the flag the non-root command executes them and is root inside again. This
+/// test deliberately asks for a run-as identity and no hardening at all,
+/// because that is the combination where the flag has no other reason to be
+/// set.
+#[cfg(feature = "subid")]
+#[test]
+fn run_as_alone_sets_no_new_privileges() {
+    let Some(rootfs) = rootfs() else { return };
+    if !range_map_available() {
+        return;
+    }
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "grep '^NoNewPrivs' /proc/self/status"])
+        .identity_map(IdentityMap::Subordinate)
+        .run_as(Identity::new(250, 250))
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    let flag = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+        .map(str::trim)
+        .unwrap_or_default();
+    assert_eq!(flag, "1", "{stdout}");
+}
+
+/// Without a run-as identity the flag stays clear, so the assertion above is
+/// about the switch rather than about something the launch always does.
+#[test]
+fn a_launch_without_a_run_as_identity_leaves_no_new_privileges_clear() {
+    let Some(rootfs) = rootfs() else { return };
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "grep '^NoNewPrivs' /proc/self/status"])
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    let flag = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+        .map(str::trim)
+        .unwrap_or_default();
+    assert_eq!(flag, "0", "{stdout}");
 }
 
 /// The securebits path, asserted through the command's own view: a kept

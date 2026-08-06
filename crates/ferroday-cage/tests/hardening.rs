@@ -407,8 +407,17 @@ fn a_denied_syscall_kills_the_command() {
     );
 }
 
+/// A full capability drop leaves every set empty, bounding set included.
+///
+/// This is also the guard on where the nested user namespace is entered.
+/// Entering one has the kernel re-derive the credential: the bounding set comes
+/// back full, the inheritable and ambient sets are cleared, and the securebits
+/// go back to the default with the locked bit among them. A drop applied before
+/// the entry would therefore be undone without a word, and `CapBnd` would read
+/// back full — so this assertion fails the moment the entry moves after the
+/// hardening layer.
 #[test]
-fn dropping_capabilities_empties_the_bounding_set() {
+fn dropping_capabilities_empties_every_set() {
     let Some(rootfs) = rootfs() else { return };
     let output = Cage::builder()
         .rootfs(rootfs)
@@ -421,15 +430,17 @@ fn dropping_capabilities_empties_the_bounding_set() {
         .expect("the sandbox launches");
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    let bounding = text
-        .lines()
-        .find_map(|line| line.strip_prefix("CapBnd:"))
-        .map(str::trim)
-        .expect("the status reports a bounding set");
-    assert_eq!(
-        bounding, "0000000000000000",
-        "a full capability drop empties the bounding set"
-    );
+    for set in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{set}:")))
+            .map(str::trim)
+            .unwrap_or_else(|| panic!("the status reports {set}"));
+        assert_eq!(
+            value, "0000000000000000",
+            "a full capability drop must empty {set}",
+        );
+    }
 }
 
 #[test]

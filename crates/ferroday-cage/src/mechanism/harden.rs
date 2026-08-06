@@ -11,6 +11,17 @@
 //! libc-free, allocation-free inline-assembly conduit — over kernel `uapi`
 //! structs defined and size-checked here.
 //!
+//! Everything here runs *after* the command has entered its nested user
+//! namespace, and that ordering is a requirement rather than a preference.
+//! Entering a user namespace has the kernel re-derive the whole credential for
+//! the new namespace: the securebits go back to the default — the `_LOCKED` bit
+//! wiped with the rest — the bounding set is refilled from the full set, and
+//! the inheritable and ambient sets are cleared. Hardening applied before the
+//! entry would therefore not merely fail to help; it would be silently undone,
+//! and a capability dropped from the bounding set would come back. The entry is
+//! the last thing `exec_command` does before calling into this module, and
+//! moving it after any of the calls below would quietly disable them.
+//!
 //! The hardening applies in two halves around the identity switch, and the
 //! order within them is fixed by the kernel's rules. Before the switch:
 //! lock the securebits that preserve capabilities across a uid change (they
@@ -54,9 +65,16 @@ pub(super) fn apply_pre_switch(plan: &HardeningPlan) -> Result<(), Failure> {
     // Set only when a non-root run-as identity is combined with a
     // capability keep set; inherited bits are preserved, since a locked
     // inherited bit cannot be cleared.
+    //
+    // A failed read of the inherited bits fails the step rather than standing
+    // in an empty set for them. The write below states the whole set, so an
+    // empty stand-in clears every unlocked bit already held — among them
+    // NOROOT, whose loss restores privilege by uid. A locked bit cannot be
+    // cleared, so that much would surface as an EPERM on the write, but the
+    // unlocked ones would go silently.
     if plan.set_securebits {
-        let inherited =
-            rustix::thread::capabilities_secure_bits().unwrap_or(CapabilitiesSecureBits::empty());
+        let inherited = rustix::thread::capabilities_secure_bits()
+            .map_err(|errno| (SetupStep::SetSecurebits, errno))?;
         rustix::thread::set_capabilities_secure_bits(
             inherited
                 | CapabilitiesSecureBits::NO_SETUID_FIXUP
@@ -123,9 +141,14 @@ fn drop_capabilities(keep: CapabilitySet) -> Result<(), Errno> {
     // sets, and the no-new-privileges flag keeps a set-user-ID or file-caps
     // exec from raising anything the wide bounding set would still admit. Skip
     // the edit rather than fail on an EPERM the reduction already covers.
-    let hold_setpcap = rustix::thread::capabilities(None)
-        .map(|sets| sets.effective.contains(CapabilitySet::SETPCAP))
-        .unwrap_or(false);
+    //
+    // A failed query is not that case. It leaves which of the two applies
+    // unknown, and answering the unknown with the unprivileged one would drop
+    // the narrowing on the very path that needs it, so the query's own failure
+    // fails the step.
+    let hold_setpcap = rustix::thread::capabilities(None)?
+        .effective
+        .contains(CapabilitySet::SETPCAP);
     if hold_setpcap {
         // Drop every known capability the caller did not keep from the bounding
         // set. A capability the running kernel does not define answers EINVAL,

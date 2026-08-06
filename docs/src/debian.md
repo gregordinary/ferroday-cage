@@ -770,6 +770,7 @@ Architecture: arm64
 SHA256: 7b21...
 Filename: pool/main/b/base-files/base-files_13.6_arm64.deb
 Archive: 0
+Installed-Size: 340
 
 Package: local-tool
 Version: 2.4-1
@@ -777,6 +778,7 @@ Architecture: all
 SHA256: e0d5...
 Filename: pool/main/l/local-tool/local-tool_2.4-1_all.deb
 Archive: 1
+Source: local-suite
 ```
 
 Archive 0 names both the archive certificate and the signing subkey that made
@@ -789,16 +791,38 @@ editors and hooks that strip it. It carries no
 `local-tool` names `Archive: 1`, which is what says it will be fetched from the
 pool rather than from the Debian mirror.
 
+`Installed-Size` and `Source` are optional, and each stanza above carries one of
+them to show it. `Installed-Size` is the archive's own figure, in the kibibytes
+[Debian Policy
+5.6.20](https://www.debian.org/doc/debian-policy/ch-controlfields.html#installed-size)
+defines it in rather than normalized to bytes, so it can be compared against a
+mirror's value directly. It is an estimate: the package's build produces it from
+its staged tree, so it neither measures an installed filesystem nor accounts for
+the target's block size, and a total over a plan is best presented as the
+archive's accounting rather than as what an image will weigh. `Source` names the
+source package a binary package was built from, with any parenthesized source
+version dropped, and is absent for the common case of a source that shares the
+binary package's name — which is how the archive itself says it. Reading it that
+way is what lets several binary packages be attributed to the one source that
+produced them.
+
+A plan the library resolved never states a `Source` equal to the package's own
+name. A plan read back from a document states whatever the document does: the
+reader takes the field verbatim, so a hand-written stanza naming a source that
+matches reads that way and is written back unchanged. Attributing a plan by
+source is therefore a question of the source name where there is one and the
+package's own name where there is not, not of whether the field is present.
+
 Both of a plan's lists are already ordered, so two renderings of one plan are
 byte-identical and a plan that changes shows the change as a diff rather than as
 a different blob.
 
-A field a reader does not know is ignored, so a document written by a later
-version of the library still reads here as long as the `Format` version is
-unchanged — that version is bumped only for a change an older reader would
-misread.
+A field a reader does not know is carried rather than refused, so a document
+written by a later version of the library still reads here as long as the
+`Format` version is unchanged — that version is bumped only for a change an
+older reader would misread. Adding a field is not one.
 
-Ignored on the way in does not mean dropped on the way out. A field this version
+Carried on the way in does not mean dropped on the way out. A field this version
 does not know is carried with its stanza and re-emitted after the ones it does,
 so reading a plan and writing it back preserves every field. That matters
 because re-emitting a plan is a thing a consumer does — into a provenance
@@ -806,12 +830,18 @@ record, or to normalize a file it commits — and a round trip that quietly
 discarded whatever a newer writer had added would corrupt exactly the record it
 was kept for.
 
-What a round trip does *not* promise is byte identity across versions: a future
-writer may interleave its own fields with the known ones rather than append
-them, and this version cannot know where they belong. Within one version it is
-byte-identical, carried fields included, so re-emitting does not churn a
-committed file. If you need bytes that are stable across versions, digest the
-document you were given rather than a re-render of it.
+Within one version a round trip is byte-identical, carried fields included, so
+re-emitting does not churn a committed file. Across versions of this library it
+is byte-identical too, because a field added to the format is written after
+every field the older readers knew — which is exactly where those readers put a
+field they do not know back. `Installed-Size` and `Source` sit after `Archive`
+for that reason rather than beside the fields they describe.
+
+What no round trip can promise is byte identity across *writers*: another
+implementation of this format may interleave its fields with the known ones
+rather than append them, and a reader cannot know where they belong. If you need
+bytes that are stable against anything, digest the document you were given
+rather than a re-render of it.
 
 No line the format emits ends in whitespace, so a plan survives the editors and
 pre-commit hooks that strip it. An empty field — `Signed-By` for a repository

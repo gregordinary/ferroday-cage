@@ -89,6 +89,14 @@ pub(crate) struct Package {
     pub provides: Vec<String>,
     pub essential: bool,
     pub priority: Option<String>,
+    /// The archive's `Installed-Size:` in kibibytes, when the stanza carries
+    /// one. Kept in the archive's own unit rather than normalized to bytes, so
+    /// the value can be compared against a mirror's directly.
+    pub installed_size: Option<u64>,
+    /// The source package this binary package was built from, when the stanza
+    /// names one that differs from [`name`](Self::name). `None` is the common
+    /// case, and means the source package carries the same name.
+    pub source: Option<String>,
     /// The index of the repository this package was retained from, so its
     /// bytes are fetched from that repository's own mirrors rather than a
     /// single global one. The resolver ignores it.
@@ -177,6 +185,16 @@ impl Package {
         if !is_sha256_hex(&sha256) {
             return None;
         }
+        // Read before the literal below moves `name`, which the source name is
+        // compared against. Neither field is required: a stanza missing or
+        // malforming one is reported as carrying no value rather than dropped,
+        // since nothing the bootstrap does depends on either.
+        let installed_size = stanza
+            .get("Installed-Size")
+            .and_then(|value| value.parse::<u64>().ok());
+        let source = stanza
+            .get("Source")
+            .and_then(|value| source_name(value, &name));
         Some(Package {
             name,
             version,
@@ -199,6 +217,8 @@ impl Package {
                 .get("Essential")
                 .is_some_and(|value| value.eq_ignore_ascii_case("yes")),
             priority: stanza.get("Priority").map(str::to_string),
+            installed_size,
+            source,
             // Set by the caller as the stanza is folded into an index; the
             // repository this stanza came from is not known here.
             origin: 0,
@@ -374,6 +394,23 @@ pub(crate) fn parse_provides(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parses a `Source:` field into the source package's name, or `None` when it
+/// names the binary package's own.
+///
+/// The field may carry a version the source was built at — `Source: foo
+/// (1.2-3)` — which belongs to the source package rather than to this binary
+/// one, and is dropped. Debian encodes "the source has the same name" by
+/// omitting the field entirely, so a stanza that states it anyway is read the
+/// same way, leaving one representation of that case rather than two.
+fn source_name(value: &str, package: &str) -> Option<String> {
+    let name: String = value
+        .trim()
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '(')
+        .collect();
+    (!name.is_empty() && name != package).then_some(name)
+}
+
 /// Parses one dependency alternative into its package name, dropping the
 /// version constraint, architecture qualifier, and any restriction lists.
 fn parse_atom(text: &str) -> Option<DepAtom> {
@@ -450,6 +487,58 @@ mod tests {
         assert!(!is_safe_pool_path("pool/p.deb\nX-Injected: 1"));
         assert!(!is_safe_pool_path("pool/p.deb HTTP/1.1"));
         assert!(!is_safe_pool_path("pool/\u{e9}clair.deb"));
+    }
+
+    #[test]
+    fn a_stanza_reports_its_installed_size_and_source_package() {
+        let text = format!(
+            "Package: bind9-dnsutils\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\n\
+             SHA256: {}\nInstalled-Size: 412\nSource: bind9 (1:9.20.4-1)\n",
+            "a".repeat(64),
+        );
+        let index = Index::parse(&text, "amd64");
+        let package = index.get("bind9-dnsutils").expect("the stanza parses");
+        // The archive's own unit, kibibytes, rather than bytes: a value that
+        // differs from the mirror's is one more thing that can disagree with it.
+        assert_eq!(package.installed_size, Some(412));
+        // The version belongs to the source package rather than to this binary
+        // one, so only the name is kept.
+        assert_eq!(package.source.as_deref(), Some("bind9"));
+    }
+
+    #[test]
+    fn a_source_naming_the_package_itself_reads_as_no_source() {
+        // Debian says "the source package has this name" by omitting the field,
+        // so a stanza that states it anyway is read the same way, leaving one
+        // representation of that case rather than two.
+        assert_eq!(source_name("hello", "hello"), None);
+        assert_eq!(source_name("hello (2.10-3)", "hello"), None);
+        assert_eq!(source_name("", "hello"), None);
+        assert_eq!(source_name("hello", "hello-data").as_deref(), Some("hello"));
+        assert_eq!(
+            source_name("hello (2.10-3)", "libhello1").as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn a_stanza_stating_no_size_or_a_malformed_one_still_parses() {
+        // Neither field is required by Debian Policy and nothing the bootstrap
+        // does depends on either, so their absence is reported rather than
+        // dropping a package the install needs.
+        let base = format!(
+            "Package: p\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\nSHA256: {}\n",
+            "a".repeat(64),
+        );
+        let index = Index::parse(&base, "amd64");
+        let package = index.get("p").expect("the stanza parses");
+        assert_eq!(package.installed_size, None);
+        assert_eq!(package.source, None);
+
+        let malformed = format!("{base}Installed-Size: unknown\n");
+        let index = Index::parse(&malformed, "amd64");
+        let package = index.get("p").expect("the stanza still parses");
+        assert_eq!(package.installed_size, None);
     }
 
     #[test]

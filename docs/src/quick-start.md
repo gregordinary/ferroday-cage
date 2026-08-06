@@ -84,6 +84,12 @@ fn main() -> ferroday_cage::Result<()> {
 }
 ```
 
+`bind_ro` is a boundary and not merely a view: the command cannot remount it
+read-write, cannot unmount it, and a write to it answers `EROFS`. Nothing else
+has to be configured for that to hold — see [A read-only bind is a
+boundary](how-the-sandbox-is-built.md#a-read-only-bind-is-a-boundary) for the
+mechanism.
+
 ## Using the command line
 
 The `fcage` binary offers the same sandbox at a shell prompt:

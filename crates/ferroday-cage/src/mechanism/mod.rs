@@ -84,6 +84,10 @@ mod remove;
 pub(crate) use harden::probe_landlock_abi;
 
 pub(crate) use child::CONTROL_TERMINATE;
+// The network stack's tap helper is the one forked child outside this module,
+// and it sweeps like every child inside it.
+#[cfg(feature = "netstack")]
+pub(crate) use child::sweep_fds_keeping;
 pub(crate) use copyin::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_SYMLINK, CopyFailure,
     LINK_BUF, start_copy_in,
@@ -160,6 +164,66 @@ impl IdentityPlan {
     pub(crate) fn is_ranged(&self) -> bool {
         matches!(self, IdentityPlan::Ranged { .. })
     }
+}
+
+/// How the command's nested user namespace gets its identity map.
+///
+/// The tier mirrors the sandbox's own: the single-identity map is one extent of
+/// one id and the command writes it in process, and a range map is written from
+/// outside the nested namespace by a delegate — here a delegate inside the
+/// sandbox, because the party that writes it must be root of the namespace the
+/// nested one is a child of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NestedMap {
+    /// The command writes its own map, under the kernel's unprivileged one-id
+    /// exception: `setgroups` is denied first, which is what permits the write.
+    SelfWritten,
+    /// A delegate inside the sandbox — the process that forked the command —
+    /// writes the map while the command blocks at a gate. `setgroups` stays at
+    /// `allow`, so the supplementary groups a run-as identity names still work.
+    Delegated,
+}
+
+/// The nested user namespace the command enters before the hardening layer,
+/// composed and frozen at build time.
+///
+/// A read-only bind is established by the sandbox setup inside the user
+/// namespace that setup created, and the kernel locks a mount's flags only when
+/// it copies the mount tree *into* a new user namespace. Root of the namespace
+/// that owns a mount may therefore remount it read-write — so the command, root
+/// of its own namespace, could clear the very flag the bind was for. Entering a
+/// nested user namespace has the kernel do the copy, and with it the locking:
+/// past the entry no mount the command inherited can have a restriction lifted.
+///
+/// The map is the identity reflection of the sandbox's own (see
+/// [`reflect_inside`](crate::idmap::reflect_inside)), so the command's view of
+/// itself is unchanged one namespace deeper.
+///
+/// Present for every container; `None` for the restriction fallback, which
+/// creates no user namespace to nest inside.
+#[derive(Debug, Clone)]
+pub(crate) struct NestedPlan {
+    /// Who writes the map.
+    pub(crate) map: NestedMap,
+    /// The `uid_map` content, formatted at build time.
+    pub(crate) uid_lines: Vec<u8>,
+    /// The `gid_map` content, formatted at build time.
+    pub(crate) gid_lines: Vec<u8>,
+    /// `/proc/self/setgroups` as it is named inside the sandbox, through the
+    /// procfs the profile mounts. Written only by
+    /// [`SelfWritten`](NestedMap::SelfWritten).
+    pub(crate) setgroups_path: CString,
+    /// `/proc/self/gid_map` as it is named inside the sandbox.
+    pub(crate) gid_map_path: CString,
+    /// `/proc/self/uid_map` as it is named inside the sandbox.
+    pub(crate) uid_map_path: CString,
+    /// The procfs mount target, rootfs-relative, that the sandbox's own
+    /// delegate opens during setup and writes the command's map files through.
+    /// Used only by [`Delegated`](NestedMap::Delegated), and only where the
+    /// sandbox has a PID namespace and so a delegate inside it; without one the
+    /// delegate is the launch stage, which is outside and uses the host's
+    /// `/proc`.
+    pub(crate) procfs_target: CString,
 }
 
 /// How an overlay-rooted cage's root is assembled.
@@ -315,6 +379,10 @@ pub(crate) struct LaunchPlan {
     /// How the sandbox's identity map is established; unused in a
     /// restriction, which creates no user namespace.
     pub(crate) identity: IdentityPlan,
+    /// The nested user namespace the command enters before the hardening
+    /// layer, which is what locks the flags of every mount it inherited.
+    /// `None` in a restriction, which creates no namespace to nest inside.
+    pub(crate) nested: Option<NestedPlan>,
     /// The identity the command switches to before `execve`; `None` leaves
     /// it running as root inside. Always `None` in a restriction.
     pub(crate) run_as: Option<RunAsPlan>,
@@ -810,9 +878,13 @@ impl ChildMap<'_> {
     /// not cross the fork.
     pub(in crate::mechanism) fn duty(&self) -> child::MapDuty<'_> {
         match self {
-            ChildMap::SelfMap { uid_line, gid_line } => {
-                child::MapDuty::Write { uid_line, gid_line }
-            }
+            // A provisioning child runs on the caller's own mount view, so its
+            // map files are under the host's `/proc`.
+            ChildMap::SelfMap { uid_line, gid_line } => child::MapDuty::Write {
+                paths: child::MapPaths::SELF,
+                uid_line,
+                gid_line,
+            },
             ChildMap::Delegated { .. } => child::MapDuty::Await,
         }
     }
@@ -820,12 +892,14 @@ impl ChildMap<'_> {
 
 /// The ready byte a stage sends on its map gate once it has unshared and is
 /// blocked waiting for the identity map. Every child that waits for a
-/// delegated map sends it: stage A, the export child, the copy-in child, and
-/// the removal child.
+/// delegated map sends it: stage A, the command stage at its nested entry, the
+/// export child, the copy-in child, and the removal child.
 pub(super) const MAP_READY_BYTE: u8 = b'R';
 
-/// The go byte the caller sends on the map gate once the identity map is
-/// established. Stage A treats any byte as the signal.
+/// The go byte the delegate sends on the map gate once the identity map is
+/// established — the caller for a launch's own namespace, and the process that
+/// forked the command for its nested one. The waiting side treats any byte as
+/// the signal.
 pub(super) const MAP_GO_BYTE: u8 = b'M';
 
 /// Marshals the launch data, creates the launch channels, and forks the
@@ -984,10 +1058,14 @@ fn fork_launch(
             // The one copy no launch controls is a sibling's: `kernel_fork`
             // copies the whole descriptor table, so a child this caller forked
             // between the replica's open just above and this close inherits one,
-            // exactly as the map gate records. Each of those children sweeps its
-            // inherited table early, which bounds the exposure to that sweep
-            // rather than to the sibling's life, and the replica is opened
-            // close-on-exec so no exec'd descendant can hold one at all.
+            // exactly as the map gate records. Every child the library forks —
+            // another launch's stage A, an export, a copy-in, a removal, the
+            // network stack's tap helper — sweeps its inherited table as its
+            // first act, which bounds the exposure to that sweep rather than to
+            // the sibling's life, and the replica is opened close-on-exec so no
+            // exec'd descendant can hold one at all. A child the *consumer*
+            // forked in the same window sweeps nothing, and holds its copy until
+            // it execs or exits; that is the caller's window to keep clear.
             let primary = terminal.map(|(primary, replica)| {
                 drop(replica);
                 primary
@@ -1074,12 +1152,16 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
             // delegate's error.
             //
             // Killed rather than released by closing the gate: `kernel_fork`
-            // copies the whole descriptor table, so a sibling process this
-            // caller forked concurrently — an export or removal child, which
-            // performs no descriptor sweep of its own — holds a copy of this
-            // gate's caller end and keeps the peer open however promptly this
-            // one closes. The end-of-file stage A waits on might then never
-            // arrive, and the reap below would block forever.
+            // copies the whole descriptor table, so any process this caller
+            // forked concurrently holds a copy of this gate's caller end and
+            // keeps the peer open however promptly this one closes. The
+            // library's own children do sweep their inherited tables, but each
+            // only after its fork has returned in it, and nothing bounds when
+            // the kernel next schedules that child; a child the *consumer*
+            // forked sweeps nothing at all, and drops the copy only when it
+            // execs — the gate is close-on-exec — or exits. The end-of-file
+            // stage A waits on is therefore not something this caller can make
+            // arrive, and the reap below would block on it.
             let _ = process::kill_process(parent.stage_a, Signal::KILL);
             parent.map_gate = None;
             let _ = wait_for_exit(parent.stage_a);
@@ -1431,6 +1513,14 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
             blocker: host::userns_blocker(),
             errno,
         };
+    }
+    // A user namespace is charged against `user.max_user_namespaces` at every
+    // level up to the initial namespace, and a launch holds two. `ENOSPC` from
+    // the nested entry is that budget and nothing else — no other setup step
+    // reports it — so the error names the sysctl rather than leaving a reader
+    // with "No space left on device" against a step that touched no filesystem.
+    if step == SetupStep::NestedUnshare && errno == Errno::NOSPC.raw_os_error() {
+        return Error::NestedUsernsBudgetExhausted;
     }
     // The exec step carries no detail index — there is one command, not a list
     // — so its subject comes from the plan's own label. Every other step with a

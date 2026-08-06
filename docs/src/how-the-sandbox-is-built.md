@@ -86,7 +86,10 @@ sequence itself.
     every mount beneath it become read-only in one step; on a kernel before
     5.12, which lacks `mount_setattr`, only the top mount is made read-only
     (carrying along the flags the user namespace holds locked) and any
-    submounts of the source keep their own flags.
+    submounts of the source keep their own flags. The restriction becomes a
+    boundary at step 12, where the command enters a nested user namespace and
+    the kernel locks it — see [A read-only bind is a
+    boundary](#a-read-only-bind-is-a-boundary).
 11. **Pivot.** The init enters the new mount and calls
     `pivot_root(".", ".")`, stacking the old root on the same mount point,
     then lazily detaches the old root and changes directory to the new `/`.
@@ -95,15 +98,76 @@ sequence itself.
 12. **Fork and exec.** After changing to the configured working directory,
     the init forks the command process — PID 2 — which wires its standard
     streams per the configuration, applies the configured [resource
-    limits](hardening.md#resource-limits), applies any hardening, and calls
-    `execve`, resolved inside the new root. The hardening layer applies in
-    two halves around the switch to the configured [run-as
+    limits](hardening.md#resource-limits), enters a nested user namespace
+    (below), applies any hardening, and calls `execve`, resolved inside the new
+    root. The hardening layer applies in two halves around the switch to the
+    configured [run-as
     identity](identity-maps.md#running-as-a-non-root-identity), when one is
     set: securebits, no-new-privileges, and Landlock before it, the
     capability drop and the seccomp filter after. The command receives the
     composed environment: the deterministic base (`PATH` and `HOME`) plus
     the caller's variables, nothing from the host. The init remains as the
     namespace's supervisor.
+
+## The nested user namespace
+
+The command does not execute in the user namespace the sandbox was built in.
+Between the resource limits and the hardening layer it enters a second one, of
+its own, with a fresh mount namespace alongside it.
+
+The reason is that the kernel locks a mount's flags exactly when it copies a
+mount tree *into* a new user namespace. A sandbox built the other way round —
+create the namespace, then build the mounts inside it — carries no locks at all,
+and root of the namespace that owns a mount may lift any restriction on it. The
+nested entry makes the kernel perform the copy, and every mount the command
+inherits comes across locked.
+
+The nested namespace's map is the sandbox's own map reflected onto its inside
+ids: for each extent `inside outside count` of the sandbox's map, a line
+`inside inside count`. The command therefore sees exactly the ids it saw
+before, under the same names. It is established the same way the sandbox's own
+is — written in process under the single-identity map, and written by a
+delegate under a [range map](identity-maps.md), the delegate here being the
+sandbox init rather than the caller, since only a process inside the sandbox's
+namespace is root of it. Either way it goes through a procfs, by path, which is
+why a sandbox that mounts none is refused at build time.
+
+The entry sits where it does because the kernel re-derives the whole credential
+for a new user namespace: securebits return to their defaults, the capability
+bounding set is refilled, and the inheritable and ambient sets are cleared. Any
+hardening applied before it would be silently undone. The [launch
+gate](userspace-networking.md) stays above it, so a caller attaches its network
+stack against the namespaces it already knows, and the resource limits stay
+above it because they are unaffected either way.
+
+### What the command gives up
+
+Past the entry the command is root of a namespace that owns nothing but its own
+mount namespace. It therefore holds no capability over the namespaces the
+sandbox created, which the sandbox's user namespace still owns:
+
+- It cannot clear a locked flag on any mount it inherited, cannot change atime
+  behaviour on one — the kernel locks atime on every copied mount, whatever it
+  was — and cannot unmount one to reveal what is beneath. It can still mount
+  whatever it likes in its own namespace; those mounts are its own, unlocked,
+  and private to it.
+- It cannot bind a TCP port below 1024 (`CAP_NET_BIND_SERVICE`), open a raw
+  socket, or send ICMP — so `ping` does not work inside a sandbox. Ordinary
+  sockets are unaffected: connecting out, listening above 1024, and everything
+  the [userspace network stack](userspace-networking.md) carries all behave as
+  before.
+- It cannot change the sandbox's hostname, and cannot reconfigure the network
+  interfaces the setup brought up.
+
+### The host requirement
+
+Every launch now holds two user namespaces rather than one, and a namespace is
+charged against `user.max_user_namespaces` at every level up to the initial
+namespace. [`host::userns_blocker`](host-requirements.md) reports a ceiling of
+`1` as a blocker for that reason. The check is necessary and not sufficient — a
+host whose ceiling is four with three namespaces already live fails the same way
+— so the launch itself reports the exhausted budget as
+`Error::NestedUsernsBudgetExhausted`, naming the sysctl.
 
 ## The mount profile
 
@@ -149,6 +213,41 @@ owns outright, which is how the managed `/dev` is itself assembled.
 
 Last, the host's `resolv.conf` — resolved to its real file — is bound
 read-only onto `/etc/resolv.conf` when the host network is shared.
+
+### A read-only bind is a boundary
+
+A read-only bind establishes both what the sandbox *sees* and what the command
+*can do*. The command cannot remount it read-write, and a write to it answers
+`EROFS`.
+
+The kernel locks a mount's flags when it copies a mount tree into a new user
+namespace, and [the nested user namespace](#the-nested-user-namespace) the
+command enters before it execs is that copy. The lock is unconditional: it needs
+no hardening, no capability drop, and no non-root identity, and it holds against
+a command that is root of its own namespace with `CAP_SYS_ADMIN` and an
+unfiltered `mount` syscall.
+
+The same lock covers every restriction the sandbox's mounts carry — `nosuid` on
+the root, `nodev` and `noexec` where the profile sets them — and it holds for
+unmounting too: the command cannot detach an inherited mount to reveal what is
+beneath it. What the command remains free to do is mount things of its own; those
+mounts are its own, unlocked, and private to its mount namespace.
+
+### The root is `nosuid`
+
+The root mount carries `nosuid`, so a set-user-ID or set-group-ID binary in the
+rootfs confers nothing on the command that executes it, and a file capability
+recorded on one is ignored. This matters because a provisioned rootfs applies
+the tree's permission bits verbatim: a Debian or Alpine root ships set-user-ID
+binaries owned by in-namespace uid 0, which a non-root [run-as
+identity](identity-maps.md#running-as-a-non-root-identity) would otherwise be
+able to execute its way back through. The flag is locked by the nested entry
+like every other, so the command cannot clear it.
+
+The scope is the root and whatever the root bind carried with it. A caller's own
+`bind` and `bind_ro` mounts keep inheriting their source's flags: a caller who
+binds a host tree in order to run what is in it is entitled to a different
+answer than the rootfs gets.
 
 ## What a launch leaves in the root
 

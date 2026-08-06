@@ -202,8 +202,17 @@ impl TcpFlow {
         // otherwise idle flow is probed by the kernel and surfaced as a poll
         // error, which reclaims the flow rather than holding its descriptor
         // open indefinitely. Tuned to the same cadence as the guest-facing
-        // socket. Best-effort: a kernel that refuses a tuning knob still runs
-        // the connection, only with its default (longer) keep-alive timing.
+        // socket.
+        //
+        // Best-effort, and a refusal costs differently at each call. A refused
+        // tuning knob leaves the kernel's own, much longer cadence, so the flow
+        // is still reclaimed, late. A refused enable leaves no probing at all:
+        // the guest answers the probes its own side of the flow sends, so
+        // [`IDLE_TIMEOUT`] does not fire either, and the flow is held until the
+        // guest closes it or the sandbox ends, bounded only by [`MAX_FLOWS`].
+        // Neither is reachable through the kernel — every value here is a
+        // constant inside the range it accepts — and neither is a reason to
+        // refuse to forward the guest's traffic.
         let _ = sockopt::set_socket_keepalive(&host, true);
         let _ = sockopt::set_tcp_keepidle(&host, KEEP_ALIVE_INTERVAL);
         let _ = sockopt::set_tcp_keepintvl(&host, KEEP_ALIVE_INTERVAL);

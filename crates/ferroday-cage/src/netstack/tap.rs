@@ -44,7 +44,7 @@
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
@@ -57,6 +57,7 @@ use rustix::runtime::{self, Fork, How, KernelSigSet};
 use rustix::thread::LinkNameSpaceType;
 
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
+use crate::mechanism::sweep_fds_keeping;
 
 /// `TUNSETIFF`: create or attach to a tun/tap interface (`_IOW('T', 202, int)`).
 const TUNSETIFF: ioctl::Opcode = 0x400454CA;
@@ -104,46 +105,49 @@ const DAD_ALL: &CStr = c"/proc/sys/net/ipv6/conf/all/accept_dad";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum Step {
+    /// Close the inherited descriptors this process does not own.
+    SweepFds = 1,
     /// Join the sandbox's user namespace.
-    JoinUser = 1,
+    JoinUser = 2,
     /// Join the sandbox's network namespace.
-    JoinNet = 2,
+    JoinNet = 3,
     /// Open `/dev/net/tun`.
-    OpenTun = 3,
+    OpenTun = 4,
     /// Create the tap interface.
-    CreateTap = 4,
+    CreateTap = 5,
     /// Open the IPv4 configuration socket.
-    OpenInet = 5,
+    OpenInet = 6,
     /// Set the hardware address.
-    SetHwaddr = 6,
+    SetHwaddr = 7,
     /// Set the MTU.
-    SetMtu = 7,
+    SetMtu = 8,
     /// Assign the IPv4 address.
-    SetV4Addr = 8,
+    SetV4Addr = 9,
     /// Set the IPv4 netmask.
-    SetV4Mask = 9,
+    SetV4Mask = 10,
     /// Read the interface flags.
-    ReadFlags = 10,
+    ReadFlags = 11,
     /// Bring the interface up.
-    RaiseFlags = 11,
+    RaiseFlags = 12,
     /// Add the IPv4 default route.
-    AddV4Route = 12,
+    AddV4Route = 13,
     /// Read the interface index.
-    ReadIndex = 13,
+    ReadIndex = 14,
     /// Open the IPv6 configuration socket.
-    OpenInet6 = 14,
+    OpenInet6 = 15,
     /// Assign the IPv6 address.
-    SetV6Addr = 15,
+    SetV6Addr = 16,
     /// Add the IPv6 default route.
-    AddV6Route = 16,
+    AddV6Route = 17,
     /// Send the tap descriptor back to the caller.
-    SendTap = 17,
+    SendTap = 18,
 }
 
 impl Step {
     /// Every step, in wire order. Used by the wire-protocol test.
     #[cfg(test)]
-    const ALL: [Step; 17] = [
+    const ALL: [Step; 18] = [
+        Step::SweepFds,
         Step::JoinUser,
         Step::JoinNet,
         Step::OpenTun,
@@ -166,23 +170,24 @@ impl Step {
     /// Decodes a step from its record wire value.
     fn from_wire(value: u32) -> Option<Step> {
         Some(match value {
-            1 => Step::JoinUser,
-            2 => Step::JoinNet,
-            3 => Step::OpenTun,
-            4 => Step::CreateTap,
-            5 => Step::OpenInet,
-            6 => Step::SetHwaddr,
-            7 => Step::SetMtu,
-            8 => Step::SetV4Addr,
-            9 => Step::SetV4Mask,
-            10 => Step::ReadFlags,
-            11 => Step::RaiseFlags,
-            12 => Step::AddV4Route,
-            13 => Step::ReadIndex,
-            14 => Step::OpenInet6,
-            15 => Step::SetV6Addr,
-            16 => Step::AddV6Route,
-            17 => Step::SendTap,
+            1 => Step::SweepFds,
+            2 => Step::JoinUser,
+            3 => Step::JoinNet,
+            4 => Step::OpenTun,
+            5 => Step::CreateTap,
+            6 => Step::OpenInet,
+            7 => Step::SetHwaddr,
+            8 => Step::SetMtu,
+            9 => Step::SetV4Addr,
+            10 => Step::SetV4Mask,
+            11 => Step::ReadFlags,
+            12 => Step::RaiseFlags,
+            13 => Step::AddV4Route,
+            14 => Step::ReadIndex,
+            15 => Step::OpenInet6,
+            16 => Step::SetV6Addr,
+            17 => Step::AddV6Route,
+            18 => Step::SendTap,
             _ => return None,
         })
     }
@@ -419,6 +424,22 @@ fn run_helper(context: &HelperContext<'_>) -> Result<(), (Step, Errno)> {
     // child; nothing here relies on receiving signals.
     let _ = unsafe { runtime::kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::all())) };
 
+    // Then the descriptor table, before anything that can block. `kernel_fork`
+    // copied the caller's whole table into this process, and an inherited copy
+    // is not inert: it holds open a concurrently live sandbox's control socket
+    // (which defers the supervisor's hangup detection), a concurrently
+    // allocated pseudoterminal replica (which defers end-of-file on the
+    // primary), and a concurrently open map gate. The helper's life is short
+    // but bounded by nothing — a namespace join, a device open, a dozen ioctls
+    // and two sysctl writes — so it sweeps like every other forked child. Only
+    // the three channels it was given survive.
+    sweep_fds_keeping(&[
+        context.userns.as_raw_fd(),
+        context.netns.as_raw_fd(),
+        context.sock.as_raw_fd(),
+    ])
+    .map_err(|errno| (Step::SweepFds, errno))?;
+
     rustix::thread::move_into_link_name_space(context.userns, Some(LinkNameSpaceType::User))
         .map_err(|errno| (Step::JoinUser, errno))?;
     rustix::thread::move_into_link_name_space(context.netns, Some(LinkNameSpaceType::Network))
@@ -553,6 +574,10 @@ fn receive_tap(sock: &OwnedFd, plan: &Plan) -> Result<OwnedFd, NetStackError> {
 fn step_error(step: Step, errno: i32, plan: &Plan) -> NetStackError {
     let configure = |detail| NetStackError::TapConfigure { detail, errno };
     match step {
+        // The helper never reached its work: it could not read its own
+        // descriptor table, which is a failure to start rather than a failure
+        // of the tap.
+        Step::SweepFds => NetStackError::Spawn { errno },
         Step::JoinUser => NetStackError::NamespaceJoin {
             which: "joining the sandbox's user namespace",
             errno,

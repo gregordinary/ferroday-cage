@@ -55,6 +55,38 @@ unshares and then blocks at an internal gate while the caller's side writes
 the map against its pid, and only then proceeds — so by the time a launch is
 observable, its namespace is always fully mapped.
 
+## The nested map
+
+The command runs one user namespace deeper than the sandbox: it enters a
+nested one before it hardens, which is what locks the flags of the mounts the
+sandbox established (see [The nested user
+namespace](how-the-sandbox-is-built.md#the-nested-user-namespace)). That
+namespace needs a map of its own, and the library composes it rather than
+asking for one.
+
+A nested namespace maps against its parent's id space, not the host's, so the
+map that leaves the command's view unchanged is the parent map reflected onto
+its own inside ids: for each extent `inside outside count`, a line
+`inside inside count`. Every id the sandbox could represent is still
+representable, under the same name, and `id` inside reports what it reported
+before.
+
+The same kernel rules decide who writes it. Under the single-identity map the
+nested map is `0 0 1` — one line, of one id, naming the writer's own effective
+id — so the command writes it itself. Under a range map it cannot, and neither
+can the host caller, which owns the sandbox's user namespace but is not inside
+it: the writer has to be root of the namespace the nested one is a child of,
+which is the sandbox init (or, without a PID namespace, the launch stage). That
+process creates a gate immediately before it forks the command, writes the map
+when the command signals that it has unshared, and releases it. No delegate of
+the caller's is involved, and the `IdMapper` seam below is not consulted.
+
+Because the map files are reached by path, a container requires a procfs: a
+profile that mounts none is refused at `build` with
+`ConfigError::NestedUsernsNeedsProcfs`. The managed profile mounts one by
+default, so this arises only for a profile that opts out of the managed mounts
+and supplies no procfs of its own.
+
 ## Delegates
 
 Who writes a range map is a public seam: the `IdMapper` trait. An
@@ -206,6 +238,14 @@ inherit it. Every id must be contained in the identity map —
 `build` rejects one that is not — and supplementary groups additionally
 require a range gid map, because establishing the single-identity map denies
 `setgroups` permanently.
+
+A run-as identity also sets no-new-privileges, in every build of the library
+and whatever else the sandbox requests. The cleared capability set is only half
+of the boundary: a rootfs ships set-user-ID binaries and file capabilities owned
+by in-namespace uid 0 — the provisioners apply a tree's permission bits
+verbatim, so `/usr/bin/sudo` is a working `/usr/bin/sudo` — and without the flag
+the non-root command executes them and is root inside again. The flag is
+inherited across `execve` and by every process the command starts.
 
 Capabilities interact with the switch in three ways:
 

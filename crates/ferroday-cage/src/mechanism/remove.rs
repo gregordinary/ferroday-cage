@@ -505,12 +505,14 @@ mod tests {
     /// A delegate that resolves the map, forks a bystander process, and then
     /// refuses to apply.
     ///
-    /// The bystander stands in for a sibling this caller forked concurrently —
-    /// another removal or export child. `kernel_fork` copies the whole
-    /// descriptor table, so the bystander holds its own copy of the caller's
-    /// end of the removal gate and keeps the peer open no matter how promptly
-    /// the caller closes its own. A caller that abandoned the removal child by
-    /// closing the gate alone would therefore leave it blocked forever.
+    /// The bystander stands in for any process this caller forked concurrently
+    /// — one of the library's own children before it has swept, or one the
+    /// consumer forked and that never sweeps at all. `kernel_fork` copies the
+    /// whole descriptor table, so the bystander holds its own copy of the
+    /// caller's end of the removal gate and keeps the peer open no matter how
+    /// promptly the caller closes its own. A caller that abandoned the removal
+    /// child by closing the gate alone would therefore leave it blocked for as
+    /// long as the bystander lives.
     #[derive(Debug, Default)]
     struct ForksThenRefuses {
         /// The bystander's pid, for the test to collect.

@@ -268,7 +268,10 @@ Hardening:
 
 Turning off what is on by default:
   --share-pid           Share the host PID namespace (default: isolated)
-  --no-proc             Do not mount /proc
+  --no-proc             Do not mount /proc. A cage needs a procfs from
+                        somewhere -- the nested user namespace that locks its
+                        mount flags establishes its identity map through one --
+                        so a run that sets this supplies its own with --bind
   --no-dev              Do not assemble the minimal /dev
   --no-tmp              Do not mount a tmpfs on /tmp
   --no-resolv-conf      Do not bind the host resolv.conf: neither the bind
@@ -276,7 +279,8 @@ Turning off what is on by default:
   --no-managed-mounts   Establish no mount of the library's own, so the sandbox
                         carries exactly the --bind and --raw-mount flags given.
                         Unlike the individual --no-* toggles this also excludes
-                        any managed mount a later release adds
+                        any managed mount a later release adds. One of the flags
+                        given must supply a procfs; see --no-proc
   --no-base-env         Give the command exactly the --setenv variables, with
                         no PATH or HOME supplied underneath them
 

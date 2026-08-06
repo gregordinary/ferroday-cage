@@ -28,6 +28,14 @@
 //! changes its working directory, applies the hardening plan, and execs
 //! against the host filesystem.
 //!
+//! A container's command process ends one user namespace deeper than the rest
+//! of the sandbox. Between its resource limits and its hardening it enters a
+//! nested user namespace, which is what locks the flags of every mount the
+//! setup established — see [`enter_nested_namespace`]. Under a range map the
+//! nested map is written by whichever process forked the command, over a gate
+//! that process creates immediately before the fork; see
+//! [`delegate_nested_map`].
+//!
 //! Everything here executes between `kernel_fork` and `execve` or
 //! `exit_group`. The caller may be multithreaded, so these processes —
 //! single-threaded copies — must not:
@@ -184,6 +192,28 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
         establish_identity_map(context)?;
     }
 
+    // Without a PID namespace this stage is the delegate for the command's
+    // nested identity map, and the host's `/proc` is the procfs that indexes
+    // it: the command shares this PID namespace, so the pid the fork below
+    // returns names it there. Opened now rather than after the fork, because
+    // the command's `pivot_root` acts on the mount namespace this stage shares
+    // with it and would change what the path resolves to.
+    let procfs = if !plan.pid_namespace && delegates_nested_map(context) {
+        Some(
+            rustix::fs::open(
+                c"/proc",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|errno| (SetupStep::OpenSandboxProcfs, errno, 0))?,
+        )
+    } else {
+        None
+    };
+    // The gate the map is established across, created immediately before the
+    // fork so that this stage and the command are its only holders.
+    let seam = nested_seam(procfs)?;
+
     let fork_step = if plan.pid_namespace {
         SetupStep::ForkInit
     } else {
@@ -196,7 +226,14 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
             if plan.pid_namespace {
                 stage_init(context)
             } else {
-                stage_command(context)
+                // The command keeps its own end of the gate and drops the
+                // delegate's side of the seam, which is not its to hold.
+                let gate = seam.map(|seam| {
+                    drop(seam.procfs);
+                    drop(seam.delegate);
+                    seam.command
+                });
+                stage_command(context, gate)
             }
         }
         runtime::Fork::ParentOf(child) => {
@@ -207,13 +244,28 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                     // just-forked process must not outlive this failure:
                     // kill and collect it before reporting, so it cannot
                     // run unsupervised or write a report record of its own.
-                    let _ = process::kill_process(child, Signal::KILL);
-                    while let Err(Errno::INTR) = process::waitpid(Some(child), WaitOptions::empty())
-                    {
-                    }
+                    abandon_command(child);
                     return Err((SetupStep::SendPidfd, errno, 0));
                 }
             };
+            // The nested map, established while the report pipe is still open
+            // and a failure is still reportable. The seam drops with it, so
+            // neither the procfs nor the gate outlives the step that needed
+            // them.
+            if let Some(seam) = seam {
+                let NestedSeam {
+                    procfs,
+                    delegate,
+                    command,
+                } = seam;
+                drop(command);
+                if let Err(failure) =
+                    delegate_nested_map(context, procfs.as_fd(), delegate.as_fd(), child)
+                {
+                    abandon_command(child);
+                    return Err(failure);
+                }
+            }
             if plan.pid_namespace {
                 // The init supervises itself from inside the namespace;
                 // this stage's work is done.
@@ -302,10 +354,23 @@ fn stage_init(context: &Context<'_>) -> ! {
         report(context.report_fd, step, errno, detail);
         runtime::exit_group(127)
     }
-    if let Err((step, errno, detail)) = setup_sandbox(context) {
-        report(context.report_fd, step, errno, detail);
-        runtime::exit_group(127)
-    }
+    let procfs = match setup_sandbox(context) {
+        Ok(procfs) => procfs,
+        Err((step, errno, detail)) => {
+            report(context.report_fd, step, errno, detail);
+            runtime::exit_group(127)
+        }
+    };
+    // The gate the command's nested identity map is established across, created
+    // immediately before the fork so that this process and the command are its
+    // only holders.
+    let seam = match nested_seam(procfs) {
+        Ok(seam) => seam,
+        Err((step, errno, detail)) => {
+            report(context.report_fd, step, errno, detail);
+            runtime::exit_group(127)
+        }
+    };
 
     // SAFETY: as at every fork here: the child process touches only frozen
     // data and raw syscalls, and never returns.
@@ -314,7 +379,16 @@ fn stage_init(context: &Context<'_>) -> ! {
             report(context.report_fd, SetupStep::ForkCommand, errno, 0);
             runtime::exit_group(127)
         }
-        Ok(runtime::Fork::Child(_)) => exec_command(context),
+        Ok(runtime::Fork::Child(_)) => {
+            // The command keeps its own end of the gate and drops the
+            // delegate's side of the seam, which is not its to hold.
+            let gate = seam.map(|seam| {
+                drop(seam.procfs);
+                drop(seam.delegate);
+                seam.command
+            });
+            exec_command(context, gate)
+        }
         Ok(runtime::Fork::ParentOf(command)) => {
             // The command's pidfd is what lets the supervisor sleep in one
             // poll; opened before anything else so a failure is still
@@ -326,19 +400,54 @@ fn stage_init(context: &Context<'_>) -> ! {
                     runtime::exit_group(127)
                 }
             };
+            // The nested map, established while the report pipe is still open
+            // and a failure is still reportable. The seam drops with it, so
+            // neither the procfs nor the gate outlives the step that needed
+            // them.
+            if let Some(seam) = seam {
+                let NestedSeam {
+                    procfs,
+                    delegate,
+                    command: command_end,
+                } = seam;
+                drop(command_end);
+                if let Err((step, errno, detail)) =
+                    delegate_nested_map(context, procfs.as_fd(), delegate.as_fd(), command)
+                {
+                    abandon_command(command);
+                    report(context.report_fd, step, errno, detail);
+                    runtime::exit_group(127)
+                }
+            }
             supervisor_hygiene(context);
             supervise(context, pidfd.as_fd(), command, Role::Init)
         }
     }
 }
 
+/// Kills and collects the command after the delegate failed to establish its
+/// nested identity map.
+///
+/// Killed rather than released by closing the gate: the command would see
+/// end-of-file and report a failure of its own, and two records in a pipe whose
+/// protocol is one record is a report the caller cannot decode. The command is
+/// blocked at the gate, before it has run anything of the caller's, so nothing
+/// is lost by ending it here.
+fn abandon_command(command: Pid) {
+    let _ = process::kill_process(command, Signal::KILL);
+    while let Err(Errno::INTR) = process::waitpid(Some(command), WaitOptions::empty()) {}
+}
+
 /// Stage command without a PID namespace: setup and exec in one process,
 /// supervised from outside by stage A. In a container the setup is the full
 /// sandbox sequence; in a restriction there is nothing to build and only the
 /// working directory changes.
-fn stage_command(context: &Context<'_>) -> ! {
+fn stage_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     let setup = start_own_session(context).and_then(|()| match context.plan.confinement {
-        super::Confinement::Container => setup_sandbox(context),
+        // The setup opens no procfs here: without a PID namespace the delegate
+        // for the nested map is the launch stage, outside, which holds the
+        // host's own.
+        super::Confinement::Container => setup_sandbox(context).map(|_| ()),
         #[cfg(feature = "hardening")]
         super::Confinement::Restriction => setup_restriction(context),
     });
@@ -346,7 +455,7 @@ fn stage_command(context: &Context<'_>) -> ! {
         report(context.report_fd, step, errno, detail);
         runtime::exit_group(127)
     }
-    exec_command(context)
+    exec_command(context, nested_gate)
 }
 
 /// The restriction setup: no namespaces to configure and no root to swap —
@@ -362,11 +471,15 @@ fn setup_restriction(context: &Context<'_>) -> Result<(), Failure> {
 
 /// Wires the command's standard streams and executes the command.
 ///
+/// `nested_gate` is this process's end of the gate the sandbox's own delegate
+/// established the nested identity map across, present only where a delegate
+/// writes it; it is closed as the entry returns.
+///
 /// Never returns: on success `execve` replaces the process image, and on
 /// failure the step and errno are reported over the report pipe and the
 /// process exits. The exit status of a failed stage is not meaningful to
 /// the caller, which trusts the pipe record instead.
-fn exec_command(context: &Context<'_>) -> ! {
+fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     if let Err(errno) = wire_stdio(context) {
         report(context.report_fd, SetupStep::WireStdio, errno, 0);
         runtime::exit_group(127)
@@ -391,6 +504,26 @@ fn exec_command(context: &Context<'_>) -> ! {
     // yet that could deny the call. Each limit is inherited across `execve` and
     // by every process the command starts.
     if let Err((step, errno, detail)) = apply_rlimits(context) {
+        report(context.report_fd, step, errno, detail);
+        runtime::exit_group(127)
+    }
+
+    // The nested user namespace, entered before anything below it and after
+    // everything above it. Entering one has the kernel copy the mount tree and
+    // lock every restriction it carries, which is what makes a read-only bind a
+    // boundary rather than a default the command could remount away.
+    //
+    // The position is forced, not preferred. The kernel re-derives the whole
+    // credential for the new namespace: securebits go back to the default with
+    // the locked bit among them, the bounding set is refilled, and the
+    // inheritable and ambient sets are cleared. Every restriction below is
+    // therefore applied to the credential this call produces, and any applied
+    // above it would be silently undone. The launch gate stays above so a
+    // caller attaches its network stack against the namespaces it already
+    // knows, and the resource limits with it: raising a hard limit needs
+    // CAP_SYS_RESOURCE in the initial user namespace, which no sandbox holds at
+    // any depth.
+    if let Err((step, errno, detail)) = enter_nested_namespace(context, nested_gate) {
         report(context.report_fd, step, errno, detail);
         runtime::exit_group(127)
     }
@@ -519,6 +652,18 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 /// not been copied from yet. With standard input on the caller's descriptor 1
 /// and standard output somewhere else, the `dup2` onto 1 would take standard
 /// input's source with it.
+///
+/// The relocation covers the sources. It does not cover the launch's own
+/// channels: a caller that had already closed one of 0, 1 and 2 when it called
+/// `spawn` would have the report pipe, the status pipe, the control socket or
+/// the nested identity map's gate land there, and the `dup2`s below would
+/// clobber it in the command process. A
+/// `std` program cannot start in that state — the runtime's startup opens
+/// `/dev/null` over any standard descriptor that is closed — so this is
+/// reachable only for a consumer that closes one at runtime, and it is
+/// pre-existing rather than something the terminal introduced. What a terminal
+/// launch changes is the breadth: it wires all three, where a capturing launch
+/// wires at most two.
 fn wire_stdio(context: &Context<'_>) -> Result<(), Errno> {
     /// The highest standard stream number: the ceiling a source must be above
     /// before anything is wired, and the floor it is moved to.
@@ -600,10 +745,29 @@ fn wire_stdio(context: &Context<'_>) -> Result<(), Errno> {
 /// All three calls are the thread-scoped raw syscalls: this process is
 /// single-threaded, so no cross-thread broadcast is needed and none of
 /// libc's setxid machinery is involved.
+///
+/// # No-new-privileges
+///
+/// Set here rather than only in the hardening layer, because it is what makes
+/// the switch a boundary at all. Dropping to a non-zero uid clears the
+/// command's capabilities, but on its own it leaves the privilege-raising path
+/// through `execve` open: the rootfs bind inherits the host mount's flags
+/// rather than adding `nosuid`, and the provisioners apply a tree's permission
+/// bits verbatim, so a Debian or Alpine rootfs inside the sandbox ships
+/// set-user-ID binaries owned by in-namespace uid 0 and file capabilities to
+/// match. Without the flag, the non-root command executes them and is root
+/// inside again.
+///
+/// It costs one `prctl`, needs no privilege, and is inherited across `execve`
+/// and by every descendant. The hardening layer sets it too, before Landlock
+/// and the seccomp install, which both require it; setting it twice is
+/// idempotent, and doing it here is what covers a build without that feature
+/// and a launch that asks for a non-root identity and nothing else.
 fn switch_identity(context: &Context<'_>) -> Result<(), (SetupStep, Errno)> {
     let Some(run_as) = &context.plan.run_as else {
         return Ok(());
     };
+    rustix::thread::set_no_new_privs(true).map_err(|errno| (SetupStep::SetNoNewPrivs, errno))?;
     if context.plan.identity.is_ranged() {
         rustix::thread::set_thread_groups(&run_as.groups)
             .map_err(|errno| (SetupStep::SetGroups, errno))?;
@@ -642,14 +806,42 @@ fn await_proceed(fd: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
 pub(super) enum MapDuty<'a> {
     /// Write the single-identity map in process.
     Write {
+        /// Where the writing process's own map files are.
+        paths: MapPaths<'a>,
         /// The `uid_map` line.
         uid_line: &'a [u8],
         /// The `gid_map` line.
         gid_line: &'a [u8],
     },
-    /// Signal ready on the map gate and block until the caller's delegate has
-    /// written a range map from outside.
+    /// Signal ready on the map gate and block until the delegate has written a
+    /// range map from outside.
     Await,
+}
+
+/// Where a process finds the files that establish its own user namespace's
+/// identity map.
+///
+/// Named rather than hardcoded because the nested user namespace a command
+/// enters is mapped after the root swap, where the procfs is wherever the mount
+/// profile put it. Every other caller writes through the host's `/proc`, which
+/// [`SELF`](MapPaths::SELF) names.
+#[derive(Clone, Copy)]
+pub(super) struct MapPaths<'a> {
+    /// The `setgroups` file, written `deny` before the gid map.
+    pub(super) setgroups: &'a CStr,
+    /// The `gid_map` file.
+    pub(super) gid_map: &'a CStr,
+    /// The `uid_map` file.
+    pub(super) uid_map: &'a CStr,
+}
+
+impl MapPaths<'static> {
+    /// The writing process's own map files, through the procfs at `/proc`.
+    pub(super) const SELF: MapPaths<'static> = MapPaths {
+        setgroups: c"/proc/self/setgroups",
+        gid_map: c"/proc/self/gid_map",
+        uid_map: c"/proc/self/uid_map",
+    };
 }
 
 /// A step of a child's entry into a user namespace of its own.
@@ -747,12 +939,16 @@ pub(super) fn establish_map(
     gate: Option<BorrowedFd<'_>>,
 ) -> Result<(), MapFailure> {
     match duty {
-        MapDuty::Write { uid_line, gid_line } => {
-            write_file(c"/proc/self/setgroups", b"deny")
+        MapDuty::Write {
+            paths,
+            uid_line,
+            gid_line,
+        } => {
+            write_file(paths.setgroups, b"deny")
                 .map_err(|errno| MapFailure::Step(MapStep::DenySetgroups, errno))?;
-            write_file(c"/proc/self/gid_map", gid_line)
+            write_file(paths.gid_map, gid_line)
                 .map_err(|errno| MapFailure::Step(MapStep::WriteGidMap, errno))?;
-            write_file(c"/proc/self/uid_map", uid_line)
+            write_file(paths.uid_map, uid_line)
                 .map_err(|errno| MapFailure::Step(MapStep::WriteUidMap, errno))?;
         }
         MapDuty::Await => {
@@ -794,7 +990,10 @@ fn establish_identity_map(context: &Context<'_>) -> Result<(), Failure> {
     let duty = if ranged {
         MapDuty::Await
     } else {
+        // Stage A has not swapped its root, so the host's `/proc` is the one
+        // its own map files are under.
         MapDuty::Write {
+            paths: MapPaths::SELF,
             uid_line: context.uid_line,
             gid_line: context.gid_line,
         }
@@ -809,6 +1008,222 @@ fn establish_identity_map(context: &Context<'_>) -> Result<(), Failure> {
         MapFailure::Abandoned => (SetupStep::AwaitIdentityMap, Errno::CANCELED, 0),
         MapFailure::Step(step, errno) => (setup_step(step), errno, 0),
     })
+}
+
+/// Enters the nested user namespace that locks the sandbox's mount flags, and
+/// establishes its identity map.
+///
+/// A read-only bind is established by the sandbox setup inside the user
+/// namespace that setup created, and the kernel locks a mount's flags only as
+/// it copies the tree into a *new* user namespace. Root of the namespace that
+/// owns a mount may lift any restriction on it, so before this call the command
+/// could remount its own read-only bind read-write and write through to the
+/// host. `CLONE_NEWUSER | CLONE_NEWNS` has the kernel perform the copy, and
+/// every mount the command inherits comes across locked.
+///
+/// The map is the identity reflection of the sandbox's own, frozen at build
+/// time, so nothing about the command's view of itself changes: it is the same
+/// uid, with the same ids reachable, one namespace deeper. The single-identity
+/// tier writes its own map under the kernel's one-id exception; a range map is
+/// written by the sandbox's own delegate, because a process that has just
+/// unshared cannot write its own range map and neither can anything outside the
+/// namespace it unshared *from*.
+///
+/// `gate` is this process's end of the delegate's gate, closed as this returns.
+///
+/// Post-fork safe: no allocation, no locking, and no panic.
+fn enter_nested_namespace(context: &Context<'_>, gate: Option<OwnedFd>) -> Result<(), Failure> {
+    // A restriction creates no user namespace, so it has none to nest inside.
+    let Some(nested) = &context.plan.nested else {
+        return Ok(());
+    };
+
+    // SAFETY: as at every unshare here, the flags never include the descriptor
+    // table, and this process is a single-threaded forked child besides.
+    unsafe { thread::unshare_unsafe(thread::UnshareFlags::NEWUSER | thread::UnshareFlags::NEWNS) }
+        .map_err(|errno| (SetupStep::NestedUnshare, errno, 0))?;
+
+    let duty = match nested.map {
+        super::NestedMap::SelfWritten => MapDuty::Write {
+            // The root was swapped before this stage ran, so the map files are
+            // named through the procfs the mount profile established.
+            paths: MapPaths {
+                setgroups: nested.setgroups_path.as_c_str(),
+                gid_map: nested.gid_map_path.as_c_str(),
+                uid_map: nested.uid_map_path.as_c_str(),
+            },
+            uid_line: &nested.uid_lines,
+            gid_line: &nested.gid_lines,
+        },
+        super::NestedMap::Delegated => MapDuty::Await,
+    };
+    establish_map(duty, gate.as_ref().map(AsFd::as_fd)).map_err(|failure| match failure {
+        // The delegate closed the gate without writing: it failed, and reports
+        // its own error over the report pipe. Named for form.
+        MapFailure::Abandoned => (SetupStep::AwaitNestedIdentityMap, Errno::CANCELED, 0),
+        MapFailure::Step(step, errno) => (nested_setup_step(step), errno, 0),
+    })
+    // `gate` drops here, which closes this end: the delegate is done with it,
+    // and nothing past this point may hold a descriptor the command did not
+    // ask for.
+}
+
+/// The [`SetupStep`] a launch reports for a map step performed against the
+/// nested user namespace.
+///
+/// Named apart from the outer namespace's steps so a failure says which of the
+/// two the launch was establishing. The two steps this sequence never performs
+/// keep the outer names: the signal scrub and the descriptor sweep happened in
+/// the launch stage, before the command existed.
+fn nested_setup_step(step: MapStep) -> SetupStep {
+    match step {
+        MapStep::ResetSignals => SetupStep::ResetSignals,
+        MapStep::SweepFds => SetupStep::SweepFds,
+        MapStep::Unshare => SetupStep::NestedUnshare,
+        MapStep::DenySetgroups => SetupStep::NestedDenySetgroups,
+        MapStep::WriteGidMap => SetupStep::NestedWriteGidMap,
+        MapStep::WriteUidMap => SetupStep::NestedWriteUidMap,
+        MapStep::AwaitMap => SetupStep::AwaitNestedIdentityMap,
+    }
+}
+
+/// The sandbox's side of the nested identity map: the procfs the command's map
+/// files are reached through, and the gate the command waits at.
+///
+/// Created by the process that forks the command — the init inside the PID
+/// namespace, or the launch stage where there is none — immediately before that
+/// fork. Immediately, and by that process, for a reason the launch's own map
+/// gate has to work around: a gate created before the caller's fork can be
+/// inherited by any process the *consumer* forked in that window, so its
+/// abandoned-child path cannot close the gate and must `SIGKILL` instead. This
+/// one is created inside the sandbox and after the descriptor sweep, so it has
+/// exactly two holders and end-of-file means what it says.
+struct NestedSeam {
+    /// The procfs the delegate writes the command's map files through.
+    procfs: OwnedFd,
+    /// The delegate's end of the gate.
+    delegate: OwnedFd,
+    /// The command's end of the gate.
+    command: OwnedFd,
+}
+
+/// Creates the nested identity-map seam, when this process is the delegate for
+/// one.
+///
+/// `procfs` is the descriptor the map files are reached through, already open:
+/// the sandbox's own for the init, which opened it during setup through the
+/// new-root descriptor, and the host's `/proc` for the launch stage, which
+/// opened it before the pivot that would have changed what the path names.
+/// `None` when the map needs no delegate — the single-identity tier, whose
+/// command writes its own — or when there is no nested namespace at all.
+fn nested_seam(procfs: Option<OwnedFd>) -> Result<Option<NestedSeam>, Failure> {
+    let Some(procfs) = procfs else {
+        return Ok(None);
+    };
+    let (delegate, command) = rustix::net::socketpair(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|errno| (SetupStep::NestedMapGate, errno, 0))?;
+    Ok(Some(NestedSeam {
+        procfs,
+        delegate,
+        command,
+    }))
+}
+
+/// Whether this process is the delegate for the command's nested identity map,
+/// and so must open a procfs to write it through.
+fn delegates_nested_map(context: &Context<'_>) -> bool {
+    matches!(
+        &context.plan.nested,
+        Some(nested) if nested.map == super::NestedMap::Delegated
+    )
+}
+
+/// Writes the command's nested identity map from inside the sandbox, releasing
+/// the command once it is in force.
+///
+/// The kernel accepts a range map only from a process that is root of the
+/// namespace the new one is a child of. The command cannot write its own, and
+/// neither can the host caller, which owns the sandbox's user namespace but is
+/// not inside it: this process is, and is its root, which is what qualifies it.
+///
+/// Nothing about the command is transmitted. The pid `fork` returned here
+/// already indexes the same procfs both processes see — in-namespace pid 2
+/// where the sandbox has a PID namespace, the host pid where it has none — so
+/// the map files are named from what this process already knows.
+///
+/// End-of-file at the gate means the command died before it unshared. It
+/// reported its own failure over the report pipe, so there is nothing to add
+/// and nothing to write: supervision proceeds and collects its exit.
+///
+/// Post-fork safe: no allocation, no locking, and no panic.
+fn delegate_nested_map(
+    context: &Context<'_>,
+    procfs: BorrowedFd<'_>,
+    gate: BorrowedFd<'_>,
+    command: Pid,
+) -> Result<(), Failure> {
+    let Some(nested) = &context.plan.nested else {
+        return Ok(());
+    };
+
+    // The command is unshared and waiting.
+    let mut byte = [0u8; 1];
+    loop {
+        match rustix::io::read(gate, &mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => break,
+            Err(Errno::INTR) => continue,
+            Err(errno) => return Err((SetupStep::NestedMapGate, errno, 0)),
+        }
+    }
+
+    // The gid map before the uid map, which is the order `establish_map` writes
+    // them in; neither ordering is forced for a privileged writer, and matching
+    // the self-written path leaves one order to know. `setgroups` is left at
+    // `allow` — a privileged writer needs no denial, and denying it would cost
+    // the supplementary groups a run-as identity sets.
+    let pid = command.as_raw_nonzero().get() as u32;
+    for (file, lines, step) in [
+        (
+            &b"gid_map"[..],
+            &nested.gid_lines,
+            SetupStep::NestedWriteGidMap,
+        ),
+        (
+            &b"uid_map"[..],
+            &nested.uid_lines,
+            SetupStep::NestedWriteUidMap,
+        ),
+    ] {
+        write_map_file(procfs, pid, file, lines).map_err(|errno| (step, errno, 0))?;
+    }
+
+    // Release the command.
+    loop {
+        match rustix::io::write(gate, &[super::MAP_GO_BYTE]) {
+            Ok(_) => return Ok(()),
+            Err(Errno::INTR) => continue,
+            Err(errno) => return Err((SetupStep::NestedMapGate, errno, 0)),
+        }
+    }
+}
+
+/// Writes one of another process's identity-map files, addressed relative to a
+/// descriptor for the procfs that indexes it.
+fn write_map_file(procfs: BorrowedFd<'_>, pid: u32, file: &[u8], data: &[u8]) -> Result<(), Errno> {
+    let path = map_file_path(pid, file);
+    let fd = fs::openat(
+        procfs,
+        path.as_cstr(),
+        OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    write_all_at_once(&fd, data)
 }
 
 /// The [`SetupStep`] a launch reports for a shared map step.
@@ -827,7 +1242,15 @@ fn setup_step(step: MapStep) -> SetupStep {
 /// The sandbox setup sequence: the identity-dependent namespace
 /// configuration through the root swap. The identity map itself is already
 /// established — by stage A, before this stage was forked.
-fn setup_sandbox(context: &Context<'_>) -> Result<(), Failure> {
+///
+/// Returns a descriptor for the sandbox's procfs when this stage is the
+/// delegate for the command's nested identity map, and `None` otherwise. It is
+/// opened here, through the new-root descriptor and with the same
+/// `RESOLVE_IN_ROOT` discipline every mount target gets, because here is the
+/// last moment at which nothing else could be mounted over it: the command does
+/// not exist yet, and once it does it shares this mount namespace until it
+/// unshares one of its own.
+fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     let plan = context.plan;
 
     // The UTS namespace is always new; the hostname changes only when one
@@ -861,6 +1284,11 @@ fn setup_sandbox(context: &Context<'_>) -> Result<(), Failure> {
     // `unshare` cannot anchor this step. The overlay mounts as root inside the
     // now-established identity map, so its copy-up ownership resolves against
     // that map.
+    // The root carries `nosuid` either way; see `nosuid_root`. An overlay takes
+    // it at its own mount, where the flag applies directly and no fallback is
+    // needed; a bind inherits its source's flags instead and has the attribute
+    // added below, once there is a descriptor for the mount to add it to.
+    let bound_root = plan.overlay.is_none();
     match &plan.overlay {
         None => {
             mount::mount_bind_recursive(&plan.rootfs_path, &plan.rootfs_path)
@@ -871,7 +1299,7 @@ fn setup_sandbox(context: &Context<'_>) -> Result<(), Failure> {
                 c"overlay",
                 plan.rootfs_path.as_c_str(),
                 c"overlay",
-                MountFlags::empty(),
+                MountFlags::NOSUID,
                 overlay.options.as_c_str(),
             )
             .map_err(|errno| (SetupStep::MountOverlayRoot, errno, 0))?;
@@ -888,12 +1316,37 @@ fn setup_sandbox(context: &Context<'_>) -> Result<(), Failure> {
     )
     .map_err(|errno| (SetupStep::EnterRootfs, errno, 0))?;
 
+    // Before the profile's own mounts, so the recursion covers the root bind
+    // and whatever it carried along and nothing the caller went on to mount:
+    // a caller's bind keeps its source's flags.
+    if bound_root {
+        nosuid_root(newroot.as_fd()).map_err(|errno| (SetupStep::NosuidRootfs, errno, 0))?;
+    }
+
     // The mount profile: host bind sources are still resolvable (the host
     // tree is mounted until the pivot), and every target resolves inside
     // the new root.
     for (index, op) in plan.ops.iter().enumerate() {
         execute_op(newroot.as_fd(), op).map_err(|(step, errno)| (step, errno, index as u32 + 1))?;
     }
+
+    // The procfs the command's nested identity map will be written through,
+    // opened only where this stage is the delegate for it. The mount profile
+    // has just established it, and the build refused a profile that establishes
+    // none.
+    let procfs = if plan.pid_namespace && delegates_nested_map(context) {
+        let target = plan
+            .nested
+            .as_ref()
+            .map(|nested| nested.procfs_target.as_c_str())
+            .unwrap_or(c"");
+        Some(
+            open_in_root(newroot.as_fd(), target, OFlags::RDONLY | OFlags::DIRECTORY)
+                .map_err(|errno| (SetupStep::OpenSandboxProcfs, errno, 0))?,
+        )
+    } else {
+        None
+    };
 
     process::fchdir(&newroot).map_err(|errno| (SetupStep::EnterRootfs, errno, 0))?;
 
@@ -910,7 +1363,7 @@ fn setup_sandbox(context: &Context<'_>) -> Result<(), Failure> {
         process::chdir(workdir.as_c_str()).map_err(|errno| (SetupStep::ChdirWorkdir, errno, 0))?;
     }
 
-    Ok(())
+    Ok(procfs)
 }
 
 /// Who the supervisor is relative to the sandbox.
@@ -1225,7 +1678,7 @@ fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
 ///
 /// Post-fork safe: no allocation, no locking, and no syscall but the directory
 /// read and `close`.
-pub(super) fn sweep_fds_keeping(keep: &[RawFd]) -> Result<(), Errno> {
+pub(crate) fn sweep_fds_keeping(keep: &[RawFd]) -> Result<(), Errno> {
     let dir = rustix::fs::open(
         c"/proc/self/fd",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -1457,15 +1910,41 @@ fn remount_read_only(root: BorrowedFd<'_>, target: &CStr) -> Result<(), Errno> {
         Mode::empty(),
         ResolveFlags::IN_ROOT,
     )?;
-    match mount_setattr_recursive_read_only(target.as_fd()) {
+    match mount_setattr_recursive(target.as_fd(), MOUNT_ATTR_RDONLY) {
         Ok(()) => Ok(()),
-        Err(Errno::NOSYS) => remount_read_only_top(target.as_fd()),
+        Err(Errno::NOSYS) => remount_top(target.as_fd(), MountFlags::RDONLY),
+        Err(errno) => Err(errno),
+    }
+}
+
+/// Marks the sandbox's root mount, and every mount the rootfs bind carried
+/// with it, `nosuid`.
+///
+/// The root is bound from a host tree and inherits that mount's flags, and the
+/// provisioners apply a tree's permission bits verbatim, so a Debian or Alpine
+/// rootfs inside the sandbox ships set-user-ID binaries owned by in-namespace
+/// uid 0 and file capabilities to match. Without the flag a non-root
+/// [`run_as`](crate::CageBuilder::run_as) command executes one of them and is
+/// root inside again — and the flag is only worth setting because the nested
+/// user namespace locks it, where before the command could have cleared it as
+/// readily as it cleared a read-only bind.
+///
+/// Scoped to the root. A caller's own bind keeps inheriting its source's flags:
+/// a caller who binds a host tree in order to run what is in it is entitled to
+/// a different answer than the rootfs gets.
+fn nosuid_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
+    match mount_setattr_recursive(root, MOUNT_ATTR_NOSUID) {
+        Ok(()) => Ok(()),
+        Err(Errno::NOSYS) => remount_top(root, MountFlags::NOSUID),
         Err(errno) => Err(errno),
     }
 }
 
 /// `MOUNT_ATTR_RDONLY`: with `mount_setattr`, mark the mount read-only.
 const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+/// `MOUNT_ATTR_NOSUID`: with `mount_setattr`, ignore set-user-ID and set-group-ID
+/// bits and file capabilities on the mount.
+const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
 /// `AT_RECURSIVE`: apply a `mount_setattr` change to the whole mount subtree.
 const AT_RECURSIVE: usize = 0x8000;
 /// `AT_EMPTY_PATH`: operate on the mount the descriptor itself names.
@@ -1484,14 +1963,18 @@ struct MountAttr {
 // The layout must match the kernel's, or the attribute would be misread.
 const _: () = assert!(size_of::<MountAttr>() == 32);
 
-/// Marks the mount `target` names, and every mount beneath it, read-only
+/// Sets `attr_set` on the mount `target` names, and on every mount beneath it,
 /// through `mount_setattr`.
+///
+/// Only ever used to *add* a restriction, which is what makes the recursion
+/// safe to apply without locked-flag handling: the call never clears a flag the
+/// namespace holds locked.
 ///
 /// Returns `Errno::NOSYS` on a kernel that predates `mount_setattr` (before
 /// 5.12), which the caller handles by falling back to a top-level remount.
-fn mount_setattr_recursive_read_only(target: BorrowedFd<'_>) -> Result<(), Errno> {
+fn mount_setattr_recursive(target: BorrowedFd<'_>, attr_set: u64) -> Result<(), Errno> {
     let attr = MountAttr {
-        attr_set: MOUNT_ATTR_RDONLY,
+        attr_set,
         attr_clr: 0,
         propagation: 0,
         userns_fd: 0,
@@ -1514,30 +1997,31 @@ fn mount_setattr_recursive_read_only(target: BorrowedFd<'_>) -> Result<(), Errno
     .map_err(|err| Errno::from_raw_os_error(err.into_raw()))
 }
 
-/// Remounts only the bind mount `target` names read-only, the fallback for a
-/// kernel without `mount_setattr`.
-fn remount_read_only_top(target: BorrowedFd<'_>) -> Result<(), Errno> {
-    let flags = remount_flags(fs::fstatvfs(target)?.f_flag);
+/// Remounts only the mount `target` names with `added` set, the fallback for a
+/// kernel without `mount_setattr`. Submounts keep their own flags.
+fn remount_top(target: BorrowedFd<'_>, added: MountFlags) -> Result<(), Errno> {
+    let flags = remount_flags(fs::fstatvfs(target)?.f_flag, added);
     mount::mount_remount(fd_path(&target).as_cstr(), flags, c"")
 }
 
-/// Translates the flags `fstatvfs` observed on a mount into the flags its
-/// read-only remount must carry.
+/// Translates the flags `fstatvfs` observed on a mount into the flags a remount
+/// of it must carry, `added` being the restriction the remount is for.
 ///
-/// A read-only remount in a user namespace must not clear the mount flags the
-/// namespace holds locked (`nosuid`, `nodev`, ...), so the observed flags are
-/// carried into the remount. Atime flags are left unspecified — the kernel
-/// preserves the existing atime settings on a remount that names none —
-/// because `fstatvfs` reports raw `ST_*` bits, and `ST_RELATIME` does not
-/// share `MS_RELATIME`'s value; the flags copied here all have coinciding
-/// `ST_*` and `MS_*` values.
+/// A remount in a user namespace must not clear the mount flags the namespace
+/// holds locked (`nosuid`, `nodev`, ...), so the observed flags are carried
+/// into the remount alongside the one being added. Atime flags are left
+/// unspecified — the kernel preserves the existing atime settings on a remount
+/// that names none — because `fstatvfs` reports raw `ST_*` bits, and
+/// `ST_RELATIME` does not share `MS_RELATIME`'s value; the flags copied here
+/// all have coinciding `ST_*` and `MS_*` values.
 ///
-/// Split out from its one caller because it is pure logic on a path no current
+/// Split out from its callers because it is pure logic on a path no current
 /// kernel takes: the fallback runs only below Linux 5.12, so the table is
 /// testable where the remount around it is not.
-fn remount_flags(observed: StatVfsMountFlags) -> MountFlags {
-    let mut flags = MountFlags::BIND | MountFlags::RDONLY;
+fn remount_flags(observed: StatVfsMountFlags, added: MountFlags) -> MountFlags {
+    let mut flags = MountFlags::BIND | added;
     for (statvfs_flag, mount_flag) in [
+        (StatVfsMountFlags::RDONLY, MountFlags::RDONLY),
         (StatVfsMountFlags::NOSUID, MountFlags::NOSUID),
         (StatVfsMountFlags::NODEV, MountFlags::NODEV),
         (StatVfsMountFlags::NOEXEC, MountFlags::NOEXEC),
@@ -1570,47 +2054,87 @@ fn open_in_root_with(
     fs::openat2(root, path, oflags, mode, ResolveFlags::IN_ROOT)
 }
 
-/// The `/proc/self/fd/<fd>` path of a descriptor, formatted into a stack
-/// buffer: the widest raw descriptor is ten decimal digits.
-struct FdPath {
-    buf: [u8; 25],
+/// A path assembled into a stack buffer, for the post-fork stages that cannot
+/// allocate one.
+///
+/// The buffer holds every path formatted here with room to spare: the longest
+/// is `/proc/self/fd/` and ten decimal digits. A push that would not fit is
+/// dropped rather than truncating mid-way — these processes must not panic, and
+/// a short path fails its `open` with `ENOENT` instead of naming something else.
+struct StackPath {
+    buf: [u8; 48],
     len: usize,
+}
+
+impl StackPath {
+    /// An empty path.
+    fn new() -> StackPath {
+        StackPath {
+            buf: [0u8; 48],
+            len: 0,
+        }
+    }
+
+    /// Appends literal bytes, if they fit alongside the terminating NUL.
+    fn push(&mut self, bytes: &[u8]) {
+        if self.len + bytes.len() >= self.buf.len() {
+            return;
+        }
+        for &byte in bytes {
+            self.buf[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    /// Appends a value in decimal.
+    fn push_decimal(&mut self, mut value: u32) {
+        // The widest u32 is ten digits, emitted least-significant first and
+        // reversed into the buffer.
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            value /= 10;
+            count += 1;
+            if value == 0 {
+                break;
+            }
+        }
+        digits[..count].reverse();
+        self.push(&digits[..count]);
+    }
+
+    fn as_cstr(&self) -> &CStr {
+        // SAFETY: the buffer is zero-initialized and `push` never lets `len`
+        // reach the final byte, so the slice holds exactly one NUL, at the end.
+        unsafe { CStr::from_bytes_with_nul_unchecked(&self.buf[..self.len + 1]) }
+    }
 }
 
 /// Formats the `/proc/self/fd` path that names `fd`, so a descriptor
 /// resolved with `RESOLVE_IN_ROOT` can anchor a mount syscall that only
 /// accepts paths.
-fn fd_path<Fd: AsFd>(fd: &Fd) -> FdPath {
-    const PREFIX: &[u8] = b"/proc/self/fd/";
-    let mut buf = [0u8; 25];
-    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+fn fd_path<Fd: AsFd>(fd: &Fd) -> StackPath {
+    let mut path = StackPath::new();
+    path.push(b"/proc/self/fd/");
     // Descriptors are non-negative, so the cast is lossless.
-    let mut value = fd.as_fd().as_raw_fd() as u32;
-    let mut digits = [0u8; 10];
-    let mut count = 0;
-    loop {
-        digits[count] = b'0' + (value % 10) as u8;
-        value /= 10;
-        count += 1;
-        if value == 0 {
-            break;
-        }
-    }
-    let mut len = PREFIX.len();
-    while count > 0 {
-        count -= 1;
-        buf[len] = digits[count];
-        len += 1;
-    }
-    FdPath { buf, len }
+    path.push_decimal(fd.as_fd().as_raw_fd() as u32);
+    path
 }
 
-impl FdPath {
-    fn as_cstr(&self) -> &CStr {
-        // SAFETY: the buffer is zero-initialized and `len` never reaches the
-        // final byte, so the slice holds exactly one NUL, at the end.
-        unsafe { CStr::from_bytes_with_nul_unchecked(&self.buf[..self.len + 1]) }
-    }
+/// Formats the `<pid>/<file>` path of one identity-map file, relative to a
+/// descriptor for the procfs it lives in.
+///
+/// The delegate that writes another process's map addresses it this way rather
+/// than through an absolute path, because the procfs that indexes the process
+/// differs by launch shape: the sandbox's own where there is a PID namespace,
+/// the host's where there is not.
+fn map_file_path(pid: u32, file: &[u8]) -> StackPath {
+    let mut path = StackPath::new();
+    path.push_decimal(pid);
+    path.push(b"/");
+    path.push(file);
+    path
 }
 
 /// The flags half of `struct ifreq`, as the kernel's interface ioctls
@@ -1675,7 +2199,13 @@ fn bring_up_loopback() -> Result<(), Errno> {
 /// and nothing else; a short write is reported as an I/O error, not retried.
 pub(super) fn write_file(path: &CStr, data: &[u8]) -> Result<(), Errno> {
     let fd = rustix::fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())?;
-    match rustix::io::write(&fd, data) {
+    write_all_at_once(&fd, data)
+}
+
+/// Writes `data` in a single `write`, on the terms the identity-map files
+/// impose: the whole content or nothing.
+fn write_all_at_once<Fd: AsFd>(fd: &Fd, data: &[u8]) -> Result<(), Errno> {
+    match rustix::io::write(fd.as_fd(), data) {
         Ok(n) if n == data.len() => Ok(()),
         Ok(_) => Err(Errno::IO),
         Err(errno) => Err(errno),
@@ -1702,15 +2232,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_read_only_remount_carries_the_locked_flags_forward() {
-        // Every remount is a read-only bind, and each locked flag the kernel
-        // reported must come back with it: a user namespace refuses a remount
-        // that would clear one.
+    fn a_remount_carries_the_locked_flags_forward() {
+        // Every remount is a bind remount adding one restriction, and each
+        // locked flag the kernel reported must come back with it: a user
+        // namespace refuses a remount that would clear one.
         assert_eq!(
-            remount_flags(StatVfsMountFlags::empty()),
+            remount_flags(StatVfsMountFlags::empty(), MountFlags::RDONLY),
             MountFlags::BIND | MountFlags::RDONLY,
         );
         for (observed, expected) in [
+            (StatVfsMountFlags::RDONLY, MountFlags::RDONLY),
             (StatVfsMountFlags::NOSUID, MountFlags::NOSUID),
             (StatVfsMountFlags::NODEV, MountFlags::NODEV),
             (StatVfsMountFlags::NOEXEC, MountFlags::NOEXEC),
@@ -1721,11 +2252,23 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                remount_flags(observed),
+                remount_flags(observed, MountFlags::RDONLY),
                 MountFlags::BIND | MountFlags::RDONLY | expected,
                 "{observed:?}",
             );
         }
+        // The rootfs's `nosuid` remount is the other user of the table, and it
+        // must not make the root read-only along the way: only the restriction
+        // it was asked for is added, and a read-only source is still carried
+        // forward because clearing it is what a user namespace refuses.
+        assert_eq!(
+            remount_flags(StatVfsMountFlags::empty(), MountFlags::NOSUID),
+            MountFlags::BIND | MountFlags::NOSUID,
+        );
+        assert_eq!(
+            remount_flags(StatVfsMountFlags::RDONLY, MountFlags::NOSUID),
+            MountFlags::BIND | MountFlags::NOSUID | MountFlags::RDONLY,
+        );
     }
 
     /// Opens a directory the way the sandbox stage holds its new root.
@@ -1831,7 +2374,7 @@ mod tests {
             | StatVfsMountFlags::NOATIME
             | StatVfsMountFlags::NODIRATIME;
         assert_eq!(
-            remount_flags(atime),
+            remount_flags(atime, MountFlags::RDONLY),
             MountFlags::BIND | MountFlags::RDONLY,
             "an atime bit reached the remount flags",
         );

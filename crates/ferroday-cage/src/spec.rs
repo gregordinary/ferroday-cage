@@ -1,7 +1,7 @@
 //! The sandbox specification: builder, validation, and the launch entry point.
 
 use std::collections::BTreeMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
@@ -17,7 +17,7 @@ use crate::idmap::{self, IdMapper, Identity, IdentityMap};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
     Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction, MountDir, MountOp,
-    OverlayPlan, RlimitPlan, RunAsPlan, StdioPlan,
+    NestedMap, NestedPlan, OverlayPlan, RlimitPlan, RunAsPlan, StdioPlan,
 };
 use crate::observer::{Collect, Observer, Output};
 use crate::resolved::ResolvedInputs;
@@ -1349,6 +1349,21 @@ impl CageBuilder {
     /// carries nested mounts does not leave those nested mounts writable. On a
     /// kernel that predates `mount_setattr` (before Linux 5.12) only the top
     /// mount is made read-only and any submounts keep their own flags.
+    ///
+    /// # What read-only means here
+    ///
+    /// A boundary, not merely a view. The command cannot remount the bind
+    /// read-write, and a write to it answers `EROFS`.
+    ///
+    /// The kernel locks a mount's flags when it copies a mount tree *into* a
+    /// new user namespace, and the command enters one of its own between the
+    /// resource limits and the hardening layer. The lock holds against a
+    /// command that is root of that namespace with `CAP_SYS_ADMIN` and an
+    /// unfiltered `mount` syscall, so nothing else has to be configured for a
+    /// `bind_ro` to mean what it says: no capability drop, no seccomp filter,
+    /// and no non-root [`run_as`](Self::run_as) identity. The same lock covers
+    /// unmounting, so the bind cannot be detached to reveal the target
+    /// underneath it either.
     pub fn bind_ro(mut self, source: impl AsRef<Path>, target: impl AsRef<Path>) -> Self {
         self.mounts.push(Mount::Bind(Bind {
             source: source.as_ref().to_path_buf(),
@@ -1530,6 +1545,16 @@ impl CageBuilder {
     /// set survives it, and retaining `CAP_SETUID`, `CAP_SETGID`, or
     /// `CAP_SETPCAP` alongside a non-root identity is rejected at build
     /// time.
+    ///
+    /// The launch sets no-new-privileges whenever a run-as identity is
+    /// configured, in every build of the library and whatever else the sandbox
+    /// requests, because the cleared capability set is only half of the
+    /// boundary. A rootfs ships set-user-ID binaries and file capabilities
+    /// owned by in-namespace uid 0 — the provisioners apply a tree's
+    /// permission bits verbatim, so `/usr/bin/sudo` is a working
+    /// `/usr/bin/sudo` — and without the flag the non-root command executes
+    /// them and is root inside again. The flag closes that path for the
+    /// command and everything it starts.
     pub fn run_as(mut self, identity: Identity) -> Self {
         self.run_as = Some(identity);
         self
@@ -1613,6 +1638,13 @@ impl CageBuilder {
     /// host PID namespace and `/proc` is the host's procfs, bind-mounted.
     /// Either way, `/proc/net` and `/proc/sys/net` resolve through the
     /// sandbox's own network namespace.
+    ///
+    /// A container needs a procfs from somewhere: the nested user namespace the
+    /// command enters — which is what locks the sandbox's mount flags —
+    /// establishes its identity map through one, by path. Setting this to
+    /// `false` therefore obliges the profile to mount a procfs of its own, and
+    /// [`build`](Self::build) refuses one that does not with
+    /// [`ConfigError::NestedUsernsNeedsProcfs`](crate::ConfigError::NestedUsernsNeedsProcfs).
     pub fn mount_proc(mut self, mount: bool) -> Self {
         self.mount_proc = Some(mount);
         self
@@ -1693,6 +1725,10 @@ impl CageBuilder {
     /// is refused by [`build`](Self::build) rather than resolved silently.
     /// Leaving those toggles alone is not a contradiction, so
     /// `managed_mounts(false)` on its own is all it takes.
+    ///
+    /// One mount the profile must then declare for itself is a procfs; see
+    /// [`mount_proc`](Self::mount_proc) for why, and for the error a profile
+    /// that declares none is refused with.
     pub fn managed_mounts(mut self, managed: bool) -> Self {
         self.managed_mounts = Some(managed);
         self
@@ -2119,6 +2155,13 @@ impl CageBuilder {
             .map(|identity_request| validate_run_as(identity_request, &identity))
             .transpose()?;
 
+        // The nested user namespace the command enters before it hardens, which
+        // is what locks the flags of every mount the sandbox established. Its
+        // map reflects the one resolved above, and the procfs it is written
+        // through is the profile's, so both are settled here and the command
+        // stage replays frozen bytes.
+        let nested = build_nested_plan(&identity, &lowering.ops, self.pid_namespace)?;
+
         // The hardening request, compiled and validated here so the command
         // stage only replays frozen data.
         #[cfg(feature = "hardening")]
@@ -2165,6 +2208,7 @@ impl CageBuilder {
             plan: LaunchPlan {
                 confinement: Confinement::Container,
                 identity,
+                nested: Some(nested),
                 run_as,
                 program,
                 program_search,
@@ -2463,6 +2507,134 @@ fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan
             .map(|&group| rustix::thread::Gid::from_raw_unchecked(group))
             .collect(),
     })
+}
+
+/// Composes the nested user namespace's plan: the map it takes, and the procfs
+/// paths through which that map is established.
+///
+/// The map is the identity reflection of the sandbox's own, so the command sees
+/// the same ids one namespace deeper; the tier follows the sandbox's, because
+/// the kernel's one-id exception is what lets a process write its own map and
+/// nothing richer.
+///
+/// A container needs a procfs for this: the map files are reached by path, and
+/// the paths that name them are inside the sandbox by the time the command
+/// writes them. A profile that mounts none is refused here rather than at
+/// launch, where the failure would be an `ENOENT` on a path nobody asked for.
+fn build_nested_plan(
+    identity: &IdentityPlan,
+    ops: &[MountOp],
+    pid_namespace: bool,
+) -> Result<NestedPlan, Error> {
+    // Only a delegated map inside a PID namespace of the sandbox's own needs a
+    // *fresh* procfs; see `procfs_op_target`.
+    let needs_fresh_procfs = pid_namespace && matches!(identity, IdentityPlan::Ranged { .. });
+    let procfs_target =
+        visible_procfs(ops, needs_fresh_procfs).ok_or(ConfigError::NestedUsernsNeedsProcfs)?;
+
+    // The map files as the command names them after the pivot: absolute, under
+    // the profile's own procfs target.
+    let under_procfs = |leaf: &str| -> Result<CString, ConfigError> {
+        let target = procfs_target.to_bytes();
+        let mut path = Vec::with_capacity(target.len() + leaf.len() + 2);
+        path.push(b'/');
+        path.extend_from_slice(target);
+        path.push(b'/');
+        path.extend_from_slice(leaf.as_bytes());
+        CString::new(path).map_err(|_| ConfigError::EmbeddedNul)
+    };
+
+    let (map, uid, gid) = match identity {
+        // The single-identity tier collapses to one extent of one id, which is
+        // all it ever had, and which the command may write for itself.
+        IdentityPlan::Single => {
+            let root = [idmap::IdRange {
+                inside: 0,
+                outside: 0,
+                count: 1,
+            }];
+            (NestedMap::SelfWritten, root.to_vec(), root.to_vec())
+        }
+        IdentityPlan::Ranged { map, .. } => (
+            NestedMap::Delegated,
+            idmap::reflect_inside(map.uid()),
+            idmap::reflect_inside(map.gid()),
+        ),
+    };
+
+    Ok(NestedPlan {
+        map,
+        uid_lines: idmap::format_map(&uid),
+        gid_lines: idmap::format_map(&gid),
+        setgroups_path: under_procfs("self/setgroups")?,
+        gid_map_path: under_procfs("self/gid_map")?,
+        uid_map_path: under_procfs("self/uid_map")?,
+        procfs_target: procfs_target.to_owned(),
+    })
+}
+
+/// The rootfs-relative target of the procfs the sandbox ends up with, or `None`
+/// when the profile mounts none the nested map can be established through.
+///
+/// The ops execute in order, so a later mount can hide an earlier one; the scan
+/// follows the same order and drops a procfs another mount comes to rest on top
+/// of. Where a profile mounts more than one, the last still visible is taken —
+/// any of them would serve.
+fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
+    let mut visible: Option<&CStr> = None;
+    for op in ops {
+        if let Some(target) = procfs_op_target(op, needs_fresh) {
+            visible = Some(target);
+        } else if let (Some(chosen), Some(target)) = (visible, op.action.target())
+            && covers(target, chosen)
+        {
+            visible = None;
+        }
+    }
+    visible
+}
+
+/// The rootfs-relative target an op mounts a usable procfs on, or `None` for
+/// every other op.
+///
+/// A fresh procfs instance is mounted by the stage that performs the setup, so
+/// it presents the sandbox's own PID namespace whatever that namespace is. A
+/// bind carries whichever namespace its source presents instead, which matters
+/// in exactly one case: a delegate names the command's map files by the pid its
+/// `fork` returned, which is a pid of the sandbox's own PID namespace, and a
+/// bound procfs from outside that namespace does not index it. Everything else
+/// is served by either kind, because a process writing its *own* map reaches it
+/// through `self`, which every procfs instance resolves for its reader.
+fn procfs_op_target(op: &MountOp, needs_fresh: bool) -> Option<&CStr> {
+    match &op.action {
+        MountAction::Procfs { target } => Some(target),
+        MountAction::Raw { target, fstype, .. } if fstype.as_bytes() == b"proc" => Some(target),
+        MountAction::Bind { source, target, .. } if !needs_fresh && is_procfs(source) => {
+            Some(target)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the bind source is a procfs, by the filesystem's own magic number
+/// rather than by its path: the managed profile binds `/proc`, and a caller is
+/// free to bind a procfs mounted anywhere else.
+///
+/// A source that cannot be interrogated is not one, which is the safe answer:
+/// the build then refuses rather than composing paths into a filesystem that
+/// holds no map files.
+fn is_procfs(source: &CStr) -> bool {
+    rustix::fs::statfs(source).is_ok_and(|stat| stat.f_type == rustix::fs::PROC_SUPER_MAGIC)
+}
+
+/// Whether a mount at `mount` hides an entry at `covered`: the same path, or a
+/// directory the covered path sits beneath.
+///
+/// Both are rootfs-relative and carry no leading slash, so the comparison is a
+/// plain component-aligned prefix test.
+fn covers(mount: &CStr, covered: &CStr) -> bool {
+    let (mount, covered) = (mount.to_bytes(), covered.to_bytes());
+    covered.starts_with(mount) && (covered.len() == mount.len() || covered[mount.len()] == b'/')
 }
 
 /// Builder methods for the opt-in hardening layer: Landlock filesystem and
@@ -3732,10 +3904,18 @@ mod tests {
 
     #[test]
     fn opting_out_of_the_managed_mounts_establishes_none_of_them() {
-        let cage = sh_in("/tmp").managed_mounts(false).build().unwrap();
-        assert!(
-            cage.plan.ops.is_empty(),
-            "expected no mount operations, got {:?}",
+        // The caller's own procfs is all the plan carries: none of the managed
+        // profile's mounts survive the opt-out, and the one the nested user
+        // namespace's map needs is the caller's to declare.
+        let cage = sh_in("/tmp")
+            .managed_mounts(false)
+            .bind("/proc", "/proc")
+            .build()
+            .unwrap();
+        assert_eq!(
+            cage.plan.op_labels.len(),
+            1,
+            "expected only the caller's own mount, got {:?}",
             cage.plan.op_labels,
         );
     }
@@ -3763,9 +3943,10 @@ mod tests {
         let cage = sh_in("/tmp")
             .managed_mounts(false)
             .mount_dev(false)
+            .bind("/proc", "/proc")
             .build()
             .unwrap();
-        assert!(cage.plan.ops.is_empty());
+        assert_eq!(cage.plan.op_labels.len(), 1);
     }
 
     #[test]
@@ -4155,13 +4336,69 @@ mod tests {
 
     #[test]
     fn toggles_remove_the_profile_mounts() {
+        // Each toggle removes its own mount; the procfs the nested user
+        // namespace's map is established through comes back as the caller's
+        // own, which is what `mount_proc(false)` now obliges them to supply.
         let cage = sh_in("/tmp")
             .mount_proc(false)
             .mount_dev(false)
             .mount_tmp(false)
+            .bind("/proc", "/proc")
             .build()
             .unwrap();
-        assert!(cage.plan.ops.is_empty(), "{:?}", cage.plan.op_labels);
+        assert_eq!(cage.plan.op_labels.len(), 1, "{:?}", cage.plan.op_labels);
+        assert!(cage.plan.op_labels[0].starts_with("/proc at /proc"));
+    }
+
+    #[test]
+    fn a_container_with_no_procfs_at_all_is_refused() {
+        // The nested user namespace that locks the sandbox's mount flags
+        // establishes its identity map through a procfs, by path, from inside
+        // the sandbox. A profile that mounts none is refused here rather than
+        // failing at launch on a path nobody asked for.
+        let err = sh_in("/tmp").mount_proc(false).build().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::NestedUsernsNeedsProcfs),
+        ));
+    }
+
+    #[test]
+    fn a_ranged_map_in_a_pid_namespace_will_not_take_a_bound_procfs() {
+        // The sandbox's own delegate names the command's map files by the pid
+        // its `fork` returned, which is a pid of the sandbox's PID namespace. A
+        // bind of the host's procfs does not index that namespace, so it cannot
+        // serve — while the same bind serves the single-identity tier, whose
+        // command reaches its own map through `self`.
+        let ranged = || {
+            sh_in("/tmp")
+                .managed_mounts(false)
+                .bind("/proc", "/proc")
+                .identity_map(IdentityMap::ranges(
+                    vec![crate::IdRange {
+                        inside: 0,
+                        outside: 1000,
+                        count: 1,
+                    }],
+                    vec![crate::IdRange {
+                        inside: 0,
+                        outside: 1000,
+                        count: 1,
+                    }],
+                ))
+                .id_mapper(FakeMapper)
+        };
+        assert!(matches!(
+            ranged().build().unwrap_err(),
+            Error::Config(ConfigError::NestedUsernsNeedsProcfs),
+        ));
+        // Without a PID namespace of its own the sandbox's pids are the
+        // caller's, and the bind indexes exactly the processes the delegate
+        // names.
+        ranged()
+            .pid_namespace(false)
+            .build()
+            .expect("a bound procfs serves where the pids agree");
     }
 
     #[test]

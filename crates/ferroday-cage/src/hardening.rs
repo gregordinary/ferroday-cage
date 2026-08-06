@@ -1121,9 +1121,14 @@ const TIOCLINUX: u64 = 0x541C;
 /// runs once the sandbox exits. Modern kernels gate `TIOCSTI` behind the
 /// `dev.tty.legacy_tiocsti` sysctl, which defaults to off, and grant it only
 /// for the process's own controlling terminal; this denies it outright, on
-/// every kernel, whichever terminal is named. See
-/// [`Stdio`](crate::Stdio), which decides whether the sandbox has a terminal to
-/// aim them at in the first place.
+/// every kernel, whichever terminal is named. See [`Stdio`](crate::Stdio),
+/// which decides whether the sandbox reaches the *caller's* terminal at all —
+/// the reach this exists to close. A terminal launch
+/// ([`Cage::spawn_terminal`](crate::Cage::spawn_terminal)) reaches none of it
+/// whatever `Stdio` says, since the sandbox has a terminal of its own; the
+/// denial still applies there, and denies an operation on a terminal nobody
+/// else can see, which is the price of a denylist that does not ask whose
+/// terminal it is.
 ///
 /// The comparison is on the low 32 bits because `ioctl`'s request argument
 /// reaches the kernel as an `unsigned int`: the high half is discarded before

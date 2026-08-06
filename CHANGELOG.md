@@ -14,7 +14,105 @@ affected.
 
 ## [Unreleased]
 
+### Security
+
+- A read-only bind is a boundary. The command enters a nested user namespace
+  before it hardens, and the kernel locks a mount's flags exactly when it copies
+  a mount tree into a new user namespace — so past that point no restriction on
+  a mount the sandbox established can be lifted. Previously the sandbox created
+  its user namespace and then built the mounts inside it, which locks nothing:
+  the command ran as root of that same namespace holding `CAP_SYS_ADMIN`, and
+  could clear `MS_RDONLY` on its own read-only bind and write through to the
+  host as the calling user. It holds in every build and needs nothing else
+  configured — no capability drop, no seccomp filter, no non-root `run_as` — and
+  it covers unmounting and atime behaviour as well as the flags. The command
+  remains free to mount whatever it likes in its own namespace; those mounts are
+  its own, unlocked, and private to it.
+
+- The sandbox's root mount carries `nosuid`, so a set-user-ID or set-group-ID
+  binary in the rootfs confers nothing on the command that executes it, and a
+  file capability recorded on one is ignored. A provisioned rootfs applies the
+  tree's permission bits verbatim, so a Debian or Alpine root ships set-user-ID
+  binaries owned by in-namespace uid 0; a non-root `run_as` identity could
+  otherwise execute its way back through one. The flag is locked by the nested
+  entry like every other. The scope is the root and whatever its bind carried
+  along: a caller's own `bind` and `bind_ro` mounts keep inheriting their
+  source's flags, since a caller who binds a host tree in order to run what is
+  in it is entitled to a different answer.
+
+### Changed
+
+- **Breaking.** A container requires a procfs. The nested user namespace's
+  identity map is established through one, by path, from inside the sandbox, so
+  a profile that mounts none is refused at build time with the new
+  `ConfigError::NestedUsernsNeedsProcfs`. The managed profile mounts one by
+  default; this is reachable only from a profile that sets `managed_mounts(false)`
+  or `mount_proc(false)` and declares no procfs of its own. A bind of the host's
+  procfs serves, except under the one combination that needs the sandbox's own
+  pids to index it — a range identity map inside a PID namespace of the
+  sandbox's own — where a fresh instance is required.
+
+- **Breaking.** The command holds no capability over the namespaces the sandbox
+  created, because it is now root of a *child* of the user namespace that owns
+  them. In practice: it cannot bind a TCP port below 1024, cannot open a raw
+  socket or send ICMP — `ping` no longer works inside a sandbox — and cannot
+  change the hostname or reconfigure the network interfaces the setup brought
+  up. Ordinary sockets are unaffected, and everything the userspace network
+  stack carries behaves as before.
+
+- **Breaking.** Every launch holds two user namespaces rather than one, and a
+  namespace is charged against `user.max_user_namespaces` at every level up to
+  the initial namespace. `host::userns_blocker` gains
+  `UsernsBlocker::MaxUserNamespacesBelowNesting` for a ceiling of `1`, which
+  admits the first namespace and refuses the second; a budget exhausted at
+  launch — which no probe can foresee — surfaces as the new
+  `Error::NestedUsernsBudgetExhausted`, naming the sysctl.
+
+- `SetupStep` gains eight variants for the new steps: `NestedUnshare`,
+  `NestedDenySetgroups`, `NestedWriteGidMap`, `NestedWriteUidMap`,
+  `AwaitNestedIdentityMap`, `OpenSandboxProcfs`, `NestedMapGate`, and
+  `NosuidRootfs`. They are named apart from the outer namespace's steps so a
+  failure says which of the two the launch was establishing.
+
 ### Fixed
+
+- A run-as identity sets no-new-privileges, in every build of the library and
+  whatever else the sandbox requests. The flag was set only by the hardening
+  layer, and only when that layer had something else to do, so a sandbox
+  configured with a non-root identity and nothing else ran without it — and a
+  build without the `hardening` feature never set it at all, while `run_as`
+  worked there. The cleared capability set is only half of the boundary a
+  non-root identity draws: the rootfs bind inherits the host mount's flags
+  rather than adding `nosuid`, and the provisioners apply a tree's permission
+  bits verbatim, so a Debian or Alpine rootfs inside the sandbox ships
+  set-user-ID binaries and file capabilities owned by in-namespace uid 0, and
+  the non-root command could execute them and be root inside again.
+
+- **`fcage`.** `--terminal` no longer spins at 100% CPU when `fcage`'s own
+  standard input is a pipe whose writer has closed, or names no open file at
+  all. The relay retired that channel by giving its poll slot an empty events
+  mask, and `poll` reports `POLLHUP`, `POLLERR`, and `POLLNVAL` whatever the
+  requested events are, so the slot was ready on every pass and the loop stopped
+  blocking — for the rest of the session. A retired channel now leaves the
+  polled set instead. `producer | fcage --terminal ...` is the shape that
+  reached it; `< /dev/null` and a regular-file redirect never did, because
+  neither reports a hangup. An invalid standard input (`0<&-`) was additionally
+  never diagnosed; it now retires the channel exactly as end of input does,
+  which is the same thing it says.
+
+- The network stack's tap helper closes its inherited descriptor table before
+  joining the sandbox's namespaces. It was the one process the library forks
+  that swept nothing, so for its lifetime it held open every descriptor the
+  caller had — among them a concurrently live sandbox's control socket, whose
+  last copy closing is what `stop_with_caller` waits on, and a concurrently
+  allocated pseudoterminal replica, whose last copy closing is what ends the
+  primary's reads.
+
+- **`fcage`.** The `--terminal` relay's signal descriptor decodes the signal
+  number in the host's byte order rather than little-endian, and a record naming
+  a number the build has no name for is skipped rather than ending the drain for
+  that wake. Neither was reachable on any target the crate builds for; both were
+  claims about the kernel's format that happened to hold.
 
 - The command's standard output and standard error can be directed somewhere,
   which closes the rest of the caller's terminal. A sandbox in a session of its
@@ -259,6 +357,23 @@ affected.
 
 ### Added
 
+- A plan reports what the archive says each package weighs and which source
+  package it was built from. `PlannedPackage::installed_size` carries the
+  archive's `Installed-Size` in the kibibytes Debian Policy defines it in,
+  rather than normalized to bytes, so it can be compared against a mirror's
+  value directly; it is the archive's build-time estimate of a staged tree, not
+  a measurement of an installed filesystem, and a sum over a plan should be
+  presented as one. `PlannedPackage::source` carries the `Source` field's
+  package name with any parenthesized source version dropped, and is `None` for
+  the common case of a binary package whose source shares its name, so the
+  several binary packages of one source can be attributed to the thing that was
+  built. Both are optional, both are written to a plan document and read back,
+  and neither changes the document's `Format` version: a document written
+  without them still reads. They are written after every field the format's
+  first readers knew, which is where those readers put an unknown field back, so
+  a plan that makes the round trip through an older reader of this library
+  returns byte-identical.
+
 - A tree written under the single-identity map is removed through that map when
   the plain removal is refused. `provision::remove` escalated a range map only,
   so a single-mapped tree holding a directory whose own mode denies the write
@@ -445,6 +560,25 @@ affected.
   that ran. The lookup also skips relative `PATH` entries, which name the
   process's working directory — not somewhere to resolve a privileged helper
   from — matching what `path_lookup` already does for the sandbox's own `PATH`.
+  The two auxiliary tools the delegate consults, `id` for the caller's user name
+  and `getsubids` for the allocation, go through the same lookup for the same
+  reason.
+
+- `Terminal::size` leaves a zero dimension at its default rather than passing it
+  through. Zero is what a terminal reports when its size is *unknown* — a
+  pseudoterminal nobody has sized — and the kernel accepts it silently, leaving
+  the sandbox a terminal that answers "no size" to everything that asks: `stty
+  size` refuses it and a full-screen program has nothing to draw into. `fcage`
+  already guarded against exactly this before calling `size`; a library caller
+  plumbing the same reading in now lands in the same place.
+
+- **`fcage`.** The `--terminal` relay blocks `SIGTTOU`. A `tcsetattr` from a
+  background process group raises it and its default action stops the process,
+  so a backgrounded relay would stop inside the restoration and leave the
+  caller's terminal in raw mode with nothing left to fix it. Blocked, the call
+  succeeds and the restoration holds from the background as it does from the
+  foreground. `SIGTTIN` is deliberately not blocked: a backgrounded relay
+  stopping when it tries to read the terminal is the conventional behavior.
 
 - The overlay documentation no longer steers callers at `/var/tmp`, which is
   mode `1777` everywhere. `Overlay::upper`, `Overlay::work`, `overlay`, and

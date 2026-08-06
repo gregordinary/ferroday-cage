@@ -12,6 +12,16 @@ enables it. Every restriction is configured on the builder, applies
 only to the command and the processes it starts, and is enforced after the root
 pivot and immediately before the command executes.
 
+More precisely, it is enforced after the command enters [its nested user
+namespace](how-the-sandbox-is-built.md#the-nested-user-namespace), and that
+ordering is a requirement rather than a detail of the implementation. Entering a
+user namespace has the kernel re-derive the whole credential: the securebits
+return to their defaults, the capability bounding set is refilled, and the
+inheritable and ambient sets are cleared. Anything on this page applied before
+the entry would be undone without a word. What the entry itself establishes —
+the locks on the sandbox's mount flags — needs none of this layer, and holds in
+every build.
+
 ## Landlock filesystem rules
 
 [`landlock_fs`] grants a set of accesses beneath a path. Configuring any grant
@@ -324,6 +334,9 @@ reasonably assume are covered, and are not:
   the calling user could modify on the host. A Landlock grant narrows this; so
   does [`overlay_rootfs`](provisioning.md#keeping-a-provisioned-rootfs-pristine),
   which leaves the base untouched and sends every write to a disposable upper.
+  The root is mounted `nosuid`, so what the command writes into the tree cannot
+  be executed back with elevated ids — but the tree's contents are still the
+  command's to change.
 
 Neither gap is silent: what the layer does enforce, it enforces completely,
 and what it does not, it does not claim.
@@ -361,7 +374,10 @@ the identity switch: the securebits are locked (when a non-root identity keeps
 capabilities), no-new-privileges is set, and Landlock is enforced; then the
 identity switch is performed; then capabilities are dropped and the seccomp
 filter is installed last, so the active filter governs only the command's
-`execve` and what follows. The ordering is deliberate. Landlock and its
+`execve` and what follows. No-new-privileges is set a second time by the switch
+itself when a run-as identity is configured, so that a build without this
+feature — and a sandbox that asks for a non-root identity and no hardening at
+all — still gets it. The ordering is deliberate. Landlock and its
 grant-path opens run while the process still holds its in-namespace root
 credentials, before the switch and the capability drop take them away, so the
 grants are established successfully; and the seccomp filter, installed after the

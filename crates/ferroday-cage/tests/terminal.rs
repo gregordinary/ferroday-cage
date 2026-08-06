@@ -7,7 +7,11 @@ mod common;
 
 use std::io::{Read as _, Write as _};
 
-use ferroday_cage::{Cage, ConfigError, Error, Identity, IdentityMap, Pty, Stdio, Terminal};
+use ferroday_cage::{Cage, ConfigError, Error, IdentityMap, Pty, Stdio, Terminal};
+// The run-as case is the only one that names an identity, and it needs a range
+// map, so it and this import are gated together.
+#[cfg(feature = "subid")]
+use ferroday_cage::Identity;
 
 /// Everything the sandbox wrote to its terminal, up to end-of-file.
 ///

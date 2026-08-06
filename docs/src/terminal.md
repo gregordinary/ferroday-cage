@@ -38,7 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `Terminal` states the window size and nothing else: `Terminal::new()` is 80
 columns by 24 rows, a stated constant rather than anything read from the host,
-and `Terminal::new().size(rows, cols)` says otherwise. The replica is wired onto
+and `Terminal::new().size(rows, cols)` says otherwise. A zero dimension is left
+at its default: zero is what a terminal reports when its size is *unknown*, not
+a terminal with no rows, and a caller passing along what its own terminal
+reported should not have to filter that out. The replica is wired onto
 the command's file descriptors 0, 1 and 2 — a terminal is one stream — and the
 launch owns its session, so the pseudoterminal is the sandbox's controlling
 terminal whatever the standard-input disposition would otherwise have decided.
@@ -325,11 +328,11 @@ screen left active, a hidden cursor — were written by the sandboxed program
 through the relay verbatim and belong to it, exactly as `ssh` treats them.
 
 **Signals are data.** The relay blocks `SIGWINCH`, `SIGINT`, `SIGTERM`,
-`SIGHUP`, `SIGQUIT`, `SIGTSTP`, and `SIGCONT` before anything else starts — in
-particular before any thread the run may create, since a thread inherits the
-creating thread's mask — and reads them as one channel of its poll loop, from a
-signal descriptor. No relay code runs in signal context: there are no handlers,
-no async-signal-safety reasoning, and no shared flags.
+`SIGHUP`, `SIGQUIT`, `SIGTSTP`, `SIGCONT`, and `SIGTTOU` before anything else
+starts — in particular before any thread the run may create, since a thread
+inherits the creating thread's mask — and reads them as one channel of its poll
+loop, from a signal descriptor. No relay code runs in signal context: there are
+no handlers, no async-signal-safety reasoning, and no shared flags.
 
 - **`SIGWINCH`** — read the caller terminal's size and call `Pty::resize`.
 - **`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`** — forward: terminate the sandbox
@@ -344,22 +347,50 @@ no async-signal-safety reasoning, and no shared flags.
   `SIGSTOP`.
 - **`SIGCONT`** — re-enter raw mode and re-read the window size, which may have
   changed while stopped. The discipline `less` follows.
+- **`SIGTTOU`** — blocked for the effect of blocking it, and otherwise ignored.
+  A `tcsetattr` from a background process group raises it and its default action
+  stops the process, so a backgrounded relay would stop *inside* the restoration
+  and leave the caller's terminal raw. Blocked, the call succeeds and the
+  restoration discipline holds from the background as it does from the
+  foreground. `SIGTTIN` is deliberately not blocked: a backgrounded relay
+  stopping when it tries to read the terminal is the conventional behavior, and
+  the one the caller's shell reports.
 
-**The loop.** One thread, one poll: the caller's standard input, the primary,
-and the signal descriptor. The primary is set non-blocking so a large paste
-cannot stall the loop; bytes that do not fit yet wait in a pending buffer behind
-`POLLOUT`, and standard input is left unwatched while that buffer is occupied,
-so it cannot grow without bound. End-of-file on the caller's standard input
-sends `VEOF` to the primary — read from the replica's *current* settings rather
-than assumed, since a program inside is free to have changed it — and retires
-that channel. End-of-file on the primary ends the loop. `--timeout` is the poll
-deadline, answered with the same terminate-then-kill escalation the
+**The loop.** One thread, one poll: the primary, the signal descriptor, and the
+caller's standard input — in that order, because standard input is the one
+channel that retires and a retired channel must leave the polled set rather than
+be given an empty events mask. `poll` reports `POLLHUP`, `POLLERR`, and
+`POLLNVAL` whatever the requested events are, so a muted slot on a hung-up pipe
+is ready on every pass and the loop stops blocking; dropping the slot is what
+keeps `producer | fcage --terminal ...` from burning a core after the producer
+exits.
+
+The primary is set non-blocking so a large paste cannot stall the loop; bytes
+that do not fit yet wait in a pending buffer behind `POLLOUT`, and standard
+input is left unwatched while that buffer is occupied, so it cannot grow without
+bound. End-of-file on the caller's standard input sends `VEOF` to the primary —
+read from the replica's *current* settings rather than assumed, since a program
+inside is free to have changed it — and retires that channel. An invalid
+standard input (`fcage --terminal ... 0<&-`) takes the same path, since it says
+the same thing. End-of-file on the primary ends the loop. `--timeout` is the
+poll deadline, answered with the same terminate-then-kill escalation the
 non-terminal path uses.
+
+The two directions are not symmetric: the caller-bound one is a plain blocking
+write, outside the poll. Making it symmetric would need `O_NONBLOCK` on
+descriptor 1, and that flag lives on the open file description rather than on
+the descriptor — setting it would set it for the caller's shell and for every
+other process in the pipeline `fcage` was started from. What is given up is that
+a stopped downstream reader stalls the loop, including the signal channel; `ssh`
+has the same shape for the same reason.
 
 When `fcage`'s own standard input is not a terminal, raw mode, the size copy,
 and resize are all skipped and the relay still relays. A terminal that reports a
 size of zero in either dimension is treated as reporting none: that is what a
 pseudoterminal nobody has sized says, and passing it through would hand the
 sandbox a terminal that answers "no size" to everything that asks it.
+`Terminal::size` takes the same position, leaving a zero dimension at its
+default, so a library caller plumbing the same reading in lands in the same
+place.
 
 [relay]: https://github.com/gregordinary/ferroday-cage/blob/main/crates/ferroday-cage-cli/src/terminal.rs

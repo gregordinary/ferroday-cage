@@ -118,12 +118,31 @@ pub enum SetupStep {
     /// Make the launch's pseudoterminal the controlling terminal of the
     /// sandbox's session.
     SetControllingTerminal = 46,
+    /// Enter the nested user namespace that locks the sandbox's mount flags.
+    NestedUnshare = 47,
+    /// Write `deny` to the nested user namespace's `setgroups`.
+    NestedDenySetgroups = 48,
+    /// Write the nested user namespace's gid map.
+    NestedWriteGidMap = 49,
+    /// Write the nested user namespace's uid map.
+    NestedWriteUidMap = 50,
+    /// Wait for the sandbox's own delegate to establish the nested user
+    /// namespace's identity map.
+    AwaitNestedIdentityMap = 51,
+    /// Open the procfs the nested user namespace's identity map is
+    /// established through.
+    OpenSandboxProcfs = 52,
+    /// Create or operate the gate the nested identity map is established
+    /// across.
+    NestedMapGate = 53,
+    /// Mark the sandbox's root mount `nosuid`.
+    NosuidRootfs = 54,
 }
 
 impl SetupStep {
     /// Every step, in wire order. Used by the wire-protocol tests.
     #[cfg(test)]
-    pub(crate) const ALL: [SetupStep; 46] = [
+    pub(crate) const ALL: [SetupStep; 54] = [
         SetupStep::Unshare,
         SetupStep::DenySetgroups,
         SetupStep::WriteGidMap,
@@ -170,6 +189,14 @@ impl SetupStep {
         SetupStep::SetRlimit,
         SetupStep::NewSession,
         SetupStep::SetControllingTerminal,
+        SetupStep::NestedUnshare,
+        SetupStep::NestedDenySetgroups,
+        SetupStep::NestedWriteGidMap,
+        SetupStep::NestedWriteUidMap,
+        SetupStep::AwaitNestedIdentityMap,
+        SetupStep::OpenSandboxProcfs,
+        SetupStep::NestedMapGate,
+        SetupStep::NosuidRootfs,
     ];
 
     /// Decodes a step from its setup-error-pipe wire value.
@@ -221,6 +248,14 @@ impl SetupStep {
             44 => SetupStep::SetRlimit,
             45 => SetupStep::NewSession,
             46 => SetupStep::SetControllingTerminal,
+            47 => SetupStep::NestedUnshare,
+            48 => SetupStep::NestedDenySetgroups,
+            49 => SetupStep::NestedWriteGidMap,
+            50 => SetupStep::NestedWriteUidMap,
+            51 => SetupStep::AwaitNestedIdentityMap,
+            52 => SetupStep::OpenSandboxProcfs,
+            53 => SetupStep::NestedMapGate,
+            54 => SetupStep::NosuidRootfs,
             _ => return None,
         })
     }
@@ -277,6 +312,18 @@ impl fmt::Display for SetupStep {
             SetupStep::SetControllingTerminal => {
                 "making the sandbox's pseudoterminal its controlling terminal"
             }
+            SetupStep::NestedUnshare => "entering the nested user namespace",
+            SetupStep::NestedDenySetgroups => "denying setgroups in the nested user namespace",
+            SetupStep::NestedWriteGidMap => "writing the nested user namespace's gid map",
+            SetupStep::NestedWriteUidMap => "writing the nested user namespace's uid map",
+            SetupStep::AwaitNestedIdentityMap => {
+                "waiting for the nested identity map to be established"
+            }
+            SetupStep::OpenSandboxProcfs => {
+                "opening the procfs the nested identity map is established through"
+            }
+            SetupStep::NestedMapGate => "operating the nested identity-map gate",
+            SetupStep::NosuidRootfs => "marking the root mount nosuid",
         })
     }
 }
@@ -511,8 +558,10 @@ pub enum ConfigError {
     /// launch is free to supply one and this never arises against it.
     /// [`Stdio::Null`](crate::Stdio::Null) and
     /// [`Stdio::from_fd`](crate::Stdio::from_fd) state one, and a launch that
-    /// would supply its own — an [`Observer`](crate::Observer)'s capture pipes
-    /// — is refused rather than silently overriding what the caller said.
+    /// would supply its own is refused rather than silently overriding what the
+    /// caller said. Two launches supply one: an [`Observer`](crate::Observer)'s
+    /// capture pipes, on the output pair, and a terminal launch's
+    /// pseudoterminal replica, on all three at once.
     ///
     /// Reported by the launch rather than by
     /// [`build`](crate::CageBuilder::build): the contradiction is between the
@@ -521,8 +570,9 @@ pub enum ConfigError {
     /// nothing.
     #[non_exhaustive]
     StreamAttachmentConflict {
-        /// The stream whose disposition the attachment contradicts:
-        /// `"standard output"` or `"standard error"`.
+        /// The stream whose disposition the attachment contradicts, as a short
+        /// phrase — `"standard input"`, `"standard output"`, or
+        /// `"standard error"`.
         stream: &'static str,
         /// What the launch attaches to it, as a short phrase.
         attachment: &'static str,
@@ -569,6 +619,24 @@ pub enum ConfigError {
     /// can ever be set inside it. Supplementary groups need a range gid
     /// map.
     RunAsGroupsWithSingleMap,
+    /// The profile mounts no procfs the nested user namespace's identity map
+    /// can be established through.
+    ///
+    /// Every container enters a nested user namespace before it hardens, which
+    /// is what locks the flags of the mounts it inherited — without it the
+    /// command is root of the namespace those mounts belong to and may lift any
+    /// restriction they carry. The nested namespace's map is written through
+    /// `/proc`, by path, from inside the sandbox, so a sandbox with no procfs
+    /// has no way to establish one.
+    ///
+    /// Reachable only from a profile that opts out of the managed mounts with
+    /// [`managed_mounts(false)`](crate::CageBuilder::managed_mounts) (or
+    /// [`mount_proc(false)`](crate::CageBuilder::mount_proc)) and mounts no
+    /// procfs of its own. A bind of the host's procfs serves, except under the
+    /// one combination that needs the sandbox's own pids to index it: a range
+    /// [`identity_map`](crate::CageBuilder::identity_map), whose nested map a
+    /// delegate writes, inside a PID namespace of the sandbox's own.
+    NestedUsernsNeedsProcfs,
     /// A retained set-id capability alongside a non-root run-as identity.
     ///
     /// The securebits that preserve kept capabilities across the identity
@@ -827,6 +895,13 @@ impl fmt::Display for ConfigError {
                 "run-as supplementary groups require a range gid map; the single-identity \
                  map denies setgroups",
             ),
+            ConfigError::NestedUsernsNeedsProcfs => f.write_str(
+                "the sandbox mounts no procfs the nested user namespace that locks its mount \
+                 flags can establish its identity map through; mount one, or leave the \
+                 managed profile's own in place. A range identity map inside a PID namespace \
+                 of the sandbox's own needs a fresh procfs rather than a bind of the host's, \
+                 which the sandbox's pids do not index",
+            ),
             ConfigError::SetidCapWithNonRootIdentity { capability } => write!(
                 f,
                 "keeping {capability} alongside a non-root run-as identity would let the \
@@ -908,6 +983,18 @@ pub enum Error {
         /// The raw OS error the kernel returned for namespace creation.
         errno: i32,
     },
+    /// The host's user-namespace budget is exhausted, so the command could not
+    /// enter the nested user namespace that locks the sandbox's mount flags.
+    ///
+    /// A user namespace is charged against `user.max_user_namespaces` at every
+    /// level up to the initial namespace, and a launch holds two: the sandbox's
+    /// own, and the nested one the command enters. A host whose ceiling admits
+    /// the first and not the second reports this rather than a bare `ENOSPC`.
+    ///
+    /// Distinct from [`UsernsUnavailable`](Self::UsernsUnavailable), which is a
+    /// host that permits no user namespace at all: here the sandbox was built
+    /// and only the second namespace was refused.
+    NestedUsernsBudgetExhausted,
     /// A sandbox setup step failed in the child process.
     #[non_exhaustive]
     Setup {
@@ -998,6 +1085,12 @@ impl fmt::Display for Error {
                 "the kernel denied user namespace creation ({}); a seccomp filter or LSM \
                  policy may be blocking unprivileged user namespaces",
                 std::io::Error::from_raw_os_error(*errno),
+            ),
+            Error::NestedUsernsBudgetExhausted => f.write_str(
+                "the sandbox could not enter its nested user namespace: the host's user \
+                 namespace budget is exhausted. Every launch holds two user namespaces; \
+                 raise user.max_user_namespaces, or reduce the number of namespaces already \
+                 live",
             ),
             Error::Setup {
                 step,

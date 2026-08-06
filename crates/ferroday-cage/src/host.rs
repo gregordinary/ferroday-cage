@@ -32,6 +32,19 @@ pub enum UsernsBlocker {
     ///
     /// A limit of zero denies user namespace creation outright.
     MaxUserNamespacesIsZero,
+    /// The `user.max_user_namespaces` sysctl is `1`, and a launch needs two.
+    ///
+    /// The sandbox creates one user namespace, and the command enters a nested
+    /// one before it hardens — which is what locks the flags of the mounts the
+    /// sandbox established. A namespace is charged against the sysctl at every
+    /// level up to the initial namespace, so a ceiling of one admits the first
+    /// and refuses the second.
+    ///
+    /// The condition is necessary and not sufficient, as every blocker here is:
+    /// a host whose ceiling is four with three namespaces already live fails
+    /// the same way, and only the launch can know that. It surfaces there as
+    /// [`Error::NestedUsernsBudgetExhausted`](crate::Error::NestedUsernsBudgetExhausted).
+    MaxUserNamespacesBelowNesting,
     /// The `kernel.apparmor_restrict_unprivileged_userns` sysctl is `1`.
     ///
     /// On Ubuntu-derived systems this restricts user namespace creation to
@@ -49,6 +62,11 @@ impl fmt::Display for UsernsBlocker {
             UsernsBlocker::MaxUserNamespacesIsZero => {
                 "the user.max_user_namespaces sysctl is 0; raise it to permit user \
                  namespace creation"
+            }
+            UsernsBlocker::MaxUserNamespacesBelowNesting => {
+                "the user.max_user_namespaces sysctl is 1, and every launch holds two user \
+                 namespaces: the sandbox's own, and the nested one its command enters to \
+                 lock the sandbox's mount flags. Raise the sysctl to at least 2"
             }
             UsernsBlocker::ApparmorRestrictsUnprivilegedUserns => {
                 "the kernel.apparmor_restrict_unprivileged_userns sysctl is 1; set it to 0, \
@@ -71,8 +89,14 @@ pub fn userns_blocker() -> Option<UsernsBlocker> {
     if sysctl_value("/proc/sys/kernel/unprivileged_userns_clone") == Some(0) {
         return Some(UsernsBlocker::UnprivilegedUsernsCloneDisabled);
     }
-    if sysctl_value("/proc/sys/user/max_user_namespaces") == Some(0) {
-        return Some(UsernsBlocker::MaxUserNamespacesIsZero);
+    // The budget, not merely its presence: a launch holds two user namespaces,
+    // so a ceiling of one admits the sandbox's and refuses the nested one the
+    // command enters. Reporting that here turns a launch-time `ENOSPC` into a
+    // condition a caller can check for before it starts.
+    match sysctl_value("/proc/sys/user/max_user_namespaces") {
+        Some(0) => return Some(UsernsBlocker::MaxUserNamespacesIsZero),
+        Some(1) => return Some(UsernsBlocker::MaxUserNamespacesBelowNesting),
+        _ => {}
     }
     if sysctl_value("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") == Some(1) {
         return Some(UsernsBlocker::ApparmorRestrictsUnprivilegedUserns);

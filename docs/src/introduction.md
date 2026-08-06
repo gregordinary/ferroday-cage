@@ -30,7 +30,10 @@ with a standard mount profile — a fresh `/proc`, a minimal `/dev`, a tmpfs
 under a minimal reaping init in isolated PID, mount, UTS, IPC, cgroup, and
 (by default) network namespaces, with a clean, reproducible environment,
 scrubbed signal state, and a descriptor table holding only its standard
-streams. The surface grows additively from there. [How the sandbox is
+streams. It runs one user namespace deeper than the rest of the sandbox: the
+command enters a nested one before it execs, which is what locks the flags of
+every mount the setup established, so a read-only bind is a boundary and the
+root is `nosuid`. The surface grows additively from there. [How the sandbox is
 built](how-the-sandbox-is-built.md) describes the mechanism and [The
 process model](process-model.md) the process tree, lifetimes, and signal
 behavior.
