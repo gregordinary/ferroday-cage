@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Started by hand against a chosen ref. A push event is delivered once and is
+  # not redelivered, so a commit whose delivery was dropped -- a webhook
+  # throttled during a platform incident, most of all -- otherwise has no way to
+  # be checked short of pushing another commit for the sole purpose of
+  # triggering one.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -251,9 +257,12 @@ jobs:
     # README.md, SECURITY.md, CONTRIBUTING.md, and CHANGELOG.md. Publishing
     # requires the repository's Pages source to be set to "GitHub Actions".
     #
-    # A merged change publishes; a pull request builds and link-checks the
-    # guide in the job above without touching the live site.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # A merged change publishes, as does a run started by hand against main; a
+    # pull request builds and link-checks the guide in the job above without
+    # touching the live site.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
     needs: book
     runs-on: ubuntu-latest
     permissions:
