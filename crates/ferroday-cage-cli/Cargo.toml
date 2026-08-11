@@ -1,6 +1,6 @@
 [package]
 name = "ferroday-cage-cli"
-description = "Run a command inside an unprivileged Linux sandbox from a shell prompt: fresh namespaces, a provided root filesystem, seccomp and Landlock hardening, and a clean environment. Installs the fcage binary"
+description = "Run a command inside an unprivileged Linux sandbox from a shell prompt: fresh namespaces, a root filesystem you supply or bootstrap from Debian, Alpine, or Gentoo, seccomp and Landlock hardening, and a clean environment. Installs the fcage binary"
 # `fcage` versions independently of the library. Its compatibility contract is
 # its flags, exit codes, and output format, which a library release does not
 # necessarily change — and a library release that does break its own API need
@@ -13,7 +13,7 @@ repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
-keywords = ["sandbox", "container", "rootless", "chroot", "debootstrap"]
+keywords = ["sandbox", "rootless", "chroot", "debootstrap", "alpine"]
 # The integration tests drive the built binary against the library crate's
 # rootfs fixture, which they reach by workspace-relative path. They cannot run
 # from a published tarball, where that path does not exist, so they are not part

@@ -55,11 +55,13 @@ outbound IPv4 and IPv6 — and the seam also accepts an external one such as
 `pasta` or `slirp4netns`. See [Userspace networking](userspace-networking.md).
 
 The root filesystem is the caller's to supply, and the library can also produce
-one — provisioning from a tarball or bootstrapping a distribution. See
-[Provisioning a rootfs](provisioning.md); [An ebuild development
-sandbox](ebuild-sandbox.md) provisions a Gentoo stage3 and builds a package in
-it, and [Building a Debian package](building-a-debian-package.md) bootstraps a
-Debian suite and builds a `.deb` from source.
+one — provisioning from a tarball, or bootstrapping [a Debian](debian.md), [an
+Alpine or postmarketOS](alpine.md), or [a Gentoo](gentoo.md) userland from the
+distribution's own archive. See [Provisioning a rootfs](provisioning.md); [An
+ebuild development sandbox](ebuild-sandbox.md) provisions a Gentoo stage3 and
+builds a package in it, and [Building a Debian
+package](building-a-debian-package.md) bootstraps a Debian suite and builds a
+`.deb` from source.
 
 The default profile is a rootless convenience for code you trust: a controlled
 filesystem view, isolated namespaces, and a clean environment. Untrusted code

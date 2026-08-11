@@ -7,8 +7,9 @@ neither covers.
 ## Versioning
 
 The library follows Cargo's semantic versioning. Before 1.0 the minor position
-is the breaking one: `0.1.x` releases are compatible with each other, and
-`0.2.0` may break.
+is the breaking one: releases sharing a minor version are compatible with each
+other, and a new minor version may break. A release that breaks says so, entry
+by entry, in the [changelog](https://github.com/gregordinary/ferroday-cage/blob/main/CHANGELOG.md).
 
 `fcage`, the command-line interface, versions independently of the library. Its
 compatibility contract is its flags, exit codes, and output format, so a

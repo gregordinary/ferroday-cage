@@ -24,6 +24,12 @@ It is not a container runtime: there are no images, no registry, and no OCI runt
 specification. A root filesystem is a directory you supply or provision, and every
 sandbox is rootless — built with the caller's own credentials, with no daemon involved.
 
+The library can also produce that root filesystem: extracted from a tar archive, or
+bootstrapped straight from a distribution's own archive — Debian, Alpine and
+postmarketOS, or a signed Gentoo stage3 — with signatures verified, the package closure
+resolved in process, and no distribution tooling on the host. Each is an opt-in feature;
+the table below has the detail.
+
 ## Features
 
 A bare dependency gives the sandbox itself: namespaces, mounts, the root swap,

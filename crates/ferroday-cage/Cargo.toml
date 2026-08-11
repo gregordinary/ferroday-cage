@@ -1,6 +1,6 @@
 [package]
 name = "ferroday-cage"
-description = "Run a command inside an unprivileged Linux sandbox: fresh namespaces, a provided root filesystem, and a clean environment, established in pure Rust against the kernel"
+description = "Run a command inside an unprivileged Linux sandbox: fresh namespaces, a root filesystem you supply or bootstrap from Debian, Alpine, or Gentoo, and a clean environment, established in pure Rust against the kernel"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 categories = ["os::linux-apis", "virtualization"]
-keywords = ["sandbox", "container", "rootless", "seccomp", "debootstrap"]
+keywords = ["sandbox", "rootless", "seccomp", "debootstrap", "alpine"]
 # Test fixtures are host-and-feature-gated build inputs, and the public-API
 # snapshot is a review artifact, not part of the published crate. Keep both out
 # of the packaged tarball.

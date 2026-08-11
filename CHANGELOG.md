@@ -10,19 +10,26 @@ version.
 
 `ferroday-cage` (the library) and `ferroday-cage-cli` (the `fcage` binary)
 version independently. Entries below name the component when only one is
-affected.
+affected, and an entry a consumer must act on is prefixed **Breaking.**
+
+One section is not Keep a Changelog's. **Internal** records changes with no
+effect on the public API or on behaviour, kept because this workspace answers
+a question once and a reader needs to know where that answer moved to. A
+consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-11
+
 ### Changed
 
-- The transport seam is `provision::{Fetch, FetchRequest, FetchError,
-  HttpFetch, file_url}`, moved out of `provision::debian`. It was never
-  Debian's: it speaks HTTP and `file://` and knows nothing of an archive's
-  format, and every userland provisioner needs one. Under the old paths a
-  provisioner built without the `debian` feature had no transport at all, not
-  even the built-in client. The modules now compile for any userland feature,
-  and no re-export is left at the old paths.
+- **Breaking.** The transport seam is `provision::{Fetch, FetchRequest,
+  FetchError, HttpFetch, file_url}`, moved out of `provision::debian`. It was
+  never Debian's: it speaks HTTP and `file://` and knows nothing of an
+  archive's format, and every userland provisioner needs one. Under the old
+  paths a provisioner built without the `debian` feature had no transport at
+  all, not even the built-in client. The modules now compile for any userland
+  feature, and no re-export is left at the old paths.
 
   `file_url` reports a `FetchError` rather than a `DebianError`, since a path
   that cannot be named is a resource that cannot be addressed, whichever layer
@@ -30,22 +37,23 @@ affected.
   `DebianError::Fetch` where it previously returned `DebianError::Config` or
   `DebianError::Io`.
 
-- `BuildLayer` is `provision::BuildLayer`, moved out of `provision::debian` for
-  the same reason. It is the overlay upper a layered build installs into and the
-  handle that disposes of it — a path, the work directory beside it, and the
-  identity map that decides how both are removed — with nothing in it about any
-  particular userland. Every userland provisioner that stages an increment
-  returns one. No re-export is left at the old path.
+- **Breaking.** `BuildLayer` is `provision::BuildLayer`, moved out of
+  `provision::debian` for the same reason. It is the overlay upper a layered
+  build installs into and the handle that disposes of it — a path, the work
+  directory beside it, and the identity map that decides how both are removed —
+  with nothing in it about any particular userland. Every userland provisioner
+  that stages an increment returns one. No re-export is left at the old path.
 
-- `Stream` is `provision::Stream`, moved out of `provision::debian` and
-  `provision::alpine`, which each defined their own. The two definitions were
-  identical, down to the documentation: a provisioner that runs a command in a
-  cage has output to attribute to a standard stream whichever archive it
-  provisions from, and the attribution says nothing about the archive.
-  `DebianEvent::CommandOutput::stream` and `AlpineEvent::CommandOutput::stream`
-  both carry the shared type, so code that handles one layer's output handles the
-  other's. The events themselves stay with their layers, since those do speak
-  each archive's own vocabulary. No re-export is left at the old paths.
+- **Breaking.** `Stream` is `provision::Stream`, moved out of
+  `provision::debian` and `provision::alpine`, which each defined their own. The
+  two definitions were identical, down to the documentation: a provisioner that
+  runs a command in a cage has output to attribute to a standard stream
+  whichever archive it provisions from, and the attribution says nothing about
+  the archive. `DebianEvent::CommandOutput::stream` and
+  `AlpineEvent::CommandOutput::stream` both carry the shared type, so code that
+  handles one layer's output handles the other's. The events themselves stay
+  with their layers, since those do speak each archive's own vocabulary. No
+  re-export is left at the old paths.
 
 - An Alpine bootstrap fetches packages over its repository's whole mirror list,
   not only the mirror that served the index. `AlpineBuilder::mirror_fallback`
@@ -71,14 +79,14 @@ affected.
   failure, so a mistyped primary mirror was reported against whichever mirror
   came last instead of against the one that was wrong.
 
-- Every OS failure a library error carries is now an `io::Error` and is returned
-  from `source()`. `Error`, `ConfigError`, `IdMapError`, and `NetStackError`
-  stored a raw `errno: i32` and then rendered it by constructing an `io::Error`
-  at each `Display` arm — twenty-odd sites undoing the same representation —
-  while `ProvisionError`, `DebianError`, and `FetchError` carried the error
-  itself. `source()` divergence followed from that split: an error that holds
-  only a number has nothing to return, so half the crate's errors terminated a
-  caller's error chain early.
+- **Breaking.** Every OS failure a library error carries is now an `io::Error`
+  and is returned from `source()`. `Error`, `ConfigError`, `IdMapError`, and
+  `NetStackError` stored a raw `errno: i32` and then rendered it by constructing
+  an `io::Error` at each `Display` arm — twenty-odd sites undoing the same
+  representation — while `ProvisionError`, `DebianError`, and `FetchError`
+  carried the error itself. `source()` divergence followed from that split: an
+  error that holds only a number has nothing to return, so half the crate's
+  errors terminated a caller's error chain early.
 
   Every `errno: i32` field is now `source: io::Error`. The errno is not lost —
   `io::Error::raw_os_error` gives it back — and the two places where a failure
@@ -90,16 +98,16 @@ affected.
   Consequently those four types are no longer `UnwindSafe` or `RefUnwindSafe`,
   which is the same posture `ProvisionError` and `DebianError` already had.
 
-- `FetchError::Io::op` is a `&'static str` and `FetchError::io` takes its
-  arguments as `(op, url, source)`. Every error constructor in the crate now
-  reads operation, then locator, then cause; this one read locator first. Both
-  arguments were `impl Into<String>` before, so a stale call would have compiled
-  and silently produced a transposed message — narrowing `op` to `&'static str`
-  makes it a compile error instead.
+- **Breaking.** `FetchError::Io::op` is a `&'static str` and `FetchError::io`
+  takes its arguments as `(op, url, source)`. Every error constructor in the
+  crate now reads operation, then locator, then cause; this one read locator
+  first. Both arguments were `impl Into<String>` before, so a stale call would
+  have compiled and silently produced a transposed message — narrowing `op` to
+  `&'static str` makes it a compile error instead.
 
-- `ParseCapabilityError::name` is `ParseCapabilityError::text`, matching
-  `ParseFsAccessError::text` and `ParseNetAccessError::text`. Three parse errors
-  in one file answered the same question under two names.
+- **Breaking.** `ParseCapabilityError::name` is `ParseCapabilityError::text`,
+  matching `ParseFsAccessError::text` and `ParseNetAccessError::text`. Three
+  parse errors in one file answered the same question under two names.
 
 - `Debian::observe` takes a `DebianObserver` rather than a bare
   `FnMut(DebianEvent<'_>)` closure. A closure is still an observer — the trait
@@ -172,8 +180,9 @@ affected.
   mirror — and an observer saw nothing between `Resolving` and the first package
   download, while the Debian walk and the Alpine package walk both reported.
 
-- `fcage`'s `--debian-repository` and `--alpine-repository` refuse a spec whose
-  only mirror field is `mirror-fallback=`, and one that gives `mirror=` twice.
+- **Breaking.** `fcage`'s `--debian-repository` and `--alpine-repository` refuse
+  a spec whose only mirror field is `mirror-fallback=`, and one that gives
+  `mirror=` twice.
   Both were read positionally, so a lone backstop was promoted to primary and a
   repeated `mirror=` demoted the earlier value to a backstop ahead of the
   declared ones. A repository's primary mirror is written into the finished
@@ -186,13 +195,14 @@ affected.
   can supply the keys, which is what 125 means and what the library reports for
   the same failure. The help text reserves 2 for usage errors.
 
-- The shared tar reader refuses an entry whose `APK-TOOLS.checksum.SHA1` pax
-  record is not a SHA-1, and that reader serves the `.deb` data member and the
-  `Tarball` provisioner too. Before the Alpine layer every unknown pax key was
-  ignored, so a `.deb` or rootfs tarball carrying a malformed record of that name
-  was extractable and is now refused. dpkg toolchains do not write the key, and a
-  checksum that cannot be read is the safe thing to refuse; it is recorded here
-  because the seam is shared and the change reaches archives that are not apk's.
+- **Breaking.** The shared tar reader refuses an entry whose
+  `APK-TOOLS.checksum.SHA1` pax record is not a SHA-1, and that reader serves
+  the `.deb` data member and the `Tarball` provisioner too. Before the Alpine
+  layer every unknown pax key was ignored, so a `.deb` or rootfs tarball
+  carrying a malformed record of that name was extractable and is now refused.
+  dpkg toolchains do not write the key, and a checksum that cannot be read is
+  the safe thing to refuse; it is recorded here because the seam is shared and
+  the change reaches archives that are not apk's.
 
 - An Alpine resolution reports an increment that breaks a refusal a base package
   declares, where the base breaks the same refusal itself. Only the first
@@ -207,6 +217,30 @@ affected.
   ceiling moved out of the HTTP client with `LimitedWriter` and now bounds a
   compressed segment expanding under a decoder as readily as a mirror ignoring
   its own content length, so what it names is no longer a response body.
+
+- Both crates describe the root filesystem as one you supply *or bootstrap*,
+  and carry `alpine` among their keywords in place of `container`. The
+  descriptions were written when a root was only ever handed to the library,
+  and a third of what it now does went unmentioned on the page a reader
+  decides from. `container` was the weakest of the five: the README opens by
+  saying this is not a container runtime, so the term was competing for a
+  search whose results it did not belong in.
+
+- **`fcage`.** The crate carries a readme of its own rather than the library's.
+  Both crates rendered the same file, so the page a reader reaches by looking
+  for a command-line tool opened by describing a library and led with
+  `cargo add`. What it documents is the tool's own contract: installing it,
+  provisioning a root from each of the four sources, the confinement flags, a
+  profile, and the exit codes.
+
+- The readme and the guide's introduction name the three userlands where they
+  describe what the library does. Both mentioned provisioning only as a clause
+  — "a directory you supply or provision" — with the detail left to a feature
+  table and a chapter further in, so the front door of each undersold a third
+  of the crate. The introduction now links the three chapters directly. The
+  stability chapter states the pre-1.0 rule without naming particular versions,
+  having illustrated it with `0.2.0` as the release that might break, which
+  reads as a claim about a shipped version rather than as the rule.
 
 ### Added
 
@@ -316,6 +350,14 @@ affected.
 - `fcage --provision-alpine RELEASE`, with the `--alpine-*` options mapping onto
   the builder as the `--debian-*` set does. The two provisioners are mutually
   exclusive.
+
+- The `musl-build` example: a C build sandbox that bootstraps an Alpine root
+  with the toolchain, builds a source tree in a cage over a copy of it, and
+  collects the artifacts to a directory the caller names, leaving the host with
+  no compiler on it. It is the Alpine counterpart of the Debian package-build
+  example, and it ends by reading each artifact's ELF program headers and
+  reporting whether the binary really is static rather than asserting that
+  linking against musl made it so.
 
 - `ExitStatus::shell_code` and `Error::shell_code` return the process exit code
   a launcher reports: the command's own code or `128 + signal` for the first,
@@ -2197,7 +2239,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.2...v0.1.3
