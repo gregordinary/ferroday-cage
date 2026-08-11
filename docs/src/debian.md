@@ -610,7 +610,7 @@ for archive in &plan.archives {
         archive.signed_by.join(", "),
     );
 }
-// Which archive a package will be fetched from.
+// Which archive answered for a package when the plan was resolved.
 for package in &plan.packages {
     println!("{} <- {}", package.name, plan.archives[package.archive].mirror);
 }
@@ -865,6 +865,18 @@ out of order, a missing required field, and, on the writing side, a value the
 format cannot carry on one line or one whose own leading or trailing whitespace
 a reader would strip.
 
+Two fields are also held to their shape, because they are what a plan install
+composes rather than merely reports. A package's `Filename` is interpolated
+verbatim into the URL its `.deb` is fetched from, so it is held to the same rule
+an archive index's is: a relative path, no `..` component, printable ASCII only,
+as written and as a server that percent-decodes it would read it. And its
+`SHA256` must be 64 lowercase hex characters, since that is the value the fetched
+bytes are compared against. A document is a trust anchor, so neither is a
+defense against the plan itself — it is what keeps a plan that was edited by hand
+into something unfetchable from being reported as a mirror that served the wrong
+bytes. Both are checked again at `build`, since a `Plan` taken from `resolve`
+and modified in memory reaches the bootstrap without passing a reader.
+
 ## Holding a resolution to a plan's versions
 
 [`pin`] takes the same `Plan` and does something else with it. Where [`plan`]
@@ -933,8 +945,11 @@ and the pin's own archive records are not read — a pin constrains packages.
 A pin alongside a `plan` is refused at `build` with `DebianError::Config`: a
 plan resolves nothing, so there is no resolution left to constrain. So is a pin
 whose suite or architecture disagrees with the builder's, and one naming the
-same package twice, which states two versions to hold it at. Where the builder
-names no architecture the pin's is adopted, as a plan's is.
+same package twice, which states two versions to hold it at. So is one whose
+entries fail the shape a plan document's do — a digest that is not 64 lowercase
+hex characters is refused as the malformed entry it is, rather than compared and
+reported as an archive that had published past the pin. Where the builder names
+no architecture the pin's is adopted, as a plan's is.
 
 ### When the archives have moved past it
 

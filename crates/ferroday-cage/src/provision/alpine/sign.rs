@@ -1,7 +1,8 @@
 //! Signature verification: the `.SIGN.` member, and the key it names.
 //!
-//! An apk container's first segment holds exactly one tar member, whose *name*
-//! carries the whole scheme:
+//! An apk container's first segment holds one tar member per signature — every
+//! published artifact carries one, and a key rotation is what makes it more —
+//! whose *name* carries the whole scheme:
 //!
 //! ```text
 //! .SIGN.RSA.alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
@@ -185,27 +186,10 @@ impl Signature {
         &self.key
     }
 
-    /// Reads the signature a container's first segment carries.
+    /// Reads one `.SIGN.<algorithm>.<key>` member.
     ///
-    /// `segment` is that segment's members, of which there is exactly one.
     /// `subject` names what is being verified, for the error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AlpineError::Signature`] where the segment is not one
-    /// `.SIGN.<algorithm>.<key>` member. An algorithm this reader does not
-    /// implement is carried rather than refused, and refused by
-    /// [`verify`](Signature::verify).
-    pub(super) fn parse(subject: &str, segment: &[Member]) -> Result<Signature, AlpineError> {
-        let [member] = segment else {
-            return Err(AlpineError::signature(
-                subject,
-                format!(
-                    "its signature segment holds {} members rather than one",
-                    segment.len(),
-                ),
-            ));
-        };
+    fn parse(subject: &str, member: &Member) -> Result<Signature, AlpineError> {
         let Some(rest) = member.name.strip_prefix(SIGN_PREFIX) else {
             return Err(AlpineError::signature(
                 subject,
@@ -279,6 +263,107 @@ impl Signature {
                     format!("its signature by {} does not verify: {err}", self.key),
                 )
             })
+    }
+}
+
+/// Every signature a container's first segment carries, in the order it carries
+/// them.
+///
+/// A segment usually holds one member, and every artifact Alpine and
+/// postmarketOS publish today holds exactly one. It may hold several: that is
+/// what an artifact signed during a key rotation looks like, one member per key,
+/// so that readers holding either key can verify it. Refusing such a segment
+/// would refuse a container `apk` reads, and reading only its first member would
+/// refuse one whose first signature happens to be by the key this reader does
+/// not hold.
+#[derive(Debug)]
+pub(super) struct Signatures(Vec<Signature>);
+
+impl Signatures {
+    /// Reads a container's signature segment.
+    ///
+    /// `segment` is that segment's members, of which there is at least one and
+    /// every one is a `.SIGN.<algorithm>.<key>`. `subject` names what is being
+    /// verified, for the errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpineError::Signature`] where the segment is empty or holds a
+    /// member that is not a signature. An algorithm this reader does not
+    /// implement is carried rather than refused, and refused by
+    /// [`verify`](Self::verify) — and only where no other member verified.
+    pub(super) fn parse(subject: &str, segment: &[Member]) -> Result<Signatures, AlpineError> {
+        if segment.is_empty() {
+            return Err(AlpineError::signature(
+                subject,
+                "its signature segment holds no members".to_string(),
+            ));
+        }
+        segment
+            .iter()
+            .map(|member| Signature::parse(subject, member))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Signatures)
+    }
+
+    /// The key the first member names, for a container nothing verifies.
+    ///
+    /// Only [`Anchor::ControlIdentity`](super::apk::Anchor::ControlIdentity)
+    /// reaches this: the segment is read so the container's shape is known, and
+    /// its signature is not what binds the package. The key that *verified* is
+    /// [`verify`](Self::verify)'s answer, and that is the one a plan records.
+    pub(super) fn first_key(&self) -> &str {
+        self.0
+            .first()
+            .expect("a signature segment holds at least one member")
+            .key()
+    }
+
+    /// Verifies `payload` against `keys`, answering with the signature that did.
+    ///
+    /// The members are tried in order and the first that both names a held key
+    /// and verifies is the answer, which is `apk`'s own rule. A member naming a
+    /// key the repository does not trust is passed over rather than refused —
+    /// that is the whole of what makes a rotation-era container readable — so a
+    /// segment nothing verifies is reported against the last member that got as
+    /// far as being checked, and against the whole segment where none did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpineError::Signature`] where no member verifies: naming the
+    /// failure of the last one that could be attempted, or reporting that no
+    /// member names a key this repository holds.
+    pub(super) fn verify(
+        &self,
+        subject: &str,
+        keys: &KeySet,
+        payload: &[u8],
+    ) -> Result<&Signature, AlpineError> {
+        let mut attempted = None;
+        for signature in &self.0 {
+            if signature.algorithm.is_none() || keys.get(&signature.key).is_none() {
+                // Kept as the failure to report only where nothing else is
+                // tried, so a rotation-era container whose other member verifies
+                // does not report this one.
+                attempted.get_or_insert_with(|| signature.verify(subject, keys, payload));
+                continue;
+            }
+            match signature.verify(subject, keys, payload) {
+                Ok(()) => return Ok(signature),
+                Err(err) => attempted = Some(Err(err)),
+            }
+        }
+        match attempted {
+            Some(Err(err)) => Err(err),
+            // Every member both named a held key and verified, which the loop
+            // above returns from, so this is unreachable; it is written as an
+            // error rather than a panic because a `Signatures` is built from
+            // whatever a mirror served.
+            _ => Err(AlpineError::signature(
+                subject,
+                "its signature segment holds no member that could be checked".to_string(),
+            )),
+        }
     }
 }
 

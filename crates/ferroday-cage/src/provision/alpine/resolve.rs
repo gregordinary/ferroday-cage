@@ -310,7 +310,7 @@ fn select(
             accepted.push(candidate);
         }
     }
-    let Some(best) = best(&accepted) else {
+    let Some(highest) = best(&accepted) else {
         if excluded_one {
             return Err(ResolveError::ExcludedButRequired {
                 dependency: dependency.to_string(),
@@ -330,32 +330,47 @@ fn select(
         });
     };
 
+    // A base layer already carrying a candidate means installing that candidate
+    // would leave two versions of one package in the merged root: the base's own
+    // offer was consulted first, at the top of this function, and did not satisfy
+    // the entry. Such a candidate cannot be taken, so it is dropped here rather
+    // than being ranked and then refused — a *different* provider that satisfies
+    // the entry without an upgrade is a resolution, and one apk's own solver
+    // would find. Only when every candidate would upgrade something the base
+    // carries is there nothing left to do but stop, and the refusal then names
+    // the highest-ranked of them, which is the one that was asked for.
+    let installable: Vec<&Candidate<'_>> = accepted
+        .iter()
+        .copied()
+        .filter(|candidate| !selection.assumed.contains_key(&candidate.package.name))
+        .collect();
+    let Some(best) = best(&installable) else {
+        let carried = selection
+            .assumed
+            .get(&highest.package.name)
+            .expect("no candidate is installable, so the highest is one the base carries");
+        return Err(ResolveError::WouldUpgrade {
+            name: highest.package.name.clone(),
+            installed: carried.version.clone(),
+            offered: highest.package.version.clone(),
+            dependency: dependency.to_string(),
+            required_by: required_by.map(str::to_string),
+        });
+    };
+
     // A name answered only by unversioned `p:` entries is one apk declines to
-    // choose for, unless a provider ranks itself with `k:`. Following that is
-    // what keeps a closure from silently taking whichever shell or whichever
-    // `awk` the archive happens to list.
+    // choose for, unless a provider ranks itself with `k:` above zero. Following
+    // that is what keeps a closure from silently taking whichever shell or
+    // whichever `awk` the archive happens to list. The choice is among what can
+    // be installed, so a provider the base already carries is not one of the
+    // names the refusal offers.
     if best.offers.is_none() && best.package.provider_priority.is_none() {
         return Err(ResolveError::Ambiguous {
             name: dependency.name.clone(),
-            providers: accepted
+            providers: installable
                 .iter()
                 .map(|candidate| candidate.package.name.clone())
                 .collect(),
-            required_by: required_by.map(str::to_string),
-        });
-    }
-
-    // A base layer already carrying this package means the entry above asked for
-    // a version the base does not have — the base's own offer was consulted
-    // first and did not satisfy it. Installing the newer one would leave two
-    // versions of one package in the merged root, so this is where a delta
-    // resolution stops.
-    if let Some(carried) = selection.assumed.get(&best.package.name) {
-        return Err(ResolveError::WouldUpgrade {
-            name: best.package.name.clone(),
-            installed: carried.version.clone(),
-            offered: best.package.version.clone(),
-            dependency: dependency.to_string(),
             required_by: required_by.map(str::to_string),
         });
     }
@@ -443,12 +458,17 @@ fn conflicts(selection: &Selection) -> Result<(), ResolveError> {
         .chain(selection.assumed.values().map(|record| (record, true)));
     for (record, carried) in declarations {
         for refusal in record.depends.iter().filter(|entry| entry.conflict) {
-            let Some(present) = selection.breaker(refusal, Some(&record.name)) else {
-                continue;
+            // Every breaker rather than the first: a carried declarer excuses
+            // only the breakers the base itself already held, and base offers
+            // sort ahead of the increment's, so stopping at the first would
+            // excuse the increment along with the base whenever both break the
+            // same refusal.
+            let mut breakers = selection.breakers(refusal, Some(&record.name));
+            let present = match carried {
+                true => breakers.find(|offer| selection.packages.contains_key(&offer.package)),
+                false => breakers.next(),
             };
-            if carried && !selection.packages.contains_key(&present.package) {
-                continue;
-            }
+            let Some(present) = present else { continue };
             return Err(ResolveError::Conflict {
                 dependency: refusal.to_string(),
                 declared_by: record.name.clone(),
@@ -515,6 +535,10 @@ fn better(candidate: &Candidate<'_>, best: &Candidate<'_>) -> bool {
     };
     order
         .then_with(|| {
+            // A stated priority is always greater than zero — `Record` collapses
+            // `k:0` into "none" because that is what apk does with it — so "no
+            // priority" ranks below every stated one and beside every other
+            // absent one, which is exactly zero.
             candidate
                 .package
                 .provider_priority
@@ -629,25 +653,44 @@ impl Selection {
         self.materializer(dependency, declared_by).is_some() != dependency.conflict
     }
 
-    /// The offer that breaks `dependency`, where `dependency` is a refusal and
+    /// Every offer that breaks `dependency`, where `dependency` is a refusal and
     /// the selection holds something it refuses.
-    fn breaker(&self, dependency: &Dependency, declared_by: Option<&str>) -> Option<&Offer> {
+    ///
+    /// All of them rather than the first, because which one a refusal is
+    /// reported against is a decision the caller makes: a refusal declared by a
+    /// package the base carries is excused by a breaker the base already held
+    /// and not by one the increment brought.
+    fn breakers<'s, 'd>(
+        &'s self,
+        dependency: &'d Dependency,
+        declared_by: Option<&'d str>,
+    ) -> impl Iterator<Item = &'s Offer> + use<'s, 'd> {
         debug_assert!(dependency.conflict, "only a refusal can be broken");
-        self.materializer(dependency, declared_by)
+        self.materializers(dependency, declared_by)
     }
 
     /// The first offer that answers `dependency` at a version it accepts.
+    fn materializer(&self, dependency: &Dependency, declared_by: Option<&str>) -> Option<&Offer> {
+        self.materializers(dependency, declared_by).next()
+    }
+
+    /// Every offer that answers `dependency` at a version it accepts, in the
+    /// order they were recorded.
     ///
     /// `declared_by` is the package the entry came from, where there is one. It
     /// matters for a refusal alone: a package that provides a name and refuses
     /// it in the same breath is not refusing itself, which is the exemption apk
     /// makes and the reason this takes an argument it otherwise would not.
-    fn materializer(&self, dependency: &Dependency, declared_by: Option<&str>) -> Option<&Offer> {
+    fn materializers<'s, 'd>(
+        &'s self,
+        dependency: &'d Dependency,
+        declared_by: Option<&'d str>,
+    ) -> impl Iterator<Item = &'s Offer> + use<'s, 'd> {
         self.offers
             .get(&dependency.name)
             .into_iter()
             .flatten()
-            .find(|offer| {
+            .filter(move |offer| {
                 let itself = dependency.conflict
                     && !offer.own_name
                     && Some(offer.package.as_str()) == declared_by;
@@ -696,9 +739,31 @@ mod tests {
         world: &[&str],
         excludes: &[&str],
     ) -> Result<Vec<String>, ResolveError> {
+        resolved_over(index, world, excludes, &[])
+    }
+
+    /// The records a base layer's `installed` database would hand a layered
+    /// resolution, spelled as index records because that is what it holds.
+    fn carried(records: &[(&str, &str, &str)]) -> Vec<Record> {
+        let text: String = records
+            .iter()
+            .map(|(name, version, fields)| record(name, version, fields))
+            .collect::<Vec<_>>()
+            .join("\n");
+        index::parse("the base", &text, usize::MAX)
+            .unwrap_or_else(|err| panic!("the base parses: {err}"))
+    }
+
+    /// The increment `world` resolves to over a base carrying `installed`.
+    fn resolved_over(
+        index: &Index,
+        world: &[&str],
+        excludes: &[&str],
+        installed: &[Record],
+    ) -> Result<Vec<String>, ResolveError> {
         let world: Vec<String> = world.iter().map(|name| (*name).to_string()).collect();
         let excludes: Vec<String> = excludes.iter().map(|name| (*name).to_string()).collect();
-        Ok(resolve(index, &world, &excludes, [])?
+        Ok(resolve(index, &world, &excludes, installed)?
             .into_iter()
             .map(|record| record.name)
             .collect())
@@ -799,6 +864,156 @@ mod tests {
             ("pb", "1.0-r0", "p:virt\nk:10"),
         ]);
         assert_eq!(closure(&ranked, &["app"]), ["app", "pb"]);
+    }
+
+    #[test]
+    fn a_base_answers_a_name_and_the_increment_leaves_it_alone() {
+        // The whole of what a layered resolution does differently: a package the
+        // base carries is already answered, so neither it nor anything only it
+        // needed joins the increment.
+        let index = merged(&[
+            ("app", "1.0-r0", "D:lib"),
+            ("lib", "1.0-r0", "D:only-for-lib"),
+            ("only-for-lib", "1.0-r0", ""),
+        ]);
+        let base = carried(&[
+            ("lib", "1.0-r0", "D:only-for-lib"),
+            ("only-for-lib", "1.0-r0", ""),
+        ]);
+        assert_eq!(
+            resolved_over(&index, &["app"], &[], &base).unwrap(),
+            ["app"]
+        );
+    }
+
+    #[test]
+    fn a_base_answers_at_a_version_rather_than_by_name() {
+        // A constraint the base's version does not meet is reported as the
+        // upgrade it would be, rather than being quietly taken as answered: an
+        // increment installs over a base, and a package the base carries cannot
+        // be replaced without rebuilding it.
+        let index = merged(&[("app", "1.0-r0", "D:lib>=2.0-r0"), ("lib", "2.0-r0", "")]);
+        let base = carried(&[("lib", "1.0-r0", "")]);
+        match resolved_over(&index, &["app"], &[], &base) {
+            Err(ResolveError::WouldUpgrade {
+                name,
+                installed,
+                offered,
+                ..
+            }) => {
+                assert_eq!(
+                    (name.as_str(), installed.as_str(), offered.as_str()),
+                    ("lib", "1.0-r0", "2.0-r0")
+                );
+            }
+            other => panic!("expected an upgrade refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_alternative_provider_is_taken_before_an_upgrade_is_refused() {
+        // The base carries `lib` too old for the constraint, and the index
+        // offers both a newer `lib` and a different package providing the same
+        // name at a version that already satisfies it. Refusing on the
+        // highest-ranked candidate alone would refuse a resolution that exists;
+        // apk's own solver finds it.
+        let index = merged(&[
+            ("app", "1.0-r0", "D:lib>=2.0-r0"),
+            ("lib", "2.0-r0", ""),
+            ("other-lib", "1.0-r0", "p:lib=3.0-r0"),
+        ]);
+        let base = carried(&[("lib", "1.0-r0", "")]);
+        assert_eq!(
+            resolved_over(&index, &["app"], &[], &base).unwrap(),
+            ["app", "other-lib"],
+        );
+
+        // And with no alternative there is still nothing to do but stop, naming
+        // the candidate that was asked for.
+        let alone = merged(&[("app", "1.0-r0", "D:lib>=2.0-r0"), ("lib", "2.0-r0", "")]);
+        assert!(matches!(
+            resolved_over(&alone, &["app"], &[], &base),
+            Err(ResolveError::WouldUpgrade { .. }),
+        ));
+    }
+
+    #[test]
+    fn a_carried_refusal_is_reported_against_the_increment_that_breaks_it() {
+        // A base package refusing a name the base itself already answers is the
+        // base's own business — refusing to layer over it would name the wrong
+        // thing. But the base's offers sort ahead of the increment's, so a
+        // refusal broken by *both* must still be reported: it is the increment
+        // that is being decided here.
+        let index = merged(&[
+            ("app", "1.0-r0", "D:plugin"),
+            ("plugin", "1.0-r0", "p:feature=1.0-r0"),
+        ]);
+        // The base holds `host`, which refuses `feature`, and its own `shipped`
+        // already provides one — a tree that already violates its own refusal.
+        let base = carried(&[
+            ("host", "1.0-r0", "D:!feature"),
+            ("shipped", "1.0-r0", "p:feature=1.0-r0"),
+        ]);
+        match resolved_over(&index, &["app"], &[], &base) {
+            Err(ResolveError::Conflict {
+                declared_by,
+                present,
+                ..
+            }) => {
+                assert_eq!(declared_by, "host");
+                assert!(present.contains("plugin"), "{present}");
+            }
+            other => panic!("expected a conflict naming the increment, got {other:?}"),
+        }
+
+        // With nothing in the increment breaking it, the base's own violation
+        // stays the base's own business.
+        let quiet = merged(&[("app", "1.0-r0", "")]);
+        assert_eq!(
+            resolved_over(&quiet, &["app"], &[], &base).unwrap(),
+            ["app"]
+        );
+    }
+
+    #[test]
+    fn a_priority_that_is_not_above_zero_is_no_preference_at_all() {
+        // Established by driving `apk.static` 3.0.7 against a purpose-built
+        // repository rather than read out of its sources: a provider stating
+        // `k:0`, `k:-1` or `k:abc` leaves apk refusing to choose against one
+        // stating no `k:` at all, exactly as two unranked providers do, while
+        // `k:1` wins outright. Telling `k:0` apart from an absent `k:` would
+        // make a zero-priority provider silently auto-selectable here and not
+        // under apk.
+        for stated in ["k:0", "k:-1", "k:abc", "k:"] {
+            let index = merged(&[
+                ("app", "1.0-r0", "D:virt"),
+                ("pa", "1.0-r0", "p:virt"),
+                ("pb", "1.0-r0", &format!("p:virt\n{stated}")),
+            ]);
+            match resolved(&index, &["app"], &[]) {
+                Err(ResolveError::Ambiguous { providers, .. }) => {
+                    assert_eq!(providers, ["pa", "pb"], "{stated}");
+                }
+                other => panic!("expected an ambiguity for {stated}, got {other:?}"),
+            }
+        }
+
+        // And the record is kept rather than refused, which is what keeps this
+        // reader from refusing an index apk itself reads: `pb` is still there to
+        // be installed by name.
+        let index = merged(&[("pa", "1.0-r0", "p:virt"), ("pb", "1.0-r0", "p:virt\nk:0")]);
+        assert_eq!(closure(&index, &["pb"]), ["pb"]);
+
+        // A stated priority still outranks an absent one, in either order.
+        for order in [["k:2", ""], ["", "k:2"]] {
+            let index = merged(&[
+                ("app", "1.0-r0", "D:virt"),
+                ("pa", "1.0-r0", &format!("p:virt\n{}", order[0])),
+                ("pb", "1.0-r0", &format!("p:virt\n{}", order[1])),
+            ]);
+            let winner = if order[0] == "k:2" { "pa" } else { "pb" };
+            assert_eq!(closure(&index, &["app"]), ["app", winner], "{order:?}");
+        }
     }
 
     #[test]

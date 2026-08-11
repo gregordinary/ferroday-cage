@@ -385,6 +385,26 @@ fn is_prefix(constraint: &Version<'_>, candidate: &Version<'_>) -> bool {
     constraint.len() <= candidate.len() && constraint == candidate[..constraint.len()]
 }
 
+/// The name half of a dependency entry: everything before the operator, or the
+/// whole entry where it carries none.
+///
+/// Infallible where [`split`] is not, and deliberately so: a caller that needs
+/// only the name has nothing to refuse, since everything it could refuse is
+/// about the version half. That caller is the bootstrap's install order, which
+/// reads the `.PKGINFO` strings it must also write into the installed database
+/// verbatim — parsing them there would put a refusal between a package and the
+/// record that has to reproduce it byte for byte.
+///
+/// A `!` prefix is not this function's: it negates the whole entry rather than
+/// belonging to the name, and [`Dependency::parse`](super::index::Dependency::parse)
+/// strips it before the split.
+pub(super) fn name_of(text: &str) -> &str {
+    match text.find(OPERATOR_CHARACTERS) {
+        Some(at) => &text[..at],
+        None => text,
+    }
+}
+
 /// Splits a dependency's `name[<operator><version>]` into the two.
 ///
 /// `None` for the constraint means the dependency accepts any version, which is
@@ -398,9 +418,10 @@ fn is_prefix(constraint: &Version<'_>, candidate: &Version<'_>) -> bool {
 /// contents rather than by a version, and no repository this layer reads
 /// publishes one; accepting it would mean reading the version field as a digest.
 pub(super) fn split(text: &str) -> Result<(&str, Option<Constraint>), String> {
-    let Some(at) = text.find(OPERATOR_CHARACTERS) else {
+    let at = name_of(text).len();
+    if at == text.len() {
         return Ok((text, None));
-    };
+    }
     let (name, rest) = text.split_at(at);
     let operator_len = rest
         .find(|character| !OPERATOR_CHARACTERS.contains(&character))

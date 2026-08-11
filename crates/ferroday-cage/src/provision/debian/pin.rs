@@ -108,15 +108,14 @@ impl Pins {
                         archive: offered.version.clone(),
                     })
                 }
-                // Compared case-insensitively because the digest is hex: a
-                // document written by hand in the case the OpenPGP tools print
-                // records the same bytes as the index's lowercase.
-                Some(offered) if !offered.sha256.eq_ignore_ascii_case(&pinned.sha256) => {
-                    Some(UnheldReason::Digest {
-                        pin: pinned.sha256.clone(),
-                        archive: offered.sha256.clone(),
-                    })
-                }
+                // A plain `==`, as everywhere else in the crate: both sides came
+                // through `is_sha256_hex`, the index's on the way out of a
+                // stanza and the pin's on the way into `pin()`, so two spellings
+                // of one digest never meet here.
+                Some(offered) if offered.sha256 != pinned.sha256 => Some(UnheldReason::Digest {
+                    pin: pinned.sha256.clone(),
+                    archive: offered.sha256.clone(),
+                }),
                 Some(_) => None,
             };
             if let Some(reason) = reason {
@@ -347,12 +346,18 @@ mod tests {
     }
 
     #[test]
-    fn a_digest_recorded_in_the_other_case_is_the_same_digest() {
-        let text = stanza("p", "1.0", A);
-        let pins =
-            Pins::of(&plan_of(&[("p", "1.0", &A.to_uppercase())])).expect("no duplicate name");
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
-        pins.check(&index).expect("hex case is not a difference");
+    fn a_digest_that_is_not_lowercase_hex_is_refused_before_it_is_ever_compared() {
+        // Where the case question is settled: at the boundary, not at the
+        // comparison. A digest spelled any other way is a malformed pin, and
+        // saying so is a better answer than a mismatch report naming an archive
+        // that published exactly what the pin asked for.
+        let shouted = plan_of(&[("p", "1.0", &A.to_uppercase())]);
+        match super::super::validate_pin(&shouted, "trixie", "amd64", false) {
+            Err(DebianError::Config { reason }) => {
+                assert!(reason.contains("lowercase hex"), "{reason}");
+            }
+            other => panic!("expected a configuration refusal, got {other:?}"),
+        }
     }
 
     #[test]

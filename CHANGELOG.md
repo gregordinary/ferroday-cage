@@ -47,6 +47,24 @@ affected.
   other's. The events themselves stay with their layers, since those do speak
   each archive's own vocabulary. No re-export is left at the old paths.
 
+- An Alpine bootstrap fetches packages over its repository's whole mirror list,
+  not only the mirror that served the index. `AlpineBuilder::mirror_fallback`
+  backed the index alone, so a package rebuilt to a higher `-r` — which removes
+  its predecessor from a live mirror — left a plan naming the predecessor with
+  nowhere to go, while the same configuration on the Debian side had a backstop.
+  The two builders' methods now mean the same thing.
+
+  A plan resolved against more indexes than the configured repositories publish
+  is refused, before anything is downloaded, because its packages name no mirror
+  to be fetched over. This is the check the Debian layer already made against its
+  archive count.
+
+  Both plan formats recorded the serving mirror and described it as where the
+  packages come from. It is provenance: the plan names what to install and holds
+  it to a digest, and the configuration names where to fetch it. The Debian layer
+  already behaved this way and its documentation did not say so; both are now
+  accurate.
+
 - A mirror walk advances only past a failure that says *this* mirror could not
   serve the resource, which is `provision::FetchError`'s own question now rather
   than one each layer answers. The Alpine index walk advanced past every fetch
@@ -87,11 +105,94 @@ affected.
   `FnMut(DebianEvent<'_>)` closure. A closure is still an observer — the trait
   carries a blanket impl for one — so existing callers are unaffected.
 
+- `AlpineBuilder::build` validates a `plan()` and a `pin()` against the
+  configuration, which `plan()`'s documentation already described and only
+  `preflight` partly did. A plan resolved for another architecture, one naming an
+  index it does not carry, one whose index slot is not the release and component
+  the configured repository publishes there, and one naming a package by
+  something no repository could publish it under are all refused with
+  `AlpineError::Config` before anything is fetched. So are the combinations that
+  would have silently dropped half of what was asked for: `plan()` beside
+  `include()`, `exclude()`, or `pin()`, each of which describes a resolution that
+  a plan already is. The Debian layer made these checks; the two builders now
+  refuse the same configurations.
+
+  A Debian `plan()` and `pin()` are validated the same way, over the fields the
+  Alpine layer's `unaddressable` covers: a package's `Filename`, which is
+  interpolated verbatim into the URL its `.deb` is fetched from, is held to the
+  pool-path rule an archive index's is, and its `SHA256` must be 64 lowercase hex
+  characters. `Plan::parse_document` refuses a document carrying either, and
+  `build` refuses a `Plan` edited after `resolve` returned it. A pin recording an
+  uppercase digest was previously tolerated by `pin()` and refused by `plan()` as
+  a hash mismatch; it is now refused as the malformed entry it is, wherever it
+  arrives.
+
+  An `AlpineBuilder` that names no `architecture()` adopts the plan's or the
+  pin's, as `DebianBuilder` already did. A plan states which architecture it is
+  for, so refusing one the caller never contradicted — over a host default they
+  never chose — would be a rejection they could not act on.
+
+- An Alpine plan document is held to the index's own grammar as it is read.
+  `Plan::parse_document` accepted any non-empty `Package:` and `Version:`, and
+  those two compose the file name a package is fetched over and cached under — so
+  a document naming a package `../../x` wrote mirror-served bytes outside the
+  cache directory, before the control identity that would have rejected them was
+  checked. The live-resolve path already held every name to this; a plan is a
+  document a caller may have edited, which the crate's own comments say, and it
+  now passes the same gate.
+
+- An apk container's signature segment may hold more than one `.SIGN.*` member,
+  and the first that names a trusted key and verifies is the one that answers.
+  A rotation-era artifact carries one member per key so that readers holding
+  either can verify it; requiring exactly one refused a container `apk` reads.
+  A plan records the key that verified rather than the first listed.
+
+- A `k:` provider priority of zero is no priority, as are a negative and an
+  unreadable one. A record publishing `k:0` was auto-selectable where an
+  unranked one was refused as ambiguous. Driving `apk.static` 3.0.7 against a
+  purpose-built repository settles it: `k:0`, `k:-1` and `k:abc` each leave apk
+  refusing to choose against a provider stating no `k:` at all, exactly as two
+  unranked providers do, while `k:1` wins outright.
+
+- An Alpine resolution takes an alternative provider rather than refusing an
+  upgrade it does not need. Where a base layer carries a package too old for a
+  constrained dependency, `WouldUpgrade` fired on the highest-ranked candidate
+  before the others were considered — so a closure the repositories could supply,
+  and that apk's own solver finds, was refused. Only a dependency every candidate
+  for which would upgrade something the base carries is refused now.
+
 - A `.PKGINFO` whose `datahash` is not a SHA-256 in lowercase hex is refused as
   the malformed metadata it is, rather than reaching the data-segment comparison
   and being reported as a digest mismatch — an authenticity-flavoured answer to a
   spelling. This is the shape check the Debian layer makes on every
   archive-supplied digest, now made by both from one place.
+
+- The Alpine index walk reports `AlpineEvent::Fetching` for each index it asks
+  for. It is the slowest part of a resolve — one mirror timeout per unreachable
+  mirror — and an observer saw nothing between `Resolving` and the first package
+  download, while the Debian walk and the Alpine package walk both reported.
+
+- The shared tar reader refuses an entry whose `APK-TOOLS.checksum.SHA1` pax
+  record is not a SHA-1, and that reader serves the `.deb` data member and the
+  `Tarball` provisioner too. Before the Alpine layer every unknown pax key was
+  ignored, so a `.deb` or rootfs tarball carrying a malformed record of that name
+  was extractable and is now refused. dpkg toolchains do not write the key, and a
+  checksum that cannot be read is the safe thing to refuse; it is recorded here
+  because the seam is shared and the change reaches archives that are not apk's.
+
+- An Alpine resolution reports an increment that breaks a refusal a base package
+  declares, where the base breaks the same refusal itself. Only the first
+  breaking offer was consulted and a base layer's offers sort first, so a refusal
+  broken by both the base and the increment was excused as the base's own
+  business — which it is when the base alone breaks it, and is not when the
+  increment does. Reachable only over a hand-assembled base tree that already
+  violates its own conflict, which neither this resolver nor apk produces.
+
+- The size-ceiling message says `the stream exceeded the maximum size accepted
+  for it` where it said `the response body exceeded the maximum size`. The
+  ceiling moved out of the HTTP client with `LimitedWriter` and now bounds a
+  compressed segment expanding under a decoder as readily as a mirror ignoring
+  its own content length, so what it names is no longer a response body.
 
 ### Added
 
@@ -191,6 +292,28 @@ affected.
   digests; which one `apk` read was then a function of the order it walked the
   records in. Both are closed: the hook decides whether an entry is written, and
   a replacement takes the path out of the record it took it from.
+
+- An Alpine package is extracted from the file its verification read, not from
+  the path that file was at. The two were independent `File::open`s on the same
+  cache entry, so with a `cache_dir` shared across a trust boundary — which the
+  atomic staging and rename are written for — a writer swapping the file between
+  the two got unverified content extracted into the root. The verified descriptor
+  is carried and rewound instead; nothing can be swapped underneath it.
+
+- A failed write while downloading an Alpine package is reported as the I/O
+  failure it is. The body went through a `std::io::BufWriter` whose `Drop`
+  swallows a failed flush, so a last-buffer failure — `ENOSPC`, `EIO` — renamed a
+  truncated file into the cache and surfaced on the following read as a digest or
+  container failure, telling the caller their mirror was serving the wrong bytes.
+  The Debian download already checked its writer before publishing.
+
+- A `Filename` or `SHA256` in a Debian plan document is held to its shape. See
+  Changed, above.
+
+- An `APKINDEX` record whose `C:` field is the right length and the right
+  alphabet but not one the encoder can produce — `Q1` followed by padding — is
+  refused as the malformed record it is, rather than at fetch time as a mirror
+  serving the wrong bytes.
 
 - The `HttpFetch` transport parses `HTTP://` and `FILE://` as the schemes they
   are. A scheme is case-insensitive (RFC 3986 §3.1), which the crate's scheme
@@ -321,6 +444,12 @@ change where a reader looks.
   unlink-and-retry, the same attempt bound, the same rationale in both comments,
   differing only in what a failure was called. Each now names its own failures
   over one errno-level core.
+
+- `provision::alpine::version::name_of` is where a dependency entry's name ends.
+  The bootstrap's install order re-spelled the operator grammar twice rather than
+  reach for `version::split`, which it could not: it returns a `Result`, and this
+  path reads `.PKGINFO` strings it must write into the installed database
+  verbatim.
 
 ## [0.2.0] - 2026-08-06
 

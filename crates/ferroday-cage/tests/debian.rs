@@ -2765,10 +2765,24 @@ fn a_plan_refuses_every_setting_that_would_shape_a_resolution() {
     // package's archive index past the end — and the index is what a bootstrap
     // slices the repository list with, so an unchecked one is a panic partway
     // through a download rather than a refusal at build time.
-    let mut edited = plan;
+    let mut edited = plan.clone();
     edited.packages[0].archive = 7;
     let reason = refusal(base(edited));
     assert!(reason.contains("archive 7"), "{reason}");
+
+    // Same route, and the fields that become a URL rather than an index. The
+    // pool path is interpolated verbatim into the fetch URL, so an edited one
+    // could ask a mirror for something above its root; the digest is compared
+    // with a plain `==`, so one spelled any other way could only ever mismatch.
+    let mut traversing = plan.clone();
+    traversing.packages[0].filename = "../../../etc/passwd".to_string();
+    let reason = refusal(base(traversing));
+    assert!(reason.contains("asked for"), "{reason}");
+
+    let mut shouted = plan;
+    shouted.packages[0].sha256 = shouted.packages[0].sha256.to_uppercase();
+    let reason = refusal(base(shouted));
+    assert!(reason.contains("lowercase hex"), "{reason}");
 }
 
 /// A package at an explicit version, which [`Pkg::ordinary`] fixes at `1.0`.

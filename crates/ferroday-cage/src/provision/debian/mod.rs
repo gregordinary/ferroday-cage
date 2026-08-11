@@ -224,6 +224,12 @@ fn validate_plan(
                 package.name, package.archive,
             ));
         }
+        // A document is held to this as it is read; a `Plan` is public and
+        // `Clone`, so one taken from `resolve()` and edited reaches here having
+        // passed nothing.
+        if let Some(reason) = package.unaddressable() {
+            return contradiction(reason);
+        }
     }
     Ok(())
 }
@@ -236,7 +242,8 @@ fn validate_plan(
 /// selected — the includes, the exclusions, the base seed's priority floor —
 /// composes with it, and the repository list is free to differ from the one the
 /// pin was resolved against. What remains is a pin that cannot mean anything: a
-/// resolution that will not happen, or one for a different coordinate.
+/// resolution that will not happen, one for a different coordinate, or one whose
+/// entries state a digest nothing an archive publishes could equal.
 fn validate_pin(
     pin: &Plan,
     suite: &str,
@@ -263,6 +270,18 @@ fn validate_pin(
              {architecture}",
             pin.architecture,
         ));
+    }
+    // A pin holds a resolution to the digests it records, and `Pins::check`
+    // compares them against the index with a plain `==`. A digest spelled any
+    // other way could only ever mismatch, and would be reported as an archive
+    // that had published past the pin rather than as the malformed entry it is.
+    // The whole rule is applied, not the digest half alone: a pin is a plan
+    // document, read by the same reader, and one it would refuse is worth
+    // refusing here too.
+    for package in &pin.packages {
+        if let Some(reason) = package.unaddressable() {
+            return contradiction(reason);
+        }
     }
     Ok(())
 }
@@ -1657,8 +1676,12 @@ fn fetch_release(
 /// The two facts a [`ResolvedArchive`] needs that the release body does not
 /// itself carry.
 struct Served {
-    /// The mirror that served the release, which is the one the packages are
-    /// fetched from.
+    /// The mirror that served the release.
+    ///
+    /// Where the release came from, and not where the packages go to: a
+    /// bootstrap walks the mirrors its repositories are configured with, so this
+    /// records the choice that was made rather than deciding a later one. It
+    /// reaches a caller as [`ResolvedArchive::mirror`].
     mirror: String,
     /// The verifying certificate's primary-key fingerprint, or empty for a
     /// trusted-unsigned repository.
@@ -2882,8 +2905,9 @@ mod tests {
             let (bytes, mirror) = result.expect("the backstop answers");
             assert_eq!(bytes, b"from the backstop", "{asked:?}");
             // And the walk reports the mirror that served, not the one that was
-            // asked first: a plan resolved this way records where its packages
-            // actually come from.
+            // asked first: a plan resolved this way records which mirror
+            // answered, which is the provenance a reader of the plan wants and
+            // not a decision about where the packages are later fetched from.
             assert_eq!(mirror, "https://snapshot.example/debian", "{asked:?}");
             assert_eq!(asked.len(), 2, "both mirrors were tried: {asked:?}");
         }

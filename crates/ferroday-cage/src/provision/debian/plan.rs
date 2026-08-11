@@ -96,12 +96,18 @@ pub struct Plan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedArchive {
-    /// The mirror URL that served the release, which is the one the packages
-    /// will be fetched from.
+    /// The mirror URL that served the release.
     ///
     /// The URL that answered, not the configured list: a repository with a
     /// snapshot backstop resolves against whichever mirror served, and
     /// recording the list would describe a choice rather than the choice made.
+    ///
+    /// This records where the release came from; it does not decide where the
+    /// packages are fetched from. A bootstrap installing this plan walks the
+    /// mirrors its repositories are configured with, so a plan carried to a
+    /// different configuration fetches from that configuration's mirrors and
+    /// still installs the packages this plan names, each held to the digest
+    /// recorded here.
     pub mirror: String,
     /// The suite as the repository requested it.
     pub suite: String,
@@ -209,6 +215,43 @@ pub struct PlannedPackage {
     carried: Carried,
 }
 
+impl PlannedPackage {
+    /// Why this entry cannot be addressed, or `None` where it can.
+    ///
+    /// [`filename`](Self::filename) is interpolated verbatim into the URL the
+    /// `.deb` is fetched from and, for a `file://` mirror, into a local path, so
+    /// one holding a `..`, a leading slash, or a byte a request line ends on
+    /// would fetch from somewhere other than the mirror root. And
+    /// [`sha256`](Self::sha256) is what the fetched bytes are compared against,
+    /// with a plain `==` against a lowercase-hex digest, so one spelled any
+    /// other way can only ever mismatch.
+    ///
+    /// A package resolved from an index passed
+    /// [`index::is_safe_pool_path`](super::index::is_safe_pool_path) and
+    /// [`is_sha256_hex`](crate::provision::digest::is_sha256_hex) on the way in,
+    /// so this is the same gate for the way a plan arrives instead: a document a
+    /// caller kept and may have edited, or a [`Plan`] taken from
+    /// [`resolve`](super::Debian::resolve) and modified, neither of which has an
+    /// index behind it. The package's name and version are not held to a shape,
+    /// because neither reaches a URL or a path: the pool path names the file,
+    /// and the cache entry is named from the digest.
+    pub(super) fn unaddressable(&self) -> Option<String> {
+        if !super::index::is_safe_pool_path(&self.filename) {
+            return Some(format!(
+                "the plan fetches {} from {:?}, which is not a path a mirror can be asked for",
+                self.name, self.filename,
+            ));
+        }
+        if !crate::provision::digest::is_sha256_hex(&self.sha256) {
+            return Some(format!(
+                "the plan states {} at digest {:?}, which is not 64 lowercase hex characters",
+                self.name, self.sha256,
+            ));
+        }
+        None
+    }
+}
+
 impl Plan {
     /// Renders the plan as a deb822 document.
     ///
@@ -299,8 +342,9 @@ impl Plan {
     ///
     /// [`DebianError::PlanDocument`] for a document with no header, a format
     /// version this library does not read, a stanza missing a field the plan
-    /// cannot do without, a malformed archive index, or a package naming an
-    /// archive the document does not carry.
+    /// cannot do without, a malformed archive index, a package naming an
+    /// archive the document does not carry, or a package whose pool path or
+    /// digest is not one a fetch could be composed from.
     pub fn parse_document(text: &str) -> Result<Plan, DebianError> {
         let stanzas = document::parse(text);
         let (header, rest) = stanzas
@@ -339,7 +383,7 @@ impl Plan {
                     )));
                 }
                 let at_package = format!("the package {name}");
-                plan.packages.push(PlannedPackage {
+                let package = PlannedPackage {
                     name: name.to_string(),
                     version: required(stanza.get("Version"), "Version", &at_package)?,
                     architecture: required(
@@ -357,7 +401,11 @@ impl Plan {
                     // unchanged is what keeps the round trip byte-faithful.
                     source: stanza.get("Source").map(str::to_string),
                     carried: document::carried(stanza, PACKAGE_FIELDS),
-                });
+                };
+                if let Some(reason) = package.unaddressable() {
+                    return Err(document(reason));
+                }
+                plan.packages.push(package);
                 continue;
             }
 
@@ -773,6 +821,53 @@ mod tests {
                 assert!(reason.contains("archive 7"), "{reason}");
             }
             other => panic!("expected an archive refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_filename_no_mirror_could_be_asked_for_is_refused() {
+        // The pool path is interpolated verbatim into the fetch URL and, for a
+        // `file://` mirror, into a local path. A document is a trust anchor, but
+        // it is also a file a caller may have edited, and the index path refuses
+        // exactly these for exactly these reasons.
+        for filename in [
+            "../../../etc/passwd",
+            "/etc/passwd",
+            "pool/%2e%2e/%2e%2e/etc/passwd",
+            // Folded across a continuation line, which is how a value carrying
+            // a newline reaches the reader at all.
+            "pool/main/b/base-files.deb\n GET /elsewhere HTTP/1.1",
+        ] {
+            let document = sample().to_document().unwrap().replace(
+                "Filename: pool/main/b/base-files/base-files_13.6_arm64.deb",
+                &format!("Filename: {filename}"),
+            );
+            match Plan::parse_document(&document) {
+                Err(DebianError::PlanDocument { reason }) => {
+                    assert!(reason.contains("base-files"), "{filename:?}: {reason}");
+                    assert!(reason.contains("asked for"), "{filename:?}: {reason}");
+                }
+                other => panic!("expected a pool-path refusal for {filename:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_digest_that_is_not_lowercase_hex_is_refused() {
+        // The digest is compared with a plain `==` against what the archive
+        // publishes, so an uppercase one could only ever mismatch — and would be
+        // reported as bytes that were not the package rather than as the
+        // malformed document it came from.
+        let document = sample()
+            .to_document()
+            .unwrap()
+            .replace(&"aa".repeat(32), &"AA".repeat(32));
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("base-files"), "{reason}");
+                assert!(reason.contains("lowercase hex"), "{reason}");
+            }
+            other => panic!("expected a digest refusal, got {other:?}"),
         }
     }
 

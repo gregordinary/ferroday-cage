@@ -197,8 +197,19 @@ first download. [`plan`] hands a resolved `Plan` back to the bootstrap, which
 then fetches exactly what it records and never reads an index; [`pin`] instead
 *constrains* a fresh resolution to the versions a plan recorded. The three behave
 exactly as [their Debian counterparts](debian.md#the-resolved-plan) do, including
-what a plan refuses to compose with, so that chapter is the reference for all of
-it.
+what a plan refuses to compose with and the trust model a plan carries, so that
+chapter is the reference for all of it.
+
+One refusal is this layer's own, and it follows from where an apk package lives.
+A package is fetched from the directory of the index that named it, so the
+correspondence between a plan's indexes and the configured repositories is
+positional: index *i* of the plan is served by whichever repository publishes the
+*i*th index. `build` therefore refuses a plan that records more indexes than the
+configuration publishes, and one whose index *i* is not the release and component
+the configured repository publishes there — both of which would otherwise compose
+URLs no mirror serves and fail as an exhausted mirror walk. The mirror a plan
+records is deliberately *not* compared: a plan carried to another configuration
+fetches over that configuration's mirrors, which is what makes it portable.
 
 A plan is written and read as a document with `to_document` and
 `parse_document`. The syntax is the same field-and-stanza form the Debian plan

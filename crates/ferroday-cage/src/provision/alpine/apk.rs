@@ -28,16 +28,17 @@ use flate2::bufread::GzDecoder;
 
 use super::AlpineError;
 use super::keyring::KeySet;
-use super::sign::Signature;
+use super::sign::Signatures;
 use crate::provision::tar::TarReader;
 use crate::provision::{LimitedWriter, ProvisionError};
 
 /// The ceiling on a signature segment, decompressed and compressed alike.
 ///
-/// The segment holds one tar member of at most a few hundred bytes — an
-/// RSA-4096 signature is 512 — so the padded tar comes to 2 KiB and the gzip of
-/// it to under one. The bound is here because gzip is a compression format and
-/// an untrusted repository can spend a kilobyte to make a gigabyte, and because
+/// The segment holds a tar member of at most a few hundred bytes per signature —
+/// an RSA-4096 signature is 512 — so the padded tar comes to 2 KiB and the gzip
+/// of it to under one, and a rotation-era artifact carrying several is still far
+/// inside this. The bound is here because gzip is a compression format and an
+/// untrusted repository can spend a kilobyte to make a gigabyte, and because
 /// this segment is read before anything about the container has been
 /// authenticated.
 const MAX_SIGNATURE_SEGMENT: u64 = 64 * 1024;
@@ -329,16 +330,21 @@ pub(super) fn read_metadata<R: Read>(
     };
 
     let mut signature_segment = Vec::new();
+    // Both sides, which is what the ceiling says it is: the decompressed side
+    // because a gzip member is an untrusted repository's to inflate, and the
+    // compressed side because the only thing bounding it otherwise is whatever
+    // the caller wrapped the container in.
+    let mut raw = io::sink();
     let read = segments
         .read_segment(
             &mut LimitedWriter::new(&mut signature_segment, MAX_SIGNATURE_SEGMENT),
-            &mut io::sink(),
+            &mut LimitedWriter::new(&mut raw, MAX_SIGNATURE_SEGMENT),
         )
         .map_err(unreadable("signature"))?;
     if read.is_none() {
         return Err(AlpineError::container(subject, "it is empty"));
     }
-    let signature = Signature::parse(subject, &members(subject, &signature_segment)?)?;
+    let signatures = Signatures::parse(subject, &members(subject, &signature_segment)?)?;
 
     let mut plain = Vec::new();
     let mut compressed = Vec::new();
@@ -358,14 +364,17 @@ pub(super) fn read_metadata<R: Read>(
     // Over the compressed bytes, and over the segment that follows the
     // signature rather than the one that carries it. Both are the mistake a
     // reimplementation makes, and both are what the negative tests pin.
-    if let Anchor::Signature(keys) = anchor {
-        signature.verify(subject, keys, &compressed)?;
-    }
+    let signed_by = match anchor {
+        Anchor::Signature(keys) => signatures.verify(subject, keys, &compressed)?.key(),
+        // Nothing was verified, so there is no key that verified; the first
+        // member's is what the segment says about itself.
+        Anchor::ControlIdentity => signatures.first_key(),
+    };
 
     Ok(Metadata {
         members: members(subject, &plain)?,
         compressed,
-        signed_by: signature.key().to_string(),
+        signed_by: signed_by.to_string(),
     })
 }
 
@@ -637,6 +646,257 @@ mod tests {
         KeySet::alpine("x86_64").expect("x86_64 is in the bundle")
     }
 
+    /// A gzip member holding a tar of `members`, as every apk segment is.
+    ///
+    /// The tests below reassemble a published container with one segment
+    /// replaced, so this has to produce something the reader accepts as a
+    /// segment; what varies is only what the tar inside it holds.
+    fn segment(members: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tar = Vec::new();
+        for (name, data) in members {
+            tar.extend_from_slice(
+                &crate::provision::tar::ustar_block(
+                    name.as_bytes(),
+                    b"",
+                    0o644,
+                    0,
+                    0,
+                    data.len() as u64,
+                    0,
+                    b'0',
+                    b"",
+                )
+                .expect("the header fields fit"),
+            );
+            tar.extend_from_slice(data);
+            crate::provision::tar::pad(&mut tar, data.len() as u64).expect("padding a vector");
+        }
+        tar.extend_from_slice(&[0u8; 1024]);
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar).expect("writing to a vector");
+        encoder.finish().expect("the segment compresses")
+    }
+
+    /// The signature member a published container carries: its name, and the
+    /// signature bytes that actually verify over the segment after it.
+    fn published_signature(container: &[u8]) -> (String, Vec<u8>) {
+        let mut segments = Segments::new(container);
+        let mut plain = Vec::new();
+        segments
+            .read_segment(&mut plain, &mut io::sink())
+            .expect("the fixture decodes");
+        let [member] = &members("the fixture", &plain).expect("the segment is a tar")[..] else {
+            panic!("a published signature segment holds one member");
+        };
+        (member.name.clone(), member.data.clone())
+    }
+
+    #[test]
+    fn a_signature_segment_may_hold_several_members_and_the_trusted_one_verifies() {
+        // What an artifact signed during a key rotation looks like: one member
+        // per key, so a reader holding either can verify it. Refusing the
+        // segment would refuse a container apk reads, and reading only its first
+        // member would refuse one whose first signature is by the key this
+        // reader does not hold.
+        let base = extents(fixtures::ALPINE_BASE);
+        let (name, bytes) = published_signature(fixtures::ALPINE_BASE);
+        let decoy = (".SIGN.RSA.rotated-out.rsa.pub", &[0x00; 512][..]);
+        let real = (name.as_str(), &bytes[..]);
+
+        for (order, members) in [
+            ("decoy first", [decoy, real]),
+            ("real first", [real, decoy]),
+        ] {
+            let container = [&segment(&members)[..], &base[1][..], &base[2][..]].concat();
+            let mut segments = Segments::new(&container[..]);
+            let metadata = read_metadata(
+                "rotated",
+                &mut segments,
+                Anchor::Signature(&alpine_keys()),
+                16 * 1024 * 1024,
+            )
+            .unwrap_or_else(|err| panic!("{order}: {err}"));
+            // And the key reported is the one that verified, not the first one
+            // listed, since that is what a plan records as its trust anchor.
+            assert_eq!(metadata.signed_by, fixtures::ALPINE_KEY_NAME, "{order}");
+        }
+    }
+
+    #[test]
+    fn a_signature_segment_no_member_of_which_verifies_is_refused() {
+        // The other half: passing over a member that names an untrusted key
+        // must not become passing over every member.
+        let base = extents(fixtures::ALPINE_BASE);
+        let container = [
+            &segment(&[
+                (".SIGN.RSA.rotated-out.rsa.pub", &[0x00; 512][..]),
+                (".SIGN.RSA.also-untrusted.rsa.pub", &[0x00; 512][..]),
+            ])[..],
+            &base[1][..],
+            &base[2][..],
+        ]
+        .concat();
+        let mut segments = Segments::new(&container[..]);
+        let err = read_metadata(
+            "rotated",
+            &mut segments,
+            Anchor::Signature(&alpine_keys()),
+            16 * 1024 * 1024,
+        )
+        .expect_err("no member names a trusted key");
+        let reason = err.to_string();
+        assert!(matches!(err, AlpineError::Signature { .. }), "{reason}");
+        assert!(
+            reason.contains("not a key this repository trusts"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn an_algorithm_this_reader_does_not_implement_is_refused_only_where_it_is_used() {
+        // `RSA256` and `RSA512` are defined by the format and unimplemented
+        // here. A container anchored by its control identity never consults the
+        // signature at all, so the algorithm is no reason to refuse it; one
+        // anchored by the signature has nothing else to fall back on.
+        let base = extents(fixtures::ALPINE_BASE);
+        let container = [
+            &segment(&[(".SIGN.RSA256.some-key.rsa.pub", &[0x00; 512][..])])[..],
+            &base[1][..],
+            &base[2][..],
+        ]
+        .concat();
+
+        let mut segments = Segments::new(&container[..]);
+        let err = read_metadata(
+            "future",
+            &mut segments,
+            Anchor::Signature(&alpine_keys()),
+            16 * 1024 * 1024,
+        )
+        .expect_err("the algorithm is not implemented");
+        let reason = err.to_string();
+        assert!(matches!(err, AlpineError::Signature { .. }), "{reason}");
+        assert!(reason.contains("RSA256"), "{reason}");
+
+        let mut segments = Segments::new(&container[..]);
+        read_package("future", &mut segments, 16 * 1024 * 1024)
+            .expect("the control identity binds it, and no signature is read");
+    }
+
+    #[test]
+    fn a_signature_segment_that_is_not_one_is_refused_by_shape() {
+        let base = extents(fixtures::ALPINE_BASE);
+        for (what, members, expected) in [
+            ("an empty segment", &[][..], "holds no members"),
+            (
+                "a member that is not a signature",
+                &[("README", &b"not a signature"[..])][..],
+                "not a signature member",
+            ),
+            (
+                "a signature naming no key",
+                &[(".SIGN.RSA", &[0x00; 512][..])][..],
+                "names no key",
+            ),
+        ] {
+            let container = [&segment(members)[..], &base[1][..], &base[2][..]].concat();
+            let mut segments = Segments::new(&container[..]);
+            let err = read_metadata(
+                "malformed",
+                &mut segments,
+                Anchor::Signature(&alpine_keys()),
+                16 * 1024 * 1024,
+            )
+            .unwrap_err();
+            let reason = err.to_string();
+            assert!(
+                matches!(err, AlpineError::Signature { .. }),
+                "{what}: {reason}"
+            );
+            assert!(reason.contains(expected), "{what}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_signature_segment_past_the_ceiling_is_refused() {
+        // A gzip member is an untrusted repository's to inflate, and this
+        // segment is read before anything about the container is authenticated.
+        // The bound is over both forms, and a signature member is a few hundred
+        // bytes, so a segment reaching it is not one any repository publishes.
+        let base = extents(fixtures::ALPINE_BASE);
+        let huge = vec![0u8; 2 * MAX_SIGNATURE_SEGMENT as usize];
+        let container = [
+            &segment(&[(".SIGN.RSA.some-key.rsa.pub", &huge[..])])[..],
+            &base[1][..],
+            &base[2][..],
+        ]
+        .concat();
+        // It compresses to well under the ceiling, so only the decompressed
+        // side can catch it — which is the half a comment could claim and the
+        // code not do.
+        assert!(
+            container.len() < MAX_SIGNATURE_SEGMENT as usize,
+            "{}",
+            container.len()
+        );
+
+        let mut segments = Segments::new(&container[..]);
+        let err = read_metadata(
+            "inflated",
+            &mut segments,
+            Anchor::Signature(&alpine_keys()),
+            16 * 1024 * 1024,
+        )
+        .expect_err("the segment is past the ceiling");
+        assert!(matches!(err, AlpineError::Container { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_package_stating_no_datahash_is_refused() {
+        // Without it nothing binds the file tree to the signature that covers
+        // the metadata, so the package is one this layer will not install --
+        // however well-formed the rest of it is.
+        let base = extents(fixtures::ALPINE_BASE);
+        let mut plain = Vec::new();
+        let mut walk = Segments::new(fixtures::ALPINE_BASE);
+        walk.read_segment(&mut io::sink(), &mut io::sink())
+            .expect("the signature segment decodes");
+        walk.read_segment(&mut plain, &mut io::sink())
+            .expect("the control segment decodes");
+
+        let stripped: Vec<(String, Vec<u8>)> = members("alpine-base", &plain)
+            .expect("the control segment is a tar")
+            .into_iter()
+            .map(|member| {
+                let data = match member.name.as_str() {
+                    ".PKGINFO" => String::from_utf8(member.data)
+                        .expect(".PKGINFO is text")
+                        .lines()
+                        .filter(|line| !line.starts_with("datahash"))
+                        .map(|line| format!("{line}\n"))
+                        .collect::<String>()
+                        .into_bytes(),
+                    _ => member.data,
+                };
+                (member.name, data)
+            })
+            .collect();
+        let borrowed: Vec<(&str, &[u8])> = stripped
+            .iter()
+            .map(|(name, data)| (name.as_str(), &data[..]))
+            .collect();
+
+        let container = [&base[0][..], &segment(&borrowed)[..], &base[2][..]].concat();
+        let mut segments = Segments::new(&container[..]);
+        let err = read_package("stripped", &mut segments, 16 * 1024 * 1024)
+            .expect_err("nothing binds the file tree");
+        let reason = err.to_string();
+        assert!(matches!(err, AlpineError::Container { .. }), "{reason}");
+        assert!(reason.contains("datahash"), "{reason}");
+    }
+
     #[test]
     fn a_fixture_is_the_file_its_provenance_records() {
         // The README beside the fixtures records where each came from and its
@@ -662,6 +922,14 @@ mod tests {
                 "alpine-baselayout",
                 fixtures::ALPINE_BASELAYOUT,
                 "6e55ad7baa87468244e7919c7556e96abc5da05576cabd8b879a019c6d43e1b6",
+            ),
+            // The one that decides the trust-model question — a package signed
+            // by a key no anchor holds — so a silent swap would undermine
+            // exactly the test it is committed for.
+            (
+                "pmos-baselayout",
+                fixtures::POSTMARKETOS_BASELAYOUT,
+                "66692c0f6859bb53d39bf1fccff97397fa51b5faf11de7f02438d898af684a1a",
             ),
         ] {
             assert_eq!(

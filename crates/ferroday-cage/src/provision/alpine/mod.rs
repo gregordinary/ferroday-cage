@@ -314,7 +314,7 @@ impl Alpine {
                     .to_string(),
             });
         }
-        let (records, indexes) = self.read_indexes()?;
+        let (records, indexes) = self.read_indexes(observer)?;
         observer.progress(AlpineEvent::Resolving);
         let merged = Index::merge(records, &self.architecture, &self.pins);
         // Before the closure, so a pin the repositories have moved past refuses
@@ -402,14 +402,23 @@ impl Alpine {
     /// records a resolution reads and the record of what was read are produced
     /// by one pass, and a plan that named an index it had not verified would be
     /// describing something other than what it resolved against.
-    fn read_indexes(&mut self) -> Result<(Vec<Vec<Record>>, Vec<ResolvedIndex>), AlpineError> {
+    fn read_indexes(
+        &mut self,
+        observer: &mut dyn AlpineObserver,
+    ) -> Result<(Vec<Vec<Record>>, Vec<ResolvedIndex>), AlpineError> {
         let mut records = Vec::new();
         let mut indexes = Vec::new();
         for repository in &self.repositories {
             for (component, path) in repository.indexes(&self.architecture) {
                 let from = indexes.len();
-                let (read, resolved) =
-                    read_index(&mut *self.fetcher, repository, component, &path, from)?;
+                let (read, resolved) = read_index(
+                    &mut *self.fetcher,
+                    repository,
+                    component,
+                    &path,
+                    from,
+                    observer,
+                )?;
                 records.push(read);
                 indexes.push(resolved);
             }
@@ -432,10 +441,23 @@ impl Alpine {
     /// [`AlpineError::Index`] when the records it carries are not the ones the
     /// format defines.
     pub fn available(&mut self) -> Result<Available, AlpineError> {
+        self.available_reporting(&mut Silent)
+    }
+
+    /// The catalogue, with an observer already chosen.
+    ///
+    /// Split out for the same reason [`resolve_reporting`](Self::resolve_reporting)
+    /// is, and it matters more here: this call is nothing *but* the index walk,
+    /// which spends one mirror timeout per unreachable mirror, so an observed
+    /// caller watching a long silence has nothing else to learn it from.
+    fn available_reporting(
+        &mut self,
+        observer: &mut dyn AlpineObserver,
+    ) -> Result<Available, AlpineError> {
         // Unpinned whatever the builder holds: this reports what the
         // repositories offer, and a pin describes a selection from it rather
         // than a bound on what may be asked about.
-        let (records, _indexes) = self.read_indexes()?;
+        let (records, _indexes) = self.read_indexes(observer)?;
         Ok(Index::merge(records, &self.architecture, &Pins::none()).into_available())
     }
 
@@ -617,7 +639,12 @@ impl AlpineBuilder {
     }
 
     /// Adds a backstop mirror for the primary repository, tried in order after
-    /// it when a fetch reports the index missing or fails at the transport.
+    /// it when a fetch reports the resource missing or fails at the transport.
+    ///
+    /// It backs the packages as well as the index, so a package rebuilt to a
+    /// higher `-r` — which removes its predecessor from a live mirror — is
+    /// served by the backstop for as long as a plan naming the predecessor is
+    /// still being installed.
     pub fn mirror_fallback(mut self, url: impl Into<String>) -> Self {
         self.fallbacks.push(url.into());
         self
@@ -711,9 +738,10 @@ impl AlpineBuilder {
     ///
     /// # Errors
     ///
-    /// A plan naming one package twice is refused at [`build`](Self::build) with
-    /// [`AlpineError::Config`]: a pin is keyed by name, so two entries state two
-    /// versions to hold it at.
+    /// [`build`](Self::build) refuses a pin with [`AlpineError::Config`] when it
+    /// names one package twice — a pin is keyed by name, so two entries state
+    /// two versions to hold it at — when it resolves another architecture, or
+    /// when an entry states a version this grammar cannot compare.
     ///
     /// A pin the repositories cannot supply fails the resolution with
     /// [`AlpineError::Pin`], naming every package at once — the repositories
@@ -742,9 +770,15 @@ impl AlpineBuilder {
     ///
     /// # Errors
     ///
-    /// A plan whose architecture is not the one being bootstrapped, or that
-    /// names an index it does not carry, is refused at [`build`](Self::build)
-    /// with [`AlpineError::Config`].
+    /// [`build`](Self::build) refuses a plan the configuration cannot install,
+    /// with [`AlpineError::Config`]: one resolved for another architecture; one
+    /// naming an index it does not itself carry, or more indexes than the
+    /// configured repositories publish, or an index whose release and component
+    /// are not what the repository in that slot publishes; and one naming a
+    /// package by something no repository could publish it under. It also
+    /// refuses the combinations that would silently drop half of what was asked
+    /// for — [`include`](Self::include), [`exclude`](Self::exclude) and
+    /// [`pin`](Self::pin) all describe a resolution, and a plan is one already.
     pub fn plan(mut self, plan: Plan) -> Self {
         self.plan = Some(plan);
         self
@@ -868,12 +902,22 @@ impl AlpineBuilder {
     ///
     /// Returns [`AlpineError::Config`] when the architecture is not one a
     /// repository can be addressed by, when the bundle holds no keys for it and
-    /// none were given, or when the primary repository's release or a component
-    /// is not addressable.
+    /// none were given, when the primary repository's release or a component is
+    /// not addressable, or when a [`plan`](Self::plan) does not describe
+    /// something this configuration could install.
     pub fn build(self) -> Result<Alpine, AlpineError> {
-        let architecture = match self.architecture {
-            Some(architecture) => architecture,
-            None => host_architecture(),
+        // A plan states which architecture it is for, so a builder that names
+        // none adopts it: refusing a plan the caller never contradicted, over a
+        // default the caller never chose, would be a confusing rejection. A pin
+        // states one for the same reason and is adopted the same way. This is
+        // the Debian builder's rule, and it has to be the same rule, because it
+        // is what decides whether the check below ever fires for a caller who
+        // simply did not say.
+        let stated = self.plan.as_ref().or(self.pin.as_ref());
+        let architecture = match (&self.architecture, stated) {
+            (Some(architecture), _) => architecture.clone(),
+            (None, Some(plan)) => plan.architecture.clone(),
+            (None, None) => host_architecture(),
         };
         check_coordinate(
             "the bootstrap's architecture",
@@ -910,6 +954,20 @@ impl AlpineBuilder {
         )?);
         repositories.extend(self.repositories);
 
+        if let Some(plan) = &self.plan {
+            validate_plan(
+                plan,
+                &architecture,
+                &index_slots(&repositories, &architecture),
+                self.pin.is_some(),
+                &self.includes,
+                &self.excludes,
+            )?;
+        }
+        if let Some(pin) = &self.pin {
+            validate_pin(pin, &architecture)?;
+        }
+
         Ok(Alpine {
             architecture,
             repositories,
@@ -932,6 +990,166 @@ impl AlpineBuilder {
     }
 }
 
+/// One slot of the index walk: which repository publishes it, and what it
+/// publishes there.
+struct IndexSlot<'a> {
+    /// Which of the configured repositories serves it, as an index into them.
+    origin: usize,
+    /// The release, as that repository requested it.
+    release: &'a str,
+    /// The component published there, or `None` for a repository that publishes
+    /// none — the `<release>/<architecture>` layout.
+    component: Option<&'a str>,
+}
+
+/// The index slots a configuration publishes, in the order they are read.
+///
+/// The slots are the walk [`Alpine::read_indexes`] makes — every repository, and
+/// within it every component it publishes — so slot *i* of a plan is the one
+/// described at *i* here. The correspondence is positional, which is what
+/// [`validate_plan`] holds a caller-supplied plan to and what lets a package
+/// reach the mirror list it is fetched over.
+fn index_slots<'a>(repositories: &'a [Repository], architecture: &str) -> Vec<IndexSlot<'a>> {
+    let mut slots = Vec::new();
+    for (origin, repository) in repositories.iter().enumerate() {
+        for (component, _) in repository.indexes(architecture) {
+            slots.push(IndexSlot {
+                origin,
+                release: repository.release(),
+                component,
+            });
+        }
+    }
+    slots
+}
+
+/// What must hold of a [`Plan`] used as a pin.
+///
+/// A pin is read as constraints rather than as a manifest, so it needs less of
+/// the plan than [`validate_plan`] does: no index is consulted and nothing is
+/// fetched by name. What it does need is that every entry states a version this
+/// grammar can compare, because a version it cannot parse compares equal to
+/// nothing and would be reported as a repository that had published past the pin
+/// rather than as the malformed entry it is.
+fn validate_pin(pin: &Plan, architecture: &str) -> Result<(), AlpineError> {
+    let contradiction = |reason: String| Err(AlpineError::Config { reason });
+    if pin.architecture != architecture {
+        return contradiction(format!(
+            "the pin resolves architecture {} but the bootstrap is configured for {architecture}",
+            pin.architecture,
+        ));
+    }
+    for package in &pin.packages {
+        if let Some(reason) = package.unaddressable() {
+            return contradiction(reason);
+        }
+    }
+    Ok(())
+}
+
+/// What must hold of a caller-supplied [`Plan`] before a bootstrap is built from
+/// it.
+///
+/// A plan reaches a bootstrap without having been resolved by it, so nothing the
+/// resolution guarantees can be assumed: not that the packages are the
+/// configuration's architecture, not that their names are ones a repository
+/// could publish, and not that the indexes they name are ones the configuration
+/// walks. Every one of those is cheaper to refuse here, where the configuration
+/// is frozen, than partway through a download — which is where each of them
+/// would otherwise surface.
+///
+/// The counterpart of the Debian layer's `validate_plan`, and it answers the
+/// same questions in the same order.
+fn validate_plan(
+    plan: &Plan,
+    architecture: &str,
+    slots: &[IndexSlot<'_>],
+    pin_set: bool,
+    includes: &[String],
+    excludes: &[String],
+) -> Result<(), AlpineError> {
+    let contradiction = |reason: String| Err(AlpineError::Config { reason });
+    if !includes.is_empty() {
+        return contradiction(
+            "a plan already names every package to install, so include() has nothing to add; \
+             drop one of the two"
+                .to_string(),
+        );
+    }
+    if !excludes.is_empty() {
+        return contradiction(
+            "a plan already names every package to install, so exclude() has nothing to remove; \
+             drop one of the two"
+                .to_string(),
+        );
+    }
+    if pin_set {
+        return contradiction(
+            "plan() installs a resolved plan instead of resolving, so there is no resolution for \
+             pin() to hold to versions; drop one of the two"
+                .to_string(),
+        );
+    }
+    if plan.architecture != architecture {
+        return contradiction(format!(
+            "the plan resolves architecture {} but the bootstrap is configured for {architecture}",
+            plan.architecture,
+        ));
+    }
+    // Each package names the index it came from, and a bootstrap fetches it
+    // through the repository that serves that index, so a plan resolved against
+    // more indexes than the configuration publishes has packages with no mirror
+    // to walk.
+    if plan.indexes.len() > slots.len() {
+        return contradiction(format!(
+            "the plan resolved against {} indexes but the configured repositories publish {}, so \
+             some of its packages name no mirror",
+            plan.indexes.len(),
+            slots.len(),
+        ));
+    }
+    // The correspondence is positional, and a package's URL is composed from the
+    // configured mirror and the plan's own release and component. Two
+    // configurations that publish the same number of indexes in a different
+    // order therefore compose URLs no mirror serves, and the walk that follows
+    // would blame every mirror for a directory none of them was ever asked to
+    // publish. The mirrors themselves are deliberately not compared: a plan
+    // carried to a different configuration fetches from that configuration's
+    // mirrors, which is what makes it portable.
+    for (at, (index, slot)) in plan.indexes.iter().zip(slots).enumerate() {
+        let describe = |release: &str, component: Option<&str>| match component {
+            Some(component) => format!("{release}/{component}"),
+            None => release.to_string(),
+        };
+        if index.release != slot.release || index.component.as_deref() != slot.component {
+            return contradiction(format!(
+                "the plan's index {at} is {} and the configured repository publishes {} there, so \
+                 its packages would be fetched from a directory that repository does not serve",
+                describe(&index.release, index.component.as_deref()),
+                describe(slot.release, slot.component),
+            ));
+        }
+    }
+    for package in &plan.packages {
+        if package.index >= plan.indexes.len() {
+            return contradiction(format!(
+                "the plan's package {} names index {} but the plan records {}, so it names no \
+                 mirror",
+                package.name,
+                package.index,
+                plan.indexes.len(),
+            ));
+        }
+        // A document is held to this as it is read; a `Plan` is public and
+        // `Clone`, so one taken from `resolve()` and edited reaches here having
+        // passed nothing.
+        if let Some(reason) = package.unaddressable() {
+            return contradiction(reason);
+        }
+    }
+    Ok(())
+}
+
 /// Fetches, verifies and parses one repository index.
 ///
 /// `path` is mirror-relative. The mirror list is walked in order, advancing past
@@ -947,10 +1165,16 @@ fn read_index(
     component: Option<&str>,
     path: &str,
     from: usize,
+    observer: &mut dyn AlpineObserver,
 ) -> Result<(Vec<Record>, ResolvedIndex), AlpineError> {
     let mut last_missing = None;
     for mirror in &repository.mirrors {
         let url = format!("{}/{path}", mirror.trim_end_matches('/'));
+        // Reported for the same reason a package fetch is: this walk spends one
+        // mirror timeout per unreachable mirror, and it is the slowest part of a
+        // resolve. An observer that saw only `Resolving` would watch a bootstrap
+        // that looks stopped.
+        observer.progress(AlpineEvent::Fetching { url: &url });
         let mut bytes = Vec::new();
         let request = FetchRequest::new(&url);
         match fetcher.fetch(
@@ -1204,8 +1428,11 @@ impl Observed<'_> {
     }
 
     /// [`Alpine::available`], reporting to the attached sink.
+    ///
+    /// The sink sees one [`Fetching`](AlpineEvent::Fetching) per index, which is
+    /// the whole of what this call does.
     pub fn available(&mut self) -> Result<Available, AlpineError> {
-        self.alpine.available()
+        self.alpine.available_reporting(self.sink)
     }
 
     /// [`Alpine::resolve_layer`], reporting to the attached sink.
@@ -1283,7 +1510,18 @@ struct Acquired {
     planned: PlannedPackage,
     /// What the container says about itself, and where its file tree begins.
     package: apk::Package,
-    /// The cached file, to be read a second time for the extraction.
+    /// The verified file itself, still open, to be seeked to the file tree the
+    /// verification already digested.
+    ///
+    /// The descriptor rather than the path, and that is the whole point: a cache
+    /// directory is the caller's and its atomic publish is written for concurrent
+    /// writers, so re-opening the path would extract whatever is there by then
+    /// rather than what was verified. Nothing can be swapped underneath an open
+    /// descriptor — a replacement publishes a new inode and this one keeps
+    /// reading the old.
+    file: std::fs::File,
+    /// Where that file is, for the errors, which name a path rather than a
+    /// descriptor.
     path: PathBuf,
     /// The file's length, which the record states as `S:`.
     size: u64,
@@ -1293,7 +1531,12 @@ struct Acquired {
 ///
 /// An unavailable identity map or an unrunnable architecture is a configuration
 /// problem, and both are cheaper to report now than after a closure has been
-/// fetched. Neither applies to an extract-only run, which executes nothing.
+/// fetched. Neither applies to an extract-only run, which executes nothing, so
+/// such a run reaches none of this.
+///
+/// A caller-supplied plan is not checked here: it is checked by
+/// [`validate_plan`] at `build()`, where the configuration is frozen and where
+/// the refusal reaches a caller who never provisions at all.
 fn preflight(alpine: &Alpine) -> Result<(), AlpineError> {
     if alpine.extract_only {
         return Ok(());
@@ -1385,9 +1628,10 @@ fn install(
     // The cache disposes of itself when this frame ends, on the failure paths
     // below as on the success path.
     let cache = PackageCache::beside(into, alpine.cache_dir.as_deref(), APK_CACHE);
-    let acquired = acquire(
+    let mut acquired = acquire(
         &mut *alpine.fetcher,
         &plan,
+        &alpine.repositories,
         &alpine.architecture,
         cache.path(),
         observer,
@@ -1395,7 +1639,7 @@ fn install(
 
     let order = install_order(&acquired);
     let carried = base.map(layer::Base::carried).unwrap_or_default();
-    let (database, subjects) = lay_down(into, carried, &acquired, &order, observer)?;
+    let (database, subjects) = lay_down(into, carried, &mut acquired, &order, observer)?;
 
     // After every package's files are down, so this overwrites what they
     // shipped, and before any script runs, so a script reads what was injected.
@@ -1477,9 +1721,15 @@ fn joined(carried: &[String], mine: impl IntoIterator<Item = String>) -> Vec<Str
 /// publishes no digest of the whole file, so what identifies a package is its
 /// signature, the control identity the index recorded, and the `datahash`
 /// binding its file tree — all of which this reads anyway.
+/// Each package is fetched over the mirrors of the repository that serves the
+/// index it came from, walked in configured order, so a package that has rotated
+/// off a live mirror is served by that repository's backstop. The plan's own
+/// record of which mirror served the index is provenance rather than a fetch
+/// instruction; it is the configuration that says where to fetch from.
 fn acquire(
     fetcher: &mut dyn Fetch,
     plan: &Plan,
+    repositories: &[Repository],
     architecture: &str,
     cache: &Path,
     observer: &mut dyn AlpineObserver,
@@ -1487,6 +1737,9 @@ fn acquire(
     std::fs::create_dir_all(cache)
         .map_err(|err| ProvisionError::io("creating the package directory", cache, err))?;
 
+    // Positional, and `validate_plan` has already held the plan to it, so a slot
+    // a package names is one this resolves.
+    let slots = index_slots(repositories, architecture);
     let mut acquired = Vec::with_capacity(plan.packages.len());
     for (position, planned) in plan.packages.iter().enumerate() {
         // A package boundary: whatever has been downloaded is complete and the
@@ -1504,6 +1757,20 @@ fn acquire(
                 ),
             })
         })?;
+        let mirrors = slots
+            .get(planned.index)
+            .map(|slot| repositories[slot.origin].mirrors.as_slice())
+            .ok_or_else(|| {
+                wrap(AlpineError::Config {
+                    reason: format!(
+                        "the plan attributes {} to index {}, and the configured repositories \
+                         publish {}",
+                        planned.name,
+                        planned.index,
+                        slots.len(),
+                    ),
+                })
+            })?;
         let path = cache.join(planned.file_name());
 
         // A cached entry that does not read back as this package is not an
@@ -1516,13 +1783,16 @@ fn acquire(
                     index: position + 1,
                     total: plan.packages.len(),
                 });
-                let url = format!(
-                    "{}/{architecture}/{}",
-                    index.directory(),
-                    planned.file_name()
-                );
-                observer.progress(AlpineEvent::Fetching { url: &url });
-                download(fetcher, &url, planned, &path).map_err(wrap)?;
+                download_over(
+                    fetcher,
+                    mirrors,
+                    index,
+                    planned,
+                    architecture,
+                    &path,
+                    observer,
+                )
+                .map_err(wrap)?;
                 read_acquired(&path, planned, architecture).map_err(wrap)?
             }
         };
@@ -1538,6 +1808,10 @@ fn acquire(
 /// that arrived and compared to the one the plan records — which came out of a
 /// verified index, or out of a plan a caller kept — and the package's own name,
 /// version and architecture are compared to the plan's.
+///
+/// The file the checks were made against is carried out in the [`Acquired`],
+/// rather than the path being opened again where the tree is laid down: the two
+/// opens would be two files, and only the first of them was verified.
 ///
 /// The binding is what a signature alone cannot do. A signature says that *some*
 /// package was signed; without the binding a mirror answers a request for
@@ -1598,19 +1872,59 @@ fn read_acquired(
     Ok(Acquired {
         planned: planned.clone(),
         package,
+        file,
         path: path.to_path_buf(),
         size,
     })
 }
 
+/// Downloads one package, walking the mirrors of the repository that serves it.
+///
+/// A mirror that [could not serve it](FetchError::is_failover) advances the walk
+/// and the last such failure is reported once none is left, which is the
+/// discipline the index walk and the Debian layer's package walk both follow.
+/// Nothing else advances it: a body that arrives and does not verify is refused
+/// where it is read, since what arrived was answered for by the URL that was
+/// asked for.
+#[allow(clippy::too_many_arguments)]
+fn download_over(
+    fetcher: &mut dyn Fetch,
+    mirrors: &[String],
+    index: &ResolvedIndex,
+    planned: &PlannedPackage,
+    architecture: &str,
+    dest: &Path,
+    observer: &mut dyn AlpineObserver,
+) -> Result<(), AlpineError> {
+    let mut last_missing = None;
+    for mirror in mirrors {
+        let url = format!(
+            "{}/{architecture}/{}",
+            index.directory_under(mirror),
+            planned.file_name(),
+        );
+        observer.progress(AlpineEvent::Fetching { url: &url });
+        match download(fetcher, &url, planned, dest) {
+            Ok(()) => return Ok(()),
+            Err(AlpineError::Fetch(err)) if err.is_failover() => last_missing = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(AlpineError::Fetch(last_missing.unwrap_or_else(|| {
+        FetchError::not_found(planned.file_name())
+    })))
+}
+
 /// Downloads one package into the cache, atomically.
 ///
 /// The body is written to a staging file beside the destination and renamed onto
-/// it, so nothing unverified is ever visible at the cache path and a concurrent
+/// it, so a partial body is never visible at the cache path and a concurrent
 /// download of the same package publishes its own file rather than consuming
-/// this one. The verification happens on the read that follows, which is the
+/// this one. What the rename publishes is a *complete* body rather than a
+/// verified one: the verification happens on the read that follows, which is the
 /// same read a cache hit goes through — one code path, whichever produced the
-/// file.
+/// file — and an entry that does not verify is downloaded again rather than
+/// trusted.
 ///
 /// The index's `S:` bounds what the download may spend. It is a length a
 /// verified source declared, so it travels as [`FetchRequest::sized`] as well as
@@ -1629,17 +1943,32 @@ fn download(
         .open(&staged)
         .map_err(AlpineError::at("staging a package", &staged))?;
 
+    let mut sink = std::io::BufWriter::new(file);
     let request = FetchRequest::new(url);
     let fetched = match planned.size {
-        Some(size) => fetcher.fetch(
-            &request.sized(size),
-            &mut LimitedWriter::new(&mut std::io::BufWriter::new(file), size),
-        ),
-        None => fetcher.fetch(&request, &mut std::io::BufWriter::new(file)),
+        Some(size) => {
+            let mut capped = LimitedWriter::new(&mut sink, size);
+            fetcher.fetch(&request.sized(size), &mut capped)
+        }
+        None => fetcher.fetch(&request, &mut sink),
     };
-    let published = fetched.map_err(AlpineError::Fetch).and_then(|()| {
-        std::fs::rename(&staged, dest).map_err(AlpineError::at("publishing a package", dest))
-    });
+    // The last buffer is written here rather than by `BufWriter`'s own `Drop`,
+    // which has nowhere to report a failure and so swallows it. A body whose
+    // tail never reached the disk would otherwise be renamed into the cache and
+    // reported by the read that follows as a digest or container failure — an
+    // authenticity answer to a local write failure, which is the wrong thing to
+    // tell the caller and the wrong thing for them to act on.
+    let flushed = sink
+        .into_inner()
+        .map(|_| ())
+        .map_err(|err| AlpineError::at("writing a package", &staged)(err.into_error()));
+
+    let published = fetched
+        .map_err(AlpineError::Fetch)
+        .and(flushed)
+        .and_then(|()| {
+            std::fs::rename(&staged, dest).map_err(AlpineError::at("publishing a package", dest))
+        });
     if published.is_err() {
         let _ = std::fs::remove_file(&staged);
     }
@@ -1658,10 +1987,10 @@ fn install_order(acquired: &[Acquired]) -> Vec<usize> {
         for entry in &held.package.info.provides {
             // A `p:` entry may state a version; the name is what a dependency
             // names it by.
-            let name = entry
-                .split_once(['=', '<', '>', '~'])
-                .map_or(entry.as_str(), |(name, _)| name);
-            provides.entry(name.to_string()).or_default().push(at);
+            provides
+                .entry(version::name_of(entry).to_string())
+                .or_default()
+                .push(at);
         }
     }
     let depends: Vec<Vec<String>> = acquired
@@ -1671,12 +2000,11 @@ fn install_order(acquired: &[Acquired]) -> Vec<usize> {
                 .info
                 .depends
                 .iter()
+                // A `!` entry states what must *not* be installed. The
+                // resolution already settled that; an install order has no edge
+                // to draw from it.
                 .filter(|entry| !entry.starts_with('!'))
-                .map(|entry| {
-                    entry
-                        .split_once(['=', '<', '>', '~'])
-                        .map_or(entry.clone(), |(name, _)| name.to_string())
-                })
+                .map(|entry| version::name_of(entry).to_string())
                 .collect()
         })
         .collect();
@@ -1686,13 +2014,14 @@ fn install_order(acquired: &[Acquired]) -> Vec<usize> {
 /// Lays every package's file tree into the staging tree, building the installed
 /// database as it goes.
 ///
-/// One pass per package, in `order`, and the second read of each cached file:
+/// One pass per package, in `order`, and the second read of each acquired file:
 /// the first established that the bytes are the package, and this one decodes
-/// the file tree it already digested.
+/// the file tree it already digested. It is the same open file both times, which
+/// is what makes "already digested" true of the bytes this reads.
 fn lay_down(
     staging: &Path,
     carried: Carried,
-    acquired: &[Acquired],
+    acquired: &mut [Acquired],
     order: &[usize],
     observer: &mut dyn AlpineObserver,
 ) -> Result<(Database, Vec<ScriptSubject>), ProvisionError> {
@@ -1701,7 +2030,7 @@ fn lay_down(
     let mut subjects = Vec::with_capacity(order.len());
 
     for at in order {
-        let held = &acquired[*at];
+        let held = &mut acquired[*at];
         // A package boundary again: the staging tree is discarded wholesale by
         // `ensure` when this returns an error, so a partial layout is no hazard.
         if observer.cancelled() {
@@ -1724,11 +2053,12 @@ fn lay_down(
         .with_scripts(held.package.scripts.clone());
         let at = database.add(record);
 
-        let mut file = std::fs::File::open(&held.path)
+        // Rewound rather than reopened: the verification left this descriptor at
+        // the end of the file it authenticated.
+        held.file
+            .seek(std::io::SeekFrom::Start(held.package.data_at))
             .map_err(|err| ProvisionError::io("reading the package", &held.path, err))?;
-        file.seek(std::io::SeekFrom::Start(held.package.data_at))
-            .map_err(|err| ProvisionError::io("reading the package", &held.path, err))?;
-        let mut archive = TarReader::new(apk::data_reader(file));
+        let mut archive = TarReader::new(apk::data_reader(&mut held.file));
 
         let mut collision = None;
         extraction.extract(&mut archive, &mut |entry, components| {
@@ -2313,6 +2643,41 @@ mod tests {
         let available = alpine.available().expect("both indexes verify");
         assert!(available.contains("alpine-base"), "from Alpine");
         assert!(available.contains("postmarketos-base"), "from postmarketOS",);
+    }
+
+    #[test]
+    fn an_observed_catalogue_reports_the_index_it_is_fetching() {
+        // The call is nothing but the index walk, which spends one mirror
+        // timeout per unreachable mirror, so an observed caller has no other
+        // way to learn what a long silence is waiting on.
+        struct Sink(Vec<String>);
+        impl AlpineObserver for Sink {
+            fn progress(&mut self, event: AlpineEvent<'_>) {
+                if let AlpineEvent::Fetching { url } = event {
+                    self.0.push(url.to_string());
+                }
+            }
+        }
+
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .repository(postmarketos())
+            .fetcher(canned())
+            .build()
+            .expect("the bootstrap configures");
+        let mut sink = Sink(Vec::new());
+        alpine
+            .observe(&mut sink)
+            .available()
+            .expect("both indexes verify");
+        assert_eq!(
+            sink.0,
+            [
+                "http://mirror.invalid/alpine/v3.23/main/x86_64/APKINDEX.tar.gz",
+                "http://mirror.invalid/pmos/v26.06/x86_64/APKINDEX.tar.gz",
+            ],
+        );
     }
 
     #[test]
@@ -2959,7 +3324,7 @@ mod tests {
         let staging = scratch.join("root");
         std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
 
-        let mut acquired = Vec::new();
+        let mut acquired: Vec<Acquired> = Vec::new();
         for container in [fixtures::ALPINE_BASELAYOUT, fixtures::MUSL] {
             let planned = planned_from(container, "x86_64");
             let path = cache.join(planned.file_name());
@@ -2971,9 +3336,14 @@ mod tests {
         }
 
         let order: Vec<usize> = (0..acquired.len()).collect();
-        let (database, subjects) =
-            lay_down(&staging, Carried::default(), &acquired, &order, &mut Silent)
-                .expect("the closure lays down");
+        let (database, subjects) = lay_down(
+            &staging,
+            Carried::default(),
+            &mut acquired,
+            &order,
+            &mut Silent,
+        )
+        .expect("the closure lays down");
 
         assert_eq!(
             String::from_utf8(database.installed()).expect("the database is text"),
@@ -3608,6 +3978,103 @@ mod tests {
         assert!(installed.contains("\nP:musl\n"), "{installed}");
     }
 
+    #[test]
+    fn a_package_missing_from_the_primary_is_served_by_the_backstop() {
+        // The plan records the mirror that served the index, and a package is
+        // fetched over the configured mirror list rather than that record. The
+        // primary keeps the index the plan resolved from and loses the package,
+        // which is what a rebuild does to a live mirror; a walk that stopped at
+        // the recorded mirror could not recover from it.
+        let scratch = Scratch::new("alpine-package-backstop");
+        let primary = scratch.join("primary/v3.23/main/x86_64");
+        let backstop = scratch.join("backstop/v3.23/main/x86_64");
+        for tree in [&primary, &backstop] {
+            std::fs::create_dir_all(tree).expect("the repository tree is creatable");
+        }
+        std::fs::write(primary.join("APKINDEX.tar.gz"), fixtures::INDEX)
+            .expect("the index is writable");
+        std::fs::write(primary.join("musl-1.2.5-r23.apk"), fixtures::MUSL)
+            .expect("the package is writable");
+
+        let primary_url =
+            crate::provision::file_url(&scratch.join("primary")).expect("the path is nameable");
+        let backstop_url =
+            crate::provision::file_url(&scratch.join("backstop")).expect("the path is nameable");
+
+        let plan = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&primary_url)
+            .include(["musl"])
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect("musl resolves");
+
+        // The package rotates off the primary onto the backstop. The index it
+        // was resolved from stays exactly where it was.
+        std::fs::rename(
+            primary.join("musl-1.2.5-r23.apk"),
+            backstop.join("musl-1.2.5-r23.apk"),
+        )
+        .expect("the package is movable");
+
+        // Without a backstop there is nowhere else to look, which is what makes
+        // the success below the walk's doing rather than the primary's.
+        let mut alone = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&primary_url)
+            .plan(plan.clone())
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures");
+        crate::provision::ensure(scratch.join("alone"), &mut alone)
+            .expect_err("the primary no longer serves the package");
+
+        let root = scratch.join("root");
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&primary_url)
+            .mirror_fallback(&backstop_url)
+            .plan(plan)
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures");
+        crate::provision::ensure(&root, &mut alpine).expect("the backstop serves the package");
+        assert!(root.join("lib/ld-musl-x86_64.so.1").is_file());
+    }
+
+    #[test]
+    fn a_plan_resolved_against_more_indexes_than_are_configured_is_refused() {
+        // A package names the index it came from, and the mirrors it is fetched
+        // over are the ones the repository publishing that index is configured
+        // with. A plan the configuration cannot account for therefore names no
+        // mirror, and says so before anything is downloaded.
+        let plan = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .repository(postmarketos())
+            .include(["busybox"])
+            .fetcher(canned())
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect("busybox resolves");
+        assert_eq!(plan.indexes.len(), 2, "one index from each repository");
+
+        let err = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .plan(plan)
+            .extract_only(true)
+            .fetcher(canned())
+            .build()
+            .expect_err("the second repository is not configured");
+        assert!(
+            matches!(&err, AlpineError::Config { reason } if reason.contains("name no mirror")),
+            "{err}",
+        );
+    }
+
     /// A one-entry uncompressed tar holding `path` with `contents`, as a
     /// package's data segment lays a file down.
     fn one_file_archive(path: &str, contents: &[u8]) -> Vec<u8> {
@@ -3731,6 +4198,134 @@ mod tests {
                 .find(|record| record.contains("R:tool"))
                 .expect("some record holds it");
             assert!(owner.contains(&format!("P:{later}")), "{owner}");
+        }
+    }
+
+    /// A plan the canned repository would resolve, for the refusals below to
+    /// start from something valid.
+    #[cfg(test)]
+    fn resolved_plan() -> Plan {
+        Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .include(["busybox"])
+            .fetcher(canned())
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect("busybox resolves")
+    }
+
+    /// The refusal `build()` gives for `plan`, under `configure`.
+    fn refuses_plan(plan: Plan, configure: impl FnOnce(AlpineBuilder) -> AlpineBuilder) -> String {
+        let builder = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .extract_only(true)
+            .fetcher(canned())
+            .plan(plan);
+        match configure(builder).build() {
+            Err(AlpineError::Config { reason }) => reason,
+            other => panic!("expected a configuration refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plan_resolved_for_another_architecture_is_refused_at_build() {
+        // The failure this replaces: `build()` succeeded, the first package
+        // downloaded, and the run failed with a per-package "states
+        // architecture" error rather than an upfront configuration refusal.
+        let mut plan = resolved_plan();
+        plan.architecture = "aarch64".to_string();
+        let reason = refuses_plan(plan, |builder| builder);
+        assert!(reason.contains("aarch64"), "{reason}");
+        assert!(reason.contains("x86_64"), "{reason}");
+    }
+
+    #[test]
+    fn a_builder_naming_no_architecture_adopts_the_plans() {
+        // The other half of the check above, and the reason it is not a trap: a
+        // plan states which architecture it is for, so refusing one the caller
+        // never contradicted — over a host default they never chose — would be a
+        // confusing rejection. The Debian builder adopts a plan's architecture
+        // for exactly this reason, and a pin's the same way.
+        let mut plan = resolved_plan();
+        plan.architecture = "aarch64".to_string();
+        for package in &mut plan.packages {
+            package.architecture = "aarch64".to_string();
+        }
+        let alpine = Alpine::builder("v3.23")
+            .mirror("http://mirror.invalid/alpine")
+            .extract_only(true)
+            .fetcher(canned())
+            .plan(plan)
+            .build()
+            .expect("the plan states the architecture");
+        assert_eq!(alpine.architecture, "aarch64");
+    }
+
+    #[test]
+    fn a_plan_whose_index_is_not_the_one_configured_in_that_slot_is_refused() {
+        // The correspondence is positional and a package's URL is composed from
+        // the configured mirror with the plan's own release and component, so a
+        // mismatched slot composes a directory no mirror serves. Without this
+        // the whole mirror walk 404s and blames mirrors that were never asked
+        // for that directory.
+        let mut plan = resolved_plan();
+        plan.indexes[0].component = Some("community".to_string());
+        let reason = refuses_plan(plan, |builder| builder);
+        assert!(reason.contains("v3.23/community"), "{reason}");
+        assert!(reason.contains("v3.23/main"), "{reason}");
+
+        // The mirror is deliberately not compared: a plan carried to another
+        // configuration fetches from that configuration's mirrors, which is
+        // what makes it portable.
+        let mut moved = resolved_plan();
+        moved.indexes[0].mirror = "http://elsewhere.invalid/alpine".to_string();
+        Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .extract_only(true)
+            .fetcher(canned())
+            .plan(moved)
+            .build()
+            .expect("a plan resolved elsewhere still installs here");
+    }
+
+    #[test]
+    fn a_plan_naming_a_package_by_a_path_is_refused_at_build() {
+        // `Plan` is public and `Clone`, so a plan taken from `resolve()` and
+        // edited reaches `build()` without having passed the index's gate. The
+        // name composes the cache path the downloaded bytes are published at,
+        // before anything has checked what they are.
+        let mut plan = resolved_plan();
+        plan.packages[0].name = "../../escaped".to_string();
+        let reason = refuses_plan(plan, |builder| builder);
+        assert!(reason.contains("addressed by"), "{reason}");
+    }
+
+    #[test]
+    fn a_plan_beside_a_resolution_of_its_own_is_refused() {
+        // Each of these describes a resolution, and a plan is one already; the
+        // bootstrap would install the plan and silently drop the rest.
+        for (what, configure) in [
+            (
+                "include",
+                Box::new(|builder: AlpineBuilder| builder.include(["busybox"]))
+                    as Box<dyn FnOnce(AlpineBuilder) -> AlpineBuilder>,
+            ),
+            (
+                "exclude",
+                Box::new(|builder: AlpineBuilder| builder.exclude(["busybox"])),
+            ),
+            (
+                "pin",
+                Box::new(|builder: AlpineBuilder| builder.pin(resolved_plan())),
+            ),
+        ] {
+            let reason = refuses_plan(resolved_plan(), configure);
+            assert!(reason.contains(what), "{what}: {reason}");
+            assert!(reason.contains("drop one of the two"), "{what}: {reason}");
         }
     }
 

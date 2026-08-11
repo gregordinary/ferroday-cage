@@ -71,6 +71,12 @@ pub(super) struct Record {
     /// `k:`, the priority that ranks this package against another providing the
     /// same name, and the flag that makes an unversioned `p:` entry selectable
     /// at all.
+    ///
+    /// Only ever *greater than zero*. `apk` declines to choose between a
+    /// provider that states `k:0` and one that states no `k:` at all, exactly as
+    /// it declines between two that state none, so the two are one case and are
+    /// held as one value here rather than being told apart and then treated
+    /// alike everywhere downstream.
     pub(super) provider_priority: Option<u32>,
     /// Which of the caller's indexes this record was retained from, so a
     /// package is fetched from the repository that published it.
@@ -116,14 +122,16 @@ impl Dependency {
     /// Also of `.PKGINFO`'s `replaces`, which is the same grammar: an entry
     /// there may carry a version, and reading it as a bare name would widen
     /// which packages a file may be taken from.
-    pub(super) fn parse(text: &str) -> Result<Dependency, String> {
-        let (text, conflict) = match text.strip_prefix('!') {
+    pub(super) fn parse(entry: &str) -> Result<Dependency, String> {
+        let (text, conflict) = match entry.strip_prefix('!') {
             Some(rest) => (rest, true),
-            None => (text, false),
+            None => (entry, false),
         };
         let (name, constraint) = version::split(text)?;
         if name.is_empty() {
-            return Err(format!("{text:?} names no package"));
+            // The entry as it was written rather than what is left after the
+            // `!`, so a bare `!` is quoted as itself and not as an empty string.
+            return Err(format!("{entry:?} names no package"));
         }
         Ok(Dependency {
             name: name.to_string(),
@@ -213,7 +221,10 @@ fn list<T>(value: Option<&str>, parse: fn(&str) -> Result<T, String>) -> Result<
 /// character set apk names are drawn from rather than merely to a safe shape,
 /// which leaves nothing that could end a request line, start a query, or name a
 /// directory other than itself.
-fn is_package_name(name: &str) -> bool {
+///
+/// A plan document is held to this too, in [`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable):
+/// a plan reaches the same URL and the same cache path without passing an index.
+pub(super) fn is_package_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with(['-', '.'])
         && name
@@ -227,12 +238,31 @@ fn is_package_name(name: &str) -> bool {
 /// The value is recomputed and compared when a package is fetched, and written
 /// into a plan document meanwhile, so a record carrying anything else is
 /// malformed rather than merely unfamiliar.
+///
+/// The padding is where it has to be rather than merely allowed: twenty bytes
+/// of base64 is twenty-seven alphabet characters and exactly one `=`, so a value
+/// with padding anywhere else is one [`sign::identity`](super::sign) can never
+/// render. Admitting it would put the refusal in the wrong place — a fetch-time
+/// digest mismatch, worded as a mirror serving something else, for an index that
+/// was malformed before anything was fetched.
+///
+/// The whole index is refused rather than the record dropped, which is stricter
+/// than `apk`: measured against `apk.static`, a record whose `C:` will not
+/// decode is silently skipped and the rest of the index used. A mirror that
+/// serves a malformed record has served something this reader cannot account
+/// for, and a root assembled from the remainder would be missing whatever that
+/// record named, without saying so.
 fn is_control_identity(value: &str) -> bool {
+    let Some(encoded) = value.strip_prefix(IDENTITY_PREFIX) else {
+        return false;
+    };
+    let Some(digest) = encoded.strip_suffix('=') else {
+        return false;
+    };
     value.len() == IDENTITY_LENGTH
-        && value.starts_with(IDENTITY_PREFIX)
-        && value[IDENTITY_PREFIX.len()..]
+        && digest
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
 }
 
 /// Parses an `APKINDEX` into its records.
@@ -347,7 +377,16 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
         depends: list(value('D'), Dependency::parse).map_err(&malformed)?,
         provides: list(value('p'), Provided::parse).map_err(&malformed)?,
         install_if: list(value('i'), Dependency::parse).map_err(&malformed)?,
-        provider_priority: value('k').and_then(|value| value.parse().ok()),
+        // A `k:` that is not a number greater than zero is no priority, which is
+        // measurably `apk`'s own reading rather than a lenient one: driving
+        // `apk.static` 3.0.7 over a purpose-built repository, a `k:0`, a `k:-1`
+        // and a `k:abc` provider each left it refusing to choose against a
+        // provider stating no `k:` at all, while a `k:1` provider won. It keeps
+        // the record either way, so refusing one here would refuse an index apk
+        // itself reads.
+        provider_priority: value('k')
+            .and_then(|value| value.parse().ok())
+            .filter(|priority| *priority > 0),
         from,
     }))
 }
@@ -682,16 +721,31 @@ mod tests {
         // It is recomputed and compared when the package is fetched, so a
         // record carrying anything else is malformed rather than unfamiliar.
         let right_length_wrong_alphabet = format!("{}!", &identity("a")[..IDENTITY_LENGTH - 1]);
+        // Twenty bytes of base64 is twenty-seven alphabet characters and one
+        // trailing `=`, so padding anywhere else is a value the encoder can
+        // never produce. Admitting it would move the refusal to fetch time and
+        // word it as a mirror serving the wrong bytes.
+        let padded_throughout = format!("{IDENTITY_PREFIX}{}", "=".repeat(28));
+        let padded_early = format!("{}={}", &identity("a")[..IDENTITY_LENGTH - 2], "A");
         for value in [
             "",
             "Q1",
             "Q2abc",
             &right_length_wrong_alphabet,
+            &padded_throughout,
+            &padded_early,
             &format!("{}x", identity("a")),
         ] {
             let text = format!("C:{value}\nP:musl\nV:1.0-r0\nA:x86_64\n");
             let err = parse("the index", &text, 0).expect_err("the identity is malformed");
             assert!(matches!(err, AlpineError::Index { .. }), "{value:?}: {err}");
+        }
+        // And what the encoder does produce is accepted, over inputs whose
+        // final base64 group varies.
+        for seed in ["a", "bb", "ccc", "dddd"] {
+            let text = format!("C:{}\nP:musl\nV:1.0-r0\nA:x86_64\n", identity(seed));
+            parse("the index", &text, 0)
+                .unwrap_or_else(|err| panic!("{seed}'s identity is one this crate renders: {err}"));
         }
     }
 

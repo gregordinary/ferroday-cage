@@ -545,8 +545,15 @@ fn set(rest: &[u8]) -> Option<(impl Fn(u8) -> bool + use<'_>, &[u8])> {
 /// the names each package provides as well as its own. It has cycles — Alpine
 /// publishes mutually dependent packages — so this is a depth-first post-order
 /// that steps over a package it is already visiting rather than a sort that
-/// insists on a total order. Ties are broken by name, so one closure always
-/// produces one order.
+/// insists on a total order.
+///
+/// Nothing here consults a name. Two packages neither of which needs the other
+/// come out in the order they were handed in, so the same input always produces
+/// the same output and a different input may produce a different one. That is
+/// the property the callers need and the one they have: a resolution walks a
+/// `BTreeMap`, so its input is in name order, and a caller-supplied plan
+/// document's is in document order — each reproducible from what it was built
+/// from.
 pub(super) fn dependency_order(
     depends: &[Vec<String>],
     provides: &HashMap<String, Vec<usize>>,

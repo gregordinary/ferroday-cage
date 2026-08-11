@@ -14,6 +14,7 @@
 
 use super::AlpineError;
 use super::index::Record;
+use super::version;
 use crate::provision::document::{self, Carried, Draft};
 
 /// The suffix every apk file carries.
@@ -104,12 +105,18 @@ pub struct Plan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedIndex {
-    /// The mirror URL that served this index, which is the one its packages
-    /// will be fetched from.
+    /// The mirror URL that served this index.
     ///
     /// The URL that answered, not the configured list: a repository with a
     /// backstop resolves against whichever mirror served, and recording the
     /// list would describe a choice rather than the choice made.
+    ///
+    /// This records where the index came from; it does not decide where the
+    /// packages are fetched from. A bootstrap installing this plan walks the
+    /// mirrors its repositories are configured with, so a plan carried to a
+    /// different configuration fetches from that configuration's mirrors and
+    /// still installs the packages this plan names, each held to the identity
+    /// recorded here.
     pub mirror: String,
     /// The release, as the repository requested it.
     pub release: String,
@@ -127,8 +134,9 @@ pub struct ResolvedIndex {
     ///
     /// The name the repository publishes the key under, which is what the
     /// signature member itself carries — `alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub`.
-    /// An index may be signed once only, so this names the key that was used
-    /// rather than one of several that could have been.
+    /// An index may carry more than one signature, one per key, which is what a
+    /// key rotation looks like; this names the one that actually verified rather
+    /// than the first the container happens to list.
     pub signed_by: String,
     /// The index's `DESCRIPTION` member, as written, when it carries one.
     ///
@@ -259,14 +267,18 @@ impl ResolvedIndex {
 }
 
 impl ResolvedIndex {
-    /// The mirror-relative directory this index's packages are addressed from,
+    /// The directory this index's packages are addressed from under `mirror`,
     /// as a URL without a trailing slash.
     ///
     /// An apk package sits beside its own index, so the whole of a package's
     /// location is this and its file name — with the architecture between them,
     /// since a repository serves one directory per architecture.
-    pub(super) fn directory(&self) -> String {
-        let mirror = self.mirror.trim_end_matches('/');
+    ///
+    /// The mirror is supplied rather than taken from [`mirror`](Self::mirror),
+    /// because a download walks the mirrors its repository is configured with
+    /// and the recorded one names only where the index came from.
+    pub(super) fn directory_under(&self, mirror: &str) -> String {
+        let mirror = mirror.trim_end_matches('/');
         match &self.component {
             Some(component) => format!("{mirror}/{}/{component}", self.release),
             None => format!("{mirror}/{}", self.release),
@@ -282,6 +294,11 @@ impl PlannedPackage {
     /// recorded in it. It sits in the directory of the index that named the
     /// package, which [`index`](Self::index) identifies.
     ///
+    /// The name and version are held to the index grammar before a plan is used
+    /// — as a document is read, and again at
+    /// [`build`](super::AlpineBuilder::build) — so this is one path segment and
+    /// never a path.
+    ///
     /// # Example
     ///
     /// ```
@@ -292,6 +309,36 @@ impl PlannedPackage {
     /// ```
     pub fn file_name(&self) -> String {
         format!("{}-{}{PACKAGE_SUFFIX}", self.name, self.version)
+    }
+
+    /// Why this entry cannot be addressed, or `None` where it can.
+    ///
+    /// [`file_name`](Self::file_name) interpolates the name and the version and
+    /// nothing else, and that file name becomes both a path segment of the URL
+    /// the package is fetched from and the entry it is cached under. A name
+    /// holding a separator or a `..` would therefore name a directory other than
+    /// the cache, and the bytes would land there before the identity binding that
+    /// rejects them ever runs.
+    ///
+    /// A package resolved from an index passed [`index::is_package_name`] and the
+    /// version grammar on the way in, so this is the same gate for the way a plan
+    /// arrives instead: a document a caller kept and may have edited, or a
+    /// [`Plan`] taken from [`resolve`](super::Alpine::resolve) and modified,
+    /// neither of which has an index behind it.
+    pub(super) fn unaddressable(&self) -> Option<String> {
+        if !super::index::is_package_name(&self.name) {
+            return Some(format!(
+                "the plan names {:?}, which is not a name a package can be addressed by",
+                self.name,
+            ));
+        }
+        if version::parse(&self.version).is_none() {
+            return Some(format!(
+                "the plan states {} at {:?}, which is not a version this format defines",
+                self.name, self.version,
+            ));
+        }
+        None
     }
 }
 
@@ -401,8 +448,11 @@ impl Plan {
     ///
     /// [`AlpineError::PlanDocument`] for a document with no header, a format
     /// version this library does not read, a stanza missing a field the plan
-    /// cannot do without, a malformed number, or a package naming an index the
-    /// document does not carry.
+    /// cannot do without, a malformed number, a package naming an index the
+    /// document does not carry, or a package whose name or version is not one an
+    /// apk repository can publish. That last is the shape an index guarantees a
+    /// resolved plan and a document guarantees nothing about: the two fields
+    /// compose the file name a package is fetched and cached under.
     pub fn parse_document(text: &str) -> Result<Plan, AlpineError> {
         let stanzas = document::parse(text);
         let (header, rest) = stanzas
@@ -437,7 +487,7 @@ impl Plan {
                          — index stanzas must precede the packages that refer to them",
                     )));
                 }
-                plan.packages.push(PlannedPackage {
+                let package = PlannedPackage {
                     name: name.to_string(),
                     version: required(stanza.get("Version"), "Version", &at_package)?,
                     architecture: required(
@@ -459,7 +509,13 @@ impl Plan {
                     )?,
                     origin: stanza.get("Origin").map(str::to_string),
                     carried: document::carried(stanza, PACKAGE_FIELDS),
-                });
+                };
+                // The document is the only thing behind a plan read this way, so
+                // the shape an index would have guaranteed is checked here.
+                if let Some(reason) = package.unaddressable() {
+                    return Err(plan_document(reason));
+                }
+                plan.packages.push(package);
                 continue;
             }
 
@@ -827,6 +883,53 @@ mod tests {
             Plan::parse_document("Release: v3.23\nArchitecture: x86_64\n"),
             Err(AlpineError::PlanDocument { .. }),
         ));
+    }
+
+    #[test]
+    fn a_package_name_that_is_not_one_is_refused() {
+        // The name composes the file the package is fetched to and cached
+        // under, so a name that is a path names a directory other than the
+        // cache — and the bytes would land there before the identity binding
+        // that rejects them ever runs. A resolved plan passes the index's own
+        // gate on the way in; a document has no index behind it.
+        for name in [
+            "/etc/cron.d/x",
+            "../../foo",
+            "..",
+            "foo/bar",
+            "foo bar",
+            "-leading-dash",
+            "foo?query",
+        ] {
+            let document = sample()
+                .to_document()
+                .unwrap()
+                .replace("Package: busybox", &format!("Package: {name}"));
+            match Plan::parse_document(&document) {
+                Err(AlpineError::PlanDocument { reason }) => {
+                    assert!(reason.contains("addressed by"), "{name:?}: {reason}");
+                }
+                other => panic!("expected a name refusal for {name:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_version_that_is_not_one_is_refused() {
+        // The other half of the file name, and the same reasoning: `..` is a
+        // version the grammar does not define, and it is also a directory.
+        for version in ["..", "1.0-r0/../..", "not a version", "1.0-r0+"] {
+            let document = sample()
+                .to_document()
+                .unwrap()
+                .replace("Version: 1.37.0-r30", &format!("Version: {version}"));
+            match Plan::parse_document(&document) {
+                Err(AlpineError::PlanDocument { reason }) => {
+                    assert!(reason.contains("not a version"), "{version:?}: {reason}");
+                }
+                other => panic!("expected a version refusal for {version:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
