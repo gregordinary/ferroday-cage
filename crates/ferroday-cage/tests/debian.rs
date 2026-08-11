@@ -38,12 +38,22 @@ fn deb_with_control(control: &str, data_tar: &[u8]) -> Vec<u8> {
 /// network.
 const NETWORK_GATE: &str = "FERRODAY_CAGE_DEBIAN_NETWORK_TEST";
 
+/// The variable that asserts these tests ran, in the crate's usual shape: a
+/// skip stays a skip by default, and this turns it into a failure so a release
+/// check cannot come back green having exercised no repository at all.
+const REQUIRE_GATE: &str = "FERRODAY_CAGE_REQUIRE_NETWORK_TEST";
+
 /// Returns `false` and prints a skip note when the network tests are not
 /// enabled.
 fn network_enabled() -> bool {
     if std::env::var_os(NETWORK_GATE).is_some() {
         return true;
     }
+    assert!(
+        std::env::var_os(REQUIRE_GATE).is_none(),
+        "{REQUIRE_GATE} is set and {NETWORK_GATE} is not, so the Debian bootstrap tests \
+         would have been skipped",
+    );
     eprintln!("skipping: set {NETWORK_GATE}=1 to run the Debian bootstrap tests");
     false
 }

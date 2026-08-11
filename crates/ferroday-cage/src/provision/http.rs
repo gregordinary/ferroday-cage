@@ -467,8 +467,25 @@ fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
 /// [`scheme_of`](super::fetch::scheme_of) documents. A literal comparison would
 /// let `HTTP://` be a URL one check in this crate accepts and another refuses,
 /// with the second refusing it for the wrong reason.
+///
+/// A URL carrying anything outside printable ASCII is refused whole, and that
+/// refusal is this client's request-line boundary. [`request`](HttpFetch::request)
+/// interpolates the parsed path verbatim into `GET <path> HTTP/1.1`, and every
+/// other URL this crate composes has already passed a check of its own —
+/// `coordinate::check` for a layer's own coordinates, `is_safe_pool_path` for a
+/// pool path, `is_sha256_hex` for a digest. A redirect `Location` has passed
+/// none: it is a hostile mirror's string, and one holding a CR or an LF would
+/// otherwise write headers of its own into the follow-up request. Refusing here
+/// covers the whole URL rather than the path alone, since the host reaches the
+/// request line too, through the `Host:` header.
 fn parse_http_url(url: &str) -> Result<HttpUrl, FetchError> {
     let bad = |reason: &str| FetchError::url(url, reason);
+    if !url.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(bad(
+            "the URL carries a space or a control character, which no part of a request line \
+             can hold",
+        ));
+    }
     // The remedy is named, not just the constraint: the scheme is refused
     // because this fetcher carries no TLS, which a caller reads as a broken URL
     // unless told that supplying a transport is how an https:// mirror works.
@@ -757,6 +774,35 @@ mod tests {
                 "{url} should be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_url_that_could_write_a_request_line_of_its_own_is_refused() {
+        // The one URL source that reaches the request line having passed no
+        // boundary of its own is a redirect `Location`, which is a hostile
+        // mirror's string. A CRLF in one would otherwise append headers to the
+        // follow-up request, turning the documented cross-host redirect into a
+        // request the caller did not compose.
+        for url in [
+            "http://mirror.example/x\r\nX-Injected: 1",
+            "http://mirror.example/x\nX-Injected: 1",
+            "http://mirror.example/x HTTP/1.1",
+            "http://mirror.example/x\0",
+            "http://mirror.exam\rple/x",
+        ] {
+            assert!(
+                matches!(parse_http_url(url), Err(FetchError::Url { .. })),
+                "{url:?} should be refused",
+            );
+        }
+        // And a redirect carrying one is refused as the URL it resolves to,
+        // rather than reaching the request line.
+        let injected =
+            resolve_redirect("http://mirror.example/debian/x", "/pool/y\r\nX-Injected: 1");
+        assert!(matches!(
+            parse_http_url(&injected),
+            Err(FetchError::Url { .. }),
+        ));
     }
 
     #[test]

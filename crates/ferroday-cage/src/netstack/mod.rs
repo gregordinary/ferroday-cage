@@ -27,6 +27,12 @@
 //! whether the stack happens to hold a socket on that port for some other
 //! destination, so a caller must not read anything into either outcome.
 //!
+//! Only TCP and UDP are forwarded. The stack answers ICMP echo for the
+//! gateway address and for nothing else, so a ping inside the guest tells the
+//! guest that its gateway is up and says nothing at all about the destination
+//! — a reachable address does not answer, and neither does a refused one.
+//! Reachability is what a connection reports.
+//!
 //! Attachment happens in a forked, short-lived helper process that joins
 //! the sandbox's user and network namespaces, creates and configures the
 //! tap, passes its descriptor back, and exits; the caller's own threads

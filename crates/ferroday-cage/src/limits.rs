@@ -478,10 +478,48 @@ mod tests {
         assert_eq!(Limit::UNLIMITED.to_string(), "unlimited");
     }
 
+    /// The resource each one is documented after, or `None` for the last.
+    ///
+    /// A chain rather than a list, and that is the whole point: the match has no
+    /// wildcard, so a resource added to the enum stops this compiling until it
+    /// is linked in, and linking it in puts it in the chain the test below holds
+    /// [`Resource::ALL`] to. A test that merely walked `ALL` could never notice
+    /// a variant `ALL` does not hold.
+    fn successor(resource: Resource) -> Option<Resource> {
+        match resource {
+            Resource::AddressSpace => Some(Resource::CoreDump),
+            Resource::CoreDump => Some(Resource::CpuTime),
+            Resource::CpuTime => Some(Resource::Data),
+            Resource::Data => Some(Resource::FileSize),
+            Resource::FileSize => Some(Resource::LockedMemory),
+            Resource::LockedMemory => Some(Resource::OpenFiles),
+            Resource::OpenFiles => Some(Resource::PendingSignals),
+            Resource::PendingSignals => Some(Resource::Processes),
+            Resource::Processes => Some(Resource::Stack),
+            Resource::Stack => None,
+        }
+    }
+
+    /// `ALL` is the roster, and it holds every resource.
+    ///
+    /// The omission this catches would be quiet rather than loud: `Resolved`
+    /// recovers a public resource by scanning `ALL` and falls back to
+    /// `AddressSpace`, so a variant left out of it is misreported in a
+    /// provenance record rather than refused anywhere.
+    #[test]
+    fn the_roster_holds_every_resource_in_the_documented_order() {
+        let mut chain = vec![Resource::AddressSpace];
+        while let Some(next) = successor(*chain.last().expect("the chain starts somewhere")) {
+            chain.push(next);
+        }
+        assert_eq!(Resource::ALL, chain);
+    }
+
     /// Every resource's `spelling` is the name the configuration formats
     /// accept, which is serde's kebab-case rename of the variant. The two are
-    /// written out separately, so this proves they agree — and, because it
-    /// walks `ALL`, that a resource added to the enum is added to the roster.
+    /// written out separately, so this proves they agree, over the roster
+    /// [`the_roster_holds_every_resource_in_the_documented_order`] proves is
+    /// complete.
     #[cfg(feature = "serde")]
     #[test]
     fn every_resources_spelling_is_the_name_a_profile_accepts() {

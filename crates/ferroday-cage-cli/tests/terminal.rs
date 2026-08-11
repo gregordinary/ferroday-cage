@@ -130,6 +130,46 @@ fn an_expired_timeout_exits_124() {
     );
 }
 
+/// The same expiry against a command that never stops printing.
+///
+/// The silent case above leaves the relay asleep in a `poll` whose only wakeup
+/// is the deadline, so it cannot tell an expiry the clock decided from one the
+/// absence of traffic decided. A command flooding the pseudoterminal keeps the
+/// primary readable, so every `poll` returns on a descriptor rather than on the
+/// timeout — and a relay that acted on the deadline only when `poll` reported
+/// nothing else would go on relaying instead of escalating.
+#[test]
+fn an_expired_timeout_exits_124_against_a_command_that_never_stops_printing() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let started = Instant::now();
+    let output = Command::new(FCAGE)
+        .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal"])
+        .args(["--timeout", "2", "--kill-after", "1"])
+        // Three writers, so the relay is refilled while it drains.
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "yes flooding & yes flooding & yes flooding",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("fcage runs");
+    assert_eq!(output.status.code(), Some(124), "{}", output.status);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the timeout did not end the session promptly",
+    );
+    assert!(
+        !output.stdout.is_empty(),
+        "the relay kept relaying while the deadline ran out",
+    );
+}
+
 // -- The interactive shape ----------------------------------------------------
 
 /// A typed line reaches the sandbox, its output comes back, and the caller's

@@ -146,7 +146,9 @@ pub(crate) fn remove_tree_mapped(
             drop(child_end);
             // `drive_removal` owns the gate, so returning closes the caller's
             // end before the wait below, and it signals the child before
-            // giving up on it. The wait is therefore always reachable.
+            // giving up on it. The wait is therefore always reachable — and it
+            // is this child's only one, on every path through `drive_removal`,
+            // which is why the one that gives up kills without reaping.
             let result = drive_removal(caller, child, &map);
             let _ = super::wait_for_exit(child);
             result
@@ -189,7 +191,11 @@ fn drive_removal(gate: OwnedFd, child: Pid, map: &ChildMap<'_>) -> Result<(), Re
             Err(super::GateFailure::Map(err)) => Some(RemoveFailure::Map(err)),
         };
         if let Some(failure) = failure {
-            super::abandon_gated_child(child);
+            // Killed but not reaped: the caller waits on this child whatever
+            // this function returns, and that wait is its one reap. Collecting
+            // the status here as well would leave the caller's wait blocking on
+            // a pid the kernel is free to have given to something else.
+            super::kill_gated_child(child);
             return Err(failure);
         }
     }

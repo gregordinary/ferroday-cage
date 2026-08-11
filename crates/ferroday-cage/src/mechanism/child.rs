@@ -63,7 +63,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
-use rustix::fs::{self, AtFlags, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags};
+use rustix::fs::{self, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags};
 use rustix::io::Errno;
 use rustix::ioctl;
 use rustix::mount::{self, MountFlags, MountPropagationFlags, UnmountFlags};
@@ -1753,9 +1753,24 @@ fn parse_fd(name: &CStr) -> Option<RawFd> {
 /// provisioned tree to carry forward. Setting it only on the directory this
 /// call just created keeps the rootfs's own modes intact — the tree owns what
 /// it ships, the sandbox owns what it creates.
+///
+/// It is set through a descriptor rather than by name, for the reason
+/// [`create_mount_file`] uses `fchmod`: a path-wise `chmodat` follows a symlink
+/// at the leaf, so a host process racing the window between the `mkdir` and the
+/// mode would have a path of its choosing chmod-ed instead. `O_NOFOLLOW` refuses
+/// a leaf replaced by a symlink outright, and `O_DIRECTORY` refuses one replaced
+/// by anything that is not a directory.
 fn create_mount_dir(dir: BorrowedFd<'_>, leaf: &CStr, mode: Mode) -> Result<(), Errno> {
     match fs::mkdirat(dir, leaf, mode) {
-        Ok(()) => fs::chmodat(dir, leaf, mode, AtFlags::empty()),
+        Ok(()) => {
+            let created = fs::openat(
+                dir,
+                leaf,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            fs::fchmod(&created, mode)
+        }
         Err(Errno::EXIST) => Ok(()),
         Err(errno) => Err(errno),
     }
@@ -2326,6 +2341,75 @@ mod tests {
             .permissions()
             .mode()
             & 0o7777
+    }
+
+    #[test]
+    fn a_mount_point_is_created_at_exactly_its_mode() {
+        // The umask must not decide a mode the sandbox contributes: the mount
+        // point outlives the sandbox, so a launch under `umask 077` would leave
+        // a 0700 `/tmp` behind for a provisioned tree to carry forward. 0777 is
+        // the value that shows it, since a umask conventionally clears write
+        // bits and `mkdir` would otherwise land on 0755.
+        let dir = Scratch::new("mount-dir-mode");
+        let root = open_root(dir.path());
+
+        create_mount_dir(root.as_fd(), c"created", Mode::from_raw_mode(0o777))
+            .expect("a mount point the root does not ship is created");
+
+        assert_eq!(mode_of(&dir.join("created")), 0o777);
+        assert!(dir.join("created").is_dir());
+    }
+
+    #[test]
+    fn a_mount_point_the_root_ships_is_left_exactly_as_it_is() {
+        // The tree owns what it ships and the sandbox owns what it creates, so
+        // an existing directory keeps its mode however the profile spells the
+        // mount point's.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = Scratch::new("mount-dir-shipped");
+        let root = open_root(dir.path());
+        std::fs::create_dir(dir.join("shipped")).expect("the directory is creatable");
+        std::fs::write(dir.join("shipped/kept"), b"the root's own").expect("the file is writable");
+        std::fs::set_permissions(dir.join("shipped"), std::fs::Permissions::from_mode(0o700))
+            .expect("the directory's mode is settable");
+
+        create_mount_dir(root.as_fd(), c"shipped", Mode::from_raw_mode(0o777))
+            .expect("a mount point the root ships is not an error");
+
+        assert_eq!(mode_of(&dir.join("shipped")), 0o700);
+        assert_eq!(
+            std::fs::read(dir.join("shipped/kept")).expect("the entry is readable"),
+            b"the root's own",
+        );
+    }
+
+    #[test]
+    fn a_mount_point_the_root_ships_as_a_symlink_is_left_alone() {
+        // A symbolic link to a directory is a mount point the root arranged
+        // that way — the merged-`/usr` layout is the common case — so it is
+        // satisfied rather than replaced, and its mode is never rewritten
+        // through it.
+        let dir = Scratch::new("mount-dir-symlink");
+        let root = open_root(dir.path());
+        std::fs::create_dir(dir.join("real")).expect("the directory is creatable");
+        std::os::unix::fs::symlink("real", dir.join("linked"))
+            .expect("the symbolic link is creatable");
+
+        create_mount_dir(root.as_fd(), c"linked", Mode::from_raw_mode(0o777))
+            .expect("an entry the root ships is not an error, whatever kind it is");
+
+        assert!(
+            std::fs::symlink_metadata(dir.join("linked"))
+                .expect("the link is still there")
+                .is_symlink(),
+            "the root's own symbolic link was replaced",
+        );
+        assert_ne!(
+            mode_of(&dir.join("real")),
+            0o777,
+            "the mode was set through the link",
+        );
     }
 
     #[test]

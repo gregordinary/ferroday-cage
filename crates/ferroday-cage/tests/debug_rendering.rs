@@ -14,6 +14,8 @@
 #[cfg(feature = "debian")]
 use std::path::Path;
 
+mod common;
+
 use ferroday_cage::DirectMapper;
 use ferroday_cage::provision::{Provision, ProvisionEvent, ProvisionObserver, Remove};
 
@@ -31,14 +33,11 @@ use ferroday_cage::provision::debian::{Debian, Pool, Repository};
 #[cfg(feature = "debian")]
 const ANCHOR: &[u8] = b"NOT-A-REAL-KEYRING-BUT-DISTINCTIVE-ENOUGH-TO-FIND";
 
-/// Writes the stand-in anchor to a file of its own, in a directory that is
-/// removed when the returned guard drops.
+/// Writes the stand-in anchor to a file of its own, in a scratch directory the
+/// returned guard removes when it drops.
 #[cfg(feature = "debian")]
 fn anchor_file(tag: &str) -> Anchor {
-    let dir =
-        std::env::temp_dir().join(format!("ferroday-cage-debug-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+    let dir = common::scratch_dir(&format!("debug-{tag}"));
     let file = dir.join("keyring.gpg");
     std::fs::write(&file, ANCHOR).expect("the anchor is writable");
     Anchor { dir, file }

@@ -155,6 +155,17 @@ jobs:
         # ordinary package check and to every all-features command a contributor
         # runs locally.
         run: cargo hack check -p ferroday-cage --feature-powerset --depth 2 --all-targets
+      - name: Document the feature powerset
+        # The same matrix over rustdoc, because a doc link is resolved against
+        # the items a combination actually compiles. A link from shared code to
+        # a feature-gated item resolves under `--all-features` and under nothing
+        # else, so the docs job cannot see it and neither can a contributor
+        # building the guide. Where a sentence genuinely names items from two
+        # features, it is written per combination with `cfg_attr(..., doc = ...)`
+        # and this step is what holds each spelling to a build that has them.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo hack doc -p ferroday-cage --feature-powerset --depth 2 --no-deps --no-dev-deps
 
   api:
     name: Public API surface
@@ -239,10 +250,11 @@ jobs:
         # toolchain, which sits ahead of the floor, so this checks the version
         # `rust-version` actually promises rather than the one contributors use.
         run: rustup toolchain install 1.91 --profile minimal
+      # The cache key is derived from the job, so this job's artifacts — built
+      # by the floor toolchain rather than the pinned one — stay in a cache of
+      # their own without being told which toolchain they came from.
       - name: Cache the dependency build
         uses: Swatinem/rust-cache@v2
-        with:
-          toolchain: '1.91'
       - name: Check
         run: cargo +1.91 check --workspace --all-targets --all-features
 

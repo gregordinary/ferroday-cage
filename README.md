@@ -13,7 +13,7 @@ sandbox at a shell prompt.
 The library issues the sandbox's syscalls itself, so a default build is
 self-contained: pure Rust throughout, resting on the kernel alone. `unsafe` is
 confined to the small kernel-facing core — namespaces, id maps, mounts, `pivot_root`,
-`exec` — and everything above it, and every consumer, is safe Rust.
+`exec` — and nothing in the public API requires a caller to write it.
 
 The sandbox rests on the same kernel primitives as bubblewrap — user and mount
 namespaces, `pivot_root`, seccomp — and presents them as a library with a typed builder
@@ -36,6 +36,7 @@ backends off, so any combination keeps the build self-contained.
 | `hardening` | Landlock filesystem and network rules, seccomp syscall filters, and capability drops applied to the command — plus a restriction fallback for hosts that disable user namespaces, confining a plain process with the same primitives |
 | `tarball` | Provision a rootfs atomically from a tar archive (uncompressed, gzip, xz, or zstd, detected by content) with kernel-enforced containment, and export one back with its ownership and extended attributes intact |
 | `debian` | Bootstrap a Debian suite and architecture straight from the archive — a `debootstrap` replacement that verifies the release signature, resolves the dependency closure itself, and configures the root in a cage |
+| `alpine` | Bootstrap an Alpine root from an apk repository — verifying each index signature, resolving the dependency closure itself, and running the install scripts in a cage. Serves postmarketOS's repositories too |
 | `netstack` | A native userspace TCP/IP stack giving the isolated network outbound IPv4 and IPv6, terminated in-process and forwarded over ordinary host sockets |
 | `serde` | The sandbox specification round-trips through profile files, including a restricted mode for profiles from an untrusted source |
 | `subid` | uid/gid range maps through the shadow suite's `newuidmap`/`newgidmap`, so a userland needing more than one identity works inside |

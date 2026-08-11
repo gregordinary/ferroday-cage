@@ -128,6 +128,28 @@ Both are a plural Rust field naming a singular TOML table, which no \
 `rename_all` derives: `rlimits` -> `rlimit` and `mounts` -> `mount`."""
 
 [[idiom]]
+name = "reading a nameserver out of a resolv.conf"
+pattern = 'strip_prefix\("nameserver"\)'
+answer = """\
+Neither site, which is why this entry exists. The library composes no \
+`resolv.conf` and so owns no answer, and the two that ask the question are in \
+different crates with no way to share one. What the record buys is that a \
+change to either arrives as a diff naming the other: the rule they must agree \
+on is glibc's, where the keyword and its value are separated by whitespace and \
+a line running them together is ignored, and a review found them already \
+disagreeing about exactly that."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage-cli/src/main.rs"
+count = 1
+why = "Deciding whether `--netstack` composes a resolv.conf for the sandbox."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/examples/fetch-sandbox.rs"
+count = 1
+why = "The same decision, for the same reason, in a consumer of the public API."
+
+[[idiom]]
 name = "the host's temporary directory"
 pattern = 'env::temp_dir\(\)'
 answer = """\
@@ -139,3 +161,13 @@ that is no longer stated once."""
 path = "crates/ferroday-cage/src/scratch.rs"
 count = 1
 why = "The answer."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/examples/overlay-race.rs"
+count = 1
+why = """\
+`Scratch` is the library's own and is not public, so an example — which is a \
+consumer of the public API and nothing more — cannot reach it. The tree it \
+names holds subordinate-owned entries anyway, which `Scratch` could not remove: \
+it is cleared through `provision::remove` at the start of each run, the same \
+answer `tests/export.rs` reaches for."""

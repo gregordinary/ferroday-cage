@@ -1,10 +1,17 @@
 //! Frame classification ahead of the interface.
 //!
 //! The pump inspects every frame read from the tap before queueing it for
-//! the interface, because a TCP connection attempt needs a listening
+//! the interface, for two reasons. A TCP connection attempt needs a listening
 //! socket to exist by the time the interface processes the segment — the
-//! same poll that ingests the SYN. The classifier is a pure function over
-//! `smoltcp::wire`, with no state and no side effects.
+//! same poll that ingests the SYN. And a request the interface would answer
+//! *on behalf of an address it does not own* has to be withheld from it: the
+//! interface accepts any destination (`any_ip`) so that routed traffic reaches
+//! the flows' sockets, and that switch also makes it answer address resolution
+//! and ICMP echo for the whole address space. Those two are the only frames
+//! whose answer is the interface's own, so classifying them is what keeps
+//! `any_ip` a receive rule rather than a claim of ownership. The classifier is
+//! a pure function over `smoltcp::wire`, with no state and no side effects; it
+//! reports what a frame is, and [`pump`](super::pump) decides.
 //!
 //! Only cleanly parsed, unfragmented frames classify. IP fragmentation is
 //! not compiled in, so the interface rejects every fragment before it
@@ -19,7 +26,8 @@
 //! then discards is reaped by the establish deadline.
 
 use smoltcp::wire::{
-    EthernetFrame, EthernetProtocol, IpAddress, IpEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet,
+    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Icmpv4Message, Icmpv4Packet,
+    Icmpv6Message, Icmpv6Packet, IpAddress, IpEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet,
     TcpPacket, UdpPacket,
 };
 
@@ -40,6 +48,17 @@ pub(super) enum Sniff {
         src: IpEndpoint,
         /// The destination the guest addressed.
         dst: IpEndpoint,
+    },
+    /// An address-resolution request: an ARP request, whose answer would
+    /// assert that this interface holds `target`.
+    Resolve {
+        /// The address whose hardware address the guest is asking for.
+        target: IpAddress,
+    },
+    /// An ICMP echo request, whose answer would come back sourced from `dst`.
+    Echo {
+        /// The destination the guest addressed.
+        dst: IpAddress,
     },
     /// Anything else: no per-flow action ahead of the interface.
     Other,
@@ -82,6 +101,25 @@ pub(super) fn classify(frame: &[u8]) -> Sniff {
                 packet.payload(),
             )
         }
+        EthernetProtocol::Arp => {
+            let Ok(packet) = ArpPacket::new_checked(ethernet.payload()) else {
+                return Sniff::Other;
+            };
+            // Only a request asks the interface to speak for an address. A
+            // reply is the guest answering something this stack asked for, and
+            // the interface's own use for it — filling the neighbor cache —
+            // asserts nothing.
+            match ArpRepr::parse(&packet) {
+                Ok(ArpRepr::EthernetIpv4 {
+                    operation: ArpOperation::Request,
+                    target_protocol_addr,
+                    ..
+                }) => Sniff::Resolve {
+                    target: IpAddress::Ipv4(target_protocol_addr),
+                },
+                _ => Sniff::Other,
+            }
+        }
         _ => Sniff::Other,
     }
 }
@@ -116,6 +154,19 @@ fn classify_transport(
                 dst: IpEndpoint::new(dst, datagram.dst_port()),
             }
         }
+        // An echo request is the one ICMP message the interface answers by
+        // itself. Every other ICMPv6 message is left alone, neighbor discovery
+        // among them: an advertisement is confined to the interface's own
+        // addresses already, and a solicitation the interface ignores is how
+        // the guest learns an address is nobody's.
+        IpProtocol::Icmp => match Icmpv4Packet::new_checked(payload) {
+            Ok(message) if message.msg_type() == Icmpv4Message::EchoRequest => Sniff::Echo { dst },
+            _ => Sniff::Other,
+        },
+        IpProtocol::Icmpv6 => match Icmpv6Packet::new_checked(payload) {
+            Ok(message) if message.msg_type() == Icmpv6Message::EchoRequest => Sniff::Echo { dst },
+            _ => Sniff::Other,
+        },
         _ => Sniff::Other,
     }
 }
@@ -126,8 +177,9 @@ mod tests {
 
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
-        EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, Ipv4Packet,
-        Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+        ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+        EthernetRepr, IpAddress, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
+        TcpRepr, TcpSeqNumber,
     };
 
     use super::*;
@@ -336,5 +388,129 @@ mod tests {
         assert_eq!(classify(&[]), Sniff::Other);
         assert_eq!(classify(&[0xff; 10]), Sniff::Other);
         assert_eq!(classify(&[0x00; 64]), Sniff::Other);
+    }
+
+    /// Builds an ARP frame of `operation` asking after `target`.
+    fn arp_frame(operation: ArpOperation, target: Ipv4Addr) -> Vec<u8> {
+        let guest = EthernetAddress([0x02, 0, 0, 0, 0, 1]);
+        let arp = ArpRepr::EthernetIpv4 {
+            operation,
+            source_hardware_addr: guest,
+            source_protocol_addr: Ipv4Addr::new(10, 0, 2, 15),
+            target_hardware_addr: EthernetAddress([0; 6]),
+            target_protocol_addr: target,
+        };
+        let ethernet = EthernetRepr {
+            src_addr: guest,
+            dst_addr: EthernetAddress([0xff; 6]),
+            ethertype: EthernetProtocol::Arp,
+        };
+        let mut frame = vec![0u8; ethernet.buffer_len() + arp.buffer_len()];
+        let mut eth = EthernetFrame::new_unchecked(&mut frame);
+        ethernet.emit(&mut eth);
+        arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
+        frame
+    }
+
+    #[test]
+    fn an_arp_request_classifies_by_the_address_it_asks_after() {
+        // What the pump needs to withhold it: an answer would assert that this
+        // interface holds the target, which `any_ip` alone would make it do for
+        // every address on the guest's link.
+        let frame = arp_frame(ArpOperation::Request, Ipv4Addr::new(10, 0, 2, 99));
+        assert_eq!(
+            classify(&frame),
+            Sniff::Resolve {
+                target: IpAddress::Ipv4(Ipv4Addr::new(10, 0, 2, 99)),
+            },
+        );
+    }
+
+    #[test]
+    fn an_arp_reply_asks_nothing_of_the_interface() {
+        // A reply answers something this stack asked for. The interface's use
+        // for it is to fill its neighbor cache, which asserts nothing, so
+        // withholding one would only cost the stack a lookup it made itself.
+        let frame = arp_frame(ArpOperation::Reply, Ipv4Addr::new(10, 0, 2, 2));
+        assert_eq!(classify(&frame), Sniff::Other);
+    }
+
+    /// Builds an ICMP frame of `message` addressed to `dst`, in whichever
+    /// family `dst` names.
+    fn icmp_frame(message: u8, dst: IpAddress) -> Vec<u8> {
+        // Type, code, and a zero checksum the interface would recompute; the
+        // classifier reads the type alone and never verifies a checksum.
+        let payload = [message, 0, 0, 0, 0, 0, 0, 0];
+        let checksums = ChecksumCapabilities::default();
+        let ethernet = EthernetRepr {
+            src_addr: EthernetAddress([0x02, 0, 0, 0, 0, 1]),
+            dst_addr: EthernetAddress([0x02, 0, 0, 0, 0, 2]),
+            ethertype: match dst {
+                IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
+                IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
+            },
+        };
+        let mut frame = vec![0u8; ethernet.buffer_len() + 40 + payload.len()];
+        let mut eth = EthernetFrame::new_unchecked(&mut frame);
+        ethernet.emit(&mut eth);
+        match dst {
+            IpAddress::Ipv4(dst) => {
+                let repr = Ipv4Repr {
+                    src_addr: Ipv4Addr::new(10, 0, 2, 15),
+                    dst_addr: dst,
+                    next_header: IpProtocol::Icmp,
+                    payload_len: payload.len(),
+                    hop_limit: 64,
+                };
+                let mut packet = Ipv4Packet::new_unchecked(eth.payload_mut());
+                repr.emit(&mut packet, &checksums);
+                packet.payload_mut()[..payload.len()].copy_from_slice(&payload);
+                frame.truncate(ethernet.buffer_len() + repr.buffer_len() + payload.len());
+            }
+            IpAddress::Ipv6(dst) => {
+                let repr = Ipv6Repr {
+                    src_addr: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x15),
+                    dst_addr: dst,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: payload.len(),
+                    hop_limit: 64,
+                };
+                let mut packet = Ipv6Packet::new_unchecked(eth.payload_mut());
+                repr.emit(&mut packet);
+                packet.payload_mut()[..payload.len()].copy_from_slice(&payload);
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn an_echo_request_classifies_by_the_address_it_would_answer_as() {
+        // The reply is sourced from the destination, so answering one for an
+        // address the interface does not hold reports that address as up.
+        for dst in [
+            IpAddress::Ipv4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddress::Ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        ] {
+            let message = match dst {
+                // Echo request: type 8 in ICMPv4, type 128 in ICMPv6.
+                IpAddress::Ipv4(_) => 8,
+                IpAddress::Ipv6(_) => 128,
+            };
+            assert_eq!(classify(&icmp_frame(message, dst)), Sniff::Echo { dst });
+        }
+    }
+
+    #[test]
+    fn neighbor_discovery_is_not_an_echo_request() {
+        // Withholding a neighbor solicitation would break the guest's only way
+        // to reach the gateway. It needs no rule of its own: smoltcp answers
+        // one only for an address whose solicited-node group the interface
+        // joined, which `any_ip` does not widen.
+        let solicitation = 135;
+        let frame = icmp_frame(
+            solicitation,
+            IpAddress::Ipv6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 2)),
+        );
+        assert_eq!(classify(&frame), Sniff::Other);
     }
 }

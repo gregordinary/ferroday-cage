@@ -31,13 +31,15 @@ allow = [
 # enter the graph unnoticed. One advisory is analyzed and deliberately ignored.
 [advisories]
 ignore = [
-    # Marvin Attack: a timing sidechannel in the `rsa` crate, pulled in through
-    # `pgp`. The attack recovers an RSA *private* key from the timing of private
-    # key operations (signing, decryption). This crate uses `pgp` only to
-    # *verify* the Debian archive's OpenPGP signature against an embedded
-    # keyring -- a public-key operation over public material -- and never holds
-    # or uses an RSA private key, so the sidechannel is not reachable here. No
-    # fixed `rsa` release exists yet; this is revisited when one does.
+    # Marvin Attack: a timing sidechannel in the `rsa` crate. It enters the
+    # graph two ways -- through `pgp` under the `debian` feature, and directly
+    # under `alpine`, which verifies an apk index signature with it. The attack
+    # recovers an RSA *private* key from the timing of private key operations
+    # (signing, decryption), and neither consumer performs one: both verify a
+    # signature against a public key this crate ships, over material the mirror
+    # published, and no RSA private key is ever held or used. So the
+    # sidechannel is unreachable under either feature. No fixed `rsa` release
+    # exists yet; this is revisited when one does.
     { id = "RUSTSEC-2023-0071", reason = "verification-only; no RSA private key is ever used" },
 ]
 

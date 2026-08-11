@@ -226,10 +226,16 @@ impl CopyChild {
             }
         };
         let outcome = super::wait_for_exit(pid);
-        if read == 0 {
-            // The child died without reporting, so its exit status is all there
-            // is to go on: a clean exit here would mean it finished the tree and
-            // lost only the record, which is not something to claim.
+        if read != record.len() {
+            // The child died without reporting, or reported something that is
+            // not a record. Its exit status is all there is to go on either
+            // way: a clean exit here would mean it finished the tree and lost
+            // only the record, which is not something to claim. The length is
+            // checked rather than only the end of input because this is a
+            // seqpacket — a short message is delivered whole and would
+            // otherwise decode against the zero-filled rest of the buffer as a
+            // step this child never reached, with errno 0. The gate's other two
+            // readers hold the same line.
             let _ = outcome;
             return Err(CopyFailure::Step {
                 step: CopyStep::Spawn,

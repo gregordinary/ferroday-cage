@@ -749,7 +749,7 @@ Archive: 0
 Mirror: http://deb.debian.org/debian
 Suite: trixie
 Components: main
-Release-SHA256: 9f3a...
+Release-SHA256: 9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a
 Date: Sat, 02 Aug 2026 08:14:33 UTC
 Valid-Until: Sat, 09 Aug 2026 08:14:33 UTC
 Signed-By: 04B54C3CDCA79751B16BC6B5225629DF75B188BD
@@ -759,7 +759,7 @@ Archive: 1
 Mirror: file:///srv/pool
 Suite: trixie
 Components: main
-Release-SHA256: 1c0f...
+Release-SHA256: 1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f
 Date: Sat, 02 Aug 2026 09:02:11 UTC
 Signed-By:
 Signing-Key:
@@ -767,7 +767,7 @@ Signing-Key:
 Package: base-files
 Version: 13.6
 Architecture: arm64
-SHA256: 7b21...
+SHA256: 7b217b217b217b217b217b217b217b217b217b217b217b217b217b217b217b21
 Filename: pool/main/b/base-files/base-files_13.6_arm64.deb
 Archive: 0
 Installed-Size: 340
@@ -775,7 +775,7 @@ Installed-Size: 340
 Package: local-tool
 Version: 2.4-1
 Architecture: all
-SHA256: e0d5...
+SHA256: e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5e0d5
 Filename: pool/main/l/local-tool/local-tool_2.4-1_all.deb
 Archive: 1
 Source: local-suite

@@ -218,6 +218,11 @@ fn export_inner<W: Write>(
         Err(StartError::Spawn(errno)) => {
             return Err(ProvisionError::io("exporting", rootfs, errno.into()));
         }
+        // The child's own account of what stopped it, reported exactly as the
+        // same failure arriving mid-walk as a `FRAME_ERROR` would be.
+        Err(StartError::Reported { step, errno }) => {
+            return Err(ProvisionError::io(step.describe(), rootfs, errno.into()));
+        }
         Err(StartError::Map(err)) => {
             return Err(ProvisionError::ExportUnprivileged {
                 path: rootfs.to_path_buf(),

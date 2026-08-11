@@ -1474,10 +1474,15 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
 /// positional and every `--` argument is one of fcage's own. The provisioning
 /// vocabulary is short enough to name; everything else shapes a sandbox that is
 /// never built.
+///
+/// The bare `--` separator is not a flag and is skipped: it introduces a command
+/// line rather than configuring one, and a run that ends on it — `--rootfs /r
+/// --provision-debian trixie --` — names no launch setting at all. Reading it as
+/// a flag would refuse such a run for something it did not do.
 fn first_launch_flag(args: &[OsString]) -> Option<String> {
     args.iter()
         .map(|arg| arg.to_string_lossy().into_owned())
-        .find(|arg| arg.starts_with("--") && !provisions(flag_name(arg)))
+        .find(|arg| arg != "--" && arg.starts_with("--") && !provisions(flag_name(arg)))
 }
 
 /// Whether `flag` configures the provisioning rather than the launch.
@@ -1909,12 +1914,60 @@ fn parse_priority(value: &str) -> Result<Priority, String> {
         .map_err(|err| format!("--debian-base-priority: {err}"))
 }
 
+/// The mirrors a repository specification names: its primary, and its backstops
+/// in the order they were given.
+///
+/// The two fields are held apart rather than as one list, because neither a
+/// repeated `mirror=` nor a lone `mirror-fallback=` is a spelling of something
+/// the caller could have meant. One list read positionally makes both of them
+/// mean something: a lone backstop becomes the primary, and a second `mirror=`
+/// demotes the first to a backstop ahead of the declared ones. The first is the
+/// one that matters — a repository's primary mirror is written into the finished
+/// root, as `/etc/apk/repositories` or `sources.list`, so a typo-dropped
+/// `mirror=` would leave that root permanently fetching from what the caller
+/// meant as a fetch-time backstop.
+#[derive(Debug, Default)]
+struct MirrorSpec {
+    primary: Option<String>,
+    fallbacks: Vec<String>,
+}
+
+impl MirrorSpec {
+    /// Records a `mirror=` field, refusing a second one.
+    fn primary(&mut self, flag: &str, url: &str) -> Result<(), String> {
+        if let Some(first) = &self.primary {
+            return Err(format!(
+                "{flag}: mirror= is given twice, as {first:?} and {url:?}; a repository has one \
+                 primary mirror, and the rest are mirror-fallback="
+            ));
+        }
+        self.primary = Some(url.to_string());
+        Ok(())
+    }
+
+    /// Records a `mirror-fallback=` field.
+    fn fallback(&mut self, url: &str) {
+        self.fallbacks.push(url.to_string());
+    }
+
+    /// The primary and its backstops, refusing a spec that names only backstops.
+    fn finish(self, flag: &str) -> Result<(Option<String>, Vec<String>), String> {
+        if self.primary.is_none() && !self.fallbacks.is_empty() {
+            return Err(format!(
+                "{flag}: mirror-fallback= names a backstop for a mirror= that was not given; a \
+                 repository is fetched from its primary mirror first"
+            ));
+        }
+        Ok((self.primary, self.fallbacks))
+    }
+}
+
 /// Parses a `--debian-repository` specification:
 /// `suite=S mirror=URL [mirror-fallback=URL] [components=a,b] [keyring=PATH]
 /// [name=NAME] [trust-unsigned] [allow-stale-release]`.
 fn parse_repository(spec: &str) -> Result<Repository, String> {
     let mut suite = None;
-    let mut mirrors: Vec<String> = Vec::new();
+    let mut mirrors = MirrorSpec::default();
     let mut components: Vec<String> = Vec::new();
     let mut keyring = None;
     let mut name = None;
@@ -1923,8 +1976,8 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
     for (key, value) in spec_pairs("--debian-repository", spec)? {
         match key {
             "suite" => suite = Some(value.to_string()),
-            "mirror" => mirrors.insert(0, value.to_string()),
-            "mirror-fallback" => mirrors.push(value.to_string()),
+            "mirror" => mirrors.primary("--debian-repository", value)?,
+            "mirror-fallback" => mirrors.fallback(value),
             "components" => extend_comma(&mut components, value),
             "keyring" => keyring = Some(PathBuf::from(value)),
             "name" => name = Some(value.to_string()),
@@ -1940,14 +1993,14 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
         }
     }
     let suite = suite.ok_or("--debian-repository requires a suite= field".to_string())?;
+    let (primary, fallbacks) = mirrors.finish("--debian-repository")?;
     let mut builder = Repository::builder(suite)
         .trust_unsigned(trust_unsigned)
         .allow_stale_release(allow_stale);
-    let mut mirrors = mirrors.into_iter();
-    if let Some(primary) = mirrors.next() {
+    if let Some(primary) = primary {
         builder = builder.mirror(primary);
     }
-    for fallback in mirrors {
+    for fallback in fallbacks {
         builder = builder.mirror_fallback(fallback);
     }
     if !components.is_empty() {
@@ -1988,8 +2041,12 @@ enum AlpineKeys {
 #[derive(Debug, Clone)]
 struct AlpineRepositorySpec {
     release: String,
-    /// The primary mirror first, then any backstops, as the builder takes them.
-    mirrors: Vec<String>,
+    /// The primary mirror, absent where the spec named none — which the library
+    /// refuses, and is left to it so the refusal reads the same however the
+    /// repository was configured.
+    mirror: Option<String>,
+    /// The backstops, in the order they were given.
+    fallbacks: Vec<String>,
     components: Vec<String>,
     keys: AlpineKeys,
 }
@@ -2066,14 +2123,14 @@ fn alpine_key_set(
 /// `release=R mirror=URL keys=SOURCE [mirror-fallback=URL] [components=a,b]`.
 fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
     let mut release = None;
-    let mut mirrors: Vec<String> = Vec::new();
+    let mut mirrors = MirrorSpec::default();
     let mut components: Vec<String> = Vec::new();
     let mut keys = None;
     for (key, value) in spec_pairs("--alpine-repository", spec)? {
         match key {
             "release" => release = Some(value.to_string()),
-            "mirror" => mirrors.insert(0, value.to_string()),
-            "mirror-fallback" => mirrors.push(value.to_string()),
+            "mirror" => mirrors.primary("--alpine-repository", value)?,
+            "mirror-fallback" => mirrors.fallback(value),
             "components" => extend_comma(&mut components, value),
             "keys" => keys = Some(parse_alpine_keys("--alpine-repository", value)),
             other => {
@@ -2084,9 +2141,11 @@ fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
             }
         }
     }
+    let (primary, fallbacks) = mirrors.finish("--alpine-repository")?;
     Ok(AlpineRepositorySpec {
         release: release.ok_or("--alpine-repository requires a release= field".to_string())?,
-        mirrors,
+        mirror: primary,
+        fallbacks,
         components,
         // Unlike the primary, an additional repository has no default: its
         // signing key is its own, and the library refuses one without keys.
@@ -2922,6 +2981,13 @@ fn resolv_conf_has_routable_nameserver(contents: &str) -> bool {
         let Some(address) = line.strip_prefix("nameserver") else {
             return false;
         };
+        // The keyword and its value are separated by whitespace, and glibc
+        // ignores a line that runs them together. Reading `nameserver8.8.8.8`
+        // as a nameserver would count a line the resolver does not as the
+        // reason this host is considered routable.
+        if !address.starts_with([' ', '\t']) {
+            return false;
+        }
         match address.trim().parse::<std::net::IpAddr>() {
             Ok(address) => !address.is_loopback(),
             Err(_) => false,
@@ -3151,6 +3217,17 @@ fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(
         eprintln!("fcage: {message}");
         ExitCode::from(2)
     };
+    // Reading a key set is not spelling: the selector was checked when the
+    // command line was parsed, so what is left is whether this machine can
+    // supply the keys — an unreadable directory, a file that is not a PEM key,
+    // a bundle holding none for the architecture. Those are what 125 means, and
+    // what the library reports for the same failures when it resolves the keys
+    // itself. A script telling "fix my command line" from "fix my machine" reads
+    // the two codes.
+    let environment = |message: String| {
+        eprintln!("fcage: {message}");
+        ExitCode::from(125)
+    };
 
     // The architecture the key sets are chosen by: the one named, or the host's,
     // which is what the builder would default to.
@@ -3181,8 +3258,8 @@ fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(
         builder = builder.cache_dir(cache);
     }
     if let Some(keys) = &options.alpine_keys {
-        builder =
-            builder.keys(alpine_key_set("--alpine-keys", keys, &architecture).map_err(usage)?);
+        builder = builder
+            .keys(alpine_key_set("--alpine-keys", keys, &architecture).map_err(environment)?);
     }
     if let Some(overlay) = &options.alpine_pre_configure_overlay {
         builder = builder.pre_configure_overlay(overlay);
@@ -3191,13 +3268,14 @@ fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(
         builder = builder.identity_map(map.clone());
     }
     for spec in &options.alpine_repositories {
-        let mut repository = Repository::builder(&spec.release)
-            .keys(alpine_key_set("--alpine-repository", &spec.keys, &architecture).map_err(usage)?);
-        let mut mirrors = spec.mirrors.iter();
-        if let Some(primary) = mirrors.next() {
+        let mut repository = Repository::builder(&spec.release).keys(
+            alpine_key_set("--alpine-repository", &spec.keys, &architecture)
+                .map_err(environment)?,
+        );
+        if let Some(primary) = &spec.mirror {
             repository = repository.mirror(primary);
         }
-        for fallback in mirrors {
+        for fallback in &spec.fallbacks {
             repository = repository.mirror_fallback(fallback);
         }
         if !spec.components.is_empty() {
@@ -3468,6 +3546,19 @@ mod tests {
             ])
             .is_ok()
         );
+        // A trailing separator with nothing after it names no launch setting:
+        // it introduces a command line rather than configuring one, and the run
+        // it ends is the provisioning run it was already.
+        assert!(
+            parse_args(&[
+                "--rootfs",
+                "/roots/trixie",
+                "--provision-debian",
+                "trixie",
+                "--"
+            ])
+            .is_ok()
+        );
     }
 
     /// The options of a parsed invocation, or a panic naming what went wrong.
@@ -3528,9 +3619,64 @@ mod tests {
             );
         };
         assert_eq!(overlay.release, "v26.06");
-        assert_eq!(overlay.mirrors, ["http://mirror.invalid/pmos"]);
+        assert_eq!(
+            overlay.mirror.as_deref(),
+            Some("http://mirror.invalid/pmos")
+        );
+        assert!(overlay.fallbacks.is_empty());
         assert!(overlay.components.is_empty(), "the shallower layout");
         assert_eq!(overlay.keys, AlpineKeys::PostmarketOs);
+    }
+
+    #[test]
+    fn a_repository_spec_states_one_primary_mirror_and_names_it_mirror() {
+        // A repository's primary mirror is written into the finished root, so a
+        // spec that promoted a backstop would leave that root permanently
+        // fetching from what the caller meant as a fetch-time backstop, and one
+        // that demoted a repeated mirror= would quietly reorder the walk.
+        for (flag, spec) in [
+            (
+                "--alpine-repository",
+                "release=v26.06 keys=postmarketos mirror-fallback=http://backstop.invalid",
+            ),
+            (
+                "--debian-repository",
+                "suite=trixie mirror-fallback=http://backstop.invalid",
+            ),
+        ] {
+            let error = parse_error(&[
+                "--rootfs",
+                "/roots/r",
+                "--provision-alpine",
+                "v3.23",
+                flag,
+                spec,
+            ]);
+            assert!(error.contains("mirror-fallback="), "{flag}: {error}");
+            assert!(error.contains("was not given"), "{flag}: {error}");
+        }
+
+        for (flag, spec) in [
+            (
+                "--alpine-repository",
+                "release=v26.06 keys=postmarketos mirror=http://one.invalid \
+                 mirror=http://two.invalid",
+            ),
+            (
+                "--debian-repository",
+                "suite=trixie mirror=http://one.invalid mirror=http://two.invalid",
+            ),
+        ] {
+            let error = parse_error(&[
+                "--rootfs",
+                "/roots/r",
+                "--provision-alpine",
+                "v3.23",
+                flag,
+                spec,
+            ]);
+            assert!(error.contains("given twice"), "{flag}: {error}");
+        }
     }
 
     #[test]

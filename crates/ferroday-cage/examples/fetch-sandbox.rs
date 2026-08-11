@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ferroday_cage::provision::{self, Tarball};
-use ferroday_cage::{Cage, NetStack};
+use ferroday_cage::{Cage, Error, NetStack, NetStackError};
 
 mod common;
 
@@ -101,21 +101,54 @@ fn main() -> ExitCode {
 
     match fetch(&options) {
         Ok(code) => code,
-        Err(error) => {
+        // The library owns the exit-code conventions, so a sandbox that could
+        // not run its command reports through them: 126 for a command that is
+        // there and cannot be run, 127 for one that is not there. Only the
+        // stack's own failures are this example's, and 125 is what it says
+        // about those.
+        Err(FetchFailure::Cage(error)) => {
             eprintln!("fetch-sandbox: {error}");
+            ExitCode::from(error.shell_code())
+        }
+        Err(FetchFailure::Stack(error)) => {
+            eprintln!("fetch-sandbox: the network stack could not be attached: {error}");
             ExitCode::from(125)
         }
+    }
+}
+
+/// What can stop the run before the command's own exit status is the answer.
+///
+/// Two kinds, because they report differently. The library's [`Error`] carries
+/// the exit-code convention every launcher here follows; a
+/// [`NetStackError`] is about the stack this example stood up, which the
+/// command never saw, so it is the example's own failure to report.
+enum FetchFailure {
+    /// The sandbox could not be configured, launched, or waited on.
+    Cage(Error),
+    /// The stack could not be built or attached.
+    Stack(NetStackError),
+}
+
+impl From<Error> for FetchFailure {
+    fn from(error: Error) -> FetchFailure {
+        FetchFailure::Cage(error)
+    }
+}
+
+impl From<NetStackError> for FetchFailure {
+    fn from(error: NetStackError) -> FetchFailure {
+        FetchFailure::Stack(error)
     }
 }
 
 /// Builds the sandbox, attaches the stack, and runs the fetch, returning the
 /// process exit code to propagate.
 ///
-/// The error type is boxed so both the sandbox's [`ferroday_cage::Error`] and
-/// the stack's [`NetStackError`](ferroday_cage::NetStackError) propagate with
-/// `?`, rather than being unwrapped — attaching the stack stands up a tap
-/// device and can fail for real reasons.
-fn fetch(options: &Options) -> Result<ExitCode, Box<dyn std::error::Error>> {
+/// Both the sandbox's [`Error`] and the stack's [`NetStackError`] propagate
+/// with `?` through [`FetchFailure`], rather than being unwrapped — attaching
+/// the stack stands up a tap device and can fail for real reasons.
+fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
     let mut builder = Cage::builder()
         .rootfs(&options.rootfs)
         .command(WGET)
@@ -149,19 +182,7 @@ fn fetch(options: &Options) -> Result<ExitCode, Box<dyn std::error::Error>> {
         eprintln!("fetch-sandbox: the network stack did not stop cleanly: {error}");
     }
 
-    Ok(exit_code(status))
-}
-
-/// Maps the command's wait status onto a process exit code, following the
-/// shell's signal convention.
-fn exit_code(status: ferroday_cage::ExitStatus) -> ExitCode {
-    if let Some(code) = status.code() {
-        ExitCode::from(code as u8)
-    } else if let Some(signal) = status.signal() {
-        ExitCode::from(128_u8.wrapping_add(signal as u8))
-    } else {
-        ExitCode::FAILURE
-    }
+    Ok(ExitCode::from(status.shell_code()))
 }
 
 /// Whether the host's `resolv.conf` names a nameserver reachable through the
@@ -171,10 +192,20 @@ fn host_has_routable_nameserver() -> bool {
         return false;
     };
     contents.lines().any(|line| {
-        line.trim()
-            .strip_prefix("nameserver")
-            .and_then(|address| address.trim().parse::<std::net::IpAddr>().ok())
-            .is_some_and(|address| !address.is_loopback())
+        let Some(address) = line.trim().strip_prefix("nameserver") else {
+            return false;
+        };
+        // The keyword and its value are separated by whitespace, and glibc
+        // ignores a line that runs them together. Reading `nameserver8.8.8.8`
+        // as a nameserver would count a line the resolver does not as the
+        // reason this host is considered routable.
+        if !address.starts_with([' ', '\t']) {
+            return false;
+        }
+        address
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| !address.is_loopback())
     })
 }
 

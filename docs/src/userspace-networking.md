@@ -165,6 +165,22 @@ segment, and the stack answers ARP and neighbor discovery only for the gateway.
 Nothing replies, and the connection fails a few seconds later, when the guest's
 own address resolution gives up.
 
+### What answers, and what a ping means
+
+The stack holds one address per family — the gateway — and answers for that and
+nothing else. That is narrower than it sounds, because the interface accepts
+packets for every destination so that routed traffic reaches its sockets, and
+accepting a packet and answering for its address are the same question to the
+underlying stack. The pump asks the narrower one instead: an address-resolution
+request or an ICMP echo request naming an address the stack does not hold is
+dropped before the interface can answer it.
+
+So a `ping` inside the guest reports on the gateway and on nothing else. Pinging
+the gateway succeeds — it is the stack, and it is up. Pinging anything else
+receives no reply whether or not that destination is reachable, since only TCP
+and UDP are forwarded and the stack has no way to ask. A connection is what
+reports reachability here; a ping reports the link to the stack.
+
 The gateway address is the one deliberate exception. With
 [`host_loopback(true)`][`NetStackBuilder::host_loopback`], a connection to the
 gateway (`10.0.2.2` or `fd00::2` by default) is forwarded to the host's

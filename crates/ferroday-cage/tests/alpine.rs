@@ -11,10 +11,19 @@ use ferroday_cage::provision::alpine::{Alpine, AlpineEvent, KeySet, Repository};
 use ferroday_cage::provision::{self, Provisioned};
 
 /// The environment variable that opts into the network-dependent bootstrap
-/// tests. They fetch from a live Alpine mirror and are off by default, so a
-/// plain `cargo test --all-features` — CI included — does not reach the
-/// network.
+/// tests. They resolve and install from a live Alpine repository, and are off by
+/// default, so a plain `cargo test --all-features` — CI included — reaches no
+/// repository.
+///
+/// Not the same as reaching no network at all: the rootfs fixture every suite
+/// builds sandboxes from is a pinned minirootfs tarball, provisioned from a
+/// mirror on a cold cache and kept under `target` afterwards.
 const NETWORK_GATE: &str = "FERRODAY_CAGE_ALPINE_NETWORK_TEST";
+
+/// The variable that asserts these tests ran, in the crate's usual shape: a
+/// skip stays a skip by default, and this turns it into a failure so a release
+/// check cannot come back green having exercised no repository at all.
+const REQUIRE_GATE: &str = "FERRODAY_CAGE_REQUIRE_NETWORK_TEST";
 
 /// Returns `false` and prints a skip note when the network tests are not
 /// enabled.
@@ -22,6 +31,11 @@ fn network_enabled() -> bool {
     if std::env::var_os(NETWORK_GATE).is_some() {
         return true;
     }
+    assert!(
+        std::env::var_os(REQUIRE_GATE).is_none(),
+        "{REQUIRE_GATE} is set and {NETWORK_GATE} is not, so the Alpine bootstrap tests \
+         would have been skipped",
+    );
     eprintln!("skipping: set {NETWORK_GATE}=1 to run the Alpine bootstrap tests");
     false
 }

@@ -646,6 +646,68 @@ mod tests {
         }
     }
 
+    /// What [`sample`] renders to, spelled out.
+    ///
+    /// A round trip proves the reader and the writer agree with each other; it
+    /// cannot notice the two of them moving together. This is the format itself:
+    /// which fields are written, in which order, how an absent optional differs
+    /// from an empty list, and where the blank lines fall. A change to any of
+    /// those is a change to the format, and the format carries a version because
+    /// a reader that cannot tell which shape it is holding cannot say what it is
+    /// trusting — so this failing is the prompt to decide whether that version
+    /// has to move.
+    const GOLDEN: &str = "\
+Format: ferroday-cage-plan 2
+Suite: trixie
+Architecture: arm64
+
+Archive: 0
+Mirror: http://deb.debian.org/debian
+Suite: trixie
+Components: main contrib
+Release-SHA256: 9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a
+Date: Sat, 02 Aug 2026 08:14:33 UTC
+Valid-Until: Sat, 09 Aug 2026 08:14:33 UTC
+Signed-By: 04B54C3CDCA79751B16BC6B5225629DF75B188BD
+Signing-Key: B8E5F13176D2A7A75220028078DBA3BC47EF2265
+
+Archive: 1
+Mirror: http://mirror.invalid/local
+Suite: trixie
+Components: main
+Release-SHA256: 1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f
+Signed-By:
+Signing-Key:
+
+Package: base-files
+Version: 13.6
+Architecture: arm64
+SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Filename: pool/main/b/base-files/base-files_13.6_arm64.deb
+Archive: 0
+Installed-Size: 340
+
+Package: local-tool
+Version: 1:2.4-1
+Architecture: all
+SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Filename: pool/main/l/local-tool/local-tool_2.4-1_all.deb
+Archive: 1
+Source: local-suite
+
+";
+
+    #[test]
+    fn the_document_is_the_format_this_version_writes() {
+        assert_eq!(sample().to_document().expect("the plan renders"), GOLDEN);
+        // And it reads back as the plan it came from, so the literal above is a
+        // document rather than only a string that happens to match.
+        assert_eq!(
+            Plan::parse_document(GOLDEN).expect("the golden reads"),
+            sample()
+        );
+    }
+
     #[test]
     fn a_plan_survives_a_document_round_trip() {
         let plan = sample();

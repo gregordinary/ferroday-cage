@@ -2569,17 +2569,24 @@ fn build_nested_plan(
 /// of. Where a profile mounts more than one, the last still visible is taken —
 /// any of them would serve.
 fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
-    let mut visible: Option<&CStr> = None;
-    for op in ops {
-        if let Some(target) = procfs_op_target(op, needs_fresh) {
-            visible = Some(target);
-        } else if let (Some(chosen), Some(target)) = (visible, op.action.target())
-            && covers(target, chosen)
-        {
-            visible = None;
+    // Walked backwards, because what is wanted is the *last* one still visible:
+    // a candidate qualifies when nothing after it comes to rest on top of it.
+    // Carrying only the most recent candidate forward instead would report no
+    // procfs at all for a profile that mounted two and covered the second,
+    // though the first is still standing.
+    for (at, op) in ops.iter().enumerate().rev() {
+        let Some(target) = procfs_op_target(op, needs_fresh) else {
+            continue;
+        };
+        let covered = ops[at + 1..]
+            .iter()
+            .filter_map(|later| later.action.target())
+            .any(|over| covers(over, target));
+        if !covered {
+            return Some(target);
         }
     }
-    visible
+    None
 }
 
 /// The rootfs-relative target an op mounts a usable procfs on, or `None` for
@@ -2593,10 +2600,31 @@ fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
 /// bound procfs from outside that namespace does not index it. Everything else
 /// is served by either kind, because a process writing its *own* map reaches it
 /// through `self`, which every procfs instance resolves for its reader.
+///
+/// A raw mount is read by what the kernel will do with it rather than by what it
+/// says: `mount(2)` ignores `fstype` entirely when `MS_BIND` is set, so a raw
+/// op carrying that flag is a bind however it spells its filesystem, and is held
+/// to the bind rule rather than to the fresh-instance one. Reading it the other
+/// way would let `RawMount::new("/proc").source("/proc").fstype("proc")
+/// .flags(MS_BIND)` satisfy a requirement it does not meet, and the failure
+/// would arrive at launch instead of as the typed build error this machinery
+/// exists to give.
 fn procfs_op_target(op: &MountOp, needs_fresh: bool) -> Option<&CStr> {
     match &op.action {
         MountAction::Procfs { target } => Some(target),
-        MountAction::Raw { target, fstype, .. } if fstype.as_bytes() == b"proc" => Some(target),
+        MountAction::Raw {
+            source,
+            target,
+            fstype,
+            flags,
+            ..
+        } => {
+            if flags.contains(MountFlags::BIND) {
+                (!needs_fresh && is_procfs(source)).then_some(target.as_c_str())
+            } else {
+                (fstype.as_bytes() == b"proc").then_some(target.as_c_str())
+            }
+        }
         MountAction::Bind { source, target, .. } if !needs_fresh && is_procfs(source) => {
             Some(target)
         }
@@ -4351,6 +4379,65 @@ mod tests {
     }
 
     #[test]
+    fn a_covered_procfs_does_not_hide_one_that_is_still_standing() {
+        // The ops run in order, so a later mount can bury an earlier one, and
+        // the scan follows the same order. What it must not do is track only
+        // the most recent candidate: this profile mounts a procfs, mounts a
+        // second, and covers the second — and the first is still there to
+        // establish the map through.
+        let cage = sh_in("/tmp")
+            .mount_proc(false)
+            .raw_mount(RawMount::new("/proc").fstype("proc"))
+            .raw_mount(RawMount::new("/mnt").fstype("proc"))
+            .raw_mount(RawMount::new("/mnt").fstype("tmpfs"))
+            .build()
+            .expect("the first procfs is still visible");
+        let nested = cage.plan.nested.as_ref().expect("a container nests");
+        let crate::mechanism::NestedMap::SelfWritten { uid_map_path, .. } = &nested.map else {
+            panic!("this tier writes its own map: {:?}", nested.map);
+        };
+        // Composed from the procfs that is still standing, not from the one
+        // the tmpfs came to rest on.
+        assert_eq!(uid_map_path.to_bytes(), b"/proc/self/uid_map");
+    }
+
+    #[test]
+    fn a_raw_mount_that_binds_is_a_bind_whatever_it_calls_its_filesystem() {
+        // `mount(2)` ignores `fstype` when `MS_BIND` is set, so a raw op
+        // carrying that flag mounts whatever its source already is. Reading it
+        // by the name it gives would have this configuration satisfy the
+        // fresh-procfs requirement it does not meet, and the failure would
+        // arrive at launch rather than here.
+        let err = sh_in("/tmp")
+            .mount_proc(false)
+            .identity_map(IdentityMap::ranges(
+                vec![crate::IdRange {
+                    inside: 0,
+                    outside: 1000,
+                    count: 1,
+                }],
+                vec![crate::IdRange {
+                    inside: 0,
+                    outside: 1000,
+                    count: 1,
+                }],
+            ))
+            .id_mapper(FakeMapper)
+            .raw_mount(
+                RawMount::new("/proc")
+                    .source("/proc")
+                    .fstype("proc")
+                    .flags(MountFlags::BIND.bits().into()),
+            )
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::NestedUsernsNeedsProcfs)),
+            "{err:?}",
+        );
+    }
+
+    #[test]
     fn a_delegated_map_outside_a_pid_namespace_needs_no_procfs() {
         // The requirement follows the route the map actually takes. A range map
         // without a PID namespace is written by the launch stage, outside the
@@ -5529,11 +5616,24 @@ read-only = true
 
     #[test]
     fn the_profile_key_set_is_pinned() {
-        // The profile format is a published interface, and every serialised
-        // field carries an explicit `rename`, so a Rust-side field rename
-        // cannot silently rename a key. This test is the other half of that
-        // guarantee: it fails when a key appears, disappears, or changes
-        // spelling, which is a profile-format change whatever the Rust API did.
+        // A deliberate second answer to `the_profile_format_keys_are_what_they_are`,
+        // which pins the same interface from the other end. That one reads an
+        // exhaustive profile *document* and walks what it renders back as dotted
+        // paths; this one drives the *builder's setters* and reads the top level
+        // and each nested table. Three things follow from the difference, and
+        // each is why both are here:
+        //
+        // - The document-driven test needs `hardening` for its profile to
+        //   parse, so it does not run at all in a build without that feature.
+        //   This one does, and the keys it pins are the ones such a build has.
+        // - A key reachable from the setters but not from a document, or the
+        //   reverse, is a format that does not round-trip. Pinning each
+        //   direction separately is what would notice.
+        // - A dotted path unions an array's entries, so `mount[].fstype` says
+        //   only that *some* mount carries it. Here each `[[mount]]` variant's
+        //   key set is asserted on its own, which is what catches a bind entry
+        //   that started rendering a raw mount's field.
+        //
         // `rootfs` and `overlay` are alternatives — setting either clears the
         // other — so the full key set is the union of a plain-rooted and an
         // overlay-rooted profile.

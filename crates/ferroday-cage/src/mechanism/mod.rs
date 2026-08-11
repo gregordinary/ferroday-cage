@@ -990,7 +990,7 @@ pub(super) fn drive_map_gate(
     Ok(Gated::Released)
 }
 
-/// Ends a child left blocked at its map gate, and reaps it.
+/// Ends a child left blocked at its map gate, leaving it to be reaped.
 ///
 /// A child whose map the delegate could not establish is waiting for a go byte
 /// that will never come. It holds nothing but its own descriptors and has
@@ -1004,9 +1004,24 @@ pub(super) fn drive_map_gate(
 /// inherited descriptors, but each only once its own fork has returned in it,
 /// and a child the *consumer* forked never sweeps at all. The end of input the
 /// blocked child is waiting for is therefore not something this caller can make
-/// arrive, and the reap that follows would block on it forever.
-pub(super) fn abandon_gated_child(child: Pid) {
+/// arrive, and a reap would block on it forever.
+///
+/// The reap is separate because it is the caller's, and exactly one caller may
+/// perform it: a pid is the kernel's to reuse the moment its status is
+/// collected, so a second wait on the same number can collect an unrelated
+/// child of this process instead. A caller whose own path already waits calls
+/// this; one that returns without waiting calls
+/// [`abandon_gated_child`] and has the reap done here.
+pub(super) fn kill_gated_child(child: Pid) {
     let _ = process::kill_process(child, Signal::KILL);
+}
+
+/// [`kill_gated_child`], and reaps it.
+///
+/// For a caller that gives up on a child by returning, so nothing further in
+/// its own path would collect the status.
+pub(super) fn abandon_gated_child(child: Pid) {
+    kill_gated_child(child);
     let _ = wait_for_exit(child);
 }
 

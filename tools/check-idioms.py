@@ -17,8 +17,14 @@ This watches the shapes `clippy.toml` cannot: an operator, a hand-written
 split, a formatted string. A concept clippy can express as a disallowed method
 belongs there instead, so that each has exactly one guard.
 
-Only the crates' own `src` trees are scanned, and within them only code: a
-trailing `#[cfg(test)]` module and every comment line are cut first, so a test
+The crates' `src` trees and their examples are scanned. An example is
+documentation a reader copies from, so a second answer there transfers into a
+consumer's code exactly as one in `src` would, and it is the tree a reviewer is
+least likely to read twice. Integration tests are not scanned: a test's numbers
+and paths are its own literals rather than a caller's, so the shapes these
+idioms name are usually not the hazard they name, and the test conventions
+belong to `CONTRIBUTING.md`. Within a file only code counts: a trailing
+`#[cfg(test)]` module and every comment line are cut first, so a test
 constructing the shape under test and a comment naming it are not sites.
 
 Usage:
@@ -49,10 +55,22 @@ def code(path: Path) -> str:
     return "\n".join(line for line in lines if not line.lstrip().startswith("//"))
 
 
+TREES = ("src", "examples")
+
+
+def sources() -> list[Path]:
+    """Every Rust file the crates build, in path order."""
+    return sorted(
+        path
+        for tree in TREES
+        for path in REPO.glob(f"crates/*/{tree}/**/*.rs")
+    )
+
+
 def census(pattern: str) -> dict[str, int]:
-    """Where `pattern` occurs in the crates' source, and how often."""
+    """Where `pattern` occurs in the crates' code, and how often."""
     found = {}
-    for path in sorted(REPO.glob("crates/*/src/**/*.rs")):
+    for path in sources():
         occurrences = len(re.findall(pattern, code(path)))
         if occurrences:
             found[str(path.relative_to(REPO))] = occurrences

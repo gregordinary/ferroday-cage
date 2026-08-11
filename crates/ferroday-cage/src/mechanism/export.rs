@@ -121,6 +121,15 @@ wire_enum! {
 pub(crate) enum StartError {
     /// A syscall of the spawn machinery failed.
     Spawn(Errno),
+    /// The child failed before it reached the map gate and named the step on
+    /// the stream, where this caller read it back rather than reporting the
+    /// lost child it looked like from the gate's side.
+    Reported {
+        /// What the child was doing.
+        step: ExportStep,
+        /// What the kernel answered it with.
+        errno: Errno,
+    },
     /// The delegate failed to apply the map; its own error is the diagnostic.
     Map(IdMapError),
 }
@@ -227,7 +236,13 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
                 if let Some(err) = failure {
                     drop(caller);
                     super::abandon_gated_child(pid);
-                    return Err(err);
+                    // A child that failed on its way to the gate reported on
+                    // the stream, as it reports every other failure — and this
+                    // caller was blocked on the gate, so it has not read it.
+                    // Reading it now is what turns "the child is gone" into the
+                    // step it went on; the copy-in path preserves its child's
+                    // diagnostic the same way, through `Gated::EarlyRecord`.
+                    return Err(early_report(stream_read.as_fd()).unwrap_or(err));
                 }
             }
             Ok(ExportChild {
@@ -634,6 +649,36 @@ fn put_bytes_u16(stream: BorrowedFd<'_>, data: &[u8]) -> Result<(), (ExportStep,
 /// Emits a lone tag byte (a directory-leave or the terminator), checked.
 fn emit_tag_checked(stream: BorrowedFd<'_>, tag: u8) -> Result<(), (ExportStep, Errno)> {
     put(stream, &[tag])
+}
+
+/// The failure an export child put on the stream before it reached the gate, or
+/// `None` where it put nothing there.
+///
+/// Read without blocking, because neither a frame nor an end of input is
+/// guaranteed to arrive: a sibling process the caller forked concurrently holds
+/// its own copy of the child's write end — `kernel_fork` copies the whole
+/// descriptor table — so even a dead child's end-of-file can be held off
+/// indefinitely. The child is already dead by the time this runs, so whatever it
+/// wrote is queued in full: an error frame is nine bytes, well under `PIPE_BUF`,
+/// and a pipe write that small is atomic.
+///
+/// Only an error frame is read back. A child past the gate is walking rather
+/// than reporting, and this runs only for one that never got there.
+fn early_report(stream: BorrowedFd<'_>) -> Option<StartError> {
+    // The descriptor belongs to a `start_export` that is on its way to
+    // returning an error, so it is dropped rather than restored to blocking.
+    fs::fcntl_setfl(stream, OFlags::NONBLOCK).ok()?;
+    let mut record = [0u8; 9];
+    let read = frame::retry_on_intr!(rustix::io::read(stream, &mut record)).ok()?;
+    if read != record.len() || record[0] != FRAME_ERROR {
+        return None;
+    }
+    let wire = u32::from_le_bytes(record[1..5].try_into().expect("slice length is 4"));
+    let errno = i32::from_le_bytes(record[5..9].try_into().expect("slice length is 4"));
+    Some(StartError::Reported {
+        step: ExportStep::from_wire(wire)?,
+        errno: Errno::from_raw_os_error(errno),
+    })
 }
 
 /// Emits a lone tag byte, best-effort (the terminator, where a gone parent is

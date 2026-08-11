@@ -319,7 +319,10 @@ fn local_repository(suite: &str, dir: &Path, index: usize) -> Result<Repository,
             path: dir.to_path_buf(),
             source,
         })?;
-    let url = format!("file://{}", canonical.display());
+    // The library owns the `file://` form, including the case a hand-written
+    // `format!` degrades: a path that is not valid UTF-8 is reported rather than
+    // lossily rendered into a URL naming something else.
+    let url = provision::file_url(&canonical).map_err(DebianError::Fetch)?;
     let name = dir
         .file_name()
         .and_then(|name| name.to_str())

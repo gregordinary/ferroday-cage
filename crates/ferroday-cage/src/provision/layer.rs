@@ -98,8 +98,14 @@ impl<'a> Rooting<'a> {
 /// [`provision::remove`](crate::provision::remove) before dropping the handle,
 /// which then finds nothing to remove.
 ///
-/// [`Debian::stage_layer`]: crate::provision::debian::Debian::stage_layer
-/// [`Alpine::stage_layer`]: crate::provision::alpine::Alpine::stage_layer
+#[cfg_attr(
+    feature = "debian",
+    doc = "[`Debian::stage_layer`]: crate::provision::debian::Debian::stage_layer"
+)]
+#[cfg_attr(
+    feature = "alpine",
+    doc = "[`Alpine::stage_layer`]: crate::provision::alpine::Alpine::stage_layer"
+)]
 #[derive(Debug)]
 pub struct BuildLayer {
     /// The overlay upper the increment was installed into: the build root's

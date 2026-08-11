@@ -675,6 +675,63 @@ mod tests {
         }
     }
 
+    /// What [`sample`] renders to, spelled out.
+    ///
+    /// A round trip proves the reader and the writer agree with each other; it
+    /// cannot notice the two of them moving together. This is the format itself:
+    /// which fields are written, in which order, how an absent optional differs
+    /// from an empty one, and where the blank lines fall. A change to any of
+    /// those is a change to the format, and the format carries a version because
+    /// a reader that cannot tell which shape it is holding cannot say what it is
+    /// trusting — so this failing is the prompt to decide whether that version
+    /// has to move.
+    const GOLDEN: &str = "\
+Format: ferroday-cage-alpine-plan 1
+Release: v3.23
+Architecture: x86_64
+
+Index: 0
+Mirror: http://dl-cdn.alpinelinux.org/alpine
+Release: v3.23
+Component: main
+SHA256: 9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a9f3a
+Signed-By: alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub
+Description: v3.23.5-111-g2a2e55ba802
+
+Index: 1
+Mirror: http://mirror.postmarketos.org/postmarketos
+Release: v26.06
+SHA256: 1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f1c0f
+Signed-By: build.postmarketos.org.rsa.pub
+
+Package: busybox
+Version: 1.37.0-r30
+Architecture: x86_64
+Control-Identity: Q18TR4AbuWsapA0X+CI3w/T/AqRyU=
+Index: 0
+Size: 504726
+Installed-Size: 813480
+
+Package: postmarketos-baselayout
+Version: 1.0-r0
+Architecture: noarch
+Control-Identity: Q1LSohzMjVRmn08215M0mwFPRtsg8=
+Index: 1
+Origin: postmarketos-base
+
+";
+
+    #[test]
+    fn the_document_is_the_format_this_version_writes() {
+        assert_eq!(sample().to_document().expect("the plan renders"), GOLDEN);
+        // And it reads back as the plan it came from, so the literal above is a
+        // document rather than only a string that happens to match.
+        assert_eq!(
+            Plan::parse_document(GOLDEN).expect("the golden reads"),
+            sample(),
+        );
+    }
+
     #[test]
     fn a_plan_survives_a_document_round_trip() {
         let plan = sample();

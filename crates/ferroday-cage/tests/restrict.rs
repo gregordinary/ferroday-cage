@@ -7,9 +7,12 @@
 //! the kernel lacks the facility they use, Landlock or seccomp, rather than
 //! passing silently.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
+mod common;
+
+use common::scratch_dir as scratch;
 use ferroday_cage::{
     Error, FsAccess, NetAccess, Restriction, RestrictionBuilder, SeccompAction, SeccompArg,
     SeccompPolicy, SeccompRules, SetupStep, Stdio, Terminal,
@@ -48,17 +51,6 @@ fn seccomp_supported() -> bool {
         eprintln!("skipping: the kernel offers no seccomp support");
         false
     }
-}
-
-/// Creates an empty scratch directory for one test, under the target
-/// directory so `cargo clean` clears it.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("the previous scratch directory is removable");
-    }
-    std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
-    dir
 }
 
 /// Adds the grants that make a dynamically linked host binary runnable:

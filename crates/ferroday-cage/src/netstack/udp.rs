@@ -330,8 +330,6 @@ impl UdpTables {
         progress
     }
 
-    /// Expires flows idle past [`IDLE_TIMEOUT`] and removes any port socket
-    /// left with no flows.
     /// The time until the nearest flow must be reaped, for the pump's poll
     /// timeout, so the loop wakes to expire an idle flow rather than reaping it
     /// lazily on the next unrelated event. A flow already marked dead is due
@@ -349,6 +347,13 @@ impl UdpTables {
             .min()
     }
 
+    /// Reaps every flow idle past [`IDLE_TIMEOUT`] or marked dead, then removes
+    /// any port socket the reaping left with no flows behind it.
+    ///
+    /// A port socket outlives its flows for exactly as long as one of them is
+    /// still using the port, since the interface delivers to the socket rather
+    /// than to the flow: dropping it while another flow shares the port would
+    /// silently stop that flow's replies.
     pub(super) fn expire(&mut self, sockets: &mut SocketSet<'static>, now: Instant) {
         self.flows.retain(|flow| {
             !flow.dead && now.saturating_duration_since(flow.last_active) < IDLE_TIMEOUT
@@ -460,13 +465,80 @@ mod tests {
 
     #[test]
     fn a_flow_is_expired_only_after_the_idle_timeout() {
+        // Driven through `expire` rather than by restating its predicate: a
+        // restatement passes whatever the predicate later becomes, which is the
+        // one thing a pinned boundary is written to catch.
         let base = Instant::now();
-        // The retain predicate: a flow expires once its idle time reaches
-        // the timeout.
-        let idle_ok = base + IDLE_TIMEOUT - Duration::from_millis(1);
-        let idle_expired = base + IDLE_TIMEOUT;
-        assert!(idle_ok.saturating_duration_since(base) < IDLE_TIMEOUT);
-        assert!(!(idle_expired.saturating_duration_since(base) < IDLE_TIMEOUT));
+        let at = |elapsed: Duration| {
+            let mut tables = UdpTables::new(1500);
+            let mut sockets = SocketSet::new(Vec::new());
+            tables.ensure_port(53, &mut sockets);
+            let (flow_side, _peer) = host_pair();
+            let mut flow = flow_over(flow_side);
+            flow.last_active = base;
+            tables.flows.push(flow);
+            tables.expire(&mut sockets, base + elapsed);
+            (tables.flows.len(), tables.ports.len())
+        };
+
+        assert_eq!(
+            at(IDLE_TIMEOUT - Duration::from_millis(1)),
+            (1, 1),
+            "a flow one millisecond short of the timeout is still live",
+        );
+        // And the port socket goes with the last flow that was using it, since
+        // nothing is left for the interface to deliver to it.
+        assert_eq!(
+            at(IDLE_TIMEOUT),
+            (0, 0),
+            "a flow idle for the whole timeout is reaped",
+        );
+    }
+
+    #[test]
+    fn a_dead_flow_is_reaped_however_recently_it_was_active() {
+        // The `dead` flag is set when the host side answers a hard error, and
+        // it is due immediately: holding such a flow to the idle timeout would
+        // keep a slot for a peer that is already gone.
+        let now = Instant::now();
+        let mut tables = UdpTables::new(1500);
+        let mut sockets = SocketSet::new(Vec::new());
+        tables.ensure_port(53, &mut sockets);
+        let (flow_side, _peer) = host_pair();
+        let mut flow = flow_over(flow_side);
+        flow.last_active = now;
+        flow.dead = true;
+        tables.flows.push(flow);
+
+        tables.expire(&mut sockets, now);
+        assert!(tables.flows.is_empty());
+        assert!(tables.ports.is_empty());
+    }
+
+    #[test]
+    fn a_port_socket_outlives_a_reaped_flow_that_shares_it() {
+        // The interface delivers to the port socket rather than to the flow, so
+        // removing it while another flow is still using the port would silently
+        // stop that flow's replies.
+        let now = Instant::now();
+        let mut tables = UdpTables::new(1500);
+        let mut sockets = SocketSet::new(Vec::new());
+        tables.ensure_port(53, &mut sockets);
+
+        let (idle_side, _idle_peer) = host_pair();
+        let mut idle = flow_over(idle_side);
+        idle.last_active = now;
+        tables.flows.push(idle);
+
+        let (live_side, _live_peer) = host_pair();
+        let mut live = flow_over(live_side);
+        live.guest = IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 40_001);
+        live.last_active = now + IDLE_TIMEOUT;
+        tables.flows.push(live);
+
+        tables.expire(&mut sockets, now + IDLE_TIMEOUT);
+        assert_eq!(tables.flows.len(), 1, "only the idle flow is reaped");
+        assert_eq!(tables.ports.len(), 1, "the port the survivor uses stays");
     }
 
     #[test]

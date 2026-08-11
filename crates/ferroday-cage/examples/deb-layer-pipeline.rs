@@ -207,8 +207,8 @@ fn run(config: Config) -> Result<(), String> {
         .publish::<&Path>([])
         .map_err(|error| format!("cannot create the pool: {error}"))?;
 
-    for component in &config.components {
-        build_component(&config, component)?;
+    for (at, component) in config.components.iter().enumerate() {
+        build_component(&config, at, component)?;
     }
     Ok(())
 }
@@ -242,11 +242,16 @@ fn provision_base(config: &Config) -> Result<(), String> {
 
 /// Stages one component's build dependencies as a layer over the base, builds
 /// it, and publishes its packages into the pool.
-fn build_component(config: &Config, source: &Path) -> Result<(), String> {
+///
+/// `at` is the component's position on the command line, which is what keeps two
+/// `--component` paths with the same last segment — `a/src` and `b/src` — from
+/// sharing an output directory and a layer upper. The packages themselves are
+/// pool-addressed and would not collide; the tree the run leaves behind would.
+fn build_component(config: &Config, at: usize, source: &Path) -> Result<(), String> {
     let name = source
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "component".to_string());
+        .map(|name| format!("{at:02}-{}", name.to_string_lossy()))
+        .unwrap_or_else(|| format!("{at:02}-component"));
     eprintln!("deb-layer-pipeline: building {name}");
 
     // This component's declared build dependencies, resolved against the archive

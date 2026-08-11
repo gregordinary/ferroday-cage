@@ -75,6 +75,20 @@ impl Escalation {
         self.deadline
     }
 
+    /// Whether the current stage's deadline has passed and
+    /// [`expire`](Self::expire) is owed.
+    ///
+    /// A waiter that sleeps *on* the deadline can tell it passed by how it woke
+    /// up; the relay cannot, because it wakes on descriptors as well, and once
+    /// the deadline is behind it every wakeup is a wakeup with a zero timeout
+    /// left. Asking the question rather than inferring it from a timed-out
+    /// sleep is what makes the escalation a consequence of the clock rather
+    /// than of what the sandbox happened to be printing.
+    pub fn passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     /// Acts on the deadline that has just passed and moves to the next stage.
     ///
     /// The termination request is a `SIGTERM` the command may trap, clean up
@@ -163,6 +177,33 @@ mod tests {
             second < first,
             "the grace hangs off the expiry, not off the start",
         );
+    }
+
+    #[test]
+    fn a_passed_deadline_is_reported_by_the_clock_alone() {
+        // What the relay asks on every wakeup, however it woke: it polls on
+        // descriptors as well as on the deadline, so it cannot read the expiry
+        // off a timed-out sleep the way the plain wait does.
+        let mut escalation = Escalation::new(Some(Duration::from_secs(60)), GRACE);
+        assert!(!escalation.passed(), "the timeout has not run out");
+
+        // A deadline already behind the run, reached the way the escalation
+        // itself reaches one rather than by editing the field.
+        escalation.deadline = Instant::now().checked_sub(Duration::from_secs(1));
+        assert!(escalation.passed());
+
+        // And after the kill there is no deadline left to pass, so nothing is
+        // owed however long the command goes on running.
+        escalation.advance();
+        escalation.advance();
+        assert_eq!(escalation.deadline(), None);
+        assert!(!escalation.passed());
+    }
+
+    #[test]
+    fn a_run_without_a_timeout_has_no_deadline_to_pass() {
+        let escalation = Escalation::new(None, GRACE);
+        assert!(!escalation.passed());
     }
 
     #[test]

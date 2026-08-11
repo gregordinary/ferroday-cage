@@ -65,6 +65,7 @@ CI asserts the security-property suites actually ran:
 | `FERRODAY_CAGE_REQUIRE_TUN` | `/dev/net/tun` unavailable |
 | `FERRODAY_CAGE_REQUIRE_LANDLOCK` | The kernel offers no Landlock LSM |
 | `FERRODAY_CAGE_REQUIRE_SECCOMP` | The kernel offers no seccomp |
+| `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` | A network suite was not opted into |
 
 To exercise the full suite locally you need unprivileged user namespaces
 enabled (on Ubuntu 23.10 and later, `sysctl -w
@@ -72,8 +73,36 @@ kernel.apparmor_restrict_unprivileged_userns=0`), the `tun` module loaded, and
 a subordinate id allocation for your user (`usermod --add-subuids
 --add-subgids`).
 
-The tests provision a pinned Alpine minirootfs fixture on first run and cache
-it under `target/`.
+### The network suites
+
+Two integration suites bootstrap from a live repository, and both are **off by
+default**, so `cargo test --workspace --all-features` — CI included — resolves
+against no repository unless it is asked to. Each is opted into with its own
+variable:
+
+| Variable | Runs |
+| --- | --- |
+| `FERRODAY_CAGE_DEBIAN_NETWORK_TEST` | `tests/debian.rs`'s live bootstraps, against a Debian mirror |
+| `FERRODAY_CAGE_ALPINE_NETWORK_TEST` | `tests/alpine.rs`'s live bootstraps, against Alpine and postmarketOS mirrors |
+
+These are the proofs that a produced root is one the distribution's own tools
+agree with — `apt` and `dpkg` on the Debian side, `apk audit` and `busybox` on
+the Alpine one — so run them before a release and after any change to a
+provisioner. They are happy-path suites by design; the failure paths are covered
+by the hermetic unit tests beside the code, which run always.
+
+`FERRODAY_CAGE_REQUIRE_NETWORK_TEST` turns *not* opting in into a failure, which
+is what keeps a release check that meant to exercise them from coming back green
+having run nothing. Both suites also skip when the host cannot build a sandbox at
+all — a missing user namespace is not a repository failure — and that skip is
+`FERRODAY_CAGE_REQUIRE_USERNS`'s to assert on, as it is everywhere else.
+
+That is narrower than "reaches no network", and deliberately so. Every suite that
+builds a sandbox needs a root filesystem to build it in, and that is a pinned
+Alpine minirootfs the first run fetches from a mirror and caches under `target/`.
+A cold cache therefore reaches the network whatever is opted into; a warm one
+reaches nothing. `FERRODAY_CAGE_FIXTURE_DIR` points the cache somewhere already
+populated, for a build with no network at all.
 
 ### Scratch directories
 
@@ -85,9 +114,12 @@ one tree per run behind forever, which a long-lived machine notices.
 - **A unit test** inside `crates/ferroday-cage/src` uses
   `crate::scratch::Scratch`, which dereferences to its `Path`.
 - **An integration test** uses `common::scratch_dir`, which places its trees
-  under `target` so `cargo clean` clears them. `tests/export.rs` carries a guard
-  of its own, because a tree holding subordinate-owned entries has to be removed
-  through `provision::remove` rather than by the calling user.
+  under `target` so `cargo clean` clears them. Two tests name a tree of their
+  own instead — `tests/export.rs` and the removal test in `tests/identity.rs` —
+  because both fill it with subordinate-owned entries, which have to be removed
+  through `provision::remove` rather than by the calling user. `scratch_dir`
+  clears the previous run's tree as the calling user, which is exactly what such
+  a tree resists.
 
 Both crates' `tests/common/mod.rs` are re-exports of `ferroday-cage-testkit`, a
 workspace member that is never published. It holds the rootfs fixture, the
@@ -142,6 +174,14 @@ Two further gates matter when the public API moves:
   `Sync` for every public type, including the ones that deliberately have
   neither. Losing an auto trait is a breaking change; if a change withdraws
   one, the assertion and its recorded reason both need updating.
+
+If a doc comment on shared code links a feature-gated item, the `cargo doc`
+above will not catch it: the link resolves under `--all-features` and under
+nothing else. The `features` job documents the whole powerset for that reason,
+and `cargo hack doc -p ferroday-cage --feature-powerset --depth 2 --no-deps
+--no-dev-deps` reproduces it. Where a sentence genuinely names items from two
+features, write it once per combination with `cfg_attr(..., doc = "...")`;
+`provision::BuildLayer` is the worked example.
 
 If you touch the guide, build it: `mdbook build docs`.
 

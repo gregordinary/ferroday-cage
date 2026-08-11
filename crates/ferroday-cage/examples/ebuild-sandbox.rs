@@ -42,8 +42,10 @@
 //! One consequence of real ids: directories portage chowns to its own user
 //! (its state and cache trees) are owned by subordinate ids on the host, so
 //! a later `rm -rf` of the rootfs by the plain calling user fails inside
-//! them. Remove it from inside the same mapping — `unshare --map-auto rm
-//! -rf ./gentoo-root` — as rootless container storage is removed.
+//! them. Remove it through
+//! [`provision::remove`](ferroday_cage::provision::remove), which removes such a
+//! tree from inside the same mapping that created it, or from a shell with
+//! `fcage --remove-rootfs ./gentoo-root`.
 //!
 //! # Usage
 //!

@@ -18,12 +18,23 @@
 //! The interface owns the gateway addresses, answers ARP, neighbor
 //! discovery, and ICMP echo for them itself, and accepts any destination
 //! (`any_ip`) so the sniffed listeners see segments addressed to the wider
-//! world. `any_ip` covers only what the interface receives, not what it
-//! answers for: an address on the guest's own subnet other than the gateway
-//! is on-link as far as the guest is concerned, so the guest asks for its
-//! hardware address and nothing replies. No segment for such a destination
-//! ever reaches the stack, which is why that refusal alone is not a reset —
-//! see [`host_target`].
+//! world. `any_ip` is a receive rule, and holding it to that is ingestion's
+//! second job: smoltcp's own `any_ip` also makes the interface answer
+//! address resolution and ICMP echo for every address, since the check both
+//! answers run is the same "is this addressed to us" the switch overrides.
+//! So an ARP request or an echo request naming an address the interface does
+//! not hold is dropped before the interface sees it ([`Engine::holds`]), and
+//! two properties follow. An address on the guest's own subnet other than the
+//! gateway is on-link as far as the guest is concerned, so the guest asks for
+//! its hardware address, nothing replies, and no segment for it ever reaches
+//! the stack — which is why that refusal alone is not a reset, see
+//! [`host_target`]. And a successful ping inside the guest means the gateway
+//! answered, rather than the stack answering in the name of whatever was
+//! pinged.
+//!
+//! Neighbor discovery needs no such rule: smoltcp answers a solicitation only
+//! for an address whose solicited-node multicast group the interface has
+//! joined, which `any_ip` does not widen.
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
@@ -35,7 +46,7 @@ use rustix::rand::GetRandomFlags;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp as tcp_socket;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 use super::device::TapDevice;
 use super::sniff::{self, Sniff};
@@ -288,6 +299,12 @@ impl Engine {
                     });
                 }
                 Ok(read) => {
+                    // Classified from the read buffer, before a queue buffer is
+                    // taken: a frame the interface must not answer is withheld
+                    // rather than queued and then regretted.
+                    if !self.consider(sniff::classify(&self.read_buf[..read])) {
+                        continue;
+                    }
                     // The queued frame is its own buffer, since the interface
                     // consumes it after this batch rather than during it. It
                     // comes from the device's free list, so a steady stream of
@@ -295,7 +312,6 @@ impl Engine {
                     // allocating one per frame.
                     let mut frame = self.device.take_buffer();
                     frame.extend_from_slice(&self.read_buf[..read]);
-                    self.consider(&frame);
                     self.device.enqueue(frame);
                 }
                 Err(Errno::AGAIN) => break,
@@ -311,15 +327,37 @@ impl Engine {
         Ok(())
     }
 
-    /// Acts on one classified frame before the interface sees it: a TCP
-    /// connection attempt or a UDP datagram to an admitted destination gets
-    /// the receive socket the interface will deliver to; everything else
-    /// passes through untouched.
-    fn consider(&mut self, frame: &[u8]) {
-        match sniff::classify(frame) {
+    /// Acts on one classified frame before the interface sees it, and reports
+    /// whether the interface may have it.
+    ///
+    /// A TCP connection attempt or a UDP datagram to an admitted destination
+    /// gets the receive socket the interface will deliver to. A request the
+    /// interface would answer on behalf of an address it does not hold is
+    /// withheld — the one thing `any_ip` would otherwise widen beyond
+    /// receiving. Everything else passes through untouched.
+    fn consider(&mut self, sniff: Sniff) -> bool {
+        match sniff {
             Sniff::TcpSyn { src, dst } => self.admit_tcp(src, dst),
             Sniff::Udp { src, dst } => self.admit_udp(src, dst),
+            Sniff::Resolve { target } => return self.holds(target),
+            Sniff::Echo { dst } => return self.holds(dst),
             Sniff::Other => {}
+        }
+        true
+    }
+
+    /// Whether `addr` is an address this interface holds.
+    ///
+    /// Not [`Interface::has_ip_addr`], which answers `true` for everything
+    /// under `any_ip` — that switch is exactly what this question exists to see
+    /// past. The interface holds its gateway addresses and nothing else: the
+    /// guest's own address is the guest's, and the rest of the guest's subnet
+    /// is nobody's, which is what makes it safe to refuse in
+    /// [`host_target`].
+    fn holds(&self, addr: IpAddress) -> bool {
+        match IpAddr::from(addr) {
+            IpAddr::V4(addr) => self.plan.v4.as_ref().is_some_and(|v4| v4.gateway == addr),
+            IpAddr::V6(addr) => self.plan.v6.as_ref().is_some_and(|v6| v6.gateway == addr),
         }
     }
 
@@ -453,7 +491,9 @@ impl Engine {
 /// hardware address before sending anything, and the interface answers ARP and
 /// neighbor discovery only for the addresses it owns — the gateway. Nothing
 /// replies, and the connection fails when the guest's own address resolution
-/// gives up.
+/// gives up. That property is [held by ingestion](self), not by the interface:
+/// under `any_ip` smoltcp would answer for every on-link address, and a stack
+/// that did would be claiming to be each of them and then resetting.
 ///
 /// The refusals do not shield a host service bound to a wildcard address
 /// (`0.0.0.0` or `::`): that service is reachable through the host's own

@@ -172,6 +172,20 @@ affected.
   mirror — and an observer saw nothing between `Resolving` and the first package
   download, while the Debian walk and the Alpine package walk both reported.
 
+- `fcage`'s `--debian-repository` and `--alpine-repository` refuse a spec whose
+  only mirror field is `mirror-fallback=`, and one that gives `mirror=` twice.
+  Both were read positionally, so a lone backstop was promoted to primary and a
+  repeated `mirror=` demoted the earlier value to a backstop ahead of the
+  declared ones. A repository's primary mirror is written into the finished
+  root — as `/etc/apk/repositories` or `sources.list` — so a typo-dropped
+  `mirror=` left that root permanently fetching from a fetch-time backstop.
+
+- `fcage` exits 125, not 2, when `--alpine-keys` or an `--alpine-repository`'s
+  `keys=` names a directory it cannot read at provision time. The spelling is
+  checked when the command line is parsed; what is left is whether the machine
+  can supply the keys, which is what 125 means and what the library reports for
+  the same failure. The help text reserves 2 for usage errors.
+
 - The shared tar reader refuses an entry whose `APK-TOOLS.checksum.SHA1` pax
   record is not a SHA-1, and that reader serves the `.deb` data member and the
   `Tarball` provisioner too. Before the Alpine layer every unknown pax key was
@@ -307,13 +321,89 @@ affected.
   container failure, telling the caller their mirror was serving the wrong bytes.
   The Debian download already checked its writer before publishing.
 
+- `fcage` no longer counts `nameserver8.8.8.8` — no separator — as a routable
+  nameserver when deciding whether a `resolv.conf` needs the network stack.
+  glibc ignores such a line. The `fetch-sandbox` example answers the same
+  question for the same purpose and now applies the same rule; the two are
+  recorded in `tools/idioms.toml` so a change to either arrives as a diff naming
+  the other.
+
+- The network stack answers address resolution and ICMP echo only for the
+  addresses it holds. It accepts packets for every destination so that routed
+  traffic reaches its sockets, and smoltcp's switch for that also had the
+  interface answer ARP for every address on the guest's link and answer an echo
+  request for any destination at all, sourced from whatever was pinged. Nothing
+  was forwarded that the policy refuses — the destination check is unchanged —
+  but a guest ARPing a non-existent neighbour got a completed entry carrying the
+  gateway's hardware address, and a ping of an unreachable address succeeded
+  against the stack itself. Both requests are now withheld from the interface
+  before it can answer them, so an on-link refusal fails when the guest's own
+  address resolution gives up, as documented, and a successful ping means the
+  gateway answered.
+
+- `fcage --terminal --timeout` acts on the deadline on every wakeup rather than
+  only on the one `poll` timed out on. Once the deadline had passed the poll
+  timeout was zero, so a sandbox with something to say answered every poll with a
+  ready descriptor and the escalation was reached only when the pseudoterminal
+  fell quiet. In practice the relay drains faster than a writer can refill, so
+  the quiet instant arrived within milliseconds — but the guarantee was the
+  scheduler's rather than the clock's, where the non-terminal wait's is
+  unconditional.
+
 - A `Filename` or `SHA256` in a Debian plan document is held to its shape. See
   Changed, above.
+
+- The `HttpFetch` transport refuses a URL carrying a space or a control
+  character. A redirect `Location` is the one URL reaching the request line that
+  has passed no boundary check of its own, and the path was interpolated
+  verbatim, so a hostile mirror could put a CRLF in one and write headers into
+  the follow-up request. Same-origin redirects are the default and content is
+  digest-verified, so the reach was the documented
+  `cross_host_redirects(true)` envelope — but a blind GET is a narrower
+  primitive than one with attacker-chosen headers.
+
+- An export child that fails before it reaches its map gate reports the step it
+  reached. It writes its diagnostic on the frame stream, as it reports every
+  other failure, and the caller was blocked on the gate and returned without
+  reading it — so an `unshare` an LSM denied surfaced as `EPROTO` from a child
+  that vanished. The copy-in path already preserved its child's account.
+
+- A removal child abandoned at its map gate is reaped once. `abandon_gated_child`
+  killed and reaped it, and the caller then waited a second time on a pid the
+  kernel was free to have reused, where a blocking wait could have collected an
+  unrelated child's status. Killing and reaping are separate now, and each caller
+  does whichever its own path has left.
+
+- A profile that mounts a procfs, mounts a second, and covers the second is no
+  longer refused as having none. The scan for a procfs the nested user namespace
+  can establish its map through tracked only the most recent candidate, so a
+  covered one erased the memory of an earlier one still standing.
+
+- A raw mount carrying `MS_BIND` is read as the bind it is. `mount(2)` ignores
+  `fstype` when that flag is set, so `RawMount::new("/proc").source("/proc")
+  .fstype("proc").flags(MS_BIND)` satisfied the fresh-procfs requirement it does
+  not meet, and the failure arrived at launch instead of as a build error.
 
 - An `APKINDEX` record whose `C:` field is the right length and the right
   alphabet but not one the encoder can produce — `Q1` followed by padding — is
   refused as the malformed record it is, rather than at fetch time as a mirror
   serving the wrong bytes.
+
+- The copy-in child's outcome record is checked for length before it is decoded,
+  as the gate's other two readers already were. A short seqpacket message would
+  have decoded against the zero-filled rest of the buffer as a step the child
+  never reached, with errno 0.
+
+- `fcage --rootfs R --provision-debian trixie --` — a provisioning run ending on
+  a bare separator — is accepted. It names no launch setting, and the check for
+  one read the separator as a flag.
+
+- A mount-target directory's mode is applied through a descriptor opened
+  `O_NOFOLLOW`, not by path. A path-wise `chmodat` follows a symlink at the leaf,
+  so a host process racing the window between the `mkdir` and the mode had a path
+  of its choosing chmod-ed instead. There is no privilege delta — such a process
+  can chmod those paths directly — but the file bind's target already used
+  `fchmod` for exactly this reason, and the directory's did not.
 
 - The `HttpFetch` transport parses `HTTP://` and `FILE://` as the schemes they
   are. A scheme is case-insensitive (RFC 3986 §3.1), which the crate's scheme
@@ -438,6 +528,32 @@ change where a reader looks.
   the digests it describes. It lived in the Debian index reader, which is not
   where "is this a digest, and could it be a path segment" is asked from; the
   Alpine layer now asks it too, of a `.PKGINFO`'s `datahash`.
+
+- Both plan formats are pinned by a golden document as well as by a round trip.
+  A round trip proves the reader and the writer agree with each other and cannot
+  notice the two of them moving together, which is exactly what a format version
+  exists to catch.
+
+- `deb-layer-pipeline` names each component's output directory and layer upper
+  by its position as well as its last path segment. Two `--component` paths
+  ending in the same segment — `a/src` and `b/src` — shared both.
+
+- The `features` job documents the whole feature powerset, so a doc link that
+  resolves only under `--all-features` fails there rather than in a consumer's
+  build. `cargo doc --all-features` cannot catch one: the link resolves under
+  that selection and under nothing else. Where a sentence genuinely names items
+  from two features it is written once per combination with
+  `cfg_attr(..., doc = "...")`, which `CONTRIBUTING.md` records with
+  `provision::BuildLayer` as the worked example.
+
+- `tools/check-idioms.py` scans the crates' examples as well as their `src`
+  trees. An example is documentation a reader copies from, so a second answer
+  there transfers into a consumer's code exactly as one in `src` would — and the
+  census could not see it. Widening it found `deb-multirepo` formatting a
+  `file://` URL by hand, which is now `provision::file_url`. Integration tests
+  stay outside the census: a test's numbers and paths are its own literals rather
+  than a caller's, so the shapes these idioms name are usually not the hazard
+  they name.
 
 - `provision::containment` owns the create-over-what-is-already-there answer,
   which the extractor and the host-side `Rooted` each spelled: the same

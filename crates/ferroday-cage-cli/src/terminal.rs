@@ -443,16 +443,23 @@ fn pump(
 
         let wait = escalation.deadline().map(timespec_until);
         match rustix::event::poll(watched, wait.as_ref()) {
-            Ok(0) => {
-                // The deadline passed. Escalate, and keep relaying: the
-                // sandbox's exit closes the replicas, end-of-file ends the loop,
-                // and restoration happens on the normal path.
-                escalation.expire(running)?;
-                continue;
-            }
             Ok(_) => {}
             Err(Errno::INTR) => continue,
             Err(errno) => return Err(errno.into()),
+        }
+
+        // Asked on every wakeup, not only on the one `poll` timed out on.
+        // Once the deadline is behind the loop the poll timeout is zero, so a
+        // descriptor with something to say answers `Ok(n > 0)` first and a
+        // sandbox printing without pause would postpone the escalation for as
+        // long as it kept winning that race. Consulting the clock instead makes
+        // the expiry a consequence of the clock, the way the non-terminal
+        // wait's is.
+        if escalation.passed() {
+            // Escalate, and keep relaying: the sandbox's exit closes the
+            // replicas, end-of-file ends the loop, and restoration happens on
+            // the normal path.
+            escalation.expire(running)?;
         }
 
         let ready: [PollFlags; 3] = std::array::from_fn(|index| slots[index].revents());
