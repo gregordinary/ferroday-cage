@@ -71,10 +71,12 @@ compile_error!(
      rustix's libc backend. See the mechanism module documentation."
 );
 
+pub(crate) mod bounds;
 mod child;
 mod copyin;
 #[cfg(feature = "tarball")]
 mod export;
+pub(crate) mod frame;
 #[cfg(feature = "hardening")]
 mod harden;
 mod overlay;
@@ -90,7 +92,7 @@ pub(crate) use child::CONTROL_TERMINATE;
 pub(crate) use child::sweep_fds_keeping;
 pub(crate) use copyin::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_SYMLINK, CopyFailure,
-    LINK_BUF, start_copy_in,
+    start_copy_in,
 };
 #[cfg(feature = "tarball")]
 pub(crate) use export::{
@@ -912,6 +914,102 @@ pub(super) const MAP_READY_BYTE: u8 = b'R';
 /// the signal.
 pub(super) const MAP_GO_BYTE: u8 = b'M';
 
+/// The length of a helper child's failure record: a step's wire value then an
+/// errno, both little-endian.
+pub(super) const RECORD_LEN: usize = 8;
+
+/// How driving a map gate ended.
+pub(super) enum Gated {
+    /// The map is in force and the child has been released.
+    Released,
+    /// The child reported a failure before it signalled ready, so it never
+    /// reached the gate. The record is the caller's to decode, since only the
+    /// caller knows which step vocabulary it names.
+    EarlyRecord([u8; RECORD_LEN]),
+    /// The child is gone, or said something that is neither a ready byte nor a
+    /// failure record. Nothing was applied and nothing was released.
+    ChildLost,
+}
+
+/// Why driving a map gate failed.
+pub(super) enum GateFailure {
+    /// A read or write on the gate itself failed.
+    Io(Errno),
+    /// The delegate refused to establish the map; its own error is the
+    /// diagnostic.
+    Map(crate::idmap::IdMapError),
+}
+
+/// The caller's half of a map gate: waits for the child's ready byte, has the
+/// delegate establish the child's identity map, and releases the child.
+///
+/// Every provisioning child that takes a delegated map is driven through this:
+/// the export, the copy-in, and the removal. The child's side of the same
+/// handshake is [`child::enter_mapped_namespace`], which is why the two byte
+/// constants above are shared rather than restated.
+///
+/// The gate is a seqpacket socket, so one read receives one whole message and
+/// its length distinguishes the two things a child may send: one byte is
+/// [`MAP_READY_BYTE`], and [`RECORD_LEN`] bytes is a failure the child hit
+/// before it ever reached the gate — it could not sweep its descriptors, or
+/// could not unshare. Reading the record here is what lets that failure name
+/// its step instead of surfacing as a child that vanished.
+///
+/// Nothing is killed or reaped here. A caller that gets anything but
+/// [`Gated::Released`] has a child blocked in an unmapped namespace, and
+/// [`abandon_gated_child`] is how it ends it.
+///
+/// The fork that produces the child stays in each helper's own module even
+/// though the three read alike. The child branch runs a different
+/// never-returning function each time, and the `unsafe` block's SAFETY comment
+/// has to vouch for *that* function's post-fork discipline by name; a shared
+/// harness would leave the comment vouching for a closure whose body is
+/// somewhere else.
+pub(super) fn drive_map_gate(
+    gate: BorrowedFd<'_>,
+    child: Pid,
+    mapper: &dyn crate::idmap::IdMapper,
+    map: &crate::idmap::ResolvedMap,
+) -> Result<Gated, GateFailure> {
+    let mut record = [0u8; RECORD_LEN];
+    let received =
+        frame::retry_on_intr!(rustix::io::read(gate, &mut record)).map_err(GateFailure::Io)?;
+    match received {
+        1 if record[0] == MAP_READY_BYTE => {}
+        RECORD_LEN => return Ok(Gated::EarlyRecord(record)),
+        _ => return Ok(Gated::ChildLost),
+    }
+
+    let pid = child.as_raw_nonzero().get() as u32;
+    mapper.apply(pid, map).map_err(GateFailure::Map)?;
+
+    // A failed write means the child is already gone. Whatever it was going to
+    // report, it reports through its own channel or not at all; that is not a
+    // failure of the gate.
+    let _ = frame::retry_on_intr!(rustix::io::write(gate, &[MAP_GO_BYTE]));
+    Ok(Gated::Released)
+}
+
+/// Ends a child left blocked at its map gate, and reaps it.
+///
+/// A child whose map the delegate could not establish is waiting for a go byte
+/// that will never come. It holds nothing but its own descriptors and has
+/// touched no tree, so killing it is a clean end — and it is the only end
+/// available.
+///
+/// Killed rather than released by closing the gate. `kernel_fork` copies the
+/// whole descriptor table, so any process this caller forked concurrently holds
+/// its own copy of this gate's caller end and keeps the child's peer open
+/// however promptly this one closes. The library's own children sweep their
+/// inherited descriptors, but each only once its own fork has returned in it,
+/// and a child the *consumer* forked never sweeps at all. The end of input the
+/// blocked child is waiting for is therefore not something this caller can make
+/// arrive, and the reap that follows would block on it forever.
+pub(super) fn abandon_gated_child(child: Pid) {
+    let _ = process::kill_process(child, Signal::KILL);
+    let _ = wait_for_exit(child);
+}
+
 /// Marshals the launch data, creates the launch channels, and forks the
 /// launch stage.
 ///
@@ -1208,13 +1306,7 @@ fn reap_after(pid_namespace: bool, stage_a: Pid) -> Option<OwnedFd> {
 /// `waitpid` this cannot alias a pid a concurrent reaper freed and the OS
 /// recycled for another same-parent child.
 pub(crate) fn reap_via_pidfd(pidfd: BorrowedFd<'_>) -> Result<(), Errno> {
-    loop {
-        match process::waitid(WaitId::PidFd(pidfd), WaitIdOptions::EXITED) {
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(errno),
-        }
-    }
+    frame::retry_on_intr!(process::waitid(WaitId::PidFd(pidfd), WaitIdOptions::EXITED)).map(|_| ())
 }
 
 /// Launches the sandbox and blocks until the command is executing.
@@ -1521,7 +1613,7 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     {
         return Error::UsernsUnavailable {
             blocker: host::userns_blocker(),
-            errno,
+            source: std::io::Error::from_raw_os_error(errno),
         };
     }
     // A user namespace is charged against `user.max_user_namespaces` at every
@@ -1542,7 +1634,7 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     };
     Error::Setup {
         step,
-        errno,
+        source: std::io::Error::from_raw_os_error(errno),
         detail,
     }
 }
@@ -1645,27 +1737,21 @@ fn read_report(fd: &OwnedFd) -> Result<Report, Error> {
 /// Waits for a direct child process to terminate, retrying on signal
 /// interruption.
 pub(crate) fn wait_for_exit(pid: Pid) -> Result<WaitStatus, Errno> {
-    loop {
-        match process::waitpid(Some(pid), WaitOptions::empty()) {
-            Ok(Some((_, status))) => return Ok(status),
-            Ok(None) => {
-                unreachable!("ferroday-cage: waitpid without WNOHANG returned no status")
-            }
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(errno),
-        }
+    match frame::retry_on_intr!(process::waitpid(Some(pid), WaitOptions::empty()))? {
+        Some((_, status)) => Ok(status),
+        None => unreachable!("ferroday-cage: waitpid without WNOHANG returned no status"),
     }
 }
 
 fn spawn_error(errno: Errno) -> Error {
     Error::Spawn {
-        errno: errno.raw_os_error(),
+        source: errno.into(),
     }
 }
 
 pub(crate) fn wait_syscall_error(errno: Errno) -> Error {
     Error::Wait {
-        errno: errno.raw_os_error(),
+        source: errno.into(),
     }
 }
 

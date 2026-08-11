@@ -1168,7 +1168,10 @@ private mirror protocol supplies their own through
 [`fetcher`]. A `file://` URL names a path on the machine it is read on, in either
 of RFC 8089's spellings for that — `file:///srv/pool` and
 `file://localhost/srv/pool`. One naming any other host is refused rather than
-read as a path relative to the current directory. A transport is `Send`, because the provisioner owns it and is
+read as a path relative to the current directory. [`file_url`] builds the URL
+for a local path, and is what [`Pool::mirror_url`] answers with: it makes a
+relative path absolute, since such a URL carries a path from a root and has no
+way to spell one that is not. A transport is `Send`, because the provisioner owns it and is
 itself `Send` — see [thread bounds](stability.md#thread-bounds). Fetches run on
 the thread that called into the provisioner, so a transport is never used from
 two threads at once.
@@ -1339,6 +1342,7 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`name`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.RepositoryBuilder.html#method.name
 [`Pool`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html
 [`Pool::mirror_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.mirror_url
+[`file_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/fn.file_url.html
 [`Pool::release_path`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.release_path
 [`Pool::dists_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.dists_dir
 [`Pool::date`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.date

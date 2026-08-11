@@ -8,6 +8,7 @@
 //! of real packages to download and install.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::fmt;
 
 use super::index::{Dependency, Index, Package};
 
@@ -36,8 +37,8 @@ pub(crate) enum ResolveError {
     },
 }
 
-impl std::fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ResolveError::PackageNotFound { name } => {
                 write!(f, "package {name} is not in the index")

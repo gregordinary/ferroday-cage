@@ -15,15 +15,13 @@
 //! write. So installing or publishing a 90 MB kernel package costs what a shell
 //! script costs.
 
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
+use super::super::ProvisionError;
 use super::super::compress;
 use super::super::extract::{Extraction, OnEntry};
 use super::super::tar::TarReader;
-use super::super::{ProvisionError, io_error};
 
 /// The 8-byte `ar` global header.
 const AR_MAGIC: &[u8] = b"!<arch>\n";
@@ -41,94 +39,6 @@ const CHUNK: usize = 64 * 1024;
 /// stops a `.deb` that declares an implausible member size from being read into
 /// memory just because its header said so.
 const CONTROL_MEMBER_LIMIT: u64 = 16 * 1024 * 1024;
-
-/// The lowercase hex SHA-256 of `bytes`.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
-}
-
-/// The lowercase hex SHA-256 of everything `reader` yields, with the number of
-/// bytes it yielded.
-///
-/// The digest is taken in fixed-size chunks, so it costs the same memory for a
-/// kernel package as for a shell script. The size is counted from what was
-/// actually read rather than taken from a stat, so it describes the same bytes
-/// the digest does.
-pub(crate) fn sha256_stream(reader: &mut impl Read) -> io::Result<(String, u64)> {
-    let mut hasher = Sha256::new();
-    let mut chunk = vec![0u8; CHUNK];
-    let mut size = 0u64;
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(got) => {
-                hasher.update(&chunk[..got]);
-                size += got as u64;
-            }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Ok((hex(&hasher.finalize()), size))
-}
-
-/// A writer that digests everything written through it on its way to `inner`.
-///
-/// The write-side counterpart of [`sha256_stream`]. A [`Fetch`](super::Fetch)
-/// writes a resource to a sink as it arrives, so a download that digests at the
-/// sink learns what it received without holding it: the bytes go to their file
-/// and to the hasher in one pass, and the caller decides whether to publish the
-/// file only after the digest is known.
-pub(crate) struct DigestWriter<W> {
-    inner: W,
-    hasher: Sha256,
-    written: u64,
-}
-
-impl<W: Write> DigestWriter<W> {
-    /// Wraps `inner`, digesting what passes through.
-    pub(crate) fn new(inner: W) -> DigestWriter<W> {
-        DigestWriter {
-            inner,
-            hasher: Sha256::new(),
-            written: 0,
-        }
-    }
-
-    /// Flushes the wrapped writer and reports the lowercase hex digest of
-    /// everything written through it, with the number of bytes that was.
-    ///
-    /// The count comes from what was actually written rather than from a stat,
-    /// so it describes the same bytes the digest does.
-    pub(crate) fn finish(mut self) -> io::Result<(String, u64)> {
-        self.inner.flush()?;
-        Ok((hex(&self.hasher.finalize()), self.written))
-    }
-}
-
-impl<W: Write> Write for DigestWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Only what the inner writer accepted is digested, so a short write
-        // cannot put the digest and the file out of step.
-        let written = self.inner.write(buf)?;
-        self.hasher.update(&buf[..written]);
-        self.written += written as u64;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// Formats a digest as lowercase hex.
-fn hex(digest: &[u8]) -> String {
-    let mut text = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        text.push_str(&format!("{byte:02x}"));
-    }
-    text
-}
 
 /// Extracts a `.deb`'s `data.tar` member into an ongoing extraction.
 ///
@@ -154,7 +64,7 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     // member ends instead of running on into the container's next header.
     let mut member = deb.take(size);
     let head = compress::sniff_head(&mut member)
-        .map_err(|err| io_error("reading the data member of", Path::new(package), err))?;
+        .map_err(|err| ProvisionError::io("reading the data member of", Path::new(package), err))?;
     let decoded = compress::decompress(&head, member)?;
     let mut archive = TarReader::new(decoded);
     extraction.extract(&mut archive, on_entry)
@@ -186,7 +96,9 @@ fn seek_to_member<R: Read + Seek>(
     limit: Option<u64>,
     bad: &dyn Fn(String) -> ProvisionError,
 ) -> Result<u64, ProvisionError> {
-    let io = |err: io::Error| io_error("reading a member of the package", Path::new(member), err);
+    let io = |err: io::Error| {
+        ProvisionError::io("reading a member of the package", Path::new(member), err)
+    };
 
     // The end offset bounds every member size, so a header claiming more than
     // the file holds is refused before anything is read on its word.
@@ -271,7 +183,7 @@ pub(crate) fn read_control_from<R: Read + Seek>(deb: &mut R) -> Result<String, P
     )?;
     let mut member = vec![0u8; size as usize];
     deb.read_exact(&mut member).map_err(|err| {
-        io_error(
+        ProvisionError::io(
             "reading the control member of the package",
             Path::new("control.tar"),
             err,
@@ -284,7 +196,7 @@ pub(crate) fn read_control_from<R: Read + Seek>(deb: &mut R) -> Result<String, P
 fn control_from_tar(member: &[u8]) -> Result<String, ProvisionError> {
     let mut cursor = Cursor::new(member);
     let head = compress::sniff_head(&mut cursor).map_err(|err| {
-        io_error(
+        ProvisionError::io(
             "reading the control member of the package",
             Path::new("control.tar"),
             err,
@@ -365,14 +277,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sha256_of_empty_input() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
     /// Seeks to `member`, reporting the reason rather than a typed error, and
     /// returns it with the bytes the member holds.
     fn member_of(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
@@ -433,39 +337,12 @@ mod tests {
         assert!(reason.contains("runs past the archive"), "{reason}");
     }
 
-    /// Writes an octal header field: digits padded to the field width, NUL
-    /// terminated, as a ustar header carries them.
-    fn octal(field: &mut [u8], value: u64) {
-        let width = field.len() - 1;
-        field[..width].copy_from_slice(format!("{value:0width$o}").as_bytes());
-        field[width] = 0;
-    }
-
     /// A single-entry uncompressed tar holding `./control`, the shape of a
     /// `.deb`'s control member once decompressed.
     fn control_tar(body: &[u8]) -> Vec<u8> {
-        let mut header = [0u8; 512];
-        header[..b"./control".len()].copy_from_slice(b"./control");
-        octal(&mut header[100..108], 0o644);
-        octal(&mut header[108..116], 0);
-        octal(&mut header[116..124], 0);
-        octal(&mut header[124..136], body.len() as u64);
-        octal(&mut header[136..148], 0);
-        header[156] = b'0';
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-
-        // The checksum is taken over the header with its own field blanked.
-        header[148..156].copy_from_slice(b"        ");
-        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
-        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-
-        let mut tar = header.to_vec();
-        tar.extend_from_slice(body);
-        tar.resize(tar.len().div_ceil(512) * 512, 0);
-        // The two zero blocks that terminate the archive.
-        tar.extend_from_slice(&[0u8; 1024]);
-        tar
+        ferroday_cage_testkit::tar::Tar::new()
+            .file("./control", 0o644, body)
+            .finish()
     }
 
     /// A `.deb` whose data member is `data_size` bytes, with its members in the
@@ -567,21 +444,5 @@ mod tests {
         let err = read_control_from(&mut Cursor::new(&archive))
             .expect_err("an implausible control member is refused");
         assert!(err.to_string().contains("implausibly large"), "{err}");
-    }
-
-    #[test]
-    fn a_streamed_digest_matches_the_buffered_one() {
-        // The streaming digest spans several chunks, so the chunk boundaries
-        // are exercised rather than assumed away by a small input.
-        let bytes: Vec<u8> = (0..CHUNK * 3 + 17).map(|i| (i % 251) as u8).collect();
-        let (digest, size) =
-            sha256_stream(&mut Cursor::new(&bytes)).expect("the stream is digested");
-        assert_eq!(digest, sha256_hex(&bytes));
-        assert_eq!(size, bytes.len() as u64);
-
-        // An empty stream is the empty digest, not a failure.
-        let (digest, size) = sha256_stream(&mut Cursor::new(Vec::new())).expect("empty digests");
-        assert_eq!(digest, sha256_hex(b""));
-        assert_eq!(size, 0);
     }
 }

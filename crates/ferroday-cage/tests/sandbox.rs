@@ -129,8 +129,8 @@ fn a_nonexistent_rootfs_is_a_config_error() {
         .build()
         .unwrap_err();
     match err {
-        Error::Config(ConfigError::RootfsUnusable { errno, .. }) => {
-            assert_eq!(errno, Errno::NOENT.raw_os_error());
+        Error::Config(ConfigError::RootfsUnusable { source, .. }) => {
+            assert_eq!(source.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
         }
         other => panic!("expected RootfsUnusable, got {other:?}"),
     }
@@ -151,12 +151,12 @@ fn a_missing_command_is_a_typed_exec_error() {
     match err {
         Error::Setup {
             step,
-            errno,
+            ref source,
             ref detail,
             ..
         } => {
             assert_eq!(step, SetupStep::Exec);
-            assert_eq!(errno, Errno::NOENT.raw_os_error());
+            assert_eq!(source.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
             // The command that could not be executed is named, so a typo in
             // the path appears in the message reporting it.
             assert_eq!(detail.as_deref(), Some("/does/not/exist"));
@@ -205,12 +205,12 @@ fn path_lookup_of_an_unresolvable_command_is_a_typed_exec_error() {
     match err {
         Error::Setup {
             step,
-            errno,
+            ref source,
             ref detail,
             ..
         } => {
             assert_eq!(step, SetupStep::Exec);
-            assert_eq!(errno, Errno::NOENT.raw_os_error());
+            assert_eq!(source.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
             // A search reports the bare name and every candidate it tried, so
             // the message shows which PATH directories were consulted.
             let detail = detail.as_deref().expect("the exec step names its subject");
@@ -263,9 +263,11 @@ fn path_lookup_reports_a_denial_ahead_of_a_later_miss() {
     // execvp's rule: the EACCES from the first directory outranks the ENOENT
     // from the second. "Found it, may not run it" is the useful diagnosis.
     match search("blocked").unwrap_err() {
-        Error::Setup { step, errno, .. } => {
+        Error::Setup {
+            step, ref source, ..
+        } => {
             assert_eq!(step, SetupStep::Exec);
-            assert_eq!(errno, Errno::ACCESS.raw_os_error());
+            assert_eq!(source.raw_os_error(), Some(Errno::ACCESS.raw_os_error()));
         }
         other => panic!("expected a Setup error at the exec step, got {other:?}"),
     }
@@ -284,9 +286,11 @@ fn a_non_executable_command_is_a_typed_exec_error() {
         .run()
         .unwrap_err();
     match err {
-        Error::Setup { step, errno, .. } => {
+        Error::Setup {
+            step, ref source, ..
+        } => {
             assert_eq!(step, SetupStep::Exec);
-            assert_eq!(errno, Errno::ACCESS.raw_os_error());
+            assert_eq!(source.raw_os_error(), Some(Errno::ACCESS.raw_os_error()));
         }
         other => panic!("expected a Setup error at the exec step, got {other:?}"),
     }
@@ -1112,9 +1116,11 @@ fn a_missing_working_directory_is_a_typed_error() {
         .run()
         .unwrap_err();
     match err {
-        Error::Setup { step, errno, .. } => {
+        Error::Setup {
+            step, ref source, ..
+        } => {
             assert_eq!(step, SetupStep::ChdirWorkdir);
-            assert_eq!(errno, Errno::NOENT.raw_os_error());
+            assert_eq!(source.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
         }
         other => panic!("expected a Setup error at the workdir step, got {other:?}"),
     }

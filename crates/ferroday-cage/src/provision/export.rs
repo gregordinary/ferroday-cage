@@ -27,7 +27,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::identity::compose_child_map;
-use super::{Delegate, ProvisionError, io_error};
+use super::{Delegate, ProvisionError};
 use crate::mechanism::{
     ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
     StartError, kill_export, start_export,
@@ -211,7 +211,7 @@ fn export_inner<W: Write>(
     clamp_mtime: Option<i64>,
 ) -> Result<(), ProvisionError> {
     let rootfs_c = CString::new(rootfs.as_os_str().as_bytes()).map_err(|_| {
-        io_error(
+        ProvisionError::io(
             "exporting",
             rootfs,
             io::Error::from(io::ErrorKind::InvalidInput),
@@ -227,7 +227,7 @@ fn export_inner<W: Write>(
     let child = match start_export(&rootfs_c, source.child_map()) {
         Ok(child) => child,
         Err(StartError::Spawn(errno)) => {
-            return Err(io_error("exporting", rootfs, errno.into()));
+            return Err(ProvisionError::io("exporting", rootfs, errno.into()));
         }
         Err(StartError::Map(err)) => {
             return Err(ProvisionError::ExportUnprivileged {
@@ -257,13 +257,13 @@ fn drive<W: Write>(
 ) -> Result<(), ProvisionError> {
     // The stream is duplicated so it can be owned by a buffered reader while the
     // child retains its own descriptor for reaping.
-    let dup =
-        rustix::io::dup(stream).map_err(|errno| io_error("exporting", rootfs, errno.into()))?;
+    let dup = rustix::io::dup(stream)
+        .map_err(|errno| ProvisionError::io("exporting", rootfs, errno.into()))?;
     let mut reader = BufReader::new(std::fs::File::from(dup));
     let mut tar = TarWriter::new(BufWriter::new(writer), clamp_mtime);
 
-    let read_err = |e: io::Error| io_error("reading the exported tree", rootfs, e);
-    let write_err = |e: io::Error| io_error("writing the archive", rootfs, e);
+    let read_err = |e: io::Error| ProvisionError::io("reading the exported tree", rootfs, e);
+    let write_err = |e: io::Error| ProvisionError::io("writing the archive", rootfs, e);
 
     loop {
         let tag = match read_u8(&mut reader) {
@@ -299,7 +299,7 @@ fn drive<W: Write>(
                         format!("unexpected export failure step {step}"),
                     )));
                 };
-                return Err(io_error(
+                return Err(ProvisionError::io(
                     step.describe(),
                     rootfs,
                     io::Error::from_raw_os_error(errno),
@@ -746,7 +746,12 @@ fn read_i64(reader: &mut impl Read) -> io::Result<i64> {
 }
 
 /// Reads a `u16`-length-prefixed byte string.
-fn read_bytes(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+///
+/// Named for the shape rather than for this side of the pipe, so it matches the
+/// child's `frame::read_bytes_u16` that wrote it. The `Read` bound is what
+/// keeps these separate from the child's descriptor-based readers: the archive
+/// writer is fed from a reader in the tests as well as from the child's pipe.
+fn read_bytes_u16(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     let len = read_u16(reader)? as usize;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
@@ -760,7 +765,7 @@ fn read_xattrs(reader: &mut impl Read) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let count = read_u16(reader)? as usize;
     let mut xattrs = Vec::with_capacity(count);
     for _ in 0..count {
-        let name = read_bytes(reader)?;
+        let name = read_bytes_u16(reader)?;
         let value_len = read_u32(reader)? as usize;
         let mut value = vec![0u8; value_len];
         reader.read_exact(&mut value)?;
@@ -772,7 +777,7 @@ fn read_xattrs(reader: &mut impl Read) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
 
 /// Reads a directory or file metadata frame (the tag already consumed).
 fn read_meta(reader: &mut impl Read, is_file: bool) -> io::Result<Meta> {
-    let name = read_bytes(reader)?;
+    let name = read_bytes_u16(reader)?;
     let mode = read_u32(reader)?;
     let uid = read_u32(reader)?;
     let gid = read_u32(reader)?;
@@ -805,12 +810,12 @@ fn read_meta(reader: &mut impl Read, is_file: bool) -> io::Result<Meta> {
 
 /// Reads a symlink metadata frame (the tag already consumed).
 fn read_symlink(reader: &mut impl Read) -> io::Result<Meta> {
-    let name = read_bytes(reader)?;
+    let name = read_bytes_u16(reader)?;
     let mode = read_u32(reader)?;
     let uid = read_u32(reader)?;
     let gid = read_u32(reader)?;
     let mtime = read_i64(reader)?;
-    let link_target = read_bytes(reader)?;
+    let link_target = read_bytes_u16(reader)?;
     Ok(Meta {
         name,
         mode,

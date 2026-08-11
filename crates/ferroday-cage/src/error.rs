@@ -1,330 +1,144 @@
 //! Typed errors for sandbox configuration, spawn, setup, and wait failures.
 
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
 
 use crate::host::UsernsBlocker;
 use crate::spec::command_has_slash;
+use crate::wire::wire_enum;
 
-/// A step of the sandbox setup sequence, performed in the child process.
-///
-/// When a setup step fails inside the sandbox process, the failure is reported
-/// to the caller as [`Error::Setup`], naming the step and the `errno` the
-/// kernel returned.
-///
-/// The explicit discriminants are the wire encoding of the setup-error pipe,
-/// which both ends of a single build write and read. They are an
-/// implementation detail: a step inserted in a later release renumbers the
-/// ones after it, and no discriminant is guaranteed to denote the same step
-/// across versions. Do not persist, transmit, or compare them — match on the
-/// variant, and use [`Display`](std::fmt::Display) for a human-readable name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-#[repr(u32)]
-pub enum SetupStep {
-    /// Unshare into the new namespaces.
-    Unshare = 1,
-    /// Write `deny` to `/proc/self/setgroups`.
-    DenySetgroups = 2,
-    /// Write the single-identity gid map.
-    WriteGidMap = 3,
-    /// Write the single-identity uid map.
-    WriteUidMap = 4,
-    /// Set the sandbox hostname.
-    SetHostname = 5,
-    /// Bring up the loopback interface in the isolated network namespace.
-    ConfigureLoopback = 6,
-    /// Make mount propagation recursively private.
-    PrivatizeMounts = 7,
-    /// Bind the rootfs onto itself so it becomes a mount point.
-    BindRootfs = 8,
-    /// Enter the rootfs mount point.
-    EnterRootfs = 9,
-    /// Create a missing mount target inside the rootfs.
-    CreateMountTarget = 10,
-    /// Open a mount target inside the rootfs.
-    OpenMountTarget = 11,
-    /// Mount a tmpfs.
-    MountTmpfs = 12,
-    /// Mount a devpts instance.
-    MountDevpts = 13,
-    /// Bind-mount a host path into the rootfs.
-    BindMount = 14,
-    /// Remount a bind mount read-only.
-    RemountReadOnly = 15,
-    /// Create a symlink inside the rootfs.
-    CreateSymlink = 16,
-    /// Pivot the root into the rootfs.
-    PivotRoot = 17,
-    /// Lazily detach the old root mount.
-    DetachOldRoot = 18,
-    /// Change directory to the new root.
-    ChdirNewRoot = 19,
-    /// Change to the configured working directory.
-    ChdirWorkdir = 20,
-    /// Execute the command.
-    Exec = 21,
-    /// Reset the inherited signal dispositions and mask.
-    ResetSignals = 22,
-    /// Fork the sandbox init process.
-    ForkInit = 23,
-    /// Send the supervisor's pidfd back to the caller.
-    SendPidfd = 24,
-    /// Mount a fresh procfs instance.
-    MountProc = 25,
-    /// Perform a raw mount.
-    MountRaw = 26,
-    /// Sweep inherited file descriptors.
-    SweepFds = 27,
-    /// Fork the command process.
-    ForkCommand = 28,
-    /// Open a pidfd for the command process.
-    WatchCommand = 29,
-    /// Wire the command's standard streams.
-    WireStdio = 30,
-    /// Drop or reduce the command's capabilities.
-    DropCapabilities = 31,
-    /// Set the no-new-privileges flag before restricting the command.
-    SetNoNewPrivs = 32,
-    /// Create the Landlock ruleset.
-    LandlockCreateRuleset = 33,
-    /// Add a rule to the Landlock ruleset.
-    LandlockAddRule = 34,
-    /// Enforce the Landlock ruleset on the command.
-    LandlockRestrictSelf = 35,
-    /// Install the seccomp filter.
-    InstallSeccomp = 36,
-    /// Wait at the launch gate for the caller to attach a network stack and
-    /// release the command.
-    AwaitNetworkStack = 37,
-    /// Wait for the caller's delegate to establish the identity map.
-    AwaitIdentityMap = 38,
-    /// Lock the securebits that preserve capabilities across the identity
-    /// switch.
-    SetSecurebits = 39,
-    /// Set the command's supplementary groups.
-    SetGroups = 40,
-    /// Switch to the command's gid.
-    SetGid = 41,
-    /// Switch to the command's uid.
-    SetUid = 42,
-    /// Mount the overlay that roots an overlay-rooted cage.
-    MountOverlayRoot = 43,
-    /// Apply a resource limit to the command.
-    SetRlimit = 44,
-    /// Start the sandbox's own session, detaching it from the caller's
-    /// controlling terminal.
-    NewSession = 45,
-    /// Make the launch's pseudoterminal the controlling terminal of the
-    /// sandbox's session.
-    SetControllingTerminal = 46,
-    /// Enter the nested user namespace that locks the sandbox's mount flags.
-    NestedUnshare = 47,
-    /// Write `deny` to the nested user namespace's `setgroups`.
-    NestedDenySetgroups = 48,
-    /// Write the nested user namespace's gid map.
-    NestedWriteGidMap = 49,
-    /// Write the nested user namespace's uid map.
-    NestedWriteUidMap = 50,
-    /// Wait for the sandbox's own delegate to establish the nested user
-    /// namespace's identity map.
-    AwaitNestedIdentityMap = 51,
-    /// Open the procfs the nested user namespace's identity map is
-    /// established through.
-    OpenSandboxProcfs = 52,
-    /// Create or operate the gate the nested identity map is established
-    /// across.
-    NestedMapGate = 53,
-    /// Mark the sandbox's root mount `nosuid`.
-    NosuidRootfs = 54,
-}
-
-impl SetupStep {
-    /// Every step, in wire order. Used by the wire-protocol tests.
-    #[cfg(test)]
-    pub(crate) const ALL: [SetupStep; 54] = [
-        SetupStep::Unshare,
-        SetupStep::DenySetgroups,
-        SetupStep::WriteGidMap,
-        SetupStep::WriteUidMap,
-        SetupStep::SetHostname,
-        SetupStep::ConfigureLoopback,
-        SetupStep::PrivatizeMounts,
-        SetupStep::BindRootfs,
-        SetupStep::EnterRootfs,
-        SetupStep::CreateMountTarget,
-        SetupStep::OpenMountTarget,
-        SetupStep::MountTmpfs,
-        SetupStep::MountDevpts,
-        SetupStep::BindMount,
-        SetupStep::RemountReadOnly,
-        SetupStep::CreateSymlink,
-        SetupStep::PivotRoot,
-        SetupStep::DetachOldRoot,
-        SetupStep::ChdirNewRoot,
-        SetupStep::ChdirWorkdir,
-        SetupStep::Exec,
-        SetupStep::ResetSignals,
-        SetupStep::ForkInit,
-        SetupStep::SendPidfd,
-        SetupStep::MountProc,
-        SetupStep::MountRaw,
-        SetupStep::SweepFds,
-        SetupStep::ForkCommand,
-        SetupStep::WatchCommand,
-        SetupStep::WireStdio,
-        SetupStep::DropCapabilities,
-        SetupStep::SetNoNewPrivs,
-        SetupStep::LandlockCreateRuleset,
-        SetupStep::LandlockAddRule,
-        SetupStep::LandlockRestrictSelf,
-        SetupStep::InstallSeccomp,
-        SetupStep::AwaitNetworkStack,
-        SetupStep::AwaitIdentityMap,
-        SetupStep::SetSecurebits,
-        SetupStep::SetGroups,
-        SetupStep::SetGid,
-        SetupStep::SetUid,
-        SetupStep::MountOverlayRoot,
-        SetupStep::SetRlimit,
-        SetupStep::NewSession,
-        SetupStep::SetControllingTerminal,
-        SetupStep::NestedUnshare,
-        SetupStep::NestedDenySetgroups,
-        SetupStep::NestedWriteGidMap,
-        SetupStep::NestedWriteUidMap,
-        SetupStep::AwaitNestedIdentityMap,
-        SetupStep::OpenSandboxProcfs,
-        SetupStep::NestedMapGate,
-        SetupStep::NosuidRootfs,
-    ];
-
-    /// Decodes a step from its setup-error-pipe wire value.
-    pub(crate) fn from_wire(value: u32) -> Option<SetupStep> {
-        Some(match value {
-            1 => SetupStep::Unshare,
-            2 => SetupStep::DenySetgroups,
-            3 => SetupStep::WriteGidMap,
-            4 => SetupStep::WriteUidMap,
-            5 => SetupStep::SetHostname,
-            6 => SetupStep::ConfigureLoopback,
-            7 => SetupStep::PrivatizeMounts,
-            8 => SetupStep::BindRootfs,
-            9 => SetupStep::EnterRootfs,
-            10 => SetupStep::CreateMountTarget,
-            11 => SetupStep::OpenMountTarget,
-            12 => SetupStep::MountTmpfs,
-            13 => SetupStep::MountDevpts,
-            14 => SetupStep::BindMount,
-            15 => SetupStep::RemountReadOnly,
-            16 => SetupStep::CreateSymlink,
-            17 => SetupStep::PivotRoot,
-            18 => SetupStep::DetachOldRoot,
-            19 => SetupStep::ChdirNewRoot,
-            20 => SetupStep::ChdirWorkdir,
-            21 => SetupStep::Exec,
-            22 => SetupStep::ResetSignals,
-            23 => SetupStep::ForkInit,
-            24 => SetupStep::SendPidfd,
-            25 => SetupStep::MountProc,
-            26 => SetupStep::MountRaw,
-            27 => SetupStep::SweepFds,
-            28 => SetupStep::ForkCommand,
-            29 => SetupStep::WatchCommand,
-            30 => SetupStep::WireStdio,
-            31 => SetupStep::DropCapabilities,
-            32 => SetupStep::SetNoNewPrivs,
-            33 => SetupStep::LandlockCreateRuleset,
-            34 => SetupStep::LandlockAddRule,
-            35 => SetupStep::LandlockRestrictSelf,
-            36 => SetupStep::InstallSeccomp,
-            37 => SetupStep::AwaitNetworkStack,
-            38 => SetupStep::AwaitIdentityMap,
-            39 => SetupStep::SetSecurebits,
-            40 => SetupStep::SetGroups,
-            41 => SetupStep::SetGid,
-            42 => SetupStep::SetUid,
-            43 => SetupStep::MountOverlayRoot,
-            44 => SetupStep::SetRlimit,
-            45 => SetupStep::NewSession,
-            46 => SetupStep::SetControllingTerminal,
-            47 => SetupStep::NestedUnshare,
-            48 => SetupStep::NestedDenySetgroups,
-            49 => SetupStep::NestedWriteGidMap,
-            50 => SetupStep::NestedWriteUidMap,
-            51 => SetupStep::AwaitNestedIdentityMap,
-            52 => SetupStep::OpenSandboxProcfs,
-            53 => SetupStep::NestedMapGate,
-            54 => SetupStep::NosuidRootfs,
-            _ => return None,
-        })
-    }
-}
-
-impl fmt::Display for SetupStep {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            SetupStep::Unshare => "unsharing the namespaces",
-            SetupStep::DenySetgroups => "denying setgroups",
-            SetupStep::WriteGidMap => "writing the gid map",
-            SetupStep::WriteUidMap => "writing the uid map",
-            SetupStep::SetHostname => "setting the hostname",
-            SetupStep::ConfigureLoopback => "bringing up the loopback interface",
-            SetupStep::PrivatizeMounts => "making mount propagation private",
-            SetupStep::BindRootfs => "binding the rootfs onto itself",
-            SetupStep::EnterRootfs => "entering the rootfs mount point",
-            SetupStep::CreateMountTarget => "creating a mount target",
-            SetupStep::OpenMountTarget => "opening a mount target",
-            SetupStep::MountTmpfs => "mounting a tmpfs",
-            SetupStep::MountDevpts => "mounting devpts",
-            SetupStep::BindMount => "bind-mounting",
-            SetupStep::RemountReadOnly => "remounting a bind mount read-only",
-            SetupStep::CreateSymlink => "creating a symlink",
-            SetupStep::PivotRoot => "pivoting into the rootfs",
-            SetupStep::DetachOldRoot => "detaching the old root",
-            SetupStep::ChdirNewRoot => "changing to the new root directory",
-            SetupStep::ChdirWorkdir => "changing to the working directory",
-            SetupStep::Exec => "executing the command",
-            SetupStep::ResetSignals => "resetting the inherited signal state",
-            SetupStep::ForkInit => "forking the sandbox init process",
-            SetupStep::SendPidfd => "publishing the supervisor pidfd",
-            SetupStep::MountProc => "mounting a fresh procfs",
-            SetupStep::MountRaw => "performing a raw mount",
-            SetupStep::SweepFds => "sweeping inherited file descriptors",
-            SetupStep::ForkCommand => "forking the command process",
-            SetupStep::WatchCommand => "opening a pidfd for the command process",
-            SetupStep::WireStdio => "wiring the command's standard streams",
-            SetupStep::DropCapabilities => "dropping capabilities",
-            SetupStep::SetNoNewPrivs => "setting the no-new-privileges flag",
-            SetupStep::LandlockCreateRuleset => "creating the Landlock ruleset",
-            SetupStep::LandlockAddRule => "adding a Landlock rule",
-            SetupStep::LandlockRestrictSelf => "enforcing the Landlock ruleset",
-            SetupStep::InstallSeccomp => "installing the seccomp filter",
-            SetupStep::AwaitNetworkStack => "waiting for the network stack to attach",
-            SetupStep::AwaitIdentityMap => "waiting for the identity map to be established",
-            SetupStep::SetSecurebits => "locking the securebits for the identity switch",
-            SetupStep::SetGroups => "setting the supplementary groups",
-            SetupStep::SetGid => "switching to the command gid",
-            SetupStep::SetUid => "switching to the command uid",
-            SetupStep::MountOverlayRoot => "mounting the overlay root",
-            SetupStep::SetRlimit => "applying a resource limit",
-            SetupStep::NewSession => "starting the sandbox's own session",
-            SetupStep::SetControllingTerminal => {
-                "making the sandbox's pseudoterminal its controlling terminal"
-            }
-            SetupStep::NestedUnshare => "entering the nested user namespace",
-            SetupStep::NestedDenySetgroups => "denying setgroups in the nested user namespace",
-            SetupStep::NestedWriteGidMap => "writing the nested user namespace's gid map",
-            SetupStep::NestedWriteUidMap => "writing the nested user namespace's uid map",
-            SetupStep::AwaitNestedIdentityMap => {
-                "waiting for the nested identity map to be established"
-            }
-            SetupStep::OpenSandboxProcfs => {
-                "opening the procfs the nested identity map is established through"
-            }
-            SetupStep::NestedMapGate => "operating the nested identity-map gate",
-            SetupStep::NosuidRootfs => "marking the root mount nosuid",
-        })
+wire_enum! {
+    /// A step of the sandbox setup sequence, performed in the child process.
+    ///
+    /// When a setup step fails inside the sandbox process, the failure is
+    /// reported to the caller as [`Error::Setup`], naming the step and the
+    /// `errno` the kernel returned.
+    ///
+    /// The explicit discriminants are the wire encoding of the setup-error
+    /// pipe, which both ends of a single build write and read. They are an
+    /// implementation detail: a step inserted in a later release renumbers the
+    /// ones after it, and no discriminant is guaranteed to denote the same step
+    /// across versions. Do not persist, transmit, or compare them — match on
+    /// the variant, and use [`Display`](std::fmt::Display) for a human-readable
+    /// name.
+    #[non_exhaustive]
+    pub enum SetupStep {
+        /// Unshare into the new namespaces.
+        Unshare = 1 => "unsharing the namespaces",
+        /// Write `deny` to `/proc/self/setgroups`.
+        DenySetgroups = 2 => "denying setgroups",
+        /// Write the single-identity gid map.
+        WriteGidMap = 3 => "writing the gid map",
+        /// Write the single-identity uid map.
+        WriteUidMap = 4 => "writing the uid map",
+        /// Set the sandbox hostname.
+        SetHostname = 5 => "setting the hostname",
+        /// Bring up the loopback interface in the isolated network namespace.
+        ConfigureLoopback = 6 => "bringing up the loopback interface",
+        /// Make mount propagation recursively private.
+        PrivatizeMounts = 7 => "making mount propagation private",
+        /// Bind the rootfs onto itself so it becomes a mount point.
+        BindRootfs = 8 => "binding the rootfs onto itself",
+        /// Enter the rootfs mount point.
+        EnterRootfs = 9 => "entering the rootfs mount point",
+        /// Create a missing mount target inside the rootfs.
+        CreateMountTarget = 10 => "creating a mount target",
+        /// Open a mount target inside the rootfs.
+        OpenMountTarget = 11 => "opening a mount target",
+        /// Mount a tmpfs.
+        MountTmpfs = 12 => "mounting a tmpfs",
+        /// Mount a devpts instance.
+        MountDevpts = 13 => "mounting devpts",
+        /// Bind-mount a host path into the rootfs.
+        BindMount = 14 => "bind-mounting",
+        /// Remount a bind mount read-only.
+        RemountReadOnly = 15 => "remounting a bind mount read-only",
+        /// Create a symlink inside the rootfs.
+        CreateSymlink = 16 => "creating a symlink",
+        /// Pivot the root into the rootfs.
+        PivotRoot = 17 => "pivoting into the rootfs",
+        /// Lazily detach the old root mount.
+        DetachOldRoot = 18 => "detaching the old root",
+        /// Change directory to the new root.
+        ChdirNewRoot = 19 => "changing to the new root directory",
+        /// Change to the configured working directory.
+        ChdirWorkdir = 20 => "changing to the working directory",
+        /// Execute the command.
+        Exec = 21 => "executing the command",
+        /// Reset the inherited signal dispositions and mask.
+        ResetSignals = 22 => "resetting the inherited signal state",
+        /// Fork the sandbox init process.
+        ForkInit = 23 => "forking the sandbox init process",
+        /// Send the supervisor's pidfd back to the caller.
+        SendPidfd = 24 => "publishing the supervisor pidfd",
+        /// Mount a fresh procfs instance.
+        MountProc = 25 => "mounting a fresh procfs",
+        /// Perform a raw mount.
+        MountRaw = 26 => "performing a raw mount",
+        /// Sweep inherited file descriptors.
+        SweepFds = 27 => "sweeping inherited file descriptors",
+        /// Fork the command process.
+        ForkCommand = 28 => "forking the command process",
+        /// Open a pidfd for the command process.
+        WatchCommand = 29 => "opening a pidfd for the command process",
+        /// Wire the command's standard streams.
+        WireStdio = 30 => "wiring the command's standard streams",
+        /// Drop or reduce the command's capabilities.
+        DropCapabilities = 31 => "dropping capabilities",
+        /// Set the no-new-privileges flag before restricting the command.
+        SetNoNewPrivs = 32 => "setting the no-new-privileges flag",
+        /// Create the Landlock ruleset.
+        LandlockCreateRuleset = 33 => "creating the Landlock ruleset",
+        /// Add a rule to the Landlock ruleset.
+        LandlockAddRule = 34 => "adding a Landlock rule",
+        /// Enforce the Landlock ruleset on the command.
+        LandlockRestrictSelf = 35 => "enforcing the Landlock ruleset",
+        /// Install the seccomp filter.
+        InstallSeccomp = 36 => "installing the seccomp filter",
+        /// Wait at the launch gate for the caller to attach a network stack and
+        /// release the command.
+        AwaitNetworkStack = 37 => "waiting for the network stack to attach",
+        /// Wait for the caller's delegate to establish the identity map.
+        AwaitIdentityMap = 38 => "waiting for the identity map to be established",
+        /// Lock the securebits that preserve capabilities across the identity
+        /// switch.
+        SetSecurebits = 39 => "locking the securebits for the identity switch",
+        /// Set the command's supplementary groups.
+        SetGroups = 40 => "setting the supplementary groups",
+        /// Switch to the command's gid.
+        SetGid = 41 => "switching to the command gid",
+        /// Switch to the command's uid.
+        SetUid = 42 => "switching to the command uid",
+        /// Mount the overlay that roots an overlay-rooted cage.
+        MountOverlayRoot = 43 => "mounting the overlay root",
+        /// Apply a resource limit to the command.
+        SetRlimit = 44 => "applying a resource limit",
+        /// Start the sandbox's own session, detaching it from the caller's
+        /// controlling terminal.
+        NewSession = 45 => "starting the sandbox's own session",
+        /// Make the launch's pseudoterminal the controlling terminal of the
+        /// sandbox's session.
+        SetControllingTerminal = 46 => "making the sandbox's pseudoterminal its controlling terminal",
+        /// Enter the nested user namespace that locks the sandbox's mount flags.
+        NestedUnshare = 47 => "entering the nested user namespace",
+        /// Write `deny` to the nested user namespace's `setgroups`.
+        NestedDenySetgroups = 48 => "denying setgroups in the nested user namespace",
+        /// Write the nested user namespace's gid map.
+        NestedWriteGidMap = 49 => "writing the nested user namespace's gid map",
+        /// Write the nested user namespace's uid map.
+        NestedWriteUidMap = 50 => "writing the nested user namespace's uid map",
+        /// Wait for the sandbox's own delegate to establish the nested user
+        /// namespace's identity map.
+        AwaitNestedIdentityMap = 51 => "waiting for the nested identity map to be established",
+        /// Open the procfs the nested user namespace's identity map is
+        /// established through.
+        OpenSandboxProcfs = 52 => "opening the procfs the nested identity map is established through",
+        /// Create or operate the gate the nested identity map is established
+        /// across.
+        NestedMapGate = 53 => "operating the nested identity-map gate",
+        /// Mark the sandbox's root mount `nosuid`.
+        NosuidRootfs = 54 => "marking the root mount nosuid",
     }
 }
 
@@ -381,8 +195,8 @@ pub enum ConfigError {
     RootfsUnusable {
         /// The rootfs path as it was given to the builder.
         path: PathBuf,
-        /// The raw OS error encountered while resolving or opening it.
-        errno: i32,
+        /// The error encountered while resolving or opening it.
+        source: io::Error,
     },
     /// The rootfs resolves to the host root directory.
     RootfsIsHostRoot,
@@ -418,8 +232,8 @@ pub enum ConfigError {
     BindSourceUnusable {
         /// The source path as it was given to the builder.
         path: PathBuf,
-        /// The raw OS error encountered while resolving it.
-        errno: i32,
+        /// The error encountered while resolving it.
+        source: io::Error,
     },
     /// A mount target is not a normal absolute path inside the rootfs.
     ///
@@ -692,8 +506,8 @@ pub enum ConfigError {
         layer: OverlayLayer,
         /// The directory that could not be prepared.
         path: PathBuf,
-        /// The raw OS error the preparation failed with.
-        errno: i32,
+        /// The error the preparation failed with.
+        source: io::Error,
     },
     /// An overlay layer directory the library would have created was already
     /// there, and is not a directory the calling user owns.
@@ -761,12 +575,9 @@ impl fmt::Display for ConfigError {
                 "a rootfs and an overlay root are both configured, but exactly one root is \
                  in force; drop one of the two",
             ),
-            ConfigError::RootfsUnusable { path, errno } => write!(
-                f,
-                "cannot use {} as the rootfs: {}",
-                path.display(),
-                std::io::Error::from_raw_os_error(*errno),
-            ),
+            ConfigError::RootfsUnusable { path, source } => {
+                write!(f, "cannot use {} as the rootfs: {}", path.display(), source,)
+            }
             ConfigError::RootfsIsHostRoot => {
                 f.write_str("the host root directory cannot be the rootfs")
             }
@@ -792,11 +603,11 @@ impl fmt::Display for ConfigError {
                 f,
                 "path lookup has nothing to search: PATH {path:?} holds no absolute directory",
             ),
-            ConfigError::BindSourceUnusable { path, errno } => write!(
+            ConfigError::BindSourceUnusable { path, source } => write!(
                 f,
                 "cannot use {} as a bind-mount source: {}",
                 path.display(),
-                std::io::Error::from_raw_os_error(*errno),
+                source,
             ),
             ConfigError::MountTargetInvalid { path } => write!(
                 f,
@@ -925,11 +736,15 @@ impl fmt::Display for ConfigError {
             ConfigError::OverlayUpperMissing => {
                 f.write_str("the overlay root names no upper layer for its writes")
             }
-            ConfigError::OverlayDirUnusable { layer, path, errno } => write!(
+            ConfigError::OverlayDirUnusable {
+                layer,
+                path,
+                source,
+            } => write!(
                 f,
                 "cannot use {} as the overlay {layer} directory: {}",
                 path.display(),
-                std::io::Error::from_raw_os_error(*errno),
+                source,
             ),
             ConfigError::OverlayDirUnowned { layer, path } => write!(
                 f,
@@ -960,7 +775,21 @@ impl fmt::Display for ConfigError {
     }
 }
 
-impl std::error::Error for ConfigError {}
+impl std::error::Error for ConfigError {
+    /// The OS failure underneath, for the three refusals that have one.
+    ///
+    /// Every other variant is a request the builder refused on its own terms —
+    /// a contradiction, a missing field, a path that is not the shape it has to
+    /// be — where nothing failed and there is nothing to return.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::RootfsUnusable { source, .. }
+            | ConfigError::BindSourceUnusable { source, .. }
+            | ConfigError::OverlayDirUnusable { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// An error from the library itself.
 ///
@@ -986,8 +815,8 @@ pub enum Error {
         /// The host configuration identified as blocking user namespaces,
         /// when one could be determined.
         blocker: Option<UsernsBlocker>,
-        /// The raw OS error the kernel returned for namespace creation.
-        errno: i32,
+        /// The error the kernel returned for namespace creation.
+        source: io::Error,
     },
     /// The host's user-namespace budget is exhausted, so the command could not
     /// enter the nested user namespace that locks the sandbox's mount flags.
@@ -1006,8 +835,8 @@ pub enum Error {
     Setup {
         /// The step that failed.
         step: SetupStep,
-        /// The raw OS error the step failed with.
-        errno: i32,
+        /// The error the step failed with.
+        source: io::Error,
         /// What the step was operating on, when the step has a subject — for a
         /// mount step, the mount it was assembling; for
         /// [`Exec`](SetupStep::Exec), the command path, and for a command
@@ -1024,16 +853,15 @@ pub enum Error {
     /// The sandbox process could not be created.
     #[non_exhaustive]
     Spawn {
-        /// The raw OS error from pipe creation or fork.
-        errno: i32,
+        /// The error from pipe creation or fork.
+        source: io::Error,
     },
     /// The sandbox process outcome could not be collected.
     #[non_exhaustive]
     Wait {
-        /// The raw OS error from collecting the outcome: reading the
-        /// setup-error, status, or capture pipes, waiting on them, or the wait
-        /// itself.
-        errno: i32,
+        /// The error from collecting the outcome: reading the setup-error,
+        /// status, or capture pipes, waiting on them, or the wait itself.
+        source: io::Error,
     },
     /// The sandbox supervisor exited without reporting the command's
     /// outcome.
@@ -1050,8 +878,8 @@ pub enum Error {
     /// The sandbox could not be signaled through the handle.
     #[non_exhaustive]
     Signal {
-        /// The raw OS error from the signaling machinery.
-        errno: i32,
+        /// The error from the signaling machinery.
+        source: io::Error,
     },
     /// The identity-map delegate failed to establish the range map.
     ///
@@ -1062,8 +890,8 @@ pub enum Error {
     /// reading or setting its window size.
     #[non_exhaustive]
     Terminal {
-        /// The raw OS error the operation failed with.
-        errno: i32,
+        /// The error the operation failed with.
+        source: io::Error,
     },
     /// The host has no free pseudoterminal to allocate.
     ///
@@ -1073,6 +901,67 @@ pub enum Error {
     /// the one allocation failure that says nothing is wrong with the request:
     /// the same launch succeeds once something releases a terminal.
     TerminalsExhausted,
+}
+
+impl Error {
+    /// The exit code a launcher reports when a launch fails, following the
+    /// conventions `sh` and `timeout(1)` established.
+    ///
+    /// A caller whose whole purpose is to run one command inside a sandbox is a
+    /// launcher, and a launcher's own failures have to be distinguishable from
+    /// the command's exit codes. The conventions are:
+    ///
+    /// | Code | Meaning |
+    /// | --- | --- |
+    /// | 127 | The command does not exist. |
+    /// | 126 | The command exists but could not be executed. |
+    /// | 125 | The launcher itself failed, for any other reason. |
+    ///
+    /// The distinction between 127 and 126 comes from the errno the
+    /// [`Exec`](SetupStep::Exec) step failed with. An `ENOENT` there has two
+    /// readings — the command is absent, or its ELF interpreter is — and both
+    /// are reported as 127, since neither produced a runnable process.
+    ///
+    /// This is what the `fcage` binary returns. A caller with its own
+    /// convention is free to map [`Error`] itself; this is the answer for one
+    /// that has none, and the one that makes a consumer behave like a shell.
+    ///
+    /// 124, `timeout(1)`'s "the deadline expired", is not produced here: an
+    /// expired deadline is not an [`Error`], it is a
+    /// [`Running::wait_timeout`](crate::Running::wait_timeout) that returned no
+    /// status, so only the caller knows it happened.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::process::ExitCode;
+    ///
+    /// use ferroday_cage::Cage;
+    ///
+    /// fn launch(rootfs: &str) -> ExitCode {
+    ///     match Cage::builder().command("/bin/true").rootfs(rootfs).build() {
+    ///         Ok(_cage) => ExitCode::SUCCESS,
+    ///         Err(error) => {
+    ///             eprintln!("myapp: {error}");
+    ///             ExitCode::from(error.shell_code())
+    ///         }
+    ///     }
+    /// }
+    /// # let _ = launch;
+    /// ```
+    pub fn shell_code(&self) -> u8 {
+        match self {
+            Error::Setup {
+                step: SetupStep::Exec,
+                source,
+                ..
+            } => match source.kind() {
+                std::io::ErrorKind::NotFound => 127,
+                _ => 126,
+            },
+            _ => 125,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -1085,12 +974,12 @@ impl fmt::Display for Error {
             } => write!(f, "unprivileged user namespaces are unavailable: {blocker}"),
             Error::UsernsUnavailable {
                 blocker: None,
-                errno,
+                source,
             } => write!(
                 f,
                 "the kernel denied user namespace creation ({}); a seccomp filter or LSM \
                  policy may be blocking unprivileged user namespaces",
-                std::io::Error::from_raw_os_error(*errno),
+                source,
             ),
             Error::NestedUsernsBudgetExhausted => f.write_str(
                 "the sandbox could not enter its nested user namespace: the host's user \
@@ -1100,48 +989,36 @@ impl fmt::Display for Error {
             ),
             Error::Setup {
                 step,
-                errno,
+                source,
                 detail: Some(detail),
             } => write!(
                 f,
                 "sandbox setup failed while {step} ({detail}): {}",
-                std::io::Error::from_raw_os_error(*errno),
+                source,
             ),
             Error::Setup {
                 step,
-                errno,
+                source,
                 detail: None,
-            } => write!(
-                f,
-                "sandbox setup failed while {step}: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
-            Error::Spawn { errno } => write!(
-                f,
-                "could not spawn the sandbox process: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
-            Error::Wait { errno } => write!(
+            } => write!(f, "sandbox setup failed while {step}: {}", source,),
+            Error::Spawn { source } => {
+                write!(f, "could not spawn the sandbox process: {}", source,)
+            }
+            Error::Wait { source } => write!(
                 f,
                 "could not collect the sandbox process outcome: {}",
-                std::io::Error::from_raw_os_error(*errno),
+                source,
             ),
             Error::SupervisorLost => {
                 f.write_str("the sandbox supervisor exited without reporting the command's outcome")
             }
-            Error::Signal { errno } => write!(
-                f,
-                "could not signal the sandbox: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
+            Error::Signal { source } => write!(f, "could not signal the sandbox: {}", source,),
             Error::IdentityMap(err) => {
                 write!(f, "could not establish the identity map: {err}")
             }
-            Error::Terminal { errno } => write!(
-                f,
-                "a pseudoterminal operation failed: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
+            Error::Terminal { source } => {
+                write!(f, "a pseudoterminal operation failed: {}", source,)
+            }
             Error::TerminalsExhausted => f.write_str(
                 "the host has no free pseudoterminal to allocate; \
                  /proc/sys/kernel/pty/max states the ceiling",
@@ -1151,10 +1028,24 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {
+    /// The failure underneath, where there is one.
+    ///
+    /// Every OS failure this type carries is an [`io::Error`], so every one of
+    /// them is returned here. The variants that answer `None` carry nothing:
+    /// [`NestedUsernsBudgetExhausted`](Self::NestedUsernsBudgetExhausted),
+    /// [`SupervisorLost`](Self::SupervisorLost), and
+    /// [`TerminalsExhausted`](Self::TerminalsExhausted) are conditions the
+    /// library recognized rather than syscalls that failed.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Config(err) => Some(err),
             Error::IdentityMap(err) => Some(err),
+            Error::UsernsUnavailable { source, .. }
+            | Error::Setup { source, .. }
+            | Error::Spawn { source }
+            | Error::Wait { source }
+            | Error::Signal { source }
+            | Error::Terminal { source } => Some(source),
             _ => None,
         }
     }
@@ -1170,16 +1061,26 @@ impl From<ConfigError> for Error {
 mod tests {
     use super::*;
 
+    /// Every step decodes back to itself, and every step names itself in prose.
+    ///
+    /// The round trip is structural now — the decoder's match arms are the same
+    /// literals the variants are declared with, so a value used twice is a
+    /// duplicate discriminant and a duplicate pattern, both of which the
+    /// compiler refuses. What this still checks is that the list of steps and
+    /// the encoding agree about which values exist, and that no step was left
+    /// without a description.
     #[test]
     fn setup_step_wire_round_trip() {
-        for step in SetupStep::ALL {
-            assert_eq!(SetupStep::from_wire(step as u32), Some(step));
+        for &step in SetupStep::ALL {
+            assert_eq!(SetupStep::from_wire(step.wire()), Some(step));
+            assert!(!step.describe().is_empty(), "{step:?} describes itself");
         }
     }
 
     #[test]
     fn setup_step_unknown_wire_value_is_rejected() {
         assert_eq!(SetupStep::from_wire(0), None);
+        assert_eq!(SetupStep::from_wire(SetupStep::past_the_last()), None);
         assert_eq!(SetupStep::from_wire(u32::MAX), None);
     }
 
@@ -1187,7 +1088,7 @@ mod tests {
     fn error_display_names_the_failed_step() {
         let err = Error::Setup {
             step: SetupStep::PivotRoot,
-            errno: 22,
+            source: io::Error::from_raw_os_error(22),
             detail: None,
         };
         let message = err.to_string();
@@ -1226,7 +1127,7 @@ mod tests {
     fn error_display_includes_the_step_detail() {
         let err = Error::Setup {
             step: SetupStep::BindMount,
-            errno: 13,
+            source: io::Error::from_raw_os_error(13),
             detail: Some("/host/data at /data, read-only".to_string()),
         };
         let message = err.to_string();

@@ -57,13 +57,17 @@
 //! say, for interactive ebuild work in the same posture. The command path is
 //! interpreted inside the sandbox and must be absolute.
 
-use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ferroday_cage::provision::{self, Provisioned, Tarball};
-use ferroday_cage::{Cage, ConfigError, Error, ExitStatus, IdentityMap, Network, SetupStep};
+use ferroday_cage::{Cage, ConfigError, Error, IdentityMap, Network};
+
+mod common;
+
+use common::{flag_value, usage_error, value_for};
 
 /// Where the host portage tree is bound, read-only, inside the sandbox.
 const REPO_DEST: &str = "/var/db/repos/gentoo";
@@ -160,7 +164,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Invocation::Run(config)) => run(config),
-        Err(message) => usage_error(&message),
+        Err(message) => usage_error("ebuild-sandbox", &message),
     }
 }
 
@@ -264,10 +268,13 @@ fn run(config: Config) -> ExitCode {
             }
         }
     } else if !config.rootfs.is_dir() {
-        return usage_error(&format!(
-            "root filesystem {} does not exist; pass --stage3 FILE to provision it",
-            config.rootfs.display()
-        ));
+        return usage_error(
+            "ebuild-sandbox",
+            &format!(
+                "root filesystem {} does not exist; pass --stage3 FILE to provision it",
+                config.rootfs.display()
+            ),
+        );
     }
 
     let mut builder = Cage::builder().rootfs(&config.rootfs);
@@ -305,7 +312,7 @@ fn run(config: Config) -> ExitCode {
         Ok(cage) => launch(cage),
         Err(error) => {
             report_build_error(&error);
-            ExitCode::from(error_exit_code(&error))
+            ExitCode::from(error.shell_code())
         }
     }
 }
@@ -314,25 +321,11 @@ fn run(config: Config) -> ExitCode {
 /// mapping the outcome onto the process exit status.
 fn launch(cage: Cage) -> ExitCode {
     match cage.run() {
-        Ok(status) => exit_code_for(status),
+        Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
             eprintln!("ebuild-sandbox: {error}");
-            ExitCode::from(error_exit_code(&error))
+            ExitCode::from(error.shell_code())
         }
-    }
-}
-
-/// Maps a command's exit status onto the process exit code, following the
-/// shell convention of 128 plus the signal number for a signalled command.
-fn exit_code_for(status: ExitStatus) -> ExitCode {
-    if let Some(code) = status.code() {
-        ExitCode::from(code as u8)
-    } else if let Some(signal) = status.signal() {
-        ExitCode::from(128_u8.wrapping_add(signal as u8))
-    } else {
-        // A wait status is always an exit code or a signal; a fallback rather
-        // than a panic keeps this tail total.
-        ExitCode::FAILURE
     }
 }
 
@@ -354,40 +347,4 @@ fn report_build_error(error: &Error) {
         }
         other => eprintln!("ebuild-sandbox: {other}"),
     }
-}
-
-/// The launcher conventions: 127 when the command does not exist, 126 when it
-/// exists but cannot be executed, 125 for any other library failure.
-fn error_exit_code(error: &Error) -> u8 {
-    match error {
-        Error::Setup {
-            step: SetupStep::Exec,
-            errno,
-            ..
-        } => match std::io::Error::from_raw_os_error(*errno).kind() {
-            std::io::ErrorKind::NotFound => 127,
-            _ => 126,
-        },
-        _ => 125,
-    }
-}
-
-/// Prints a usage error and returns the usage exit code.
-fn usage_error(message: &str) -> ExitCode {
-    eprintln!("ebuild-sandbox: {message}");
-    eprintln!("Try 'ebuild-sandbox --help' for usage.");
-    ExitCode::from(2)
-}
-
-/// Consumes the next argument as a required value.
-fn value_for(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
-    args.next()
-        .ok_or_else(|| format!("{name} requires a value"))
-}
-
-/// Splits `--flag=value` syntax, preserving a non-UTF-8 value.
-fn flag_value(arg: &OsStr, prefix: &[u8]) -> Option<OsString> {
-    arg.as_bytes()
-        .strip_prefix(prefix)
-        .map(|value| OsString::from_vec(value.to_vec()))
 }

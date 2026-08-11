@@ -60,10 +60,15 @@
 //! fixture will do. Nothing in it is written to: the probes go in layers of the
 //! harness's own, and the rootfs is only ever a lower.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ferroday_cage::{Cage, Overlay};
+
+mod common;
+
+use common::{string_value, value_for};
 
 fn main() -> ExitCode {
     let options = match Options::parse() {
@@ -142,22 +147,18 @@ impl Options {
         let mut trials = 2000;
         let mut parallel = 32;
         let mut warm = false;
-        let mut args = std::env::args().skip(1);
+        let mut args = std::env::args_os().skip(1);
         while let Some(arg) = args.next() {
-            let mut value = || {
-                args.next()
-                    .ok_or_else(|| format!("{arg} needs a value"))
-                    .and_then(|raw| {
-                        raw.parse::<u32>()
-                            .map_err(|_| format!("{arg} needs a number"))
-                    })
-            };
-            match arg.as_str() {
-                "--rootfs" => rootfs = Some(PathBuf::from(value_of(&mut args, "--rootfs")?)),
-                "--trials" => trials = value()?,
-                "--parallel" => parallel = value()?,
-                "--warm" => warm = true,
-                other => return Err(format!("unrecognized option {other}")),
+            if arg == "--rootfs" {
+                rootfs = Some(PathBuf::from(value_for("--rootfs", &mut args)?));
+            } else if arg == "--trials" {
+                trials = count("--trials", &mut args)?;
+            } else if arg == "--parallel" {
+                parallel = count("--parallel", &mut args)?;
+            } else if arg == "--warm" {
+                warm = true;
+            } else {
+                return Err(format!("unrecognized option {}", arg.to_string_lossy()));
             }
         }
         Ok(Options {
@@ -169,9 +170,11 @@ impl Options {
     }
 }
 
-/// Reads a string-valued option.
-fn value_of(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("{flag} needs a value"))
+/// Reads a count-valued option.
+fn count(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<u32, String> {
+    string_value(name, args)?
+        .parse()
+        .map_err(|_| format!("{name} needs a number"))
 }
 
 /// How many lookups of each shape came back missing.

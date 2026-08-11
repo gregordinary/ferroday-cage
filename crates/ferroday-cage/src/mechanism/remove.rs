@@ -41,90 +41,43 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{self, AtFlags, Mode, OFlags, RawDir, SeekFrom};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
-use rustix::process::{Pid, Signal};
+use rustix::process::Pid;
 use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
 use super::child::{MapDuty, MapFailure, MapStep};
 use crate::idmap::IdMapError;
+use crate::wire::wire_enum;
 
-/// What a failed map-assisted removal was doing, for the caller's error.
-///
-/// The explicit discriminants are the result record's wire encoding, which
-/// both ends of a single build write and read; zero is not among them, since
-/// the all-zero record is the success record. They are not a stable protocol
-/// and they are not declaration order: a step added in a later release takes
-/// the next free value rather than renumbering the ones it was declared
-/// among.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub(crate) enum RemoveStep {
-    /// Forking the removal process or speaking to it. Reported by the caller
-    /// alone: the child has no channel to report it on.
-    Spawn = 6,
-    /// The child could not reset its inherited signal dispositions.
-    ResetSignals = 1,
-    /// The child could not close the descriptors it inherited.
-    SweepFds = 2,
-    /// The child could not unshare its user namespace.
-    Unshare = 3,
-    /// The child could not write its own single-identity map.
-    SelfMap = 7,
-    /// The child died or was abandoned at the map gate.
-    AwaitMap = 4,
-    /// The deletion itself failed inside the mapped namespace.
-    Delete = 5,
-}
-
-impl RemoveStep {
-    /// Every step, in declaration order. Used by the wire-protocol tests.
-    #[cfg(test)]
-    pub(crate) const ALL: [RemoveStep; 7] = [
-        RemoveStep::Spawn,
-        RemoveStep::ResetSignals,
-        RemoveStep::SweepFds,
-        RemoveStep::Unshare,
-        RemoveStep::SelfMap,
-        RemoveStep::AwaitMap,
-        RemoveStep::Delete,
-    ];
-
-    /// The step as launch-error prose: what the failure was doing.
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            RemoveStep::Spawn => "spawning the removal process",
-            RemoveStep::ResetSignals => "resetting the removal process's signal dispositions",
-            RemoveStep::SweepFds => "closing the removal process's inherited descriptors",
-            RemoveStep::Unshare => "unsharing the removal namespace",
-            RemoveStep::SelfMap => "writing the removal identity map",
-            RemoveStep::AwaitMap => "establishing the removal identity map",
-            RemoveStep::Delete => "deleting the tree inside the mapped namespace",
-        }
-    }
-
-    /// The wire discriminant carried in the result record.
-    fn wire(self) -> u32 {
-        self as u32
-    }
-
-    /// Decodes a wire discriminant, or `None` for a value no step carries —
-    /// zero, which is the success record, among them.
+wire_enum! {
+    /// What a failed map-assisted removal was doing, for the caller's error.
     ///
-    /// Both ends of the record are the same build, so an unrecognized value is
-    /// a malformed record rather than a step from another version. It is
-    /// reported as one instead of being read as a step the child did not
-    /// name.
-    fn from_wire(wire: u32) -> Option<RemoveStep> {
-        Some(match wire {
-            1 => RemoveStep::ResetSignals,
-            2 => RemoveStep::SweepFds,
-            3 => RemoveStep::Unshare,
-            4 => RemoveStep::AwaitMap,
-            5 => RemoveStep::Delete,
-            6 => RemoveStep::Spawn,
-            7 => RemoveStep::SelfMap,
-            _ => return None,
-        })
+    /// The explicit discriminants are the result record's wire encoding, which
+    /// both ends of a single build write and read; zero is not among them,
+    /// since the all-zero record is the success record. They are not a stable
+    /// protocol and they are not declaration order: a step added in a later
+    /// release takes the next free value rather than renumbering the ones it
+    /// was declared among.
+    pub(crate) enum RemoveStep {
+        /// Forking the removal process or speaking to it. Reported by the
+        /// caller alone: the child has no channel to report it on.
+        Spawn = 6 => "spawning the removal process",
+        /// The child could not reset its inherited signal dispositions.
+        ResetSignals = 1 => "resetting the removal process's signal dispositions",
+        /// The child could not close the descriptors it inherited.
+        SweepFds = 2 => "closing the removal process's inherited descriptors",
+        /// The child could not unshare its user namespace.
+        Unshare = 3 => "unsharing the removal namespace",
+        /// The child could not deny `setgroups` in its own user namespace.
+        DenySetgroups = 7 => "denying setgroups in the removal namespace",
+        /// The child could not write its own gid map.
+        WriteGidMap = 8 => "writing the removal gid map",
+        /// The child could not write its own uid map.
+        WriteUidMap = 9 => "writing the removal uid map",
+        /// The child died or was abandoned at the map gate.
+        AwaitMap = 4 => "establishing the removal identity map",
+        /// The deletion itself failed inside the mapped namespace.
+        Delete = 5 => "deleting the tree inside the mapped namespace",
     }
 }
 
@@ -208,70 +161,40 @@ pub(crate) fn remove_tree_mapped(
 /// side and never signals ready, so there is no handshake to drive: the gate
 /// carries the result record alone.
 ///
-/// Takes the gate by value so that returning closes it, and signals the child
-/// on every path that gives up on it. The child blocks on the gate until the
-/// go byte arrives, and a caller that simply stopped writing would strand it
-/// there and hang the wait that follows.
+/// Takes the gate by value so that returning closes it. The child blocks on the
+/// gate until the go byte arrives, and a caller that simply stopped writing
+/// would strand it there and hang the wait that follows — which is why a caller
+/// that gives up on the child kills it rather than closing the gate, as
+/// [`abandon_gated_child`](super::abandon_gated_child) explains.
 ///
-/// Closing the gate is not enough on its own to release it. `kernel_fork`
-/// copies the whole descriptor table, so a sibling process this caller forked
-/// concurrently — another removal or export child — holds its own copy of this
-/// gate's caller end and keeps the peer open however promptly this one closes.
-/// The signal does not depend on any other process's descriptor table.
+/// The result record that follows the go byte is this removal's own: past the
+/// gate the child is deleting rather than waiting, and it exits when it is done
+/// either way, so a failure reading it needs no signal — the wait still
+/// returns.
 fn drive_removal(gate: OwnedFd, child: Pid, map: &ChildMap<'_>) -> Result<(), RemoveFailure> {
     let io_failure = |step: RemoveStep, errno: Errno| RemoveFailure::Step {
         step,
         errno: errno.raw_os_error(),
     };
 
-    let mut record = [0u8; 8];
     if let ChildMap::Delegated { mapper, map } = map {
-        // Ready, or the child's early failure record, or end-of-file.
-        let first = loop {
-            match rustix::io::read(&gate, &mut record) {
-                Ok(n) => break n,
-                Err(Errno::INTR) => continue,
-                Err(errno) => {
-                    let _ = rustix::process::kill_process(child, Signal::KILL);
-                    return Err(io_failure(RemoveStep::Spawn, errno));
-                }
-            }
+        let failure = match super::drive_map_gate(gate.as_fd(), child, *mapper, map) {
+            Ok(super::Gated::Released) => None,
+            // A record before ready is the failure the child hit on the way to
+            // the gate: it names the step it reached, and no kill is owed to a
+            // child that has already exited reporting it.
+            Ok(super::Gated::EarlyRecord(record)) => return Err(decode_record(record)),
+            Ok(super::Gated::ChildLost) => Some(io_failure(RemoveStep::Spawn, Errno::PROTO)),
+            Err(super::GateFailure::Io(errno)) => Some(io_failure(RemoveStep::Spawn, errno)),
+            Err(super::GateFailure::Map(err)) => Some(RemoveFailure::Map(err)),
         };
-        match first {
-            // The ready byte: the namespace exists and the child is blocked.
-            1 => {}
-            // An 8-byte record before ready is the unshare failure.
-            8 => return Err(decode_record(record)),
-            // End-of-file or a corrupt message: the child is gone.
-            _ => {
-                let _ = rustix::process::kill_process(child, Signal::KILL);
-                return Err(io_failure(RemoveStep::Spawn, Errno::PROTO));
-            }
-        }
-
-        let pid = child.as_raw_nonzero().get() as u32;
-        if let Err(err) = mapper.apply(pid, map) {
-            // The child is blocked at the gate in an unmapped namespace with
-            // nothing left to do. It has touched no tree and holds no resource
-            // but its own descriptors, so killing it is a clean end.
-            let _ = rustix::process::kill_process(child, Signal::KILL);
-            return Err(RemoveFailure::Map(err));
-        }
-        loop {
-            match rustix::io::write(&gate, &[super::MAP_GO_BYTE]) {
-                Ok(_) => break,
-                Err(Errno::INTR) => continue,
-                Err(errno) => {
-                    let _ = rustix::process::kill_process(child, Signal::KILL);
-                    return Err(io_failure(RemoveStep::AwaitMap, errno));
-                }
-            }
+        if let Some(failure) = failure {
+            super::abandon_gated_child(child);
+            return Err(failure);
         }
     }
 
-    // The result record: all zeros is success. Past the go byte the child is
-    // deleting rather than waiting, and it exits when it is done either way,
-    // so a failure here needs no signal: the wait still returns.
+    let mut record = [0u8; super::RECORD_LEN];
     let mut len = 0;
     while len < record.len() {
         match rustix::io::read(&gate, &mut record[len..]) {
@@ -284,7 +207,7 @@ fn drive_removal(gate: OwnedFd, child: Pid, map: &ChildMap<'_>) -> Result<(), Re
     if len != record.len() {
         return Err(io_failure(RemoveStep::Delete, Errno::PROTO));
     }
-    if record == [0u8; 8] {
+    if record == [0u8; super::RECORD_LEN] {
         Ok(())
     } else {
         Err(decode_record(record))
@@ -293,7 +216,7 @@ fn drive_removal(gate: OwnedFd, child: Pid, map: &ChildMap<'_>) -> Result<(), Re
 
 /// Decodes the child's 8-byte record: step discriminant then errno, both
 /// little-endian.
-fn decode_record(record: [u8; 8]) -> RemoveFailure {
+fn decode_record(record: [u8; super::RECORD_LEN]) -> RemoveFailure {
     let wire = u32::from_le_bytes(record[0..4].try_into().expect("slice length is 4"));
     let errno = i32::from_le_bytes(record[4..8].try_into().expect("slice length is 4"));
     match RemoveStep::from_wire(wire) {
@@ -302,15 +225,16 @@ fn decode_record(record: [u8; 8]) -> RemoveFailure {
     }
 }
 
-/// The step a removal reports for a shared map step. The three writes of a
-/// single-identity map are one step: the removal names what it was doing, and
-/// it was writing its own map.
+/// The step a removal reports for a shared map step: the removal's own name for
+/// the same step, one for one.
 fn remove_step(step: MapStep) -> RemoveStep {
     match step {
         MapStep::ResetSignals => RemoveStep::ResetSignals,
         MapStep::SweepFds => RemoveStep::SweepFds,
         MapStep::Unshare => RemoveStep::Unshare,
-        MapStep::DenySetgroups | MapStep::WriteGidMap | MapStep::WriteUidMap => RemoveStep::SelfMap,
+        MapStep::DenySetgroups => RemoveStep::DenySetgroups,
+        MapStep::WriteGidMap => RemoveStep::WriteGidMap,
+        MapStep::WriteUidMap => RemoveStep::WriteUidMap,
         MapStep::AwaitMap => RemoveStep::AwaitMap,
     }
 }
@@ -475,14 +399,21 @@ mod tests {
     use crate::idmap::{IdMapper, IdRange, IdentityMap, ResolvedMap};
 
     use super::*;
+    use crate::scratch::Scratch;
 
-    /// The encoding and the decoding are two tables that have to agree, and
-    /// nothing but this test makes them: the child would otherwise name one
-    /// step while the caller read another.
+    /// Every step decodes back to itself, and every step names itself in prose.
+    ///
+    /// The round trip is structural now — the decoder's match arms are the same
+    /// literals the variants are declared with, so a value used twice is a
+    /// duplicate discriminant and a duplicate pattern, both of which the
+    /// compiler refuses. What this still checks is that the list of steps and
+    /// the encoding agree about which values exist, and that no step was left
+    /// without a description.
     #[test]
     fn remove_step_wire_round_trip() {
-        for step in RemoveStep::ALL {
+        for &step in RemoveStep::ALL {
             assert_eq!(RemoveStep::from_wire(step.wire()), Some(step));
+            assert!(!step.describe().is_empty(), "{step:?} describes itself");
         }
     }
 
@@ -491,10 +422,7 @@ mod tests {
     #[test]
     fn unknown_wire_values_are_rejected() {
         assert_eq!(RemoveStep::from_wire(0), None);
-        assert_eq!(
-            RemoveStep::from_wire(RemoveStep::ALL.len() as u32 + 1),
-            None
-        );
+        assert_eq!(RemoveStep::from_wire(RemoveStep::past_the_last()), None);
         assert_eq!(RemoveStep::from_wire(u32::MAX), None);
         assert!(matches!(
             decode_record([0xFFu8; 8]),
@@ -573,7 +501,7 @@ mod tests {
                 .lock()
                 .expect("the test holds no poisoned lock")
             {
-                let _ = rustix::process::kill_process(pid, Signal::KILL);
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
                 let _ = super::super::wait_for_exit(pid);
             }
         }
@@ -596,7 +524,7 @@ mod tests {
 
         // A real directory, so a regression in the other direction — the
         // removal proceeding without a map — has somewhere harmless to land.
-        let dir = crate::scratch::Scratch::new("abandon");
+        let dir = Scratch::new("abandon");
         std::fs::create_dir_all(dir.join("tree")).expect("the scratch tree is creatable");
         let parent = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
         let leaf = c"tree";

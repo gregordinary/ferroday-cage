@@ -44,6 +44,16 @@ impl Scratch {
         Scratch { path }
     }
 
+    /// Creates an empty scratch directory for `subject`'s test named `tag`.
+    ///
+    /// Every test module used to wrap [`new`](Self::new) in a local `tempdir`
+    /// that prefixed the tag with the module's own name — six functions of one
+    /// name and six meanings. This is that, once: the prefix is an argument, so
+    /// a reader of a call site sees which tree it makes.
+    pub(crate) fn for_test(subject: &str, tag: &str) -> Scratch {
+        Scratch::new(&format!("{subject}-{tag}"))
+    }
+
     /// The directory's path.
     pub(crate) fn path(&self) -> &Path {
         &self.path

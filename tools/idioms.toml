@@ -1,0 +1,141 @@
+# The census `tools/check-idioms.py` holds the tree to.
+#
+# Each idiom below is a concept the workspace answers once. The sites are where
+# the shape occurs today, each with the reason it is there: one of them is the
+# answer, and any other says why the answer does not cover it. A change to this
+# file is how a second answer gets decided rather than merely written.
+#
+# `pattern` is a Python regular expression, matched against each crate's `src`
+# tree with the trailing test module and every comment line removed.
+#
+# What is deliberately not here: a concept clippy can name as a method. Those
+# live in `clippy.toml`, which refuses them at the call rather than counting
+# them afterwards, and `rustix::fs::openat2` is the worked example.
+
+[[idiom]]
+name = "a deadline from a duration"
+pattern = 'Instant::now\(\) \+'
+answer = """\
+`Instant::now().checked_add(d)`, and a duration the clock cannot express is no \
+deadline at all. The addition panics on overflow, and every timeout this \
+workspace takes is a caller's number: `Running::wait_timeout`, `--timeout`, \
+and `HttpFetch::request_timeout` all read an inexpressible one as a wait \
+without a bound, and two of the three learned it the hard way."""
+# No sites. The shape is refused outright, which is the whole entry: this is
+# the one idiom here that has no legitimate use in the crates' source.
+
+[[idiom]]
+name = "the kernel's retry-the-walk answer"
+pattern = 'Errno::AGAIN\) => continue'
+answer = """\
+`provision::containment::open_dir`, which loops on it once for every caller. \
+`openat2` answers `EAGAIN` when a rename raced the walk, meaning "ask again"; \
+a caller that takes it for a failure reports a tree as unusable because \
+something moved underneath it."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/containment.rs"
+count = 1
+why = "The answer."
+
+[[idiom]]
+name = "a file:// URL built from a path"
+pattern = 'format!\("file://'
+answer = """\
+`provision::file_url`, which makes the path absolute first. A \
+`file://` URL carries a path from a root and cannot spell a relative one, so \
+formatting a bare path produces a URL that resolves somewhere else or nowhere."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/http.rs"
+count = 1
+why = "The answer."
+
+[[idiom]]
+name = "splitting a path on its separators"
+pattern = "split\\(\\|by?t?e?\\| \\*by?t?e? == b'/'\\)"
+answer = """\
+`path::tree_components` for a path that names something inside a tree, and \
+`path::is_ordinary_component` for what it leaves behind. Both refuse `..`, a \
+NUL, and the shapes that are not a name; a hand-rolled split decides those \
+again, and the two reviews found four splits that had decided them \
+differently."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/path.rs"
+count = 1
+why = "The answer."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/mechanism/copyin.rs"
+count = 1
+why = """\
+The hardlink anchor's check, which runs post-fork where nothing may allocate. \
+It splits itself and holds every component to `path::is_ordinary_component`, \
+so the rule is shared even though the walk over it is not."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/debian/index.rs"
+count = 1
+why = """\
+A pool path out of a package index, which is a URL path rather than a \
+filesystem one: it is checked before and after percent-decoding, and against \
+rules a filesystem path has no use for."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/extract.rs"
+count = 1
+why = """\
+Not a caller's path at all: it undoes the extractor's own join of components \
+it had already validated, to key the deferred directory metadata."""
+
+[[idiom]]
+name = "scanning for a NUL"
+pattern = '\.contains\(&0\)'
+answer = """\
+`path::tree_components` and `path::is_ordinary_component`, which refuse one \
+before anything is resolved. A path carrying a NUL is not a path that was \
+understood, and taking the part before it names something the caller never \
+asked for."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/path.rs"
+count = 2
+why = "The answer, over a whole path and over one component."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/mechanism/copyin.rs"
+count = 1
+why = """\
+Writing arbitrary bytes into a stack buffer as a `CStr`, post-fork: the refusal \
+is about what a `CStr` can hold rather than about what a path may name."""
+
+[[idiom]]
+name = "a serde key spelled by hand"
+# Not anchored on `serde(`: the attribute is wrapped in `cfg_attr` and the
+# rename lands on a line of its own.
+pattern = '\brename = "'
+answer = """\
+`rename_all` on the container. The profile format is a compatibility \
+commitment and its keys come from one place; a field-level rename that merely \
+restates what the container derives hides the two that do not."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/spec.rs"
+count = 2
+why = """\
+Both are a plural Rust field naming a singular TOML table, which no \
+`rename_all` derives: `rlimits` -> `rlimit` and `mounts` -> `mount`."""
+
+[[idiom]]
+name = "the host's temporary directory"
+pattern = 'env::temp_dir\(\)'
+answer = """\
+`Scratch`, which owns the library's one reading of it and removes what it \
+creates. A second reading is a directory nothing cleans up, named by a rule \
+that is no longer stated once."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/scratch.rs"
+count = 1
+why = "The answer."

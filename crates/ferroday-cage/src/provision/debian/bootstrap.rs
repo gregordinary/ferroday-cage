@@ -32,7 +32,7 @@ use std::path::Path;
 
 use super::index::parse_stanzas;
 use super::repository::{Repository, Trust};
-use super::{DebianError, DebianEvent, Stream};
+use super::{DebianError, DebianEvent, DebianObserver, Stream};
 use crate::provision::rooted::Rooted;
 use crate::{Cage, CageBuilder, IdentityMap, Observer, Stdio};
 
@@ -197,7 +197,7 @@ pub(crate) fn configure(
     env: &[(String, String)],
     repositories: &[Repository],
     overlay: Option<&Path>,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
     // Under a range map every id Debian assigns is real and every chown
     // works; the reconciliation below exists solely for the single-identity
@@ -231,7 +231,7 @@ pub(crate) fn configure(
         archives_host,
         identity_map,
         env,
-        progress,
+        observer,
     )?;
     if single {
         write_statoverride(&tree, statoverride)?;
@@ -247,7 +247,7 @@ pub(crate) fn configure(
             archives_host,
             identity_map,
             env,
-            progress,
+            observer,
         )?;
     }
     // The real mawk replaces the temporary awk symlink.
@@ -259,7 +259,7 @@ pub(crate) fn configure(
         archives_host,
         identity_map,
         env,
-        progress,
+        observer,
     )?;
 
     // Unpack registers every package in the database and lays its files;
@@ -275,7 +275,7 @@ pub(crate) fn configure(
         identity_map,
         env,
         &unpack,
-        progress,
+        observer,
     )?;
 
     if single {
@@ -304,7 +304,7 @@ pub(crate) fn configure(
             "--force-configure-any",
             "--force-depends",
         ],
-        progress,
+        observer,
     )?;
 
     // Restore the real tools and remove the bootstrap-only files, then write
@@ -355,7 +355,7 @@ pub(crate) fn configure_delta(
     identity_map: &IdentityMap,
     env: &[(String, String)],
     overlay_source: Option<&Path>,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
     let single = matches!(identity_map, IdentityMap::Single);
 
@@ -387,7 +387,7 @@ pub(crate) fn configure_delta(
         identity_map,
         env,
         &unpack,
-        progress,
+        observer,
     )?;
 
     // The caller's pre-configure overlay, after unpack so it overwrites the
@@ -410,7 +410,7 @@ pub(crate) fn configure_delta(
             "--force-configure-any",
             "--force-depends",
         ],
-        progress,
+        observer,
     )?;
 
     // Reveal the base's real ownership tools through the overlay again and drop
@@ -481,11 +481,11 @@ fn write_delta_statoverride(
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(source) => {
-            return Err(DebianError::Io {
-                op: "reading the base statoverride",
-                path: base_tree.path(STATOVERRIDE),
+            return Err(DebianError::io(
+                "reading the base statoverride",
+                base_tree.path(STATOVERRIDE),
                 source,
-            });
+            ));
         }
     };
     let mut merged = StatOverride::read(&base);
@@ -495,20 +495,20 @@ fn write_delta_statoverride(
         .map_err(at("writing", upper, STATOVERRIDE))
 }
 
-/// Forwards a wave's dpkg output to the progress callback.
+/// Forwards a wave's dpkg output to the bootstrap's observer.
 struct DpkgOutput<'a> {
-    emit: &'a mut dyn FnMut(DebianEvent<'_>),
+    emit: &'a mut dyn DebianObserver,
 }
 
 impl Observer for DpkgOutput<'_> {
     fn stdout(&mut self, chunk: &[u8]) {
-        (self.emit)(DebianEvent::CommandOutput {
+        self.emit.progress(DebianEvent::CommandOutput {
             stream: Stream::Stdout,
             bytes: chunk,
         });
     }
     fn stderr(&mut self, chunk: &[u8]) {
-        (self.emit)(DebianEvent::CommandOutput {
+        self.emit.progress(DebianEvent::CommandOutput {
             stream: Stream::Stderr,
             bytes: chunk,
         });
@@ -524,7 +524,7 @@ fn core_install(
     archives_host: &Path,
     identity_map: &IdentityMap,
     env: &[(String, String)],
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
     if let Some(package) = installables.iter().find(|p| p.name == name) {
         run_dpkg(
@@ -534,7 +534,7 @@ fn core_install(
             identity_map,
             env,
             &["--force-depends", "--install", &package.deb_path],
-            progress,
+            observer,
         )?;
     }
     Ok(())
@@ -583,7 +583,7 @@ fn run_dpkg(
     identity_map: &IdentityMap,
     env: &[(String, String)],
     args: &[&str],
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
     run_dpkg_in(
         wave,
@@ -592,7 +592,7 @@ fn run_dpkg(
         identity_map,
         env,
         args,
-        progress,
+        observer,
     )
 }
 
@@ -611,7 +611,7 @@ fn run_dpkg_overlay(
     identity_map: &IdentityMap,
     env: &[(String, String)],
     args: &[&str],
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
     run_dpkg_in(
         wave,
@@ -620,7 +620,7 @@ fn run_dpkg_overlay(
         identity_map,
         env,
         args,
-        progress,
+        observer,
     )
 }
 
@@ -635,7 +635,7 @@ fn run_dpkg_in(
     identity_map: &IdentityMap,
     env: &[(String, String)],
     args: &[&str],
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
     let cage = root
         .command("/usr/bin/dpkg")
@@ -658,8 +658,8 @@ fn run_dpkg_in(
         )
         .build()
         .map_err(DebianError::Launch)?;
-    let mut observer = DpkgOutput { emit: progress };
-    let status = cage.run_with(&mut observer).map_err(DebianError::Launch)?;
+    let mut output = DpkgOutput { emit: observer };
+    let status = cage.run_with(&mut output).map_err(DebianError::Launch)?;
     if status.success() {
         Ok(())
     } else {
@@ -669,11 +669,8 @@ fn run_dpkg_in(
 
 /// Verifies every selected package reached `install ok installed`.
 fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianError> {
-    let text = read_text(tree, STATUS).map_err(|source| DebianError::Io {
-        op: "reading the dpkg status database",
-        path: tree.path(STATUS),
-        source,
-    })?;
+    let text =
+        read_text(tree, STATUS).map_err(at("reading the dpkg status database", tree, STATUS))?;
     let mut installed = HashSet::new();
     for stanza in parse_stanzas(&text) {
         if let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status"))
@@ -875,11 +872,7 @@ pub(super) fn read_base_status(base: &Path) -> io::Result<String> {
 
 /// Opens a tree for the host-side steps that read and write inside it.
 fn open_tree(root: &Path) -> Result<Rooted, DebianError> {
-    Rooted::open(root).map_err(|source| DebianError::Io {
-        op: "opening the tree",
-        path: root.to_path_buf(),
-        source,
-    })
+    Rooted::open(root).map_err(DebianError::at("opening the tree", root))
 }
 
 /// Reads a file of the tree as text, as [`std::fs::read_to_string`] would:
@@ -896,19 +889,23 @@ fn read_text(tree: &Rooted, rootfs_path: &str) -> io::Result<String> {
 
 /// Builds an I/O error closure for a host-side step, naming the host path the
 /// tree-relative one would compose to.
+///
+/// [`DebianError::at`] with the path composition every host-side step here
+/// needs: the operation is asked for by its tree-relative name, and only the
+/// error message names a host path.
 fn at(op: &'static str, tree: &Rooted, rootfs_path: &str) -> impl FnOnce(io::Error) -> DebianError {
-    let path = tree.path(rootfs_path);
-    move |source| DebianError::Io { op, path, source }
+    DebianError::at(op, tree.path(rootfs_path))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
     use std::fs;
 
     /// A scratch tree, and a [`Rooted`] anchored to it.
-    fn tempdir(tag: &str) -> (crate::scratch::Scratch, Rooted) {
-        let scratch = crate::scratch::Scratch::new(&format!("bootstrap-{tag}"));
+    fn rooted_tree(tag: &str) -> (Scratch, Rooted) {
+        let scratch = Scratch::for_test("bootstrap", tag);
         let tree = open_tree(&scratch).expect("the scratch tree opens");
         (scratch, tree)
     }
@@ -936,7 +933,7 @@ mod tests {
         // The primary owns sources.list and the canonical keyring path; the deb
         // line must carry a signed-by naming it, or apt would reject the release
         // for want of a trusted keyring.
-        let (staging, tree) = tempdir("sources-list");
+        let (staging, tree) = rooted_tree("sources-list");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -966,7 +963,7 @@ mod tests {
     fn an_additional_signed_repository_writes_its_own_entry_and_anchor() {
         // The second repository writes a named sources.list.d entry signed by
         // its own keyring, distinct from the primary's anchor.
-        let (staging, tree) = tempdir("sources-additional");
+        let (staging, tree) = rooted_tree("sources-additional");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -1000,7 +997,7 @@ mod tests {
     fn an_unsigned_repository_writes_a_trusted_line_and_no_keyring() {
         // A trust_unsigned repository writes [trusted=yes] and lays down no
         // keyring, apt's posture for a source under the caller's control.
-        let (staging, tree) = tempdir("sources-unsigned");
+        let (staging, tree) = rooted_tree("sources-unsigned");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -1034,7 +1031,7 @@ mod tests {
     fn the_single_identity_apt_config_runs_methods_as_root() {
         // Under the single-identity map apt cannot drop to _apt, so the
         // written config points its sandbox user at root instead.
-        let (staging, tree) = tempdir("apt-sandbox-user");
+        let (staging, tree) = rooted_tree("apt-sandbox-user");
         write_apt_sandbox_user(&tree).expect("the apt config is written");
 
         let conf = fs::read_to_string(staging.join("etc/apt/apt.conf.d/00fcage-single-identity"))
@@ -1049,7 +1046,7 @@ mod tests {
         // script is free to leave an absolute link where one of them writes.
         // The write must land in the tree, and the host file it names must be
         // untouched.
-        let (staging, tree) = tempdir("planted-link");
+        let (staging, tree) = rooted_tree("planted-link");
         let victim = staging.join("victim");
         fs::write(&victim, b"host contents\n").unwrap();
         for path in [
@@ -1096,8 +1093,8 @@ mod tests {
         // statoverride is read and carried into the upper. A link there would
         // otherwise make the read an arbitrary host-file read, published in the
         // tree the caller exports.
-        let (base, _) = tempdir("delta-base");
-        let (upper, upper_tree) = tempdir("delta-upper");
+        let (base, _) = rooted_tree("delta-base");
+        let (upper, upper_tree) = rooted_tree("delta-upper");
         let secret = base.join("secret");
         fs::write(&secret, b"root root 4755 /host/secret\n").unwrap();
         fs::create_dir_all(base.join("var/lib/dpkg")).unwrap();

@@ -133,10 +133,13 @@ Settled so that generalising a parameter later is never a breaking change:
 
 ## What the profile format promises
 
-A profile is a serialized `CageBuilder`. Every serialized field carries an
-explicit `#[serde(rename)]`, so the wire name is chosen deliberately and a
-Rust-side field rename cannot silently rename a key; a test pins the exact key
-set so an accidental change fails the build.
+A profile is a serialized `CageBuilder`. Every key is the kebab-case form of the
+field's name, derived by `rename_all` on the container; the two exceptions are
+stated explicitly, and both are a plural Rust field naming a singular TOML table
+(`rlimits` becomes `rlimit`, `mounts` becomes `mount`). A test pins the exact
+key set the format can carry, so a Rust-side field rename, a changed
+`rename_all`, or a newly added field moves a key only where that diff is
+reviewed.
 
 Compatibility runs in one direction: **a profile works with the library
 version that wrote it, or any later one, and never with an earlier one.**

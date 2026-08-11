@@ -69,7 +69,11 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::debian::{Debian, DebianError, DebianEvent, Repository};
 use ferroday_cage::provision::{self, Provisioned};
-use ferroday_cage::{Cage, ConfigError, Error, ExitStatus, SetupStep};
+use ferroday_cage::{Cage, ConfigError, Error};
+
+mod common;
+
+use common::{flag_value, into_string, string_value, usage_error, value_for};
 
 /// The suite bootstrapped when `--suite` is not given.
 const DEFAULT_SUITE: &str = "trixie";
@@ -144,7 +148,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Invocation::Run(config)) => run(config),
-        Err(message) => usage_error(&message),
+        Err(message) => usage_error("deb-multirepo", &message),
     }
 }
 
@@ -357,14 +361,14 @@ fn launch(rootfs: &Path, argv: &[OsString]) -> ExitCode {
         Ok(cage) => cage,
         Err(error) => {
             report_launch_error(&error);
-            return ExitCode::from(error_exit_code(&error));
+            return ExitCode::from(error.shell_code());
         }
     };
     match cage.run() {
-        Ok(status) => exit_code_for(status),
+        Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
             eprintln!("deb-multirepo: {error}");
-            ExitCode::from(error_exit_code(&error))
+            ExitCode::from(error.shell_code())
         }
     }
 }
@@ -423,20 +427,6 @@ fn print_progress(event: DebianEvent<'_>) {
     }
 }
 
-/// Maps a command's exit status onto the process exit code, following the
-/// shell convention of 128 plus the signal number for a signalled command.
-fn exit_code_for(status: ExitStatus) -> ExitCode {
-    if let Some(code) = status.code() {
-        ExitCode::from(code as u8)
-    } else if let Some(signal) = status.signal() {
-        ExitCode::from(128_u8.wrapping_add(signal as u8))
-    } else {
-        // A wait status is always an exit code or a signal; a fallback rather
-        // than a panic keeps this tail total.
-        ExitCode::FAILURE
-    }
-}
-
 /// Explains a launch failure, pointing at the fix for the configuration errors
 /// an invocation most often omits.
 fn report_launch_error(error: &Error) {
@@ -450,56 +440,4 @@ fn report_launch_error(error: &Error) {
         ),
         other => eprintln!("deb-multirepo: {other}"),
     }
-}
-
-/// The launcher conventions: 127 when the command does not exist, 126 when it
-/// exists but cannot be executed, 125 for any other library failure.
-fn error_exit_code(error: &Error) -> u8 {
-    match error {
-        Error::Setup {
-            step: SetupStep::Exec,
-            errno,
-            ..
-        } => match std::io::Error::from_raw_os_error(*errno).kind() {
-            std::io::ErrorKind::NotFound => 127,
-            _ => 126,
-        },
-        _ => 125,
-    }
-}
-
-/// Prints a usage error and returns the usage exit code.
-fn usage_error(message: &str) -> ExitCode {
-    eprintln!("deb-multirepo: {message}");
-    eprintln!("Try 'deb-multirepo --help' for usage.");
-    ExitCode::from(2)
-}
-
-/// Consumes the next argument as a required value.
-fn value_for(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
-    args.next()
-        .ok_or_else(|| format!("{name} requires a value"))
-}
-
-/// Consumes the next argument as a required UTF-8 value.
-fn string_value(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<String, String> {
-    into_string(name, value_for(name, args)?)
-}
-
-/// Requires a value to be UTF-8, naming the option on failure.
-fn into_string(name: &str, value: OsString) -> Result<String, String> {
-    value.into_string().map_err(|value| {
-        format!(
-            "{name} value {} is not valid UTF-8",
-            value.to_string_lossy()
-        )
-    })
-}
-
-/// Splits `--flag=value` syntax, preserving a non-UTF-8 value.
-fn flag_value(arg: &OsString, prefix: &[u8]) -> Option<OsString> {
-    let bytes = arg.as_bytes();
-    bytes
-        .strip_prefix(prefix)
-        .map(|rest| OsString::from(std::ffi::OsStr::from_bytes(rest)))
 }

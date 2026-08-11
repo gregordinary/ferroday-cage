@@ -75,6 +75,7 @@ use rustix::runtime::{self, How, KernelSigSet, KernelSigaction};
 use rustix::thread;
 use syscalls::Sysno;
 
+use super::frame;
 use super::{
     IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdioPlan,
 };
@@ -812,13 +813,10 @@ fn switch_identity(context: &Context<'_>) -> Result<(), (SetupStep, Errno)> {
 /// never runs unreleased.
 fn await_proceed(fd: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
     let mut byte = [0u8; 1];
-    loop {
-        match rustix::io::read(fd, &mut byte) {
-            Ok(0) => return Err((SetupStep::AwaitNetworkStack, Errno::CANCELED)),
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err((SetupStep::AwaitNetworkStack, errno)),
-        }
+    match frame::retry_on_intr!(rustix::io::read(fd, &mut byte)) {
+        Ok(0) => Err((SetupStep::AwaitNetworkStack, Errno::CANCELED)),
+        Ok(_) => Ok(()),
+        Err(errno) => Err((SetupStep::AwaitNetworkStack, errno)),
     }
 }
 
@@ -983,21 +981,13 @@ pub(super) fn establish_map(
                 // process must not panic.
                 return Err(MapFailure::Step(MapStep::AwaitMap, Errno::BADF));
             };
-            loop {
-                match rustix::io::write(gate, &[super::MAP_READY_BYTE]) {
-                    Ok(_) => break,
-                    Err(Errno::INTR) => continue,
-                    Err(errno) => return Err(MapFailure::Step(MapStep::AwaitMap, errno)),
-                }
-            }
+            frame::retry_on_intr!(rustix::io::write(gate, &[super::MAP_READY_BYTE]))
+                .map_err(|errno| MapFailure::Step(MapStep::AwaitMap, errno))?;
             let mut byte = [0u8; 1];
-            loop {
-                match rustix::io::read(gate, &mut byte) {
-                    Ok(0) => return Err(MapFailure::Abandoned),
-                    Ok(_) => break,
-                    Err(Errno::INTR) => continue,
-                    Err(errno) => return Err(MapFailure::Step(MapStep::AwaitMap, errno)),
-                }
+            match frame::retry_on_intr!(rustix::io::read(gate, &mut byte)) {
+                Ok(0) => return Err(MapFailure::Abandoned),
+                Ok(_) => {}
+                Err(errno) => return Err(MapFailure::Step(MapStep::AwaitMap, errno)),
             }
         }
     }
@@ -1221,13 +1211,10 @@ fn delegate_nested_map(
 
     // The command is unshared and waiting.
     let mut byte = [0u8; 1];
-    loop {
-        match rustix::io::read(gate, &mut byte) {
-            Ok(0) => return Ok(()),
-            Ok(_) => break,
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err((SetupStep::NestedMapGate, errno, 0)),
-        }
+    match frame::retry_on_intr!(rustix::io::read(gate, &mut byte)) {
+        Ok(0) => return Ok(()),
+        Ok(_) => {}
+        Err(errno) => return Err((SetupStep::NestedMapGate, errno, 0)),
     }
 
     // The gid map before the uid map, which is the order `establish_map` writes
@@ -1252,13 +1239,9 @@ fn delegate_nested_map(
     }
 
     // Release the command.
-    loop {
-        match rustix::io::write(gate, &[super::MAP_GO_BYTE]) {
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err((SetupStep::NestedMapGate, errno, 0)),
-        }
-    }
+    frame::retry_on_intr!(rustix::io::write(gate, &[super::MAP_GO_BYTE]))
+        .map(|_| ())
+        .map_err(|errno| (SetupStep::NestedMapGate, errno, 0))
 }
 
 /// Writes one of another process's identity-map files, addressed relative to a
@@ -1945,6 +1928,10 @@ fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errn
 /// this falls back to a top-level remount, which covers the bind itself but
 /// leaves any submounts with their own flags.
 fn remount_read_only(root: BorrowedFd<'_>, target: &CStr) -> Result<(), Errno> {
+    // Not `provision::containment::open_dir`: this runs post-fork, and a bind
+    // target is whatever the caller named — a file as readily as a directory —
+    // so the `O_DIRECTORY` that helper folds in would refuse half of them.
+    #[allow(clippy::disallowed_methods)]
     let target = fs::openat2(
         root,
         target,
@@ -2087,12 +2074,18 @@ fn open_in_root(root: BorrowedFd<'_>, path: &CStr, oflags: OFlags) -> Result<Own
 }
 
 /// [`open_in_root`] with an explicit creation mode.
+///
+/// The post-fork stage's own opener, rather than
+/// `provision::containment::open_dir`: it opens whatever a mount target is,
+/// creates where asked to, and runs where a helper that loops on the kernel's
+/// retry has no caller to answer to.
 fn open_in_root_with(
     root: BorrowedFd<'_>,
     path: &CStr,
     oflags: OFlags,
     mode: Mode,
 ) -> Result<OwnedFd, Errno> {
+    #[allow(clippy::disallowed_methods)]
     fs::openat2(root, path, oflags, mode, ResolveFlags::IN_ROOT)
 }
 
@@ -2272,6 +2265,7 @@ fn report(fd: BorrowedFd<'_>, step: SetupStep, errno: Errno, detail: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     #[test]
     fn a_remount_carries_the_locked_flags_forward() {
@@ -2341,7 +2335,7 @@ mod tests {
         // the value that shows it: a umask conventionally clears write bits, so
         // an `O_CREAT` left to decide the mode lands on 0644 under the usual
         // `022` and on 0664 under the `002` of a user-private-group host.
-        let dir = crate::scratch::Scratch::new("mount-file-mode");
+        let dir = Scratch::new("mount-file-mode");
         let root = open_root(dir.path());
 
         create_mount_file(root.as_fd(), c"created", Mode::from_raw_mode(0o666))
@@ -2362,7 +2356,7 @@ mod tests {
         // would change a tree the launch has no claim on.
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = crate::scratch::Scratch::new("mount-file-shipped");
+        let dir = Scratch::new("mount-file-shipped");
         let root = open_root(dir.path());
         std::fs::write(dir.join("shipped"), b"the root's own").expect("the entry is writable");
         std::fs::set_permissions(dir.join("shipped"), std::fs::Permissions::from_mode(0o600))
@@ -2385,7 +2379,7 @@ mod tests {
         // destination — a path the caller side does not record and therefore
         // never takes away, leaving the root holding content it never shipped.
         // `O_EXCL` refuses the link instead.
-        let dir = crate::scratch::Scratch::new("mount-file-symlink");
+        let dir = Scratch::new("mount-file-symlink");
         let root = open_root(dir.path());
         std::os::unix::fs::symlink("../absent", dir.join("linked"))
             .expect("the symbolic link is creatable");

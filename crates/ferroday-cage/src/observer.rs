@@ -100,6 +100,37 @@ pub trait Observer {
     }
 }
 
+/// A closure is an observer that watches the launch's milestones and ignores
+/// the command's output.
+///
+/// The same blanket impl [`ProvisionObserver`] carries, so a caller that wants
+/// one line per milestone writes the same thing on either side:
+///
+/// ```no_run
+/// # #[cfg(feature = "tarball")]
+/// # fn main() -> Result<(), ferroday_cage::Error> {
+/// use ferroday_cage::{Cage, Progress};
+///
+/// # let rootfs = "/var/cache/myapp/rootfs";
+/// let mut cage = Cage::builder().command("/bin/true").rootfs(rootfs).build()?;
+/// cage.run_with(&mut |event: Progress| eprintln!("{event:?}"))?;
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "tarball"))]
+/// # fn main() {}
+/// ```
+///
+/// A closure cannot receive the command's output, because it would have no way
+/// to say which stream a chunk came from. An observer that wants the output
+/// implements the trait.
+///
+/// [`ProvisionObserver`]: crate::provision::ProvisionObserver
+impl<F: FnMut(Progress)> Observer for F {
+    fn progress(&mut self, event: Progress) {
+        self(event)
+    }
+}
+
 /// A completed command's exit status and its captured output.
 ///
 /// Produced by [`Cage::output`], the run-it-and-give-me-everything shape of a

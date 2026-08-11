@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::extract::extract_archive;
 use super::tar::TarReader;
-use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, compress, io_error};
+use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, compress};
 
 /// How often the byte counter reports progress: once per mebibyte consumed.
 ///
@@ -152,7 +152,8 @@ impl Provisioner for Tarball {
 
         let (reader, total): (Box<dyn Read + Send>, Option<u64>) = match &mut self.source {
             Source::Path(path) => {
-                let file = File::open(&*path).map_err(|err| io_error("opening", path, err))?;
+                let file =
+                    File::open(&*path).map_err(|err| ProvisionError::io("opening", &*path, err))?;
                 let total = file.metadata().ok().map(|meta| meta.len());
                 (Box::new(file), total)
             }
@@ -178,8 +179,8 @@ impl Provisioner for Tarball {
 
         // Sniff the compression from the leading magic bytes, then hand the
         // full stream (head included) to the chosen decoder.
-        let head =
-            compress::sniff_head(&mut source).map_err(|err| io_error("reading", &subject, err))?;
+        let head = compress::sniff_head(&mut source)
+            .map_err(|err| ProvisionError::io("reading", &subject, err))?;
         let decoded = compress::decompress(&head, source)?;
 
         let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded));

@@ -18,6 +18,11 @@ use ferroday_cage::Identity;
 /// End-of-file arrives when the last replica descriptor anywhere closes, which
 /// the launch guarantees for every process that is not the command, so this
 /// terminates on its own once the session ends.
+/// Deliberately the plain read-to-end rather than the testkit's
+/// deadline-bounded reader: what these tests assert is that the primary reaches
+/// *end of file* when the sandbox's replicas close, rather than failing with
+/// the `EIO` a pseudoterminal reports on some paths. A reader that treated
+/// `EIO` as an ending would pass either way.
 fn drain(pty: &mut Pty) -> String {
     let mut written = Vec::new();
     pty.read_to_end(&mut written)

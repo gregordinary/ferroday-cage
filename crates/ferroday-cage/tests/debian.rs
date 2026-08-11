@@ -2396,17 +2396,17 @@ struct Watching {
     asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-impl ferroday_cage::provision::debian::Fetch for Watching {
+impl ferroday_cage::provision::Fetch for Watching {
     fn fetch(
         &mut self,
-        request: &ferroday_cage::provision::debian::FetchRequest<'_>,
+        request: &ferroday_cage::provision::FetchRequest<'_>,
         sink: &mut dyn std::io::Write,
-    ) -> Result<(), ferroday_cage::provision::debian::FetchError> {
+    ) -> Result<(), ferroday_cage::provision::FetchError> {
         self.asked
             .lock()
             .expect("the URL log is not poisoned")
             .push(request.url().to_string());
-        ferroday_cage::provision::debian::HttpFetch::new().fetch(request, sink)
+        ferroday_cage::provision::HttpFetch::new().fetch(request, sink)
     }
 }
 

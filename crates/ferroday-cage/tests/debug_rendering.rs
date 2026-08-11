@@ -135,11 +135,11 @@ fn a_builder_shows_its_settings_and_names_its_delegate() {
     }
 
     // Observing wraps the bootstrap; the rendering carries it and names the
-    // sink, which is a caller's closure and has nothing to show.
+    // sink, which is a caller's own observer and has nothing to show.
     let observed = debian.observe(&mut sink);
     let rendering = format!("{observed:?}");
     assert!(
-        rendering.contains("sink: <dyn FnMut(DebianEvent)>"),
+        rendering.contains("sink: <dyn DebianObserver>"),
         "{rendering}"
     );
     assert!(rendering.contains("trixie"), "{rendering}");

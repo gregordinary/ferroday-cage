@@ -44,11 +44,15 @@
 //! ```
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ferroday_cage::{Cage, CageBuilder, ConfigError, Error, ExitStatus, Network, SetupStep};
+use ferroday_cage::{Cage, CageBuilder, ConfigError, Error, Network};
+
+mod common;
+
+use common::{flag_value, into_string, usage_error, value_for};
 
 const USAGE: &str = "\
 Run commands inside named, group-based sandbox profiles.
@@ -128,7 +132,7 @@ fn main() -> ExitCode {
         }
         Ok(Invocation::List { profiles }) => match profile_dir(profiles) {
             Ok(dir) => run_list(&dir),
-            Err(message) => usage_error(&message),
+            Err(message) => usage_error("orchestrator", &message),
         },
         Ok(Invocation::Run {
             profiles,
@@ -137,9 +141,9 @@ fn main() -> ExitCode {
             command_line,
         }) => match profile_dir(profiles) {
             Ok(dir) => run_group(&dir, &group, overrides, command_line),
-            Err(message) => usage_error(&message),
+            Err(message) => usage_error("orchestrator", &message),
         },
-        Err(message) => usage_error(&message),
+        Err(message) => usage_error("orchestrator", &message),
     }
 }
 
@@ -329,7 +333,7 @@ fn run_group(
 ) -> ExitCode {
     let path = match group_profile_path(dir, group) {
         Ok(path) => path,
-        Err(message) => return usage_error(&message),
+        Err(message) => return usage_error("orchestrator", &message),
     };
 
     // A profile is a CageBuilder, so it deserializes straight into one.
@@ -375,7 +379,7 @@ fn run_group(
         Ok(cage) => launch(cage),
         Err(error) => {
             report_build_error(group, &error);
-            ExitCode::from(error_exit_code(&error))
+            ExitCode::from(error.shell_code())
         }
     }
 }
@@ -406,25 +410,11 @@ fn load_group(path: &Path) -> Result<CageBuilder, String> {
 /// mapping the outcome onto the process exit status.
 fn launch(cage: Cage) -> ExitCode {
     match cage.spawn().and_then(|mut running| running.wait()) {
-        Ok(status) => exit_code_for(status),
+        Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
             eprintln!("orchestrator: {error}");
-            ExitCode::from(error_exit_code(&error))
+            ExitCode::from(error.shell_code())
         }
-    }
-}
-
-/// Maps a command's exit status onto the process exit code, following the
-/// shell convention of 128 plus the signal number for a signalled command.
-fn exit_code_for(status: ExitStatus) -> ExitCode {
-    if let Some(code) = status.code() {
-        ExitCode::from(code as u8)
-    } else if let Some(signal) = status.signal() {
-        ExitCode::from(128_u8.wrapping_add(signal as u8))
-    } else {
-        // A wait status is always an exit code or a signal; a fallback rather
-        // than a panic keeps this tail total.
-        ExitCode::FAILURE
     }
 }
 
@@ -440,47 +430,4 @@ fn report_build_error(group: &str, error: &Error) {
         ),
         other => eprintln!("orchestrator: {other}"),
     }
-}
-
-/// The launcher conventions: 127 when the command does not exist, 126 when it
-/// exists but cannot be executed, 125 for any other library failure.
-fn error_exit_code(error: &Error) -> u8 {
-    match error {
-        Error::Setup {
-            step: SetupStep::Exec,
-            errno,
-            ..
-        } => match std::io::Error::from_raw_os_error(*errno).kind() {
-            std::io::ErrorKind::NotFound => 127,
-            _ => 126,
-        },
-        _ => 125,
-    }
-}
-
-/// Prints a usage error and returns the usage exit code.
-fn usage_error(message: &str) -> ExitCode {
-    eprintln!("orchestrator: {message}");
-    eprintln!("Try 'orchestrator --help' for usage.");
-    ExitCode::from(2)
-}
-
-/// Consumes the next argument as a required value.
-fn value_for(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
-    args.next()
-        .ok_or_else(|| format!("{name} requires a value"))
-}
-
-/// Converts an argument to a `String`, requiring UTF-8.
-fn into_string(name: &str, value: OsString) -> Result<String, String> {
-    value
-        .into_string()
-        .map_err(|_| format!("{name} must be valid UTF-8"))
-}
-
-/// Splits `--flag=value` syntax, preserving a non-UTF-8 value.
-fn flag_value(arg: &OsStr, prefix: &[u8]) -> Option<OsString> {
-    arg.as_bytes()
-        .strip_prefix(prefix)
-        .map(|value| OsString::from_vec(value.to_vec()))
 }

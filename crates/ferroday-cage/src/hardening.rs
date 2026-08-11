@@ -26,13 +26,158 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fmt;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use rustix::thread::CapabilitySet;
 
 use crate::error::ConfigError;
 use crate::mechanism::{HardeningPlan, LandlockNetRule, LandlockRule, SockFilter};
+
+/// Declares the text side of a letter-set access type: its
+/// [`Display`](fmt::Display), its [`FromStr`], the parse error it produces, and
+/// the serde adapters that go through both.
+///
+/// [`FsAccess`] and [`NetAccess`] are the same type twice — a bitflag newtype
+/// whose textual form is an unordered set of single letters — differing only in
+/// the letters, the flags, and their names. Everything that follows from the
+/// letter table is generated from the table.
+///
+/// Letters are declared in the order [`Display`](fmt::Display) writes them, and
+/// parsing accepts them in any order and any case. A letter outside the table,
+/// or a letter given twice, is a parse error; the empty string is the empty
+/// set.
+macro_rules! letter_set_text {
+    (
+        $set:ident, $expected:literal,
+        $( $letter:literal => $flag:ident, )+
+        $(#[$error_meta:meta])*
+        $error:ident
+    ) => {
+        impl fmt::Display for $set {
+            #[doc = concat!("Writes the rights as the letters ", $expected, ", in that order; the empty set writes nothing.")]
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                $(
+                    if self.contains($set::$flag) {
+                        write!(f, "{}", $letter)?;
+                    }
+                )+
+                Ok(())
+            }
+        }
+
+        impl FromStr for $set {
+            type Err = $error;
+
+            #[doc = concat!("Parses an access set from the letters ", $expected, ", in any order and any case. A letter outside that set, or a letter given twice, is an error; the empty string is the empty set.")]
+            fn from_str(s: &str) -> Result<$set, $error> {
+                let mut access = $set::empty();
+                for ch in s.chars() {
+                    let right = match ch.to_ascii_lowercase() {
+                        $( $letter => $set::$flag, )+
+                        _ => return Err($error { text: s.to_string() }),
+                    };
+                    if access.contains(right) {
+                        return Err($error { text: s.to_string() });
+                    }
+                    access |= right;
+                }
+                Ok(access)
+            }
+        }
+
+        $(#[$error_meta])*
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct $error {
+            text: String,
+        }
+
+        impl $error {
+            /// The access string that failed to parse, as it was given.
+            ///
+            /// Named `text` on every parse error in this crate, so a caller
+            /// moving between them does not have to check.
+            pub fn text(&self) -> &str {
+                &self.text
+            }
+        }
+
+        impl fmt::Display for $error {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    concat!("invalid access set {:?}: expected some combination of the letters ", $expected),
+                    self.text,
+                )
+            }
+        }
+
+        impl std::error::Error for $error {}
+
+        #[cfg(feature = "serde")]
+        impl serde::Serialize for $set {
+            /// Serializes as the letter string, through [`Display`](fmt::Display).
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(self)
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl<'de> serde::Deserialize<'de> for $set {
+            /// Deserializes from the letter string, through [`FromStr`].
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<$set, D::Error> {
+                let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+                text.parse().map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+/// Declares the bitwise operators of a bitflag newtype over an integer.
+///
+/// `!` complements within `MASK`, so a bit outside the modeled set is never
+/// produced.
+macro_rules! bitflag_ops {
+    ($set:ident) => {
+        impl BitOr for $set {
+            type Output = $set;
+
+            fn bitor(self, rhs: $set) -> $set {
+                $set(self.0 | rhs.0)
+            }
+        }
+
+        impl BitOrAssign for $set {
+            fn bitor_assign(&mut self, rhs: $set) {
+                self.0 |= rhs.0;
+            }
+        }
+
+        impl BitAnd for $set {
+            type Output = $set;
+
+            fn bitand(self, rhs: $set) -> $set {
+                $set(self.0 & rhs.0)
+            }
+        }
+
+        impl BitAndAssign for $set {
+            fn bitand_assign(&mut self, rhs: $set) {
+                self.0 &= rhs.0;
+            }
+        }
+
+        impl Not for $set {
+            type Output = $set;
+
+            /// The modeled rights this set does not hold; bits outside the
+            /// modeled set are never produced.
+            fn not(self) -> $set {
+                $set(!self.0 & $set::MASK)
+            }
+        }
+    };
+}
 
 /// Kernel `LANDLOCK_ACCESS_FS_*` rights. Named here rather than pulled from a
 /// binding so the ABI contract is visible in one place; re-verify against the
@@ -263,134 +408,18 @@ impl FsAccess {
     }
 }
 
-impl BitOr for FsAccess {
-    type Output = FsAccess;
+bitflag_ops!(FsAccess);
 
-    fn bitor(self, rhs: FsAccess) -> FsAccess {
-        FsAccess(self.0 | rhs.0)
-    }
-}
-
-impl BitOrAssign for FsAccess {
-    fn bitor_assign(&mut self, rhs: FsAccess) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl BitAnd for FsAccess {
-    type Output = FsAccess;
-
-    fn bitand(self, rhs: FsAccess) -> FsAccess {
-        FsAccess(self.0 & rhs.0)
-    }
-}
-
-impl BitAndAssign for FsAccess {
-    fn bitand_assign(&mut self, rhs: FsAccess) {
-        self.0 &= rhs.0;
-    }
-}
-
-impl Not for FsAccess {
-    type Output = FsAccess;
-
-    /// The modeled rights this set does not hold; bits outside the modeled
-    /// set are never produced.
-    fn not(self) -> FsAccess {
-        FsAccess(!self.0 & FsAccess::MASK)
-    }
-}
-
-impl fmt::Display for FsAccess {
-    /// Writes the rights as the letters `r`, `w`, and `x`, in that order, like
-    /// a Unix file mode; the empty set writes nothing.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.contains(FsAccess::READ) {
-            f.write_str("r")?;
-        }
-        if self.contains(FsAccess::WRITE) {
-            f.write_str("w")?;
-        }
-        if self.contains(FsAccess::EXECUTE) {
-            f.write_str("x")?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for FsAccess {
-    type Err = ParseFsAccessError;
-
-    /// Parses an access set from the letters `r` (read), `w` (write), and `x`
-    /// (execute), in any order and any case. A letter outside that set, or a
-    /// letter given twice, is an error; the empty string is the empty set.
-    fn from_str(s: &str) -> Result<FsAccess, ParseFsAccessError> {
-        let mut access = FsAccess::empty();
-        for ch in s.chars() {
-            let right = match ch {
-                'r' | 'R' => FsAccess::READ,
-                'w' | 'W' => FsAccess::WRITE,
-                'x' | 'X' => FsAccess::EXECUTE,
-                _ => {
-                    return Err(ParseFsAccessError {
-                        text: s.to_string(),
-                    });
-                }
-            };
-            if access.contains(right) {
-                return Err(ParseFsAccessError {
-                    text: s.to_string(),
-                });
-            }
-            access |= right;
-        }
-        Ok(access)
-    }
-}
-
-/// The error from parsing an [`FsAccess`] from an invalid access string.
-///
-/// Produced when the string holds a character other than `r`, `w`, or `x`, or
-/// repeats one of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseFsAccessError {
-    text: String,
-}
-
-impl ParseFsAccessError {
-    /// The access string that failed to parse, as it was given.
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-}
-
-impl fmt::Display for ParseFsAccessError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid access set {:?}: expected some combination of the letters r, w, and x",
-            self.text,
-        )
-    }
-}
-
-impl std::error::Error for ParseFsAccessError {}
-
-#[cfg(feature = "serde")]
-impl serde::Serialize for FsAccess {
-    /// Serializes as the `rwx` letter string, through [`Display`](fmt::Display).
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for FsAccess {
-    /// Deserializes from the `rwx` letter string, through [`FromStr`].
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<FsAccess, D::Error> {
-        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
+letter_set_text! {
+    FsAccess, "r, w, and x",
+    'r' => READ,
+    'w' => WRITE,
+    'x' => EXECUTE,
+    /// The error from parsing an [`FsAccess`] from an invalid access string.
+    ///
+    /// Produced when the string holds a character other than `r`, `w`, or `x`,
+    /// or repeats one of them.
+    ParseFsAccessError
 }
 
 /// A set of Landlock network access rights, granted on a TCP port by
@@ -463,130 +492,17 @@ impl NetAccess {
     }
 }
 
-impl BitOr for NetAccess {
-    type Output = NetAccess;
+bitflag_ops!(NetAccess);
 
-    fn bitor(self, rhs: NetAccess) -> NetAccess {
-        NetAccess(self.0 | rhs.0)
-    }
-}
-
-impl BitOrAssign for NetAccess {
-    fn bitor_assign(&mut self, rhs: NetAccess) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl BitAnd for NetAccess {
-    type Output = NetAccess;
-
-    fn bitand(self, rhs: NetAccess) -> NetAccess {
-        NetAccess(self.0 & rhs.0)
-    }
-}
-
-impl BitAndAssign for NetAccess {
-    fn bitand_assign(&mut self, rhs: NetAccess) {
-        self.0 &= rhs.0;
-    }
-}
-
-impl Not for NetAccess {
-    type Output = NetAccess;
-
-    /// The modeled rights this set does not hold; bits outside the modeled
-    /// set are never produced.
-    fn not(self) -> NetAccess {
-        NetAccess(!self.0 & NetAccess::MASK)
-    }
-}
-
-impl fmt::Display for NetAccess {
-    /// Writes the rights as the letters `b` (bind) and `c` (connect), in that
-    /// order; the empty set writes nothing.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.contains(NetAccess::BIND) {
-            f.write_str("b")?;
-        }
-        if self.contains(NetAccess::CONNECT) {
-            f.write_str("c")?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for NetAccess {
-    type Err = ParseNetAccessError;
-
-    /// Parses an access set from the letters `b` (bind) and `c` (connect), in
-    /// any order and any case. A letter outside that set, or a letter given
-    /// twice, is an error; the empty string is the empty set.
-    fn from_str(s: &str) -> Result<NetAccess, ParseNetAccessError> {
-        let mut access = NetAccess::empty();
-        for ch in s.chars() {
-            let right = match ch {
-                'b' | 'B' => NetAccess::BIND,
-                'c' | 'C' => NetAccess::CONNECT,
-                _ => {
-                    return Err(ParseNetAccessError {
-                        text: s.to_string(),
-                    });
-                }
-            };
-            if access.contains(right) {
-                return Err(ParseNetAccessError {
-                    text: s.to_string(),
-                });
-            }
-            access |= right;
-        }
-        Ok(access)
-    }
-}
-
-/// The error from parsing a [`NetAccess`] from an invalid access string.
-///
-/// Produced when the string holds a character other than `b` or `c`, or
-/// repeats one of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseNetAccessError {
-    text: String,
-}
-
-impl ParseNetAccessError {
-    /// The access string that failed to parse, as it was given.
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-}
-
-impl fmt::Display for ParseNetAccessError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid access set {:?}: expected some combination of the letters b and c",
-            self.text,
-        )
-    }
-}
-
-impl std::error::Error for ParseNetAccessError {}
-
-#[cfg(feature = "serde")]
-impl serde::Serialize for NetAccess {
-    /// Serializes as the `bc` letter string, through [`Display`](fmt::Display).
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for NetAccess {
-    /// Deserializes from the `bc` letter string, through [`FromStr`].
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<NetAccess, D::Error> {
-        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
+letter_set_text! {
+    NetAccess, "b and c",
+    'b' => BIND,
+    'c' => CONNECT,
+    /// The error from parsing a [`NetAccess`] from an invalid access string.
+    ///
+    /// Produced when the string holds a character other than `b` or `c`, or
+    /// repeats one of them.
+    ParseNetAccessError
 }
 
 /// One Landlock filesystem grant, as configured on the builder.
@@ -1412,7 +1328,7 @@ impl FromStr for Capability {
             .copied()
             .find(|cap| cap.as_str() == normalized)
             .ok_or_else(|| ParseCapabilityError {
-                name: s.to_string(),
+                text: s.to_string(),
             })
     }
 }
@@ -1420,19 +1336,22 @@ impl FromStr for Capability {
 /// The error from parsing an unrecognized [`Capability`] name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseCapabilityError {
-    name: String,
+    text: String,
 }
 
 impl ParseCapabilityError {
     /// The unrecognized name, as it was given.
-    pub fn name(&self) -> &str {
-        &self.name
+    ///
+    /// Named `text` on every parse error in this crate, so a caller moving
+    /// between them does not have to check.
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 
 impl fmt::Display for ParseCapabilityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown capability {:?}", self.name)
+        write!(f, "unknown capability {:?}", self.text)
     }
 }
 
@@ -1615,23 +1534,18 @@ impl Request {
     }
 }
 
-/// Validates a Landlock grant path — absolute, normal components only, the
+/// Validates a Landlock grant path — absolute, ordinary components only, the
 /// bare root allowed so a grant can cover a whole tree — and freezes it as a
-/// `CString`. In a cage the path resolves after the pivot; in a restriction
-/// it resolves against the host filesystem.
+/// `CString`.
+///
+/// The bare root is the one way this differs from a mount target's check: a
+/// grant over `/` is a coherent request, where a mount target of `/` is not.
+/// In a cage the path resolves after the pivot; in a restriction it resolves
+/// against the host filesystem.
 fn grant_path_cstring(path: &Path) -> Result<CString, ConfigError> {
-    let invalid = || ConfigError::LandlockPathInvalid {
+    crate::path::absolute_components(path).map_err(|_| ConfigError::LandlockPathInvalid {
         path: path.to_path_buf(),
-    };
-    let mut components = path.components();
-    if components.next() != Some(Component::RootDir) {
-        return Err(invalid());
-    }
-    for component in components {
-        if !matches!(component, Component::Normal(_)) {
-            return Err(invalid());
-        }
-    }
+    })?;
     crate::spec::cstring(path.as_os_str())
 }
 
@@ -2947,7 +2861,7 @@ mod tests {
     #[test]
     fn unknown_capability_name_is_rejected() {
         let err = "not-a-cap".parse::<Capability>().unwrap_err();
-        assert_eq!(err.name(), "not-a-cap");
+        assert_eq!(err.text(), "not-a-cap");
         assert!(err.to_string().contains("not-a-cap"));
     }
 

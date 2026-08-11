@@ -56,11 +56,11 @@ pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianE
             });
         }
         Err(source) => {
-            return Err(DebianError::Io {
-                op: "reading the base layer's dpkg status database",
-                path: base.join(super::bootstrap::STATUS),
+            return Err(DebianError::io(
+                "reading the base layer's dpkg status database",
+                base.join(super::bootstrap::STATUS),
                 source,
-            });
+            ));
         }
     };
 
@@ -195,17 +195,12 @@ mod tests {
         std::fs::create_dir_all(&dpkg).unwrap();
         std::fs::write(dpkg.join("status"), status).unwrap();
     }
-
-    fn tempdir(tag: &str) -> Scratch {
-        Scratch::new(&format!("layer-{tag}"))
-    }
-
     #[test]
     fn read_installed_set_collects_configured_names_and_provides() {
         // Two configured packages, one carrying a Provides, and one half-installed
         // package that must not count. The set is the configured names plus the
         // virtuals they provide.
-        let dir = tempdir("installed-set");
+        let dir = Scratch::for_test("layer", "installed-set");
         base_with_status(
             &dir,
             "Package: libc6\nStatus: install ok installed\nVersion: 2.41\n\n\
@@ -225,7 +220,7 @@ mod tests {
     #[test]
     fn read_installed_set_rejects_a_missing_or_empty_database() {
         // A base with no status database is not a configured bootstrap.
-        let missing = tempdir("no-status");
+        let missing = Scratch::for_test("layer", "no-status");
         assert!(matches!(
             read_installed_set(&missing),
             Err(DebianError::Config { .. }),
@@ -233,7 +228,7 @@ mod tests {
 
         // A status database listing nothing installed (an extract-only tree) is
         // rejected rather than treated as an empty base.
-        let empty = tempdir("empty-status");
+        let empty = Scratch::for_test("layer", "empty-status");
         base_with_status(&empty, "");
         assert!(matches!(
             read_installed_set(&empty),
@@ -248,7 +243,7 @@ mod tests {
         // delete cannot descend — the artifact an overlay mount leaves behind.
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempdir("dispose-single");
+        let dir = Scratch::for_test("layer", "dispose-single");
         let upper = dir.join("upper");
         std::fs::create_dir_all(upper.join("usr/bin")).unwrap();
         std::fs::write(upper.join("usr/bin/tool"), b"x").unwrap();

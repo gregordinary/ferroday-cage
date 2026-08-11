@@ -39,6 +39,7 @@
 //! stack merely loses connectivity.
 
 use std::fmt;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::OwnedFd;
 use std::panic::AssertUnwindSafe;
@@ -198,12 +199,12 @@ impl NetStack {
         let caller = std::fs::read_link("/proc/self/ns/net").map_err(|err| {
             NetStackError::NamespaceJoin {
                 which: "reading the caller's namespace link",
-                errno: err.raw_os_error().unwrap_or(0),
+                source: err.raw_os_error().is_some().then_some(err),
             }
         })?;
         let sandbox = std::fs::read_link(&target).map_err(|err| NetStackError::NamespaceJoin {
             which: "reading the sandbox's namespace link",
-            errno: err.raw_os_error().unwrap_or(0),
+            source: err.raw_os_error().is_some().then_some(err),
         })?;
         if caller == sandbox {
             return Err(NetStackError::SharedNamespace);
@@ -216,7 +217,7 @@ impl NetStack {
         let netns = rustix::fs::open(&target, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
             .map_err(|errno| NetStackError::NamespaceJoin {
                 which: "opening the sandbox's network namespace",
-                errno: errno.raw_os_error(),
+                source: Some(errno.into()),
             })?;
         let userns = rustix::fs::open(
             format!("/proc/{pid}/ns/user"),
@@ -225,7 +226,7 @@ impl NetStack {
         )
         .map_err(|errno| NetStackError::NamespaceJoin {
             which: "opening the sandbox's user namespace",
-            errno: errno.raw_os_error(),
+            source: Some(errno.into()),
         })?;
 
         let tap = tap::create(userns, netns, &self.plan)?;
@@ -234,7 +235,7 @@ impl NetStack {
         // handle closes the write end, which the pump sees as a hangup.
         let (stop_read, stop_write) =
             pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|errno| NetStackError::Spawn {
-                errno: errno.raw_os_error(),
+                source: errno.into(),
             })?;
         let running = Arc::new(AtomicBool::new(true));
         let running_pump = Arc::clone(&running);
@@ -250,12 +251,10 @@ impl NetStack {
                 running_pump.store(false, Ordering::SeqCst);
                 exit.unwrap_or(PumpExit::Failed {
                     op: "recovering from a panic",
-                    errno: 0,
+                    source: None,
                 })
             })
-            .map_err(|err| NetStackError::Spawn {
-                errno: err.raw_os_error().unwrap_or(0),
-            })?;
+            .map_err(|err| NetStackError::Spawn { source: err })?;
 
         Ok(NetStackHandle {
             pump: Some(pump),
@@ -277,8 +276,13 @@ impl Default for NetStack {
 enum PumpExit {
     /// The pump stopped because the handle asked it to.
     Clean,
-    /// The pump stopped on an unrecoverable error of its own machinery.
-    Failed { op: &'static str, errno: i32 },
+    /// The pump stopped on an unrecoverable error of its own machinery. The
+    /// error is absent where the pump stopped on something that was not a
+    /// syscall failure — a panic it recovered from.
+    Failed {
+        op: &'static str,
+        source: Option<io::Error>,
+    },
 }
 
 /// A handle to one attached network stack.
@@ -319,12 +323,12 @@ impl NetStackHandle {
         drop(self.stop.take());
         match pump.join() {
             Ok(PumpExit::Clean) => Ok(()),
-            Ok(PumpExit::Failed { op, errno }) => Err(NetStackError::Pump { op, errno }),
+            Ok(PumpExit::Failed { op, source }) => Err(NetStackError::Pump { op, source }),
             // The pump converts its panics into a failed exit; a join error
             // means that conversion itself was bypassed. Report, not rethrow.
             Err(_) => Err(NetStackError::Pump {
                 op: "recovering from a panic",
-                errno: 0,
+                source: None,
             }),
         }
     }
@@ -377,21 +381,14 @@ impl Drop for NetStackHandle {
     serde(default, rename_all = "kebab-case", deny_unknown_fields)
 )]
 pub struct NetStackBuilder {
-    #[cfg_attr(feature = "serde", serde(rename = "ipv4"))]
     ipv4: bool,
-    #[cfg_attr(feature = "serde", serde(rename = "ipv6"))]
     ipv6: bool,
     #[cfg_attr(feature = "serde", serde(with = "serde_cidr::v4"))]
-    #[cfg_attr(feature = "serde", serde(rename = "ipv4-cidr"))]
     ipv4_cidr: (Ipv4Addr, u8),
     #[cfg_attr(feature = "serde", serde(with = "serde_cidr::v6"))]
-    #[cfg_attr(feature = "serde", serde(rename = "ipv6-cidr"))]
     ipv6_cidr: (Ipv6Addr, u8),
-    #[cfg_attr(feature = "serde", serde(rename = "mtu"))]
     mtu: u16,
-    #[cfg_attr(feature = "serde", serde(rename = "interface"))]
     interface: String,
-    #[cfg_attr(feature = "serde", serde(rename = "host-loopback"))]
     host_loopback: bool,
 }
 
@@ -623,8 +620,8 @@ pub enum NetStackError {
     NamespaceJoin {
         /// The step that failed.
         which: &'static str,
-        /// The raw OS error it failed with.
-        errno: i32,
+        /// The underlying error, absent where the failure carried none.
+        source: Option<io::Error>,
     },
     /// `/dev/net/tun` could not be opened.
     ///
@@ -633,24 +630,24 @@ pub enum NetStackError {
     /// run there.
     #[non_exhaustive]
     TapOpen {
-        /// The raw OS error the open failed with.
-        errno: i32,
+        /// The underlying error.
+        source: io::Error,
     },
     /// The tap interface could not be created.
     #[non_exhaustive]
     TapCreate {
         /// The interface name the creation was asked for.
         name: String,
-        /// The raw OS error the creation failed with.
-        errno: i32,
+        /// The underlying error.
+        source: io::Error,
     },
     /// The tap interface was created but could not be configured.
     #[non_exhaustive]
     TapConfigure {
         /// The configuration step that failed.
         detail: &'static str,
-        /// The raw OS error it failed with.
-        errno: i32,
+        /// The underlying error.
+        source: io::Error,
     },
     /// The tap was created and configured, but its descriptor could not be
     /// handed back to the caller.
@@ -660,14 +657,14 @@ pub enum NetStackError {
     /// destroyed with the helper that made it.
     #[non_exhaustive]
     TapHandoff {
-        /// The raw OS error the handoff failed with.
-        errno: i32,
+        /// The underlying error.
+        source: io::Error,
     },
     /// The stack's helper process or pump thread could not be started.
     #[non_exhaustive]
     Spawn {
-        /// The raw OS error the spawn failed with.
-        errno: i32,
+        /// The underlying error.
+        source: io::Error,
     },
     /// The tap helper exited without delivering a result.
     ///
@@ -681,8 +678,9 @@ pub enum NetStackError {
     Pump {
         /// The operation the pump failed at.
         op: &'static str,
-        /// The raw OS error it failed with, when the failure was a syscall.
-        errno: i32,
+        /// The underlying error, absent where the pump stopped on something
+        /// that was not a syscall failure.
+        source: Option<io::Error>,
     },
 }
 
@@ -711,56 +709,76 @@ impl fmt::Display for NetStackError {
                 "the sandbox shares the caller's network namespace; a network stack \
                  attaches only to a private one",
             ),
-            NetStackError::NamespaceJoin { which, errno: 0 } => write!(
+            NetStackError::NamespaceJoin {
+                which,
+                source: None,
+            } => write!(
                 f,
                 "could not join the sandbox's network namespace while {which}"
             ),
-            NetStackError::NamespaceJoin { which, errno } => write!(
+            NetStackError::NamespaceJoin {
+                which,
+                source: Some(source),
+            } => write!(
                 f,
-                "could not join the sandbox's network namespace while {which}: {}",
-                std::io::Error::from_raw_os_error(*errno),
+                "could not join the sandbox's network namespace while {which}: {source}"
             ),
-            NetStackError::TapOpen { errno } => write!(
+            NetStackError::TapOpen { source } => {
+                write!(f, "could not open /dev/net/tun: {source}")
+            }
+            NetStackError::TapCreate { name, source } => {
+                write!(f, "could not create the tap interface {name}: {source}")
+            }
+            NetStackError::TapConfigure { detail, source } => write!(
                 f,
-                "could not open /dev/net/tun: {}",
-                std::io::Error::from_raw_os_error(*errno),
+                "could not configure the tap interface while {detail}: {source}"
             ),
-            NetStackError::TapCreate { name, errno } => write!(
+            NetStackError::TapHandoff { source } => write!(
                 f,
-                "could not create the tap interface {name}: {}",
-                std::io::Error::from_raw_os_error(*errno),
+                "could not send the tap descriptor back from the network stack's helper: {source}"
             ),
-            NetStackError::TapConfigure { detail, errno } => write!(
+            NetStackError::Spawn { source } => write!(
                 f,
-                "could not configure the tap interface while {detail}: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
-            NetStackError::TapHandoff { errno } => write!(
-                f,
-                "could not send the tap descriptor back from the network stack's helper: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
-            NetStackError::Spawn { errno } => write!(
-                f,
-                "could not start the network stack's helper or pump: {}",
-                std::io::Error::from_raw_os_error(*errno),
+                "could not start the network stack's helper or pump: {source}"
             ),
             NetStackError::HelperLost => {
                 f.write_str("the network stack's tap helper exited without delivering a result")
             }
-            NetStackError::Pump { op, errno: 0 } => {
+            NetStackError::Pump { op, source: None } => {
                 write!(f, "the network stack pump failed while {op}")
             }
-            NetStackError::Pump { op, errno } => write!(
-                f,
-                "the network stack pump failed while {op}: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
+            NetStackError::Pump {
+                op,
+                source: Some(source),
+            } => write!(f, "the network stack pump failed while {op}: {source}"),
         }
     }
 }
 
-impl std::error::Error for NetStackError {}
+impl std::error::Error for NetStackError {
+    /// The OS failure underneath, where there is one.
+    ///
+    /// The configuration refusals — an unusable prefix, an MTU below the
+    /// minimum, an invalid interface name, no protocols, a shared namespace —
+    /// carry no inner error: nothing failed, the request was refused.
+    /// [`HelperLost`](Self::HelperLost) carries none either: the helper's
+    /// silence is the failure.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            NetStackError::NamespaceJoin { source, .. } | NetStackError::Pump { source, .. } => {
+                source
+                    .as_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+            }
+            NetStackError::TapOpen { source }
+            | NetStackError::TapCreate { source, .. }
+            | NetStackError::TapConfigure { source, .. }
+            | NetStackError::TapHandoff { source }
+            | NetStackError::Spawn { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Serde adapters presenting the CIDR fields as `"address/len"` strings, the
 /// reviewable form for profile files.

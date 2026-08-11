@@ -27,6 +27,7 @@
 //! pair has no flag at all: a shell already spells both of its dispositions,
 //! and a profile carries `stdout` and `stderr` where they belong.
 
+mod escalation;
 mod terminal;
 
 use std::ffi::{OsStr, OsString};
@@ -41,9 +42,11 @@ use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ExitStatus, FsAccess, IdRange, Identity,
     IdentityMap, Limit, Mount, NetAccess, NetStack, Network, Overlay, RawMount, Resource,
     RestrictedProfile, Restriction, Running, SeccompArg, SeccompArgLen, SeccompCompare,
-    SeccompPolicy, SeccompRules, SetupStep, Stdio,
+    SeccompPolicy, SeccompRules, Stdio,
 };
 use serde::Deserialize as _;
+
+use escalation::Escalation;
 
 const USAGE: &str = "\
 Run a command inside an unprivileged Linux sandbox.
@@ -1698,18 +1701,14 @@ fn parse_rlimit(spec: &str) -> Result<(Resource, Limit, Limit), String> {
 }
 
 /// Parses a Debian priority floor for `--debian-base-priority`.
+///
+/// The library owns the name table — it is the same one that reads a
+/// `Priority:` field out of an index — so this only prefixes the flag onto the
+/// refusal.
 fn parse_priority(value: &str) -> Result<Priority, String> {
-    match value {
-        "required" => Ok(Priority::Required),
-        "important" => Ok(Priority::Important),
-        "standard" => Ok(Priority::Standard),
-        "optional" => Ok(Priority::Optional),
-        "extra" => Ok(Priority::Extra),
-        other => Err(format!(
-            "--debian-base-priority: unknown priority {other:?}; expected required, important, \
-             standard, optional, or extra"
-        )),
-    }
+    value
+        .parse()
+        .map_err(|err| format!("--debian-base-priority: {err}"))
 }
 
 /// Parses a `--debian-repository` specification:
@@ -1768,6 +1767,12 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
 }
 
 /// Consumes the next argument as a required UTF-8 string value.
+///
+/// The library's examples carry helpers answering the same three questions —
+/// this, [`into_string`], and [`flag_value`] — and keep them because a crate's
+/// examples cannot reach another crate's code, so sharing four
+/// argument-parsing functions would mean publishing a crate for them. Each side
+/// owns the wording of its own diagnostics.
 fn string_value(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<String, String> {
     let value = args.next().ok_or(format!("{name} requires a value"))?;
     into_string(name, value)
@@ -2421,7 +2426,7 @@ fn run_on_a_terminal(
         Ok(launched) => launched,
         Err(error) => {
             eprintln!("fcage: {error}");
-            return ExitCode::from(error_exit_code(&error));
+            return ExitCode::from(error.shell_code());
         }
     };
     conclude_relay(terminal::relay(running, pty, signals, timeout, kill_after))
@@ -2470,7 +2475,7 @@ fn run_with_netstack(
         Ok(cage) => cage,
         Err(error) => {
             eprintln!("fcage: {error}");
-            return ExitCode::from(error_exit_code(&error));
+            return ExitCode::from(error.shell_code());
         }
     };
 
@@ -2507,7 +2512,7 @@ fn run_with_netstack(
         Ok(held) => held,
         Err(error) => {
             eprintln!("fcage: {error}");
-            return ExitCode::from(error_exit_code(&error));
+            return ExitCode::from(error.shell_code());
         }
     };
     let handle = match stack.attach(&pending) {
@@ -2521,7 +2526,7 @@ fn run_with_netstack(
         Ok(running) => running,
         Err(error) => {
             eprintln!("fcage: {error}");
-            return ExitCode::from(error_exit_code(&error));
+            return ExitCode::from(error.shell_code());
         }
     };
 
@@ -2640,7 +2645,7 @@ fn run_restricted(options: Options) -> ExitCode {
             Ok(launched) => launched,
             Err(error) => {
                 eprintln!("fcage: {error}");
-                return ExitCode::from(error_exit_code(&error));
+                return ExitCode::from(error.shell_code());
             }
         };
         return conclude_relay(terminal::relay(
@@ -2668,26 +2673,29 @@ fn landlock_access(writable: bool) -> FsAccess {
     }
 }
 
-/// Waits a launch out under the optional deadline: terminate at the
-/// deadline, kill after the grace period. `Ok(None)` means the deadline
-/// fired.
+/// Waits a launch out under the optional deadline, escalating as
+/// [`Escalation`] says. `Ok(None)` means the deadline fired.
+///
+/// The blocking half of the two waits `fcage` has; the terminal relay drives
+/// the same escalation from its poll loop.
 fn wait_with_deadline(
     mut running: Running<'_>,
     timeout: Option<Duration>,
     kill_after: Duration,
 ) -> Result<Option<ExitStatus>, Error> {
-    let Some(timeout) = timeout else {
-        return running.wait().map(Some);
+    let mut escalation = Escalation::new(timeout, kill_after);
+    let status = loop {
+        // No deadline left: either none was asked for, or the escalation has
+        // run its course and only the outcome is outstanding.
+        let Some(deadline) = escalation.deadline() else {
+            break running.wait()?;
+        };
+        match running.wait_deadline(deadline)? {
+            Some(status) => break status,
+            None => escalation.expire(&mut running)?,
+        }
     };
-    if let Some(status) = running.wait_timeout(timeout)? {
-        return Ok(Some(status));
-    }
-    running.terminate()?;
-    if running.wait_timeout(kill_after)?.is_none() {
-        running.kill()?;
-        running.wait()?;
-    }
-    Ok(None)
+    Ok(escalation.outcome(status))
 }
 
 /// Maps a launch outcome onto the process exit status.
@@ -2696,22 +2704,10 @@ fn conclude(outcome: Result<Option<ExitStatus>, Error>) -> ExitCode {
         // The timeout(1) convention: 124 announces an expired timeout,
         // whatever became of the command afterwards.
         Ok(None) => ExitCode::from(124),
-        Ok(Some(status)) => {
-            if let Some(code) = status.code() {
-                // Wait statuses carry exit codes in the 0..=255 range.
-                ExitCode::from(code as u8)
-            } else if let Some(signal) = status.signal() {
-                // The shell convention for termination by a signal.
-                ExitCode::from(128_u8.wrapping_add(signal as u8))
-            } else {
-                // A wait status is always an exit code or a signal; a fallback
-                // rather than a panic keeps this tail total.
-                ExitCode::FAILURE
-            }
-        }
+        Ok(Some(status)) => ExitCode::from(status.shell_code()),
         Err(error) => {
             eprintln!("fcage: {error}");
-            ExitCode::from(error_exit_code(&error))
+            ExitCode::from(error.shell_code())
         }
     }
 }
@@ -2799,22 +2795,6 @@ fn print_debian_event(event: ferroday_cage::provision::debian::DebianEvent<'_>) 
             let _ = std::io::stderr().write_all(bytes);
         }
         _ => {}
-    }
-}
-
-/// The launcher conventions: 127 when the command does not exist, 126 when
-/// it exists but cannot be executed, 125 for any other library failure.
-fn error_exit_code(error: &Error) -> u8 {
-    match error {
-        Error::Setup {
-            step: SetupStep::Exec,
-            errno,
-            ..
-        } => match std::io::Error::from_raw_os_error(*errno).kind() {
-            std::io::ErrorKind::NotFound => 127,
-            _ => 126,
-        },
-        _ => 125,
     }
 }
 

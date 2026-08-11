@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::os::fd::BorrowedFd;
@@ -22,18 +23,16 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use super::identity::compose_child_map;
-use super::{Delegate, ProvisionError, io_error};
+use super::{Delegate, ProvisionError};
 use crate::IdentityMap;
 use crate::idmap::{IdMapper, IdRange};
+use crate::mechanism::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH};
+use crate::mechanism::frame;
 use crate::mechanism::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_SYMLINK, ChildMap,
-    CopyFailure, LINK_BUF, start_copy_in,
+    CopyFailure, start_copy_in,
 };
-
-/// How deep the walk descends, matching the child's own bound.
-const MAX_DEPTH: usize = 128;
-/// The file-data streaming buffer, matching the child's.
-const DATA_BUF: usize = 65536;
+use crate::path;
 
 /// Copies a host directory tree into a rootfs, with each entry created under
 /// the identity map the rootfs is owned through.
@@ -117,10 +116,10 @@ pub struct CopyIn<'a> {
     mapper: Option<&'a dyn IdMapper>,
 }
 
-impl std::fmt::Debug for CopyIn<'_> {
+impl fmt::Debug for CopyIn<'_> {
     /// Renders every setting, and the mapper by its presence rather than its
     /// contents: it is a caller's trait object, with nothing useful to show.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CopyIn")
             .field("source", &self.source)
             .field("rootfs", &self.rootfs)
@@ -243,8 +242,8 @@ pub enum SkippedKind {
     Socket,
 }
 
-impl std::fmt::Display for SkippedKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SkippedKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let described = match self {
             SkippedKind::CharacterDevice => {
                 "a character device, which needs a privilege the copy does not hold"
@@ -267,14 +266,14 @@ fn copy_in_inner(
     mapper: Option<&dyn IdMapper>,
 ) -> Result<CopyReport, ProvisionError> {
     let rootfs_c = CString::new(rootfs.as_os_str().as_bytes()).map_err(|_| {
-        io_error(
+        ProvisionError::io(
             "copying into",
             rootfs,
             io::Error::from(io::ErrorKind::InvalidInput),
         )
     })?;
     if !source.is_dir() {
-        return Err(io_error(
+        return Err(ProvisionError::io(
             "copying",
             source,
             io::Error::from(io::ErrorKind::NotADirectory),
@@ -399,10 +398,10 @@ impl Walk<'_> {
             });
         }
         let mut entries: Vec<PathBuf> = fs::read_dir(dir)
-            .map_err(|err| io_error("reading", dir, err))?
+            .map_err(|err| ProvisionError::io("reading", dir, err))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<_, _>>()
-            .map_err(|err| io_error("reading", dir, err))?;
+            .map_err(|err| ProvisionError::io("reading", dir, err))?;
         entries.sort();
 
         for path in entries {
@@ -415,9 +414,10 @@ impl Walk<'_> {
                 .as_bytes()
                 .to_vec();
             // The child refuses anything that is not a single ordinary
-            // component, but refusing here too means the caller gets a path in
-            // the message rather than an errno from a forked process.
-            if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
+            // component, by the same rule, but refusing here too means the
+            // caller gets a path in the message rather than an errno from a
+            // forked process.
+            if !path::is_ordinary_component(&name) {
                 return Err(ProvisionError::EntryRefused {
                     path: path.clone(),
                     reason: "the entry name is not a single path component".to_string(),
@@ -435,8 +435,8 @@ impl Walk<'_> {
             // recreated as a symlink inside the destination, and never
             // traversed: the walk does not descend through one, and the child
             // opens each directory with `O_NOFOLLOW`.
-            let meta =
-                fs::symlink_metadata(&path).map_err(|err| io_error("reading", &path, err))?;
+            let meta = fs::symlink_metadata(&path)
+                .map_err(|err| ProvisionError::io("reading", &path, err))?;
             let kind = meta.file_type();
             if kind.is_dir() {
                 self.emit_named(stream, COPY_DIR, &name, &meta, &path)?;
@@ -454,7 +454,8 @@ impl Walk<'_> {
                 put(stream, &meta.len().to_le_bytes(), &path)?;
                 stream_file(stream, &path, meta.len())?;
             } else if kind.is_symlink() {
-                let target = fs::read_link(&path).map_err(|err| io_error("reading", &path, err))?;
+                let target = fs::read_link(&path)
+                    .map_err(|err| ProvisionError::io("reading", &path, err))?;
                 let target = target.as_os_str().as_bytes();
                 if target.len() > u16::MAX as usize {
                     return Err(ProvisionError::EntryRefused {
@@ -660,7 +661,7 @@ fn inside(extents: &[IdRange], host: u32, which: &str, path: &Path) -> Result<u3
 /// reported at all rather than as a desynchronized child; it is not a reason to
 /// hand back a rootfs holding a zero-padded binary and call it a copy.
 fn stream_file(stream: BorrowedFd<'_>, path: &Path, size: u64) -> Result<(), ProvisionError> {
-    let mut file = fs::File::open(path).map_err(|err| io_error("reading", path, err))?;
+    let mut file = fs::File::open(path).map_err(|err| ProvisionError::io("reading", path, err))?;
     let mut buf = [0u8; DATA_BUF];
     let mut left = size;
     let mut changed = false;
@@ -668,7 +669,7 @@ fn stream_file(stream: BorrowedFd<'_>, path: &Path, size: u64) -> Result<(), Pro
         let want = usize::try_from(left.min(DATA_BUF as u64)).unwrap_or(DATA_BUF);
         let read = file
             .read(&mut buf[..want])
-            .map_err(|err| io_error("reading", path, err))?;
+            .map_err(|err| ProvisionError::io("reading", path, err))?;
         if read == 0 {
             // The file is shorter than its stat said.
             changed = true;
@@ -687,7 +688,7 @@ fn stream_file(stream: BorrowedFd<'_>, path: &Path, size: u64) -> Result<(), Pro
         let mut past = [0u8; 1];
         changed = file
             .read(&mut past)
-            .map_err(|err| io_error("reading", path, err))?
+            .map_err(|err| ProvisionError::io("reading", path, err))?
             != 0;
     }
     if changed {
@@ -699,26 +700,14 @@ fn stream_file(stream: BorrowedFd<'_>, path: &Path, size: u64) -> Result<(), Pro
     Ok(())
 }
 
-/// Writes `data` in full to the child's stream.
+/// Writes `data` in full to the child's stream, blaming `path` for a failure.
+///
+/// The child is the only thing that can end the write early, and its outcome
+/// record says why; this reports the broken pipe and lets `finish` supply the
+/// reason.
 fn put(stream: BorrowedFd<'_>, data: &[u8], path: &Path) -> Result<(), ProvisionError> {
-    let mut written = 0;
-    while written < data.len() {
-        match rustix::io::write(stream, &data[written..]) {
-            Ok(0) => {
-                return Err(io_error(
-                    "copying",
-                    path,
-                    io::Error::from(io::ErrorKind::WriteZero),
-                ));
-            }
-            Ok(n) => written += n,
-            Err(rustix::io::Errno::INTR) => continue,
-            // The child is gone. Its outcome record says why, so this reports a
-            // broken pipe and lets `finish` supply the reason.
-            Err(errno) => return Err(io_error("copying", path, errno.into())),
-        }
-    }
-    Ok(())
+    frame::write_full(stream, data)
+        .map_err(|errno| ProvisionError::io("copying", path, errno.into()))
 }
 
 #[cfg(test)]

@@ -1,17 +1,12 @@
 //! The running-sandbox handle: wait, deadline, terminate, kill.
 
-use std::ffi::CString;
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use rustix::event::Timespec;
-use rustix::event::{PollFd, PollFlags};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 use rustix::net::SendFlags;
 use rustix::process;
@@ -20,7 +15,8 @@ use rustix::process::Signal;
 use crate::error::Error;
 use crate::mechanism::{self, CONTROL_TERMINATE, LaunchPlan, ManagedPlaceholders};
 use crate::observer::Observer;
-use crate::spec;
+use crate::poll;
+use crate::provision::rooted::Rooted;
 use crate::status::ExitStatus;
 use crate::terminal::{Pty, Terminal};
 
@@ -363,7 +359,7 @@ impl<'obs> Running<'obs> {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         return Ok(None);
                     };
-                    Some(timespec_from(remaining))
+                    Some(poll::timeout(remaining))
                 }
             };
 
@@ -371,9 +367,9 @@ impl<'obs> Running<'obs> {
             // nothing. A retired channel's slot watches the pidfd with no
             // requested events: a valid descriptor the poll ignores.
             let mut pollfds = [
-                poll_slot(&self.stdout, &self.pidfd),
-                poll_slot(&self.stderr, &self.pidfd),
-                poll_slot(&self.status, &self.pidfd),
+                poll::slot(&self.stdout, &self.pidfd),
+                poll::slot(&self.stderr, &self.pidfd),
+                poll::slot(&self.status, &self.pidfd),
             ];
 
             match rustix::event::poll(&mut pollfds, timeout.as_ref()) {
@@ -501,7 +497,7 @@ impl Drop for PlaceholderGuard {
         }
         // One descriptor for the root, which every path below is resolved
         // against; nothing here walks the host's own tree.
-        let Some(root) = spec::open_root(&self.placeholders.root) else {
+        let Ok(root) = Rooted::open(&self.placeholders.root) else {
             return;
         };
         for path in &self.placeholders.paths {
@@ -513,13 +509,14 @@ impl Drop for PlaceholderGuard {
 /// Removes a mount target the launch created in the root, once the sandbox
 /// that needed it is gone.
 ///
-/// `path` is relative to `root` and is resolved against it with `openat2` and
-/// `RESOLVE_IN_ROOT` — the containment the sandbox stage gives every mount
-/// target, for the same reason. A rootfs is entitled to hold an absolute
-/// symbolic link (`./etc -> /etc` in an unpacked tarball, an `/etc/resolv.conf`
-/// pointing into a resolver's runtime directory), and joining the two into one
-/// host path would have that link resolve against the *host's* root on this side
-/// of the fork, which is where the unlink below would then land.
+/// `path` is relative to `root` and is resolved against it by [`Rooted`], with
+/// `openat2` and `RESOLVE_IN_ROOT` — the containment the sandbox stage gives
+/// every mount target, for the same reason. A rootfs is entitled to hold an
+/// absolute symbolic link (`./etc -> /etc` in an unpacked tarball, an
+/// `/etc/resolv.conf` pointing into a resolver's runtime directory), and joining
+/// the two into one host path would have that link resolve against the *host's*
+/// root on this side of the fork, which is where the unlink below would then
+/// land.
 ///
 /// Only an empty regular file is removed. The placeholder a launch creates is
 /// empty and stays that way — the bind covers it for the sandbox's whole life,
@@ -535,39 +532,8 @@ impl Drop for PlaceholderGuard {
 ///
 /// Best-effort, like the teardown around it. A failure leaves a file the rootfs
 /// did not ship, which is untidy but not a failure of the launch itself.
-fn remove_managed_placeholder(root: &OwnedFd, path: &Path) {
-    // The parent is resolved inside the root and the leaf is then addressed by
-    // name under it, so the `AT_SYMLINK_NOFOLLOW` stat and the unlink name one
-    // and the same entry, and neither follows a link out of the tree.
-    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
-        return;
-    };
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    let Ok(parent) = CString::new(parent.as_os_str().as_bytes()) else {
-        return;
-    };
-    let Ok(dir) = rustix::fs::openat2(
-        root,
-        parent.as_c_str(),
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::IN_ROOT,
-    ) else {
-        return;
-    };
-    match rustix::fs::statat(&dir, leaf, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat)
-            if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-                && stat.st_size == 0 =>
-        {
-            let _ = rustix::fs::unlinkat(&dir, leaf, AtFlags::empty());
-        }
-        _ => {}
-    }
+fn remove_managed_placeholder(root: &Rooted, path: &Path) {
+    let _ = root.remove_if(path, Rooted::is_empty_file);
 }
 
 /// A detached signaling handle for a running sandbox.
@@ -843,39 +809,18 @@ fn send_kill(pidfd: &OwnedFd, kill_sent: &AtomicBool) -> Result<(), Error> {
     }
 }
 
-/// Builds the poll entry for a channel: the channel's descriptor when it
-/// is live, and otherwise `placeholder` with no requested events — an
-/// always-valid descriptor whose slot the poll leaves quiet.
-fn poll_slot<'fd>(fd: &'fd Option<OwnedFd>, placeholder: &'fd OwnedFd) -> PollFd<'fd> {
-    match fd {
-        Some(fd) => PollFd::new(fd, PollFlags::IN),
-        None => PollFd::new(placeholder, PollFlags::empty()),
-    }
-}
-
-/// Converts a remaining duration into a poll timeout, saturating rather
-/// than overflowing on absurd durations.
-fn timespec_from(duration: Duration) -> Timespec {
-    Timespec {
-        tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-        tv_nsec: i64::from(duration.subsec_nanos()),
-    }
-}
-
 fn wait_error(errno: Errno) -> Error {
     Error::Wait {
-        errno: errno.raw_os_error(),
+        source: errno.into(),
     }
 }
 
 fn signal_error(errno: Errno) -> Error {
     Error::Signal {
-        errno: errno.raw_os_error(),
+        source: errno.into(),
     }
 }
 
 fn clone_error(err: std::io::Error) -> Error {
-    Error::Signal {
-        errno: err.raw_os_error().unwrap_or(Errno::IO.raw_os_error()),
-    }
+    Error::Signal { source: err }
 }

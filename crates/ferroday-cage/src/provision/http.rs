@@ -1,9 +1,9 @@
 //! The default fetcher: a minimal HTTP/1.1 client plus `file://`.
 //!
-//! It speaks just enough HTTP to retrieve static files from a Debian mirror
-//! over plain `http://` — a single `GET`, content-length or chunked bodies,
-//! capped redirects, connect and read timeouts — with no dependency beyond
-//! `std::net`. Authenticity of what it fetches comes from the archive
+//! It speaks just enough HTTP to retrieve static files from a distribution
+//! mirror over plain `http://` — a single `GET`, content-length or chunked
+//! bodies, capped redirects, connect and read timeouts — with no dependency
+//! beyond `std::net`. Authenticity of what it fetches comes from the archive
 //! signature, verified above this layer, not from the transport; a consumer
 //! who needs HTTPS or a proxy supplies their own [`Fetch`]. `file://` URLs
 //! read a local path, which serves local mirrors and the test suite.
@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::fetch::{Fetch, FetchError, FetchRequest};
@@ -82,6 +83,10 @@ impl HttpFetch {
     /// Sets the whole-request deadline bounding the total time one fetch may
     /// take, or `None` to remove the bound. The default is one hour per file;
     /// raise it only to fetch an unusually large artifact over a slow link.
+    ///
+    /// A timeout beyond what the clock can express removes the bound as well:
+    /// there is no faithful deadline for one, and asking to wait that long is
+    /// asking to wait.
     pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.request_timeout = timeout;
         self
@@ -115,7 +120,7 @@ impl Fetch for HttpFetch {
         // not serving the resource that was asked for, and the digest check
         // that catches the substitution runs only after the bytes are spent.
         let cap = request.size().map_or(MAX_BODY, |size| size.min(MAX_BODY));
-        if let Some(path) = url.strip_prefix("file://") {
+        if let Some(path) = strip_scheme(url, "file://") {
             return fetch_file(url, path, sink, cap);
         }
         let mut current = url.to_string();
@@ -168,7 +173,7 @@ impl HttpFetch {
     /// one that runs past `cap` bytes.
     fn request(&self, url: &str, sink: &mut dyn Write, cap: u64) -> Result<Step, FetchError> {
         let parsed = parse_http_url(url)?;
-        let io = |op: &'static str| move |source: io::Error| FetchError::io(url, op, source);
+        let io = |op: &'static str| FetchError::at(op, url);
 
         let addrs = (parsed.host.as_str(), parsed.port)
             .to_socket_addrs()
@@ -198,7 +203,13 @@ impl HttpFetch {
         // Bound the whole response, not just each read: the deadline is checked
         // before every underlying read, so a mirror that trickles bytes to keep
         // the per-read timeout from firing still fails once the deadline passes.
-        let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
+        //
+        // A timeout the clock cannot express is a fetch without a deadline,
+        // which is what a caller asking to wait some hundreds of billions of
+        // years asked for; the addition would otherwise overflow and panic.
+        let deadline = self
+            .request_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
         let mut reader = BufReader::new(DeadlineReader {
             inner: stream,
             deadline,
@@ -228,7 +239,7 @@ impl HttpFetch {
         // may weigh — the signed length where one is stated, `MAX_BODY`
         // otherwise — so a hostile mirror cannot drive unbounded buffering by
         // announcing a huge framing or never closing the connection.
-        let mut sink = LimitedWriter::new(sink, cap);
+        let mut sink = super::LimitedWriter::new(sink, cap);
         if headers.chunked {
             read_chunked(&mut reader, &mut sink).map_err(io("reading the body"))?;
         } else if let Some(length) = headers.content_length {
@@ -269,7 +280,7 @@ impl HttpFetch {
             }
         }
         Err(match last {
-            Some(source) => FetchError::io(url, "connecting", source),
+            Some(source) => FetchError::io("connecting", url, source),
             None => FetchError::url(url, "the host resolved to no addresses"),
         })
     }
@@ -302,6 +313,46 @@ impl HttpFetch {
     }
 }
 
+/// The `file://` URL naming a local path — the URL form of a repository that
+/// lives on this machine.
+///
+/// This is the construction side of what this module's own fetcher reads back,
+/// and the two are stated together so a change to either is made against the
+/// other.
+/// A relative path is made absolute against the current directory, since a
+/// `file://` URL has no way to carry one: the authority is the machine and what
+/// follows it is a path from the root. The path need not exist, so the URL for
+/// a repository is available before it is written.
+///
+/// A caller reaches this for any repository that lives on this machine —
+/// a Debian pool, which answers for itself through `Pool::mirror_url`, or an
+/// apk repository assembled some other way; the result goes to the mirror
+/// setting of whichever repository builder is being configured.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Url`] for a path that is not valid UTF-8, which no URL
+/// can spell, and [`FetchError::Io`] when the current directory cannot be read
+/// to make a relative path absolute. The failure is the transport's because the
+/// locator is: a path that cannot be named is a resource that cannot be
+/// addressed, whichever layer wanted to address it.
+pub fn file_url(path: &Path) -> Result<String, FetchError> {
+    let absolute = std::path::absolute(path).map_err(|source| {
+        FetchError::io(
+            "resolving a path for its file:// URL",
+            path.display().to_string(),
+            source,
+        )
+    })?;
+    let text = absolute.to_str().ok_or_else(|| {
+        FetchError::url(
+            absolute.display().to_string(),
+            "the path is not valid UTF-8 and cannot be named by a file:// URL",
+        )
+    })?;
+    Ok(format!("file://{text}"))
+}
+
 /// Reads a local file for a `file://` URL, refusing one that runs past `cap`
 /// bytes.
 fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write, cap: u64) -> Result<(), FetchError> {
@@ -310,12 +361,11 @@ fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write, cap: u64) -> Result<(
         if source.kind() == io::ErrorKind::NotFound {
             FetchError::not_found(url)
         } else {
-            FetchError::io(url, "opening the file", source)
+            FetchError::io("opening the file", url, source)
         }
     })?;
-    let mut sink = LimitedWriter::new(sink, cap);
-    io::copy(&mut file, &mut sink)
-        .map_err(|source| FetchError::io(url, "reading the file", source))?;
+    let mut sink = super::LimitedWriter::new(sink, cap);
+    io::copy(&mut file, &mut sink).map_err(FetchError::at("reading the file", url))?;
     Ok(())
 }
 
@@ -400,13 +450,29 @@ fn resolve_redirect(base: &str, location: &str) -> String {
     }
 }
 
+/// Strips `scheme` from `url`, comparing it case-insensitively.
+///
+/// Only the scheme is case-insensitive; the rest of the URL is returned exactly
+/// as written, since a path is not.
+fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
+    let prefix = url.get(..scheme.len())?;
+    prefix
+        .eq_ignore_ascii_case(scheme)
+        .then(|| &url[scheme.len()..])
+}
+
 /// Parses an `http://host[:port]/path` URL.
+///
+/// The scheme is matched case-insensitively, as RFC 3986 §3.1 requires and as
+/// [`scheme_of`](super::fetch::scheme_of) documents. A literal comparison would
+/// let `HTTP://` be a URL one check in this crate accepts and another refuses,
+/// with the second refusing it for the wrong reason.
 fn parse_http_url(url: &str) -> Result<HttpUrl, FetchError> {
     let bad = |reason: &str| FetchError::url(url, reason);
     // The remedy is named, not just the constraint: the scheme is refused
     // because this fetcher carries no TLS, which a caller reads as a broken URL
     // unless told that supplying a transport is how an https:// mirror works.
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
+    let rest = strip_scheme(url, "http://").ok_or_else(|| {
         bad(
             "this fetcher speaks only http:// and file://; an https:// mirror needs a Fetch \
              implementation of your own, set with DebianBuilder::fetcher",
@@ -633,50 +699,10 @@ impl<R: Read> Read for DeadlineReader<R> {
     }
 }
 
-/// A writer that forwards to an inner writer until a byte ceiling is crossed,
-/// then fails. It bounds what a fetch spends regardless of what the server's
-/// framing claims.
-///
-/// The provisioner wraps its own sinks in one as well, because a
-/// caller-supplied [`Fetch`] is free to ignore the size a request declares, and
-/// the sink is the one place the bound cannot be ignored.
-pub(super) struct LimitedWriter<'a> {
-    inner: &'a mut dyn Write,
-    remaining: u64,
-}
-
-impl<'a> LimitedWriter<'a> {
-    /// Wraps `inner`, failing the write that would carry it past `limit` bytes
-    /// in total.
-    pub(super) fn new(inner: &'a mut dyn Write, limit: u64) -> LimitedWriter<'a> {
-        LimitedWriter {
-            inner,
-            remaining: limit,
-        }
-    }
-}
-
-impl Write for LimitedWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.len() as u64 > self.remaining {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the response body exceeded the maximum size",
-            ));
-        }
-        let written = self.inner.write(buf)?;
-        self.remaining -= written as u64;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     #[test]
     fn urls_parse() {
@@ -747,6 +773,31 @@ mod tests {
         );
     }
 
+    /// A scheme is case-insensitive (RFC 3986 §3.1), and every check in the
+    /// crate agrees about that.
+    ///
+    /// `scheme_of` documented it and the authenticated-transport allow-list
+    /// honoured it, while the parser matched `http://` literally — so
+    /// `HTTP://host/x` passed the transport check and was then refused by the
+    /// parser as though it were `https://`, with a message telling the caller
+    /// to supply a TLS transport for a URL that names no TLS.
+    #[test]
+    fn the_scheme_is_matched_case_insensitively() {
+        for url in [
+            "HTTP://deb.debian.org/debian/x",
+            "Http://deb.debian.org/debian/x",
+        ] {
+            let parsed = parse_http_url(url).unwrap_or_else(|err| panic!("{url}: {err}"));
+            assert_eq!(parsed.host, "deb.debian.org");
+            assert_eq!(parsed.path, "/debian/x");
+        }
+        // The path keeps its case; only the scheme is folded.
+        assert_eq!(
+            parse_http_url("HTTP://host/Mixed/Case").unwrap().path,
+            "/Mixed/Case",
+        );
+    }
+
     #[test]
     fn non_http_schemes_are_rejected() {
         let Err(err) = parse_http_url("https://host/x") else {
@@ -775,7 +826,7 @@ mod tests {
     #[test]
     fn a_limited_writer_stops_at_its_ceiling() {
         let mut out = Vec::new();
-        let mut limited = LimitedWriter::new(&mut out, 4);
+        let mut limited = crate::provision::LimitedWriter::new(&mut out, 4);
         assert!(limited.write_all(b"12345").is_err());
     }
 
@@ -789,7 +840,7 @@ mod tests {
         body.extend_from_slice(&[b'x'; 64]);
         let mut reader = BufReader::new(&body[..]);
         let mut out = Vec::new();
-        let mut limited = LimitedWriter::new(&mut out, 8);
+        let mut limited = crate::provision::LimitedWriter::new(&mut out, 8);
         let err = read_chunked(&mut reader, &mut limited).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(out.len() <= 8, "no more than the ceiling was buffered");
@@ -822,7 +873,7 @@ mod tests {
 
     #[test]
     fn file_urls_read_local_paths() {
-        let dir = crate::scratch::Scratch::new("http");
+        let dir = Scratch::new("http");
         let path = dir.join("resource");
         std::fs::write(&path, b"contents").unwrap();
         let url = format!("file://{}", path.display());
@@ -845,6 +896,44 @@ mod tests {
             .fetch(&FetchRequest::new(&localhost), &mut out)
             .unwrap();
         assert_eq!(out, b"contents");
+    }
+
+    #[test]
+    fn a_built_file_url_reads_back_as_the_path_it_was_built_from() {
+        // The two directions of the same scheme: what `file_url` writes is what
+        // the fetcher resolves, for a path that exists and for one that does
+        // not yet.
+        let dir = Scratch::new("http-file-url");
+        let path = dir.join("resource");
+        std::fs::write(&path, b"contents").unwrap();
+
+        let url = file_url(&path).unwrap();
+        let mut out = Vec::new();
+        HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut out)
+            .unwrap();
+        assert_eq!(out, b"contents");
+
+        let unwritten = file_url(&dir.join("pool")).unwrap();
+        assert_eq!(
+            local_file_path(&unwritten, unwritten.strip_prefix("file://").unwrap()).unwrap(),
+            dir.join("pool").to_str().unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_relative_path_is_made_absolute_and_a_non_utf8_one_is_refused() {
+        // A `file://` URL carries a path from a root, and carries it as text.
+        let url = file_url(Path::new("pool")).unwrap();
+        let expected = std::env::current_dir().unwrap().join("pool");
+        assert_eq!(url, format!("file://{}", expected.display()));
+
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = std::ffi::OsStr::from_bytes(b"/srv/\xff\xfe");
+        assert!(matches!(
+            file_url(Path::new(raw)),
+            Err(FetchError::Url { .. }),
+        ));
     }
 
     #[test]
@@ -878,7 +967,7 @@ mod tests {
         // the stated length rather than at two gigabytes. The `file://` path
         // carries the same cap as the HTTP one, and is the one a unit test can
         // reach without a server.
-        let dir = crate::scratch::Scratch::new("http-cap");
+        let dir = Scratch::new("http-cap");
         let path = dir.join("index");
         std::fs::write(&path, vec![b'x'; 4096]).unwrap();
         let url = format!("file://{}", path.display());

@@ -122,7 +122,15 @@ pub struct ResolvedInputs {
 /// mount the profile lays over it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "kind"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(
+        tag = "kind",
+        rename_all = "kebab-case",
+        rename_all_fields = "kebab-case"
+    )
+)]
 pub enum ResolvedRoot {
     /// No root swap: the command runs against the host's own filesystem.
     // The sentence links a feature-gated item, so its doc text is gated on the
@@ -132,17 +140,14 @@ pub enum ResolvedRoot {
         feature = "hardening",
         doc = "That is what a [`Restriction`](crate::Restriction)'s command sees."
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "host"))]
     Host,
     /// A plain rootfs, pivoted into.
-    #[cfg_attr(feature = "serde", serde(rename = "plain"))]
     Plain {
         /// The rootfs as the build resolved it: an absolute, canonicalized host
         /// path.
         path: PathBuf,
     },
     /// An overlay assembled over the rootfs and pivoted into.
-    #[cfg_attr(feature = "serde", serde(rename = "overlay"))]
     Overlay {
         /// The lower layers, base first — the reverse of the kernel's own
         /// highest-precedence-first option order.
@@ -161,7 +166,15 @@ pub enum ResolvedRoot {
 /// file's recorded ownership follows from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "kind"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(
+        tag = "kind",
+        rename_all = "kebab-case",
+        rename_all_fields = "kebab-case"
+    )
+)]
 pub enum ResolvedIdentity {
     /// No user namespace, so no map: the command runs as the calling user.
     // Gated for the reason `ResolvedRoot::Host`'s second sentence is.
@@ -169,14 +182,11 @@ pub enum ResolvedIdentity {
         feature = "hardening",
         doc = "That is what a [`Restriction`](crate::Restriction)'s command holds."
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "caller"))]
     Caller,
     /// The single-identity map: the calling user is root inside the sandbox
     /// and no other id is mapped.
-    #[cfg_attr(feature = "serde", serde(rename = "single"))]
     Single,
     /// A range map, written from outside the namespace by a delegate.
-    #[cfg_attr(feature = "serde", serde(rename = "ranged"))]
     Ranged {
         /// The uid extents, in the order they are written.
         uid: Vec<IdRange>,
@@ -272,24 +282,28 @@ pub struct ResolvedRlimit {
 /// two policies can differ with nothing else to show for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "kind"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(
+        tag = "kind",
+        rename_all = "kebab-case",
+        rename_all_fields = "kebab-case"
+    )
+)]
 pub enum ResolvedHardening {
     /// The hardening layer is not compiled into this build, so no Landlock
     /// ruleset, seccomp filter, or capability drop can apply.
     ///
     /// Distinct from an [`Applied`](Self::Applied) posture whose controls are
     /// all empty, which is a build that *could* have hardened and did not.
-    #[cfg_attr(feature = "serde", serde(rename = "unavailable"))]
     Unavailable,
     /// The hardening layer is compiled in; these are the controls in force.
     /// Every field empty is a sandbox that applies no hardening.
-    #[cfg_attr(feature = "serde", serde(rename = "applied"))]
     Applied {
         /// The Landlock filesystem grants, in the order they were declared.
-        #[cfg_attr(feature = "serde", serde(rename = "landlock-fs"))]
         landlock_fs: Vec<ResolvedLandlockFs>,
         /// The Landlock network grants, in the order they were declared.
-        #[cfg_attr(feature = "serde", serde(rename = "landlock-net"))]
         landlock_net: Vec<ResolvedLandlockNet>,
         /// The installed seccomp filter's length in BPF instructions; `None`
         /// when no filter is installed.
@@ -298,11 +312,9 @@ pub enum ResolvedHardening {
         /// and means nothing to a reader. The length is what distinguishes one
         /// policy from another at a glance, and a consumer that needs to pin
         /// the exact program has the policy it supplied.
-        #[cfg_attr(feature = "serde", serde(rename = "seccomp-instructions"))]
         seccomp_instructions: Option<usize>,
         /// The capability bits retained across the drop; `None` leaves the
         /// namespaced capability set untouched.
-        #[cfg_attr(feature = "serde", serde(rename = "keep-capabilities"))]
         keep_capabilities: Option<u64>,
     },
 }
@@ -348,10 +360,17 @@ pub struct ResolvedLandlockNet {
 /// including the ones the managed profile contributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(tag = "kind"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(
+        tag = "kind",
+        rename_all = "kebab-case",
+        rename_all_fields = "kebab-case"
+    )
+)]
 pub enum ResolvedMount {
     /// A tmpfs.
-    #[cfg_attr(feature = "serde", serde(rename = "tmpfs"))]
     Tmpfs {
         /// The mount point inside the sandbox.
         target: PathBuf,
@@ -361,13 +380,11 @@ pub enum ResolvedMount {
         data: String,
     },
     /// A procfs instance.
-    #[cfg_attr(feature = "serde", serde(rename = "procfs"))]
     Procfs {
         /// The mount point inside the sandbox.
         target: PathBuf,
     },
     /// A devpts instance.
-    #[cfg_attr(feature = "serde", serde(rename = "devpts"))]
     Devpts {
         /// The mount point inside the sandbox.
         target: PathBuf,
@@ -375,14 +392,12 @@ pub enum ResolvedMount {
         data: String,
     },
     /// A bind of a host path.
-    #[cfg_attr(feature = "serde", serde(rename = "bind"))]
     Bind {
         /// The host path bound in.
         source: PathBuf,
         /// The mount point inside the sandbox.
         target: PathBuf,
         /// Whether the bind is remounted read-only.
-        #[cfg_attr(feature = "serde", serde(rename = "read-only"))]
         read_only: bool,
     },
     /// A mount whose parameters go to the kernel verbatim.
@@ -390,7 +405,6 @@ pub enum ResolvedMount {
     /// The optional fields report `None` both for a parameter that was never
     /// set and for one set to the empty string: the two are frozen alike, and
     /// the kernel receives the same nothing from either.
-    #[cfg_attr(feature = "serde", serde(rename = "raw"))]
     Raw {
         /// The mount source, when one was given.
         source: Option<PathBuf>,
@@ -408,7 +422,6 @@ pub enum ResolvedMount {
     /// Not a mount in the kernel's sense, but part of what the managed profile
     /// establishes — the five `/dev` symlinks arrive this way — and so part of
     /// the filesystem the command sees.
-    #[cfg_attr(feature = "serde", serde(rename = "symlink"))]
     Symlink {
         /// The link's own path inside the sandbox.
         path: PathBuf,
@@ -722,6 +735,7 @@ mod tests {
 
 #[cfg(all(test, feature = "serde"))]
 mod serde_tests {
+    use crate::scratch::Scratch;
     use crate::{Cage, RawMount};
 
     /// The record a consumer stamps into provenance is a TOML document, and
@@ -797,7 +811,7 @@ mod serde_tests {
         // the plan's mount actions, and the root is not one of them, so before
         // this a plain root and an overlay over the same base recorded byte for
         // byte the same thing while describing two different builds.
-        let scratch = crate::scratch::Scratch::new("resolved-overlay");
+        let scratch = Scratch::new("resolved-overlay");
         let base = scratch.join("base");
         let patches = scratch.join("patches");
         std::fs::create_dir_all(&base).expect("the base is creatable");

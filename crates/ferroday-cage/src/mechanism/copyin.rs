@@ -89,8 +89,12 @@ use rustix::process::{Pid, Signal};
 use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
+use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
 use super::child::{MapFailure, MapStep};
+use super::frame;
 use crate::idmap::IdMapError;
+use crate::path;
+use crate::wire::wire_enum;
 
 /// Frame tag: enter a directory.
 pub(crate) const COPY_DIR: u8 = 1;
@@ -108,153 +112,58 @@ pub(crate) const COPY_FIFO: u8 = 6;
 /// name's path relative to the destination root.
 pub(crate) const COPY_LINK: u8 = 7;
 
-/// How deep the copy may descend, matching the export walk's own bound.
-const MAX_DEPTH: usize = 128;
-/// The largest length of a single path component, the kernel's `NAME_MAX`.
-const NAME_MAX: usize = 255;
-/// The symlink-target and hardlink-anchor buffer; either is at most
-/// `PATH_MAX`.
-pub(crate) const LINK_BUF: usize = 4096;
-/// The file-data streaming buffer.
-const DATA_BUF: usize = 65536;
-
-/// What the copy child was doing when a syscall failed.
-///
-/// The explicit discriminants are the outcome record's wire encoding, which
-/// both ends of a single build write and read. They are not a stable protocol
-/// and they are not declaration order: a step added in a later release takes
-/// the next free value rather than renumbering the ones it was declared
-/// among.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub(crate) enum CopyStep {
-    /// Forking the copy process or speaking to it. Reported by the caller
-    /// alone: the child has no channel to report it on.
-    Spawn = 0,
-    /// The child could not reset its inherited signal dispositions.
-    ResetSignals = 1,
-    /// The child could not close the descriptors it inherited.
-    SweepFds = 2,
-    /// The child could not unshare its user namespace.
-    Unshare = 3,
-    /// The child could not write its own single-identity map.
-    SelfMap = 4,
-    /// The child died or was abandoned at the map gate.
-    AwaitMap = 5,
-    /// The destination rootfs could not be opened.
-    OpenRoot = 6,
-    /// A frame could not be read from the parent.
-    ReadFrame = 7,
-    /// A directory could not be created.
-    Mkdir = 8,
-    /// A directory could not be opened after creation.
-    OpenDir = 9,
-    /// A file could not be created.
-    Create = 10,
-    /// A file's data could not be written.
-    Write = 11,
-    /// A symbolic link could not be created.
-    Symlink = 12,
-    /// A named pipe could not be created.
-    Fifo = 17,
-    /// A second name for an already-created file could not be linked.
-    Link = 18,
-    /// An entry's ownership could not be applied.
-    Chown = 16,
-    /// An entry's mode or modification time could not be applied.
-    Metadata = 13,
-    /// The tree is deeper than the copy descends.
-    TooDeep = 14,
-    /// A frame named something that is not a single path component.
-    BadName = 15,
-}
-
-impl CopyStep {
-    /// A human-readable phrase naming the step, for an error message.
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            CopyStep::Spawn => "forking the copy process",
-            CopyStep::ResetSignals => "resetting the copy process's signal dispositions",
-            CopyStep::SweepFds => "closing the copy process's inherited descriptors",
-            CopyStep::Unshare => "unsharing the copy process's user namespace",
-            CopyStep::SelfMap => "writing the copy process's identity map",
-            CopyStep::AwaitMap => "waiting for the identity map to be applied",
-            CopyStep::OpenRoot => "opening the destination rootfs",
-            CopyStep::ReadFrame => "reading the tree to copy",
-            CopyStep::Mkdir => "creating a directory",
-            CopyStep::OpenDir => "opening a directory just created",
-            CopyStep::Create => "creating a file",
-            CopyStep::Write => "writing a file's contents",
-            CopyStep::Symlink => "creating a symbolic link",
-            CopyStep::Fifo => "creating a named pipe",
-            CopyStep::Link => "linking a second name onto a file already copied",
-            CopyStep::Chown => {
-                "setting an entry's ownership, which an id the identity map cannot express refuses"
-            }
-            CopyStep::Metadata => "applying an entry's mode or modification time",
-            CopyStep::TooDeep => "descending into the source tree",
-            CopyStep::BadName => "reading an entry's name",
-        }
-    }
-
-    /// Every step, in declaration order. Used by the wire-protocol tests.
-    #[cfg(test)]
-    pub(crate) const ALL: [CopyStep; 19] = [
-        CopyStep::Spawn,
-        CopyStep::ResetSignals,
-        CopyStep::SweepFds,
-        CopyStep::Unshare,
-        CopyStep::SelfMap,
-        CopyStep::AwaitMap,
-        CopyStep::OpenRoot,
-        CopyStep::ReadFrame,
-        CopyStep::Mkdir,
-        CopyStep::OpenDir,
-        CopyStep::Create,
-        CopyStep::Write,
-        CopyStep::Symlink,
-        CopyStep::Fifo,
-        CopyStep::Link,
-        CopyStep::Chown,
-        CopyStep::Metadata,
-        CopyStep::TooDeep,
-        CopyStep::BadName,
-    ];
-
-    /// The wire discriminant carried in the outcome record.
-    fn wire(self) -> u32 {
-        self as u32
-    }
-
-    /// Decodes a wire discriminant, or `None` for a value no step carries.
+wire_enum! {
+    /// What the copy child was doing when a syscall failed.
     ///
-    /// Both ends of the record are the same build, so an unrecognized value is
-    /// a malformed record rather than a step from another version. It is
-    /// reported as one instead of being read as a step the child did not
-    /// name.
-    fn from_wire(wire: u32) -> Option<CopyStep> {
-        Some(match wire {
-            0 => CopyStep::Spawn,
-            1 => CopyStep::ResetSignals,
-            2 => CopyStep::SweepFds,
-            3 => CopyStep::Unshare,
-            4 => CopyStep::SelfMap,
-            5 => CopyStep::AwaitMap,
-            6 => CopyStep::OpenRoot,
-            7 => CopyStep::ReadFrame,
-            8 => CopyStep::Mkdir,
-            9 => CopyStep::OpenDir,
-            10 => CopyStep::Create,
-            11 => CopyStep::Write,
-            12 => CopyStep::Symlink,
-            13 => CopyStep::Metadata,
-            14 => CopyStep::TooDeep,
-            15 => CopyStep::BadName,
-            16 => CopyStep::Chown,
-            17 => CopyStep::Fifo,
-            18 => CopyStep::Link,
-            _ => return None,
-        })
+    /// The explicit discriminants are the outcome record's wire encoding, which
+    /// both ends of a single build write and read. They are not a stable
+    /// protocol and they are not declaration order: a step added in a later
+    /// release takes the next free value rather than renumbering the ones it
+    /// was declared among.
+    pub(crate) enum CopyStep {
+        /// Forking the copy process or speaking to it. Reported by the caller
+        /// alone: the child has no channel to report it on.
+        Spawn = 0 => "forking the copy process",
+        /// The child could not reset its inherited signal dispositions.
+        ResetSignals = 1 => "resetting the copy process's signal dispositions",
+        /// The child could not close the descriptors it inherited.
+        SweepFds = 2 => "closing the copy process's inherited descriptors",
+        /// The child could not unshare its user namespace.
+        Unshare = 3 => "unsharing the copy process's user namespace",
+        /// The child could not deny `setgroups` in its own user namespace.
+        DenySetgroups = 4 => "denying setgroups in the copy process's user namespace",
+        /// The child could not write its own gid map.
+        WriteGidMap = 19 => "writing the copy process's gid map",
+        /// The child could not write its own uid map.
+        WriteUidMap = 20 => "writing the copy process's uid map",
+        /// The child died or was abandoned at the map gate.
+        AwaitMap = 5 => "waiting for the identity map to be applied",
+        /// The destination rootfs could not be opened.
+        OpenRoot = 6 => "opening the destination rootfs",
+        /// A frame could not be read from the parent.
+        ReadFrame = 7 => "reading the tree to copy",
+        /// A directory could not be created.
+        Mkdir = 8 => "creating a directory",
+        /// A directory could not be opened after creation.
+        OpenDir = 9 => "opening a directory just created",
+        /// A file could not be created.
+        Create = 10 => "creating a file",
+        /// A file's data could not be written.
+        Write = 11 => "writing a file's contents",
+        /// A symbolic link could not be created.
+        Symlink = 12 => "creating a symbolic link",
+        /// A named pipe could not be created.
+        Fifo = 17 => "creating a named pipe",
+        /// A second name for an already-created file could not be linked.
+        Link = 18 => "linking a second name onto a file already copied",
+        /// An entry's ownership could not be applied.
+        Chown = 16 => "setting an entry's ownership, which an id the identity map cannot express refuses",
+        /// An entry's mode or modification time could not be applied.
+        Metadata = 13 => "applying an entry's mode or modification time",
+        /// The tree is deeper than the copy descends.
+        TooDeep = 14 => "descending into the source tree",
+        /// A frame named something that is not a single path component.
+        BadName = 15 => "reading an entry's name",
     }
 }
 
@@ -302,7 +211,7 @@ impl CopyChild {
         let CopyChild { pid, stream, gate } = self;
         drop(stream);
 
-        let mut record = [0u8; 8];
+        let mut record = [0u8; super::RECORD_LEN];
         let read = loop {
             match rustix::io::read(&gate, &mut record) {
                 Ok(n) => break n,
@@ -367,15 +276,14 @@ impl CopyChild {
 /// after a `COPY_END` frame, which a parent that is abandoning the copy never
 /// sent. It is reported as no outcome rather than treated as a case of its own.
 fn reported_outcome(gate: BorrowedFd<'_>) -> Option<CopyFailure> {
-    let mut record = [0u8; 8];
-    let received = loop {
-        match rustix::net::recv(gate, &mut record[..], RecvFlags::DONTWAIT) {
-            Ok((received, _)) => break received,
-            Err(Errno::INTR) => continue,
-            // `EAGAIN`: nothing is queued, so the child has reported nothing.
-            Err(_) => return None,
-        }
-    };
+    let mut record = [0u8; super::RECORD_LEN];
+    // `EAGAIN`: nothing is queued, so the child has reported nothing.
+    let (received, _) = frame::retry_on_intr!(rustix::net::recv(
+        gate,
+        &mut record[..],
+        RecvFlags::DONTWAIT
+    ))
+    .ok()?;
     if received != record.len() {
         return None;
     }
@@ -384,7 +292,7 @@ fn reported_outcome(gate: BorrowedFd<'_>) -> Option<CopyFailure> {
 
 /// Reads an 8-byte outcome record: a step discriminant and an errno, with a
 /// zero step meaning success.
-fn decode_record(record: [u8; 8]) -> Result<(), CopyFailure> {
+fn decode_record(record: [u8; super::RECORD_LEN]) -> Result<(), CopyFailure> {
     let wire = u32::from_le_bytes(record[0..4].try_into().expect("slice length is 4"));
     let errno = i32::from_le_bytes(record[4..8].try_into().expect("slice length is 4"));
     if wire == OUTCOME_OK {
@@ -444,23 +352,42 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
         Ok(Fork::ParentOf(pid)) => {
             drop(stream_read);
             drop(gate_child);
-            if let ChildMap::Delegated { mapper, map } = &map
-                && let Err(err) = drive_gate(&gate_caller, pid, *mapper, map)
-            {
-                // The delegate failed. The child is blocked at the gate in an
-                // unmapped namespace and has created nothing, so it is killed
-                // and reaped. Killed rather than released by closing the gate:
-                // `kernel_fork` copies the whole descriptor table, so any
-                // process this caller forked concurrently holds its own copy of
-                // the peer — the library's own children until their sweep, a
-                // child the consumer forked until it execs or exits — and the
-                // end-of-file the child waits on is not something this caller
-                // can make arrive.
-                let _ = rustix::process::kill_process(pid, Signal::KILL);
-                drop(gate_caller);
-                drop(stream_write);
-                let _ = super::wait_for_exit(pid);
-                return Err(err);
+            if let ChildMap::Delegated { mapper, map } = &map {
+                let driven = super::drive_map_gate(gate_caller.as_fd(), pid, *mapper, map);
+                // Anything but a released child leaves one blocked at the gate
+                // in an unmapped namespace, having created nothing.
+                let failure = match driven {
+                    Ok(super::Gated::Released) => None,
+                    // A record before ready is a failure the child hit on the
+                    // way to the gate — its sweep, or its unshare — and it
+                    // names the step it reached. Decoding it here is what keeps
+                    // that diagnostic rather than reporting a child that
+                    // vanished.
+                    Ok(super::Gated::EarlyRecord(record)) => {
+                        // A success record before ready is not something a
+                        // child sends; it is a malformed conversation.
+                        Some(
+                            decode_record(record)
+                                .err()
+                                .unwrap_or(CopyFailure::Malformed),
+                        )
+                    }
+                    Ok(super::Gated::ChildLost) => Some(CopyFailure::Step {
+                        step: CopyStep::AwaitMap,
+                        errno: Errno::PROTO.raw_os_error(),
+                    }),
+                    Err(super::GateFailure::Io(errno)) => Some(CopyFailure::Step {
+                        step: CopyStep::AwaitMap,
+                        errno: errno.raw_os_error(),
+                    }),
+                    Err(super::GateFailure::Map(err)) => Some(CopyFailure::Map(err)),
+                };
+                if let Some(err) = failure {
+                    drop(gate_caller);
+                    drop(stream_write);
+                    super::abandon_gated_child(pid);
+                    return Err(err);
+                }
             }
             Ok(CopyChild {
                 pid,
@@ -471,56 +398,16 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
     }
 }
 
-/// The caller's half of the map gate: waits for ready, applies the map, and
-/// releases the child.
-fn drive_gate(
-    gate: &OwnedFd,
-    pid: Pid,
-    mapper: &dyn crate::idmap::IdMapper,
-    map: &crate::idmap::ResolvedMap,
-) -> Result<(), CopyFailure> {
-    let mut byte = [0u8; 1];
-    let ready = loop {
-        match rustix::io::read(gate, &mut byte) {
-            Ok(n) => break n,
-            Err(Errno::INTR) => continue,
-            Err(errno) => {
-                return Err(CopyFailure::Step {
-                    step: CopyStep::AwaitMap,
-                    errno: errno.raw_os_error(),
-                });
-            }
-        }
-    };
-    if ready == 0 || byte[0] != super::MAP_READY_BYTE {
-        // The child is gone or malfunctioning; the outcome record, or its
-        // absence, reports why.
-        return Ok(());
-    }
-
-    let raw = pid.as_raw_nonzero().get() as u32;
-    mapper.apply(raw, map).map_err(CopyFailure::Map)?;
-
-    loop {
-        match rustix::io::write(gate, &[super::MAP_GO_BYTE]) {
-            Ok(_) => break Ok(()),
-            Err(Errno::INTR) => continue,
-            // A failed write means the child is already gone; its outcome, or
-            // its absence, reports what happened.
-            Err(_) => break Ok(()),
-        }
-    }
-}
-
-/// The step a copy reports for a shared map step. The three writes of a
-/// single-identity map are one step here: the copy names what it was doing,
-/// and it was writing its own map.
+/// The step a copy reports for a shared map step: the copy's own name for the
+/// same step, one for one.
 fn copy_step(step: MapStep) -> CopyStep {
     match step {
         MapStep::ResetSignals => CopyStep::ResetSignals,
         MapStep::SweepFds => CopyStep::SweepFds,
         MapStep::Unshare => CopyStep::Unshare,
-        MapStep::DenySetgroups | MapStep::WriteGidMap | MapStep::WriteUidMap => CopyStep::SelfMap,
+        MapStep::DenySetgroups => CopyStep::DenySetgroups,
+        MapStep::WriteGidMap => CopyStep::WriteGidMap,
+        MapStep::WriteUidMap => CopyStep::WriteUidMap,
         MapStep::AwaitMap => CopyStep::AwaitMap,
     }
 }
@@ -587,7 +474,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
 
     loop {
         let mut tag = [0u8; 1];
-        match read_exact(stream, &mut tag) {
+        match frame::read_full_or_eof(stream, &mut tag) {
             Ok(true) => {}
             // End of input with no COPY_END: the parent died. Report it rather
             // than claiming the tree was copied.
@@ -878,14 +765,12 @@ fn read_bytes_u16<'b>(
     stream: BorrowedFd<'_>,
     buf: &'b mut [u8],
 ) -> Result<&'b [u8], (CopyStep, Errno)> {
-    let mut len = [0u8; 2];
-    read_full(stream, &mut len)?;
-    let len = usize::from(u16::from_le_bytes(len));
-    if len > buf.len() {
-        return Err((CopyStep::BadName, Errno::NAMETOOLONG));
-    }
-    read_full(stream, &mut buf[..len])?;
-    Ok(&buf[..len])
+    frame::read_bytes_u16(stream, buf).map_err(|errno| match errno {
+        // A declared length past the buffer is a name this build cannot hold,
+        // which is the frame's fault rather than the stream's.
+        Errno::NAMETOOLONG => (CopyStep::BadName, errno),
+        errno => (CopyStep::ReadFrame, errno),
+    })
 }
 
 /// A frame's name: the bytes the frame carried, terminated for the `*at` calls,
@@ -910,6 +795,8 @@ impl Name {
     /// is a single component cannot reach outside the destination however the
     /// source tree is shaped: `..`, `.`, an embedded separator, an embedded NUL,
     /// and an empty name are all refused rather than resolved.
+    /// [`path::is_ordinary_component`] is that rule, and the walk's host side
+    /// refuses the same shapes before sending a frame at all.
     ///
     /// The NUL is refused for the reason the rest are, one step earlier. A name
     /// carrying one is not a name any filesystem can hold, so a frame naming
@@ -921,12 +808,7 @@ impl Name {
             .buf
             .get(..self.len)
             .ok_or((CopyStep::BadName, Errno::INVAL))?;
-        if bytes.is_empty()
-            || bytes == b"."
-            || bytes == b".."
-            || bytes.contains(&b'/')
-            || bytes.contains(&0)
-        {
+        if !path::is_ordinary_component(bytes) {
             return Err((CopyStep::BadName, Errno::INVAL));
         }
         CStr::from_bytes_with_nul(&self.buf[..=self.len])
@@ -939,10 +821,16 @@ impl Name {
 ///
 /// One of the three premises the module doc sets out, and only one: it stops a
 /// path from *naming* somewhere outside the destination. An absolute path would
-/// restart at the host's root and a `..` component would climb out of it, so
-/// both are refused here rather than resolved, along with an empty path, an
-/// empty component, and `.` — none of which any anchor the walk records can be,
-/// so refusing them costs nothing and closes the shape.
+/// restart at the host's root, so it is refused here rather than resolved, and
+/// every component must be an ordinary one — which refuses a `..` that would
+/// climb out, and an empty component, a `.`, and an embedded NUL besides. None
+/// of those is anything an anchor the walk records can be, so refusing them
+/// costs nothing and closes the shape.
+///
+/// The per-component rule is [`path::is_ordinary_component`], the one the
+/// walk's frames are held to; nothing is dropped or normalized on the way, so a
+/// path that merely *reduces* to something ordinary is refused too. An anchor
+/// is a path this walk itself emitted, and it emits neither.
 ///
 /// It does not by itself keep the *resolution* inside the tree, since `linkat`
 /// follows the anchor's intermediate components. What does is that this walk
@@ -951,18 +839,19 @@ impl Name {
 ///
 /// `bytes` is the anchor followed by its null terminator.
 fn contained_path(bytes: &[u8]) -> Result<&CStr, (CopyStep, Errno)> {
-    let path = bytes
+    let anchor = bytes
         .split_last()
         .filter(|(last, _)| **last == 0)
         .map(|(_, rest)| rest)
         .ok_or((CopyStep::BadName, Errno::INVAL))?;
-    if path.is_empty() || path[0] == b'/' {
+    if anchor.is_empty() || anchor[0] == b'/' {
         return Err((CopyStep::BadName, Errno::INVAL));
     }
-    for component in path.split(|byte| *byte == b'/') {
-        if component.is_empty() || component == b"." || component == b".." {
-            return Err((CopyStep::BadName, Errno::INVAL));
-        }
+    if !anchor
+        .split(|byte| *byte == b'/')
+        .all(path::is_ordinary_component)
+    {
+        return Err((CopyStep::BadName, Errno::INVAL));
     }
     CStr::from_bytes_with_nul(bytes).map_err(|_| (CopyStep::BadName, Errno::INVAL))
 }
@@ -978,15 +867,7 @@ fn copy_data(
     while left > 0 {
         let want = usize::try_from(left.min(DATA_BUF as u64)).unwrap_or(DATA_BUF);
         read_full(stream, &mut buf[..want])?;
-        let mut written = 0;
-        while written < want {
-            match rustix::io::write(file, &buf[written..want]) {
-                Ok(0) => return Err((CopyStep::Write, Errno::IO)),
-                Ok(n) => written += n,
-                Err(Errno::INTR) => continue,
-                Err(errno) => return Err((CopyStep::Write, errno)),
-            }
-        }
+        frame::write_full(file, &buf[..want]).map_err(|errno| (CopyStep::Write, errno))?;
         left -= want as u64;
     }
     Ok(())
@@ -994,29 +875,7 @@ fn copy_data(
 
 /// Fills `buf` completely, treating a short stream as a truncated frame.
 fn read_full(stream: BorrowedFd<'_>, buf: &mut [u8]) -> Result<(), (CopyStep, Errno)> {
-    match read_exact(stream, buf) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err((CopyStep::ReadFrame, Errno::PIPE)),
-        Err(errno) => Err((CopyStep::ReadFrame, errno)),
-    }
-}
-
-/// Fills `buf`, reporting `false` for a clean end of input before the first
-/// byte and treating one part-way through as a short read.
-fn read_exact(stream: BorrowedFd<'_>, buf: &mut [u8]) -> Result<bool, Errno> {
-    let mut read = 0;
-    while read < buf.len() {
-        match rustix::io::read(stream, &mut buf[read..]) {
-            // End of input. Only a clean one before the first byte is an
-            // ending; part-way through a frame it is a truncation, which the
-            // caller reports as such.
-            Ok(0) => return Ok(false),
-            Ok(n) => read += n,
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(errno),
-        }
-    }
-    Ok(true)
+    frame::read_full(stream, buf).map_err(|errno| (CopyStep::ReadFrame, errno))
 }
 
 /// Writes a null-terminated copy of `bytes` into `buf` and returns it as a
@@ -1032,7 +891,7 @@ fn cstr_in<'b>(buf: &'b mut [u8], bytes: &[u8]) -> Result<&'b CStr, (CopyStep, E
 
 /// Writes the outcome record to the gate, best effort.
 fn report(gate: BorrowedFd<'_>, wire: u32, errno: i32) {
-    let mut record = [0u8; 8];
+    let mut record = [0u8; super::RECORD_LEN];
     record[0..4].copy_from_slice(&wire.to_le_bytes());
     record[4..8].copy_from_slice(&errno.to_le_bytes());
     let _ = rustix::io::write(gate, &record);
@@ -1041,21 +900,27 @@ fn report(gate: BorrowedFd<'_>, wire: u32, errno: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
-    /// The encoding and the decoding are two tables that have to agree, and
-    /// nothing but this test makes them: the child would otherwise name one
-    /// step while the caller read another.
+    /// Every step decodes back to itself, and every step names itself in prose.
+    ///
+    /// The round trip is structural now — the decoder's match arms are the same
+    /// literals the variants are declared with, so a value used twice is a
+    /// duplicate discriminant and a duplicate pattern, both of which the
+    /// compiler refuses. What this still checks is that the list of steps and
+    /// the encoding agree about which values exist, and that no step was left
+    /// without a description.
     #[test]
     fn copy_step_wire_round_trip() {
-        for step in CopyStep::ALL {
+        for &step in CopyStep::ALL {
             assert_eq!(CopyStep::from_wire(step.wire()), Some(step));
+            assert!(!step.describe().is_empty(), "{step:?} describes itself");
         }
     }
 
     #[test]
     fn copy_step_unknown_wire_value_is_rejected() {
-        let past_the_end = CopyStep::ALL.len() as u32;
-        assert_eq!(CopyStep::from_wire(past_the_end), None);
+        assert_eq!(CopyStep::from_wire(CopyStep::past_the_last()), None);
         assert_eq!(CopyStep::from_wire(OUTCOME_OK), None);
     }
 
@@ -1064,7 +929,7 @@ mod tests {
     #[test]
     fn an_outcome_record_naming_no_step_is_malformed() {
         let record = |wire: u32| {
-            let mut record = [0u8; 8];
+            let mut record = [0u8; crate::mechanism::RECORD_LEN];
             record[0..4].copy_from_slice(&wire.to_le_bytes());
             record
         };
@@ -1172,7 +1037,7 @@ mod tests {
 
     /// Runs `frames` through the consuming walk against a fresh destination.
     fn consume_frames(tag: &str, frames: &[u8]) -> Result<(), (CopyStep, Errno)> {
-        let dir = crate::scratch::Scratch::new(tag);
+        let dir = Scratch::new(tag);
         consume_frames_in(dir.path(), frames)
     }
 
@@ -1206,7 +1071,7 @@ mod tests {
     /// asked for, and report the tree copied.
     #[test]
     fn a_name_carrying_an_embedded_nul_is_refused() {
-        let dir = crate::scratch::Scratch::new("copyin-embedded-nul");
+        let dir = Scratch::new("copyin-embedded-nul");
         let mut frames = dir_frame(b"a\0b", 0o755);
         frames.push(COPY_END);
         assert_eq!(
@@ -1231,7 +1096,7 @@ mod tests {
     fn a_symlink_carries_the_modification_time_its_frame_names() {
         use std::os::unix::fs::MetadataExt;
 
-        let dir = crate::scratch::Scratch::new("copyin-symlink-mtime");
+        let dir = Scratch::new("copyin-symlink-mtime");
         let mut frames = symlink_frame(b"link", b"target", 1_000_000_000);
         frames.push(COPY_END);
         assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));

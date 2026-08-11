@@ -1,10 +1,12 @@
 //! Host-side file operations on a tree, contained to that tree.
 //!
-//! A provisioner's host side reads and writes inside a tree that untrusted
-//! code has already run in: the Debian bootstrap seeds a statoverride, swaps
+//! The host side of a run reads and writes inside a tree that untrusted code
+//! has already run in: the Debian bootstrap seeds a statoverride, swaps
 //! ownership stubs, and writes the finished rootfs's apt sources between dpkg
 //! waves, and by then every selected package's maintainer scripts have run
-//! inside a cage rooted at that tree, as root of its namespace. Such a script
+//! inside a cage rooted at that tree, as root of its namespace; a launch's
+//! teardown removes the mount-point placeholders it created in the rootfs the
+//! command has just finished running against. Such a command, or such a script,
 //! is entitled to leave a symbolic link at any of those paths.
 //!
 //! Composing a host path with [`Path::join`] and handing it to [`std::fs`]
@@ -29,15 +31,31 @@
 //! it, but no path this is asked for has one, and a path that does is a
 //! composition bug rather than a traversal to honour. The tree's host path is
 //! held only to name it in an error; nothing resolves through it.
+//!
+//! A path is anything [`Path`]-shaped rather than a `&str`, because a mount
+//! target comes from a caller's profile and a filesystem path is bytes: a
+//! target that is not UTF-8 is unusual but not invalid, and it must not be the
+//! one path that skips the containment.
+
+// Most of this module serves the Debian bootstrap's host-side steps; a build
+// without that feature reaches it only through `remove_if`, for the launch
+// teardown's mount-point placeholders. The rest is dead code there, and saying
+// so once is clearer than gating a dozen methods one by one.
+#![cfg_attr(not(feature = "debian"), allow(dead_code))]
 
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags, Stat};
 use rustix::io::Errno;
+
+use crate::path::{self, LeadingSlash};
+
+use super::containment;
 
 /// The mode an intermediate directory is created with.
 ///
@@ -82,20 +100,30 @@ impl Rooted {
 
     /// The host path `relative` names, for an error message. Nothing resolves
     /// through it.
-    pub(crate) fn path(&self, relative: &str) -> PathBuf {
-        self.root.join(relative.trim_start_matches('/'))
+    pub(crate) fn path(&self, relative: impl AsRef<Path>) -> PathBuf {
+        let relative = relative.as_ref();
+        let bytes = relative.as_os_str().as_bytes();
+        let trimmed: &Path = Path::new(std::ffi::OsStr::from_bytes(
+            bytes.strip_prefix(b"/").unwrap_or(bytes),
+        ));
+        self.root.join(trimmed)
     }
 
     /// Writes `contents` to `relative` at the default mode, creating missing
     /// parent directories.
-    pub(crate) fn write(&self, relative: &str, contents: &[u8]) -> io::Result<()> {
-        self.create(relative, contents, FILE_MODE)
+    pub(crate) fn write(&self, relative: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
+        self.create(relative.as_ref(), contents, FILE_MODE)
     }
 
     /// Writes `contents` to `relative` at `mode`, creating missing parent
     /// directories.
-    pub(crate) fn write_mode(&self, relative: &str, contents: &[u8], mode: u32) -> io::Result<()> {
-        self.create(relative, contents, mode)
+    pub(crate) fn write_mode(
+        &self,
+        relative: impl AsRef<Path>,
+        contents: &[u8],
+        mode: u32,
+    ) -> io::Result<()> {
+        self.create(relative.as_ref(), contents, mode)
     }
 
     /// Reads the file at `relative`.
@@ -103,8 +131,8 @@ impl Rooted {
     /// `O_NOFOLLOW`: a symbolic link at the leaf fails the read rather than
     /// being followed, so a link planted where a file is expected cannot turn
     /// this into a read of something else.
-    pub(crate) fn read(&self, relative: &str) -> io::Result<Vec<u8>> {
-        let (parent, leaf) = self.parent_of(relative, Parents::Require)?;
+    pub(crate) fn read(&self, relative: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Require)?;
         let fd = rustix::fs::openat(
             &parent,
             &leaf,
@@ -119,8 +147,8 @@ impl Rooted {
     /// Whether anything occupies `relative` — a file, a directory, or a
     /// symbolic link, dangling or not. The question is whether the name is
     /// taken, so nothing is followed.
-    pub(crate) fn exists(&self, relative: &str) -> io::Result<bool> {
-        let (parent, leaf) = match self.parent_of(relative, Parents::Require) {
+    pub(crate) fn exists(&self, relative: impl AsRef<Path>) -> io::Result<bool> {
+        let (parent, leaf) = match self.parent_of(relative.as_ref(), Parents::Require) {
             Ok(found) => found,
             Err(Errno::NOENT | Errno::NOTDIR) => return Ok(false),
             Err(errno) => return Err(errno.into()),
@@ -135,23 +163,55 @@ impl Rooted {
     /// Removes `relative` if it exists, treating an already-absent path — and
     /// an absent parent — as success. `unlinkat` never follows the leaf, so a
     /// symbolic link is removed rather than its target.
-    pub(crate) fn remove(&self, relative: &str) -> io::Result<()> {
-        let (parent, leaf) = match self.parent_of(relative, Parents::Require) {
+    pub(crate) fn remove(&self, relative: impl AsRef<Path>) -> io::Result<()> {
+        self.remove_if(relative, |_| true)
+    }
+
+    /// Removes `relative` if it exists and `accept` approves what is there,
+    /// leaving it alone otherwise.
+    ///
+    /// The predicate sees the leaf's own `stat`, taken with `AT_SYMLINK_NOFOLLOW`
+    /// against the same directory descriptor the unlink uses, so the entry
+    /// inspected and the entry removed are one and the same and neither follows
+    /// a link out of the tree.
+    ///
+    /// This is what a launch's teardown removes its mount-point placeholders
+    /// through: a placeholder is an empty regular file for its whole life, so
+    /// anything with content, or anything that is no longer a plain file,
+    /// arrived from elsewhere and belongs to whoever put it there.
+    pub(crate) fn remove_if(
+        &self,
+        relative: impl AsRef<Path>,
+        accept: impl FnOnce(&Stat) -> bool,
+    ) -> io::Result<()> {
+        let (parent, leaf) = match self.parent_of(relative.as_ref(), Parents::Require) {
             Ok(found) => found,
             Err(Errno::NOENT | Errno::NOTDIR) => return Ok(()),
             Err(errno) => return Err(errno.into()),
         };
+        match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if !accept(&stat) => return Ok(()),
+            Ok(_) => {}
+            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(()),
+            Err(errno) => return Err(errno.into()),
+        }
         match rustix::fs::unlinkat(&parent, &leaf, AtFlags::empty()) {
             Ok(()) | Err(Errno::NOENT) => Ok(()),
             Err(errno) => Err(errno.into()),
         }
     }
 
+    /// Whether `stat` describes an empty regular file — the shape a launch's
+    /// mount-point placeholder has, and keeps, for its whole life.
+    pub(crate) fn is_empty_file(stat: &Stat) -> bool {
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_size == 0
+    }
+
     /// Renames `from` to `to` within the tree, replacing whatever occupies the
     /// destination. Both paths resolve against the tree's root.
-    pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        let (from_parent, from_leaf) = self.parent_of(from, Parents::Require)?;
-        let (to_parent, to_leaf) = self.parent_of(to, Parents::Create)?;
+    pub(crate) fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+        let (from_parent, from_leaf) = self.parent_of(from.as_ref(), Parents::Require)?;
+        let (to_parent, to_leaf) = self.parent_of(to.as_ref(), Parents::Create)?;
         rustix::fs::renameat(&from_parent, &from_leaf, &to_parent, &to_leaf)?;
         Ok(())
     }
@@ -161,9 +221,9 @@ impl Rooted {
     ///
     /// `target` is stored as written and never resolved here; it is read by
     /// whatever later follows the link, inside the tree.
-    pub(crate) fn symlink(&self, target: &str, relative: &str) -> io::Result<()> {
+    pub(crate) fn symlink(&self, target: &str, relative: impl AsRef<Path>) -> io::Result<()> {
         let target = CString::new(target).map_err(|_| Errno::INVAL)?;
-        let (parent, leaf) = self.parent_of(relative, Parents::Create)?;
+        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Create)?;
         replacing(&parent, &leaf, || {
             rustix::fs::symlinkat(&target, &parent, &leaf)
         })?;
@@ -177,7 +237,7 @@ impl Rooted {
     /// the file rather than written through, which is the extractor's rule for
     /// its own leaves. The mode is applied through the descriptor, so it lands
     /// on the file this created and on nothing else.
-    fn create(&self, relative: &str, contents: &[u8], mode: u32) -> io::Result<()> {
+    fn create(&self, relative: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         let (parent, leaf) = self.parent_of(relative, Parents::Create)?;
         let fd = replacing(&parent, &leaf, || {
             rustix::fs::openat(
@@ -195,7 +255,7 @@ impl Rooted {
 
     /// Opens the parent directory of `relative` and returns it with the leaf
     /// name, creating the missing links of the chain where asked to.
-    fn parent_of(&self, relative: &str, parents: Parents) -> Result<(OwnedFd, CString), Errno> {
+    fn parent_of(&self, relative: &Path, parents: Parents) -> Result<(OwnedFd, CString), Errno> {
         let components = components(relative)?;
         let (leaf, parent) = components.split_last().expect("validated non-empty");
         let leaf = CString::new(*leaf).map_err(|_| Errno::INVAL)?;
@@ -206,27 +266,20 @@ impl Rooted {
         Ok((parent, leaf))
     }
 
-    /// Resolves `components` beneath the tree as a directory.
-    fn open_dir(&self, components: &[&str]) -> Result<OwnedFd, Errno> {
+    /// Resolves `components` inside the tree as a directory.
+    ///
+    /// `RESOLVE_IN_ROOT`, so an absolute symbolic link in the chain resolves
+    /// within the tree, which is what such a link means to the root filesystem
+    /// the tree is. `O_PATH`: the descriptor is only ever the anchor of an
+    /// `*at` call.
+    fn open_dir(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
         let path = if components.is_empty() {
-            CString::new(".")
+            CString::new(&b"."[..])
         } else {
-            CString::new(components.join("/"))
+            CString::new(components.join(&b'/'))
         }
         .map_err(|_| Errno::INVAL)?;
-        loop {
-            match rustix::fs::openat2(
-                self.fd.as_fd(),
-                &path,
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-                ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
-            ) {
-                // The kernel asks for a retry when a rename raced the walk.
-                Err(Errno::AGAIN) => continue,
-                result => return result,
-            }
-        }
+        containment::open_dir(self.fd.as_fd(), &path, OFlags::PATH, ResolveFlags::IN_ROOT)
     }
 
     /// Opens `components` as a directory, creating the missing links of the
@@ -236,7 +289,7 @@ impl Rooted {
     /// in-tree symbolic link mid-path — a merged-usr alias — keeps working, and
     /// each `mkdirat` is anchored to the descriptor the previous resolve
     /// returned.
-    fn create_dirs(&self, components: &[&str]) -> Result<OwnedFd, Errno> {
+    fn create_dirs(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
         match self.open_dir(components) {
             Ok(fd) => return Ok(fd),
             Err(Errno::NOENT) => {}
@@ -308,23 +361,18 @@ fn remove_at(parent: &OwnedFd, leaf: &CString) -> Result<(), Errno> {
 
 /// Splits a tree-relative path into its components.
 ///
-/// A leading `/` is accepted and names the tree's own root, since the tree is a
-/// root filesystem whose files name themselves that way. Empty and `.`
-/// components are dropped; a `..` component, a NUL, and a path naming nothing
-/// are refused with `EINVAL` — none is a path a caller composes by accident,
-/// and refusing here keeps the shape of what reaches the kernel obvious.
-fn components(relative: &str) -> Result<Vec<&str>, Errno> {
-    if relative.contains('\0') {
-        return Err(Errno::INVAL);
-    }
-    let mut components = Vec::new();
-    for component in relative.split('/') {
-        match component {
-            "" | "." => continue,
-            ".." => return Err(Errno::INVAL),
-            _ => components.push(component),
-        }
-    }
+/// [`path::tree_components`] is the split, with a leading `/` naming the tree's
+/// own root: the tree is a root filesystem, and its files name themselves that
+/// way. Every refusal it reports becomes `EINVAL`, since this side has an errno
+/// to answer with and nothing finer; the caller's path is in the error the
+/// operation returns.
+///
+/// A path naming nothing at all — `/`, `.`, the empty path — is refused on top
+/// of what the split refuses. Every operation here acts on a leaf inside the
+/// tree, and the tree itself is not one.
+fn components(relative: &Path) -> Result<Vec<&[u8]>, Errno> {
+    let components = path::tree_components(relative.as_os_str().as_bytes(), LeadingSlash::TreeRoot)
+        .map_err(|_| Errno::INVAL)?;
     if components.is_empty() {
         return Err(Errno::INVAL);
     }

@@ -1,0 +1,16 @@
+# Primitives the workspace answers once, and the answer to reach for instead.
+#
+# An entry here belongs to a concept the code has consolidated: the second
+# direct call is how that consolidation comes undone, and this is what makes
+# the second call say so. The site that *is* the answer carries
+# `#[allow(clippy::disallowed_methods)]`, and so does any site the answer
+# genuinely does not cover -- each with a comment giving the reason, which is
+# the convention `CONTRIBUTING.md` states for a second answer generally.
+#
+# The list is deliberately short. A ban is worth adding where a direct call is
+# both tempting and subtly wrong on its own; where the concept is a shape rather
+# than a call -- an `Instant` plus a `Duration`, a hand-split path -- clippy
+# cannot see it, and `tools/check-idioms.py` is what watches instead.
+disallowed-methods = [
+  { path = "rustix::fs::openat2", reason = "open a directory contained in a tree through provision::containment::open_dir, which folds in the flags every caller passes and the retry the kernel asks for when a rename races the walk" },
+]

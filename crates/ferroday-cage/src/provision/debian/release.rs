@@ -920,7 +920,7 @@ impl Release {
             date: stanza.get("Date").map(|value| value.trim().to_string()),
             suite: stanza.get("Suite").map(|value| value.trim().to_string()),
             codename: stanza.get("Codename").map(|value| value.trim().to_string()),
-            sha256: super::deb::sha256_hex(body.as_bytes()),
+            sha256: crate::provision::digest::sha256_hex(body.as_bytes()),
         })
     }
 

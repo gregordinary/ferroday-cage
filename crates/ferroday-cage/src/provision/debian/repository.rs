@@ -19,7 +19,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::DebianError;
-use super::coordinate::{self, Nesting};
+use super::check_coordinate;
+use crate::provision::coordinate::Nesting;
 
 /// A repository's trust anchor: the keyring its signature is verified against,
 /// or an explicit decision to trust it unsigned.
@@ -210,9 +211,9 @@ impl Repository {
                 reason: "a repository needs at least one mirror URL".to_string(),
             });
         }
-        coordinate::check("the repository's suite", &self.suite, Nesting::Nested)?;
+        check_coordinate("the repository's suite", &self.suite, Nesting::Nested)?;
         for component in &self.components {
-            coordinate::check("the repository's component", component, Nesting::Nested)?;
+            check_coordinate("the repository's component", component, Nesting::Nested)?;
         }
         if self.trust_unsigned() {
             for mirror in &self.mirrors {
@@ -383,11 +384,8 @@ impl RepositoryBuilder {
                      unsigned with trust_unsigned(true)"
                     .to_string(),
             })?;
-            let bytes = std::fs::read(&path).map_err(|source| DebianError::Io {
-                op: "reading the repository keyring",
-                path: path.clone(),
-                source,
-            })?;
+            let bytes = std::fs::read(&path)
+                .map_err(DebianError::at("reading the repository keyring", &path))?;
             Trust::Signed(bytes)
         };
 
@@ -419,7 +417,7 @@ const AUTHENTICATED_SCHEMES: [&str; 2] = ["file", "https"];
 /// caller-supplied one address a mirror by scheme, so a bare path is a
 /// misconfiguration rather than a transport with a known posture.
 fn is_authenticated_transport(url: &str) -> bool {
-    super::fetch::scheme_of(url).is_some_and(|scheme| {
+    crate::provision::fetch::scheme_of(url).is_some_and(|scheme| {
         AUTHENTICATED_SCHEMES
             .iter()
             .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
@@ -429,14 +427,21 @@ fn is_authenticated_transport(url: &str) -> bool {
 /// Rejects a repository name that is not a portable file-name stem, so it
 /// cannot traverse out of `sources.list.d` or the keyrings directory when the
 /// finished rootfs's sources are written.
+///
+/// The name is one directory entry, so it passes [`check_coordinate`] as a
+/// [`Nesting::Single`] value first: that is where the empty name, the traversal,
+/// the separator, and the shapes a deb822 field cannot carry are refused, and
+/// refusing them here as well would be a second answer to a question already
+/// settled. What remains is the narrower rule this name alone needs — an
+/// allow-list, because the stem also becomes a shell-visible file name in a
+/// finished rootfs, where a caller's locale-dependent or shell-significant
+/// character is a liability rather than merely unusual.
 fn validate_name(name: &str) -> Result<(), DebianError> {
-    let portable = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        && name != "."
-        && name != "..";
-    if portable {
+    check_coordinate("the repository name", name, Nesting::Single)?;
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
         Ok(())
     } else {
         Err(DebianError::Config {
@@ -607,13 +612,25 @@ mod tests {
 
     #[test]
     fn a_traversing_name_is_refused() {
-        let err = Repository::builder("trixie")
-            .mirror("file:///srv/debs")
-            .trust_unsigned(true)
-            .name("../evil")
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, DebianError::Config { .. }));
+        // The name is one directory entry, so it is refused for every reason a
+        // single-segment coordinate is — traversal, the separator, the empty
+        // name, and the shapes a deb822 field or a request line cannot carry —
+        // and additionally for a character that is not a portable file-name
+        // stem.
+        for name in [
+            "../evil", "a/b", "", "   ", ".", "..", "my repo", "a\nb", "/abs", "star*",
+        ] {
+            match Repository::builder("trixie")
+                .mirror("file:///srv/debs")
+                .trust_unsigned(true)
+                .name(name)
+                .build()
+            {
+                Err(DebianError::Config { .. }) => {}
+                Err(other) => panic!("{name:?} was refused as {other}"),
+                Ok(_) => panic!("{name:?} was accepted"),
+            }
+        }
     }
 
     #[test]

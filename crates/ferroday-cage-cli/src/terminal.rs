@@ -69,6 +69,8 @@ use rustix::runtime::{How, KernelSigSet};
 use rustix::termios::{self, OptionalActions, SpecialCodeIndex, Termios};
 use syscalls::Sysno;
 
+use crate::escalation::Escalation;
+
 /// The signals the relay reads as data rather than letting the kernel act on.
 ///
 /// Blocking them is what makes them readable from the descriptor instead of
@@ -344,26 +346,19 @@ impl Drop for RawMode {
 /// what keeps the loop from spinning. `poll` reports `POLLHUP`, `POLLERR`, and
 /// `POLLNVAL` whatever the requested events are, so a muted slot on a hung-up
 /// pipe — `producer | fcage --terminal ...` after the producer exits — is ready
-/// on every pass and the loop never blocks again. Putting the droppable
-/// channel last is the discipline the library's own supervisor loop follows,
-/// for the same reason.
+/// on every pass and the loop never blocks again.
+///
+/// This is one of the two techniques that work, and the library states both
+/// together: its supervisor loop retires a channel by substituting a different,
+/// still-live descriptor with no requested events, because its droppable
+/// channels are not last. Muting the real descriptor is the third technique and
+/// is the one that does not work, whichever loop tries it.
 ///
 /// The other two indices stay stable across the change, and an unpolled slot's
 /// `revents` stays as `PollFd::new` left it: empty.
 const PRIMARY: usize = 0;
 const SIGNALS: usize = 1;
 const STDIN: usize = 2;
-
-/// How far the timeout escalation has gone.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Escalation {
-    /// Running normally; the deadline is the caller's `--timeout`.
-    Running,
-    /// Terminated once; the deadline is the `--kill-after` grace.
-    Terminated,
-    /// Killed; no deadline remains.
-    Killed,
-}
 
 /// Drives an interactive session to its end and returns the command's outcome.
 ///
@@ -396,39 +391,31 @@ pub fn relay(
     // input is not a terminal, where restoring is a no-op.
     let _raw = RawMode;
 
-    let outcome = pump(
-        &mut running,
-        &pty,
-        &signals,
-        interactive,
-        timeout,
-        kill_after,
-    );
+    // The `--timeout` policy the non-terminal wait follows too; the loop
+    // supplies only the waiting, which here is the poll it already blocks in.
+    let mut escalation = Escalation::new(timeout, kill_after);
+    let outcome = pump(&mut running, &pty, &signals, interactive, &mut escalation);
     drop(_raw);
-    let expired = outcome?;
+    outcome?;
 
     // The wait is prompt: the loop ended at end-of-file on the primary, which
     // means every replica is closed and the command is already gone.
     let status = running.wait()?;
-    Ok(if expired { None } else { Some(status) })
+    Ok(escalation.outcome(status))
 }
 
-/// The loop proper. Returns whether the timeout expired.
+/// The loop proper.
 fn pump(
     running: &mut Running<'_>,
     pty: &Pty,
     signals: &Signals,
     interactive: bool,
-    timeout: Option<Duration>,
-    kill_after: Duration,
-) -> Result<bool, RelayError> {
+    escalation: &mut Escalation,
+) -> Result<(), RelayError> {
     let stdin = rustix::stdio::stdin();
     let mut stdin_open = true;
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = [0u8; RELAY_BUF];
-    let mut escalation = Escalation::Running;
-    let mut expired = false;
-    let mut deadline = timeout.map(|timeout| Instant::now() + timeout);
     // A second interrupt escalates; the first is a request.
     let mut interrupted = false;
 
@@ -454,26 +441,13 @@ fn pump(
             &mut slots[..STDIN]
         };
 
-        let wait = deadline.map(timespec_until);
+        let wait = escalation.deadline().map(timespec_until);
         match rustix::event::poll(watched, wait.as_ref()) {
             Ok(0) => {
                 // The deadline passed. Escalate, and keep relaying: the
                 // sandbox's exit closes the replicas, end-of-file ends the loop,
                 // and restoration happens on the normal path.
-                expired = true;
-                match escalation {
-                    Escalation::Running => {
-                        running.terminate()?;
-                        escalation = Escalation::Terminated;
-                        deadline = Some(Instant::now() + kill_after);
-                    }
-                    Escalation::Terminated => {
-                        running.kill()?;
-                        escalation = Escalation::Killed;
-                        deadline = None;
-                    }
-                    Escalation::Killed => deadline = None,
-                }
+                escalation.expire(running)?;
                 continue;
             }
             Ok(_) => {}
@@ -567,7 +541,7 @@ fn pump(
         if ready[PRIMARY].intersects(PollFlags::IN | PollFlags::HUP) {
             match rustix::io::read(pty, &mut buf) {
                 // End-of-file on the primary is the session-over signal.
-                Ok(0) => return Ok(expired),
+                Ok(0) => return Ok(()),
                 Ok(read) => {
                     // Blocking, and outside the poll; see the module's "The two
                     // directions are not symmetric" for why descriptor 1 is not
@@ -579,7 +553,7 @@ fn pump(
                 Err(Errno::INTR | Errno::AGAIN) => {}
                 // Hangup on a pseudoterminal primary is EIO, and it is the same
                 // end of session.
-                Err(Errno::IO) => return Ok(expired),
+                Err(Errno::IO) => return Ok(()),
                 Err(errno) => return Err(errno.into()),
             }
         }
@@ -621,9 +595,16 @@ fn replica_veof(pty: &Pty) -> u8 {
 
 /// The time remaining until `deadline`, as a poll timeout; zero once it has
 /// passed, which polls without blocking and reports the expiry.
+///
+/// The library performs the same saturating conversion for its own loops and
+/// does not export it: the return type belongs to `rustix`, and a crate that
+/// published it would be promising that dependency's types to its consumers.
+/// The conversion is stated in both crates rather than in neither.
 fn timespec_until(deadline: Instant) -> Timespec {
     let remaining = deadline.saturating_duration_since(Instant::now());
     Timespec {
+        // Saturating: a duration past the `i64` seconds range has no faithful
+        // timeout, and a wrapped one would busy-loop rather than wait.
         tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
         tv_nsec: i64::from(remaining.subsec_nanos()),
     }

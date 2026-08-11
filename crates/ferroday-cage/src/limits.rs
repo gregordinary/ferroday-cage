@@ -40,6 +40,8 @@
 //! to configure. What is here is the per-process axis, which needs no
 //! privilege and no host configuration.
 
+use std::fmt;
+
 /// The spelling both the profile format and the command line use for
 /// [`Limit::UNLIMITED`].
 const UNLIMITED_NAME: &str = "unlimited";
@@ -115,8 +117,8 @@ impl From<u64> for Limit {
     }
 }
 
-impl std::fmt::Display for Limit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Limit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Some(amount) => write!(f, "{amount}"),
             None => f.write_str(UNLIMITED_NAME),
@@ -150,7 +152,7 @@ struct LimitVisitor;
 impl serde::de::Visitor<'_> for LimitVisitor {
     type Value = Limit;
 
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "a non-negative amount or {UNLIMITED_NAME:?}")
     }
 
@@ -308,8 +310,8 @@ impl Resource {
     }
 }
 
-impl std::fmt::Display for Resource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Resource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.kernel_name())
     }
 }
@@ -324,6 +326,8 @@ impl std::fmt::Display for Resource {
 /// values agree, so a hand-written profile may always spell out the pair.
 #[cfg(feature = "serde")]
 pub(crate) mod serde_rlimits {
+    use std::fmt;
+
     use super::{Limit, Resource};
     use serde::Deserialize as _;
     use serde::de::{Error as _, MapAccess, Visitor};
@@ -376,7 +380,7 @@ pub(crate) mod serde_rlimits {
     impl<'de> Visitor<'de> for SettingVisitor {
         type Value = Setting;
 
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str(
                 "a resource limit: one value for both the soft and the hard limit, \
                  or a table of `soft` and `hard`",

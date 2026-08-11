@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode, ResolveFlags};
@@ -20,6 +20,7 @@ use crate::mechanism::{
     NestedMap, NestedPlan, OverlayPlan, RlimitPlan, RunAsPlan, StdioPlan,
 };
 use crate::observer::{Collect, Observer, Output};
+use crate::path;
 use crate::resolved::ResolvedInputs;
 use crate::running::{Pending, Running};
 use crate::status::ExitStatus;
@@ -313,32 +314,27 @@ impl<'de> serde::Deserialize<'de> for Stdio {
 )]
 pub struct RawMount {
     /// The mount target, an absolute path inside the sandbox.
-    #[cfg_attr(feature = "serde", serde(rename = "target"))]
     target: PathBuf,
     /// The mount source, passed to the kernel verbatim.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "source"))]
     source: Option<PathBuf>,
     /// The filesystem type.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "fstype"))]
     fstype: Option<String>,
     /// Mount flags: the kernel's raw `MS_*` bits.
     #[cfg_attr(feature = "serde", serde(default))]
-    #[cfg_attr(feature = "serde", serde(rename = "flags"))]
     flags: u64,
     /// The filesystem data string.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "data"))]
     data: Option<String>,
 }
 
@@ -642,12 +638,9 @@ impl Cage {
     serde(rename_all = "kebab-case", deny_unknown_fields)
 )]
 pub struct Bind {
-    #[cfg_attr(feature = "serde", serde(rename = "source"))]
     source: PathBuf,
-    #[cfg_attr(feature = "serde", serde(rename = "target"))]
     target: PathBuf,
     #[cfg_attr(feature = "serde", serde(default))]
-    #[cfg_attr(feature = "serde", serde(rename = "read-only"))]
     read_only: bool,
 }
 
@@ -703,14 +696,12 @@ impl Bind {
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
-    serde(tag = "kind")
+    serde(tag = "kind", rename_all = "kebab-case")
 )]
 pub enum Mount {
     /// A bind mount of a host path.
-    #[cfg_attr(feature = "serde", serde(rename = "bind"))]
     Bind(Bind),
     /// A raw mount, passed to the kernel verbatim.
-    #[cfg_attr(feature = "serde", serde(rename = "raw"))]
     Raw(RawMount),
 }
 
@@ -783,23 +774,14 @@ impl Mount {
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
-    serde(default, deny_unknown_fields)
+    serde(default, rename_all = "kebab-case", deny_unknown_fields)
 )]
 pub struct Overlay {
-    #[cfg_attr(
-        feature = "serde",
-        serde(rename = "lower", skip_serializing_if = "Vec::is_empty")
-    )]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
     lower: Vec<PathBuf>,
-    #[cfg_attr(
-        feature = "serde",
-        serde(rename = "upper", skip_serializing_if = "Option::is_none")
-    )]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     upper: Option<PathBuf>,
-    #[cfg_attr(
-        feature = "serde",
-        serde(rename = "work", skip_serializing_if = "Option::is_none")
-    )]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     work: Option<PathBuf>,
 }
 
@@ -967,34 +949,24 @@ impl Overlay {
     serde(default, rename_all = "kebab-case", deny_unknown_fields)
 )]
 pub struct CageBuilder {
-    #[cfg_attr(feature = "serde", serde(rename = "rootfs"))]
     rootfs: Option<PathBuf>,
-    #[cfg_attr(feature = "serde", serde(rename = "command"))]
     command: Option<PathBuf>,
     #[cfg_attr(
         feature = "serde",
         serde(with = "serde_os::string_vec", skip_serializing_if = "Vec::is_empty")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "args"))]
     args: Vec<OsString>,
-    #[cfg_attr(feature = "serde", serde(rename = "network"))]
     network: Network,
     #[cfg_attr(
         feature = "serde",
         serde(with = "serde_os::string_opt", skip_serializing_if = "Option::is_none")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "hostname"))]
     hostname: Option<OsString>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "workdir"))]
     workdir: Option<PathBuf>,
-    #[cfg_attr(feature = "serde", serde(rename = "stdin"))]
     stdin: Stdio,
-    #[cfg_attr(feature = "serde", serde(rename = "stdout"))]
     stdout: Stdio,
-    #[cfg_attr(feature = "serde", serde(rename = "stderr"))]
     stderr: Stdio,
-    #[cfg_attr(feature = "serde", serde(rename = "pid-namespace"))]
     pid_namespace: bool,
     // The managed mounts are `Option<bool>` rather than `bool` so that "left at
     // its default" is distinguishable from "explicitly asked for". Only that
@@ -1002,19 +974,14 @@ pub struct CageBuilder {
     // `mount_dev(true)` instead of silently overriding it. `None` reads as the
     // default, which every one of them documents as `true`.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "managed-mounts"))]
     managed_mounts: Option<bool>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "mount-proc"))]
     mount_proc: Option<bool>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "mount-dev"))]
     mount_dev: Option<bool>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "mount-tmp"))]
     mount_tmp: Option<bool>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "resolv-conf"))]
     resolv_conf: Option<bool>,
     // Whether the library's deterministic base environment is composed under
     // the caller's variables. `false` means the command's environment is
@@ -1023,11 +990,8 @@ pub struct CageBuilder {
     // records what its author asked for, and an unstated key stays unstated
     // through a render-and-reload cycle.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "base-env"))]
     base_env: Option<bool>,
-    #[cfg_attr(feature = "serde", serde(rename = "stop-with-caller"))]
     stop_with_caller: bool,
-    #[cfg_attr(feature = "serde", serde(rename = "path-lookup"))]
     path_lookup: bool,
     // The identity fields sit between the scalars and the tables: the map
     // serializes as a string for the unit forms and a table for ranges, and
@@ -1037,17 +1001,14 @@ pub struct CageBuilder {
         feature = "serde",
         serde(skip_serializing_if = "identity_map_is_default")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "identity-map"))]
     identity_map: IdentityMap,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "run-as"))]
     run_as: Option<Identity>,
     // The overlay root, set only for an overlay-rooted cage; `None` for a plain
     // `rootfs`. Exactly one of the two is in force. It serializes as a table, so
     // it sits after every scalar key: a scalar following a table header would be
     // parsed into that table.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    #[cfg_attr(feature = "serde", serde(rename = "overlay"))]
     overlay: Option<Overlay>,
     // The delegate is code, not configuration: never part of a profile.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -1055,20 +1016,23 @@ pub struct CageBuilder {
     // Keyed by resource, so a repeated call replaces and the applied order is
     // fixed. It serializes as the `[rlimit]` table, so it sits with the other
     // tables rather than among the scalars.
+    // One of the two fields whose wire name is not what `rename_all` derives:
+    // the Rust field is plural and the TOML table it names is singular, as a
+    // table of entries reads. `mounts` below is the other, and they are the
+    // only two — every other key in the format comes from `rename_all`.
     #[cfg_attr(
         feature = "serde",
         serde(
+            rename = "rlimit",
             with = "crate::limits::serde_rlimits",
             skip_serializing_if = "BTreeMap::is_empty"
         )
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "rlimit"))]
     rlimits: BTreeMap<Resource, (Limit, Limit)>,
     #[cfg_attr(
         feature = "serde",
         serde(with = "serde_os::string_map", skip_serializing_if = "Vec::is_empty")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "env"))]
     env: Vec<(OsString, OsString)>,
     // Binds and raw mounts share one sequence so the order the caller declared
     // them in is the order they are applied in. Two kind-segregated lists could
@@ -1092,7 +1056,6 @@ pub struct CageBuilder {
             skip_serializing_if = "crate::hardening::Request::has_no_hardening"
         )
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "hardening"))]
     hardening: crate::hardening::Request,
     // In a build with `serde` but without `hardening`, a placeholder keeps the
     // `hardening` key known so a profile that configures it is refused with a
@@ -1101,7 +1064,6 @@ pub struct CageBuilder {
     #[cfg(all(feature = "serde", not(feature = "hardening")))]
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
-    #[cfg_attr(feature = "serde", serde(rename = "hardening"))]
     hardening: HardeningUnsupported,
 }
 
@@ -2042,7 +2004,7 @@ impl CageBuilder {
         let canonical = std::fs::canonicalize(&rootfs).map_err(|err| {
             Error::from(ConfigError::RootfsUnusable {
                 path: rootfs.clone(),
-                errno: err.raw_os_error().unwrap_or(Errno::IO.raw_os_error()),
+                source: err,
             })
         })?;
         if canonical.parent().is_none() {
@@ -2055,7 +2017,7 @@ impl CageBuilder {
         )
         .map_err(|errno| ConfigError::RootfsUnusable {
             path: rootfs.clone(),
-            errno: errno.raw_os_error(),
+            source: errno.into(),
         })?;
         let rootfs_path = cstring(canonical.as_os_str())?;
 
@@ -2849,7 +2811,7 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         .map_err(|errno| ConfigError::OverlayDirUnusable {
             layer: OverlayLayer::Lower,
             path: lower.clone(),
-            errno: errno.raw_os_error(),
+            source: errno.into(),
         })?;
         lowers.push(resolved);
     }
@@ -2900,7 +2862,7 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         return Err(ConfigError::OverlayDirUnusable {
             layer: OverlayLayer::Work,
             path: work,
-            errno: Errno::XDEV.raw_os_error(),
+            source: Errno::XDEV.into(),
         }
         .into());
     }
@@ -3068,7 +3030,7 @@ fn overlay_io(layer: OverlayLayer, path: &Path, err: std::io::Error) -> Error {
     ConfigError::OverlayDirUnusable {
         layer,
         path: path.to_path_buf(),
-        errno: err.raw_os_error().unwrap_or(Errno::IO.raw_os_error()),
+        source: err,
     }
     .into()
 }
@@ -3079,7 +3041,7 @@ fn overlay_errno(layer: OverlayLayer, path: &Path, errno: Errno) -> Error {
     ConfigError::OverlayDirUnusable {
         layer,
         path: path.to_path_buf(),
-        errno: errno.raw_os_error(),
+        source: errno.into(),
     }
     .into()
 }
@@ -3241,7 +3203,7 @@ impl Lowering {
         let source = std::fs::canonicalize(&bind.source).map_err(|err| {
             Error::from(ConfigError::BindSourceUnusable {
                 path: bind.source.clone(),
-                errno: err.raw_os_error().unwrap_or(Errno::IO.raw_os_error()),
+                source: err,
             })
         })?;
         let source_is_dir = source.is_dir();
@@ -3458,13 +3420,18 @@ pub(crate) fn entry_in_root(root: Option<&OwnedFd>, relative: &Path) -> Presence
     let Ok(relative) = CString::new(relative.as_os_str().as_bytes()) else {
         return Presence::Unknown;
     };
-    match rustix::fs::openat2(
+    // Not `provision::containment::open_dir`: the question is whether a *leaf*
+    // is there, of whatever kind, so this opens with `O_NOFOLLOW` and without
+    // `O_DIRECTORY`, and every failure becomes a verdict rather than an error.
+    #[allow(clippy::disallowed_methods)]
+    let opened = rustix::fs::openat2(
         root,
         relative.as_c_str(),
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
         ResolveFlags::IN_ROOT,
-    ) {
+    );
+    match opened {
         Ok(_) => Presence::Present,
         // Nothing at the path, or a non-directory where a directory would have
         // to be for anything to sit under it: either way the entry is absent.
@@ -3473,25 +3440,18 @@ pub(crate) fn entry_in_root(root: Option<&OwnedFd>, relative: &Path) -> Presence
     }
 }
 
-/// Splits an absolute sandbox path into its normal components, rejecting
-/// relative paths, the bare root, and `.` or `..` components.
+/// Splits an absolute sandbox path into its ordinary components.
+///
+/// The bare root is refused on top of what [`path::absolute_components`]
+/// refuses: a mount target names something *inside* the rootfs, and the rootfs
+/// itself is what the target would be established over.
 fn sandbox_path_components(path: &Path) -> Result<Vec<&OsStr>, Error> {
     let invalid = || {
         Error::from(ConfigError::MountTargetInvalid {
             path: path.to_path_buf(),
         })
     };
-    let mut iter = path.components();
-    if iter.next() != Some(Component::RootDir) {
-        return Err(invalid());
-    }
-    let mut components = Vec::new();
-    for component in iter {
-        match component {
-            Component::Normal(name) => components.push(name),
-            _ => return Err(invalid()),
-        }
-    }
+    let components = path::absolute_components(path).map_err(|_| invalid())?;
     if components.is_empty() {
         return Err(invalid());
     }
@@ -3762,6 +3722,7 @@ pub(crate) mod serde_os {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     fn sh_in(rootfs: &str) -> CageBuilder {
         Cage::builder().rootfs(rootfs).command("/bin/sh")
@@ -3988,8 +3949,8 @@ mod tests {
     fn build_rejects_a_missing_rootfs_with_the_os_error() {
         let err = sh_in("/ferroday-cage/does/not/exist").build().unwrap_err();
         match err {
-            Error::Config(ConfigError::RootfsUnusable { errno, .. }) => {
-                assert_eq!(errno, Errno::NOENT.raw_os_error());
+            Error::Config(ConfigError::RootfsUnusable { source, .. }) => {
+                assert_eq!(source.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
             }
             other => panic!("expected RootfsUnusable, got {other:?}"),
         }
@@ -3999,8 +3960,8 @@ mod tests {
     fn build_rejects_a_rootfs_that_is_not_a_directory() {
         let err = sh_in("/dev/null").build().unwrap_err();
         match err {
-            Error::Config(ConfigError::RootfsUnusable { errno, .. }) => {
-                assert_eq!(errno, Errno::NOTDIR.raw_os_error());
+            Error::Config(ConfigError::RootfsUnusable { source, .. }) => {
+                assert_eq!(source.raw_os_error(), Some(Errno::NOTDIR.raw_os_error()));
             }
             other => panic!("expected RootfsUnusable, got {other:?}"),
         }
@@ -4061,8 +4022,8 @@ mod tests {
             .build()
             .unwrap_err();
         match err {
-            Error::Config(ConfigError::BindSourceUnusable { errno, .. }) => {
-                assert_eq!(errno, Errno::NOENT.raw_os_error());
+            Error::Config(ConfigError::BindSourceUnusable { source, .. }) => {
+                assert_eq!(source.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
             }
             other => panic!("expected BindSourceUnusable, got {other:?}"),
         }
@@ -4770,7 +4731,7 @@ mod tests {
         if !host_has_resolv_conf() {
             return;
         }
-        let dir = crate::scratch::Scratch::new("resolv");
+        let dir = Scratch::new("resolv");
         std::fs::create_dir_all(dir.join("etc")).unwrap();
         let rootfs = dir.to_str().unwrap();
 
@@ -4825,7 +4786,7 @@ mod tests {
         if !host_has_resolv_conf() {
             return;
         }
-        let dir = crate::scratch::Scratch::new("resolv-overlay");
+        let dir = Scratch::new("resolv-overlay");
         let base = dir.join("base");
         let upper = dir.join("upper");
         std::fs::create_dir_all(base.join("etc")).unwrap();
@@ -4876,7 +4837,7 @@ mod tests {
         // resolv.conf bind does, and leaves the same residue if nothing takes
         // it away — an empty file the root never shipped, carried into an
         // export of the tree.
-        let dir = crate::scratch::Scratch::new("bind-placeholder");
+        let dir = Scratch::new("bind-placeholder");
         let rootfs = dir.join("rootfs");
         let source = dir.join("source");
         std::fs::create_dir_all(rootfs.join("etc")).unwrap();
@@ -4954,7 +4915,7 @@ mod tests {
         // RESOLVE_IN_ROOT, so such a link lands inside the rootfs; the
         // bookkeeping here has to agree, or it records a path the launch never
         // wrote to and answers a question about the host's filesystem instead.
-        let dir = crate::scratch::Scratch::new("placeholder-in-root");
+        let dir = Scratch::new("placeholder-in-root");
         let rootfs = dir.join("rootfs");
         let source = dir.join("source");
         std::fs::create_dir_all(rootfs.join("real")).unwrap();
@@ -5042,8 +5003,197 @@ mod tests {
 #[cfg(all(test, feature = "serde"))]
 mod serde_tests {
     use super::*;
+    use crate::scratch::Scratch;
 
-    /// A profile exercising every serializable field.
+    /// A profile naming every field the format has, for the key-pinning test
+    /// below. Nothing here is a meaningful configuration; it exists so that
+    /// serializing it renders every key.
+    ///
+    /// The `hardening` feature is required, and not because the test wants it:
+    /// a build without it refuses a profile that configures hardening, which is
+    /// a promise of its own that
+    /// [`a_hardening_profile_is_rejected_without_the_feature`] holds. A profile
+    /// naming every key therefore only parses where every key exists.
+    #[cfg(feature = "hardening")]
+    const EVERY_KEY_PROFILE: &str = r#"
+rootfs = "/srv/rootfs"
+command = "/bin/sh"
+args = ["-c", "true"]
+network = "host"
+hostname = "builder"
+workdir = "/build"
+stdin = "null"
+stdout = "inherit"
+stderr = "null"
+pid-namespace = false
+managed-mounts = true
+mount-proc = true
+mount-dev = false
+mount-tmp = true
+resolv-conf = false
+base-env = false
+stop-with-caller = true
+path-lookup = true
+run-as = { uid = 1000, gid = 1000, groups = [10, 20] }
+
+[identity-map.ranges]
+uid = [{ inside = 0, outside = 100000, count = 65536 }]
+gid = [{ inside = 0, outside = 100000, count = 65536 }]
+
+[overlay]
+lower = ["/srv/base"]
+upper = "/var/tmp/upper"
+work = "/var/tmp/work"
+
+[rlimit]
+processes = 64
+cpu-time = { soft = 10, hard = "unlimited" }
+
+[env]
+PATH = "/usr/bin"
+
+[[mount]]
+kind = "bind"
+source = "/etc"
+target = "/host-etc"
+read-only = true
+
+[[mount]]
+kind = "raw"
+target = "/raw"
+fstype = "tmpfs"
+flags = 6
+data = "mode=0777"
+
+[hardening]
+seccomp = "curated"
+keep-caps = ["net-bind-service"]
+
+[[hardening.landlock-fs]]
+path = "/usr"
+access = "rx"
+
+[[hardening.landlock-net]]
+port = 443
+access = "c"
+"#;
+
+    /// The keys the exhaustive profile above renders, in sorted order.
+    #[cfg(feature = "hardening")]
+    const EXPECTED_PROFILE_KEYS: [&str; 60] = [
+        "args",
+        "base-env",
+        "command",
+        "env",
+        "env.PATH",
+        "hardening",
+        "hardening.keep-caps",
+        "hardening.landlock-fs",
+        "hardening.landlock-fs[].access",
+        "hardening.landlock-fs[].path",
+        "hardening.landlock-net",
+        "hardening.landlock-net[].access",
+        "hardening.landlock-net[].port",
+        "hardening.seccomp",
+        "hostname",
+        "identity-map",
+        "identity-map.ranges",
+        "identity-map.ranges.gid",
+        "identity-map.ranges.gid[].count",
+        "identity-map.ranges.gid[].inside",
+        "identity-map.ranges.gid[].outside",
+        "identity-map.ranges.uid",
+        "identity-map.ranges.uid[].count",
+        "identity-map.ranges.uid[].inside",
+        "identity-map.ranges.uid[].outside",
+        "managed-mounts",
+        "mount",
+        "mount-dev",
+        "mount-proc",
+        "mount-tmp",
+        "mount[].data",
+        "mount[].flags",
+        "mount[].fstype",
+        "mount[].kind",
+        "mount[].read-only",
+        "mount[].source",
+        "mount[].target",
+        "network",
+        "overlay",
+        "overlay.lower",
+        "overlay.upper",
+        "overlay.work",
+        "path-lookup",
+        "pid-namespace",
+        "resolv-conf",
+        "rlimit",
+        "rlimit.cpu-time",
+        "rlimit.cpu-time.hard",
+        "rlimit.cpu-time.soft",
+        "rlimit.processes",
+        "rootfs",
+        "run-as",
+        "run-as.gid",
+        "run-as.groups",
+        "run-as.uid",
+        "stderr",
+        "stdin",
+        "stdout",
+        "stop-with-caller",
+        "workdir",
+    ];
+
+    /// Every key a serialized profile can carry, as a sorted list of dotted
+    /// paths, with an array index rendered as `[]`.
+    ///
+    /// The profile format is a compatibility commitment, and a key's spelling
+    /// comes from `rename_all` on the container rather than from a `rename` on
+    /// every field — so a Rust-side field rename, a changed `rename_all`, a
+    /// typo in a container attribute, and a newly added field all move a key
+    /// silently. This is what notices. A deliberate change to the format
+    /// updates this list, and the diff is the review.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn the_profile_format_keys_are_what_they_are() {
+        fn walk(value: &toml::Value, prefix: &str, into: &mut Vec<String>) {
+            match value {
+                toml::Value::Table(table) => {
+                    for (key, nested) in table {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        into.push(path.clone());
+                        walk(nested, &path, into);
+                    }
+                }
+                toml::Value::Array(items) => {
+                    for item in items {
+                        walk(item, &format!("{prefix}[]"), into);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let builder: CageBuilder =
+            toml::from_str(EVERY_KEY_PROFILE).expect("the exhaustive profile parses");
+        let rendered = toml::to_string(&builder).expect("the builder serializes");
+        let rendered: toml::Table =
+            toml::from_str(&rendered).expect("the rendering parses back as TOML");
+
+        let mut keys = Vec::new();
+        walk(&toml::Value::Table(rendered), "", &mut keys);
+        keys.sort();
+        keys.dedup();
+
+        assert_eq!(
+            keys, EXPECTED_PROFILE_KEYS,
+            "the profile format's keys moved"
+        );
+    }
+
     const FULL_PROFILE: &str = r#"
 rootfs = "/srv/rootfs/alpine"
 command = "/usr/bin/make"
@@ -5572,7 +5722,7 @@ read-only = true
     fn an_overlay_layer_directory_is_created_fresh_and_owned() {
         use std::os::unix::fs::PermissionsExt;
 
-        let scratch = crate::scratch::Scratch::new("overlay-layer-dir");
+        let scratch = Scratch::new("overlay-layer-dir");
 
         // A layer directory the library creates: made here, at the stated mode.
         // (The umask is not set here to prove the chmod that follows the
@@ -5637,7 +5787,7 @@ read-only = true
         // `/` has no parent, so there is nowhere for the work directory beside
         // the upper or for the host preflight's scratch entries — and an upper
         // there would put the sandbox's writes over the whole host root.
-        let lower = crate::scratch::Scratch::new("overlay-upper-root");
+        let lower = Scratch::new("overlay-upper-root");
         let err = Cage::builder()
             .overlay_rootfs(&*lower, "/")
             .command("/bin/sh")

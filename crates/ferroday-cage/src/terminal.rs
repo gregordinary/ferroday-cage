@@ -448,7 +448,7 @@ fn baseline_termios(replica: &OwnedFd) -> Result<termios::Termios, Error> {
 /// A failed pseudoterminal operation, as the typed error.
 fn terminal_error(errno: Errno) -> Error {
     Error::Terminal {
-        errno: errno.raw_os_error(),
+        source: errno.into(),
     }
 }
 

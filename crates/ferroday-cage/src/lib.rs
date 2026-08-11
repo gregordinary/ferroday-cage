@@ -282,6 +282,8 @@ mod mechanism;
 #[cfg(feature = "netstack")]
 mod netstack;
 mod observer;
+mod path;
+mod poll;
 pub mod provision;
 mod resolved;
 #[cfg(feature = "hardening")]
@@ -292,6 +294,7 @@ mod scratch;
 mod spec;
 mod status;
 mod terminal;
+mod wire;
 
 pub use error::{ConfigError, Error, OverlayLayer, SetupStep};
 #[cfg(feature = "hardening")]

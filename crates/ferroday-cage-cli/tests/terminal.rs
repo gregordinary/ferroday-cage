@@ -478,33 +478,7 @@ impl Session {
     /// a deadline — a blocking read on a quiet session would ignore it and hang
     /// the whole run.
     fn drain(&mut self, deadline: Instant) -> bool {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout = rustix::event::Timespec {
-            tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: i64::from(remaining.subsec_nanos()),
-        };
-        let mut slots = [rustix::event::PollFd::new(
-            &self.primary,
-            rustix::event::PollFlags::IN,
-        )];
-        match rustix::event::poll(&mut slots, Some(&timeout)) {
-            Ok(0) => return false,
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => return true,
-            Err(errno) => panic!("waiting on the session failed: {errno}"),
-        }
-        let mut buf = [0u8; 4096];
-        match rustix::io::read(&self.primary, &mut buf) {
-            // End of file, or the hangup a pseudoterminal reports as EIO: no
-            // more is coming.
-            Ok(0) | Err(rustix::io::Errno::IO) => false,
-            Ok(read) => {
-                self.seen.push_str(&String::from_utf8_lossy(&buf[..read]));
-                true
-            }
-            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => true,
-            Err(errno) => panic!("reading the session failed: {errno}"),
-        }
+        common::drain_until(&self.primary, deadline, &mut self.seen)
     }
 
     /// Waits for the session to end and returns its status, failing the test if

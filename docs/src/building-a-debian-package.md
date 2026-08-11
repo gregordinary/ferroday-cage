@@ -123,6 +123,25 @@ observer, wrapped as `ProvisionEvent::Debian`, for a consumer that wants one
 adapter across every provisioner; and either way the run honours that observer's
 cancellation check between packages.
 
+The sink is a `DebianObserver`, and a closure is one — which is why the example
+passes a function. A caller that also wants to *stop* a bootstrap implements the
+trait instead and answers its `cancelled`, which is consulted at the same
+boundaries: a package, an extraction. That is the only way to cancel a
+`Debian::observe(...).resolve()` or `.available()`, which run outside a
+provisioning run and so have no `Provision` observer to ask.
+
+```rust,ignore
+impl DebianObserver for Progress {
+    fn progress(&mut self, event: DebianEvent<'_>) {
+        eprintln!("{event:?}");
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+```
+
 ## Running the example
 
 The example lives at `crates/ferroday-cage/examples/deb-build.rs`. It bootstraps

@@ -1,9 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/ferroday-cage", "crates/ferroday-cage-cli"]
+members = [
+    "crates/ferroday-cage",
+    "crates/ferroday-cage-cli",
+    "crates/ferroday-cage-testkit",
+]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -23,3 +27,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
+# `clippy.toml` lists the primitives the workspace answers once. Denied rather
+# than left at its default warning, so reaching past one of those answers fails
+# a plain `cargo clippy` and not only CI's `-D warnings`.
+disallowed_methods = "deny"

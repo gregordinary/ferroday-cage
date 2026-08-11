@@ -14,6 +14,225 @@ affected.
 
 ## [Unreleased]
 
+### Changed
+
+- The transport seam is `provision::{Fetch, FetchRequest, FetchError,
+  HttpFetch, file_url}`, moved out of `provision::debian`. It was never
+  Debian's: it speaks HTTP and `file://` and knows nothing of an archive's
+  format, and every userland provisioner needs one. Under the old paths a
+  provisioner built without the `debian` feature had no transport at all, not
+  even the built-in client. The modules now compile for any userland feature,
+  and no re-export is left at the old paths.
+
+  `file_url` reports a `FetchError` rather than a `DebianError`, since a path
+  that cannot be named is a resource that cannot be addressed, whichever layer
+  wanted to address it. `Pool::mirror_url` therefore returns
+  `DebianError::Fetch` where it previously returned `DebianError::Config` or
+  `DebianError::Io`.
+
+- Every OS failure a library error carries is now an `io::Error` and is returned
+  from `source()`. `Error`, `ConfigError`, `IdMapError`, and `NetStackError`
+  stored a raw `errno: i32` and then rendered it by constructing an `io::Error`
+  at each `Display` arm — twenty-odd sites undoing the same representation —
+  while `ProvisionError`, `DebianError`, and `FetchError` carried the error
+  itself. `source()` divergence followed from that split: an error that holds
+  only a number has nothing to return, so half the crate's errors terminated a
+  caller's error chain early.
+
+  Every `errno: i32` field is now `source: io::Error`. The errno is not lost —
+  `io::Error::raw_os_error` gives it back — and the two places where a failure
+  genuinely carried no OS error, `NetStackError::NamespaceJoin` and
+  `NetStackError::Pump`, hold `Option<io::Error>` rather than the errno `0` that
+  previously stood for "none". `Error`, `ConfigError`, `IdMapError`, and
+  `NetStackError` implement `source()` for every variant that has one.
+
+  Consequently those four types are no longer `UnwindSafe` or `RefUnwindSafe`,
+  which is the same posture `ProvisionError` and `DebianError` already had.
+
+- `FetchError::Io::op` is a `&'static str` and `FetchError::io` takes its
+  arguments as `(op, url, source)`. Every error constructor in the crate now
+  reads operation, then locator, then cause; this one read locator first. Both
+  arguments were `impl Into<String>` before, so a stale call would have compiled
+  and silently produced a transposed message — narrowing `op` to `&'static str`
+  makes it a compile error instead.
+
+- `ParseCapabilityError::name` is `ParseCapabilityError::text`, matching
+  `ParseFsAccessError::text` and `ParseNetAccessError::text`. Three parse errors
+  in one file answered the same question under two names.
+
+- `Debian::observe` takes a `DebianObserver` rather than a bare
+  `FnMut(DebianEvent<'_>)` closure. A closure is still an observer — the trait
+  carries a blanket impl for one — so existing callers are unaffected.
+
+### Added
+
+- `ExitStatus::shell_code` and `Error::shell_code` return the process exit code
+  a launcher reports: the command's own code or `128 + signal` for the first,
+  and 127 / 126 / 125 for a command that does not exist, cannot be executed, or
+  a launcher failure for the second. Both conventions were written out in the
+  `fcage` binary and again in four of the crate's examples, and the second one
+  encodes a shell convention that a consumer had no way to know was the intended
+  answer. The library owns them now, documented as promises.
+
+- `provision::debian::host_architecture` reports the Debian architecture name
+  for the host — what `DebianBuilder::architecture` and `Pool::architecture`
+  default to. It was internal, so a consumer composing its own defaults wrote
+  the table again, and the crate's own `deb-layer-pipeline` example did: its
+  copy read `std::env::consts::ARCH`, which reports `powerpc64` for both
+  endiannesses and so mapped big-endian POWER onto `ppc64el`.
+
+- `provision::debian::DebianObserver`, the bootstrap's progress and cancellation
+  sink, shaped like `ProvisionObserver`: one `progress` method, one defaulted
+  `cancelled`. A bootstrap fetches and verifies indexes, downloads a hundred
+  packages, and runs several `dpkg` waves in a cage, and a caller driving one
+  through `Debian::observe(...).resolve()` had no way to stop it part-way.
+
+- `Observer` has the closure blanket impl `ProvisionObserver` always had, so
+  `cage.run_with(&mut |event: Progress| ...)` works the way
+  `Provision::observe(&mut |event| ...)` does. A closure receives the launch's
+  milestones; an observer that wants the command's output still implements the
+  trait, since a closure has no way to say which stream a chunk came from.
+
+- `Priority` implements `FromStr` and `Display`. The name table was private to
+  the index parser, so `fcage` carried a second copy — and the copies disagreed:
+  the library's was case-insensitive and the CLI's was not, so
+  `--debian-base-priority Required` was refused while a `Priority: Required`
+  field in an index was accepted. `ParsePriorityError` is the parse error.
+
+- `ProvisionError::at`, `DebianError::at`, and `FetchError::at` build the same
+  errors as their `io` constructors, as a `map_err` argument. Four separate
+  closure factories of this shape existed internally, one of them declared
+  inside a single function.
+
+- `provision::debian::file_url` builds the `file://` URL naming a local path,
+  which is how a repository on this machine is addressed:
+  `RepositoryBuilder::mirror` reads that form, and `Pool::mirror_url` answers
+  with it for the pool it writes. A caller assembling a repository some other
+  way wrote `format!("file://{path}")`, which produces an unusable URL for a
+  relative path — a `file://` URL carries a path from a root, and this makes one
+  absolute before it does.
+
+### Fixed
+
+- The `HttpFetch` transport parses `HTTP://` and `FILE://` as the schemes they
+  are. A scheme is case-insensitive (RFC 3986 §3.1), which the crate's scheme
+  extractor documents and the authenticated-transport allow-list honours, but
+  the URL parser matched `http://` literally — so an upper-cased URL passed the
+  transport check and was then refused by the parser as though it named TLS,
+  advising the caller to supply a transport for a URL that names none.
+
+- A failure the copy-in child hits before it reaches its map gate — its
+  descriptor sweep, or its `unshare` — now names the step it reached. The gate
+  driver read one byte where the child had sent an eight-byte failure record, so
+  the record was truncated away by the seqpacket read and the failure surfaced
+  as a child that vanished.
+
+- The provisioning children report `DenySetgroups`, `WriteGidMap`, and
+  `WriteUidMap` as the distinct steps they are. All three collapsed into one
+  `SelfMap` step, so a copy, export, or removal that failed to write its gid map
+  and one that failed to deny `setgroups` produced the same diagnostic. The
+  launch stage always kept them apart.
+
+- `fcage --terminal` with a `--timeout` larger than the clock can express no
+  longer panics. The relay added the timeout to the current instant, which
+  overflows; the wait without a terminal already read such a timeout as a wait
+  without a deadline, and that is now what both do.
+
+- `HttpFetch::request_timeout` with a duration larger than the clock can express
+  removes the bound rather than panicking on the same addition, which is how
+  every other timeout in the crate reads one.
+
+### Internal
+
+These change no public API and no behaviour; they are recorded because they
+change where a reader looks.
+
+- The five step enums the forked helpers report through — the launch stage's,
+  the copy-in child's, the export child's, the removal child's, and the network
+  stack's tap helper's — are declared through one `wire_enum!` macro. Each was
+  three or four parallel lists kept in step by hand: the variants with their
+  wire values, a decoder restating them, a description arm, and a list of every
+  variant for the round-trip test. The decoder's match arms are now the same
+  literals the variants are declared with, so a value used twice is a compile
+  error rather than a test failure. The tap helper's steps gained descriptions,
+  which they had none of, so a tap failure names a step rather than a number.
+
+- The three parent-side map-gate drivers are one `drive_map_gate`, and the
+  kill-and-reap that ends an abandoned child — with the reasoning for why
+  closing the gate cannot release it — is one `abandon_gated_child`. It was
+  written out three times, in three sets of words.
+
+- The framed byte protocol the copy-in and export children speak has one set of
+  primitives in `mechanism::frame`, and the four bounds both sides of it must
+  agree on are declared once in `mechanism::bounds`. The bounds were declared
+  two and three times each, with doc comments noting that the copies had to
+  agree and nothing enforcing it.
+
+- `FsAccess` and `NetAccess` — the same letter-set bitflag type written twice —
+  are one macro and two invocations.
+
+- The profile format's keys come from `rename_all` on the container. Seventy of
+  the seventy-one explicit `serde(rename = ...)` attributes restated exactly
+  what `rename_all` derives, so a reader could not tell which were pinning a
+  name. Two remain, both the same case: a plural Rust field naming a singular
+  TOML table (`rlimits` -> `rlimit`, `mounts` -> `mount`). A new test pins every
+  key the format can carry, which guards the format against a Rust-side field
+  rename, a changed `rename_all`, a container typo, and a newly added field
+  alike — where the attributes guarded only the first.
+
+- The launch teardown removes its mount-point placeholders through the same
+  contained-tree type the Debian bootstrap's host-side steps use, rather than
+  through its own `openat2` walk. The reasoning for why a rootfs path must be
+  resolved against the rootfs rather than joined onto it was written out in both
+  places.
+
+- One `Duration`-to-`Timespec` conversion, one poll-slot helper, one
+  absolute-path splitter, one `retry_on_intr!`, and one hex encoder, each
+  replacing two or three copies. The repository name is checked by the same
+  `coordinate::check` its suite and components are, and the `fmt::Display`
+  spelling is the same in all twenty-one files that implement it.
+
+- The examples share their argument-parsing helpers through
+  `examples/common/mod.rs`, and both test suites share their fixtures through a
+  new `ferroday-cage-testkit` workspace crate that is never published: one
+  rootfs fixture, one scratch directory, one tar writer, one `ar` writer, one
+  hex encoder, and one pseudoterminal reader, replacing between two and five
+  copies each. The last example keeping helpers of its own uses the shared ones,
+  and the boundary between them and the `fcage` binary's own is documented as
+  deliberate: a crate's examples cannot reach another crate's code, so sharing
+  four argument-parsing functions would mean publishing a crate for them.
+
+- One splitter for a path that names something inside a tree, over the bytes
+  such a path is. Its two callers — the archive extractor and the contained-tree
+  writer the host-side steps go through — each had one, agreeing by hand on
+  `..`, on NUL, and on dropping `.` and empty components; the single point they
+  differ on, whether a leading `/` names the tree's own root or is refused, is
+  now the argument the splitter takes. What makes one path component ordinary is
+  stated once as well, and is what the copy-in walk's host side and its forked
+  child each hold a name to, rather than two lists of the same five shapes.
+
+- One `openat2` for opening a directory the kernel keeps inside a tree, with the
+  containment flag and the descriptor's access as its arguments. Three copies
+  restated the flags every caller passes and the retry the kernel asks for when
+  a rename races the walk, and the difference between the two containment flags
+  — re-anchoring an absolute symbolic link at the tree's root, or refusing it —
+  was explained in two module docs from one side each.
+
+- `fcage` states the `--timeout` escalation once, as a value both of its waits
+  drive: the plain blocking wait and the terminal relay, which must keep moving
+  bytes while the escalation happens. Each had its own control flow for
+  deadline-then-terminate-then-kill, and they had drifted apart at the
+  arithmetic (see Fixed). The sequence has tests of its own now, which it could
+  not have had while it lived inside a poll loop.
+
+- Two guards hold the workspace to its shared vocabulary, which
+  `CONTRIBUTING.md` now lists as a table rather than as prose. `clippy.toml`
+  refuses a direct call to a primitive that has one answer, naming the answer in
+  the diagnostic; `tools/idioms.toml` records where the shapes clippy cannot see
+  occur, and `tools/check-idioms.py` fails CI on any difference, so a second
+  answer arrives as a decision in the diff. Writing the census found the
+  `HttpFetch` timeout overflow above.
+
 ## [0.2.0] - 2026-08-06
 
 ### Security

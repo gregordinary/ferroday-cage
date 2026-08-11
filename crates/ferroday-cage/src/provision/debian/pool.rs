@@ -74,11 +74,13 @@ use std::path::{Path, PathBuf};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use rustix::fs::{FlockOperation, Mode, OFlags};
-use rustix::io::Errno;
 
-use super::coordinate::{self, Nesting};
+use super::check_coordinate;
 use super::index::parse_stanzas;
-use super::{DebianError, arch, deb, release, staging_path, version, write_atomically};
+use super::{DebianError, arch, deb, release, version};
+use crate::mechanism::frame;
+use crate::provision::coordinate::Nesting;
+use crate::provision::{file_url, staging_path, write_atomically};
 
 /// A trusted local package pool, configured then published to.
 ///
@@ -304,22 +306,12 @@ impl Pool {
     ///
     /// # Errors
     ///
-    /// Returns [`DebianError::Config`] for a root that is not valid UTF-8, which
-    /// cannot be spelled in a URL, and [`DebianError::Io`] when the current
-    /// directory cannot be read to make a relative root absolute.
+    /// Returns [`DebianError::Fetch`] for a root that is not valid UTF-8, which
+    /// cannot be spelled in a URL, and for a current directory that cannot be
+    /// read to make a relative root absolute. A path that cannot be named is a
+    /// resource that cannot be addressed, so the failure is the transport's.
     pub fn mirror_url(&self) -> Result<String, DebianError> {
-        let absolute = std::path::absolute(&self.dir).map_err(|source| DebianError::Io {
-            op: "resolving the pool's path for its mirror URL",
-            path: self.dir.clone(),
-            source,
-        })?;
-        let path = absolute.to_str().ok_or_else(|| DebianError::Config {
-            reason: format!(
-                "the pool path {} is not valid UTF-8 and cannot be named by a file:// URL",
-                absolute.display(),
-            ),
-        })?;
-        Ok(format!("file://{path}"))
+        Ok(file_url(&self.dir)?)
     }
 
     /// The suite the pool publishes under, the one setting with no default,
@@ -330,7 +322,7 @@ impl Pool {
                 reason: "no suite was given for the pool".to_string(),
             });
         };
-        coordinate::check("the pool's suite", suite, Nesting::Nested)?;
+        check_coordinate("the pool's suite", suite, Nesting::Nested)?;
         Ok(suite)
     }
 
@@ -424,8 +416,8 @@ impl Pool {
             Some(architecture) => architecture,
             None => arch::host_architecture(),
         };
-        coordinate::check("the pool's component", &self.component, Nesting::Nested)?;
-        coordinate::check("the pool's architecture", &architecture, Nesting::Single)?;
+        check_coordinate("the pool's component", &self.component, Nesting::Nested)?;
+        check_coordinate("the pool's architecture", &architecture, Nesting::Single)?;
         for (label, value) in [
             ("origin", &self.origin),
             ("label", &self.label),
@@ -643,13 +635,9 @@ fn lock_pool(pool_dir: &Path) -> Result<std::os::fd::OwnedFd, DebianError> {
         Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
     )
     .map_err(|errno| io(errno.into()))?;
-    loop {
-        match rustix::fs::flock(&lock, FlockOperation::LockExclusive) {
-            Ok(()) => return Ok(lock),
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(io(errno.into())),
-        }
-    }
+    frame::retry_on_intr!(rustix::fs::flock(&lock, FlockOperation::LockExclusive))
+        .map_err(|errno| io(errno.into()))?;
+    Ok(lock)
 }
 
 /// Writes an index body under its own digest, the name a reader asks for when
@@ -660,7 +648,7 @@ fn lock_pool(pool_dir: &Path) -> Result<std::os::fd::OwnedFd, DebianError> {
 /// later publish supersedes is what a reader still working from the release
 /// that named it resolves against.
 fn write_by_hash(by_hash_dir: &Path, bytes: &[u8]) -> Result<(), DebianError> {
-    let path = by_hash_dir.join(deb::sha256_hex(bytes));
+    let path = by_hash_dir.join(crate::provision::digest::sha256_hex(bytes));
     if path.exists() {
         return Ok(());
     }
@@ -876,7 +864,8 @@ fn index_deb(
         reason,
     };
 
-    let mut source = File::open(deb_path).map_err(io_err("opening a .deb to publish", deb_path))?;
+    let mut source =
+        File::open(deb_path).map_err(DebianError::at("opening a .deb to publish", deb_path))?;
 
     // Where the .deb belongs in the pool is what its own control stanza says it
     // is, so the location is settled before anything is written.
@@ -926,7 +915,7 @@ fn index_deb(
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&staged);
         })
-        .map_err(io_err("publishing a .deb into the pool", &dest))?;
+        .map_err(DebianError::at("publishing a .deb into the pool", &dest))?;
 
     Ok(Entry {
         name: offered.name,
@@ -968,7 +957,7 @@ fn control_of(
         path: deb_path.to_path_buf(),
         reason,
     };
-    let mut file = File::open(path).map_err(io_err("reading a .deb in the pool", path))?;
+    let mut file = File::open(path).map_err(DebianError::at("reading a .deb in the pool", path))?;
     let control = deb::read_control_from(&mut file).map_err(|err| bad(err.to_string()))?;
     if identity(&control, architecture).map_err(&bad)? != *expected {
         return Err(bad(
@@ -988,9 +977,10 @@ fn describe(
     expected: &Identity,
 ) -> Result<(String, (String, u64)), DebianError> {
     let control = control_of(path, deb_path, architecture, expected)?;
-    let mut file = File::open(path).map_err(io_err("digesting a .deb in the pool", path))?;
-    let digest =
-        deb::sha256_stream(&mut file).map_err(io_err("digesting a .deb in the pool", path))?;
+    let mut file =
+        File::open(path).map_err(DebianError::at("digesting a .deb in the pool", path))?;
+    let digest = crate::provision::digest::sha256_stream(&mut file)
+        .map_err(DebianError::at("digesting a .deb in the pool", path))?;
     Ok((control, digest))
 }
 
@@ -1015,8 +1005,8 @@ fn already_published(dest: &Path, source: &mut File) -> Option<(String, u64)> {
     }
 
     source.rewind().ok()?;
-    let (offered, _) = deb::sha256_stream(source).ok()?;
-    let (held, size) = deb::sha256_stream(&mut published).ok()?;
+    let (offered, _) = crate::provision::digest::sha256_stream(source).ok()?;
+    let (held, size) = crate::provision::digest::sha256_stream(&mut published).ok()?;
     (offered == held).then_some((held, size))
 }
 
@@ -1044,7 +1034,7 @@ fn stage(dest: &Path, source: &mut File) -> Result<PathBuf, DebianError> {
         .write(true)
         .create_new(true)
         .open(&staged)
-        .map_err(io_err("staging a .deb", &staged))?;
+        .map_err(DebianError::at("staging a .deb", &staged))?;
 
     // A declined clone leaves the staging file as it was created — empty — so
     // the fallback writes it from the start. Every failure is a fallback: the
@@ -1056,17 +1046,13 @@ fn stage(dest: &Path, source: &mut File) -> Result<PathBuf, DebianError> {
             .map(|_| ());
         if let Err(err) = copied {
             let _ = std::fs::remove_file(&staged);
-            return Err(io_err("copying a .deb into the pool", &staged)(err));
+            return Err(DebianError::at("copying a .deb into the pool", &staged)(
+                err,
+            ));
         }
     }
     drop(file);
     Ok(staged)
-}
-
-/// Builds an I/O failure against the path it happened to.
-fn io_err(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> DebianError {
-    let path = path.to_path_buf();
-    move |source| DebianError::Io { op, path, source }
 }
 
 /// Inserts an entry, keeping the higher version when the name recurs. A
@@ -1162,13 +1148,14 @@ fn scan_sections(suite_dir: &Path) -> Result<Vec<Section>, DebianError> {
     // The suite root stands for no component, hence the empty string.
     let mut pending = vec![(suite_dir.to_path_buf(), String::new())];
     while let Some((dir, component)) = pending.pop() {
-        let scanning = io_err("scanning the suite for its indexes", &dir);
+        let scanning = DebianError::at("scanning the suite for its indexes", &dir);
         let entries = std::fs::read_dir(&dir).map_err(scanning)?;
         for entry in entries {
-            let entry = entry.map_err(io_err("scanning the suite for its indexes", &dir))?;
+            let entry =
+                entry.map_err(DebianError::at("scanning the suite for its indexes", &dir))?;
             let is_dir = entry
                 .file_type()
-                .map_err(io_err("scanning the suite for its indexes", &dir))?
+                .map_err(DebianError::at("scanning the suite for its indexes", &dir))?
                 .is_dir();
             // A regular file in a component directory is not an index; an index
             // is only ever read from inside a `binary-*` directory.
@@ -1218,10 +1205,10 @@ fn read_indexes(
         if !path.metadata().is_ok_and(|meta| meta.is_file()) {
             continue;
         }
-        let digesting = io_err("digesting a pool index", &path);
+        let digesting = DebianError::at("digesting a pool index", &path);
         let mut file = File::open(&path).map_err(digesting)?;
-        let (digest, size) =
-            deb::sha256_stream(&mut file).map_err(io_err("digesting a pool index", &path))?;
+        let (digest, size) = crate::provision::digest::sha256_stream(&mut file)
+            .map_err(DebianError::at("digesting a pool index", &path))?;
         sections.push(Section {
             component: component.to_string(),
             architecture: architecture.to_string(),
@@ -1384,11 +1371,6 @@ mod tests {
 
     use super::*;
     use crate::scratch::Scratch;
-
-    fn tempdir(tag: &str) -> Scratch {
-        Scratch::new(&format!("pool-{tag}"))
-    }
-
     #[test]
     fn staging_copies_the_whole_source_from_wherever_it_was_left() {
         // index_deb reads the control member before it stages, so the source's
@@ -1396,7 +1378,7 @@ mod tests {
         // offset and the fallback rewinds, so both must produce the whole file:
         // a fallback that copied from the current position would silently
         // publish a truncated package.
-        let dir = tempdir("stage");
+        let dir = Scratch::for_test("pool", "stage");
         let bytes: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
         let source_path = dir.join("source.deb");
         std::fs::write(&source_path, &bytes).unwrap();
@@ -1422,7 +1404,7 @@ mod tests {
         // filesystem that cannot clone at all that mistake would look exactly
         // like ordinary non-support. Pinning the errno is what distinguishes
         // them without a filesystem that can share extents.
-        let dir = tempdir("clone");
+        let dir = Scratch::for_test("pool", "clone");
         let bytes = vec![0x5a; 128 * 1024];
         let source_path = dir.join("source.deb");
         std::fs::write(&source_path, &bytes).unwrap();
@@ -1440,7 +1422,7 @@ mod tests {
             Ok(()) => assert_eq!(std::fs::read(&clone_path).unwrap(), bytes),
             Err(errno) => assert_ne!(
                 errno,
-                Errno::BADF,
+                rustix::io::Errno::BADF,
                 "the clone was refused for a bad descriptor, not for lack of support",
             ),
         }
@@ -1517,7 +1499,7 @@ mod tests {
         // across a publish would leave a document that still verifies but names
         // superseded indexes — and since by-hash copies are never removed, a
         // reader would resolve them successfully instead of failing.
-        let dir = tempdir("signature");
+        let dir = Scratch::for_test("pool", "signature");
         let pool = Pool::at(&dir).suite("local");
         pool.publish::<&Path>([]).expect("the first publish");
 
@@ -1615,7 +1597,7 @@ mod tests {
             architecture: architecture.to_string(),
             path: format!("{component}/binary-{architecture}/{name}"),
             size: bytes.len() as u64,
-            digest: deb::sha256_hex(bytes),
+            digest: crate::provision::digest::sha256_hex(bytes),
         }
     }
 
@@ -1643,7 +1625,10 @@ mod tests {
         // The section digest the writer recorded is the digest of the bytes.
         assert_eq!(
             parsed.digest("main/binary-amd64/Packages"),
-            Some((packages.len() as u64, deb::sha256_hex(packages).as_str())),
+            Some((
+                packages.len() as u64,
+                crate::provision::digest::sha256_hex(packages).as_str()
+            )),
         );
     }
 
@@ -1677,7 +1662,7 @@ mod tests {
         );
         // Stamping does not disturb the digest list the field sits above.
         let parsed = release::Release::parse(&release).expect("the stamped Release parses");
-        let empty = deb::sha256_hex(b"");
+        let empty = crate::provision::digest::sha256_hex(b"");
         assert_eq!(
             parsed.digest("main/binary-amd64/Packages"),
             Some((0, empty.as_str())),
@@ -1690,7 +1675,7 @@ mod tests {
         // to the pool resolves before anything has been built, which makes it
         // the first release a bootstrap validates — and the one most likely to
         // be missed by a stamp applied only where there are packages.
-        let dir = tempdir("empty-date");
+        let dir = Scratch::for_test("pool", "empty-date");
         let pool = Pool::at(&dir).suite("local").date(1_700_000_000);
         pool.publish::<&Path>([]).expect("the empty publish");
         let release = std::fs::read_to_string(pool.release_path().unwrap()).unwrap();
@@ -1703,7 +1688,7 @@ mod tests {
         // only part of a pool that would otherwise vary between two publishes
         // of the same packages. Pinning the date is what closes that gap for a
         // caller building a reproducible archive.
-        let dir = tempdir("pinned-date");
+        let dir = Scratch::for_test("pool", "pinned-date");
         let pool = Pool::at(&dir).suite("local").date(1_700_000_000);
         pool.publish::<&Path>([]).expect("the first publish");
         let first = std::fs::read(pool.release_path().unwrap()).unwrap();
@@ -1746,7 +1731,7 @@ mod tests {
         // published into one suite therefore has to add to the release rather
         // than replace what it named, or publishing one silently retires the
         // other.
-        let dir = tempdir("accumulate");
+        let dir = Scratch::for_test("pool", "accumulate");
         let pool = |component: &str, architecture: &str| {
             Pool::at(&dir)
                 .suite("local")
@@ -1801,7 +1786,7 @@ mod tests {
         // a reader has to ask for, and the reader matches a component by exact
         // string, so recording only the first segment would name a component
         // whose index is somewhere the reader will not look.
-        let dir = tempdir("nested-component");
+        let dir = Scratch::for_test("pool", "nested-component");
         let architecture = arch::host_architecture();
         for component in ["main", "main/debian-installer"] {
             Pool::at(&dir)
@@ -1844,7 +1829,7 @@ mod tests {
         // a binary-* directory, which is what keeps by-hash out of the
         // component list; a walk that descended past it would name a component
         // that does not exist and list every index a second time.
-        let dir = tempdir("by-hash-component");
+        let dir = Scratch::for_test("pool", "by-hash-component");
         let architecture = arch::host_architecture();
         Pool::at(&dir)
             .suite("local")
@@ -1882,7 +1867,7 @@ mod tests {
         // the pool, and what the release format cannot name, but not the
         // separator itself: a slashed suite and a slashed component are both
         // legitimate layouts.
-        let dir = tempdir("refused-fields");
+        let dir = Scratch::for_test("pool", "refused-fields");
         let base = || Pool::at(&dir).suite("local").date(1_700_000_000);
         let refused = |pool: Pool, field: &str, note: &str| {
             let reason = pool.publish::<&Path>([]).expect_err(note).to_string();
@@ -1948,7 +1933,7 @@ mod tests {
         // repository under and what `Pin: release o=` selects it by. They have
         // no default, because inventing one would put a name in an archive its
         // owner did not choose.
-        let dir = tempdir("identity");
+        let dir = Scratch::for_test("pool", "identity");
         let bare = Pool::at(&dir).suite("local").date(1_700_000_000);
         bare.publish::<&Path>([]).expect("the unnamed publish");
         let release = std::fs::read_to_string(bare.release_path().unwrap()).unwrap();
@@ -1999,7 +1984,7 @@ mod tests {
         // the release as fields the caller never wrote -- which for a field
         // taken from a build description is reachable without anyone meaning
         // it.
-        let dir = tempdir("identity-refused");
+        let dir = Scratch::for_test("pool", "identity-refused");
         let base = || Pool::at(&dir).suite("local").date(1_700_000_000);
         let refused = |pool: Pool, field: &str, note: &str| {
             let reason = pool.publish::<&Path>([]).expect_err(note).to_string();

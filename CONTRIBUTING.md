@@ -89,6 +89,14 @@ one tree per run behind forever, which a long-lived machine notices.
   of its own, because a tree holding subordinate-owned entries has to be removed
   through `provision::remove` rather than by the calling user.
 
+Both crates' `tests/common/mod.rs` are re-exports of `ferroday-cage-testkit`, a
+workspace member that is never published. It holds the rootfs fixture, the
+scratch directories, and the builders for `.deb`, `ar`, and tar fixtures, so the
+two suites share them rather than keeping a copy each. Every part of it that
+needs a library feature sits behind one of its own that forwards, and a dependent
+enables only what it uses — which is what keeps the `features` job's featureless
+and powerset checks meaning what they say.
+
 ### Feature-gating a test
 
 Every command above selects all features, so none of them can catch a test that
@@ -185,13 +193,78 @@ older line replaces the crate page with that line's metadata.
   beforehand; see the `mechanism` module documentation for the full rule.
 - **Errors are typed and name their subject.** A failure reports what failed
   and what it was operating on — the mount, the resource limit, the command
-  path — rather than an opaque errno.
+  path — rather than an opaque errno. An OS failure is carried as an
+  `io::Error` and returned from `source()`, never as a raw `errno: i32`; where a
+  failure genuinely carried no OS error, that is an `Option<io::Error>` rather
+  than a zero. Constructors take their arguments in one order — operation,
+  locator, cause — and each error type has one of them, plus an `at(op,
+  locator)` form for the `map_err` sites.
 - **A new capability arrives additively** where it can: a new builder method,
   a new enum variant behind `#[non_exhaustive]`, a new accessor on an existing
   request type. See the [stability
   chapter](https://gregordinary.github.io/ferroday-cage/stability.html) for the
   promises this keeps and how they are enforced.
+- **One name for one thing.** A concept the workspace already has an answer for
+  is reached through that answer rather than answered again; the table under
+  [The shared vocabulary](#the-shared-vocabulary) is the list of them. Where a
+  second answer is warranted, it says so and says why, in the doc comment of the
+  thing that is the second answer — the post-fork path checks in `mechanism`,
+  which cannot allocate, are the worked example. A second answer that says
+  nothing is how the vocabulary comes apart, so an unexplained one is a review
+  comment.
+- **A shared helper is swept for on arrival.** When a change produces one, the
+  change also moves the callers that could have used it, not only the ones it
+  was about. The alternative is an abstraction two callers out of five use,
+  which is worse than none: a reader learns the mechanism and then finds it does
+  not transfer.
+- **Profile keys come from `rename_all`.** A serde container carries
+  `rename_all = "kebab-case"` and its fields carry no `rename`. The two
+  exceptions state themselves, and both are a plural Rust field naming a
+  singular TOML table. A test pins every key the format can carry, which is what
+  catches a rename, whichever end of it moved.
 - **No emoji** in code, comments, documentation, or commit messages.
+
+### The shared vocabulary
+
+Each row is a question the workspace answers once. Before writing something
+that answers one of them, reach for the answer; before adding a row, check that
+the question is not already here under different words.
+
+| The question | The answer |
+| --- | --- |
+| What may a configured absolute path contain? | `path::absolute_components` |
+| What may a path naming something inside a tree contain? | `path::tree_components` |
+| What may one path component contain? | `path::is_ordinary_component` |
+| Open a directory the kernel keeps inside a tree | `provision::containment::open_dir` |
+| Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
+| What may a release, a component, or an architecture contain? | `provision::coordinate::check` |
+| Name a local path as a `file://` URL | `provision::file_url` |
+| What Debian architecture is the host? | `provision::debian::host_architecture` |
+| Move framed bytes between a helper child and its caller | `mechanism::frame` |
+| What limits do both ends of that protocol agree on? | `mechanism::bounds` |
+| Report a step over a wire, by number | `wire::wire_enum!` |
+| State a `poll` deadline, or retire a `poll` slot | `poll::timeout`, `poll::slot` |
+| Report an OS failure with its operation and its subject | each error type's `io` and `at` constructors |
+| What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code` |
+| Make a scratch tree that clears itself | `scratch::Scratch`, or `common::scratch_dir` from a test suite |
+| What does `fcage` do when `--timeout` runs out? | `escalation::Escalation` |
+| Parse an argument in an example | `examples/common` |
+| Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
+
+Two guards hold the table to the code, and each covers what the other cannot:
+
+- `clippy.toml` names the primitives whose second *call* is the drift, with the
+  answer in the diagnostic. A site the answer genuinely does not cover carries
+  `#[allow(clippy::disallowed_methods)]` and a comment saying which part does
+  not fit.
+- `tools/idioms.toml` records where the shapes clippy cannot see — an operator,
+  a hand-written split, a formatted URL — occur today, and
+  `tools/check-idioms.py` fails on any difference. It is not a ban: a new site
+  is sometimes right, and is then recorded there with its reason, which is the
+  same convention in a file rather than a doc comment.
+
+Neither guard decides anything. What they buy is that a second answer is
+*chosen*, in a diff a reviewer can see.
 
 ## Commit messages
 

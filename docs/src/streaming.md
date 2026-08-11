@@ -147,6 +147,17 @@ streams. They are delivered on the calling thread during the launch itself,
 before any captured output flows, and `Progress` is `#[non_exhaustive]` so
 finer milestones can arrive without breaking an existing observer.
 
+A closure taking a `Progress` is an observer, for a caller that wants the
+milestones and nothing else:
+
+```rust
+cage.run_with(&mut |event: Progress| eprintln!("{event:?}"))?;
+```
+
+A closure cannot receive the command's output, because it has no way to say
+which stream a chunk came from; an observer that wants the output implements
+the trait.
+
 ## How delivery works
 
 The library is synchronous and spawns no threads. Captured output is pumped

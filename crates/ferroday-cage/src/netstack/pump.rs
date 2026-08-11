@@ -97,7 +97,7 @@ impl Engine {
         // real entropy.
         let seed = random_seed().map_err(|errno| PumpExit::Failed {
             op: "gathering entropy",
-            errno: errno.raw_os_error(),
+            source: Some(errno.into()),
         })?;
         let mut device = TapDevice::new(tap, plan.mtu);
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC)));
@@ -189,7 +189,7 @@ impl Engine {
                 Err(errno) => {
                     return PumpExit::Failed {
                         op: "waiting for the descriptors",
-                        errno: errno.raw_os_error(),
+                        source: Some(errno.into()),
                     };
                 }
             }
@@ -271,10 +271,7 @@ impl Engine {
         if let Some(remaining) = self.udp.next_deadline(now_std) {
             tighten(remaining);
         }
-        limit.map(|duration| Timespec {
-            tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: i64::from(duration.subsec_nanos()),
-        })
+        limit.map(crate::poll::timeout)
     }
 
     /// Reads a batch of frames off the tap, classifying each ahead of the
@@ -287,7 +284,7 @@ impl Engine {
                 Ok(0) => {
                     return Err(PumpExit::Failed {
                         op: "reading the tap device",
-                        errno: 0,
+                        source: None,
                     });
                 }
                 Ok(read) => {
@@ -306,7 +303,7 @@ impl Engine {
                 Err(errno) => {
                     return Err(PumpExit::Failed {
                         op: "reading the tap device",
-                        errno: errno.raw_os_error(),
+                        source: Some(errno.into()),
                     });
                 }
             }

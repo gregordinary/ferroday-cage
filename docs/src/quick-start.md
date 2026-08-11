@@ -112,8 +112,12 @@ $ fcage --rootfs alpine-root --ro-bind ~/project /project --chdir /project \
 ```
 
 `fcage` exits with the command's own exit code, or 128 plus the signal number
-when the command is terminated by a signal, or 124 when a `--timeout`
-expires. A sandbox can also be described in a TOML file and loaded with
+when the command is terminated by a signal, or 124 when a `--timeout` expires.
+The first two come from `ExitStatus::shell_code`, so a consumer that re-exports
+a sandboxed command's outcome reports the same codes without restating the
+convention; `Error::shell_code` is its counterpart for a launch that failed
+(127 for a command that does not exist, 126 for one that cannot be executed,
+125 otherwise). A sandbox can also be described in a TOML file and loaded with
 `--profile` — see [Profiles](profiles.md). See `fcage --help` for the full
 interface.
 

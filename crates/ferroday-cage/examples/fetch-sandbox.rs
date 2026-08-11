@@ -42,6 +42,10 @@ use std::process::ExitCode;
 use ferroday_cage::provision::{self, Tarball};
 use ferroday_cage::{Cage, NetStack};
 
+mod common;
+
+use common::value_for;
+
 /// The fetch tool, addressed by absolute path: the cage does not resolve the
 /// command against `PATH`.
 const WGET: &str = "/usr/bin/wget";
@@ -210,11 +214,6 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Options>, St
         host_loopback,
         url: url.ok_or("a URL is required")?,
     }))
-}
-
-/// Consumes the next argument as a required value.
-fn value_for(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
-    args.next().ok_or(format!("{name} requires a value"))
 }
 
 /// Parses an IPv4 `address/prefix` for `--cidr`.

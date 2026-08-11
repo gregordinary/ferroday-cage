@@ -3,12 +3,40 @@
 
 use std::path::{Path, PathBuf};
 
-/// The Debian architecture name for the host, from `uname`.
+/// The Debian architecture name for the host.
+///
+/// This is what [`DebianBuilder::architecture`] and [`Pool::architecture`]
+/// default to when a caller names none, and it is exposed so a caller composing
+/// its own defaults — a pool path, a cache key, an artifact record — reaches the
+/// same answer the bootstrap will.
+///
+/// The name comes from `uname`, not from `std::env::consts::ARCH`. The two are
+/// not interchangeable: `ARCH` reports the architecture the *calling binary* was
+/// compiled for, and it reports `powerpc64` for both endiannesses, so it cannot
+/// tell `ppc64` from `ppc64el` — which are different Debian architectures with
+/// incompatible binaries. The machine name distinguishes them.
 ///
 /// Returns the raw machine name when it is not one this table knows, so a
 /// caller on an unusual host can still proceed by naming the architecture
 /// explicitly.
-pub(crate) fn host_architecture() -> String {
+///
+/// # Example
+///
+/// ```no_run
+/// use ferroday_cage::provision::debian::{Debian, host_architecture};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let architecture = host_architecture();
+/// let pool = format!("/var/cache/myapp/pool-{architecture}");
+/// let debian = Debian::builder("trixie").architecture(&architecture).build()?;
+/// # let _ = (pool, debian);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`DebianBuilder::architecture`]: super::DebianBuilder::architecture
+/// [`Pool::architecture`]: super::Pool::architecture
+pub fn host_architecture() -> String {
     let uname = rustix::system::uname();
     let machine = uname.machine().to_string_lossy();
     match machine.as_ref() {
@@ -285,6 +313,7 @@ pub(crate) fn exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     #[test]
     fn merged_usr_dirs_include_multilib() {
@@ -380,7 +409,7 @@ mod tests {
         // symlink to the real binary. Repointing the symlink changes the
         // interpreter without changing the registration, which a record
         // carrying one path alone could not show.
-        let scratch = crate::scratch::Scratch::new("interpreter");
+        let scratch = Scratch::new("interpreter");
         let real = scratch.join("qemu-aarch64-static");
         std::fs::write(&real, b"not really qemu").expect("the stand-in is writable");
         let wrapper = scratch.join("aarch64-binfmt-P");

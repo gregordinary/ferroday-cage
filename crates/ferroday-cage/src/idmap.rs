@@ -32,6 +32,7 @@
 //! [`CageBuilder::build`]: crate::CageBuilder::build
 
 use std::fmt;
+use std::io;
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
@@ -127,13 +128,10 @@ impl IdentityMap {
 )]
 pub struct IdRange {
     /// The first id inside the sandbox.
-    #[cfg_attr(feature = "serde", serde(rename = "inside"))]
     pub inside: u32,
     /// The first id on the host.
-    #[cfg_attr(feature = "serde", serde(rename = "outside"))]
     pub outside: u32,
     /// How many consecutive ids the extent covers.
-    #[cfg_attr(feature = "serde", serde(rename = "count"))]
     pub count: u32,
 }
 
@@ -164,10 +162,8 @@ pub struct IdRange {
 )]
 pub struct Identity {
     /// The uid the command runs as, a sandbox-inside id.
-    #[cfg_attr(feature = "serde", serde(rename = "uid"))]
     pub(crate) uid: u32,
     /// The gid the command runs as, a sandbox-inside id.
-    #[cfg_attr(feature = "serde", serde(rename = "gid"))]
     pub(crate) gid: u32,
     /// The supplementary groups, sandbox-inside ids. Requires a range gid
     /// map: the single-identity map denies `setgroups`.
@@ -175,7 +171,6 @@ pub struct Identity {
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
-    #[cfg_attr(feature = "serde", serde(rename = "groups"))]
     pub(crate) groups: Vec<u32>,
 }
 
@@ -310,8 +305,8 @@ pub enum IdMapError {
     HelperSpawn {
         /// The helper that failed to start.
         helper: String,
-        /// The raw OS error the spawn failed with.
-        errno: i32,
+        /// The underlying error, absent where the spawn failed with none.
+        source: Option<io::Error>,
     },
     /// A helper binary ran and refused the map.
     #[non_exhaustive]
@@ -326,8 +321,8 @@ pub enum IdMapError {
     MapWrite {
         /// The file that could not be written: `"uid_map"` or `"gid_map"`.
         which: &'static str,
-        /// The raw OS error the write failed with.
-        errno: i32,
+        /// The underlying error.
+        source: io::Error,
     },
 }
 
@@ -344,10 +339,14 @@ impl IdMapError {
     }
 
     /// A helper binary could not be executed.
-    pub fn helper_spawn(helper: impl Into<String>, errno: i32) -> IdMapError {
+    ///
+    /// `source` is `None` where the failure carried no OS error at all, which
+    /// is a fact rather than an errno of zero: rendering zero would read
+    /// "Success (os error 0)".
+    pub fn helper_spawn(helper: impl Into<String>, source: Option<io::Error>) -> IdMapError {
         IdMapError::HelperSpawn {
             helper: helper.into(),
-            errno,
+            source,
         }
     }
 
@@ -360,8 +359,8 @@ impl IdMapError {
     }
 
     /// Writing a map file failed. `which` is `"uid_map"` or `"gid_map"`.
-    pub fn map_write(which: &'static str, errno: i32) -> IdMapError {
-        IdMapError::MapWrite { which, errno }
+    pub fn map_write(which: &'static str, source: io::Error) -> IdMapError {
+        IdMapError::MapWrite { which, source }
     }
 }
 
@@ -369,16 +368,14 @@ impl fmt::Display for IdMapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IdMapError::Unsatisfiable { reason } => f.write_str(reason),
-            // An errno of zero means the spawn failure carried no OS error at
-            // all; rendering it would read "Success (os error 0)".
-            IdMapError::HelperSpawn { helper, errno: 0 } => {
-                write!(f, "could not execute {helper}")
-            }
-            IdMapError::HelperSpawn { helper, errno } => write!(
-                f,
-                "could not execute {helper}: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
+            IdMapError::HelperSpawn {
+                helper,
+                source: None,
+            } => write!(f, "could not execute {helper}"),
+            IdMapError::HelperSpawn {
+                helper,
+                source: Some(source),
+            } => write!(f, "could not execute {helper}: {source}"),
             IdMapError::HelperFailed { helper, detail } => {
                 if detail.is_empty() {
                     write!(f, "{helper} refused the map")
@@ -386,16 +383,30 @@ impl fmt::Display for IdMapError {
                     write!(f, "{helper} refused the map: {detail}")
                 }
             }
-            IdMapError::MapWrite { which, errno } => write!(
-                f,
-                "could not write {which}: {}",
-                std::io::Error::from_raw_os_error(*errno),
-            ),
+            IdMapError::MapWrite { which, source } => {
+                write!(f, "could not write {which}: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for IdMapError {}
+impl std::error::Error for IdMapError {
+    /// The OS failure underneath, where there is one.
+    ///
+    /// [`Unsatisfiable`](Self::Unsatisfiable) and
+    /// [`HelperFailed`](Self::HelperFailed) carry no inner error: the first is
+    /// a refusal this crate composed, and the second is what a helper wrote to
+    /// its standard error, which is text rather than an error value.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            IdMapError::HelperSpawn { source, .. } => source
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            IdMapError::MapWrite { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Whether `id` falls inside one of the extents' inside ranges.
 pub(crate) fn maps_inside_id(ranges: &[IdRange], id: u32) -> bool {
@@ -543,7 +554,7 @@ pub(crate) fn reflect_inside(ranges: &[IdRange]) -> Vec<IdRange> {
 /// Opens `path` and writes `data` in a single `write`, as the map files
 /// require: they accept the whole map in one write and nothing else.
 fn write_map_file(path: &str, which: &'static str, data: &[u8]) -> Result<(), IdMapError> {
-    let map_write = |errno: Errno| IdMapError::map_write(which, errno.raw_os_error());
+    let map_write = |errno: Errno| IdMapError::map_write(which, errno.into());
     let fd = rustix::fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(map_write)?;
     match rustix::io::write(&fd, data) {
@@ -859,7 +870,7 @@ mod subid {
     /// one that runs.
     fn run_helper(helper: &'static str, pid: u32, ranges: &[IdRange]) -> Result<(), IdMapError> {
         let resolved = crate::host::find_on_path(helper).ok_or_else(|| {
-            IdMapError::helper_spawn(helper, rustix::io::Errno::NOENT.raw_os_error())
+            IdMapError::helper_spawn(helper, Some(rustix::io::Errno::NOENT.into()))
         })?;
         let mut command = Command::new(resolved);
         command.arg(pid.to_string());
@@ -869,9 +880,12 @@ mod subid {
                 .arg(range.outside.to_string())
                 .arg(range.count.to_string());
         }
-        let output = command
-            .output()
-            .map_err(|err| IdMapError::helper_spawn(helper, err.raw_os_error().unwrap_or(0)))?;
+        let output = command.output().map_err(|err| {
+            // A spawn failure with no OS error behind it is reported as
+            // having none, rather than as errno zero.
+            let carried = err.raw_os_error().is_some().then_some(err);
+            IdMapError::helper_spawn(helper, carried)
+        })?;
         if output.status.success() {
             Ok(())
         } else {
@@ -1336,6 +1350,7 @@ fn coalesce(allocation: &[(u32, u32)]) -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     #[test]
     fn an_unparsable_map_line_is_skipped_rather_than_abandoning_the_file() {
@@ -1344,7 +1359,7 @@ mod tests {
         // a bare EPERM from the kernel at apply time. Abandoning the file on one
         // line the parser did not expect would drop that check silently — and
         // drop it for both id spaces, since the failure is per-file.
-        let dir = crate::scratch::Scratch::new("own-map");
+        let dir = Scratch::new("own-map");
         let path = dir.join("uid_map");
         std::fs::write(
             &path,

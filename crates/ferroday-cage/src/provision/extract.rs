@@ -43,8 +43,11 @@ use rustix::fs::Timespec;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags, Timestamps, UTIME_OMIT};
 use rustix::io::Errno;
 
+use crate::path::{self, LeadingSlash, Refused};
+
+use super::ProvisionError;
+use super::containment;
 use super::tar::{Entry, TarReader};
-use super::{ProvisionError, io_error};
 
 /// How many times a create-or-replace is retried when an existing entry
 /// is in the way. One replacement should always suffice; the bound exists
@@ -107,7 +110,7 @@ impl Extraction {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|errno| io_error("opening", root, errno.into()))?;
+        .map_err(|errno| ProvisionError::io("opening", root, errno.into()))?;
         Ok(Extraction {
             root_fd,
             dir_meta: HashMap::new(),
@@ -206,7 +209,7 @@ impl Extraction {
         apply_dir_meta(self.root_fd.as_fd(), self.dir_meta)?;
         if let Some(meta) = self.root_meta {
             apply_meta_fd(self.root_fd.as_fd(), &meta)
-                .map_err(|errno| io_error("finalizing", root, errno.into()))?;
+                .map_err(|errno| ProvisionError::io("finalizing", root, errno.into()))?;
         }
         Ok(())
     }
@@ -226,33 +229,28 @@ pub(crate) fn extract_archive<R: Read>(
 
 /// Splits and validates an entry path: relative, no `..`, no NUL.
 ///
-/// Returns the path's components; `.` components and empty segments are
-/// dropped, so `./` normalizes to an empty list. `context` names the
-/// entry in errors (for a hardlink target, the entry it belongs to).
+/// [`path::tree_components`] is the split, with an absolute path refused rather
+/// than read as naming the destination's own root: the destination is a plain
+/// host directory that nothing re-roots, so a leading `/` names the host.
+/// `.` components and empty segments are dropped, so `./` normalizes to an
+/// empty list, which is the entry describing the extraction root.
+///
+/// `context` names the entry in errors (for a hardlink target, the entry it
+/// belongs to) and `noun` names which of the two the refusal is about, so the
+/// message says whether the entry or its link target was the problem.
 fn validate_path(raw: &[u8], context: &[u8], noun: &str) -> Result<Vec<Vec<u8>>, ProvisionError> {
-    if raw.contains(&0) {
-        return Err(entry_unsafe(
+    match path::tree_components(raw, LeadingSlash::Refused) {
+        Ok(components) => Ok(components.into_iter().map(<[u8]>::to_vec).collect()),
+        Err(Refused::Nul) => Err(entry_unsafe(
             context,
             format!("the {noun} contains a NUL byte"),
-        ));
+        )),
+        Err(Refused::Absolute) => Err(entry_unsafe(context, format!("the {noun} is absolute"))),
+        Err(Refused::Traversal) => Err(entry_unsafe(
+            context,
+            format!("the {noun} contains a `..` component"),
+        )),
     }
-    if raw.first() == Some(&b'/') {
-        return Err(entry_unsafe(context, format!("the {noun} is absolute")));
-    }
-    let mut components = Vec::new();
-    for component in raw.split(|b| *b == b'/') {
-        match component {
-            b"" | b"." => continue,
-            b".." => {
-                return Err(entry_unsafe(
-                    context,
-                    format!("the {noun} contains a `..` component"),
-                ));
-            }
-            _ => components.push(component.to_vec()),
-        }
-    }
-    Ok(components)
 }
 
 /// Opens an entry's parent directory beneath `root`, creating missing
@@ -309,9 +307,9 @@ fn open_parent(
                         AtFlags::empty(),
                     )
                     .map_err(|errno| {
-                        io_error(
+                        ProvisionError::io(
                             "setting the mode of a parent directory for",
-                            &bytes_to_path(entry_path),
+                            bytes_to_path(entry_path),
                             errno.into(),
                         )
                     })?;
@@ -323,9 +321,9 @@ fn open_parent(
             // into a typed error.
             Err(Errno::EXIST) => {}
             Err(errno) => {
-                return Err(io_error(
+                return Err(ProvisionError::io(
                     "creating a parent directory for",
-                    &bytes_to_path(entry_path),
+                    bytes_to_path(entry_path),
                     errno.into(),
                 ));
             }
@@ -343,25 +341,15 @@ fn open_parent(
 
 /// Resolves `components` beneath `root` as a directory, without following
 /// magic links and without leaving `root`.
+///
+/// `O_PATH`: the descriptor is only ever the anchor of a later `*at` call.
 fn open_dir_at(root: BorrowedFd<'_>, components: &[Vec<u8>]) -> Result<OwnedFd, Errno> {
     let path = if components.is_empty() {
         CString::new(".").expect("no NUL")
     } else {
         CString::new(join(components)).map_err(|_| Errno::INVAL)?
     };
-    loop {
-        match rustix::fs::openat2(
-            root,
-            &path,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
-        ) {
-            // The kernel asks for a retry when a rename raced the walk.
-            Err(Errno::AGAIN) => continue,
-            result => return result,
-        }
-    }
+    containment::open_dir(root, &path, OFlags::PATH, ResolveFlags::BENEATH)
 }
 
 /// What already occupies a name where a directory is about to be created.
@@ -399,8 +387,9 @@ fn classify_existing_dir(
     components: &[Vec<u8>],
     entry_path: &[u8],
 ) -> Result<DirClash, ProvisionError> {
-    let stat = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|errno| io_error("inspecting", &bytes_to_path(entry_path), errno.into()))?;
+    let stat = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| {
+        ProvisionError::io("inspecting", bytes_to_path(entry_path), errno.into())
+    })?;
     let file_type = FileType::from_raw_mode(stat.st_mode);
     if file_type.is_dir() {
         Ok(DirClash::Directory)
@@ -428,7 +417,7 @@ fn resolve_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
             "the path resolves through a symlink loop or a magic link",
         ),
         Errno::NOTDIR => entry_refused(entry_path, "a parent component is not a directory"),
-        errno => io_error("resolving", &bytes_to_path(entry_path), errno.into()),
+        errno => ProvisionError::io("resolving", bytes_to_path(entry_path), errno.into()),
     }
 }
 
@@ -465,20 +454,20 @@ fn extract_file<R: Read>(
             break;
         }
         file.write_all(&buf[..got])
-            .map_err(|err| io_error("writing", &bytes_to_path(&entry.path), err))?;
+            .map_err(|err| ProvisionError::io("writing", bytes_to_path(&entry.path), err))?;
     }
 
     rustix::fs::fchmod(&file, Mode::from_raw_mode(entry.mode)).map_err(|errno| {
-        io_error(
+        ProvisionError::io(
             "setting the mode of",
-            &bytes_to_path(&entry.path),
+            bytes_to_path(&entry.path),
             errno.into(),
         )
     })?;
     rustix::fs::futimens(&file, &timestamps(entry.mtime)).map_err(|errno| {
-        io_error(
+        ProvisionError::io(
             "setting the times of",
-            &bytes_to_path(&entry.path),
+            bytes_to_path(&entry.path),
             errno.into(),
         )
     })?;
@@ -511,15 +500,17 @@ fn extract_dir(
                 DirClash::Replace => {
                     remove_at(&parent, &leaf, &entry.path)?;
                     rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)).map_err(
-                        |errno| io_error("creating", &bytes_to_path(&entry.path), errno.into()),
+                        |errno| {
+                            ProvisionError::io("creating", bytes_to_path(&entry.path), errno.into())
+                        },
                     )?;
                 }
             }
         }
         Err(errno) => {
-            return Err(io_error(
+            return Err(ProvisionError::io(
                 "creating",
-                &bytes_to_path(&entry.path),
+                bytes_to_path(&entry.path),
                 errno.into(),
             ));
         }
@@ -564,9 +555,9 @@ fn extract_symlink(
         AtFlags::SYMLINK_NOFOLLOW,
     )
     .map_err(|errno| {
-        io_error(
+        ProvisionError::io(
             "setting the times of",
-            &bytes_to_path(&entry.path),
+            bytes_to_path(&entry.path),
             errno.into(),
         )
     })?;
@@ -644,9 +635,9 @@ fn extract_fifo(
         AtFlags::empty(),
     )
     .map_err(|errno| {
-        io_error(
+        ProvisionError::io(
             "setting the mode of",
-            &bytes_to_path(&entry.path),
+            bytes_to_path(&entry.path),
             errno.into(),
         )
     })?;
@@ -657,9 +648,9 @@ fn extract_fifo(
         AtFlags::SYMLINK_NOFOLLOW,
     )
     .map_err(|errno| {
-        io_error(
+        ProvisionError::io(
             "setting the times of",
-            &bytes_to_path(&entry.path),
+            bytes_to_path(&entry.path),
             errno.into(),
         )
     })?;
@@ -679,17 +670,17 @@ fn create_replacing<T>(
             Ok(value) => return Ok(value),
             Err(Errno::EXIST) => remove_at(parent, leaf, entry_path)?,
             Err(errno) => {
-                return Err(io_error(
+                return Err(ProvisionError::io(
                     "creating",
-                    &bytes_to_path(entry_path),
+                    bytes_to_path(entry_path),
                     errno.into(),
                 ));
             }
         }
     }
-    Err(io_error(
+    Err(ProvisionError::io(
         "creating",
-        &bytes_to_path(entry_path),
+        bytes_to_path(entry_path),
         io::Error::new(
             io::ErrorKind::AlreadyExists,
             "the name could not be replaced",
@@ -702,11 +693,14 @@ fn create_replacing<T>(
 fn remove_at(parent: &OwnedFd, leaf: &CString, entry_path: &[u8]) -> Result<(), ProvisionError> {
     match rustix::fs::unlinkat(parent, leaf, AtFlags::empty()) {
         Ok(()) => Ok(()),
-        Err(Errno::ISDIR) => rustix::fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR)
-            .map_err(|errno| io_error("replacing", &bytes_to_path(entry_path), errno.into())),
-        Err(errno) => Err(io_error(
+        Err(Errno::ISDIR) => {
+            rustix::fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR).map_err(|errno| {
+                ProvisionError::io("replacing", bytes_to_path(entry_path), errno.into())
+            })
+        }
+        Err(errno) => Err(ProvisionError::io(
             "replacing",
-            &bytes_to_path(entry_path),
+            bytes_to_path(entry_path),
             errno.into(),
         )),
     }
@@ -732,10 +726,17 @@ fn apply_dir_meta(
             // describe; applying it to whatever took its place would let the
             // archive retarget an unrelated in-tree entry.
             Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => continue,
-            Err(errno) => return Err(io_error("finalizing", &bytes_to_path(&path), errno.into())),
+            Err(errno) => {
+                return Err(ProvisionError::io(
+                    "finalizing",
+                    bytes_to_path(&path),
+                    errno.into(),
+                ));
+            }
         };
-        apply_meta_fd(fd.as_fd(), &meta)
-            .map_err(|errno| io_error("finalizing", &bytes_to_path(&path), errno.into()))?;
+        apply_meta_fd(fd.as_fd(), &meta).map_err(|errno| {
+            ProvisionError::io("finalizing", bytes_to_path(&path), errno.into())
+        })?;
     }
     Ok(())
 }
@@ -751,18 +752,12 @@ fn apply_dir_meta(
 /// This matches the `O_NOFOLLOW` discipline the extraction leaves use.
 fn open_dir_meta_fd(root: BorrowedFd<'_>, components: &[Vec<u8>]) -> Result<OwnedFd, Errno> {
     let path = CString::new(join(components)).map_err(|_| Errno::INVAL)?;
-    loop {
-        match rustix::fs::openat2(
-            root,
-            &path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
-        ) {
-            Err(Errno::AGAIN) => continue,
-            result => return result,
-        }
-    }
+    containment::open_dir(
+        root,
+        &path,
+        OFlags::RDONLY | OFlags::NOFOLLOW,
+        ResolveFlags::BENEATH,
+    )
 }
 
 /// Applies a directory's deferred mode and mtime through its fd.
@@ -857,7 +852,7 @@ pub(crate) fn overlay_tree(root: &Path, source: &Path) -> Result<(), ProvisionEr
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| io_error("opening", root, errno.into()))?;
+    .map_err(|errno| ProvisionError::io("opening", root, errno.into()))?;
     overlay_dir(root_fd.as_fd(), source)
 }
 
@@ -895,7 +890,7 @@ fn overlay_dir(root: BorrowedFd<'_>, source_dir: &Path) -> Result<(), ProvisionE
             continue;
         };
         let kind = fs::symlink_metadata(&source_path)
-            .map_err(|err| io_error("inspecting the overlay entry", &source_path, err))?
+            .map_err(|err| ProvisionError::io("inspecting the overlay entry", &source_path, err))?
             .file_type();
 
         // read_dir never yields `.` or `..`, and a name is a single component,
@@ -925,7 +920,7 @@ fn overlay_dir(root: BorrowedFd<'_>, source_dir: &Path) -> Result<(), ProvisionE
 /// filesystem-dependent, and the walk must be deterministic.
 #[cfg(feature = "debian")]
 fn push_children(dir: &Path, pending: &mut Vec<OverlayStep>) -> Result<(), ProvisionError> {
-    let read = |err| io_error("reading the overlay directory", dir, err);
+    let read = |err| ProvisionError::io("reading the overlay directory", dir, err);
     let mut children: Vec<PathBuf> = fs::read_dir(dir)
         .map_err(read)?
         .map(|entry| entry.map(|entry| entry.path()))
@@ -964,17 +959,23 @@ fn overlay_mkdir(
                 DirClash::Replace => {
                     remove_at(&parent, &leaf, &path)?;
                     rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)).map_err(
-                        |errno| io_error("creating", &bytes_to_path(&path), errno.into()),
+                        |errno| ProvisionError::io("creating", bytes_to_path(&path), errno.into()),
                     )?;
                     true
                 }
             }
         }
-        Err(errno) => return Err(io_error("creating", &bytes_to_path(&path), errno.into())),
+        Err(errno) => {
+            return Err(ProvisionError::io(
+                "creating",
+                bytes_to_path(&path),
+                errno.into(),
+            ));
+        }
     };
     if created {
         rustix::fs::chmodat(&parent, &leaf, Mode::from_raw_mode(mode), AtFlags::empty()).map_err(
-            |errno| io_error("setting the mode of", &bytes_to_path(&path), errno.into()),
+            |errno| ProvisionError::io("setting the mode of", bytes_to_path(&path), errno.into()),
         )?;
     }
     Ok(())
@@ -1009,12 +1010,13 @@ fn overlay_file(
     )?;
 
     let mut source = File::open(source_path)
-        .map_err(|err| io_error("reading the overlay file", source_path, err))?;
+        .map_err(|err| ProvisionError::io("reading the overlay file", source_path, err))?;
     let mut dest = File::from(fd);
     io::copy(&mut source, &mut dest)
-        .map_err(|err| io_error("writing", &bytes_to_path(&path), err))?;
-    rustix::fs::fchmod(&dest, Mode::from_raw_mode(mode))
-        .map_err(|errno| io_error("setting the mode of", &bytes_to_path(&path), errno.into()))?;
+        .map_err(|err| ProvisionError::io("writing", bytes_to_path(&path), err))?;
+    rustix::fs::fchmod(&dest, Mode::from_raw_mode(mode)).map_err(|errno| {
+        ProvisionError::io("setting the mode of", bytes_to_path(&path), errno.into())
+    })?;
     Ok(())
 }
 
@@ -1028,7 +1030,7 @@ fn overlay_symlink(
 ) -> Result<(), ProvisionError> {
     let path = join(components);
     let target = fs::read_link(source_path)
-        .map_err(|err| io_error("reading the overlay symlink", source_path, err))?;
+        .map_err(|err| ProvisionError::io("reading the overlay symlink", source_path, err))?;
     let target = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| entry_unsafe(&path, "the symlink target contains a NUL byte"))?;
     let parent = open_parent(root, components, &path, None)?;
@@ -1047,7 +1049,7 @@ fn overlay_symlink(
 #[cfg(feature = "debian")]
 fn source_mode(path: &Path) -> Result<u32, ProvisionError> {
     let stat = rustix::fs::statat(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|errno| io_error("inspecting the overlay entry", path, errno.into()))?;
+        .map_err(|errno| ProvisionError::io("inspecting the overlay entry", path, errno.into()))?;
     Ok(stat.st_mode & 0o7777)
 }
 
@@ -1058,16 +1060,11 @@ mod tests {
     use super::*;
     use crate::scratch::Scratch;
     use std::os::unix::fs::PermissionsExt;
-
-    fn tempdir(tag: &str) -> Scratch {
-        Scratch::new(&format!("overlay-{tag}"))
-    }
-
     #[test]
     fn overlay_lays_files_and_dirs_and_preserves_modes() {
         // A nested directory and file are created, an existing directory is
         // merged into, and file modes are preserved.
-        let base = tempdir("basic");
+        let base = Scratch::for_test("overlay", "basic");
         let root = base.join("root");
         let source = base.join("source");
         fs::create_dir_all(root.join("etc")).unwrap();
@@ -1102,7 +1099,7 @@ mod tests {
         // to the caller's later mode pass. A caller with no such pass — the
         // overlay walk — asks for the mode at once instead, or the directory
         // would keep a mode that only its owner can traverse.
-        let base = tempdir("implied-parent");
+        let base = Scratch::for_test("overlay", "implied-parent");
         let root = base.join("root");
         fs::create_dir_all(&root).unwrap();
         let fd = rustix::fs::open(
@@ -1133,7 +1130,7 @@ mod tests {
     fn overlay_replaces_a_package_conffile() {
         // A file a package already unpacked is overwritten by the overlay's,
         // which is how a shipped conffile is overridden.
-        let base = tempdir("conffile");
+        let base = Scratch::for_test("overlay", "conffile");
         let root = base.join("root");
         let source = base.join("source");
         fs::create_dir_all(root.join("etc/default")).unwrap();
@@ -1153,7 +1150,7 @@ mod tests {
     fn overlay_stores_symlinks_verbatim_without_following_them() {
         // A relative in-tree link is stored as itself; an absolute link out of
         // the tree is stored as a link, never followed to write at its target.
-        let base = tempdir("symlink");
+        let base = Scratch::for_test("overlay", "symlink");
         let root = base.join("root");
         let source = base.join("source");
         fs::create_dir_all(root.join("etc")).unwrap();
@@ -1192,7 +1189,7 @@ mod tests {
         // A symlink already in the root pointing outside must not become a path
         // a file is written through: the leaf is created O_NOFOLLOW, so the
         // symlink is replaced by the file rather than followed.
-        let base = tempdir("contain");
+        let base = Scratch::for_test("overlay", "contain");
         let root = base.join("root");
         let source = base.join("source");
         fs::create_dir_all(&root).unwrap();

@@ -93,16 +93,7 @@ fn parse_tar(data: &[u8]) -> Vec<Entry> {
         let end = b.iter().position(|c| *c == 0).unwrap_or(b.len());
         b[..end].to_vec()
     };
-    let octal = |b: &[u8]| -> u64 {
-        let mut v = 0u64;
-        for c in b {
-            match c {
-                b'0'..=b'7' => v = v * 8 + u64::from(c - b'0'),
-                _ => break,
-            }
-        }
-        v
-    };
+    let octal = ferroday_cage_testkit::tar::read_octal;
 
     let mut entries = Vec::new();
     let mut pos = 0;

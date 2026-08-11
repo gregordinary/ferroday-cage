@@ -8,6 +8,7 @@
 //! `Packages` file, deduplicated to the highest version of each name.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use super::available::Available;
 use super::pin::Pins;
@@ -150,24 +151,74 @@ pub enum Priority {
     Extra,
 }
 
-impl Priority {
-    /// Parses a Debian `Priority:` field value case-insensitively, returning
-    /// `None` for an unrecognized value.
-    fn parse(value: &str) -> Option<Priority> {
-        for (name, priority) in [
-            ("required", Priority::Required),
-            ("important", Priority::Important),
-            ("standard", Priority::Standard),
-            ("optional", Priority::Optional),
-            ("extra", Priority::Extra),
-        ] {
-            if value.eq_ignore_ascii_case(name) {
-                return Some(priority);
-            }
-        }
-        None
+/// The priority names, in the order the variants declare them: the archive's
+/// own spelling of each band.
+const PRIORITY_NAMES: [(&str, Priority); 5] = [
+    ("required", Priority::Required),
+    ("important", Priority::Important),
+    ("standard", Priority::Standard),
+    ("optional", Priority::Optional),
+    ("extra", Priority::Extra),
+];
+
+impl fmt::Display for Priority {
+    /// Writes the archive's own spelling, which is what
+    /// [`FromStr`](std::str::FromStr) reads back.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (name, _) = PRIORITY_NAMES
+            .iter()
+            .find(|(_, priority)| priority == self)
+            .expect("every priority has a name");
+        f.write_str(name)
     }
 }
+
+impl std::str::FromStr for Priority {
+    type Err = ParsePriorityError;
+
+    /// Parses a Debian `Priority:` field value case-insensitively.
+    ///
+    /// The archive writes the field in lower case, but a caller naming a
+    /// priority on a command line or in a profile writes whatever it likes, and
+    /// one name means one band whichever way it is spelled.
+    fn from_str(value: &str) -> Result<Priority, ParsePriorityError> {
+        PRIORITY_NAMES
+            .iter()
+            .find(|(name, _)| value.eq_ignore_ascii_case(name))
+            .map(|(_, priority)| *priority)
+            .ok_or_else(|| ParsePriorityError {
+                text: value.to_string(),
+            })
+    }
+}
+
+/// The error from parsing an unrecognized [`Priority`] name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsePriorityError {
+    text: String,
+}
+
+impl ParsePriorityError {
+    /// The unrecognized name, as it was given.
+    ///
+    /// Named `text` on every parse error in this crate, so a caller moving
+    /// between them does not have to check.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for ParsePriorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown priority {:?}: expected required, important, standard, optional, or extra",
+            self.text,
+        )
+    }
+}
+
+impl std::error::Error for ParsePriorityError {}
 
 impl Package {
     /// Builds a package from a `Packages` stanza, or `None` when a required
@@ -242,7 +293,9 @@ impl Package {
     /// The package's priority as a [`Priority`], or `None` when it carries no
     /// priority or an unrecognized one.
     fn priority_band(&self) -> Option<Priority> {
-        self.priority.as_deref().and_then(Priority::parse)
+        self.priority
+            .as_deref()
+            .and_then(|value| value.parse().ok())
     }
 }
 
@@ -810,12 +863,21 @@ Priority: standard
 
     #[test]
     fn priority_parses_case_insensitively() {
-        assert_eq!(Priority::parse("required"), Some(Priority::Required));
-        assert_eq!(Priority::parse("Important"), Some(Priority::Important));
-        assert_eq!(Priority::parse("STANDARD"), Some(Priority::Standard));
-        assert_eq!(Priority::parse("optional"), Some(Priority::Optional));
-        assert_eq!(Priority::parse("extra"), Some(Priority::Extra));
-        assert_eq!(Priority::parse("bogus"), None);
+        // Case-insensitive both ways, and every name round-trips through the
+        // rendering the archive itself writes.
+        assert_eq!("required".parse(), Ok(Priority::Required));
+        assert_eq!("Important".parse(), Ok(Priority::Important));
+        assert_eq!("STANDARD".parse(), Ok(Priority::Standard));
+        assert_eq!("optional".parse(), Ok(Priority::Optional));
+        assert_eq!("extra".parse(), Ok(Priority::Extra));
+        for (name, priority) in PRIORITY_NAMES {
+            assert_eq!(priority.to_string(), name);
+            assert_eq!(name.parse(), Ok(priority));
+        }
+        let err = "bogus"
+            .parse::<Priority>()
+            .expect_err("bogus is no priority");
+        assert_eq!(err.text(), "bogus");
         // The ordering is most-essential-first, so a lower band compares
         // greater and a floor admits everything at least as essential.
         assert!(Priority::Required < Priority::Important);

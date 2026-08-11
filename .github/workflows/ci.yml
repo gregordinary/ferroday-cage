@@ -38,6 +38,14 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Idiom census
+        # Some concepts have one answer in this workspace and are meant to keep
+        # having one, and a second implementation is neither a compile error nor
+        # something a reviewer reliably catches. tools/idioms.toml records where
+        # each appears; this fails on any difference, so a new site arrives as a
+        # decision in the diff rather than as drift. Needs tomllib, so Python
+        # 3.11 or newer -- the runner image is well past that.
+        run: python3 tools/check-idioms.py
       - name: Check (default features)
         run: cargo check --workspace --all-targets
       - name: Enable the sandbox facilities
@@ -113,6 +121,20 @@ jobs:
         # gets from a bare dependency line. Nothing else in CI covers it: every
         # other step is a workspace build, where the CLI's feature selection
         # unifies onto the library.
+        #
+        # Without `--all-targets`, deliberately. A test target pulls the
+        # dev-dependencies in, and the testkit's own features forward to this
+        # crate's, so `--all-targets` builds the library with whatever the tests
+        # need rather than with nothing. That build is worth checking too and is
+        # the step below; this one is the consumer's.
+        run: cargo check -p ferroday-cage --no-default-features
+      - name: Check the featureless build's targets
+        # The same selection with the tests and examples, which is the library
+        # plus whatever the dev-dependencies unify onto it. What this catches
+        # that the step above does not is a test or example that stops
+        # compiling; what the step above catches that this does not is the
+        # library reaching for something a bare dependency line has no access
+        # to.
         run: cargo check -p ferroday-cage --no-default-features --all-targets
       - name: Check the feature powerset
         # Depth 2 keeps the matrix small while covering the pairwise
@@ -120,11 +142,18 @@ jobs:
         # shape of problem this catches generally. A combination that stops
         # compiling is a breaking change for whoever selected it.
         #
-        # `--all-targets` extends that to the tests and examples. A test target
-        # declaring `required-features` still compiles under a combination that
-        # satisfies them, so one reaching past what it declared is invisible to
-        # an ordinary package check and to every all-features command a
-        # contributor runs locally.
+        # `--no-dev-deps` is what makes each combination *be* that combination:
+        # with the dev-dependencies in, every one of them would additionally
+        # carry whatever the test fixtures need, and a library item reachable
+        # only through that addition would compile here and fail for the
+        # consumer who selected the combination on its own.
+        run: cargo hack check -p ferroday-cage --feature-powerset --depth 2 --no-dev-deps
+      - name: Check the feature powerset's targets
+        # The same matrix over the tests and examples. A test target declaring
+        # `required-features` still compiles under a combination that satisfies
+        # them, so one reaching past what it declared is invisible to an
+        # ordinary package check and to every all-features command a contributor
+        # runs locally.
         run: cargo hack check -p ferroday-cage --feature-powerset --depth 2 --all-targets
 
   api:

@@ -59,13 +59,18 @@
 //! isolated network, exactly as `deb-build` does.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ferroday_cage::provision::debian::{Debian, DebianEvent, Pool, Repository, build_depend_names};
+use ferroday_cage::provision::debian::{
+    Debian, DebianEvent, Pool, Repository, build_depend_names, host_architecture,
+};
 use ferroday_cage::provision::{self, Provisioned};
 use ferroday_cage::{Cage, Network};
+
+mod common;
+
+use common::{flag_value, into_string, string_value, value_for};
 
 /// The suite bootstrapped when `--suite` is not given.
 const DEFAULT_SUITE: &str = "trixie";
@@ -377,20 +382,6 @@ fn print_progress(event: DebianEvent<'_>) {
     }
 }
 
-/// The Debian architecture name for the host, for the pool's default.
-fn host_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        "arm" => "armhf",
-        "x86" => "i386",
-        "powerpc64" => "ppc64el",
-        "s390x" => "s390x",
-        "riscv64" => "riscv64",
-        other => other,
-    }
-}
-
 /// Parses the command line, excluding the program name.
 fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     let mut suite = None;
@@ -454,37 +445,9 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         base,
         pool,
         cache,
-        arch: arch.unwrap_or_else(|| host_arch().to_string()),
+        arch: arch.unwrap_or_else(host_architecture),
         components,
         output,
         network,
     }))
-}
-
-/// Consumes the next argument as a required value.
-fn value_for(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
-    args.next()
-        .ok_or_else(|| format!("{name} requires a value"))
-}
-
-/// Consumes the next argument as a required UTF-8 value.
-fn string_value(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<String, String> {
-    into_string(name, value_for(name, args)?)
-}
-
-/// Requires a value to be UTF-8, naming the option on failure.
-fn into_string(name: &str, value: OsString) -> Result<String, String> {
-    value.into_string().map_err(|value| {
-        format!(
-            "{name} value {} is not valid UTF-8",
-            value.to_string_lossy()
-        )
-    })
-}
-
-/// Splits `--flag=value` syntax, preserving a non-UTF-8 value.
-fn flag_value(arg: &OsStr, prefix: &[u8]) -> Option<OsString> {
-    arg.as_bytes()
-        .strip_prefix(prefix)
-        .map(|value| OsString::from_vec(value.to_vec()))
 }

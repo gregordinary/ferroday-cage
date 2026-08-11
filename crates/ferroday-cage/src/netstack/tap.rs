@@ -57,7 +57,9 @@ use rustix::runtime::{self, Fork, How, KernelSigSet};
 use rustix::thread::LinkNameSpaceType;
 
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
+use crate::mechanism::frame;
 use crate::mechanism::sweep_fds_keeping;
+use crate::wire::wire_enum;
 
 /// `TUNSETIFF`: create or attach to a tun/tap interface (`_IOW('T', 202, int)`).
 const TUNSETIFF: ioctl::Opcode = 0x400454CA;
@@ -98,98 +100,48 @@ const RTF_GATEWAY: u16 = 0x0002;
 /// value are zero.
 const DAD_ALL: &CStr = c"/proc/sys/net/ipv6/conf/all/accept_dad";
 
-/// The steps of the helper's work, in wire form: a failure report names the
-/// step and the errno. The explicit discriminants are the record encoding
-/// between the helper and its parent within one build; zero is reserved for
-/// the success record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-enum Step {
-    /// Close the inherited descriptors this process does not own.
-    SweepFds = 1,
-    /// Join the sandbox's user namespace.
-    JoinUser = 2,
-    /// Join the sandbox's network namespace.
-    JoinNet = 3,
-    /// Open `/dev/net/tun`.
-    OpenTun = 4,
-    /// Create the tap interface.
-    CreateTap = 5,
-    /// Open the IPv4 configuration socket.
-    OpenInet = 6,
-    /// Set the hardware address.
-    SetHwaddr = 7,
-    /// Set the MTU.
-    SetMtu = 8,
-    /// Assign the IPv4 address.
-    SetV4Addr = 9,
-    /// Set the IPv4 netmask.
-    SetV4Mask = 10,
-    /// Read the interface flags.
-    ReadFlags = 11,
-    /// Bring the interface up.
-    RaiseFlags = 12,
-    /// Add the IPv4 default route.
-    AddV4Route = 13,
-    /// Read the interface index.
-    ReadIndex = 14,
-    /// Open the IPv6 configuration socket.
-    OpenInet6 = 15,
-    /// Assign the IPv6 address.
-    SetV6Addr = 16,
-    /// Add the IPv6 default route.
-    AddV6Route = 17,
-    /// Send the tap descriptor back to the caller.
-    SendTap = 18,
-}
-
-impl Step {
-    /// Every step, in wire order. Used by the wire-protocol test.
-    #[cfg(test)]
-    const ALL: [Step; 18] = [
-        Step::SweepFds,
-        Step::JoinUser,
-        Step::JoinNet,
-        Step::OpenTun,
-        Step::CreateTap,
-        Step::OpenInet,
-        Step::SetHwaddr,
-        Step::SetMtu,
-        Step::SetV4Addr,
-        Step::SetV4Mask,
-        Step::ReadFlags,
-        Step::RaiseFlags,
-        Step::AddV4Route,
-        Step::ReadIndex,
-        Step::OpenInet6,
-        Step::SetV6Addr,
-        Step::AddV6Route,
-        Step::SendTap,
-    ];
-
-    /// Decodes a step from its record wire value.
-    fn from_wire(value: u32) -> Option<Step> {
-        Some(match value {
-            1 => Step::SweepFds,
-            2 => Step::JoinUser,
-            3 => Step::JoinNet,
-            4 => Step::OpenTun,
-            5 => Step::CreateTap,
-            6 => Step::OpenInet,
-            7 => Step::SetHwaddr,
-            8 => Step::SetMtu,
-            9 => Step::SetV4Addr,
-            10 => Step::SetV4Mask,
-            11 => Step::ReadFlags,
-            12 => Step::RaiseFlags,
-            13 => Step::AddV4Route,
-            14 => Step::ReadIndex,
-            15 => Step::OpenInet6,
-            16 => Step::SetV6Addr,
-            17 => Step::AddV6Route,
-            18 => Step::SendTap,
-            _ => return None,
-        })
+wire_enum! {
+    /// The steps of the helper's work, in wire form: a failure report names the
+    /// step and the errno. The explicit discriminants are the record encoding
+    /// between the helper and its parent within one build; zero is reserved for
+    /// the success record.
+    enum Step {
+        /// Close the inherited descriptors this process does not own.
+        SweepFds = 1 => "closing the tap helper's inherited descriptors",
+        /// Join the sandbox's user namespace.
+        JoinUser = 2 => "joining the sandbox's user namespace",
+        /// Join the sandbox's network namespace.
+        JoinNet = 3 => "joining the sandbox's network namespace",
+        /// Open `/dev/net/tun`.
+        OpenTun = 4 => "opening /dev/net/tun",
+        /// Create the tap interface.
+        CreateTap = 5 => "creating the tap interface",
+        /// Open the IPv4 configuration socket.
+        OpenInet = 6 => "opening the IPv4 configuration socket",
+        /// Set the hardware address.
+        SetHwaddr = 7 => "setting the tap interface's hardware address",
+        /// Set the MTU.
+        SetMtu = 8 => "setting the tap interface's MTU",
+        /// Assign the IPv4 address.
+        SetV4Addr = 9 => "assigning the tap interface's IPv4 address",
+        /// Set the IPv4 netmask.
+        SetV4Mask = 10 => "setting the tap interface's IPv4 netmask",
+        /// Read the interface flags.
+        ReadFlags = 11 => "reading the tap interface's flags",
+        /// Bring the interface up.
+        RaiseFlags = 12 => "bringing the tap interface up",
+        /// Add the IPv4 default route.
+        AddV4Route = 13 => "adding the IPv4 default route",
+        /// Read the interface index.
+        ReadIndex = 14 => "reading the tap interface's index",
+        /// Open the IPv6 configuration socket.
+        OpenInet6 = 15 => "opening the IPv6 configuration socket",
+        /// Assign the IPv6 address.
+        SetV6Addr = 16 => "assigning the tap interface's IPv6 address",
+        /// Add the IPv6 default route.
+        AddV6Route = 17 => "adding the IPv6 default route",
+        /// Send the tap descriptor back to the caller.
+        SendTap = 18 => "sending the tap descriptor back to the caller",
     }
 }
 
@@ -368,7 +320,7 @@ pub(super) fn create(
         None,
     )
     .map_err(|errno| NetStackError::Spawn {
-        errno: errno.raw_os_error(),
+        source: errno.into(),
     })?;
     let context = HelperContext {
         userns: userns.as_fd(),
@@ -385,7 +337,7 @@ pub(super) fn create(
     // inputs were marshaled above.
     match unsafe { runtime::kernel_fork() } {
         Err(errno) => Err(NetStackError::Spawn {
-            errno: errno.raw_os_error(),
+            source: errno.into(),
         }),
         Ok(Fork::Child(_)) => helper(&context),
         Ok(Fork::ParentOf(child)) => {
@@ -518,18 +470,13 @@ fn send_tap(sock: BorrowedFd<'_>, tap: BorrowedFd<'_>) -> Result<(), Errno> {
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
     let fds = [tap];
     ancillary.push(SendAncillaryMessage::ScmRights(&fds));
-    loop {
-        match rustix::net::sendmsg(
-            sock,
-            &[std::io::IoSlice::new(&payload)],
-            &mut ancillary,
-            SendFlags::NOSIGNAL,
-        ) {
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(errno),
-        }
-    }
+    frame::retry_on_intr!(rustix::net::sendmsg(
+        sock,
+        &[std::io::IoSlice::new(&payload)],
+        &mut ancillary,
+        SendFlags::NOSIGNAL,
+    ))
+    .map(|_| ())
 }
 
 /// Receives the helper's one record: the tap descriptor on success, a
@@ -538,18 +485,13 @@ fn receive_tap(sock: &OwnedFd, plan: &Plan) -> Result<OwnedFd, NetStackError> {
     let mut payload = [0u8; 8];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-    let received = loop {
-        match rustix::net::recvmsg(
-            sock,
-            &mut [std::io::IoSliceMut::new(&mut payload)],
-            &mut ancillary,
-            RecvFlags::CMSG_CLOEXEC,
-        ) {
-            Ok(received) => break received,
-            Err(Errno::INTR) => continue,
-            Err(_) => return Err(NetStackError::HelperLost),
-        }
-    };
+    let received = frame::retry_on_intr!(rustix::net::recvmsg(
+        sock,
+        &mut [std::io::IoSliceMut::new(&mut payload)],
+        &mut ancillary,
+        RecvFlags::CMSG_CLOEXEC,
+    ))
+    .map_err(|_| NetStackError::HelperLost)?;
     if received.bytes != payload.len() {
         return Err(NetStackError::HelperLost);
     }
@@ -572,24 +514,28 @@ fn receive_tap(sock: &OwnedFd, plan: &Plan) -> Result<OwnedFd, NetStackError> {
 
 /// Maps a reported step failure onto the public error.
 fn step_error(step: Step, errno: i32, plan: &Plan) -> NetStackError {
-    let configure = |detail| NetStackError::TapConfigure { detail, errno };
+    let source = || std::io::Error::from_raw_os_error(errno);
+    let configure = |detail| NetStackError::TapConfigure {
+        detail,
+        source: source(),
+    };
     match step {
         // The helper never reached its work: it could not read its own
         // descriptor table, which is a failure to start rather than a failure
         // of the tap.
-        Step::SweepFds => NetStackError::Spawn { errno },
+        Step::SweepFds => NetStackError::Spawn { source: source() },
         Step::JoinUser => NetStackError::NamespaceJoin {
             which: "joining the sandbox's user namespace",
-            errno,
+            source: Some(source()),
         },
         Step::JoinNet => NetStackError::NamespaceJoin {
             which: "joining the sandbox's network namespace",
-            errno,
+            source: Some(source()),
         },
-        Step::OpenTun => NetStackError::TapOpen { errno },
+        Step::OpenTun => NetStackError::TapOpen { source: source() },
         Step::CreateTap => NetStackError::TapCreate {
             name: plan.interface.clone(),
-            errno,
+            source: source(),
         },
         Step::OpenInet => configure("opening the IPv4 configuration socket"),
         Step::SetHwaddr => configure("setting the hardware address"),
@@ -605,7 +551,7 @@ fn step_error(step: Step, errno: i32, plan: &Plan) -> NetStackError {
         Step::AddV6Route => configure("adding the IPv6 default route"),
         // Not a configuration failure: the interface is built and working, and
         // only the handoff of its descriptor failed.
-        Step::SendTap => NetStackError::TapHandoff { errno },
+        Step::SendTap => NetStackError::TapHandoff { source: source() },
     }
 }
 
@@ -809,13 +755,19 @@ fn add_v6_default_route(inet6: &OwnedFd, index: i32, v6: &PlanV6) -> Result<(), 
 mod tests {
     use super::*;
 
-    /// The helper writes the discriminant and its parent decodes it from a
-    /// table written out by hand; a step inserted mid-enum renumbers every
-    /// step after it, and nothing but this test makes the two agree.
+    /// Every step decodes back to itself, and every step names itself in prose.
+    ///
+    /// The round trip is structural now — the decoder's match arms are the same
+    /// literals the variants are declared with, so a value used twice is a
+    /// duplicate discriminant and a duplicate pattern, both of which the
+    /// compiler refuses. What this still checks is that the list of steps and
+    /// the encoding agree about which values exist, and that no step was left
+    /// without a description.
     #[test]
     fn step_wire_round_trip() {
-        for step in Step::ALL {
-            assert_eq!(Step::from_wire(step as u32), Some(step));
+        for &step in Step::ALL {
+            assert_eq!(Step::from_wire(step.wire()), Some(step));
+            assert!(!step.describe().is_empty(), "{step:?} describes itself");
         }
     }
 
@@ -823,7 +775,7 @@ mod tests {
     #[test]
     fn unknown_wire_values_are_rejected() {
         assert_eq!(Step::from_wire(0), None);
-        assert_eq!(Step::from_wire(Step::ALL.len() as u32 + 1), None);
+        assert_eq!(Step::from_wire(Step::past_the_last()), None);
         assert_eq!(Step::from_wire(u32::MAX), None);
     }
 }

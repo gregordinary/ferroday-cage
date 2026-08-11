@@ -112,7 +112,7 @@ pub ferroday_cage::provision::debian::DebianError::Configure::wave: &'static str
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Deb
 pub ferroday_cage::provision::debian::DebianError::Deb::path: std::path::PathBuf
 pub ferroday_cage::provision::debian::DebianError::Deb::reason: alloc::string::String
-pub ferroday_cage::provision::debian::DebianError::Fetch(ferroday_cage::provision::debian::FetchError)
+pub ferroday_cage::provision::debian::DebianError::Fetch(ferroday_cage::provision::FetchError)
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::HashMismatch
 pub ferroday_cage::provision::debian::DebianError::HashMismatch::actual: alloc::string::String
 pub ferroday_cage::provision::debian::DebianError::HashMismatch::expected: alloc::string::String
@@ -139,10 +139,13 @@ pub ferroday_cage::provision::debian::DebianError::Release::reason: alloc::strin
 pub ferroday_cage::provision::debian::DebianError::Resolve::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Signature
 pub ferroday_cage::provision::debian::DebianError::Signature::reason: alloc::string::String
+impl ferroday_cage::provision::debian::DebianError
+pub fn ferroday_cage::provision::debian::DebianError::at(&'static str, impl core::convert::Into<std::path::PathBuf>) -> impl core::ops::function::FnOnce(core::io::error::Error) -> ferroday_cage::provision::debian::DebianError
+pub fn ferroday_cage::provision::debian::DebianError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::debian::DebianError
 impl core::convert::From<ferroday_cage::Error> for ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::Error) -> Self
-impl core::convert::From<ferroday_cage::provision::debian::FetchError> for ferroday_cage::provision::debian::DebianError
-pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::debian::FetchError) -> Self
+impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::debian::DebianError
+pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> Self
 impl core::error::Error for ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::provision::debian::DebianError
@@ -176,43 +179,17 @@ impl<'a> core::marker::Unpin for ferroday_cage::provision::debian::DebianEvent<'
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::DebianEvent<'a>
 impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::DebianEvent<'a>
 impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::DebianEvent<'a>
-#[non_exhaustive] pub enum ferroday_cage::provision::debian::FetchError
-#[non_exhaustive] pub ferroday_cage::provision::debian::FetchError::Io
-pub ferroday_cage::provision::debian::FetchError::Io::op: alloc::string::String
-pub ferroday_cage::provision::debian::FetchError::Io::source: core::io::error::Error
-pub ferroday_cage::provision::debian::FetchError::Io::url: alloc::string::String
-#[non_exhaustive] pub ferroday_cage::provision::debian::FetchError::NotFound
-pub ferroday_cage::provision::debian::FetchError::NotFound::url: alloc::string::String
-#[non_exhaustive] pub ferroday_cage::provision::debian::FetchError::Status
-pub ferroday_cage::provision::debian::FetchError::Status::code: u16
-pub ferroday_cage::provision::debian::FetchError::Status::url: alloc::string::String
-#[non_exhaustive] pub ferroday_cage::provision::debian::FetchError::Url
-pub ferroday_cage::provision::debian::FetchError::Url::reason: alloc::string::String
-pub ferroday_cage::provision::debian::FetchError::Url::url: alloc::string::String
-impl ferroday_cage::provision::debian::FetchError
-pub fn ferroday_cage::provision::debian::FetchError::io(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::io::error::Error) -> ferroday_cage::provision::debian::FetchError
-pub fn ferroday_cage::provision::debian::FetchError::not_found(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::FetchError
-pub fn ferroday_cage::provision::debian::FetchError::status(impl core::convert::Into<alloc::string::String>, u16) -> ferroday_cage::provision::debian::FetchError
-pub fn ferroday_cage::provision::debian::FetchError::url(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::FetchError
-impl core::convert::From<ferroday_cage::provision::debian::FetchError> for ferroday_cage::provision::debian::DebianError
-pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::debian::FetchError) -> Self
-impl core::error::Error for ferroday_cage::provision::debian::FetchError
-pub fn ferroday_cage::provision::debian::FetchError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
-impl core::fmt::Display for ferroday_cage::provision::debian::FetchError
-pub fn ferroday_cage::provision::debian::FetchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for ferroday_cage::provision::debian::FetchError
-impl core::marker::Send for ferroday_cage::provision::debian::FetchError
-impl core::marker::Sync for ferroday_cage::provision::debian::FetchError
-impl core::marker::Unpin for ferroday_cage::provision::debian::FetchError
-impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::FetchError
-impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::FetchError
-impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::FetchError
 #[non_exhaustive] pub enum ferroday_cage::provision::debian::Priority
 pub ferroday_cage::provision::debian::Priority::Extra
 pub ferroday_cage::provision::debian::Priority::Important
 pub ferroday_cage::provision::debian::Priority::Optional
 pub ferroday_cage::provision::debian::Priority::Required
 pub ferroday_cage::provision::debian::Priority::Standard
+impl core::fmt::Display for ferroday_cage::provision::debian::Priority
+pub fn ferroday_cage::provision::debian::Priority::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for ferroday_cage::provision::debian::Priority
+pub type ferroday_cage::provision::debian::Priority::Err = ferroday_cage::provision::debian::ParsePriorityError
+pub fn ferroday_cage::provision::debian::Priority::from_str(&str) -> core::result::Result<ferroday_cage::provision::debian::Priority, ferroday_cage::provision::debian::ParsePriorityError>
 impl core::marker::Freeze for ferroday_cage::provision::debian::Priority
 impl core::marker::Send for ferroday_cage::provision::debian::Priority
 impl core::marker::Sync for ferroday_cage::provision::debian::Priority
@@ -277,7 +254,7 @@ pub fn ferroday_cage::provision::debian::Debian<'a>::resolve(&mut self) -> core:
 pub fn ferroday_cage::provision::debian::Debian<'a>::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
 pub fn ferroday_cage::provision::debian::Debian<'a>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::debian::BuildLayer, ferroday_cage::provision::ProvisionError>
 impl<'a> ferroday_cage::provision::debian::Debian<'a>
-pub fn ferroday_cage::provision::debian::Debian<'a>::observe<'o>(&'o mut self, &'o mut dyn core::ops::function::FnMut(ferroday_cage::provision::debian::DebianEvent<'_>)) -> ferroday_cage::provision::debian::Observed<'o, 'a>
+pub fn ferroday_cage::provision::debian::Debian<'a>::observe<'o>(&'o mut self, &'o mut dyn ferroday_cage::provision::debian::DebianObserver) -> ferroday_cage::provision::debian::Observed<'o, 'a>
 impl core::fmt::Debug for ferroday_cage::provision::debian::Debian<'_>
 pub fn ferroday_cage::provision::debian::Debian<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Debian<'_>
@@ -300,7 +277,7 @@ pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::cache_dir(self, impl
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::components<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::exclude<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::extract_only(self, bool) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::fetcher(self, alloc::boxed::Box<(dyn ferroday_cage::provision::debian::Fetch + 'a)>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::fetcher(self, alloc::boxed::Box<(dyn ferroday_cage::provision::Fetch + 'a)>) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::identity_map(self, ferroday_cage::IdentityMap) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::include<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::keyring(self, impl core::convert::AsRef<std::path::Path>) -> Self
@@ -320,36 +297,6 @@ impl<'a> core::marker::Unpin for ferroday_cage::provision::debian::DebianBuilder
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::DebianBuilder<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::DebianBuilder<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::DebianBuilder<'a>
-pub struct ferroday_cage::provision::debian::FetchRequest<'a>
-impl<'a> ferroday_cage::provision::debian::FetchRequest<'a>
-pub fn ferroday_cage::provision::debian::FetchRequest<'a>::new(&'a str) -> ferroday_cage::provision::debian::FetchRequest<'a>
-pub fn ferroday_cage::provision::debian::FetchRequest<'a>::size(&self) -> core::option::Option<u64>
-pub fn ferroday_cage::provision::debian::FetchRequest<'a>::sized(self, u64) -> ferroday_cage::provision::debian::FetchRequest<'a>
-pub fn ferroday_cage::provision::debian::FetchRequest<'a>::url(&self) -> &'a str
-impl<'a> core::marker::Freeze for ferroday_cage::provision::debian::FetchRequest<'a>
-impl<'a> core::marker::Send for ferroday_cage::provision::debian::FetchRequest<'a>
-impl<'a> core::marker::Sync for ferroday_cage::provision::debian::FetchRequest<'a>
-impl<'a> core::marker::Unpin for ferroday_cage::provision::debian::FetchRequest<'a>
-impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::FetchRequest<'a>
-impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::FetchRequest<'a>
-impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::FetchRequest<'a>
-pub struct ferroday_cage::provision::debian::HttpFetch
-impl ferroday_cage::provision::debian::HttpFetch
-pub fn ferroday_cage::provision::debian::HttpFetch::cross_host_redirects(self, bool) -> Self
-pub fn ferroday_cage::provision::debian::HttpFetch::new() -> Self
-pub fn ferroday_cage::provision::debian::HttpFetch::request_timeout(self, core::option::Option<core::time::Duration>) -> Self
-pub fn ferroday_cage::provision::debian::HttpFetch::timeouts(self, core::time::Duration, core::time::Duration) -> Self
-impl core::default::Default for ferroday_cage::provision::debian::HttpFetch
-pub fn ferroday_cage::provision::debian::HttpFetch::default() -> Self
-impl ferroday_cage::provision::debian::Fetch for ferroday_cage::provision::debian::HttpFetch
-pub fn ferroday_cage::provision::debian::HttpFetch::fetch(&mut self, &ferroday_cage::provision::debian::FetchRequest<'_>, &mut dyn std::io::Write) -> core::result::Result<(), ferroday_cage::provision::debian::FetchError>
-impl core::marker::Freeze for ferroday_cage::provision::debian::HttpFetch
-impl core::marker::Send for ferroday_cage::provision::debian::HttpFetch
-impl core::marker::Sync for ferroday_cage::provision::debian::HttpFetch
-impl core::marker::Unpin for ferroday_cage::provision::debian::HttpFetch
-impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::HttpFetch
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::HttpFetch
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::HttpFetch
 #[non_exhaustive] pub struct ferroday_cage::provision::debian::Interpreter
 pub ferroday_cage::provision::debian::Interpreter::enabled: bool
 pub ferroday_cage::provision::debian::Interpreter::flags: alloc::string::String
@@ -380,6 +327,19 @@ impl<'o, 'a> core::marker::Unpin for ferroday_cage::provision::debian::Observed<
 impl<'o, 'a> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Observed<'o, 'a>
 impl<'o, 'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Observed<'o, 'a>
 impl<'o, 'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Observed<'o, 'a>
+pub struct ferroday_cage::provision::debian::ParsePriorityError
+impl ferroday_cage::provision::debian::ParsePriorityError
+pub fn ferroday_cage::provision::debian::ParsePriorityError::text(&self) -> &str
+impl core::error::Error for ferroday_cage::provision::debian::ParsePriorityError
+impl core::fmt::Display for ferroday_cage::provision::debian::ParsePriorityError
+pub fn ferroday_cage::provision::debian::ParsePriorityError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::debian::ParsePriorityError
+impl core::marker::Send for ferroday_cage::provision::debian::ParsePriorityError
+impl core::marker::Sync for ferroday_cage::provision::debian::ParsePriorityError
+impl core::marker::Unpin for ferroday_cage::provision::debian::ParsePriorityError
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::ParsePriorityError
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::ParsePriorityError
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::ParsePriorityError
 #[non_exhaustive] pub struct ferroday_cage::provision::debian::Plan
 pub ferroday_cage::provision::debian::Plan::architecture: alloc::string::String
 pub ferroday_cage::provision::debian::Plan::archives: alloc::vec::Vec<ferroday_cage::provision::debian::ResolvedArchive>
@@ -491,12 +451,47 @@ impl core::marker::Unpin for ferroday_cage::provision::debian::UnheldPin
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::UnheldPin
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::UnheldPin
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::UnheldPin
-pub trait ferroday_cage::provision::debian::Fetch: core::marker::Send
-pub fn ferroday_cage::provision::debian::Fetch::fetch(&mut self, &ferroday_cage::provision::debian::FetchRequest<'_>, &mut dyn std::io::Write) -> core::result::Result<(), ferroday_cage::provision::debian::FetchError>
-impl ferroday_cage::provision::debian::Fetch for ferroday_cage::provision::debian::HttpFetch
-pub fn ferroday_cage::provision::debian::HttpFetch::fetch(&mut self, &ferroday_cage::provision::debian::FetchRequest<'_>, &mut dyn std::io::Write) -> core::result::Result<(), ferroday_cage::provision::debian::FetchError>
+pub trait ferroday_cage::provision::debian::DebianObserver
+pub fn ferroday_cage::provision::debian::DebianObserver::cancelled(&mut self) -> bool
+pub fn ferroday_cage::provision::debian::DebianObserver::progress(&mut self, ferroday_cage::provision::debian::DebianEvent<'_>)
+impl<F: core::ops::function::FnMut(ferroday_cage::provision::debian::DebianEvent<'_>)> ferroday_cage::provision::debian::DebianObserver for F
+pub fn F::cancelled(&mut self) -> bool
+pub fn F::progress(&mut self, ferroday_cage::provision::debian::DebianEvent<'_>)
 pub fn ferroday_cage::provision::debian::build_depend_names(&str) -> alloc::vec::Vec<alloc::string::String>
 pub fn ferroday_cage::provision::debian::foreign_interpreter(&str) -> core::option::Option<ferroday_cage::provision::debian::Interpreter>
+pub fn ferroday_cage::provision::debian::host_architecture() -> alloc::string::String
+#[non_exhaustive] pub enum ferroday_cage::provision::FetchError
+#[non_exhaustive] pub ferroday_cage::provision::FetchError::Io
+pub ferroday_cage::provision::FetchError::Io::op: &'static str
+pub ferroday_cage::provision::FetchError::Io::source: core::io::error::Error
+pub ferroday_cage::provision::FetchError::Io::url: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::FetchError::NotFound
+pub ferroday_cage::provision::FetchError::NotFound::url: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::FetchError::Status
+pub ferroday_cage::provision::FetchError::Status::code: u16
+pub ferroday_cage::provision::FetchError::Status::url: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::FetchError::Url
+pub ferroday_cage::provision::FetchError::Url::reason: alloc::string::String
+pub ferroday_cage::provision::FetchError::Url::url: alloc::string::String
+impl ferroday_cage::provision::FetchError
+pub fn ferroday_cage::provision::FetchError::at(&'static str, impl core::convert::Into<alloc::string::String>) -> impl core::ops::function::FnOnce(core::io::error::Error) -> ferroday_cage::provision::FetchError
+pub fn ferroday_cage::provision::FetchError::io(&'static str, impl core::convert::Into<alloc::string::String>, core::io::error::Error) -> ferroday_cage::provision::FetchError
+pub fn ferroday_cage::provision::FetchError::not_found(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::FetchError
+pub fn ferroday_cage::provision::FetchError::status(impl core::convert::Into<alloc::string::String>, u16) -> ferroday_cage::provision::FetchError
+pub fn ferroday_cage::provision::FetchError::url(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::FetchError
+impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::debian::DebianError
+pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> Self
+impl core::error::Error for ferroday_cage::provision::FetchError
+pub fn ferroday_cage::provision::FetchError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for ferroday_cage::provision::FetchError
+pub fn ferroday_cage::provision::FetchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::FetchError
+impl core::marker::Send for ferroday_cage::provision::FetchError
+impl core::marker::Sync for ferroday_cage::provision::FetchError
+impl core::marker::Unpin for ferroday_cage::provision::FetchError
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::FetchError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::FetchError
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::FetchError
 #[non_exhaustive] pub enum ferroday_cage::provision::ProvisionError
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::Archive
 pub ferroday_cage::provision::ProvisionError::Archive::offset: u64
@@ -535,6 +530,7 @@ pub ferroday_cage::provision::ProvisionError::RemoveUnprivileged::source: core::
 pub ferroday_cage::provision::ProvisionError::SourceChanged::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::SourceChanged::recorded: u64
 impl ferroday_cage::provision::ProvisionError
+pub fn ferroday_cage::provision::ProvisionError::at(&'static str, impl core::convert::Into<std::path::PathBuf>) -> impl core::ops::function::FnOnce(core::io::error::Error) -> ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::other(impl core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>) -> ferroday_cage::provision::ProvisionError
 impl core::error::Error for ferroday_cage::provision::ProvisionError
@@ -625,6 +621,36 @@ impl<'a> core::marker::Unpin for ferroday_cage::provision::Export<'a>
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::Export<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Export<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Export<'a>
+pub struct ferroday_cage::provision::FetchRequest<'a>
+impl<'a> ferroday_cage::provision::FetchRequest<'a>
+pub fn ferroday_cage::provision::FetchRequest<'a>::new(&'a str) -> ferroday_cage::provision::FetchRequest<'a>
+pub fn ferroday_cage::provision::FetchRequest<'a>::size(&self) -> core::option::Option<u64>
+pub fn ferroday_cage::provision::FetchRequest<'a>::sized(self, u64) -> ferroday_cage::provision::FetchRequest<'a>
+pub fn ferroday_cage::provision::FetchRequest<'a>::url(&self) -> &'a str
+impl<'a> core::marker::Freeze for ferroday_cage::provision::FetchRequest<'a>
+impl<'a> core::marker::Send for ferroday_cage::provision::FetchRequest<'a>
+impl<'a> core::marker::Sync for ferroday_cage::provision::FetchRequest<'a>
+impl<'a> core::marker::Unpin for ferroday_cage::provision::FetchRequest<'a>
+impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::FetchRequest<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::FetchRequest<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::FetchRequest<'a>
+pub struct ferroday_cage::provision::HttpFetch
+impl ferroday_cage::provision::HttpFetch
+pub fn ferroday_cage::provision::HttpFetch::cross_host_redirects(self, bool) -> Self
+pub fn ferroday_cage::provision::HttpFetch::new() -> Self
+pub fn ferroday_cage::provision::HttpFetch::request_timeout(self, core::option::Option<core::time::Duration>) -> Self
+pub fn ferroday_cage::provision::HttpFetch::timeouts(self, core::time::Duration, core::time::Duration) -> Self
+impl core::default::Default for ferroday_cage::provision::HttpFetch
+pub fn ferroday_cage::provision::HttpFetch::default() -> Self
+impl ferroday_cage::provision::Fetch for ferroday_cage::provision::HttpFetch
+pub fn ferroday_cage::provision::HttpFetch::fetch(&mut self, &ferroday_cage::provision::FetchRequest<'_>, &mut dyn std::io::Write) -> core::result::Result<(), ferroday_cage::provision::FetchError>
+impl core::marker::Freeze for ferroday_cage::provision::HttpFetch
+impl core::marker::Send for ferroday_cage::provision::HttpFetch
+impl core::marker::Sync for ferroday_cage::provision::HttpFetch
+impl core::marker::Unpin for ferroday_cage::provision::HttpFetch
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::HttpFetch
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::HttpFetch
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::HttpFetch
 pub struct ferroday_cage::provision::Provision<'obs>
 impl<'obs> ferroday_cage::provision::Provision<'obs>
 pub fn ferroday_cage::provision::Provision<'obs>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Provision<'obs>
@@ -694,6 +720,10 @@ impl core::marker::Unpin for ferroday_cage::provision::Tarball
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::Tarball
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Tarball
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Tarball
+pub trait ferroday_cage::provision::Fetch: core::marker::Send
+pub fn ferroday_cage::provision::Fetch::fetch(&mut self, &ferroday_cage::provision::FetchRequest<'_>, &mut dyn std::io::Write) -> core::result::Result<(), ferroday_cage::provision::FetchError>
+impl ferroday_cage::provision::Fetch for ferroday_cage::provision::HttpFetch
+pub fn ferroday_cage::provision::HttpFetch::fetch(&mut self, &ferroday_cage::provision::FetchRequest<'_>, &mut dyn std::io::Write) -> core::result::Result<(), ferroday_cage::provision::FetchError>
 pub trait ferroday_cage::provision::ProvisionObserver
 pub fn ferroday_cage::provision::ProvisionObserver::cancelled(&mut self) -> bool
 pub fn ferroday_cage::provision::ProvisionObserver::progress(&mut self, ferroday_cage::provision::ProvisionEvent<'_>)
@@ -710,6 +740,7 @@ impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian:
 pub fn ferroday_cage::provision::debian::Observed<'_, '_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::ensure(impl core::convert::AsRef<std::path::Path>, &mut dyn ferroday_cage::provision::Provisioner) -> core::result::Result<ferroday_cage::provision::Provisioned, ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::export_tar<W: std::io::Write>(impl core::convert::AsRef<std::path::Path>, W, ferroday_cage::IdentityMap) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+pub fn ferroday_cage::provision::file_url(&std::path::Path) -> core::result::Result<alloc::string::String, ferroday_cage::provision::FetchError>
 pub fn ferroday_cage::provision::remove(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 #[non_exhaustive] pub enum ferroday_cage::Capability
 pub ferroday_cage::Capability::AuditControl
@@ -769,8 +800,8 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Capability
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Capability
 #[non_exhaustive] pub enum ferroday_cage::ConfigError
 #[non_exhaustive] pub ferroday_cage::ConfigError::BindSourceUnusable
-pub ferroday_cage::ConfigError::BindSourceUnusable::errno: i32
 pub ferroday_cage::ConfigError::BindSourceUnusable::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::BindSourceUnusable::source: core::io::error::Error
 pub ferroday_cage::ConfigError::CommandMissing
 #[non_exhaustive] pub ferroday_cage::ConfigError::CommandNotAbsolute
 pub ferroday_cage::ConfigError::CommandNotAbsolute::command: std::path::PathBuf
@@ -799,9 +830,9 @@ pub ferroday_cage::ConfigError::NestedUsernsNeedsProcfs
 pub ferroday_cage::ConfigError::OverlayDirUnowned::layer: ferroday_cage::OverlayLayer
 pub ferroday_cage::ConfigError::OverlayDirUnowned::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayDirUnusable
-pub ferroday_cage::ConfigError::OverlayDirUnusable::errno: i32
 pub ferroday_cage::ConfigError::OverlayDirUnusable::layer: ferroday_cage::OverlayLayer
 pub ferroday_cage::ConfigError::OverlayDirUnusable::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::OverlayDirUnusable::source: core::io::error::Error
 pub ferroday_cage::ConfigError::OverlayLowerMissing
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayPathInvalid
 pub ferroday_cage::ConfigError::OverlayPathInvalid::path: std::path::PathBuf
@@ -823,8 +854,8 @@ pub ferroday_cage::ConfigError::RootContradiction
 pub ferroday_cage::ConfigError::RootfsIsHostRoot
 pub ferroday_cage::ConfigError::RootfsMissing
 #[non_exhaustive] pub ferroday_cage::ConfigError::RootfsUnusable
-pub ferroday_cage::ConfigError::RootfsUnusable::errno: i32
 pub ferroday_cage::ConfigError::RootfsUnusable::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::RootfsUnusable::source: core::io::error::Error
 pub ferroday_cage::ConfigError::RunAsGroupsWithSingleMap
 #[non_exhaustive] pub ferroday_cage::ConfigError::RunAsUnmapped
 pub ferroday_cage::ConfigError::RunAsUnmapped::id: u32
@@ -848,6 +879,7 @@ pub ferroday_cage::ConfigError::WorkdirNotAbsolute::path: std::path::PathBuf
 impl core::convert::From<ferroday_cage::ConfigError> for ferroday_cage::Error
 pub fn ferroday_cage::Error::from(ferroday_cage::ConfigError) -> Self
 impl core::error::Error for ferroday_cage::ConfigError
+pub fn ferroday_cage::ConfigError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::ConfigError
 pub fn ferroday_cage::ConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::ConfigError
@@ -855,29 +887,31 @@ impl core::marker::Send for ferroday_cage::ConfigError
 impl core::marker::Sync for ferroday_cage::ConfigError
 impl core::marker::Unpin for ferroday_cage::ConfigError
 impl core::marker::UnsafeUnpin for ferroday_cage::ConfigError
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ConfigError
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ConfigError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ConfigError
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::ConfigError
 #[non_exhaustive] pub enum ferroday_cage::Error
 pub ferroday_cage::Error::Config(ferroday_cage::ConfigError)
 pub ferroday_cage::Error::IdentityMap(ferroday_cage::IdMapError)
 pub ferroday_cage::Error::NestedUsernsBudgetExhausted
 #[non_exhaustive] pub ferroday_cage::Error::Setup
 pub ferroday_cage::Error::Setup::detail: core::option::Option<alloc::string::String>
-pub ferroday_cage::Error::Setup::errno: i32
+pub ferroday_cage::Error::Setup::source: core::io::error::Error
 pub ferroday_cage::Error::Setup::step: ferroday_cage::SetupStep
 #[non_exhaustive] pub ferroday_cage::Error::Signal
-pub ferroday_cage::Error::Signal::errno: i32
+pub ferroday_cage::Error::Signal::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::Spawn
-pub ferroday_cage::Error::Spawn::errno: i32
+pub ferroday_cage::Error::Spawn::source: core::io::error::Error
 pub ferroday_cage::Error::SupervisorLost
 #[non_exhaustive] pub ferroday_cage::Error::Terminal
-pub ferroday_cage::Error::Terminal::errno: i32
+pub ferroday_cage::Error::Terminal::source: core::io::error::Error
 pub ferroday_cage::Error::TerminalsExhausted
 #[non_exhaustive] pub ferroday_cage::Error::UsernsUnavailable
 pub ferroday_cage::Error::UsernsUnavailable::blocker: core::option::Option<ferroday_cage::host::UsernsBlocker>
-pub ferroday_cage::Error::UsernsUnavailable::errno: i32
+pub ferroday_cage::Error::UsernsUnavailable::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::Wait
-pub ferroday_cage::Error::Wait::errno: i32
+pub ferroday_cage::Error::Wait::source: core::io::error::Error
+impl ferroday_cage::Error
+pub fn ferroday_cage::Error::shell_code(&self) -> u8
 impl core::convert::From<ferroday_cage::ConfigError> for ferroday_cage::Error
 pub fn ferroday_cage::Error::from(ferroday_cage::ConfigError) -> Self
 impl core::convert::From<ferroday_cage::Error> for ferroday_cage::provision::debian::DebianError
@@ -891,26 +925,27 @@ impl core::marker::Send for ferroday_cage::Error
 impl core::marker::Sync for ferroday_cage::Error
 impl core::marker::Unpin for ferroday_cage::Error
 impl core::marker::UnsafeUnpin for ferroday_cage::Error
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Error
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Error
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Error
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::Error
 #[non_exhaustive] pub enum ferroday_cage::IdMapError
 #[non_exhaustive] pub ferroday_cage::IdMapError::HelperFailed
 pub ferroday_cage::IdMapError::HelperFailed::detail: alloc::string::String
 pub ferroday_cage::IdMapError::HelperFailed::helper: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::IdMapError::HelperSpawn
-pub ferroday_cage::IdMapError::HelperSpawn::errno: i32
 pub ferroday_cage::IdMapError::HelperSpawn::helper: alloc::string::String
+pub ferroday_cage::IdMapError::HelperSpawn::source: core::option::Option<core::io::error::Error>
 #[non_exhaustive] pub ferroday_cage::IdMapError::MapWrite
-pub ferroday_cage::IdMapError::MapWrite::errno: i32
+pub ferroday_cage::IdMapError::MapWrite::source: core::io::error::Error
 pub ferroday_cage::IdMapError::MapWrite::which: &'static str
 #[non_exhaustive] pub ferroday_cage::IdMapError::Unsatisfiable
 pub ferroday_cage::IdMapError::Unsatisfiable::reason: alloc::string::String
 impl ferroday_cage::IdMapError
 pub fn ferroday_cage::IdMapError::helper_failed(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::IdMapError
-pub fn ferroday_cage::IdMapError::helper_spawn(impl core::convert::Into<alloc::string::String>, i32) -> ferroday_cage::IdMapError
-pub fn ferroday_cage::IdMapError::map_write(&'static str, i32) -> ferroday_cage::IdMapError
+pub fn ferroday_cage::IdMapError::helper_spawn(impl core::convert::Into<alloc::string::String>, core::option::Option<core::io::error::Error>) -> ferroday_cage::IdMapError
+pub fn ferroday_cage::IdMapError::map_write(&'static str, core::io::error::Error) -> ferroday_cage::IdMapError
 pub fn ferroday_cage::IdMapError::unsatisfiable(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::IdMapError
 impl core::error::Error for ferroday_cage::IdMapError
+pub fn ferroday_cage::IdMapError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::IdMapError
 pub fn ferroday_cage::IdMapError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::IdMapError
@@ -918,8 +953,8 @@ impl core::marker::Send for ferroday_cage::IdMapError
 impl core::marker::Sync for ferroday_cage::IdMapError
 impl core::marker::Unpin for ferroday_cage::IdMapError
 impl core::marker::UnsafeUnpin for ferroday_cage::IdMapError
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::IdMapError
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::IdMapError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::IdMapError
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::IdMapError
 #[non_exhaustive] pub enum ferroday_cage::IdentityMap
 #[non_exhaustive] pub ferroday_cage::IdentityMap::Ranges
 pub ferroday_cage::IdentityMap::Ranges::gid: alloc::vec::Vec<ferroday_cage::IdRange>
@@ -955,7 +990,7 @@ pub ferroday_cage::NetStackError::InterfaceNameInvalid::name: alloc::string::Str
 pub ferroday_cage::NetStackError::MtuInvalid::minimum: u16
 pub ferroday_cage::NetStackError::MtuInvalid::mtu: u16
 #[non_exhaustive] pub ferroday_cage::NetStackError::NamespaceJoin
-pub ferroday_cage::NetStackError::NamespaceJoin::errno: i32
+pub ferroday_cage::NetStackError::NamespaceJoin::source: core::option::Option<core::io::error::Error>
 pub ferroday_cage::NetStackError::NamespaceJoin::which: &'static str
 pub ferroday_cage::NetStackError::NoProtocols
 #[non_exhaustive] pub ferroday_cage::NetStackError::PrefixInvalid
@@ -963,22 +998,23 @@ pub ferroday_cage::NetStackError::PrefixInvalid::network: core::net::ip_addr::Ip
 pub ferroday_cage::NetStackError::PrefixInvalid::prefix_len: u8
 pub ferroday_cage::NetStackError::PrefixInvalid::reason: &'static str
 #[non_exhaustive] pub ferroday_cage::NetStackError::Pump
-pub ferroday_cage::NetStackError::Pump::errno: i32
 pub ferroday_cage::NetStackError::Pump::op: &'static str
+pub ferroday_cage::NetStackError::Pump::source: core::option::Option<core::io::error::Error>
 pub ferroday_cage::NetStackError::SharedNamespace
 #[non_exhaustive] pub ferroday_cage::NetStackError::Spawn
-pub ferroday_cage::NetStackError::Spawn::errno: i32
+pub ferroday_cage::NetStackError::Spawn::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::NetStackError::TapConfigure
 pub ferroday_cage::NetStackError::TapConfigure::detail: &'static str
-pub ferroday_cage::NetStackError::TapConfigure::errno: i32
+pub ferroday_cage::NetStackError::TapConfigure::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::NetStackError::TapCreate
-pub ferroday_cage::NetStackError::TapCreate::errno: i32
 pub ferroday_cage::NetStackError::TapCreate::name: alloc::string::String
+pub ferroday_cage::NetStackError::TapCreate::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::NetStackError::TapHandoff
-pub ferroday_cage::NetStackError::TapHandoff::errno: i32
+pub ferroday_cage::NetStackError::TapHandoff::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::NetStackError::TapOpen
-pub ferroday_cage::NetStackError::TapOpen::errno: i32
+pub ferroday_cage::NetStackError::TapOpen::source: core::io::error::Error
 impl core::error::Error for ferroday_cage::NetStackError
+pub fn ferroday_cage::NetStackError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::NetStackError
 pub fn ferroday_cage::NetStackError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::NetStackError
@@ -986,8 +1022,8 @@ impl core::marker::Send for ferroday_cage::NetStackError
 impl core::marker::Sync for ferroday_cage::NetStackError
 impl core::marker::Unpin for ferroday_cage::NetStackError
 impl core::marker::UnsafeUnpin for ferroday_cage::NetStackError
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackError
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackError
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackError
 #[non_exhaustive] pub enum ferroday_cage::Network
 pub ferroday_cage::Network::Host
 pub ferroday_cage::Network::Isolated
@@ -1390,6 +1426,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::DirectMapper
 pub struct ferroday_cage::ExitStatus(_)
 impl ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::code(&self) -> core::option::Option<i32>
+pub fn ferroday_cage::ExitStatus::shell_code(&self) -> u8
 pub fn ferroday_cage::ExitStatus::signal(&self) -> core::option::Option<i32>
 pub fn ferroday_cage::ExitStatus::success(&self) -> bool
 impl core::fmt::Display for ferroday_cage::ExitStatus
@@ -1607,7 +1644,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Overlay
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Overlay
 pub struct ferroday_cage::ParseCapabilityError
 impl ferroday_cage::ParseCapabilityError
-pub fn ferroday_cage::ParseCapabilityError::name(&self) -> &str
+pub fn ferroday_cage::ParseCapabilityError::text(&self) -> &str
 impl core::error::Error for ferroday_cage::ParseCapabilityError
 impl core::fmt::Display for ferroday_cage::ParseCapabilityError
 pub fn ferroday_cage::ParseCapabilityError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -1937,4 +1974,8 @@ pub trait ferroday_cage::Observer
 pub fn ferroday_cage::Observer::progress(&mut self, ferroday_cage::Progress)
 pub fn ferroday_cage::Observer::stderr(&mut self, &[u8])
 pub fn ferroday_cage::Observer::stdout(&mut self, &[u8])
+impl<F: core::ops::function::FnMut(ferroday_cage::Progress)> ferroday_cage::Observer for F
+pub fn F::progress(&mut self, ferroday_cage::Progress)
+pub fn F::stderr(&mut self, &[u8])
+pub fn F::stdout(&mut self, &[u8])
 pub type ferroday_cage::Result<T> = core::result::Result<T, ferroday_cage::Error>

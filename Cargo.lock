@@ -688,8 +688,9 @@ dependencies = [
 
 [[package]]
 name = "ferroday-cage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "ferroday-cage-testkit",
  "flate2",
  "libc",
  "lzma-rust2",
@@ -710,10 +711,20 @@ name = "ferroday-cage-cli"
 version = "0.2.0"
 dependencies = [
  "ferroday-cage",
+ "ferroday-cage-testkit",
  "rustix",
  "serde",
  "syscalls",
  "toml",
+]
+
+[[package]]
+name = "ferroday-cage-testkit"
+version = "0.0.0"
+dependencies = [
+ "ferroday-cage",
+ "rustix",
+ "sha2 0.11.0",
 ]
 
 [[package]]

@@ -196,10 +196,7 @@ fn pax_record(key: &str, value: &str) -> String {
 }
 
 fn write_octal(field: &mut [u8], value: u64) {
-    let text = format!("{value:0width$o}", width = field.len() - 1);
-    assert!(text.len() < field.len(), "octal value fits the field");
-    field[..text.len()].copy_from_slice(text.as_bytes());
-    field[text.len()] = 0;
+    ferroday_cage_testkit::tar::octal(field, value);
 }
 
 /// Writes `archive` to disk and provisions a rootfs from it, returning

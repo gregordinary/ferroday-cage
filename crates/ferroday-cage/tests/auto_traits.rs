@@ -88,6 +88,21 @@ const _: () = assert_send_sync::<ferroday_cage::provision::Export<'_>>();
 const _: () = assert_send::<ferroday_cage::provision::Tarball>();
 
 // ---------------------------------------------------------------------------
+// The transport seam, shared by every userland provisioner.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod transport {
+    use ferroday_cage::provision::{FetchError, FetchRequest, HttpFetch};
+
+    use super::*;
+
+    const _: () = assert_send_sync::<FetchError>();
+    const _: () = assert_send_sync::<FetchRequest<'_>>();
+    const _: () = assert_send_sync::<HttpFetch>();
+}
+
+// ---------------------------------------------------------------------------
 // The Debian provisioner.
 // ---------------------------------------------------------------------------
 
@@ -98,9 +113,6 @@ mod debian {
     use super::*;
 
     const _: () = assert_send_sync::<debian::DebianError>();
-    const _: () = assert_send_sync::<debian::FetchError>();
-    const _: () = assert_send_sync::<debian::FetchRequest<'_>>();
-    const _: () = assert_send_sync::<debian::HttpFetch>();
     const _: () = assert_send_sync::<debian::Plan>();
     const _: () = assert_send_sync::<debian::PlannedPackage>();
     const _: () = assert_send_sync::<debian::Priority>();

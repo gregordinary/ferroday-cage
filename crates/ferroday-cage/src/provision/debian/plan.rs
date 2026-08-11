@@ -10,6 +10,7 @@
 //! [`DebianBuilder::plan`](super::DebianBuilder::plan) covers resolving once
 //! and installing once, and nothing else.
 
+use std::fmt;
 use std::fmt::Write as _;
 
 use super::DebianError;
@@ -491,8 +492,8 @@ enum Name {
     Carried(String),
 }
 
-impl std::fmt::Display for Name {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Name::Known(name) => f.write_str(name),
             Name::Carried(name) => f.write_str(name),

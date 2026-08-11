@@ -78,6 +78,10 @@ tarball = ["dep:flate2", "dep:lzma-rust2", "dep:ruzstd"]
 # install packages, talking to the archive directly. Builds on the tarball
 # extractor for the packages' data members.
 debian = ["tarball", "dep:pgp", "dep:sha2"]
+# The Alpine userland provisioner: bootstrap a release/architecture rootfs from
+# an apk repository, and postmarketOS's repositories beside it. Builds on the
+# tarball extractor for the packages' data segments.
+alpine = ["tarball"]
 # The hardening layer: opt-in Landlock filesystem rules, seccomp syscall
 # filters, and capability drops applied to the sandboxed command.
 hardening = ["dep:seccompiler"]
@@ -213,6 +217,14 @@ name = "fetch-sandbox"
 required-features = ["netstack", "tarball"]
 
 [dev-dependencies]
+# The workspace's shared test fixtures: the rootfs, the scratch directories, and
+# the tar, `ar`, and repository builders. It never ships, and every feature it
+# names here forwards to one of this crate's own — nothing is enabled that a
+# test binary does not already require.
+ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = [
+    "tarball",
+    "debian",
+] }
 rustix = "1.1.4"
 toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.

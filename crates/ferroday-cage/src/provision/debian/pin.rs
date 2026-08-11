@@ -15,6 +15,7 @@
 //! closure is computed, so the fallback is never resolved against.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use super::DebianError;
 use super::index::Index;
@@ -179,8 +180,8 @@ pub enum UnheldReason {
     },
 }
 
-impl std::fmt::Display for UnheldPin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for UnheldPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.reason {
             UnheldReason::Version { archive } => write!(
                 f,

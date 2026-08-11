@@ -1,29 +1,34 @@
-//! The coordinates an archive is addressed by: a suite, a component, and an
+//! The coordinates an archive is addressed by: a release, a component, and an
 //! architecture.
 //!
-//! `dists/<suite>/<component>/binary-<architecture>` is the layout every Debian
-//! archive publishes and every reader asks for, so one set of three values
-//! decides a fetch URL, a directory under a pool root, a `Release` field, and a
-//! line in a finished rootfs's apt sources. [`check`] is what each of them
+//! Every distribution this crate provisions from addresses its archive by a
+//! small set of names that become directories in a URL —
+//! `dists/<suite>/<component>/binary-<architecture>` for Debian,
+//! `<release>/<component>/<architecture>` for Alpine — and that go on to become
+//! a directory under a pool root, a field of a signed index, and a line in the
+//! finished rootfs's own package configuration. [`check`] is what each of them
 //! passes before it reaches any of those, so the side that writes an archive and
-//! the side that reads one refuse the same values.
-
-use super::DebianError;
+//! the side that reads one refuse the same values, in every layer.
+//!
+//! The check reports its reason rather than an error, because the layers do not
+//! share an error type and the coordinate does not belong to either of them.
+//! Each caller wraps the reason in its own configuration failure.
 
 /// How many path segments one coordinate may name.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Nesting {
-    /// A suite or a component, either of which may name a subtree: Debian's
-    /// security archive published `dists/buster/updates/Release` for years, and
-    /// `main/debian-installer` is a component laid out the same way. An
-    /// interior slash is part of the name rather than a separator to refuse.
+pub(crate) enum Nesting {
+    /// A release or a component, either of which may name a subtree: Debian's
+    /// security archive published `dists/buster/updates/Release` for years,
+    /// `main/debian-installer` is a component laid out the same way, and
+    /// postmarketOS publishes an `extra-repos` tree of them. An interior slash
+    /// is part of the name rather than a separator to refuse.
     Nested,
     /// An architecture, which is always exactly one directory name.
     Single,
 }
 
-/// Checks one archive coordinate, which becomes both a path and a field of a
-/// deb822 document.
+/// Checks one archive coordinate, which becomes both a path and a field of an
+/// index, reporting the reason it is refused.
 ///
 /// The check refuses a value that would resolve outside the tree it belongs to,
 /// that the release format cannot name, or that a request line cannot carry. It
@@ -42,27 +47,22 @@ pub(super) enum Nesting {
 /// - A `.` segment, which the filesystem discards, so the directory written
 ///   would not be the one the caller spelled and a scanned release would name a
 ///   component the caller never asked for.
-/// - Whitespace, which the release format cannot express: `Architectures` and
-///   `Components` are whitespace-delimited lists, so a component named `my
-///   thing` would be read back as two components, neither of them the one that
-///   was published. It is also what separates the three fields of an HTTP
-///   request line, which every fetch interpolates these values into.
+/// - Whitespace, which an index cannot express: Debian's `Architectures` and
+///   `Components` are whitespace-delimited lists, and an apk record's fields are
+///   too, so a component named `my thing` would be read back as two components,
+///   neither of them the one that was published. It is also what separates the
+///   three fields of an HTTP request line, which every fetch interpolates these
+///   values into.
 /// - An ASCII control character, for the same reason a newline cannot appear in
-///   a deb822 field without ending it — and, in a request line, without
+///   an index field without ending it — and, in a request line, without
 ///   starting a header of its own.
 ///
 /// `what` names the coordinate in the refusal, in the possessive form the
 /// message reads with: `the pool's suite`, `the repository's component`.
-pub(super) fn check(what: &str, value: &str, nesting: Nesting) -> Result<(), DebianError> {
-    let refuse = |reason: &str| {
-        Err(DebianError::Config {
-            reason: format!("{what} {value:?} {reason}"),
-        })
-    };
+pub(crate) fn check(what: &str, value: &str, nesting: Nesting) -> Result<(), String> {
+    let refuse = |reason: &str| Err(format!("{what} {value:?} {reason}"));
     if value.trim().is_empty() {
-        return Err(DebianError::Config {
-            reason: format!("{what} is empty"),
-        });
+        return Err(format!("{what} is empty"));
     }
     if value.chars().any(|character| character.is_ascii_control()) {
         return refuse("contains a control character");
@@ -94,7 +94,7 @@ mod tests {
     /// The reason a refusal gives, or a panic naming what was accepted.
     fn refusal(value: &str, nesting: Nesting) -> String {
         match check("the archive's suite", value, nesting) {
-            Err(err) => err.to_string(),
+            Err(reason) => reason,
             Ok(()) => panic!("{value:?} was accepted"),
         }
     }
@@ -150,9 +150,17 @@ mod tests {
 
     #[test]
     fn ordinary_coordinates_are_accepted() {
-        for value in ["trixie", "stable-updates", "main", "amd64", "arm64"] {
+        for value in [
+            "trixie",
+            "stable-updates",
+            "main",
+            "amd64",
+            "arm64",
+            "v3.23",
+            "x86_64",
+        ] {
             check("the archive's suite", value, Nesting::Single)
-                .unwrap_or_else(|err| panic!("{value:?} was refused: {err}"));
+                .unwrap_or_else(|reason| panic!("{value:?} was refused: {reason}"));
         }
     }
 
@@ -160,7 +168,7 @@ mod tests {
     fn the_refusal_names_the_coordinate() {
         // A caller reads the message to learn which of the three it set wrong,
         // so the name has to survive into it.
-        let err = check("the pool's component", "../x", Nesting::Nested).unwrap_err();
-        assert!(err.to_string().contains("component"), "{err}");
+        let reason = check("the pool's component", "../x", Nesting::Nested).unwrap_err();
+        assert!(reason.contains("component"), "{reason}");
     }
 }

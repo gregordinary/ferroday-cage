@@ -851,6 +851,7 @@ pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     #[test]
     fn probe_runs_without_panicking() {
@@ -864,7 +865,7 @@ mod tests {
         // The result is host-dependent, but the probe — which forks a child and
         // creates temporary files and directories — must always be safe to call
         // and must leave nothing behind under the scratch directory.
-        let dir = crate::scratch::Scratch::new("overlay-probe");
+        let dir = Scratch::new("overlay-probe");
         let _ = overlay_blocker(&dir);
         // No probe residue remains in the scratch directory.
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -905,7 +906,7 @@ mod tests {
         // A neighbour who guesses the probe's name must not have the probe write
         // through what it finds there. Both plants are refused outright, and the
         // symlink's target survives intact.
-        let dir = crate::scratch::Scratch::new("plant");
+        let dir = Scratch::new("plant");
         std::fs::write(dir.join("victim"), b"intact").unwrap();
         std::os::unix::fs::symlink("victim", dir.join("link")).unwrap();
         std::fs::write(dir.join("regular"), b"mine").unwrap();

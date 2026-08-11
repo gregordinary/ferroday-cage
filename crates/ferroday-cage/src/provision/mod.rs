@@ -46,16 +46,31 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::mechanism::frame;
+
 #[cfg(feature = "tarball")]
 mod compress;
+mod containment;
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod coordinate;
 mod copyin;
 #[cfg(feature = "tarball")]
 mod export;
 #[cfg(feature = "tarball")]
 mod extract;
+// The transport seam and the digesting that verifies what it brings back serve
+// every userland provisioner that talks to an archive, so they are compiled for
+// each of them rather than gaining a feature of their own — a feature nothing
+// could enable on purpose would only widen the powerset the `features` job
+// walks.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod digest;
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod fetch;
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod http;
 mod identity;
-#[cfg(feature = "debian")]
-mod rooted;
+pub(crate) mod rooted;
 #[cfg(feature = "tarball")]
 mod tar;
 #[cfg(feature = "tarball")]
@@ -64,6 +79,10 @@ mod tarball;
 pub use copyin::{CopyIn, CopyReport, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, export_tar};
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub use fetch::{Fetch, FetchError, FetchRequest};
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub use http::{HttpFetch, file_url};
 #[cfg(feature = "tarball")]
 pub use tarball::Tarball;
 
@@ -516,12 +535,35 @@ impl ProvisionError {
 
     /// A host I/O failure, naming what the operation was doing and the path it
     /// concerned.
+    ///
+    /// Arguments run operation, then locator, then cause, which is the order
+    /// every constructor in the crate takes them in.
     pub fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> ProvisionError {
         ProvisionError::Io {
             op,
             path: path.into(),
             source,
         }
+    }
+
+    /// The same failure as a [`map_err`](Result::map_err) argument: names the
+    /// operation and the path now, and takes the cause when it arrives.
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// use ferroday_cage::provision::ProvisionError;
+    ///
+    /// # fn read(path: &std::path::Path) -> Result<Vec<u8>, ProvisionError> {
+    /// fs::read(path).map_err(ProvisionError::at("reading", path))
+    /// # }
+    /// ```
+    pub fn at(
+        op: &'static str,
+        path: impl Into<PathBuf>,
+    ) -> impl FnOnce(io::Error) -> ProvisionError {
+        let path = path.into();
+        move |source| ProvisionError::Io { op, path, source }
     }
 }
 
@@ -608,15 +650,6 @@ impl std::error::Error for ProvisionError {
     }
 }
 
-/// Shorthand for building [`ProvisionError::Io`].
-fn io_error(op: &'static str, path: &Path, source: io::Error) -> ProvisionError {
-    ProvisionError::Io {
-        op,
-        path: path.to_path_buf(),
-        source,
-    }
-}
-
 /// A rootfs publication, configured then run.
 ///
 /// The extensible form of [`ensure`]: it takes the destination, a progress and
@@ -653,7 +686,7 @@ pub struct Provision<'obs> {
 /// or `None`.
 ///
 /// [`IdMapper`](crate::IdMapper) does require `Debug`, so a mapper alone could
-/// render its own. It does not, for two reasons: [`Fetch`](debian::Fetch) and
+/// render its own. It does not, for two reasons: `Fetch` and
 /// [`ProvisionObserver`] carry no such bound, so one delegate rendering unlike
 /// the other two would be an inconsistency with nothing behind it, and a
 /// caller's mapper is free to render at any length in a place that should stay
@@ -886,7 +919,7 @@ fn ensure_inner(
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    fs::create_dir_all(parent).map_err(|err| io_error("creating", parent, err))?;
+    fs::create_dir_all(parent).map_err(|err| ProvisionError::io("creating", parent, err))?;
 
     let mut lock_name = name.to_os_string();
     lock_name.push(".lock");
@@ -901,14 +934,9 @@ fn ensure_inner(
         OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
     )
-    .map_err(|errno| io_error("creating", &lock_path, errno.into()))?;
-    loop {
-        match rustix::fs::flock(&lock, FlockOperation::LockExclusive) {
-            Ok(()) => break,
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(io_error("locking", &lock_path, errno.into())),
-        }
-    }
+    .map_err(|errno| ProvisionError::io("creating", &lock_path, errno.into()))?;
+    frame::retry_on_intr!(rustix::fs::flock(&lock, FlockOperation::LockExclusive))
+        .map_err(|errno| ProvisionError::io("locking", &lock_path, errno.into()))?;
 
     // Re-check under the lock: another caller may have finished the work
     // while this one waited.
@@ -935,12 +963,13 @@ fn ensure_inner(
     // followed into a removal of whatever it points at.
     match fs::symlink_metadata(&staging) {
         Ok(meta) if meta.is_symlink() => {
-            fs::remove_file(&staging).map_err(|err| io_error("removing", &staging, err))?;
+            fs::remove_file(&staging)
+                .map_err(|err| ProvisionError::io("removing", &staging, err))?;
         }
         Ok(_) => remove_tree(&staging, &crate::IdentityMap::Subordinate, None)?,
         Err(_) => {}
     }
-    fs::create_dir(&staging).map_err(|err| io_error("creating", &staging, err))?;
+    fs::create_dir(&staging).map_err(|err| ProvisionError::io("creating", &staging, err))?;
 
     // The observer is wrapped in a cell local to this frame, so its lifetime
     // and the staging path's unify — which `RefCell`'s invariance needs.
@@ -958,17 +987,19 @@ fn ensure_inner(
 
     // Sync the staging tree's filesystem before the rename, so the rename
     // cannot become durable ahead of the data it publishes.
-    let staging_dir = fs::File::open(&staging).map_err(|err| io_error("opening", &staging, err))?;
+    let staging_dir =
+        fs::File::open(&staging).map_err(|err| ProvisionError::io("opening", &staging, err))?;
     rustix::fs::syncfs(&staging_dir)
-        .map_err(|errno| io_error("syncing", &staging, errno.into()))?;
+        .map_err(|errno| ProvisionError::io("syncing", &staging, errno.into()))?;
     drop(staging_dir);
 
-    fs::rename(&staging, dest).map_err(|err| io_error("publishing", dest, err))?;
+    fs::rename(&staging, dest).map_err(|err| ProvisionError::io("publishing", dest, err))?;
 
-    let parent_dir = fs::File::open(parent).map_err(|err| io_error("opening", parent, err))?;
+    let parent_dir =
+        fs::File::open(parent).map_err(|err| ProvisionError::io("opening", parent, err))?;
     parent_dir
         .sync_all()
-        .map_err(|err| io_error("syncing", parent, err))?;
+        .map_err(|err| ProvisionError::io("syncing", parent, err))?;
 
     Ok(Provisioned::Created)
 }
@@ -1022,9 +1053,9 @@ fn remove_dest(
 ) -> Result<(), ProvisionError> {
     match fs::symlink_metadata(dest) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(io_error("inspecting", dest, err)),
+        Err(err) => return Err(ProvisionError::io("inspecting", dest, err)),
         Ok(meta) if !meta.is_dir() => {
-            fs::remove_file(dest).map_err(|err| io_error("removing", dest, err))?;
+            fs::remove_file(dest).map_err(|err| ProvisionError::io("removing", dest, err))?;
         }
         Ok(_) => remove_tree(dest, map, mapper)?,
     }
@@ -1057,7 +1088,7 @@ fn remove_lock(dest: &Path) -> Result<(), ProvisionError> {
     match fs::remove_file(&lock_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(io_error("removing", &lock_path, err)),
+        Err(err) => Err(ProvisionError::io("removing", &lock_path, err)),
     }
 }
 
@@ -1086,7 +1117,7 @@ fn remove_tree(
         // EACCES and EPERM are the ownership refusals; anything else is an
         // ordinary failure with nothing to escalate.
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => err,
-        Err(err) => return Err(io_error("removing", dest, err)),
+        Err(err) => return Err(ProvisionError::io("removing", dest, err)),
     };
 
     let unprivileged = |source: io::Error, reason: String| ProvisionError::RemoveUnprivileged {
@@ -1112,7 +1143,7 @@ fn remove_tree(
         });
     };
     let nul = |_| {
-        io_error(
+        ProvisionError::io(
             "removing",
             dest,
             io::Error::from(io::ErrorKind::InvalidInput),
@@ -1124,16 +1155,129 @@ fn remove_tree(
     crate::mechanism::remove_tree_mapped(&parent_c, &leaf_c, map_source.child_map()).map_err(
         |failure| match failure {
             crate::mechanism::RemoveFailure::Step { step, errno } => {
-                io_error(step.describe(), dest, io::Error::from_raw_os_error(errno))
+                ProvisionError::io(step.describe(), dest, io::Error::from_raw_os_error(errno))
             }
             crate::mechanism::RemoveFailure::Map(err) => unprivileged(denied, err.to_string()),
-            crate::mechanism::RemoveFailure::Malformed => io_error(
+            crate::mechanism::RemoveFailure::Malformed => ProvisionError::io(
                 "reading the removal process's outcome",
                 dest,
                 io::Error::from_raw_os_error(Errno::PROTO.raw_os_error()),
             ),
         },
     )
+}
+
+/// A writer that forwards to an inner writer until a byte ceiling is crossed,
+/// then fails.
+///
+/// It bounds what an untrusted producer can make the caller buffer, in the one
+/// place the bound cannot be ignored. A mirror is free to answer a request for
+/// a few megabytes with gigabytes whatever its framing claimed, and a
+/// caller-supplied [`Fetch`] is free to ignore the size a request declares; a
+/// gzip segment is free to expand a kilobyte into a gigabyte. In every case the
+/// digest that would catch the substitution runs only after the bytes have been
+/// spent, so the sink is where the ceiling belongs.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) struct LimitedWriter<'a> {
+    inner: &'a mut dyn io::Write,
+    remaining: u64,
+}
+
+#[cfg(any(feature = "debian", feature = "alpine"))]
+impl<'a> LimitedWriter<'a> {
+    /// Wraps `inner`, failing the write that would carry it past `limit` bytes
+    /// in total.
+    pub(crate) fn new(inner: &'a mut dyn io::Write, limit: u64) -> LimitedWriter<'a> {
+        LimitedWriter {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+#[cfg(any(feature = "debian", feature = "alpine"))]
+impl io::Write for LimitedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() as u64 > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the stream exceeded the maximum size accepted for it",
+            ));
+        }
+        let written = self.inner.write(buf)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The path of a staging file for `dest`: a hidden name beside it, unique to
+/// the call that asked for it.
+///
+/// The name is unique so that concurrent writers of one destination — provisions
+/// sharing a package cache, publishers sharing a pool — each stage their own
+/// file and each publish it with a rename. A staging name shared between them
+/// would let one writer's rename consume the other's file, failing the second
+/// with `ENOENT`.
+///
+/// The staging file is a sibling of the destination, so the rename that
+/// publishes it stays within one directory and one filesystem.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+fn staging_path(dest: &Path) -> PathBuf {
+    let dir = dest.parent().unwrap_or(Path::new("."));
+    let name = dest.file_name().unwrap_or(dest.as_os_str());
+    let mut staging = OsString::from(".");
+    staging.push(name);
+    staging.push(format!(".{}.partial", crate::host::unique_hex()));
+    dir.join(staging)
+}
+
+/// Writes bytes to `dest` atomically, via a staging file in its directory and a
+/// rename onto the destination.
+///
+/// This is how every userland layer publishes a cache entry — a fetched index,
+/// a downloaded package, a pool file — so that two processes provisioning at
+/// once cannot show each other a half-written file.
+///
+/// The staging file is created exclusively, which establishes that the name is
+/// this call's alone and refuses a symlink pre-planted at it rather than writing
+/// through it. [`staging_path`] describes why the name is unique per call.
+///
+/// The staging file is not synced before the rename. What a reader takes from
+/// these files is verified against a digest, so a file left short by a crash is
+/// rejected and written again, which is cheaper than syncing every write against
+/// a failure that costs only a repeat.
+///
+/// Errors name the staging file only when the failure is the staging file's
+/// own; the caller wraps them against the destination it asked for.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) fn write_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let tmp = staging_path(dest);
+
+    // Only a failure after this point removes the staging file: the exclusive
+    // create is what establishes that the name is this call's alone, so a
+    // cleanup ahead of it could delete a file the caller does not own.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+
+    // Leaving a staging file behind would accumulate in a directory that
+    // outlives the call, since no later one reuses the name.
+    if let Err(err) = file.write_all(bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    drop(file);
+
+    fs::rename(&tmp, dest).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]
@@ -1147,7 +1291,7 @@ mod tests {
         fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
             let staging = request.staging();
             fs::write(staging.join("marker"), b"provisioned")
-                .map_err(|err| io_error("writing", staging, err))
+                .map_err(|err| ProvisionError::io("writing", staging, err))
         }
     }
 
@@ -1158,20 +1302,15 @@ mod tests {
             Err(ProvisionError::other("deliberate failure"))
         }
     }
-
-    fn tempdir(tag: &str) -> Scratch {
-        Scratch::new(&format!("provision-{tag}"))
-    }
-
     #[test]
     fn remove_is_idempotent_on_a_missing_path() {
-        let dir = tempdir("remove-missing");
+        let dir = Scratch::for_test("provision", "remove-missing");
         remove(dir.join("never-created")).expect("removing nothing is not an error");
     }
 
     #[test]
     fn remove_deletes_a_plain_tree() {
-        let dir = tempdir("remove-plain");
+        let dir = Scratch::for_test("provision", "remove-plain");
         let tree = dir.join("tree");
         fs::create_dir_all(tree.join("a/b")).unwrap();
         fs::write(tree.join("a/b/file"), b"x").unwrap();
@@ -1183,7 +1322,7 @@ mod tests {
 
     #[test]
     fn remove_deletes_a_non_directory() {
-        let dir = tempdir("remove-file");
+        let dir = Scratch::for_test("provision", "remove-file");
         let file = dir.join("file");
         fs::write(&file, b"x").unwrap();
         remove(&file).expect("a plain file is removed as itself");
@@ -1192,7 +1331,7 @@ mod tests {
 
     #[test]
     fn ensure_creates_then_reuses() {
-        let dir = tempdir("create");
+        let dir = Scratch::for_test("provision", "create");
         let dest = dir.join("rootfs");
         assert_eq!(ensure(&dest, &mut Touch).unwrap(), Provisioned::Created);
         assert!(dest.join("marker").is_file());
@@ -1201,7 +1340,7 @@ mod tests {
 
     #[test]
     fn ensure_failure_leaves_no_dest_and_no_staging() {
-        let dir = tempdir("fail");
+        let dir = Scratch::for_test("provision", "fail");
         let dest = dir.join("rootfs");
         let err = ensure(&dest, &mut Fail).unwrap_err();
         assert!(matches!(err, ProvisionError::Other { .. }), "{err}");
@@ -1211,7 +1350,7 @@ mod tests {
 
     #[test]
     fn remove_takes_the_publication_lock_with_the_rootfs() {
-        let dir = tempdir("lock-round-trip");
+        let dir = Scratch::for_test("provision", "lock-round-trip");
         let dest = dir.join("rootfs");
         let lock = dir.join("rootfs.lock");
         assert_eq!(ensure(&dest, &mut Touch).unwrap(), Provisioned::Created);
@@ -1223,7 +1362,7 @@ mod tests {
 
     #[test]
     fn remove_clears_the_lock_a_failed_provision_left_behind() {
-        let dir = tempdir("lock-orphan");
+        let dir = Scratch::for_test("provision", "lock-orphan");
         let dest = dir.join("rootfs");
         let lock = dir.join("rootfs.lock");
         ensure(&dest, &mut Fail).unwrap_err();
@@ -1237,7 +1376,7 @@ mod tests {
 
     #[test]
     fn ensure_rejects_a_non_directory_dest() {
-        let dir = tempdir("nondir");
+        let dir = Scratch::for_test("provision", "nondir");
         let dest = dir.join("rootfs");
         fs::write(&dest, b"file in the way").unwrap();
         let err = ensure(&dest, &mut Touch).unwrap_err();
@@ -1246,7 +1385,7 @@ mod tests {
 
     #[test]
     fn ensure_clears_stale_staging() {
-        let dir = tempdir("stale");
+        let dir = Scratch::for_test("provision", "stale");
         let dest = dir.join("rootfs");
         let staging = dir.join(".rootfs.staging");
         fs::create_dir_all(staging.join("leftover")).unwrap();
@@ -1272,11 +1411,11 @@ mod tests {
                 // threads pile up on the lock.
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 fs::write(staging.join("marker"), b"x")
-                    .map_err(|err| io_error("writing", staging, err))
+                    .map_err(|err| ProvisionError::io("writing", staging, err))
             }
         }
 
-        let dir = tempdir("concurrent");
+        let dir = Scratch::for_test("provision", "concurrent");
         let dest = dir.join("rootfs");
         let outcomes: Vec<Provisioned> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..4)
@@ -1292,5 +1431,53 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(any(feature = "debian", feature = "alpine"))]
+    #[test]
+    fn concurrent_writes_of_one_cache_entry_all_succeed() {
+        // The shared-cache race: several provisions download the same package
+        // at once and publish it under the same content-addressed name. Every
+        // writer must succeed, and the published bytes must be the package.
+        let dir = Scratch::for_test("provision", "cache-race");
+        let bytes = vec![0xab; 64 * 1024];
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.to_path_buf();
+                let bytes = bytes.clone();
+                std::thread::spawn(move || write_atomically(&dir.join("entry"), &bytes))
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().expect("a concurrent write succeeds");
+        }
+        assert_eq!(fs::read(dir.join("entry")).unwrap(), bytes);
+
+        // Nothing is left staged: the cache holds the published entry alone.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "entry")
+            .collect();
+        assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
+    }
+
+    #[cfg(any(feature = "debian", feature = "alpine"))]
+    #[test]
+    fn a_failed_publish_leaves_nothing_staged() {
+        // Staging names are unique per call, so a failure that left one behind
+        // would accumulate in a cache directory rather than being reused. The
+        // publishing rename is made to fail by occupying the destination with
+        // a non-empty directory.
+        let dir = Scratch::for_test("provision", "cache-publish-failure");
+        fs::create_dir(dir.join("entry")).unwrap();
+        fs::write(dir.join("entry").join("occupant"), b"").unwrap();
+        assert!(write_atomically(&dir.join("entry"), b"payload").is_err());
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "entry")
+            .collect();
+        assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
     }
 }

@@ -41,10 +41,7 @@
 mod arch;
 mod available;
 mod bootstrap;
-mod coordinate;
 mod deb;
-mod fetch;
-mod http;
 mod index;
 mod layer;
 mod pin;
@@ -57,22 +54,24 @@ mod version;
 
 use std::collections::HashSet;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-pub use arch::{Interpreter, foreign_interpreter};
+pub use arch::{Interpreter, foreign_interpreter, host_architecture};
 pub use available::Available;
-pub use fetch::{Fetch, FetchError, FetchRequest};
-pub use http::HttpFetch;
-pub use index::{Priority, build_depend_names};
+pub use index::{ParsePriorityError, Priority, build_depend_names};
 pub use layer::BuildLayer;
 pub use pin::{UnheldPin, UnheldReason};
 pub use plan::{Plan, PlannedPackage, ResolvedArchive};
 pub use pool::Pool;
 pub use repository::{Repository, RepositoryBuilder};
 
+use super::coordinate::{self, Nesting};
 use super::extract::Extraction;
-use super::{Delegate, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, io_error};
+use super::{
+    Delegate, Fetch, FetchError, FetchRequest, HttpFetch, ProvisionError, ProvisionEvent,
+    ProvisionRequest, Provisioner, staging_path,
+};
 use crate::IdentityMap;
 use crate::status::ExitStatus;
 use bootstrap::{Installable, StatOverride};
@@ -129,6 +128,21 @@ pub struct Debian<'a> {
     /// additional repositories, merged into one resolution.
     repositories: Vec<Repository>,
     fetcher: Box<dyn Fetch + 'a>,
+}
+
+/// [`coordinate::check`], with its refusal reported as this layer's
+/// configuration failure.
+///
+/// The check itself is shared, because a value that becomes a directory in a URL
+/// is refused for the same reasons whichever archive publishes it. What is not
+/// shared is the error: it reports a reason, and each layer says whose
+/// configuration the reason is about.
+pub(super) fn check_coordinate(
+    what: &str,
+    value: &str,
+    nesting: Nesting,
+) -> Result<(), DebianError> {
+    coordinate::check(what, value, nesting).map_err(|reason| DebianError::Config { reason })
 }
 
 /// Refuses a plan handed to `plan()` that contradicts the rest of the
@@ -329,13 +343,13 @@ impl<'a> Debian<'a> {
     /// architecture, or components, or a caller `include` that resolves to no
     /// package.
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
-        self.resolve_reporting(&mut |_| {})
+        self.resolve_reporting(&mut Silent)
     }
 
     /// The body of [`resolve`](Self::resolve), reporting to `progress`.
     fn resolve_reporting(
         &mut self,
-        progress: &mut dyn FnMut(DebianEvent<'_>),
+        observer: &mut dyn DebianObserver,
     ) -> Result<Plan, DebianError> {
         let (packages, archives) = resolve_packages(
             self.fetcher.as_mut(),
@@ -345,7 +359,7 @@ impl<'a> Debian<'a> {
             &self.includes,
             &self.excludes,
             &self.pin,
-            progress,
+            observer,
         )?;
         Ok(Plan::project(
             &self.suite,
@@ -385,13 +399,13 @@ impl<'a> Debian<'a> {
     /// failure, or a release that does not offer the requested suite,
     /// architecture, or components.
     pub fn available(&mut self) -> Result<Available, DebianError> {
-        self.available_reporting(&mut |_| {})
+        self.available_reporting(&mut Silent)
     }
 
     /// The body of [`available`](Self::available), reporting to `progress`.
     fn available_reporting(
         &mut self,
-        progress: &mut dyn FnMut(DebianEvent<'_>),
+        observer: &mut dyn DebianObserver,
     ) -> Result<Available, DebianError> {
         // Unpinned whatever the builder holds: this reports what the archives
         // offer, and a pin describes a selection from it rather than a bound on
@@ -401,7 +415,7 @@ impl<'a> Debian<'a> {
             &self.repositories,
             &self.architecture,
             &Pins::none(),
-            progress,
+            observer,
         )?;
         Ok(index.into_available())
     }
@@ -430,14 +444,14 @@ impl<'a> Debian<'a> {
     /// failures as [`resolve`](Self::resolve), and [`DebianError::Config`] when
     /// no base layer is set or the base is not a fully configured bootstrap.
     pub fn resolve_layer(&mut self) -> Result<Plan, DebianError> {
-        self.resolve_layer_reporting(&mut |_| {})
+        self.resolve_layer_reporting(&mut Silent)
     }
 
     /// The body of [`resolve_layer`](Self::resolve_layer), reporting to
     /// `progress`.
     fn resolve_layer_reporting(
         &mut self,
-        progress: &mut dyn FnMut(DebianEvent<'_>),
+        observer: &mut dyn DebianObserver,
     ) -> Result<Plan, DebianError> {
         let Some(base) = self.base_layer.as_deref() else {
             return Err(DebianError::Config {
@@ -455,7 +469,7 @@ impl<'a> Debian<'a> {
             &self.excludes,
             &assume_installed,
             &self.pin,
-            progress,
+            observer,
         )?;
         Ok(Plan::project(
             &self.suite,
@@ -508,15 +522,14 @@ impl<'a> Debian<'a> {
     /// failure, an unmet host precondition, a base that is not a configured
     /// bootstrap, or no base layer set.
     pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
-        self.stage_layer_reporting(upper.as_ref(), &mut |_| {}, &mut || false)
+        self.stage_layer_reporting(upper.as_ref(), &mut Silent)
     }
 
-    /// The body of [`stage_layer`](Self::stage_layer), reporting to `progress`.
+    /// The body of [`stage_layer`](Self::stage_layer), reporting to `observer`.
     fn stage_layer_reporting(
         &mut self,
         upper: &Path,
-        progress: &mut dyn FnMut(DebianEvent<'_>),
-        cancelled: &mut dyn FnMut() -> bool,
+        observer: &mut dyn DebianObserver,
     ) -> Result<BuildLayer, ProvisionError> {
         // A base layer is required; the increment has nothing to layer over
         // otherwise.
@@ -550,7 +563,7 @@ impl<'a> Debian<'a> {
         // ahead of the work. The probe runs on the upper's parent, its own
         // filesystem, so its scratch files land beside the upper.
         std::fs::create_dir_all(upper)
-            .map_err(|err| io_error("creating the overlay upper", upper, err))?;
+            .map_err(|err| ProvisionError::io("creating the overlay upper", upper, err))?;
         // The handle that owns the upper is taken as soon as the upper exists,
         // not on the way out, so a failure below disposes of a partly-installed
         // increment instead of orphaning it: there is no handle in an `Err` for
@@ -582,7 +595,7 @@ impl<'a> Debian<'a> {
             &self.excludes,
             &assume_installed,
             &self.pin,
-            progress,
+            observer,
         )
         .map_err(wrap)?;
         // An empty increment — every requested package already in the base —
@@ -598,16 +611,14 @@ impl<'a> Debian<'a> {
             &self.repositories,
             &wanted,
             archives.path(),
-            progress,
-            cancelled,
+            observer,
         )?;
         let statoverride = extract_packages(
             upper,
             &self.architecture,
             &installables,
             archives.path(),
-            progress,
-            cancelled,
+            observer,
         )?;
 
         let env = maintainer_env();
@@ -620,7 +631,7 @@ impl<'a> Debian<'a> {
             &self.identity_map,
             &env,
             self.overlay.as_deref(),
-            progress,
+            observer,
         )
         .map_err(wrap)?;
 
@@ -1129,17 +1140,15 @@ impl<'a> DebianBuilder<'a> {
         // merged-usr layout, so it passes the same check the suite and the
         // components do at repository construction. It is a single segment: the
         // archive spells it `binary-<architecture>`, one directory deep.
-        coordinate::check(
+        check_coordinate(
             "the bootstrap's architecture",
             &architecture,
-            coordinate::Nesting::Single,
+            Nesting::Single,
         )?;
         let keyring = match &self.keyring_path {
-            Some(path) => std::fs::read(path).map_err(|source| DebianError::Io {
-                op: "reading the keyring",
-                path: path.clone(),
-                source,
-            })?,
+            Some(path) => {
+                std::fs::read(path).map_err(DebianError::at("reading the keyring", path))?
+            }
             None => EMBEDDED_KEYRING.to_vec(),
         };
         let components = if self.components.is_empty() {
@@ -1211,20 +1220,18 @@ impl<'a> DebianBuilder<'a> {
 
 impl Provisioner for Debian<'_> {
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        // Every event goes to the run's observer, wrapped in the shared
-        // vocabulary, and cancellation comes from the same place — the one
-        // channel every provisioner reports through.
-        self.provision_reporting(
-            request.staging(),
-            &mut |event| request.report(ProvisionEvent::Debian(&event)),
-            &mut || request.cancelled(),
-        )
+        self.provision_reporting(request.staging(), &mut RunObserver { request })
     }
 }
 
 impl<'a> Debian<'a> {
-    /// Binds a progress sink for one run, returning a provisioner that reports
-    /// to it.
+    /// Binds a [`DebianObserver`] for one run, returning a provisioner that
+    /// reports to it.
+    ///
+    /// A closure is an observer, so a caller that only wants events writes one
+    /// and never names the trait; a caller that also wants to *stop* the
+    /// bootstrap implements [`DebianObserver`] and answers its
+    /// [`cancelled`](DebianObserver::cancelled).
     ///
     /// The sink is borrowed for the returned value's lifetime, not the
     /// provisioner's, so a `Debian` outlives every observed run and whatever the
@@ -1250,17 +1257,16 @@ impl<'a> Debian<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn observe<'o>(&'o mut self, sink: &'o mut dyn FnMut(DebianEvent<'_>)) -> Observed<'o, 'a> {
+    pub fn observe<'o>(&'o mut self, sink: &'o mut dyn DebianObserver) -> Observed<'o, 'a> {
         Observed { debian: self, sink }
     }
 
-    /// The body of [`Provisioner::provision`], reporting to `progress` and
-    /// stopping when `cancelled` answers `true`.
+    /// The body of [`Provisioner::provision`], reporting to `observer` and
+    /// stopping when it answers `true` to being cancelled.
     fn provision_reporting(
         &mut self,
         staging: &Path,
-        progress: &mut dyn FnMut(DebianEvent<'_>),
-        cancelled: &mut dyn FnMut() -> bool,
+        observer: &mut dyn DebianObserver,
     ) -> Result<(), ProvisionError> {
         bootstrap_suite(
             staging,
@@ -1276,8 +1282,7 @@ impl<'a> Debian<'a> {
             self.cache_dir.as_deref(),
             self.overlay.as_deref(),
             self.fetcher.as_mut(),
-            progress,
-            cancelled,
+            observer,
         )
     }
 }
@@ -1290,7 +1295,7 @@ impl<'a> Debian<'a> {
 /// resolution or a staged layer can report too.
 pub struct Observed<'o, 'a> {
     debian: &'o mut Debian<'a>,
-    sink: &'o mut dyn FnMut(DebianEvent<'_>),
+    sink: &'o mut dyn DebianObserver,
 }
 
 impl fmt::Debug for Observed<'_, '_> {
@@ -1299,7 +1304,7 @@ impl fmt::Debug for Observed<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Observed")
             .field("debian", &self.debian)
-            .field("sink", &Delegate("dyn FnMut(DebianEvent)"))
+            .field("sink", &Delegate("dyn DebianObserver"))
             .finish()
     }
 }
@@ -1307,26 +1312,25 @@ impl fmt::Debug for Observed<'_, '_> {
 impl Observed<'_, '_> {
     /// Resolves the install plan, reporting progress. See [`Debian::resolve`].
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
-        self.debian.resolve_reporting(&mut *self.sink)
+        self.debian.resolve_reporting(self.sink)
     }
 
     /// Resolves a layered build's increment, reporting progress. See
     /// [`Debian::resolve_layer`].
     pub fn resolve_layer(&mut self) -> Result<Plan, DebianError> {
-        self.debian.resolve_layer_reporting(&mut *self.sink)
+        self.debian.resolve_layer_reporting(self.sink)
     }
 
     /// Reports the names the archives offer, reporting progress. See
     /// [`Debian::available`].
     pub fn available(&mut self) -> Result<Available, DebianError> {
-        self.debian.available_reporting(&mut *self.sink)
+        self.debian.available_reporting(self.sink)
     }
 
     /// Stages a layered build's increment, reporting progress. See
     /// [`Debian::stage_layer`].
     pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
-        self.debian
-            .stage_layer_reporting(upper.as_ref(), &mut *self.sink, &mut || false)
+        self.debian.stage_layer_reporting(upper.as_ref(), self.sink)
     }
 }
 
@@ -1337,10 +1341,12 @@ impl Provisioner for Observed<'_, '_> {
     /// [`Provision::observe`](crate::provision::Provision::observe) observer
     /// can stop a bootstrap it is not reporting on.
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
+        let mut observer = ObservedRun {
+            sink: self.sink,
+            request,
+        };
         self.debian
-            .provision_reporting(request.staging(), &mut *self.sink, &mut || {
-                request.cancelled()
-            })
+            .provision_reporting(request.staging(), &mut observer)
     }
 }
 
@@ -1360,8 +1366,7 @@ fn bootstrap_suite(
     cache_dir: Option<&Path>,
     overlay: Option<&Path>,
     fetcher: &mut dyn Fetch,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
-    cancelled: &mut dyn FnMut() -> bool,
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), ProvisionError> {
     // A full bootstrap must be able to run the target's binaries.
     if !extract_only {
@@ -1386,7 +1391,7 @@ fn bootstrap_suite(
         // as the resolved manifest so an observer sees the same event either
         // way, and it is reported as it stands rather than re-projected.
         Some(plan) => {
-            progress(DebianEvent::Resolved { plan });
+            observer.progress(DebianEvent::Resolved { plan });
             plan.packages.iter().map(Wanted::from_planned).collect()
         }
         // A bootstrap installs the plan rather than reporting it, so the archive
@@ -1400,7 +1405,7 @@ fn bootstrap_suite(
                 includes,
                 excludes,
                 pin,
-                progress,
+                observer,
             )
             .map_err(wrap)?;
             packages
@@ -1413,22 +1418,14 @@ fn bootstrap_suite(
     // The cache disposes of itself when this frame ends, on the failure paths
     // below as on the success path.
     let archives = Archives::beside(staging, cache_dir);
-    let installables = acquire_debs(
-        fetcher,
-        repositories,
-        &packages,
-        archives.path(),
-        progress,
-        cancelled,
-    )?;
+    let installables = acquire_debs(fetcher, repositories, &packages, archives.path(), observer)?;
 
     let statoverride = stage_extract(
         staging,
         architecture,
         &installables,
         archives.path(),
-        progress,
-        cancelled,
+        observer,
     )?;
 
     if !extract_only {
@@ -1442,7 +1439,7 @@ fn bootstrap_suite(
             &env,
             repositories,
             overlay,
-            progress,
+            observer,
         )
         .map_err(wrap)?;
         // The read-only bind mount left an empty mount point in the rootfs.
@@ -1472,17 +1469,17 @@ fn resolve_packages(
     includes: &[String],
     excludes: &[String],
     pins: &Pins,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(Vec<Package>, Vec<ResolvedArchive>), DebianError> {
-    let (index, archives) = merged_index(fetcher, repositories, architecture, pins, progress)?;
+    let (index, archives) = merged_index(fetcher, repositories, architecture, pins, observer)?;
 
-    progress(DebianEvent::Resolving);
+    observer.progress(DebianEvent::Resolving);
     let mut base = index.base_seed(base_priority);
     base.push("apt".to_string());
     let packages =
         resolve::resolve(&index, &base, includes, excludes).map_err(DebianError::from)?;
 
-    let packages = emit_resolved(repositories, architecture, packages, &archives, progress);
+    let packages = emit_resolved(repositories, architecture, packages, &archives, observer);
     Ok((packages, archives))
 }
 
@@ -1503,15 +1500,15 @@ fn resolve_delta(
     excludes: &[String],
     assume_installed: &HashSet<String>,
     pins: &Pins,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(Vec<Package>, Vec<ResolvedArchive>), DebianError> {
-    let (index, archives) = merged_index(fetcher, repositories, architecture, pins, progress)?;
+    let (index, archives) = merged_index(fetcher, repositories, architecture, pins, observer)?;
 
-    progress(DebianEvent::Resolving);
+    observer.progress(DebianEvent::Resolving);
     let packages = resolve::resolve_seeded(&index, &[], includes, excludes, assume_installed)
         .map_err(DebianError::from)?;
 
-    let packages = emit_resolved(repositories, architecture, packages, &archives, progress);
+    let packages = emit_resolved(repositories, architecture, packages, &archives, observer);
     Ok((packages, archives))
 }
 
@@ -1529,7 +1526,7 @@ fn merged_index(
     repositories: &[Repository],
     architecture: &str,
     pins: &Pins,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(Index, Vec<ResolvedArchive>), DebianError> {
     // Each repository contributes one text block per component, tagged with the
     // repository's index so the merged index knows where each package came from.
@@ -1538,7 +1535,7 @@ fn merged_index(
     // straight into it.
     let mut archives: Vec<ResolvedArchive> = Vec::new();
     for (origin, repository) in repositories.iter().enumerate() {
-        let (release, served) = fetch_release(fetcher, repository, progress)?;
+        let (release, served) = fetch_release(fetcher, repository, observer)?;
         release
             .check(
                 &repository.suite,
@@ -1557,7 +1554,7 @@ fn merged_index(
             served.signed_by,
             served.signing_key,
         ));
-        let text = fetch_index(fetcher, repository, architecture, &release, progress)?;
+        let text = fetch_index(fetcher, repository, architecture, &release, observer)?;
         index_inputs.push((origin, text));
     }
 
@@ -1586,13 +1583,13 @@ fn emit_resolved(
     architecture: &str,
     packages: Vec<Package>,
     archives: &[ResolvedArchive],
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Vec<Package> {
     let suite = repositories
         .first()
         .map_or("", |repository| repository.suite.as_str());
     let plan = Plan::project(suite, architecture, &packages, archives);
-    progress(DebianEvent::Resolved { plan: &plan });
+    observer.progress(DebianEvent::Resolved { plan: &plan });
     packages
 }
 
@@ -1606,14 +1603,14 @@ fn emit_resolved(
 fn fetch_release(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(Release, Served), DebianError> {
     let suite = &repository.suite;
     let (body, served) = match repository.keyring() {
         None => {
             let suffix = format!("dists/{suite}/Release");
             let (bytes, mirror) =
-                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, progress)?;
+                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, observer)?;
             let body = String::from_utf8(bytes).map_err(|_| {
                 DebianError::from(release::ReleaseError::Release(
                     "Release is not UTF-8".to_string(),
@@ -1633,7 +1630,7 @@ fn fetch_release(
         Some(keyring_bytes) => {
             let suffix = format!("dists/{suite}/InRelease");
             let (bytes, mirror) =
-                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, progress)?;
+                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, observer)?;
             let keyring = Keyring::parse(keyring_bytes).map_err(DebianError::from)?;
             let verified = keyring
                 .verify(&bytes, !repository.allow_stale)
@@ -1689,7 +1686,7 @@ fn fetch_index(
     repository: &Repository,
     architecture: &str,
     release: &Release,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<String, DebianError> {
     let mut merged = String::new();
     for component in &repository.components {
@@ -1699,7 +1696,7 @@ fn fetch_index(
             architecture,
             component,
             release,
-            progress,
+            observer,
         )?;
         append_component(&mut merged, &text);
     }
@@ -1737,7 +1734,7 @@ fn fetch_component_index(
     architecture: &str,
     component: &str,
     release: &Release,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<String, DebianError> {
     // Prefer the smallest available index; every candidate is verified against
     // the release digest, so the choice is trust-neutral. Which compressions
@@ -1772,7 +1769,7 @@ fn fetch_component_index(
             } else {
                 format!("{}/dists/{suite}/{rel}", mirror.trim_end_matches('/'))
             };
-            progress(DebianEvent::Fetching { url: &url });
+            observer.progress(DebianEvent::Fetching { url: &url });
             match fetch_bytes(fetcher, &url, Some(*size)) {
                 Ok(bytes) => {
                     verify_digest(rel, &bytes, digest)?;
@@ -1804,7 +1801,7 @@ fn fetch_from_mirrors(
     fetcher: &mut dyn Fetch,
     mirrors: &[String],
     suffix: &str,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(Vec<u8>, String), DebianError> {
     let mut last_missing = None;
     for mirror in mirrors {
@@ -1813,7 +1810,7 @@ fn fetch_from_mirrors(
             mirror.trim_end_matches('/'),
             suffix.trim_start_matches('/'),
         );
-        progress(DebianEvent::Fetching { url: &url });
+        observer.progress(DebianEvent::Fetching { url: &url });
         match fetch_bytes(fetcher, &url, None) {
             // The mirror that answered, not the whole list: a repository with a
             // snapshot backstop resolves against whichever one served, and a
@@ -1868,22 +1865,21 @@ fn acquire_debs(
     repositories: &[Repository],
     packages: &[Wanted],
     archives_host: &Path,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
-    cancelled: &mut dyn FnMut() -> bool,
+    observer: &mut dyn DebianObserver,
 ) -> Result<Vec<Installable>, ProvisionError> {
     std::fs::create_dir_all(archives_host).map_err(|source| {
-        wrap(DebianError::Io {
-            op: "creating the package directory",
-            path: archives_host.to_path_buf(),
+        wrap(DebianError::io(
+            "creating the package directory",
+            archives_host,
             source,
-        })
+        ))
     })?;
 
     let mut installables = Vec::with_capacity(packages.len());
     for (position, package) in packages.iter().enumerate() {
         // A package boundary: whatever has been downloaded is complete, and
         // the staging tree is untouched, so stopping here costs nothing.
-        if cancelled() {
+        if observer.cancelled() {
             return Err(ProvisionError::Cancelled);
         }
         let filename = format!("{}.deb", package.sha256);
@@ -1895,16 +1891,16 @@ fn acquire_debs(
         // in this crate keeps. A corrupt or truncated entry is simply
         // re-downloaded.
         let cached = std::fs::File::open(&dest)
-            .and_then(|mut file| deb::sha256_stream(&mut file))
+            .and_then(|mut file| crate::provision::digest::sha256_stream(&mut file))
             .is_ok_and(|(digest, _)| digest == package.sha256);
         if !cached {
-            progress(DebianEvent::Downloading {
+            observer.progress(DebianEvent::Downloading {
                 package: &package.name,
                 index: position + 1,
                 total: packages.len(),
             });
             let mirrors = &repositories[package.origin].mirrors;
-            download_deb(fetcher, mirrors, package, &dest, progress).map_err(wrap)?;
+            download_deb(fetcher, mirrors, package, &dest, observer).map_err(wrap)?;
         }
 
         installables.push(Installable {
@@ -1928,7 +1924,7 @@ fn download_deb(
     mirrors: &[String],
     package: &Wanted,
     dest: &Path,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
+    observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
     let mut last_missing = None;
     for mirror in mirrors {
@@ -1937,7 +1933,7 @@ fn download_deb(
             mirror.trim_end_matches('/'),
             package.filename.trim_start_matches('/'),
         );
-        progress(DebianEvent::Fetching { url: &url });
+        observer.progress(DebianEvent::Fetching { url: &url });
         match fetch_verified(fetcher, &url, &package.sha256, package.size, dest) {
             Ok(()) => return Ok(()),
             Err(err) if is_failover(&err) => {
@@ -1988,10 +1984,6 @@ fn fetch_verified(
     dest: &Path,
 ) -> Result<(), DebianError> {
     let staged = staging_path(dest);
-    let io = |op: &'static str, path: &Path| {
-        let path = path.to_path_buf();
-        move |source: std::io::Error| DebianError::Io { op, path, source }
-    };
 
     // Created exclusively, which establishes that the name is this call's alone
     // and refuses a symlink pre-planted at it rather than writing through it.
@@ -1999,18 +1991,20 @@ fn fetch_verified(
         .write(true)
         .create_new(true)
         .open(&staged)
-        .map_err(io("staging a package", &staged))?;
+        .map_err(DebianError::at("staging a package", &staged))?;
 
-    let mut sink = deb::DigestWriter::new(file);
+    let mut sink = crate::provision::digest::DigestWriter::new(file);
     let request = FetchRequest::new(url);
     let fetched = match size {
         Some(size) => {
-            let mut capped = http::LimitedWriter::new(&mut sink, size);
+            let mut capped = super::LimitedWriter::new(&mut sink, size);
             fetcher.fetch(&request.sized(size), &mut capped)
         }
         None => fetcher.fetch(&request, &mut sink),
     };
-    let digested = sink.finish().map_err(io("writing a package", &staged));
+    let digested = sink
+        .finish()
+        .map_err(DebianError::at("writing a package", &staged));
 
     let published = fetched
         .map_err(DebianError::Fetch)
@@ -2026,7 +2020,9 @@ fn fetch_verified(
                 })
             }
         })
-        .and_then(|()| std::fs::rename(&staged, dest).map_err(io("publishing a package", dest)));
+        .and_then(|()| {
+            std::fs::rename(&staged, dest).map_err(DebianError::at("publishing a package", dest))
+        });
 
     if published.is_err() {
         let _ = std::fs::remove_file(&staged);
@@ -2156,17 +2152,10 @@ fn stage_extract(
     architecture: &str,
     installables: &[Installable],
     archives_host: &Path,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
-    cancelled: &mut dyn FnMut() -> bool,
+    observer: &mut dyn DebianObserver,
 ) -> Result<StatOverride, ProvisionError> {
-    let statoverride = extract_packages(
-        staging,
-        architecture,
-        installables,
-        archives_host,
-        progress,
-        cancelled,
-    )?;
+    let statoverride =
+        extract_packages(staging, architecture, installables, archives_host, observer)?;
     init_dpkg_database(staging)?;
     Ok(statoverride)
 }
@@ -2185,8 +2174,7 @@ fn extract_packages(
     architecture: &str,
     installables: &[Installable],
     archives_host: &Path,
-    progress: &mut dyn FnMut(DebianEvent<'_>),
-    cancelled: &mut dyn FnMut() -> bool,
+    observer: &mut dyn DebianObserver,
 ) -> Result<StatOverride, ProvisionError> {
     create_merged_usr(staging, architecture)?;
 
@@ -2208,10 +2196,10 @@ fn extract_packages(
         // A package boundary again: the staging tree is discarded wholesale by
         // `ensure` when this returns an error, so a partial layout is not a
         // hazard.
-        if cancelled() {
+        if observer.cancelled() {
             return Err(ProvisionError::Cancelled);
         }
-        progress(DebianEvent::Extracting {
+        observer.progress(DebianEvent::Extracting {
             package: &installable.name,
         });
         let filename = installable
@@ -2221,7 +2209,7 @@ fn extract_packages(
             .expect("the deb path has a file name");
         let path = archives_host.join(filename);
         let mut file = std::fs::File::open(&path)
-            .map_err(|err| io_error("reading the package", &path, err))?;
+            .map_err(|err| ProvisionError::io("reading the package", &path, err))?;
         // Re-verify against the digest the package was acquired under, rather
         // than trust the bytes on disk: the download and this read are separate
         // steps, and the cache may share a filesystem with untrusted writers.
@@ -2231,8 +2219,8 @@ fn extract_packages(
         // property the download and `Pool::publish` both keep, held to here as
         // well. `extract_deb` rewinds before it seeks to the data member, so the
         // digest pass leaving the file at its end costs nothing.
-        let (actual, _) = deb::sha256_stream(&mut file)
-            .map_err(|err| io_error("reading the package", &path, err))?;
+        let (actual, _) = crate::provision::digest::sha256_stream(&mut file)
+            .map_err(|err| ProvisionError::io("reading the package", &path, err))?;
         if actual != installable.sha256 {
             return Err(wrap(DebianError::HashMismatch {
                 path: filename.to_string(),
@@ -2272,11 +2260,12 @@ fn extract_packages(
 fn create_merged_usr(staging: &Path, architecture: &str) -> Result<(), ProvisionError> {
     for dir in arch::merged_usr_dirs(architecture) {
         let target = staging.join("usr").join(dir);
-        std::fs::create_dir_all(&target).map_err(|err| io_error("creating", &target, err))?;
+        std::fs::create_dir_all(&target)
+            .map_err(|err| ProvisionError::io("creating", &target, err))?;
         let link = staging.join(dir);
         if !arch::exists(&link) {
             std::os::unix::fs::symlink(format!("usr/{dir}"), &link)
-                .map_err(|err| io_error("linking", &link, err))?;
+                .map_err(|err| ProvisionError::io("linking", &link, err))?;
         }
     }
     Ok(())
@@ -2288,12 +2277,12 @@ fn init_dpkg_database(staging: &Path) -> Result<(), ProvisionError> {
     let dpkg = staging.join("var/lib/dpkg");
     for dir in ["", "info", "updates"] {
         let path = dpkg.join(dir);
-        std::fs::create_dir_all(&path).map_err(|err| io_error("creating", &path, err))?;
+        std::fs::create_dir_all(&path).map_err(|err| ProvisionError::io("creating", &path, err))?;
     }
     for file in ["status", "available"] {
         let path = dpkg.join(file);
         if !path.exists() {
-            std::fs::write(&path, "").map_err(|err| io_error("writing", &path, err))?;
+            std::fs::write(&path, "").map_err(|err| ProvisionError::io("writing", &path, err))?;
         }
     }
     Ok(())
@@ -2333,7 +2322,7 @@ fn fetch_bytes(
     let request = FetchRequest::new(url);
     let result = match size {
         Some(size) => {
-            let mut sink = http::LimitedWriter::new(&mut bytes, size);
+            let mut sink = super::LimitedWriter::new(&mut bytes, size);
             fetcher.fetch(&request.sized(size), &mut sink)
         }
         None => fetcher.fetch(&request, &mut bytes),
@@ -2345,7 +2334,7 @@ fn fetch_bytes(
 /// Verifies bytes against an expected SHA-256, naming the resource on
 /// mismatch.
 fn verify_digest(path: &str, bytes: &[u8], expected: &str) -> Result<(), DebianError> {
-    let actual = deb::sha256_hex(bytes);
+    let actual = crate::provision::digest::sha256_hex(bytes);
     if actual == expected {
         Ok(())
     } else {
@@ -2360,11 +2349,8 @@ fn verify_digest(path: &str, bytes: &[u8], expected: &str) -> Result<(), DebianE
 /// Decompresses a fetched index into text.
 fn decompress_index(path: &str, bytes: &[u8]) -> Result<String, DebianError> {
     let mut cursor = io::Cursor::new(bytes);
-    let head = super::compress::sniff_head(&mut cursor).map_err(|source| DebianError::Io {
-        op: "reading the index",
-        path: PathBuf::from(path),
-        source,
-    })?;
+    let head = super::compress::sniff_head(&mut cursor)
+        .map_err(DebianError::at("reading the index", path))?;
     let mut reader =
         super::compress::decompress(&head, cursor).map_err(|_| DebianError::Index {
             reason: format!("{path} is not a valid index"),
@@ -2372,70 +2358,8 @@ fn decompress_index(path: &str, bytes: &[u8]) -> Result<String, DebianError> {
     let mut text = String::new();
     reader
         .read_to_string(&mut text)
-        .map_err(|source| DebianError::Io {
-            op: "decompressing the index",
-            path: PathBuf::from(path),
-            source,
-        })?;
+        .map_err(DebianError::at("decompressing the index", path))?;
     Ok(text)
-}
-
-/// The path of a staging file for `dest`: a hidden name beside it, unique to
-/// the call that asked for it.
-///
-/// The name is unique so that concurrent writers of one destination — provisions
-/// sharing a package cache, publishers sharing a pool — each stage their own
-/// file and each publish it with a rename. A staging name shared between them
-/// would let one writer's rename consume the other's file, failing the second
-/// with `ENOENT`.
-///
-/// The staging file is a sibling of the destination, so the rename that
-/// publishes it stays within one directory and one filesystem.
-fn staging_path(dest: &Path) -> PathBuf {
-    let dir = dest.parent().unwrap_or(Path::new("."));
-    let name = dest.file_name().unwrap_or(dest.as_os_str());
-    let mut staging = std::ffi::OsString::from(".");
-    staging.push(name);
-    staging.push(format!(".{}.partial", crate::host::unique_hex()));
-    dir.join(staging)
-}
-
-/// Writes bytes to `dest` atomically, via a staging file in its directory and a
-/// rename onto the destination.
-///
-/// The staging file is created exclusively, which establishes that the name is
-/// this call's alone and refuses a symlink pre-planted at it rather than writing
-/// through it. [`staging_path`] describes why the name is unique per call.
-///
-/// The staging file is not synced before the rename. What a reader takes from
-/// these files is verified against a digest, so a file left short by a crash is
-/// rejected and written again, which is cheaper than syncing every write against
-/// a failure that costs only a repeat.
-///
-/// Errors name the staging file only when the failure is the staging file's
-/// own; the caller wraps them against the destination it asked for.
-pub(super) fn write_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = staging_path(dest);
-
-    // Only a failure after this point removes the staging file: the exclusive
-    // create is what establishes that the name is this call's alone, so a
-    // cleanup ahead of it could delete a file the caller does not own.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-
-    // Leaving a staging file behind would accumulate in a directory that
-    // outlives the call, since no later one reuses the name.
-    if let Err(err) = file.write_all(bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    drop(file);
-
-    std::fs::rename(&tmp, dest).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
 }
 
 /// Joins path components into an absolute path for a statoverride line.
@@ -2459,6 +2383,133 @@ fn absolute_path(components: &[Vec<u8>]) -> String {
 /// provisioner outside the core surfaces its own failures.
 fn wrap(error: DebianError) -> ProvisionError {
     ProvisionError::other(error)
+}
+
+/// A progress and cancellation sink for a Debian bootstrap.
+///
+/// Attached with [`Debian::observe`], and shaped like
+/// [`ProvisionObserver`](crate::provision::ProvisionObserver): one method for
+/// events, one for cancellation, both with default bodies, so an observer
+/// implements only the half it wants and a plain
+/// `FnMut(DebianEvent<'_>)` closure is an observer that reports and never
+/// cancels.
+///
+/// Cancelling is what the trait adds over the closure: a bootstrap fetches and
+/// verifies indexes, downloads a hundred packages, and runs several `dpkg`
+/// waves in a cage, and a caller that wants to stop it part-way could not
+/// before.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicBool, Ordering};
+///
+/// use ferroday_cage::provision::debian::{Debian, DebianEvent, DebianObserver};
+///
+/// struct Progress {
+///     stop: Arc<AtomicBool>,
+/// }
+///
+/// impl DebianObserver for Progress {
+///     fn progress(&mut self, event: DebianEvent<'_>) {
+///         if let DebianEvent::Downloading { package, index, total, .. } = event {
+///             eprintln!("{package} ({index}/{total})");
+///         }
+///     }
+///
+///     fn cancelled(&mut self) -> bool {
+///         self.stop.load(Ordering::Relaxed)
+///     }
+/// }
+///
+/// let stop = Arc::new(AtomicBool::new(false));
+/// let mut debian = Debian::builder("trixie").build()?;
+/// let plan = debian.observe(&mut Progress { stop: Arc::clone(&stop) }).resolve()?;
+/// # let _ = plan;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Stability
+///
+/// Every method added to this trait in a later release will carry a default
+/// body, so an existing implementation keeps compiling.
+pub trait DebianObserver {
+    /// Receives one progress event.
+    fn progress(&mut self, event: DebianEvent<'_>) {
+        let _ = event;
+    }
+
+    /// Whether the bootstrap should stop.
+    ///
+    /// Consulted at the points where stopping is clean — a package boundary, an
+    /// extraction boundary. Returning `true` aborts with
+    /// [`ProvisionError::Cancelled`],
+    /// and a run driven through [`provision::ensure`](crate::provision::ensure)
+    /// then removes the staging tree, so a cancelled bootstrap leaves no
+    /// destination behind.
+    ///
+    /// The default is `false`: a bootstrap that is never cancelled.
+    ///
+    /// [`ProvisionError::Cancelled`]: crate::provision::ProvisionError::Cancelled
+    fn cancelled(&mut self) -> bool {
+        false
+    }
+}
+
+/// A closure is an observer that reports and never cancels.
+impl<F: FnMut(DebianEvent<'_>)> DebianObserver for F {
+    fn progress(&mut self, event: DebianEvent<'_>) {
+        self(event)
+    }
+}
+
+/// An observer that reports nowhere and never cancels: what an entry point the
+/// caller did not attach a sink to uses.
+struct Silent;
+
+impl DebianObserver for Silent {}
+
+/// An observer that reports nowhere and takes its cancellation from the
+/// provisioning run: what an unobserved [`Debian`] used as a [`Provisioner`].
+///
+/// The events still reach the run's own observer, wrapped in the shared
+/// vocabulary — that is the one channel every provisioner reports through.
+struct RunObserver<'a, 'r> {
+    request: &'a ProvisionRequest<'r>,
+}
+
+impl DebianObserver for RunObserver<'_, '_> {
+    fn progress(&mut self, event: DebianEvent<'_>) {
+        self.request.report(ProvisionEvent::Debian(&event));
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.request.cancelled()
+    }
+}
+
+/// An observer that reports to a sink the caller bound with [`Debian::observe`]
+/// and takes its cancellation from the provisioning run.
+///
+/// The caller chose the richer, Debian-specific channel for events; a
+/// [`Provision::observe`](crate::provision::Provision::observe) observer can
+/// still stop a bootstrap it is not reporting on.
+struct ObservedRun<'a, 'r, 'o> {
+    sink: &'o mut dyn DebianObserver,
+    request: &'a ProvisionRequest<'r>,
+}
+
+impl DebianObserver for ObservedRun<'_, '_, '_> {
+    fn progress(&mut self, event: DebianEvent<'_>) {
+        self.sink.progress(event);
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.request.cancelled()
+    }
 }
 
 /// A progress event from a Debian bootstrap.
@@ -2634,6 +2685,32 @@ pub enum DebianError {
     },
 }
 
+impl DebianError {
+    /// A host I/O failure, naming what the operation was doing and the path it
+    /// concerned.
+    ///
+    /// Arguments run operation, then locator, then cause, which is the order
+    /// every constructor in the crate takes them in.
+    pub fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> DebianError {
+        DebianError::Io {
+            op,
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// The same failure as a [`map_err`](Result::map_err) argument: names the
+    /// operation and the path now, and takes the cause when it arrives.
+    ///
+    /// This is the form the bootstrap's host-side steps use, where the path is
+    /// composed from a contained tree and the operation is known before the
+    /// call that might fail.
+    pub fn at(op: &'static str, path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> DebianError {
+        let path = path.into();
+        move |source| DebianError::Io { op, path, source }
+    }
+}
+
 impl fmt::Display for DebianError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2768,7 +2845,7 @@ mod tests {
                 return Err((self.refusal)(request.url()));
             }
             sink.write_all(b"from the backstop")
-                .map_err(|err| FetchError::io(request.url(), "writing the body", err))
+                .map_err(|err| FetchError::io("writing the body", request.url(), err))
         }
     }
 
@@ -2782,7 +2859,7 @@ mod tests {
             sink: &mut dyn std::io::Write,
         ) -> Result<(), FetchError> {
             sink.write_all(self.0)
-                .map_err(|err| FetchError::io(request.url(), "writing the body", err))
+                .map_err(|err| FetchError::io("writing the body", request.url(), err))
         }
     }
 
@@ -2808,7 +2885,7 @@ mod tests {
             .build()
             .expect("the repository validates");
 
-        let (release, served) = fetch_release(&mut Canned(INRELEASE), &repository, &mut |_| {})
+        let (release, served) = fetch_release(&mut Canned(INRELEASE), &repository, &mut Silent)
             .expect("the embedded keyring verifies a real Debian release");
 
         assert_eq!(served.mirror, "https://deb.example/debian");
@@ -2822,13 +2899,16 @@ mod tests {
             .expect("the fixture is a cleartext-signed document");
         assert_eq!(
             release.sha256(),
-            deb::sha256_hex(message.signed_text().as_bytes()),
+            crate::provision::digest::sha256_hex(message.signed_text().as_bytes()),
         );
-        assert_ne!(release.sha256(), deb::sha256_hex(INRELEASE));
+        assert_ne!(
+            release.sha256(),
+            crate::provision::digest::sha256_hex(INRELEASE)
+        );
 
         // And it is a property of those bytes rather than of the fetch, so a
         // second pass over the same release records the same digest.
-        let (again, _) = fetch_release(&mut Canned(INRELEASE), &repository, &mut |_| {})
+        let (again, _) = fetch_release(&mut Canned(INRELEASE), &repository, &mut Silent)
             .expect("the same release verifies again");
         assert_eq!(release.sha256(), again.sha256());
 
@@ -2852,7 +2932,7 @@ mod tests {
             "https://snapshot.example/debian".to_string(),
         ];
         let result =
-            fetch_from_mirrors(&mut fetcher, &mirrors, "dists/stable/Release", &mut |_| {});
+            fetch_from_mirrors(&mut fetcher, &mirrors, "dists/stable/Release", &mut Silent);
         (result, fetcher.asked)
     }
 
@@ -2867,8 +2947,8 @@ mod tests {
             |url: &str| FetchError::status(url, 403),
             |url: &str| {
                 FetchError::io(
-                    url,
                     "connecting",
+                    url,
                     std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
                 )
             },
@@ -2895,57 +2975,6 @@ mod tests {
         );
         assert_eq!(asked.len(), 1, "the walk stopped at the first mirror");
     }
-
-    fn tempdir(tag: &str) -> Scratch {
-        Scratch::new(&format!("debian-{tag}"))
-    }
-
-    #[test]
-    fn concurrent_writes_of_one_cache_entry_all_succeed() {
-        // The shared-cache race: several provisions download the same package
-        // at once and publish it under the same content-addressed name. Every
-        // writer must succeed, and the published bytes must be the package.
-        let dir = tempdir("cache-race");
-        let bytes = vec![0xab; 64 * 1024];
-        let writers: Vec<_> = (0..8)
-            .map(|_| {
-                let dir = dir.to_path_buf();
-                let bytes = bytes.clone();
-                std::thread::spawn(move || write_atomically(&dir.join("entry.deb"), &bytes))
-            })
-            .collect();
-        for writer in writers {
-            writer.join().unwrap().expect("a concurrent write succeeds");
-        }
-        assert_eq!(std::fs::read(dir.join("entry.deb")).unwrap(), bytes);
-
-        // Nothing is left staged: the cache holds the published entry alone.
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name != "entry.deb")
-            .collect();
-        assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
-    }
-
-    #[test]
-    fn a_failed_publish_leaves_nothing_staged() {
-        // Staging names are unique per call, so a failure that left one behind
-        // would accumulate in a cache directory rather than being reused. The
-        // publishing rename is made to fail by occupying the destination with
-        // a non-empty directory.
-        let dir = tempdir("cache-publish-failure");
-        std::fs::create_dir(dir.join("entry.deb")).unwrap();
-        std::fs::write(dir.join("entry.deb").join("occupant"), b"").unwrap();
-        assert!(write_atomically(&dir.join("entry.deb"), b"payload").is_err());
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name != "entry.deb")
-            .collect();
-        assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
-    }
-
     #[test]
     fn the_embedded_keyring_parses() {
         // The vendored keyring must be a valid binary OpenPGP keyring that
@@ -3075,56 +3104,23 @@ mod tests {
         assert_eq!(with_empty, "Package: a\nVersion: 1\n");
     }
 
-    /// Writes a NUL-terminated octal tar header field.
-    fn octal(field: &mut [u8], value: u64) {
-        let width = field.len() - 1;
-        field[..width].copy_from_slice(format!("{value:0width$o}").as_bytes());
-    }
-
     /// An uncompressed tar of `(path, mode, uid, gid)` entries: the shape of a
     /// `.deb`'s `data.tar`. A path ending in `/` is a directory, which is how
-    /// the oldest writers marked one and how the parser reads it.
+    /// the oldest writers marked one and how the parser reads it — so the
+    /// entries are written as regular files and the trailing slash is what the
+    /// reader keys on.
     fn data_tar(entries: &[(&str, u32, u32, u32)]) -> Vec<u8> {
-        let mut tar = Vec::new();
+        let mut tar = ferroday_cage_testkit::tar::Tar::new();
         for (path, mode, uid, gid) in entries {
-            let mut block = [0u8; 512];
-            block[..path.len()].copy_from_slice(path.as_bytes());
-            octal(&mut block[100..108], u64::from(*mode));
-            octal(&mut block[108..116], u64::from(*uid));
-            octal(&mut block[116..124], u64::from(*gid));
-            octal(&mut block[124..136], 0);
-            octal(&mut block[136..148], 0);
-            block[156] = b'0';
-            block[257..263].copy_from_slice(b"ustar\0");
-            block[263..265].copy_from_slice(b"00");
-            block[148..156].copy_from_slice(b"        ");
-            let sum: u64 = block.iter().map(|byte| u64::from(*byte)).sum();
-            octal(&mut block[148..156], sum);
-            tar.extend_from_slice(&block);
+            tar.file_owned(path, *mode, *uid, *gid, b"");
         }
-        // The two zero blocks that terminate the archive.
-        tar.extend_from_slice(&[0u8; 1024]);
-        tar
+        tar.finish()
     }
 
     /// A `.deb` around a `data.tar`, with the `debian-binary` member that
     /// precedes it. No control member: extraction never reads one.
     fn deb_of(data: &[u8]) -> Vec<u8> {
-        let mut archive = b"!<arch>\n".to_vec();
-        for (name, bytes) in [("debian-binary", &b"2.0\n"[..]), ("data.tar", data)] {
-            let mut header = [b' '; 60];
-            header[..name.len()].copy_from_slice(name.as_bytes());
-            let size = bytes.len().to_string();
-            header[48..48 + size.len()].copy_from_slice(size.as_bytes());
-            header[58] = b'`';
-            header[59] = b'\n';
-            archive.extend_from_slice(&header);
-            archive.extend_from_slice(bytes);
-            if bytes.len() % 2 == 1 {
-                archive.push(b'\n');
-            }
-        }
-        archive
+        ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n"), ("data.tar", data)])
     }
 
     /// Writes each `.deb` into `archives` under its digest, as the download
@@ -3133,7 +3129,7 @@ mod tests {
         std::fs::create_dir_all(archives).expect("the archive directory is creatable");
         debs.iter()
             .map(|(name, bytes)| {
-                let sha256 = deb::sha256_hex(bytes);
+                let sha256 = crate::provision::digest::sha256_hex(bytes);
                 std::fs::write(archives.join(format!("{sha256}.deb")), bytes)
                     .expect("the package is writable");
                 Installable {
@@ -3167,15 +3163,8 @@ mod tests {
         ]));
         let install = installables(&archives, &[("first", first), ("second", second)]);
 
-        let overrides = extract_packages(
-            &staging,
-            "amd64",
-            &install,
-            &archives,
-            &mut |_| {},
-            &mut || false,
-        )
-        .expect("both packages extract");
+        let overrides = extract_packages(&staging, "amd64", &install, &archives, &mut Silent)
+            .expect("both packages extract");
 
         // One record per path, each carrying the mode of the file that survived
         // — the last entry to describe it, which is the extraction's own rule.
@@ -3205,15 +3194,8 @@ mod tests {
             ("./usr/bin/x", 0o755, 0, 0),
         ]));
         let install = installables(&archives, &[("closed", closed)]);
-        extract_packages(
-            &staging,
-            "amd64",
-            &install,
-            &archives,
-            &mut |_| {},
-            &mut || false,
-        )
-        .expect("the package extracts");
+        extract_packages(&staging, "amd64", &install, &archives, &mut Silent)
+            .expect("the package extracts");
 
         let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, ROOTFS_ROOT_MODE, "the package chose the root's mode");
@@ -3240,7 +3222,7 @@ mod tests {
         let err = fetch_verified(
             &mut Canned(b"not what the archive recorded"),
             "file:///ignored-by-the-canned-transport",
-            &deb::sha256_hex(b"the recorded bytes"),
+            &crate::provision::digest::sha256_hex(b"the recorded bytes"),
             None,
             &dest,
         )
@@ -3256,7 +3238,7 @@ mod tests {
         fetch_verified(
             &mut Canned(b"the recorded bytes"),
             "file:///ignored-by-the-canned-transport",
-            &deb::sha256_hex(b"the recorded bytes"),
+            &crate::provision::digest::sha256_hex(b"the recorded bytes"),
             Some(b"the recorded bytes".len() as u64),
             &dest,
         )
@@ -3278,7 +3260,7 @@ mod tests {
         let err = fetch_verified(
             &mut Canned(&[b'x'; 4096]),
             "file:///ignored-by-the-canned-transport",
-            &deb::sha256_hex(&[b'x'; 4096]),
+            &crate::provision::digest::sha256_hex(&[b'x'; 4096]),
             Some(16),
             &dest,
         )

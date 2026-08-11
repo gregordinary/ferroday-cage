@@ -73,7 +73,7 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 
 /// Fetches the contents of a URL.
 ///
-/// The Debian provisioner fetches every index and package through a `Fetch`
+/// A userland provisioner fetches every index and package through a `Fetch`
 /// implementation, so a consumer can substitute a transport the built-in
 /// client does not provide — HTTPS, a proxy, an on-disk cache, a private
 /// mirror protocol. The default is [`HttpFetch`](super::HttpFetch), which
@@ -86,12 +86,12 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 ///
 /// # Threads
 ///
-/// A transport is `Send` because [`Debian`](super::Debian) owns it: a
-/// provisioner that could not cross a thread boundary would strand every value
-/// built from it on the thread that built it. `Sync` is deliberately not
-/// required — every operation on a `Debian` takes `&mut self`, so a shared
-/// reference to one buys nothing, and demanding `Sync` would rule out a
-/// transport that keeps a cache or a connection count behind a [`Cell`].
+/// A transport is `Send` because the provisioner owns it: a provisioner that
+/// could not cross a thread boundary would strand every value built from it on
+/// the thread that built it. `Sync` is deliberately not required — every
+/// operation on a provisioner takes `&mut self`, so a shared reference to one
+/// buys nothing, and demanding `Sync` would rule out a transport that keeps a
+/// cache or a connection count behind a [`Cell`].
 ///
 /// Fetches always run on the thread that called into the provisioner; the
 /// requirement is on moving the transport, not on using it concurrently. A
@@ -112,7 +112,7 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 /// ```
 /// use std::io::Write;
 ///
-/// use ferroday_cage::provision::debian::{Fetch, FetchError, FetchRequest};
+/// use ferroday_cage::provision::{Fetch, FetchError, FetchRequest};
 ///
 /// /// A transport that serves one canned response and nothing else.
 /// struct Canned(Vec<u8>);
@@ -125,7 +125,7 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 ///     ) -> Result<(), FetchError> {
 ///         if request.url().ends_with("/Release") {
 ///             sink.write_all(&self.0)
-///                 .map_err(|err| FetchError::io(request.url(), "writing the body", err))
+///                 .map_err(|err| FetchError::io("writing the body", request.url(), err))
 ///         } else {
 ///             Err(FetchError::not_found(request.url()))
 ///         }
@@ -142,10 +142,11 @@ pub trait Fetch: Send {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FetchError {
-    /// The URL could not be parsed or uses an unsupported scheme.
+    /// The URL could not be parsed, could not be formed from what was meant to
+    /// name it, or uses an unsupported scheme.
     #[non_exhaustive]
     Url {
-        /// The offending URL.
+        /// The offending URL, or the locator that could not be made into one.
         url: String,
         /// What was wrong with it.
         reason: String,
@@ -167,17 +168,18 @@ pub enum FetchError {
     /// The transport failed: connection, timeout, or a read/write error.
     #[non_exhaustive]
     Io {
+        /// What the transport was doing.
+        op: &'static str,
         /// The URL fetched.
         url: String,
-        /// What the transport was doing.
-        op: String,
         /// The underlying error.
         source: io::Error,
     },
 }
 
 impl FetchError {
-    /// A URL that could not be parsed, or whose scheme is unsupported.
+    /// A URL that could not be parsed or formed, or whose scheme is
+    /// unsupported.
     pub fn url(url: impl Into<String>, reason: impl Into<String>) -> FetchError {
         FetchError::Url {
             url: url.into(),
@@ -205,13 +207,33 @@ impl FetchError {
 
     /// A transport failure: connection, timeout, or a read/write error.
     ///
-    /// `op` names what the transport was doing, for the message.
-    pub fn io(url: impl Into<String>, op: impl Into<String>, source: io::Error) -> FetchError {
+    /// `op` names what the transport was doing, for the message. Arguments run
+    /// operation, then locator, then cause, which is the order every
+    /// constructor in the crate takes them in.
+    pub fn io(op: &'static str, url: impl Into<String>, source: io::Error) -> FetchError {
         FetchError::Io {
+            op,
             url: url.into(),
-            op: op.into(),
             source,
         }
+    }
+
+    /// The same failure as a [`map_err`](Result::map_err) argument: names the
+    /// operation and the URL now, and takes the cause when it arrives.
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// use ferroday_cage::provision::FetchError;
+    ///
+    /// # fn send(url: &str, sink: &mut dyn Write, body: &[u8]) -> Result<(), FetchError> {
+    /// sink.write_all(body)
+    ///     .map_err(FetchError::at("writing the body", url))
+    /// # }
+    /// ```
+    pub fn at(op: &'static str, url: impl Into<String>) -> impl FnOnce(io::Error) -> FetchError {
+        let url = url.into();
+        move |source| FetchError::Io { op, url, source }
     }
 }
 
