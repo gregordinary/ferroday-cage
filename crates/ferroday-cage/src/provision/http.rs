@@ -130,9 +130,16 @@ impl Fetch for HttpFetch {
                 Step::Redirect(next) => current = next,
             }
         }
-        Err(FetchError::url(
+        // A chain that never arrives at a resource is this mirror's state, not
+        // a URL the caller spelled wrong, so a walk over interchangeable
+        // mirrors advances past it rather than failing outright.
+        Err(FetchError::io(
+            "following redirects",
             url,
-            format!("more than {} redirects", self.max_redirects),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("more than {} redirects", self.max_redirects),
+            ),
         ))
     }
 }
@@ -244,10 +251,16 @@ impl HttpFetch {
             read_chunked(&mut reader, &mut sink).map_err(io("reading the body"))?;
         } else if let Some(length) = headers.content_length {
             if length > cap {
-                return Err(FetchError::url(
-                    url,
+                // The refusal `LimitedWriter` makes when a body runs past the
+                // cap, made here before a byte is read because this response
+                // said in advance how big it was. Reported identically, so
+                // which of the two a mirror meets -- and whether a walk over
+                // several of them advances past it -- does not depend on the
+                // framing that mirror chose.
+                return Err(io("reading the body")(io::Error::new(
+                    io::ErrorKind::InvalidData,
                     format!("the response is {length} bytes, over the {cap}-byte cap"),
-                ));
+                )));
             }
             read_sized(&mut reader, length, &mut sink).map_err(io("reading the body"))?;
         } else {
@@ -720,6 +733,99 @@ impl<R: Read> Read for DeadlineReader<R> {
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+
+    /// Serves one canned response to each of `connections` requests on a
+    /// loopback port, and answers the URL to fetch from it.
+    ///
+    /// The client is the thing under test, so the server does the least that
+    /// keeps it honest: it reads the request through its blank separator line,
+    /// so the client's write completes, and writes the bytes the test chose.
+    /// The thread ends when it has served them all, which is what makes the
+    /// count part of the assertion — a client that made more requests than the
+    /// test expected meets a closed port.
+    fn serving(connections: usize, response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback listener binds");
+        let url = format!(
+            "http://{}/x",
+            listener.local_addr().expect("the listener is bound"),
+        );
+        let served = std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = BufReader::new(stream.try_clone().expect("the stream clones"));
+                let mut line = String::new();
+                while request.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let _ = stream.write_all(&response);
+            }
+        });
+        (url, served)
+    }
+
+    #[test]
+    fn an_over_cap_answer_is_the_mirrors_state_whichever_framing_it_chose() {
+        // A mirror that answers a request for sixteen bytes with four kilobytes
+        // is not serving the resource that was asked for -- and that is the
+        // mirror's state, so a walk over interchangeable mirrors asks the next
+        // one. The two framings are the point: the declared length is refused
+        // before a byte is read and a chunked body is refused as it arrives,
+        // and a caller must not get a different answer depending on which the
+        // mirror sent.
+        let body = vec![b'x'; 4096];
+        let declared = [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            )
+            .into_bytes(),
+            body.clone(),
+        ]
+        .concat();
+        let chunked = [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+            format!("{:x}\r\n", body.len()).into_bytes(),
+            body,
+            b"\r\n0\r\n\r\n".to_vec(),
+        ]
+        .concat();
+
+        for (framing, response) in [("declared", declared), ("chunked", chunked)] {
+            let (url, served) = serving(1, response);
+            let err = HttpFetch::new()
+                .fetch(&FetchRequest::new(&url).sized(16), &mut Vec::new())
+                .expect_err("the answer is over the cap");
+            assert!(matches!(err, FetchError::Io { .. }), "{framing}: {err:?}");
+            assert!(err.is_failover(), "{framing}: {err}");
+            served.join().expect("the server thread ends");
+        }
+    }
+
+    #[test]
+    fn a_redirect_chain_with_no_end_is_the_mirrors_state_too() {
+        // The same question one step earlier: a mirror that answers every
+        // request with another redirect has not served the resource, and the
+        // URL it was asked for was spelled fine. The default limit is five, so
+        // the client makes six requests before it gives up.
+        let (url, served) = serving(
+            6,
+            b"HTTP/1.1 302 Found\r\nLocation: /x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        );
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut Vec::new())
+            .expect_err("the chain never arrives at a body");
+        assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
+        assert!(err.is_failover(), "{err}");
+        assert!(err.to_string().contains("more than 5 redirects"), "{err}");
+        served.join().expect("the server thread ends");
+    }
 
     #[test]
     fn urls_parse() {

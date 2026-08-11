@@ -289,6 +289,21 @@ impl<R: Read> TarReader<R> {
                     // read as the next header, and the rest of the archive with
                     // them. A real Gentoo stage3 is where that was found.
                     if entry.typeflag == b'0' && entry.path.last() == Some(&b'/') {
+                        // Unless it declares data, which no directory has. Such
+                        // an entry says two incompatible things about itself,
+                        // and a reader that resolved the contradiction would
+                        // pick one of two archives: taking the name drops the
+                        // bytes it declared and reads them as the next header,
+                        // and taking the size writes a file at a directory's
+                        // name. Refusing is what keeps two readers of these
+                        // bytes from disagreeing, which is the shape a tar
+                        // parser differential takes.
+                        if entry.size != 0 {
+                            return Err(malformed(
+                                header_offset,
+                                "an entry names a directory and declares data",
+                            ));
+                        }
                         entry.typeflag = b'5';
                     }
                     // The size and the type recorded when the header was parsed
@@ -1026,6 +1041,42 @@ mod tests {
         let next = reader.next_entry().unwrap().expect("the entry after it");
         assert_eq!(next.path, &b"after.txt"[..]);
         assert!(reader.next_entry().unwrap().is_none(), "the archive ends");
+    }
+
+    #[test]
+    fn an_entry_that_names_a_directory_and_declares_data_is_refused() {
+        // The other side of the rule above. An entry whose resolved name ends
+        // in a separator is a directory, and a directory carries no data, so
+        // one that declares some says two incompatible things about itself. No
+        // real writer emits that shape; a reader that resolved the
+        // contradiction rather than refusing it would be picking one of two
+        // archives, which is what a parser differential is made of.
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&sized_header(b"dir/", 512, b'0'));
+        archive.extend_from_slice(&[b'x'; 512]);
+        archive.extend_from_slice(&sized_header(b"after.txt", 0, b'0'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+
+        let mut reader = TarReader::new(&archive[..]);
+        let err = reader
+            .next_entry()
+            .expect_err("the entry contradicts itself");
+        assert!(
+            err.to_string()
+                .contains("names a directory and declares data"),
+            "{err}",
+        );
+
+        // A directory entry declaring nothing is the ordinary old-style shape
+        // and is read as the directory it names.
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&sized_header(b"dir/", 0, b'0'));
+        plain.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let entry = TarReader::new(&plain[..])
+            .next_entry()
+            .unwrap()
+            .expect("the directory entry");
+        assert_eq!(entry.typeflag, b'5');
     }
 
     #[test]

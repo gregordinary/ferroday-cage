@@ -21,6 +21,24 @@ pub fn cache_dir() -> PathBuf {
         .join("test-fixtures")
 }
 
+/// The download cache one network suite keeps across runs, named for the suite:
+/// `download_cache("gentoo")` is where `tests/gentoo.rs` keeps its stage3.
+///
+/// `FERRODAY_CAGE_FIXTURE_DIR` when set, and otherwise the system temporary
+/// directory rather than a place under `target`, which is the one thing it does
+/// differently from every other directory here. What these hold is up to half a
+/// gigabyte fetched from a live archive; a `cargo clean` that cost that much to
+/// undo would be a reason not to run the network suites at all. It is one fixed
+/// directory per suite either way, so nothing accumulates run over run.
+pub fn download_cache(suite: &str) -> PathBuf {
+    let base = std::env::var_os("FERRODAY_CAGE_FIXTURE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let cache = base.join(format!("ferroday-cage-{suite}-cache"));
+    std::fs::create_dir_all(&cache).expect("the download cache is creatable");
+    cache
+}
+
 /// Creates an empty scratch directory for one test, under `target` so
 /// `cargo clean` clears it. Any previous run's directory is removed first.
 pub fn scratch_dir(name: &str) -> PathBuf {

@@ -122,6 +122,13 @@ one tree per run behind forever, which a long-lived machine notices.
   through `provision::remove` rather than by the calling user. `scratch_dir`
   clears the previous run's tree as the calling user, which is exactly what such
   a tree resists.
+- **A network suite's downloads** are not a scratch tree at all: they are kept
+  on purpose, so that a second run does not fetch half a gigabyte again.
+  `common::download_cache` names one directory per suite, under
+  `FERRODAY_CAGE_FIXTURE_DIR` where it is set and the system temporary directory
+  otherwise — the one place here that deliberately sits outside `target`, since
+  a `cargo clean` costing that much to undo is a reason not to run the network
+  suites.
 
 Both crates' `tests/common/mod.rs` are re-exports of `ferroday-cage-testkit`, a
 workspace member that is never published. It holds the rootfs fixture, the
@@ -195,7 +202,12 @@ and `cargo hack doc -p ferroday-cage --feature-powerset --depth 2 --no-deps
 features, write it once per combination with `cfg_attr(..., doc = "...")`;
 `provision::BuildLayer` is the worked example.
 
-If you touch the guide, build it: `mdbook build docs`.
+If you touch the guide, build it: `mdbook build docs`. That renders it and does
+not compile it — the guide's Rust blocks are doctests of the library, included
+by `crates/ferroday-cage/src/guide.rs` and compiled by the `cargo test` above,
+so a block that no longer builds fails there. A new chapter is added to that
+module as well as to `docs/src/SUMMARY.md`; a test beside it holds the list to
+what the guide publishes.
 
 ## Releasing
 

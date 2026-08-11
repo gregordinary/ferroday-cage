@@ -47,9 +47,10 @@ featureless build and is tried first regardless.
   disable user namespaces.
 - **Loading sandbox configuration from files.** `serde`.
 - **Producing the root filesystem too.** `tarball` for an archive, `debian` for
-  a bootstrapped Debian userland, `alpine` for an Alpine or postmarketOS one.
-  An `alpine`-only build is the lighter of the two provisioners: it needs no
-  OpenPGP implementation.
+  a bootstrapped Debian userland, `alpine` for an Alpine or postmarketOS one,
+  `gentoo` for one bootstrapped from a signed stage3. An `alpine`-only build is
+  the lightest of the three userlands: it needs no OpenPGP implementation, which
+  `debian` and `gentoo` each pull in.
 - **Giving the sandbox network access.** `netstack` for the bundled stack.
   Without it, the [seam](userspace-networking.md) an external stack attaches to
   is still there — it is part of the featureless build.

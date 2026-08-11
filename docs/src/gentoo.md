@@ -284,11 +284,16 @@ out of its own cache.
 ## Mirrors
 
 `mirror` replaces the default `http://distfiles.gentoo.org`, and
-`mirror_fallback` adds URLs tried after it. The list is walked in order,
-advancing past a mirror that could not serve a document. A mirror that serves one
-that does not *verify* is fatal rather than a reason to try the next: what it
-served was answered for by the URL that was asked for, and the answer to a
-refused signature is never to ask somewhere else.
+`mirror_fallback` adds URLs tried after it. The two are separate settings, as
+they are on the [Debian](debian.md) and [Alpine](alpine.md) builders: the walk
+list is the primary followed by its backstops whichever order the calls are
+written in, repeating `mirror` takes the last value, and a backstop on its own
+backs the default archive rather than replacing it.
+
+The list is walked in order, advancing past a mirror that could not serve a
+document. A mirror that serves one that does not *verify* is fatal rather than a
+reason to try the next: what it served was answered for by the URL that was asked
+for, and the answer to a refused signature is never to ask somewhere else.
 
 The archive serves plain HTTP with no redirect to HTTPS, and the bundled client
 speaks it. Every byte it brings back is verified against the vendored keyring, so
@@ -324,6 +329,15 @@ Four events rather than the other layers' larger sets, because the work is
 smaller: the documents fetched, what was resolved, the verification, and the
 extraction.
 
+The same observer stops the run. `ProvisionObserver::cancelled` is consulted at
+each step boundary — before a document is fetched, once the resolution is in
+hand, before the download, and before the digest pass — and, unlike the other
+userlands, while the tarball is arriving: this layer has no package boundary to
+break the work up, and a check that ran only around the download would answer a
+caller who asked to stop once all of it had been fetched. A cancelled run fails
+with `ProvisionError::Cancelled`, leaves no root behind, and leaves no partial
+tarball in the cache.
+
 ## The command line
 
 `fcage --provision-gentoo ARCH` provisions the `--rootfs` directory:
@@ -355,8 +369,10 @@ $ fcage --gentoo-keyring-horizon
 earliest expiry among the certificates that can sign	1795718963
 ```
 
-`--gentoo-variants` reads the signed enumeration; `--gentoo-keyring-horizon`
-reaches no network at all.
+`--gentoo-variants` reads the signed enumeration, taking `--gentoo-mirror`,
+`--gentoo-mirror-fallback` and `--gentoo-max-pointer-age` with the meanings they
+have on a provisioning command line, so the archive a listing reads is the
+archive an install would; `--gentoo-keyring-horizon` reaches no network at all.
 
 ## Where this layer differs from the other two
 

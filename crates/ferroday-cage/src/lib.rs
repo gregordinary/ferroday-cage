@@ -273,6 +273,22 @@
 //! stable.
 
 mod error;
+// The guide's Rust blocks, compiled as doctests of this crate. Every feature is
+// named because the guide documents the whole library, and the module is a
+// test-time one either way: `doctest` collects the blocks, `test` runs the
+// chapter-list guard beside them.
+#[cfg(all(
+    any(test, doctest),
+    feature = "serde",
+    feature = "tarball",
+    feature = "debian",
+    feature = "alpine",
+    feature = "gentoo",
+    feature = "hardening",
+    feature = "netstack",
+    feature = "subid",
+))]
+mod guide;
 #[cfg(feature = "hardening")]
 mod hardening;
 pub mod host;

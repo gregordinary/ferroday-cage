@@ -40,17 +40,6 @@ fn network_enabled() -> bool {
     false
 }
 
-/// A cache directory for downloaded packages, kept across runs so the tests do
-/// not re-download the base system each time.
-fn apk_cache() -> std::path::PathBuf {
-    let base = std::env::var_os("FERRODAY_CAGE_FIXTURE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let cache = base.join("ferroday-cage-alpine-cache");
-    std::fs::create_dir_all(&cache).unwrap();
-    cache
-}
-
 /// The release the live tests bootstrap.
 const RELEASE: &str = "v3.23";
 
@@ -74,7 +63,7 @@ fn full_bootstrap_configures_a_runnable_alpine() {
         };
         let mut alpine = Alpine::builder(RELEASE)
             .include(["alpine-base"])
-            .cache_dir(apk_cache())
+            .cache_dir(common::download_cache("alpine"))
             .build()
             .expect("the builder validates");
         assert_eq!(
@@ -200,7 +189,7 @@ fn a_root_provisions_from_alpine_and_postmarketos_together() {
             "alpine-keys",
             "postmarketos-baselayout",
         ])
-        .cache_dir(apk_cache())
+        .cache_dir(common::download_cache("alpine"))
         .build()
         .expect("the builder validates");
     provision::ensure(&rootfs, &mut alpine).expect("the two-repository bootstrap runs");
@@ -264,7 +253,7 @@ fn extract_only_bootstrap_registers_without_running_anything() {
     let mut alpine = Alpine::builder(RELEASE)
         .include(["alpine-base"])
         .extract_only(true)
-        .cache_dir(apk_cache())
+        .cache_dir(common::download_cache("alpine"))
         .build()
         .expect("the builder validates");
     provision::ensure(&rootfs, &mut alpine).expect("the extract-only bootstrap runs");
@@ -314,7 +303,7 @@ fn a_layered_build_stages_an_increment_and_fires_the_bases_triggers() {
     {
         let mut alpine = Alpine::builder(RELEASE)
             .include(["alpine-base"])
-            .cache_dir(apk_cache())
+            .cache_dir(common::download_cache("alpine"))
             .build()
             .expect("the builder validates");
         provision::ensure(&base, &mut alpine).expect("the base bootstrap runs");
@@ -349,7 +338,7 @@ fn a_layered_build_stages_an_increment_and_fires_the_bases_triggers() {
         let mut alpine = Alpine::builder(RELEASE)
             .base_layer(&base)
             .include(["su-exec"])
-            .cache_dir(apk_cache())
+            .cache_dir(common::download_cache("alpine"))
             .build()
             .expect("the builder validates");
         let layer = alpine
@@ -447,7 +436,7 @@ fn an_increment_layers_over_a_root_apk_wrote() {
         let mut alpine = Alpine::builder(RELEASE)
             .base_layer(base)
             .include(["su-exec"])
-            .cache_dir(apk_cache())
+            .cache_dir(common::download_cache("alpine"))
             .build()
             .expect("the builder validates");
         let layer = alpine
@@ -490,7 +479,7 @@ fn a_resolved_plan_installs_the_same_root_it_described() {
     let scratch = common::scratch_dir("alpine-plan");
     let plan = Alpine::builder(RELEASE)
         .include(["musl", "busybox"])
-        .cache_dir(apk_cache())
+        .cache_dir(common::download_cache("alpine"))
         .build()
         .expect("the builder validates")
         .resolve()
@@ -504,7 +493,7 @@ fn a_resolved_plan_installs_the_same_root_it_described() {
                 .expect("the document reads back"),
         )
         .extract_only(true)
-        .cache_dir(apk_cache())
+        .cache_dir(common::download_cache("alpine"))
         .build()
         .expect("the builder validates");
     provision::ensure(&from_plan, &mut alpine).expect("the plan installs");
@@ -513,7 +502,7 @@ fn a_resolved_plan_installs_the_same_root_it_described() {
     let mut alpine = Alpine::builder(RELEASE)
         .include(["musl", "busybox"])
         .extract_only(true)
-        .cache_dir(apk_cache())
+        .cache_dir(common::download_cache("alpine"))
         .build()
         .expect("the builder validates");
     provision::ensure(&from_resolve, &mut alpine).expect("the resolution installs");

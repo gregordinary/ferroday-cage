@@ -48,17 +48,6 @@ fn network_enabled() -> bool {
     false
 }
 
-/// A cache directory for the downloaded stage3, kept across runs so the tests
-/// do not re-download half a gigabyte each time.
-fn stage3_cache() -> std::path::PathBuf {
-    let base = std::env::var_os("FERRODAY_CAGE_FIXTURE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let cache = base.join("ferroday-cage-gentoo-cache");
-    std::fs::create_dir_all(&cache).unwrap();
-    cache
-}
-
 #[test]
 fn the_archive_publishes_the_enumeration_this_layer_reads() {
     if !network_enabled() {
@@ -145,7 +134,7 @@ fn a_bootstrap_produces_a_root_gentoo_recognizes() {
     let root = common::scratch_dir("gentoo-bootstrap").join("rootfs");
     let mut gentoo = Gentoo::builder(ARCHITECTURE)
         .variant(VARIANT)
-        .cache_dir(stage3_cache())
+        .cache_dir(common::download_cache("gentoo"))
         .build()
         .expect("the builder accepts an ordinary configuration");
     assert_eq!(

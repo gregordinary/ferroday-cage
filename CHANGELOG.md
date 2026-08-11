@@ -243,12 +243,28 @@ affected.
   for nothing at all, so a single number would misreport the anchor's shelf life
   in both directions.
 
+  `GentooBuilder::mirror` and `mirror_fallback` are separate settings composed
+  when the provisioner is built, as they are on the other two builders: the walk
+  list is the primary followed by its backstops whichever order the calls come
+  in, repeating `mirror` takes the last value, and a backstop on its own backs
+  the default archive rather than replacing it.
+
+  A bootstrap consults the run's cancellation at each step boundary and while
+  the tarball is being written, reporting `ProvisionError::Cancelled`. The
+  write is the part the other userlands have no equivalent of: they stop between
+  two packages, and a stage3 is one file of several hundred megabytes with no
+  boundary inside it, so a check made only around the download would answer a
+  caller who asked to stop once all of it had arrived. A stopped download leaves
+  nothing behind in the cache.
+
 - `fcage --provision-gentoo ARCH` provisions a root from a signed stage3, with
   `--gentoo-variant`, `--gentoo-build-id`, `--gentoo-mirror`,
   `--gentoo-mirror-fallback`, `--gentoo-cache` and `--gentoo-max-pointer-age`
   mirroring the builder they configure. `--gentoo-variants ARCH` prints what an
-  architecture publishes and `--gentoo-keyring-horizon` prints the keyring; both
-  answer without provisioning anything, and the second reaches no network.
+  architecture publishes, taking the mirror and pointer-age flags with the
+  meanings they have on a provisioning command line, and
+  `--gentoo-keyring-horizon` prints the keyring; both answer without
+  provisioning anything, and the second reaches no network.
 
 - The `ebuild-sandbox` example provisions its stage3 from the archive with
   `--variant`, rather than only from a tarball the caller had already obtained.
@@ -348,6 +364,26 @@ affected.
   absolute before it does.
 
 ### Fixed
+
+- A mirror walk advances past an answer that is over the size the resource may
+  weigh, and past a redirect chain that never arrives at one. The bundled client
+  reported both as `FetchError::Url` — the caller's configuration — so one
+  mirror answering that way failed the whole walk. Worse, which of the two
+  behaviours a caller got depended on the framing the mirror chose: a declared
+  `Content-Length` over the cap was refused as a URL, while a chunked or unframed
+  body over the same cap tripped the writer's own ceiling and was reported as a
+  transport failure, which a walk does advance past. Both are now the transport
+  failure they are.
+
+- A tar entry that names a directory and declares data is refused rather than
+  read as one or the other. The trailing-slash convention marks a directory, and
+  a directory carries no data, so such an entry says two incompatible things
+  about itself: reading the name drops the bytes it declared and reads them as
+  the next header, and reading the size writes a file at a directory's name. No
+  real writer emits the shape, and nothing here was exploitable — the extractor
+  is the reader, so there is no second parser to disagree with — but resolving a
+  contradiction rather than refusing it is what a tar parser differential is
+  made of.
 
 - A tar entry whose real path arrived in a GNU long-name entry or a pax record
   is read as the file it is, rather than as a directory when its header's own
@@ -502,6 +538,22 @@ affected.
 These change no public API and no behaviour; they are recorded because they
 change where a reader looks.
 
+- The guide's Rust blocks are compiled by `cargo test`. `mdbook build` renders a
+  code block and does not compile one, so every `rust` block in `docs/src` was
+  unverified prose in a repository that gates its public API with a committed
+  snapshot, its whole feature powerset with `cargo hack`, and the guide's own
+  links with a script written for the purpose. Each chapter is now included as
+  documentation by `src/guide.rs`, which makes its blocks doctests of the
+  library; a test beside it holds the chapter list to what the guide publishes,
+  so a new chapter cannot be added untested. Turning the gate on found two
+  blocks a reader copying them could not have built.
+
+- One download cache for the three network suites, in `ferroday-cage-testkit`
+  beside the scratch directories. Each suite had its own copy of the same eight
+  lines, differing only in the directory name — the shape the shared-vocabulary
+  rule exists to catch, since a second answer written by someone who had not
+  seen the first is how the two drift.
+
 - The five step enums the forked helpers report through — the launch stage's,
   the copy-in child's, the export child's, the removal child's, and the network
   stack's tap helper's — are declared through one `wire_enum!` macro. Each was
@@ -588,10 +640,20 @@ change where a reader looks.
   answer arrives as a decision in the diff. Writing the census found the
   `HttpFetch` timeout overflow above.
 
-- `is_sha256_hex` is `provision::digest`'s, beside the functions that produce
-  the digests it describes. It lived in the Debian index reader, which is not
-  where "is this a digest, and could it be a path segment" is asked from; the
-  Alpine layer now asks it too, of a `.PKGINFO`'s `datahash`.
+- `provision::digest` digests under a named algorithm. `Algorithm::hex_of`,
+  `is_hex`, `stream` and `DigestWriter` each take one, because the Gentoo
+  layer's chain is defined over SHA-512 where the other two archives record
+  SHA-256. The two hashers are distinct types, so a digest in flight is a small
+  enum over them rather than a boxed trait object.
+
+  The hex boundary is where that matters. It is what keeps an archive-supplied
+  digest from reaching a filesystem path or a request line as a traversal, and
+  the width belongs to the algorithm rather than to the check: `Algorithm::is_hex`
+  holds a digest to its own algorithm's width, so a well-formed digest of the
+  other algorithm is refused at the boundary instead of compared and found
+  unequal later. The question it answers — "is this a digest, and could it be a
+  path segment" — is asked from three layers now, and lived in the Debian index
+  reader, which is none of them.
 
 - Both plan formats are pinned by a golden document as well as by a round trip.
   A round trip proves the reader and the writer agree with each other and cannot

@@ -26,7 +26,7 @@ the command runnable at all: with any Landlock grant configured, everything
 ungranted is denied, so the command's own binary, its interpreter, and its
 libraries need read and execute grants alongside the data paths it works on.
 
-```rust
+```rust,no_run
 # use ferroday_cage::{FsAccess, Restriction};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Restriction::builder()
@@ -104,7 +104,7 @@ A cage launch on a host without user namespaces fails with
 probe identifies it. A program that wants to degrade catches that error and
 runs its restriction:
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, Error, FsAccess, Restriction};
 # fn main() -> ferroday_cage::Result<()> {
 # let cage = Cage::builder().rootfs("/srv/rootfs").command("/usr/bin/job").build()?;

@@ -114,8 +114,16 @@ provisioner reports each entry and its progress through the archive; the
 fetches, resolution, downloads, and dpkg's output — through the
 `ProvisionEvent::Debian` variant, and honours the same cancellation check
 between packages. The [Alpine provisioner](alpine.md) reports the same
-progress through `ProvisionEvent::Alpine`, so a consumer reports either
-userland by changing the type it matches on.
+progress through `ProvisionEvent::Alpine`, and the [Gentoo
+provisioner](gentoo.md) through `ProvisionEvent::Gentoo`, so a consumer
+reports any of the userlands by changing the type it matches on.
+
+Where the clean stopping points are is the provisioner's own question. A
+package boundary answers it for the two layers that have one; the Gentoo layer
+has none — a stage3 is a single file of several hundred megabytes — so it
+consults the check while the tarball is being written as well as at the step
+boundaries around it, and a cancelled download leaves nothing behind in the
+cache.
 
 ## Removing a rootfs
 
@@ -197,7 +205,7 @@ Export::new("/var/lib/myapp/rootfs")
     // it, real modification times are recorded.
     .clamp_mtime(1_700_000_000)
     .write_to(&mut archive)?;
-# Ok::<(), ferroday_cage::provision::ProvisionError>(())
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `provision::export_tar(rootfs, writer, map)` is the shorthand, carrying only

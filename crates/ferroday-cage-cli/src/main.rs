@@ -403,7 +403,12 @@ enum Invocation {
     /// Print the stage3 variants an architecture publishes.
     GentooVariants {
         architecture: String,
-        mirrors: Vec<String>,
+        /// The archive to read, or `None` for the library's default.
+        ///
+        /// Kept apart from the backstops, as a provisioning run keeps them, so
+        /// that the two flags mean the same thing in both modes.
+        mirror: Option<String>,
+        fallbacks: Vec<String>,
         max_pointer_age: Option<Option<u64>>,
     },
     /// Print what each certificate of the vendored Gentoo keyring can still be
@@ -737,9 +742,15 @@ fn main() -> ExitCode {
         Ok(Invocation::Remove { dest, map }) => remove_rootfs(&dest, map),
         Ok(Invocation::GentooVariants {
             architecture,
-            mirrors,
+            mirror,
+            fallbacks,
             max_pointer_age,
-        }) => gentoo_variants(&architecture, &mirrors, max_pointer_age),
+        }) => gentoo_variants(
+            &architecture,
+            mirror.as_deref(),
+            &fallbacks,
+            max_pointer_age,
+        ),
         Ok(Invocation::GentooKeyring) => gentoo_keyring_horizon(),
         Ok(Invocation::Export {
             source,
@@ -1735,7 +1746,12 @@ fn parse_gentoo_variants(args: Vec<OsString>) -> Result<Invocation, String> {
         return Ok(answer);
     }
     let mut architecture: Option<String> = None;
-    let mut mirrors: Vec<String> = Vec::new();
+    // The primary and its backstops are separate settings here exactly as they
+    // are on a provisioning command line: repeating the primary takes the last
+    // value, and a backstop given alone backs the default archive rather than
+    // replacing it.
+    let mut mirror: Option<String> = None;
+    let mut fallbacks: Vec<String> = Vec::new();
     let mut max_pointer_age: Option<Option<u64>> = None;
     let mut args = args.into_iter();
 
@@ -1745,13 +1761,13 @@ fn parse_gentoo_variants(args: Vec<OsString>) -> Result<Invocation, String> {
         } else if let Some(value) = flag_value(&arg, b"--gentoo-variants=") {
             architecture = Some(into_string("--gentoo-variants", value)?);
         } else if arg == "--gentoo-mirror" {
-            mirrors.insert(0, string_value("--gentoo-mirror", &mut args)?);
+            mirror = Some(string_value("--gentoo-mirror", &mut args)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror=") {
-            mirrors.insert(0, into_string("--gentoo-mirror", value)?);
+            mirror = Some(into_string("--gentoo-mirror", value)?);
         } else if arg == "--gentoo-mirror-fallback" {
-            mirrors.push(string_value("--gentoo-mirror-fallback", &mut args)?);
+            fallbacks.push(string_value("--gentoo-mirror-fallback", &mut args)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror-fallback=") {
-            mirrors.push(into_string("--gentoo-mirror-fallback", value)?);
+            fallbacks.push(into_string("--gentoo-mirror-fallback", value)?);
         } else if arg == "--gentoo-max-pointer-age" {
             max_pointer_age = Some(parse_pointer_age(&string_value(
                 "--gentoo-max-pointer-age",
@@ -1782,7 +1798,8 @@ fn parse_gentoo_variants(args: Vec<OsString>) -> Result<Invocation, String> {
         architecture.ok_or_else(|| "--gentoo-variants requires a value".to_string())?;
     Ok(Invocation::GentooVariants {
         architecture,
-        mirrors,
+        mirror,
+        fallbacks,
         max_pointer_age,
     })
 }
@@ -3558,12 +3575,14 @@ fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(
     Ok(())
 }
 
-/// Prints an Alpine bootstrap progress event to stderr.
+/// Bootstraps a Gentoo rootfs from a signed stage3, printing progress to
+/// stderr.
 ///
-/// The same shape as [`print_debian_event`], which is the point of
-/// [`AlpineEvent`](ferroday_cage::provision::alpine::AlpineEvent) carrying the
-/// same progress: a consumer reports one layer by changing the type it matches
-/// on.
+/// The shortest of the three: Gentoo publishes no package resolution for a
+/// stage3, so there is nothing here for a `--debian-*` or `--alpine-*`
+/// counterpart of an include set, a priority floor, or a plan to configure. What
+/// it takes instead is which variant to install and how current the signed
+/// enumeration naming it must be.
 fn provision_gentoo(architecture: &str, options: &Options, rootfs: &Path) -> Result<(), ExitCode> {
     use ferroday_cage::provision::ProvisionEvent;
     use ferroday_cage::provision::gentoo::Gentoo;
@@ -3638,18 +3657,21 @@ fn print_gentoo_event(event: &ferroday_cage::provision::gentoo::GentooEvent<'_>)
 /// enumeration.
 fn gentoo_variants(
     architecture: &str,
-    mirrors: &[String],
+    mirror: Option<&str>,
+    fallbacks: &[String],
     max_pointer_age: Option<Option<u64>>,
 ) -> ExitCode {
     use ferroday_cage::provision::gentoo::Gentoo;
 
+    // Configured exactly as a provisioning run configures the same layer, so a
+    // command line that lists an architecture's variants and one that installs
+    // one of them read the same archive.
     let mut builder = Gentoo::builder(architecture);
-    for (at, mirror) in mirrors.iter().enumerate() {
-        builder = if at == 0 {
-            builder.mirror(mirror)
-        } else {
-            builder.mirror_fallback(mirror)
-        };
+    if let Some(mirror) = mirror {
+        builder = builder.mirror(mirror);
+    }
+    for fallback in fallbacks {
+        builder = builder.mirror_fallback(fallback);
     }
     if let Some(age) = max_pointer_age {
         builder = builder.max_pointer_age(age.map(days));
@@ -3721,6 +3743,12 @@ fn gentoo_keyring_horizon() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Prints an Alpine bootstrap progress event to stderr.
+///
+/// The same shape as [`print_debian_event`], which is the point of
+/// [`AlpineEvent`](ferroday_cage::provision::alpine::AlpineEvent) carrying the
+/// same progress: a consumer reports one layer by changing the type it matches
+/// on.
 fn print_alpine_event(event: ferroday_cage::provision::alpine::AlpineEvent<'_>) {
     use ferroday_cage::provision::alpine::AlpineEvent;
     use std::io::Write;
@@ -4212,22 +4240,50 @@ mod tests {
         {
             Invocation::GentooVariants {
                 architecture,
-                mirrors,
+                mirror,
+                fallbacks,
                 max_pointer_age,
             } => {
                 assert_eq!(architecture, "arm64");
-                // The primary leads, whatever order the flags came in.
-                assert_eq!(
-                    mirrors,
-                    [
-                        "http://mirror.invalid/gentoo",
-                        "http://backup.invalid/gentoo",
-                    ],
-                );
+                assert_eq!(mirror.as_deref(), Some("http://mirror.invalid/gentoo"));
+                assert_eq!(fallbacks, ["http://backup.invalid/gentoo"]);
                 assert_eq!(max_pointer_age, Some(None));
             }
             _ => panic!("expected a variant listing"),
         }
+
+        // The two flags mean here what they mean on a provisioning command
+        // line, which is what keeps one command line from reading an archive
+        // the other would not. A backstop given alone backs the default archive
+        // rather than replacing it, so nothing names the primary here.
+        let listing = |args: &[&str]| match parse_args(args).expect("the listing parses") {
+            Invocation::GentooVariants {
+                mirror, fallbacks, ..
+            } => (mirror, fallbacks),
+            _ => panic!("expected a variant listing"),
+        };
+        assert_eq!(
+            listing(&[
+                "--gentoo-variants",
+                "amd64",
+                "--gentoo-mirror-fallback",
+                "http://backup.invalid/gentoo",
+            ]),
+            (None, vec!["http://backup.invalid/gentoo".to_string()]),
+        );
+        // Repeating one flag takes the last value, as it does everywhere else
+        // in the tool.
+        assert_eq!(
+            listing(&[
+                "--gentoo-variants",
+                "amd64",
+                "--gentoo-mirror",
+                "http://a.invalid",
+                "--gentoo-mirror",
+                "http://b.invalid",
+            ]),
+            (Some("http://b.invalid".to_string()), Vec::new()),
+        );
 
         assert!(matches!(
             parse_args(&["--gentoo-keyring-horizon"]).expect("the horizon parses"),
@@ -4243,7 +4299,10 @@ mod tests {
     }
 
     #[test]
-    fn the_two_provisioners_are_mutually_exclusive_and_need_a_destination() {
+    fn the_provisioners_are_mutually_exclusive_and_need_a_destination() {
+        // One rootfs is provisioned one way. Every flag the refusal enumerates
+        // is exercised, so a provisioner added to the list without being added
+        // to the check fails here rather than in a caller's hands.
         let error = parse_error(&[
             "--rootfs",
             "/roots/mixed",
@@ -4256,9 +4315,48 @@ mod tests {
             error.contains("--provision-debian and --provision-alpine"),
             "{error}",
         );
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/mixed",
+            "--provision-tar",
+            "rootfs.tar",
+            "--provision-gentoo",
+            "amd64",
+        ]);
+        assert!(
+            error.contains("--provision-tar and --provision-gentoo"),
+            "{error}",
+        );
 
-        let error = parse_error(&["--provision-alpine", "v3.23"]);
-        assert!(error.contains("--rootfs"), "{error}");
+        // And each of them names the destination it writes to. Alone, that is
+        // the general refusal every command line without somewhere to run
+        // meets; alongside a profile, which does say where the launch runs, it
+        // is the provisioner's own -- and for the Gentoo one that refusal is
+        // what makes the variant refusal reachable only where a destination was
+        // named.
+        for provisioner in [
+            ["--provision-tar", "rootfs.tar"],
+            ["--provision-debian", "trixie"],
+            ["--provision-alpine", "v3.23"],
+            ["--provision-gentoo", "amd64"],
+        ] {
+            let error = parse_error(&provisioner);
+            assert!(error.contains("--rootfs"), "{provisioner:?}: {error}");
+
+            let error = parse_error(&[
+                "--profile",
+                "/etc/fcage/profile.toml",
+                provisioner[0],
+                provisioner[1],
+            ]);
+            assert_eq!(
+                error,
+                format!(
+                    "{} requires --rootfs to name the destination",
+                    provisioner[0]
+                ),
+            );
+        }
     }
 
     #[test]

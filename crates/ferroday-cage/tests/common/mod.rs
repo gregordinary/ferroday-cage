@@ -10,7 +10,9 @@
 #![allow(unused_imports)]
 
 pub use ferroday_cage_testkit::fixture::{fixture_rootfs, scratch_rootfs};
-pub use ferroday_cage_testkit::scratch::{force_remove_dir_all, scratch_dir, tun_available};
+pub use ferroday_cage_testkit::scratch::{
+    download_cache, force_remove_dir_all, scratch_dir, tun_available,
+};
 
 /// Builders for hermetic Debian fixtures: tar streams, `.deb` archives, and a
 /// `file://` repository, all with correct digests, so the Debian provisioner

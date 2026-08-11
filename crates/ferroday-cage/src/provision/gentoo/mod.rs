@@ -67,10 +67,17 @@ const MAX_DIGESTS_BYTES: u64 = 64 * 1024;
 /// The ceiling on a stage3 tarball where nothing declares its size.
 ///
 /// A fetch is normally bounded by the exact size the signed enumeration
-/// recorded. Two paths have no such number: a bare build id pin, which skips the
-/// enumeration, and one carried by a caller who assembled it themselves. The
-/// largest stage3 published today is 796 MB, so this is far above anything real
-/// and far below a bound that means nothing.
+/// recorded. One path has no such number: a build id pin, which skips the
+/// enumeration -- and, with it, a [`Stage3`] carried over from a pinned
+/// resolution, which is that same answer again. The largest stage3 published
+/// today is 796 MB, so this is far above anything real and far below a bound
+/// that means nothing.
+///
+/// It is this layer's own ceiling rather than the effective one. A transport
+/// applies whatever bound it has of its own, and the bundled client's is half
+/// this, so a default build stops a pinned download at 2 GiB. Both are far above
+/// any published stage3; where they differ, the smaller wins, as a ceiling
+/// should.
 const MAX_STAGE3_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// The suffix of the cache a run downloads into when the caller named no
@@ -106,7 +113,8 @@ pub enum GentooError {
     /// keyring, or the keyring itself could not be read.
     #[non_exhaustive]
     Signature {
-        /// What was being verified: the URL of a document, or the keyring.
+        /// What was being verified: the URL a document was served from, or the
+        /// keyring.
         subject: String,
         /// Why it was not accepted.
         reason: String,
@@ -118,7 +126,8 @@ pub enum GentooError {
     /// recording no usable SHA-512 for the tarball beside it.
     #[non_exhaustive]
     Document {
-        /// The URL of the document.
+        /// The URL the document was served from, mirror included, so a walk
+        /// over several of them names the one that answered.
         subject: String,
         /// What was wrong with it.
         reason: String,
@@ -159,6 +168,10 @@ pub enum GentooError {
         /// The SHA-512 the bytes actually have.
         actual: String,
     },
+    /// The run's observer asked the bootstrap to stop.
+    ///
+    /// Surfaces to a caller as [`super::ProvisionError::Cancelled`].
+    Cancelled,
     /// Fetching from the archive failed.
     Fetch(FetchError),
     /// A host I/O operation failed.
@@ -269,6 +282,7 @@ impl fmt::Display for GentooError {
                 "{subject} does not have the digest the archive recorded for it: the signed \
                  document states {expected}, the bytes are {actual}",
             ),
+            GentooError::Cancelled => f.write_str("the bootstrap was cancelled"),
             GentooError::Fetch(err) => write!(f, "{err}"),
             GentooError::Io { op, path, source } => {
                 write!(
@@ -292,8 +306,14 @@ impl std::error::Error for GentooError {
 }
 
 impl From<GentooError> for super::ProvisionError {
+    /// A cancellation is the run's own outcome rather than a layer failure, so
+    /// it surfaces as the shared variant a caller matches on whichever
+    /// provisioner they drove; everything else is this layer's.
     fn from(err: GentooError) -> super::ProvisionError {
-        super::ProvisionError::other(err)
+        match err {
+            GentooError::Cancelled => super::ProvisionError::Cancelled,
+            other => super::ProvisionError::other(other),
+        }
     }
 }
 
@@ -378,12 +398,21 @@ impl Stage3 {
         &self.path
     }
 
-    /// The tarball's size in bytes, as the signed enumeration recorded it.
+    /// The most bytes the tarball may weigh, and what the download is bounded
+    /// by.
     ///
-    /// Exact rather than approximate, and it bounds the download: a mirror that
-    /// answers with more than this is not serving the resource that was asked
-    /// for, and the digest that would catch the substitution runs only after the
-    /// bytes have been spent.
+    /// A mirror that answers with more than this is not serving the resource
+    /// that was asked for, and the digest that would catch the substitution runs
+    /// only after the bytes have been spent.
+    ///
+    /// Where the resolution read the signed enumeration, this is the exact
+    /// length it recorded. Where it acted on a
+    /// [`build_id`](GentooBuilder::build_id) pin it is a fixed ceiling instead,
+    /// several times the largest stage3 Gentoo publishes: a pin names the build
+    /// directly, and nothing Gentoo signs states the length of a tarball inside
+    /// one. So this is a bound in both cases and a size in one, and a caller
+    /// showing a download's size or preallocating for it wants the resolution
+    /// they got it from to be an unpinned one.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -558,7 +587,8 @@ impl Gentoo {
             build_id: None,
             stage3: None,
             max_pointer_age: Some(DEFAULT_MAX_POINTER_AGE),
-            mirrors: Vec::new(),
+            mirror: None,
+            fallbacks: Vec::new(),
             cache_dir: None,
             fetcher: None,
         }
@@ -692,24 +722,24 @@ impl Gentoo {
             }
         };
 
-        let url = self.url(&format!("{path}.DIGESTS"));
-        let (body, certificate) = self.read_signed(&url, MAX_DIGESTS_BYTES, to)?;
-        let sha512 = digests::sha512_of(&url, &body, file_name_of(&path))?;
+        let suffix = self.url(&format!("{path}.DIGESTS"));
+        let digests = self.read_signed(&suffix, MAX_DIGESTS_BYTES, to)?;
+        let sha512 = digests::sha512_of(&digests.url, &digests.body, file_name_of(&path))?;
         Ok(Stage3 {
             build_id,
             variant,
             path,
             size,
             sha512,
-            certificate,
+            certificate: digests.certificate,
         })
     }
 
     /// Fetches the pointer document, verifies it, and holds it to the age bound.
     fn read_pointer(&mut self, to: Reporting<'_, '_>) -> Result<Pointer, GentooError> {
-        let url = self.url("latest-stage3.txt");
-        let (body, _) = self.read_signed(&url, MAX_POINTER_BYTES, to)?;
-        let pointer = Pointer::parse(&url, &body)?;
+        let suffix = self.url("latest-stage3.txt");
+        let served = self.read_signed(&suffix, MAX_POINTER_BYTES, to)?;
+        let pointer = Pointer::parse(&served.url, &served.body)?;
         self.check_fresh(&pointer)?;
         Ok(pointer)
     }
@@ -746,8 +776,8 @@ impl Gentoo {
         Ok(())
     }
 
-    /// Fetches a cleartext-signed document and returns its verified body with
-    /// the fingerprint of the certificate that vouched for it.
+    /// Fetches a cleartext-signed document and returns it as the mirror that
+    /// answered served it.
     ///
     /// The mirror list is walked in order, advancing past a mirror that could
     /// not serve the document. One that serves something that does not verify is
@@ -762,9 +792,13 @@ impl Gentoo {
         suffix: &str,
         limit: u64,
         to: Reporting<'_, '_>,
-    ) -> Result<(String, String), GentooError> {
+    ) -> Result<Served, GentooError> {
         let mut unserved = None;
         for mirror in &self.mirrors {
+            // Before each mirror rather than before the walk: an unreachable
+            // mirror costs a connect timeout, so a list of them is a step long
+            // enough to want stopping in the middle of.
+            stop_if_cancelled(to)?;
             let url = format!("{}/{suffix}", mirror.trim_end_matches('/'));
             // Reported per mirror rather than per document: this walk spends one
             // mirror timeout per unreachable mirror, and an observer that saw
@@ -780,15 +814,19 @@ impl Gentoo {
                         .keyring
                         .verify(&bytes, true)
                         .map_err(|err| GentooError::signature(&url, err))?;
-                    return Ok((verified.body, verified.certificate));
+                    return Ok(Served {
+                        url,
+                        body: verified.body,
+                        certificate: verified.certificate,
+                    });
                 }
                 Err(err) if err.is_failover() => unserved = Some(err),
                 Err(err) => return Err(GentooError::Fetch(err)),
             }
         }
-        Err(GentooError::Fetch(unserved.unwrap_or_else(|| {
-            FetchError::not_found(suffix.to_string())
-        })))
+        Err(GentooError::Fetch(
+            unserved.unwrap_or_else(|| no_mirror(suffix)),
+        ))
     }
 
     /// The mirror-relative path of something in this architecture's autobuilds
@@ -796,6 +834,32 @@ impl Gentoo {
     fn url(&self, suffix: &str) -> String {
         format!("releases/{}/autobuilds/{suffix}", self.architecture)
     }
+}
+
+/// A verified document, and the URL that served it.
+///
+/// The URL is the whole one, mirror included, rather than the archive-relative
+/// path the walk was asked for: it is what tells a caller reading a refusal
+/// which mirror answered, and a walk over several of them is exactly when that
+/// matters.
+struct Served {
+    /// The URL the document arrived from.
+    url: String,
+    /// The cleartext the signature covers.
+    body: String,
+    /// The verifying certificate's primary-key fingerprint, uppercase hex.
+    certificate: String,
+}
+
+/// The failure a mirror walk reports when it had nowhere to walk.
+///
+/// Unreachable as the layer is configured — [`GentooBuilder::build`] composes at
+/// least the default archive, so every walk has a mirror and either returns or
+/// records that mirror's failure. It is a configuration failure rather than a
+/// missing resource, which is also what keeps it out of the failover class:
+/// there is nothing to advance to.
+fn no_mirror(path: &str) -> FetchError {
+    FetchError::url(path, "no mirror is configured to fetch it from")
 }
 
 impl Provisioner for Gentoo {
@@ -808,9 +872,18 @@ impl Provisioner for Gentoo {
     ///
     /// A run that has not resolved resolves as its first step, so a caller who
     /// only wants a root never has to.
+    ///
+    /// [`ProvisionRequest::cancelled`] is consulted at every step boundary and
+    /// while the tarball is being written, which is where the time goes: one
+    /// file of several hundred megabytes, with no package boundary to break it
+    /// up.
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
         let stage3 = self.resolve_reporting(Some(request))?;
         report(Some(request), GentooEvent::Resolved { stage3: &stage3 });
+        // The resolution is two small documents and the download is not, so a
+        // caller who cancelled during it should not be committed to the
+        // download by having asked what would be downloaded.
+        stop_if_cancelled(Some(request))?;
 
         // The cache is the caller's if they named one, and otherwise a sibling
         // of the tree being built that goes with this frame however it ends: a
@@ -830,6 +903,10 @@ impl Provisioner for Gentoo {
         if !tarball.is_file() {
             self.download(&stage3, &tarball, Some(request))?;
         }
+        // A digest pass over the whole tarball is the second long step, and
+        // what precedes it is a complete file in a cache that outlives the run,
+        // so stopping here costs the download nothing.
+        stop_if_cancelled(Some(request))?;
         report(
             Some(request),
             GentooEvent::Verifying {
@@ -872,6 +949,7 @@ impl Gentoo {
     ) -> Result<(), GentooError> {
         let mut unserved = None;
         for mirror in &self.mirrors {
+            stop_if_cancelled(to)?;
             let url = format!(
                 "{}/releases/{}/autobuilds/{}",
                 mirror.trim_end_matches('/'),
@@ -879,20 +957,30 @@ impl Gentoo {
                 stage3.path,
             );
             report(to, GentooEvent::Fetching { url: &url });
-            match fetch_to(self.fetcher.as_mut(), &url, stage3.size, dest) {
+            match fetch_to(self.fetcher.as_mut(), &url, stage3.size, dest, to) {
                 Ok(()) => return Ok(()),
                 Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
                 Err(err) => return Err(err),
             }
         }
-        Err(GentooError::Fetch(unserved.unwrap_or_else(|| {
-            FetchError::not_found(stage3.path.clone())
-        })))
+        Err(GentooError::Fetch(
+            unserved.unwrap_or_else(|| no_mirror(&stage3.path)),
+        ))
     }
 }
 
 /// Writes one URL's body to `dest` through a staging file beside it.
-fn fetch_to(fetcher: &mut dyn Fetch, url: &str, size: u64, dest: &Path) -> Result<(), GentooError> {
+///
+/// A cancelled run stops mid-body rather than at the end of it: the write is
+/// where a bootstrap spends its time, and a check that only ran between mirrors
+/// would leave a caller who asked to stop waiting for the whole tarball.
+fn fetch_to(
+    fetcher: &mut dyn Fetch,
+    url: &str,
+    size: u64,
+    dest: &Path,
+    to: Reporting<'_, '_>,
+) -> Result<(), GentooError> {
     let staged = super::staging_path(dest);
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -901,10 +989,15 @@ fn fetch_to(fetcher: &mut dyn Fetch, url: &str, size: u64, dest: &Path) -> Resul
         .map_err(GentooError::at("staging a stage3", &staged))?;
 
     let mut sink = io::BufWriter::new(file);
-    let fetched = fetcher.fetch(
-        &FetchRequest::new(url).sized(size),
-        &mut LimitedWriter::new(&mut sink, size),
-    );
+    let (fetched, cancelled) = {
+        let mut body = CancellableWriter {
+            inner: LimitedWriter::new(&mut sink, size),
+            to,
+            cancelled: false,
+        };
+        let fetched = fetcher.fetch(&FetchRequest::new(url).sized(size), &mut body);
+        (fetched, body.cancelled)
+    };
     // The last buffer is written here rather than by `BufWriter`'s own `Drop`,
     // which has nowhere to report a failure and so swallows it. A body whose
     // tail never reached the disk would otherwise be renamed into the cache and
@@ -916,16 +1009,60 @@ fn fetch_to(fetcher: &mut dyn Fetch, url: &str, size: u64, dest: &Path) -> Resul
         .map(|_| ())
         .map_err(|err| GentooError::at("writing a stage3", &staged)(err.into_error()));
 
-    let published = fetched
-        .map_err(GentooError::Fetch)
-        .and(flushed)
-        .and_then(|()| {
-            std::fs::rename(&staged, dest).map_err(GentooError::at("publishing a stage3", dest))
-        });
+    // A stopped write reaches the transport as a write failure, which is what
+    // the sink has to answer it with; what it means is the run's own outcome,
+    // and reporting it as a transport failure would send a mirror walk to the
+    // next mirror to do the same thing again.
+    let published = if cancelled {
+        Err(GentooError::Cancelled)
+    } else {
+        fetched
+            .map_err(GentooError::Fetch)
+            .and(flushed)
+            .and_then(|()| {
+                std::fs::rename(&staged, dest).map_err(GentooError::at("publishing a stage3", dest))
+            })
+    };
     if published.is_err() {
         let _ = std::fs::remove_file(&staged);
     }
     published
+}
+
+/// A sink that stops accepting bytes once the run has been cancelled.
+///
+/// The other userlands need nothing like it: they download packages, so a check
+/// between two of them stops a bootstrap within one package's worth of bytes. A
+/// stage3 is a single file of several hundred megabytes, and a check that ran
+/// only at the step boundaries around it would answer a caller who asked to stop
+/// once the whole thing had arrived.
+///
+/// The stop is recorded here rather than read back out of the [`io::Error`] the
+/// transport returns: a `Fetch` implementation is a caller's own and may report
+/// a failed write however it likes, and this is the one thing about it this
+/// crate knows first-hand.
+struct CancellableWriter<'a, 'r, W> {
+    inner: W,
+    to: Reporting<'a, 'r>,
+    cancelled: bool,
+}
+
+impl<W: io::Write> io::Write for CancellableWriter<'_, '_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(request) = self.to
+            && request.cancelled()
+        {
+            self.cancelled = true;
+            // Not `Interrupted`, which `io::copy` and `write_all` retry: a
+            // cancellation is the one write failure that must not be retried.
+            return Err(io::Error::other("the bootstrap was cancelled"));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Holds a downloaded tarball to the SHA-512 the signed document recorded.
@@ -969,10 +1106,12 @@ pub enum GentooEvent<'a> {
     /// The variant has been resolved to a build, carrying what a bootstrap will
     /// install.
     ///
-    /// Emitted mid-bootstrap, once both documents have verified and before the
-    /// tarball is downloaded, so a consumer sees exactly what
+    /// Emitted mid-bootstrap, once the resolution has produced an answer and
+    /// before the tarball is downloaded, so a consumer sees exactly what
     /// [`provision::ensure`](super::ensure) chose without a separate
-    /// [`Gentoo::resolve`] pass.
+    /// [`Gentoo::resolve`] pass. Where the caller carried a [`Stage3`] over with
+    /// [`GentooBuilder::stage3`] that answer is the one they supplied, and
+    /// nothing was fetched or verified to arrive at it.
     #[non_exhaustive]
     Resolved {
         /// The stage3 the bootstrap will install.
@@ -1012,6 +1151,21 @@ fn report(to: Reporting<'_, '_>, event: GentooEvent<'_>) {
     }
 }
 
+/// Stops where the run has been cancelled.
+///
+/// Consulted at the boundaries where stopping is clean: nothing has been
+/// published, and the staging tree [`provision::ensure`](super::ensure) removes
+/// on any failure is what a partial bootstrap amounts to. A read half reached
+/// directly has no request to ask, which is the same thing [`Reporting`] models
+/// for progress — nothing is driving the call, so nothing can have cancelled
+/// it.
+fn stop_if_cancelled(to: Reporting<'_, '_>) -> Result<(), GentooError> {
+    match to {
+        Some(request) if request.cancelled() => Err(GentooError::Cancelled),
+        _ => Ok(()),
+    }
+}
+
 /// A [`Gentoo`] under construction.
 pub struct GentooBuilder {
     architecture: String,
@@ -1019,7 +1173,13 @@ pub struct GentooBuilder {
     build_id: Option<String>,
     stage3: Option<Stage3>,
     max_pointer_age: Option<Duration>,
-    mirrors: Vec<String>,
+    /// The archive to read, or `None` for the default one.
+    ///
+    /// Kept apart from the backstops, as the other two userlands keep theirs,
+    /// so that the two methods compose whichever order a caller writes them in.
+    /// The walk list is assembled in [`build`](GentooBuilder::build).
+    mirror: Option<String>,
+    fallbacks: Vec<String>,
     cache_dir: Option<PathBuf>,
     fetcher: Option<Box<dyn Fetch>>,
 }
@@ -1034,7 +1194,8 @@ impl fmt::Debug for GentooBuilder {
             .field("build_id", &self.build_id)
             .field("stage3", &self.stage3)
             .field("max_pointer_age", &self.max_pointer_age)
-            .field("mirrors", &self.mirrors)
+            .field("mirror", &self.mirror)
+            .field("fallbacks", &self.fallbacks)
             .field("cache_dir", &self.cache_dir)
             .field(
                 "fetcher",
@@ -1107,13 +1268,16 @@ impl GentooBuilder {
 
     /// The archive to read, replacing the default `distfiles.gentoo.org`.
     ///
-    /// The URL names the root the `releases/` tree sits under.
+    /// The URL names the root the `releases/` tree sits under. Repeating this
+    /// takes the last value; the backstops are
+    /// [`mirror_fallback`](Self::mirror_fallback)'s and are unaffected.
     pub fn mirror(mut self, url: impl Into<String>) -> GentooBuilder {
-        self.mirrors = vec![url.into()];
+        self.mirror = Some(url.into());
         self
     }
 
-    /// Adds a mirror to try after the ones already configured.
+    /// Adds a backstop mirror, tried after the primary and after the backstops
+    /// already added.
     ///
     /// The list is walked in order, advancing past a mirror that could not serve
     /// a document. A mirror that serves one that does not verify is fatal rather
@@ -1121,10 +1285,7 @@ impl GentooBuilder {
     /// that was asked for, and the answer to a refused signature is never to ask
     /// somewhere else.
     pub fn mirror_fallback(mut self, url: impl Into<String>) -> GentooBuilder {
-        if self.mirrors.is_empty() {
-            self.mirrors.push(DEFAULT_MIRROR.to_string());
-        }
-        self.mirrors.push(url.into());
+        self.fallbacks.push(url.into());
         self
     }
 
@@ -1174,17 +1335,18 @@ impl GentooBuilder {
         }
         let keyring = Keyring::parse(EMBEDDED_KEYRING)
             .map_err(|err| GentooError::signature("the vendored Gentoo keyring", err))?;
+        // The walk list is the primary followed by its backstops, composed
+        // here so that neither method can undo the other.
+        let mut mirrors = Vec::with_capacity(1 + self.fallbacks.len());
+        mirrors.push(self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()));
+        mirrors.extend(self.fallbacks);
         Ok(Gentoo {
             architecture: self.architecture,
             variant: self.variant,
             build_id: self.build_id,
             stage3: self.stage3,
             max_pointer_age: self.max_pointer_age,
-            mirrors: if self.mirrors.is_empty() {
-                vec![DEFAULT_MIRROR.to_string()]
-            } else {
-                self.mirrors
-            },
+            mirrors,
             cache_dir: self.cache_dir,
             keyring,
             fetcher: self
@@ -1219,7 +1381,26 @@ mod tests {
     /// reaching for it from a unit test would unify those features into every
     /// `cargo test` of the library and take the meaning out of the featureless
     /// and powerset checks.
-    struct Canned(HashMap<String, Vec<u8>>);
+    struct Canned {
+        served: HashMap<String, Vec<u8>>,
+        /// The most bytes one write to the sink carries.
+        ///
+        /// A real transport delivers a body in read-sized pieces, and the
+        /// download consults the run's cancellation on each of them, so a
+        /// fixture that wrote every body in a single call could not exercise a
+        /// stop part way through one.
+        chunk: usize,
+    }
+
+    impl Canned {
+        /// A transport serving `served`, in pieces no real body would exceed.
+        fn new(served: HashMap<String, Vec<u8>>) -> Canned {
+            Canned {
+                served,
+                chunk: 64 * 1024,
+            }
+        }
+    }
 
     impl Fetch for Canned {
         fn fetch(
@@ -1227,9 +1408,10 @@ mod tests {
             request: &FetchRequest<'_>,
             sink: &mut dyn Write,
         ) -> Result<(), FetchError> {
-            match self.0.get(request.url()) {
-                Some(body) => sink
-                    .write_all(body)
+            match self.served.get(request.url()) {
+                Some(body) => body
+                    .chunks(self.chunk)
+                    .try_for_each(|chunk| sink.write_all(chunk))
                     .map_err(FetchError::at("writing the body", request.url())),
                 None => Err(FetchError::not_found(request.url())),
             }
@@ -1321,7 +1503,7 @@ mod tests {
                 tarball_bytes(),
             );
         }
-        Canned(served)
+        Canned::new(served)
     }
 
     /// A provisioner trusting `key` alone and reading `fetcher`.
@@ -1608,7 +1790,7 @@ mod tests {
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let now = crate::provision::now_epoch().expect("the clock is after the epoch");
         let at = |suffix: &str| format!("{DEFAULT_MIRROR}/releases/{ARCH}/autobuilds/{suffix}");
-        let bare = Canned(HashMap::from([(
+        let bare = Canned::new(HashMap::from([(
             at("latest-stage3.txt"),
             pointer_body(Some(now)).into_bytes(),
         )]));
@@ -1681,6 +1863,48 @@ mod tests {
             lost.resolve().expect_err("no mirror answered"),
             GentooError::Fetch(_),
         ));
+    }
+
+    #[test]
+    fn the_primary_leads_the_walk_whichever_order_the_two_methods_are_called_in() {
+        // The two are separate settings composed at build time, as they are on
+        // the other two builders, so a caller who names a backstop before the
+        // mirror it backs still has both.
+        let walked = |gentoo: Gentoo| gentoo.mirrors;
+        let built = |builder: GentooBuilder| walked(builder.build().expect("the builder is sound"));
+
+        assert_eq!(
+            built(
+                Gentoo::builder(ARCH)
+                    .mirror_fallback("http://b.invalid")
+                    .mirror("http://a.invalid"),
+            ),
+            ["http://a.invalid", "http://b.invalid"],
+        );
+        assert_eq!(
+            built(
+                Gentoo::builder(ARCH)
+                    .mirror("http://a.invalid")
+                    .mirror_fallback("http://b.invalid"),
+            ),
+            ["http://a.invalid", "http://b.invalid"],
+        );
+
+        // A backstop alone backs the default mirror rather than replacing it,
+        // and repeating the primary takes the last value.
+        assert_eq!(
+            built(Gentoo::builder(ARCH).mirror_fallback("http://b.invalid")),
+            [DEFAULT_MIRROR, "http://b.invalid"],
+        );
+        assert_eq!(
+            built(
+                Gentoo::builder(ARCH)
+                    .mirror("http://a.invalid")
+                    .mirror("http://c.invalid"),
+            ),
+            ["http://c.invalid"],
+        );
+        assert_eq!(built(Gentoo::builder(ARCH)), [DEFAULT_MIRROR]);
     }
 
     #[test]
@@ -1760,6 +1984,127 @@ mod tests {
     }
 
     #[test]
+    fn a_run_cancelled_at_a_step_boundary_never_reaches_the_download() {
+        // The resolution is two small documents; the download is most of a
+        // gigabyte. A caller who cancelled while watching what was resolved
+        // must not be committed to fetching it by having asked.
+        struct StopOnResolve {
+            resolved: bool,
+        }
+
+        impl crate::provision::ProvisionObserver for StopOnResolve {
+            fn progress(&mut self, event: ProvisionEvent<'_>) {
+                if let ProvisionEvent::Gentoo(GentooEvent::Resolved { .. }) = event {
+                    self.resolved = true;
+                }
+            }
+
+            fn cancelled(&mut self) -> bool {
+                self.resolved
+            }
+        }
+
+        let scratch = Scratch::for_test("gentoo", "cancel-boundary");
+        let (_key, mut gentoo) = current();
+        let cache = scratch.join("cache");
+        gentoo.cache_dir = Some(cache.clone());
+        let root = scratch.join("root");
+
+        let mut stop = StopOnResolve { resolved: false };
+        let err = crate::provision::Provision::new(&root)
+            .observe(&mut stop)
+            .run(&mut gentoo)
+            .expect_err("the observer asked it to stop");
+        assert!(
+            matches!(err, crate::provision::ProvisionError::Cancelled),
+            "{err}",
+        );
+        assert!(
+            stop.resolved,
+            "the Gentoo events reached the run's observer"
+        );
+        assert!(!root.exists(), "no root is published");
+        assert!(
+            !cache
+                .join(format!("stage3-amd64-openrc-{BUILD}.tar.xz"))
+                .exists(),
+            "nothing was downloaded",
+        );
+    }
+
+    #[test]
+    fn a_run_cancelled_while_the_tarball_arrives_stops_part_way_through_it() {
+        // The step this layer has and the others do not: one file with no
+        // package boundary inside it, so the cancellation check has to reach
+        // into the write. The observer counts how often it was asked once the
+        // tarball started arriving, which is what tells a boundary-only check
+        // from one the body itself consults.
+        struct StopMidBody {
+            fetches: usize,
+            asked: usize,
+        }
+
+        impl crate::provision::ProvisionObserver for StopMidBody {
+            fn progress(&mut self, event: ProvisionEvent<'_>) {
+                if let ProvisionEvent::Gentoo(GentooEvent::Fetching { .. }) = event {
+                    self.fetches += 1;
+                }
+            }
+
+            fn cancelled(&mut self) -> bool {
+                // The pointer and the digest document are fetched first, so the
+                // third fetch is the tarball's.
+                if self.fetches < 3 {
+                    return false;
+                }
+                self.asked += 1;
+                self.asked > 2
+            }
+        }
+
+        let scratch = Scratch::for_test("gentoo", "cancel-download");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let now = crate::provision::now_epoch().expect("the clock is after the epoch");
+        let mut served = archive(&key, Some(now));
+        // Small enough that the fixture tarball takes several writes, as a real
+        // body takes thousands.
+        served.chunk = 512;
+        let mut gentoo = provisioner(&key, Box::new(served));
+        let cache = scratch.join("cache");
+        gentoo.cache_dir = Some(cache.clone());
+        let root = scratch.join("root");
+
+        let mut stop = StopMidBody {
+            fetches: 0,
+            asked: 0,
+        };
+        let err = crate::provision::Provision::new(&root)
+            .observe(&mut stop)
+            .run(&mut gentoo)
+            .expect_err("the observer asked it to stop");
+        assert!(
+            matches!(err, crate::provision::ProvisionError::Cancelled),
+            "{err}",
+        );
+        assert!(
+            stop.asked > 2,
+            "the body itself consulted the check, {} times",
+            stop.asked,
+        );
+        assert!(!root.exists(), "no root is published");
+        // Neither the staging file nor a published cache entry survives: a
+        // partial body is not the archive's file, and a later run downloading
+        // it again is cheaper than one extracting a truncated one.
+        assert_eq!(
+            std::fs::read_dir(&cache)
+                .expect("the cache directory was created")
+                .count(),
+            0,
+            "no partial download is left behind",
+        );
+    }
+
+    #[test]
     fn a_tarball_that_is_not_what_the_document_vouched_for_is_never_extracted() {
         // The bytes are verified before the extractor sees them, so an archive
         // that is not the one the signed document named leaves no half-written
@@ -1772,7 +2117,7 @@ mod tests {
         let tarball_url = format!(
             "{DEFAULT_MIRROR}/releases/{ARCH}/autobuilds/{BUILD}/stage3-amd64-openrc-{BUILD}.tar.xz",
         );
-        served.0.insert(
+        served.served.insert(
             tarball_url,
             b"not the archive that was vouched for".to_vec(),
         );

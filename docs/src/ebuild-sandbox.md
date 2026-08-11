@@ -113,9 +113,9 @@ fcage --remove-rootfs ./gentoo-root
 ## Running the example
 
 The example lives at `crates/ferroday-cage/examples/ebuild-sandbox.rs`. It
-provisions the root through the tarball provisioner and establishes the range
-map through the subid delegate, so it builds with the `tarball` and `subid`
-features:
+provisions the root through the Gentoo provisioner — falling back to the tarball
+one for a `--stage3` file of your own — and establishes the range map through
+the subid delegate, so it builds with the `gentoo` and `subid` features:
 
 ```sh
 cargo run --example ebuild-sandbox --features gentoo,subid -- --help

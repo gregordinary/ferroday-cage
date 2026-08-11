@@ -165,7 +165,9 @@ pub enum FetchError {
         /// The HTTP status code.
         code: u16,
     },
-    /// The transport failed: connection, timeout, or a read/write error.
+    /// The transport failed: connection, timeout, a read/write error, or an
+    /// answer it refused to read — one over the size the resource may weigh,
+    /// or a redirect chain that never arrives at a body.
     #[non_exhaustive]
     Io {
         /// What the transport was doing.
@@ -250,7 +252,11 @@ impl FetchError {
     /// [`Url`](Self::Url) does not qualify. A malformed or unsupported URL is
     /// the caller's configuration rather than the mirror's state, and a walk
     /// that advanced past it would report the failure against the last mirror in
-    /// the list rather than the one that was spelled wrong.
+    /// the list rather than the one that was spelled wrong. That is all it
+    /// names: an answer over the size the resource may weigh, or a redirect
+    /// chain that never arrives at one, is what a mirror did rather than how the
+    /// caller spelled it, and each is carried as a transport failure so that a
+    /// walk treats it as one.
     ///
     /// This asks only about the transport. A digest or signature failure is not
     /// a `FetchError` at all — it is the layer's own, raised over bytes that did

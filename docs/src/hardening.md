@@ -28,7 +28,7 @@ every build.
 enrolls the sandbox in Landlock: from then on the command reaches a path only
 where a grant allows it, and every other path is denied.
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, FsAccess};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
@@ -66,7 +66,7 @@ filesystem rules: configuring any grant — filesystem or network — enrolls th
 sandbox in Landlock, and a network grant then governs both binding and
 connecting.
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, FsAccess, NetAccess};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
@@ -123,7 +123,7 @@ available through [`SeccompPolicy`]:
 - `Program` — a pre-compiled BPF program ([`SockFilter`] instructions),
   installed verbatim, for a policy produced by an external compiler.
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, SeccompPolicy};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
@@ -147,7 +147,7 @@ a [`SeccompArg`]: an argument index (0 through 5), a width, a comparison, and a
 value. Repeating a syscall accepts any of several condition sets; a syscall
 listed both plainly and with conditions matches unconditionally.
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, SeccompArg, SeccompPolicy, SeccompRules};
 # const TIOCGWINSZ: u64 = 0x5413;
 # fn main() -> ferroday_cage::Result<()> {
@@ -187,7 +187,7 @@ In a user namespace the command is mapped to root and holds every capability
 do grant power inside the sandbox. [`drop_all_capabilities`] sheds them all;
 [`keep_capabilities`] retains only a named few:
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, Capability};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
@@ -219,7 +219,7 @@ Beyond the default isolated network — a namespace whose loopback is brought up
 so the sandbox can talk to itself — [`Network::None`] leaves loopback down. The
 command has no connectivity at all, not even to `127.0.0.1`.
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, Network};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
@@ -244,7 +244,7 @@ filesystem it was given.
 [`rlimit`] sets the kernel's own per-process limits on the command, and every
 process it starts inherits them:
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, Limit, Resource, SeccompPolicy};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()

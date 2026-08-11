@@ -721,6 +721,7 @@ pub fn ferroday_cage::provision::debian::foreign_interpreter(&str) -> core::opti
 pub fn ferroday_cage::provision::debian::host_architecture() -> alloc::string::String
 pub mod ferroday_cage::provision::gentoo
 #[non_exhaustive] pub enum ferroday_cage::provision::gentoo::GentooError
+pub ferroday_cage::provision::gentoo::GentooError::Cancelled
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Config
 pub ferroday_cage::provision::gentoo::GentooError::Config::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Digest

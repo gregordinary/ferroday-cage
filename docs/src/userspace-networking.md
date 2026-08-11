@@ -53,7 +53,7 @@ gateway to the world.
 A stack is built from a [`NetStackBuilder`], attached to a pending launch, and
 stopped once the command has finished:
 
-```rust
+```rust,no_run
 # use ferroday_cage::{Cage, NetStack};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let cage = Cage::builder().rootfs("/srv/rootfs").command("/usr/bin/job").build()?;

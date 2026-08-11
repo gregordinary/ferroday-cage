@@ -58,17 +58,6 @@ fn network_enabled() -> bool {
     false
 }
 
-/// A cache directory for downloaded packages, persistent across runs so the
-/// tests do not re-download the base system each time.
-fn deb_cache() -> std::path::PathBuf {
-    let base = std::env::var_os("FERRODAY_CAGE_FIXTURE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let cache = base.join("ferroday-cage-debian-cache");
-    std::fs::create_dir_all(&cache).unwrap();
-    cache
-}
-
 #[test]
 fn hermetic_extract_only_bootstrap() {
     // A self-contained file:// repository, no network and no signature, so
@@ -1652,7 +1641,7 @@ fn extract_only_bootstraps_a_trixie_tree() {
     }
     let rootfs = common::scratch_dir("debian-extract").join("rootfs");
     let mut debian = Debian::builder("trixie")
-        .cache_dir(deb_cache())
+        .cache_dir(common::download_cache("debian"))
         .extract_only(true)
         .build()
         .expect("the builder validates");
@@ -1708,7 +1697,7 @@ fn full_bootstrap_configures_a_runnable_trixie() {
             }
         };
         let mut debian = Debian::builder("trixie")
-            .cache_dir(deb_cache())
+            .cache_dir(common::download_cache("debian"))
             .build()
             .expect("the builder validates");
         provision::ensure(&rootfs, &mut debian.observe(&mut progress))
@@ -1785,7 +1774,7 @@ fn full_bootstrap_applies_a_pre_configure_overlay() {
     let rootfs = scratch.join("rootfs");
     {
         let mut debian = Debian::builder("trixie")
-            .cache_dir(deb_cache())
+            .cache_dir(common::download_cache("debian"))
             .pre_configure_overlay(&overlay)
             .build()
             .expect("the builder validates");
@@ -1820,7 +1809,7 @@ fn layered_build_stages_only_the_increment_over_a_pristine_base() {
     let base = scratch.join("base");
     {
         let mut debian = Debian::builder("trixie")
-            .cache_dir(deb_cache())
+            .cache_dir(common::download_cache("debian"))
             .build()
             .expect("the builder validates");
         provision::ensure(&base, &mut debian).expect("the base bootstrap runs");
@@ -1842,7 +1831,7 @@ fn layered_build_stages_only_the_increment_over_a_pristine_base() {
         let mut debian = Debian::builder("trixie")
             .base_layer(&base)
             .include(["hello"])
-            .cache_dir(deb_cache())
+            .cache_dir(common::download_cache("debian"))
             .build()
             .expect("the builder validates");
         debian
@@ -1941,7 +1930,7 @@ fn layered_build_under_a_range_map_disposes_of_a_subordinate_owned_upper() {
     {
         let mut debian = Debian::builder("trixie")
             .identity_map(ferroday_cage::IdentityMap::Subordinate)
-            .cache_dir(deb_cache())
+            .cache_dir(common::download_cache("debian"))
             .build()
             .expect("the builder validates");
         provision::ensure(&base, &mut debian).expect("the range-mapped base bootstrap runs");
@@ -1959,7 +1948,7 @@ fn layered_build_under_a_range_map_disposes_of_a_subordinate_owned_upper() {
             .identity_map(ferroday_cage::IdentityMap::Subordinate)
             .base_layer(&base)
             .include(["hello"])
-            .cache_dir(deb_cache())
+            .cache_dir(common::download_cache("debian"))
             .build()
             .expect("the builder validates");
         debian
@@ -2026,7 +2015,7 @@ fn full_bootstrap_under_a_range_map_carries_real_ownership() {
         };
         let mut debian = Debian::builder("trixie")
             .identity_map(ferroday_cage::IdentityMap::Subordinate)
-            .cache_dir(deb_cache())
+            .cache_dir(common::download_cache("debian"))
             .build()
             .expect("the builder validates");
         provision::ensure(&rootfs, &mut debian.observe(&mut progress))

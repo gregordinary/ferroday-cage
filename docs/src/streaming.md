@@ -151,7 +151,11 @@ A closure taking a `Progress` is an observer, for a caller that wants the
 milestones and nothing else:
 
 ```rust
+# use ferroday_cage::{Cage, Progress};
+# fn report(cage: Cage) -> ferroday_cage::Result<()> {
 cage.run_with(&mut |event: Progress| eprintln!("{event:?}"))?;
+# Ok(())
+# }
 ```
 
 A closure cannot receive the command's output, because it has no way to say
