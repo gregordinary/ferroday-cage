@@ -1,24 +1,24 @@
-//! Layered build roots: install a delta over a shared base into a disposable
-//! overlay upper.
+//! Layered build roots: what a Debian base layer already carries.
 //!
 //! A build pipeline provisions a base system once, then per component stages
 //! only that component's build dependencies over it — resolving against the base
 //! as already-installed, extracting the increment into an overlay upper, and
 //! configuring it in a cage rooted on an overlay of the pristine base. The base
-//! is never mutated; the increment lives in the upper, which the returned
-//! [`BuildLayer`] removes when dropped.
+//! is never mutated; the increment lives in the upper, which the
+//! [`BuildLayer`](crate::provision::BuildLayer) the staging returns removes when
+//! dropped.
 //!
-//! This module holds the two self-contained pieces: reading a base's
-//! already-installed set for the resolver, and the [`BuildLayer`] disposal
-//! handle. The staging and configure orchestration lives in the [parent
-//! module](super) beside the full-bootstrap pipeline it reuses.
+//! This module holds the one self-contained piece: reading a base's
+//! already-installed set for the resolver. The staging and configure
+//! orchestration lives in the [parent module](super) beside the full-bootstrap
+//! pipeline it reuses.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::DebianError;
-use super::index::{parse_provides, parse_stanzas};
-use crate::IdentityMap;
+use super::index::parse_provides;
+use crate::provision::document;
 
 /// Reads a base layer's already-installed set: every configured package's name
 /// and the virtual packages those packages provide, in one set.
@@ -65,7 +65,7 @@ pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianE
     };
 
     let mut installed = HashSet::new();
-    for stanza in parse_stanzas(&text) {
+    for stanza in document::parse(&text) {
         let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status")) else {
             continue;
         };
@@ -108,81 +108,6 @@ fn is_configured(status: &str) -> bool {
     let mut words = status.split_ascii_whitespace();
     let (_want, flag, state) = (words.next(), words.next(), words.next());
     words.next().is_none() && flag == Some("ok") && state == Some("installed")
-}
-
-/// A staged build layer: the disposable overlay upper an increment was installed
-/// into, removed when the handle is dropped.
-///
-/// Returned by [`Debian::stage_layer`](super::Debian::stage_layer). The upper it
-/// owns is the writable layer of a build root — the caller roots a cage on
-/// [`overlay_rootfs(base, layer.path())`](crate::CageBuilder::overlay_rootfs) to
-/// build against the merged `base + increment` view. Dropping the handle removes
-/// the upper and the overlay's work directory beside it, reverting the increment
-/// and leaving the base pristine; the base is a separate directory the handle
-/// never touches.
-///
-/// Keep the handle alive for as long as the build root is in use, and drop it to
-/// dispose of the increment. The removal is best-effort at drop time — a drop
-/// cannot report an error — so a caller that must observe a disposal failure
-/// removes the upper directory explicitly through
-/// [`provision::remove`](crate::provision::remove) before dropping the handle,
-/// which then finds nothing to remove.
-#[derive(Debug)]
-pub struct BuildLayer {
-    /// The overlay upper the increment was installed into: the build root's
-    /// writable layer.
-    upper: PathBuf,
-    /// The overlay work directory beside the upper. The kernel leaves a mode-`0`
-    /// directory here that a plain recursive delete cannot descend, so disposal
-    /// treats it specially.
-    work: PathBuf,
-    /// The identity map the increment was configured under, which decides how the
-    /// upper and work directory are removed.
-    identity_map: IdentityMap,
-}
-
-impl BuildLayer {
-    /// Builds a layer handle over a staged `upper`, computing the sibling work
-    /// directory the overlay-rooted cage manages so disposal removes both.
-    pub(super) fn new(upper: &Path, identity_map: IdentityMap) -> BuildLayer {
-        // The work directory is the same sibling an overlay-rooted cage derives
-        // from this upper; a canonical upper always has a parent and file name,
-        // so the fallback to the upper itself is unreachable in practice and
-        // simply makes disposal a no-op rather than panicking.
-        let work = crate::spec::overlay_work_dir(upper).unwrap_or_else(|| upper.to_path_buf());
-        BuildLayer {
-            upper: upper.to_path_buf(),
-            work,
-            identity_map,
-        }
-    }
-
-    /// The overlay upper directory, the build root's writable layer.
-    ///
-    /// Pass it as the upper of
-    /// [`CageBuilder::overlay_rootfs`](crate::CageBuilder::overlay_rootfs), with
-    /// the base as the lower, to root a build cage on the merged view.
-    pub fn path(&self) -> &Path {
-        &self.upper
-    }
-}
-
-impl Drop for BuildLayer {
-    fn drop(&mut self) {
-        // Under the single-identity map every entry is the caller's own, but the
-        // overlay leaves a mode-`0` work directory a plain delete cannot descend;
-        // a chmod-aware removal restores traversable permissions as it goes.
-        // Under a range map the increment and the work directory hold
-        // subordinate-owned entries the caller cannot chmod, so the removal
-        // escalates through the identity map, where root inside it owns them.
-        if matches!(self.identity_map, IdentityMap::Single) {
-            crate::host::force_remove_dir_all(&self.upper);
-            crate::host::force_remove_dir_all(&self.work);
-        } else {
-            let _ = crate::provision::remove(&self.upper);
-            let _ = crate::provision::remove(&self.work);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -234,35 +159,5 @@ mod tests {
             read_installed_set(&empty),
             Err(DebianError::Config { .. }),
         ));
-    }
-
-    #[test]
-    fn a_single_map_layer_drop_removes_the_upper_and_work_tree() {
-        // A single-identity layer disposes of its upper and the overlay work
-        // directory, including a mode-`0` work/work directory a plain recursive
-        // delete cannot descend — the artifact an overlay mount leaves behind.
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = Scratch::for_test("layer", "dispose-single");
-        let upper = dir.join("upper");
-        std::fs::create_dir_all(upper.join("usr/bin")).unwrap();
-        std::fs::write(upper.join("usr/bin/tool"), b"x").unwrap();
-
-        let work = crate::spec::overlay_work_dir(&upper).unwrap();
-        std::fs::create_dir_all(work.join("work")).unwrap();
-        std::fs::write(work.join("index"), b"i").unwrap();
-        // The overlay artifact: a directory with no permissions at all.
-        std::fs::set_permissions(work.join("work"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
-
-        let layer = BuildLayer::new(&upper, IdentityMap::Single);
-        assert_eq!(layer.path(), upper.as_path());
-        drop(layer);
-
-        assert!(!upper.exists(), "the upper is removed");
-        assert!(
-            !work.exists(),
-            "the work directory is removed despite mode-0"
-        );
     }
 }

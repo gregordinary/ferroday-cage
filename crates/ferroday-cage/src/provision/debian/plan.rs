@@ -10,11 +10,9 @@
 //! [`DebianBuilder::plan`](super::DebianBuilder::plan) covers resolving once
 //! and installing once, and nothing else.
 
-use std::fmt;
-use std::fmt::Write as _;
-
 use super::DebianError;
-use super::index::{Package, parse_stanzas};
+use super::index::Package;
+use crate::provision::document::{self, Carried, Draft};
 
 /// The document's first field, naming the format and its version.
 ///
@@ -211,23 +209,6 @@ pub struct PlannedPackage {
     carried: Carried,
 }
 
-/// The fields of one stanza that the reading version did not recognize, in the
-/// order the document wrote them.
-///
-/// A plan document is meant to outlive the program that wrote it, so a reader
-/// ignores a field it does not know rather than refusing the document. Ignoring
-/// it on the way in and dropping it on the way out are different things: a
-/// consumer that reads a plan and writes it back — into a provenance record, or
-/// to normalize a file it commits — would silently discard whatever a newer
-/// writer had added. So the fields are carried, and re-emitted after the ones
-/// this version does know.
-///
-/// A round trip therefore preserves every field. It does not promise byte
-/// identity across versions: a future writer may interleave its own fields with
-/// these rather than append them, and this version cannot know where they
-/// belong.
-type Carried = Vec<(String, String)>;
-
 impl Plan {
     /// Renders the plan as a deb822 document.
     ///
@@ -247,15 +228,15 @@ impl Plan {
     /// as something else.
     pub fn to_document(&self) -> Result<String, DebianError> {
         let mut out = String::new();
-        let mut header = Stanza::new();
+        let mut header = Draft::new();
         header.put("Format", FORMAT);
         header.put("Suite", &self.suite);
         header.put("Architecture", &self.architecture);
         header.put_carried(&self.carried);
-        header.render(&mut out)?;
+        header.render(&mut out).map_err(document)?;
 
         for (index, archive) in self.archives.iter().enumerate() {
-            let mut stanza = Stanza::new();
+            let mut stanza = Draft::new();
             stanza.put("Archive", &index.to_string());
             stanza.put("Mirror", &archive.mirror);
             stanza.put("Suite", &archive.suite);
@@ -269,7 +250,7 @@ impl Plan {
             stanza.put_allowing_empty("Signed-By", &archive.signed_by.join(" "));
             stanza.put_allowing_empty("Signing-Key", &archive.signing_key.join(" "));
             stanza.put_carried(&archive.carried);
-            stanza.render(&mut out)?;
+            stanza.render(&mut out).map_err(document)?;
         }
 
         for package in &self.packages {
@@ -281,7 +262,7 @@ impl Plan {
                     self.archives.len(),
                 )));
             }
-            let mut stanza = Stanza::new();
+            let mut stanza = Draft::new();
             stanza.put("Package", &package.name);
             stanza.put("Version", &package.version);
             stanza.put("Architecture", &package.architecture);
@@ -300,7 +281,7 @@ impl Plan {
             stanza.put_optional("Installed-Size", installed_size.as_deref());
             stanza.put_optional("Source", package.source.as_deref());
             stanza.put_carried(&package.carried);
-            stanza.render(&mut out)?;
+            stanza.render(&mut out).map_err(document)?;
         }
         Ok(out)
     }
@@ -321,7 +302,7 @@ impl Plan {
     /// cannot do without, a malformed archive index, or a package naming an
     /// archive the document does not carry.
     pub fn parse_document(text: &str) -> Result<Plan, DebianError> {
-        let stanzas = parse_stanzas(text);
+        let stanzas = document::parse(text);
         let (header, rest) = stanzas
             .split_first()
             .ok_or_else(|| document("the document holds no stanzas".to_string()))?;
@@ -339,7 +320,7 @@ impl Plan {
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             packages: Vec::new(),
             archives: Vec::new(),
-            carried: carried(header, HEADER_FIELDS),
+            carried: document::carried(header, HEADER_FIELDS),
         };
 
         for stanza in rest {
@@ -375,7 +356,7 @@ impl Plan {
                     // document that does was written by hand, and echoing it back
                     // unchanged is what keeps the round trip byte-faithful.
                     source: stanza.get("Source").map(str::to_string),
-                    carried: carried(stanza, PACKAGE_FIELDS),
+                    carried: document::carried(stanza, PACKAGE_FIELDS),
                 });
                 continue;
             }
@@ -397,7 +378,7 @@ impl Plan {
             plan.archives.push(ResolvedArchive {
                 mirror: required(stanza.get("Mirror"), "Mirror", &at_archive)?,
                 suite: required(stanza.get("Suite"), "Suite", &at_archive)?,
-                components: list(stanza.get("Components")),
+                components: document::list(stanza.get("Components")),
                 release_sha256: required(
                     stanza.get("Release-SHA256"),
                     "Release-SHA256",
@@ -405,9 +386,9 @@ impl Plan {
                 )?,
                 date: stanza.get("Date").map(str::to_string),
                 valid_until: stanza.get("Valid-Until").map(str::to_string),
-                signed_by: list(stanza.get("Signed-By")),
-                signing_key: list(stanza.get("Signing-Key")),
-                carried: carried(stanza, ARCHIVE_FIELDS),
+                signed_by: document::list(stanza.get("Signed-By")),
+                signing_key: document::list(stanza.get("Signing-Key")),
+                carried: document::carried(stanza, ARCHIVE_FIELDS),
             });
         }
         Ok(plan)
@@ -486,146 +467,6 @@ impl PlannedPackage {
     }
 }
 
-/// A field's name: one this version writes, or one it is only passing through.
-enum Name {
-    Known(&'static str),
-    Carried(String),
-}
-
-impl fmt::Display for Name {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Name::Known(name) => f.write_str(name),
-            Name::Carried(name) => f.write_str(name),
-        }
-    }
-}
-
-/// One field of a stanza being written.
-struct Field {
-    name: Name,
-    value: String,
-    /// Whether an empty value is an answer here rather than a missing one. An
-    /// unsigned repository's `Signed-By` is empty and means it; a `Suite` that
-    /// came out empty is a plan that cannot be written.
-    may_be_empty: bool,
-}
-
-/// One stanza being written: its fields in the order they will appear.
-///
-/// Collected before anything is written, so a value the format cannot carry
-/// stops the whole document rather than truncating it mid-stanza.
-struct Stanza {
-    fields: Vec<Field>,
-}
-
-impl Stanza {
-    fn new() -> Stanza {
-        Stanza { fields: Vec::new() }
-    }
-
-    /// Adds a field that must carry a value.
-    fn put(&mut self, name: &'static str, value: &str) {
-        self.fields.push(Field {
-            name: Name::Known(name),
-            value: value.to_string(),
-            may_be_empty: false,
-        });
-    }
-
-    /// Adds a field whose value may be empty, where empty is itself the answer.
-    fn put_allowing_empty(&mut self, name: &'static str, value: &str) {
-        self.fields.push(Field {
-            name: Name::Known(name),
-            value: value.to_string(),
-            may_be_empty: true,
-        });
-    }
-
-    /// Adds a field only when the source carries one, so an absent value reads
-    /// back as absent rather than as empty.
-    fn put_optional(&mut self, name: &'static str, value: Option<&str>) {
-        if let Some(value) = value {
-            self.put(name, value);
-        }
-    }
-
-    /// Adds a space-separated list field, which may be empty.
-    fn put_list(&mut self, name: &'static str, values: &[String]) {
-        self.put_allowing_empty(name, &values.join(" "));
-    }
-
-    /// Appends the fields a document carried that this version does not know,
-    /// after every field it does.
-    ///
-    /// Their names are owned rather than static, since they came off a document
-    /// rather than out of this file. An empty value is written as one, because
-    /// the writer that produced it meant it.
-    fn put_carried(&mut self, carried: &Carried) {
-        for (name, value) in carried {
-            self.fields.push(Field {
-                name: Name::Carried(name.clone()),
-                value: value.clone(),
-                may_be_empty: true,
-            });
-        }
-    }
-
-    /// Writes the stanza and the blank line that ends it.
-    fn render(&self, out: &mut String) -> Result<(), DebianError> {
-        for field in &self.fields {
-            let name = &field.name;
-            // A carried name came off a document rather than out of this file,
-            // so it is checked as the values are: a name holding a colon or
-            // whitespace would read back as a different field, or as no field
-            // at all.
-            if let Name::Carried(carried) = name
-                && (carried.is_empty()
-                    || carried.contains([':', '\n', '\r'])
-                    || carried.trim() != carried)
-            {
-                return Err(document(format!(
-                    "the document carried a field named {carried:?}, which cannot be written \
-                     back as a field name",
-                )));
-            }
-            if field.value.contains(['\n', '\r']) {
-                return Err(document(format!(
-                    "the {name} value spans more than one line, which a plan document cannot \
-                     carry",
-                )));
-            }
-            // A reader strips the whitespace around a value, so a value
-            // carrying any of its own would not survive being written and read
-            // back. A leading one is worse still: deb822's continuation marker
-            // is a leading space, so such a value would be folded into the
-            // field above it.
-            if field.value.trim() != field.value {
-                return Err(document(format!(
-                    "the {name} value begins or ends with whitespace, which a reader strips, \
-                     so the document would not read back as the plan that wrote it",
-                )));
-            }
-            if field.value.is_empty() && !field.may_be_empty {
-                return Err(document(format!("the {name} value is empty")));
-            }
-            // An empty value is written as a bare `Name:`, with no space after
-            // the colon. `Name: ` would be the only line the format can
-            // produce that ends in whitespace, and it would appear exactly
-            // where a repository is trusted unsigned — so a committed plan
-            // would stop matching its own digest the first time an editor or a
-            // pre-commit hook stripped the line, without the plan changing.
-            if field.value.is_empty() {
-                let _ = writeln!(out, "{name}:");
-            } else {
-                let _ = writeln!(out, "{name}: {}", field.value);
-            }
-        }
-        out.push('\n');
-        Ok(())
-    }
-}
-
 /// The header fields this version writes and reads.
 ///
 /// The three tables exist so that "a field this version does not know" has one
@@ -658,33 +499,6 @@ const PACKAGE_FIELDS: &[&str] = &[
     "Source",
 ];
 
-/// Collects the stanza's fields that `known` does not name, in document order.
-///
-/// Matched case-insensitively, as every other lookup in this format is, so a
-/// document spelling `sha256` does not have that field both read as known and
-/// carried as unknown — which would write it out twice.
-fn carried(stanza: &super::index::Stanza, known: &[&str]) -> Carried {
-    stanza
-        .fields()
-        .iter()
-        .filter(|(name, _)| {
-            !known
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(name))
-        })
-        .cloned()
-        .collect()
-}
-
-/// Reads a required field, naming where it was missing from.
-fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, DebianError> {
-    match value {
-        Some(value) if !value.is_empty() => Ok(value.to_string()),
-        Some(_) => Err(document(format!("{at} has an empty {field} field"))),
-        None => Err(document(format!("{at} has no {field} field"))),
-    }
-}
-
 /// Reads an optional size field, absent giving no value.
 ///
 /// A value that is not a number refuses the document rather than reading as
@@ -702,13 +516,13 @@ fn kibibytes(value: Option<&str>, at: &str) -> Result<Option<u64>, DebianError> 
     }
 }
 
-/// Reads a space-separated list field, absent or empty giving no entries.
-fn list(value: Option<&str>) -> Vec<String> {
-    value
-        .unwrap_or_default()
-        .split_ascii_whitespace()
-        .map(str::to_string)
-        .collect()
+/// Reads a required field, reporting a refusal as this layer's document
+/// failure.
+///
+/// The rule is [`document::required`]'s and is shared with every other layer;
+/// only whose document the refusal is about belongs here.
+fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, DebianError> {
+    document::required(value, field, at).map_err(document)
 }
 
 /// Builds the document error.
@@ -1023,7 +837,7 @@ mod tests {
     /// carried.
     fn as_an_older_reader_rewrites(document: &str) -> String {
         let mut out = String::new();
-        for stanza in parse_stanzas(document) {
+        for stanza in document::parse(document) {
             let known: &[&str] = if stanza.get("Package").is_some() {
                 PACKAGE_FIELDS_AS_FIRST_WRITTEN
             } else if stanza.get("Archive").is_some() {

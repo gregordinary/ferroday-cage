@@ -32,8 +32,9 @@
 //! throwaway overlay upper. The build then runs in a cage rooted on
 //! [`overlay_rootfs`](ferroday_cage::CageBuilder::overlay_rootfs) — the pristine
 //! base as the read-only lower, the increment as the writable upper — and the
-//! layer's [`BuildLayer`] drop discards the upper afterward. The base is never
-//! mutated and is ready for the next component unchanged.
+//! layer's [`BuildLayer`](ferroday_cage::provision::BuildLayer) drop discards
+//! the upper afterward. The base is never mutated and is ready for the next
+//! component unchanged.
 //!
 //! # The feed-forward pool
 //!

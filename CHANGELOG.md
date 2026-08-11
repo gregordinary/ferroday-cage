@@ -30,6 +30,13 @@ affected.
   `DebianError::Fetch` where it previously returned `DebianError::Config` or
   `DebianError::Io`.
 
+- `BuildLayer` is `provision::BuildLayer`, moved out of `provision::debian` for
+  the same reason. It is the overlay upper a layered build installs into and the
+  handle that disposes of it — a path, the work directory beside it, and the
+  identity map that decides how both are removed — with nothing in it about any
+  particular userland. Every userland provisioner that stages an increment
+  returns one. No re-export is left at the old path.
+
 - Every OS failure a library error carries is now an `io::Error` and is returned
   from `source()`. `Error`, `ConfigError`, `IdMapError`, and `NetStackError`
   stored a raw `errno: i32` and then rendered it by constructing an `io::Error`
@@ -65,6 +72,44 @@ affected.
   carries a blanket impl for one — so existing callers are unaffected.
 
 ### Added
+
+- The `alpine` feature: a provisioner for an Alpine Linux userland, reached
+  through `provision::alpine::{Alpine, AlpineBuilder, AlpineError, AlpineEvent}`.
+  It resolves a package set from one or more apk repositories, verifies each
+  index's RSA signature against a bundled key set, binds every package to the
+  index that named it, and installs the closure — extraction in one wave, the
+  packages' own install scripts in a second, both in dependency order, with the
+  scripts running inside a cage rooted at the staging tree. The finished root
+  carries `/lib/apk/db/installed`, `/etc/apk/world`, `/etc/apk/repositories`,
+  `/etc/apk/arch` and the repositories' trusted keys, so an `apk` inside it reads
+  back what the bootstrap wrote.
+
+  The surface mirrors the Debian layer's: the same builder setters, `resolve`,
+  `available`, `plan` and `pin` with a plan document of its own, `base_layer` /
+  `resolve_layer` / `stage_layer` for layered build roots, and an `observe()`
+  sink over `AlpineEvent` carrying the same progress, reported through
+  `ProvisionEvent::Alpine`. Where the two differ, the archive is why:
+  there is no priority band, so the install set is exactly what `include` names
+  closed over its dependencies; there is no unsigned mode and no validity
+  window, so nothing corresponds to `trust_unsigned` or `allow_stale_release`;
+  and `extract_only` still writes the installed database, an apk record being a
+  file format rather than a program's output. The
+  [guide chapter](https://gregordinary.github.io/ferroday-cage/alpine.html)
+  enumerates the rest.
+
+  postmarketOS is served by the same code: its repositories are byte-identical
+  apk on a path one level shallower, so a `Repository` that names no components
+  takes that layout, and `KeySet::postmarketos` is the bundled trust anchor for
+  it.
+
+  An `alpine`-only build is lighter than a `debian` one — no OpenPGP
+  implementation — and adds nothing new to a graph that already has `debian`:
+  `rsa`, `sha1`, `pkcs8` and `spki` were transitive dependencies of rPGP
+  already.
+
+- `fcage --provision-alpine RELEASE`, with the `--alpine-*` options mapping onto
+  the builder as the `--debian-*` set does. The two provisioners are mutually
+  exclusive.
 
 - `ExitStatus::shell_code` and `Error::shell_code` return the process exit code
   a launcher reports: the command's own code or `128 + signal` for the first,

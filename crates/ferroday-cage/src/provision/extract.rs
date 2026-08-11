@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -133,7 +133,7 @@ impl Extraction {
     /// A caller assembling such a root states the mode instead. `./` entries are
     /// then ignored, and the root's modification time is left as the filesystem
     /// set it.
-    #[cfg(feature = "debian")]
+    #[cfg(any(feature = "debian", feature = "alpine"))]
     pub(crate) fn root_mode(mut self, mode: u32) -> Extraction {
         self.root_meta = Some(DirMeta { mode, mtime: None });
         self.root_mode_fixed = true;
@@ -845,7 +845,7 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// unprivileged, and that have no place in a configuration overlay — device
 /// nodes, FIFOs, sockets — are skipped, as archive extraction skips device
 /// nodes.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 pub(crate) fn overlay_tree(root: &Path, source: &Path) -> Result<(), ProvisionError> {
     let root_fd = rustix::fs::open(
         root,
@@ -857,7 +857,7 @@ pub(crate) fn overlay_tree(root: &Path, source: &Path) -> Result<(), ProvisionEr
 }
 
 /// One item of the overlay walk's stack.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 enum OverlayStep {
     /// Copy this source entry in beneath the current destination directory.
     Visit(PathBuf),
@@ -878,7 +878,7 @@ enum OverlayStep {
 /// destination directory relative to the root, empty at the top; each directory
 /// pushes a [`OverlayStep::Leave`] marker beneath its children, which pops that
 /// name back off once they are all done.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_dir(root: BorrowedFd<'_>, source_dir: &Path) -> Result<(), ProvisionError> {
     let mut components: Vec<Vec<u8>> = Vec::new();
     let mut pending = Vec::new();
@@ -918,7 +918,7 @@ fn overlay_dir(root: BorrowedFd<'_>, source_dir: &Path) -> Result<(), ProvisionE
 ///
 /// They go on in reverse so they pop in name order: `read_dir` order is
 /// filesystem-dependent, and the walk must be deterministic.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 fn push_children(dir: &Path, pending: &mut Vec<OverlayStep>) -> Result<(), ProvisionError> {
     let read = |err| ProvisionError::io("reading the overlay directory", dir, err);
     let mut children: Vec<PathBuf> = fs::read_dir(dir)
@@ -933,7 +933,7 @@ fn push_children(dir: &Path, pending: &mut Vec<OverlayStep>) -> Result<(), Provi
 
 /// Creates the overlay directory named by `components`, or merges into one
 /// already present, replacing a non-directory in the way.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_mkdir(
     root: BorrowedFd<'_>,
     source_path: &Path,
@@ -984,7 +984,7 @@ fn overlay_mkdir(
 /// Copies the overlay file named by `components`, replacing whatever occupies
 /// the name; the leaf is created `O_NOFOLLOW`, so a symlink in the way is
 /// replaced rather than written through.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_file(
     root: BorrowedFd<'_>,
     source_path: &Path,
@@ -1022,7 +1022,7 @@ fn overlay_file(
 
 /// Recreates the overlay symlink named by `components`, its target stored
 /// verbatim and never resolved, replacing whatever occupies the name.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_symlink(
     root: BorrowedFd<'_>,
     source_path: &Path,
@@ -1046,7 +1046,7 @@ fn overlay_symlink(
 }
 
 /// The permission bits of `path`, without following a final symlink.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "alpine"))]
 fn source_mode(path: &Path) -> Result<u32, ProvisionError> {
     let stat = rustix::fs::statat(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|errno| ProvisionError::io("inspecting the overlay entry", path, errno.into()))?;

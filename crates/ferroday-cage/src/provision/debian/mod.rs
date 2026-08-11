@@ -60,7 +60,6 @@ use std::path::{Path, PathBuf};
 pub use arch::{Interpreter, foreign_interpreter, host_architecture};
 pub use available::Available;
 pub use index::{ParsePriorityError, Priority, build_depend_names};
-pub use layer::BuildLayer;
 pub use pin::{UnheldPin, UnheldReason};
 pub use plan::{Plan, PlannedPackage, ResolvedArchive};
 pub use pool::Pool;
@@ -69,14 +68,17 @@ pub use repository::{Repository, RepositoryBuilder};
 use super::coordinate::{self, Nesting};
 use super::extract::Extraction;
 use super::{
-    Delegate, Fetch, FetchError, FetchRequest, HttpFetch, ProvisionError, ProvisionEvent,
-    ProvisionRequest, Provisioner, staging_path,
+    BuildLayer, Delegate, Fetch, FetchError, FetchRequest, HttpFetch, PackageCache, ProvisionError,
+    ProvisionEvent, ProvisionRequest, Provisioner, staging_path,
 };
 use crate::IdentityMap;
 use crate::status::ExitStatus;
 use bootstrap::{Installable, StatOverride};
 use index::{Index, Package};
 use pin::Pins;
+
+/// The suffix a run-owned `.deb` cache takes on the tree it is building.
+const DEB_CACHE: &str = ".fcage-debs";
 use release::{Keyring, Release};
 
 /// The mode a bootstrapped rootfs's own root directory takes.
@@ -581,7 +583,7 @@ impl<'a> Debian<'a> {
 
         // The archives cache: the caller's shared one, or a sibling of the
         // upper, which goes with this frame however it ends.
-        let archives = Archives::beside(upper, self.cache_dir.as_deref());
+        let archives = PackageCache::beside(upper, self.cache_dir.as_deref(), DEB_CACHE);
 
         // Resolve the increment against the base's installed set, download it,
         // extract it into the upper, and configure it through the overlay.
@@ -1417,7 +1419,7 @@ fn bootstrap_suite(
 
     // The cache disposes of itself when this frame ends, on the failure paths
     // below as on the success path.
-    let archives = Archives::beside(staging, cache_dir);
+    let archives = PackageCache::beside(staging, cache_dir, DEB_CACHE);
     let installables = acquire_debs(fetcher, repositories, &packages, archives.path(), observer)?;
 
     let statoverride = stage_extract(
@@ -2028,63 +2030,6 @@ fn fetch_verified(
         let _ = std::fs::remove_file(&staged);
     }
     published
-}
-
-/// The directory a run downloads its `.deb`s into, and whether the run owns it.
-///
-/// A caller that names a [`cache_dir`](DebianBuilder::cache_dir) owns it: it
-/// survives the run, which is the whole point of naming one. A run that names
-/// none downloads into a derived sibling of the tree it is building, and that
-/// directory is the run's own.
-///
-/// A derived cache is removed when the value is dropped rather than at the end
-/// of the successful path, so a failure disposes of it exactly as a success
-/// does. Every `?` between creating the cache and finishing the bootstrap would
-/// otherwise leave a base system's worth of `.deb`s beside a rootfs that was
-/// never published, and nothing later clears it: the publication's own cleanup
-/// removes the staging tree, and [`provision::remove`](super::remove) removes
-/// the destination and its lock, neither of which this is.
-struct Archives {
-    path: PathBuf,
-    owned: bool,
-}
-
-impl Archives {
-    /// The cache for a run building `tree`: the caller's, or a sibling of the
-    /// tree named after it.
-    ///
-    /// A sibling, not a child: an extracted package's entries land under the
-    /// tree, so a cache beneath it could be overwritten before it is read, but a
-    /// sibling is out of the extraction's contained reach.
-    fn beside(tree: &Path, cache_dir: Option<&Path>) -> Archives {
-        match cache_dir {
-            Some(dir) => Archives {
-                path: dir.to_path_buf(),
-                owned: false,
-            },
-            None => {
-                let mut sibling = tree.as_os_str().to_os_string();
-                sibling.push(".fcage-debs");
-                Archives {
-                    path: PathBuf::from(sibling),
-                    owned: true,
-                }
-            }
-        }
-    }
-
-    /// The directory itself, to download into and to bind into the cages.
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for Archives {
-    fn drop(&mut self) {
-        if self.owned {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 }
 
 /// One `.deb` to acquire: what the download needs and nothing else.
@@ -3079,7 +3024,7 @@ mod tests {
         append_component(&mut merged, "Package: a\nVersion: 1\n");
         append_component(&mut merged, "Package: b\nVersion: 2\n");
         assert_eq!(merged, "Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n");
-        let stanzas = index::parse_stanzas(&merged);
+        let stanzas = crate::provision::document::parse(&merged);
         let names: Vec<_> = stanzas
             .iter()
             .filter_map(|stanza| stanza.get("Package"))

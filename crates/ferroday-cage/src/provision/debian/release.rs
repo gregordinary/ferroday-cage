@@ -13,7 +13,7 @@ use pgp::crypto::hash::HashAlgorithm;
 use pgp::packet::{Signature, SignatureType, SubpacketData};
 use pgp::types::{KeyDetails, PublicParams, RsaPublicParams, Tag, Timestamp, VerifyingKey};
 
-use super::index::parse_stanzas;
+use crate::provision::document;
 
 /// A failure verifying or reading the release.
 #[derive(Debug)]
@@ -877,7 +877,7 @@ impl Release {
     /// Parses a release body (the verified `InRelease` text, or a trusted
     /// `Release`).
     pub(crate) fn parse(body: &str) -> Result<Release, ReleaseError> {
-        let stanza = parse_stanzas(body)
+        let stanza = document::parse(body)
             .into_iter()
             .next()
             .ok_or_else(|| ReleaseError::Release("the release file is empty".to_string()))?;

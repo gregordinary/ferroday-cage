@@ -1350,7 +1350,7 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`base_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.base_layer
 [`stage_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.stage_layer
 [`resolve_layer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Debian.html#method.resolve_layer
-[`BuildLayer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.BuildLayer.html
+[`BuildLayer`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/struct.BuildLayer.html
 [`overlay_rootfs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_rootfs
 [`host::overlay_blocker`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.overlay_blocker.html
 [RFC 3986 §3.1]: https://www.rfc-editor.org/rfc/rfc3986#section-3.1

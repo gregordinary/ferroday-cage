@@ -88,18 +88,20 @@ const _: () = assert_send_sync::<ferroday_cage::provision::Export<'_>>();
 const _: () = assert_send::<ferroday_cage::provision::Tarball>();
 
 // ---------------------------------------------------------------------------
-// The transport seam, shared by every userland provisioner.
+// What every userland provisioner shares: the transport seam, and the overlay
+// upper a layered build stages into.
 // ---------------------------------------------------------------------------
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
-mod transport {
-    use ferroday_cage::provision::{FetchError, FetchRequest, HttpFetch};
+mod shared {
+    use ferroday_cage::provision::{BuildLayer, FetchError, FetchRequest, HttpFetch};
 
     use super::*;
 
     const _: () = assert_send_sync::<FetchError>();
     const _: () = assert_send_sync::<FetchRequest<'_>>();
     const _: () = assert_send_sync::<HttpFetch>();
+    const _: () = assert_send_sync::<BuildLayer>();
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +122,6 @@ mod debian {
     const _: () = assert_send_sync::<debian::RepositoryBuilder>();
     const _: () = assert_send_sync::<debian::Stream>();
     const _: () = assert_send_sync::<debian::Pool>();
-    const _: () = assert_send_sync::<debian::BuildLayer>();
     const _: () = assert_send_sync::<debian::DebianEvent<'_>>();
 
     // `Fetch` requires `Send` so that a provisioner, which owns its transport,
@@ -129,6 +130,29 @@ mod debian {
     // because every operation on a `Debian` takes `&mut self`.
     const _: () = assert_send::<debian::Debian<'_>>();
     const _: () = assert_send::<debian::DebianBuilder<'_>>();
+}
+
+// ---------------------------------------------------------------------------
+// The Alpine provisioner.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "alpine")]
+mod alpine {
+    use ferroday_cage::provision::alpine;
+
+    use super::*;
+
+    const _: () = assert_send_sync::<alpine::AlpineError>();
+    const _: () = assert_send_sync::<alpine::Available>();
+    const _: () = assert_send_sync::<alpine::KeySet>();
+    const _: () = assert_send_sync::<alpine::Repository>();
+    const _: () = assert_send_sync::<alpine::RepositoryBuilder>();
+
+    // Send and not Sync, for the reason the Debian provisioner is: the
+    // provisioner owns its transport, and every operation on it takes
+    // `&mut self`.
+    const _: () = assert_send::<alpine::Alpine>();
+    const _: () = assert_send::<alpine::AlpineBuilder>();
 }
 
 // ---------------------------------------------------------------------------

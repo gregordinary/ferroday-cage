@@ -30,9 +30,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
 
-use super::index::parse_stanzas;
 use super::repository::{Repository, Trust};
 use super::{DebianError, DebianEvent, DebianObserver, Stream};
+use crate::provision::document;
 use crate::provision::rooted::Rooted;
 use crate::{Cage, CageBuilder, IdentityMap, Observer, Stdio};
 
@@ -672,7 +672,7 @@ fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianErro
     let text =
         read_text(tree, STATUS).map_err(at("reading the dpkg status database", tree, STATUS))?;
     let mut installed = HashSet::new();
-    for stanza in parse_stanzas(&text) {
+    for stanza in document::parse(&text) {
         if let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status"))
             && status == "install ok installed"
         {

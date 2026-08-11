@@ -102,6 +102,297 @@ impl core::marker::UnsafeUnpin for ferroday_cage::limits::Limit
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::limits::Limit
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::limits::Limit
 pub mod ferroday_cage::provision
+pub mod ferroday_cage::provision::alpine
+#[non_exhaustive] pub enum ferroday_cage::provision::alpine::AlpineError
+pub ferroday_cage::provision::alpine::AlpineError::Cancelled
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Collision
+pub ferroday_cage::provision::alpine::AlpineError::Collision::claimant: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Collision::owner: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Collision::path: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Config
+pub ferroday_cage::provision::alpine::AlpineError::Config::reason: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Container
+pub ferroday_cage::provision::alpine::AlpineError::Container::reason: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Container::subject: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Digest
+pub ferroday_cage::provision::alpine::AlpineError::Digest::actual: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Digest::expected: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Digest::subject: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Fetch(ferroday_cage::provision::FetchError)
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Index
+pub ferroday_cage::provision::alpine::AlpineError::Index::reason: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Index::subject: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Io
+pub ferroday_cage::provision::alpine::AlpineError::Io::op: &'static str
+pub ferroday_cage::provision::alpine::AlpineError::Io::path: std::path::PathBuf
+pub ferroday_cage::provision::alpine::AlpineError::Io::source: core::io::error::Error
+pub ferroday_cage::provision::alpine::AlpineError::Launch(ferroday_cage::Error)
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Pin
+pub ferroday_cage::provision::alpine::AlpineError::Pin::unheld: alloc::vec::Vec<ferroday_cage::provision::alpine::UnheldPin>
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::PlanDocument
+pub ferroday_cage::provision::alpine::AlpineError::PlanDocument::reason: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Resolve
+pub ferroday_cage::provision::alpine::AlpineError::Resolve::reason: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Script
+pub ferroday_cage::provision::alpine::AlpineError::Script::package: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Script::script: &'static str
+pub ferroday_cage::provision::alpine::AlpineError::Script::status: ferroday_cage::ExitStatus
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Signature
+pub ferroday_cage::provision::alpine::AlpineError::Signature::reason: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Signature::subject: alloc::string::String
+impl ferroday_cage::provision::alpine::AlpineError
+pub fn ferroday_cage::provision::alpine::AlpineError::at(&'static str, impl core::convert::Into<std::path::PathBuf>) -> impl core::ops::function::FnOnce(core::io::error::Error) -> ferroday_cage::provision::alpine::AlpineError
+pub fn ferroday_cage::provision::alpine::AlpineError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::alpine::AlpineError
+impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::alpine::AlpineError
+pub fn ferroday_cage::provision::alpine::AlpineError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::alpine::AlpineError
+impl core::error::Error for ferroday_cage::provision::alpine::AlpineError
+pub fn ferroday_cage::provision::alpine::AlpineError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for ferroday_cage::provision::alpine::AlpineError
+pub fn ferroday_cage::provision::alpine::AlpineError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::alpine::AlpineError
+impl core::marker::Send for ferroday_cage::provision::alpine::AlpineError
+impl core::marker::Sync for ferroday_cage::provision::alpine::AlpineError
+impl core::marker::Unpin for ferroday_cage::provision::alpine::AlpineError
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::AlpineError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::AlpineError
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::AlpineError
+#[non_exhaustive] pub enum ferroday_cage::provision::alpine::AlpineEvent<'a>
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::CommandOutput
+pub ferroday_cage::provision::alpine::AlpineEvent::CommandOutput::bytes: &'a [u8]
+pub ferroday_cage::provision::alpine::AlpineEvent::CommandOutput::stream: ferroday_cage::provision::alpine::Stream
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Downloading
+pub ferroday_cage::provision::alpine::AlpineEvent::Downloading::index: usize
+pub ferroday_cage::provision::alpine::AlpineEvent::Downloading::package: &'a str
+pub ferroday_cage::provision::alpine::AlpineEvent::Downloading::total: usize
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Extracting
+pub ferroday_cage::provision::alpine::AlpineEvent::Extracting::package: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Fetching
+pub ferroday_cage::provision::alpine::AlpineEvent::Fetching::url: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Resolved
+pub ferroday_cage::provision::alpine::AlpineEvent::Resolved::plan: &'a ferroday_cage::provision::alpine::Plan
+pub ferroday_cage::provision::alpine::AlpineEvent::Resolving
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Script
+pub ferroday_cage::provision::alpine::AlpineEvent::Script::package: &'a str
+pub ferroday_cage::provision::alpine::AlpineEvent::Script::script: &'static str
+impl<'a> core::marker::Freeze for ferroday_cage::provision::alpine::AlpineEvent<'a>
+impl<'a> core::marker::Send for ferroday_cage::provision::alpine::AlpineEvent<'a>
+impl<'a> core::marker::Sync for ferroday_cage::provision::alpine::AlpineEvent<'a>
+impl<'a> core::marker::Unpin for ferroday_cage::provision::alpine::AlpineEvent<'a>
+impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::AlpineEvent<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::AlpineEvent<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::AlpineEvent<'a>
+#[non_exhaustive] pub enum ferroday_cage::provision::alpine::Stream
+pub ferroday_cage::provision::alpine::Stream::Stderr
+pub ferroday_cage::provision::alpine::Stream::Stdout
+impl core::marker::Freeze for ferroday_cage::provision::alpine::Stream
+impl core::marker::Send for ferroday_cage::provision::alpine::Stream
+impl core::marker::Sync for ferroday_cage::provision::alpine::Stream
+impl core::marker::Unpin for ferroday_cage::provision::alpine::Stream
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::Stream
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::Stream
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::Stream
+#[non_exhaustive] pub enum ferroday_cage::provision::alpine::UnheldReason
+pub ferroday_cage::provision::alpine::UnheldReason::Absent
+pub ferroday_cage::provision::alpine::UnheldReason::Identity
+pub ferroday_cage::provision::alpine::UnheldReason::Identity::pin: alloc::string::String
+pub ferroday_cage::provision::alpine::UnheldReason::Identity::repository: alloc::string::String
+pub ferroday_cage::provision::alpine::UnheldReason::Version
+pub ferroday_cage::provision::alpine::UnheldReason::Version::repository: alloc::string::String
+impl core::marker::Freeze for ferroday_cage::provision::alpine::UnheldReason
+impl core::marker::Send for ferroday_cage::provision::alpine::UnheldReason
+impl core::marker::Sync for ferroday_cage::provision::alpine::UnheldReason
+impl core::marker::Unpin for ferroday_cage::provision::alpine::UnheldReason
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::UnheldReason
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::UnheldReason
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::UnheldReason
+pub struct ferroday_cage::provision::alpine::Alpine
+impl ferroday_cage::provision::alpine::Alpine
+pub fn ferroday_cage::provision::alpine::Alpine::available(&mut self) -> core::result::Result<ferroday_cage::provision::alpine::Available, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::Alpine::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::alpine::AlpineBuilder
+pub fn ferroday_cage::provision::alpine::Alpine::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::alpine::Plan, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::Alpine::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::alpine::Plan, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::Alpine::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::alpine::Alpine
+pub fn ferroday_cage::provision::alpine::Alpine::observe<'o>(&'o mut self, &'o mut dyn ferroday_cage::provision::alpine::AlpineObserver) -> ferroday_cage::provision::alpine::Observed<'o>
+impl core::fmt::Debug for ferroday_cage::provision::alpine::Alpine
+pub fn ferroday_cage::provision::alpine::Alpine::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::alpine::Alpine
+pub fn ferroday_cage::provision::alpine::Alpine::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl core::marker::Freeze for ferroday_cage::provision::alpine::Alpine
+impl core::marker::Send for ferroday_cage::provision::alpine::Alpine
+impl !core::marker::Sync for ferroday_cage::provision::alpine::Alpine
+impl core::marker::Unpin for ferroday_cage::provision::alpine::Alpine
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::Alpine
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::Alpine
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::Alpine
+pub struct ferroday_cage::provision::alpine::AlpineBuilder
+impl ferroday_cage::provision::alpine::AlpineBuilder
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::architecture(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::base_layer(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::build(self) -> core::result::Result<ferroday_cage::provision::alpine::Alpine, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::cache_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::components<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::exclude<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::extract_only(self, bool) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::fetcher(self, alloc::boxed::Box<dyn ferroday_cage::provision::Fetch>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::identity_map(self, ferroday_cage::IdentityMap) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::include<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::keys(self, ferroday_cage::provision::alpine::KeySet) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::mirror(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::pin(self, ferroday_cage::provision::alpine::Plan) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::plan(self, ferroday_cage::provision::alpine::Plan) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::pre_configure_overlay(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::repository(self, ferroday_cage::provision::alpine::Repository) -> Self
+impl core::fmt::Debug for ferroday_cage::provision::alpine::AlpineBuilder
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::alpine::AlpineBuilder
+impl core::marker::Send for ferroday_cage::provision::alpine::AlpineBuilder
+impl !core::marker::Sync for ferroday_cage::provision::alpine::AlpineBuilder
+impl core::marker::Unpin for ferroday_cage::provision::alpine::AlpineBuilder
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::AlpineBuilder
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::AlpineBuilder
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::AlpineBuilder
+pub struct ferroday_cage::provision::alpine::Available
+impl ferroday_cage::provision::alpine::Available
+pub fn ferroday_cage::provision::alpine::Available::contains(&self, &str) -> bool
+pub fn ferroday_cage::provision::alpine::Available::providers(&self, &str) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+impl core::fmt::Debug for ferroday_cage::provision::alpine::Available
+pub fn ferroday_cage::provision::alpine::Available::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::alpine::Available
+impl core::marker::Send for ferroday_cage::provision::alpine::Available
+impl core::marker::Sync for ferroday_cage::provision::alpine::Available
+impl core::marker::Unpin for ferroday_cage::provision::alpine::Available
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::Available
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::Available
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::Available
+pub struct ferroday_cage::provision::alpine::KeySet
+impl ferroday_cage::provision::alpine::KeySet
+pub fn ferroday_cage::provision::alpine::KeySet::alpine(&str) -> core::result::Result<ferroday_cage::provision::alpine::KeySet, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::KeySet::insert(&mut self, impl core::convert::Into<alloc::string::String>, &str) -> core::result::Result<(), ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::KeySet::is_empty(&self) -> bool
+pub fn ferroday_cage::provision::alpine::KeySet::names(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+pub fn ferroday_cage::provision::alpine::KeySet::new() -> ferroday_cage::provision::alpine::KeySet
+pub fn ferroday_cage::provision::alpine::KeySet::postmarketos() -> ferroday_cage::provision::alpine::KeySet
+impl core::fmt::Debug for ferroday_cage::provision::alpine::KeySet
+pub fn ferroday_cage::provision::alpine::KeySet::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::alpine::KeySet
+impl core::marker::Send for ferroday_cage::provision::alpine::KeySet
+impl core::marker::Sync for ferroday_cage::provision::alpine::KeySet
+impl core::marker::Unpin for ferroday_cage::provision::alpine::KeySet
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::KeySet
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::KeySet
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::KeySet
+pub struct ferroday_cage::provision::alpine::Observed<'o>
+impl ferroday_cage::provision::alpine::Observed<'_>
+pub fn ferroday_cage::provision::alpine::Observed<'_>::available(&mut self) -> core::result::Result<ferroday_cage::provision::alpine::Available, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::Observed<'_>::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::alpine::Plan, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::Observed<'_>::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::alpine::Plan, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::Observed<'_>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
+impl core::fmt::Debug for ferroday_cage::provision::alpine::Observed<'_>
+pub fn ferroday_cage::provision::alpine::Observed<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::alpine::Observed<'_>
+pub fn ferroday_cage::provision::alpine::Observed<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl<'o> core::marker::Freeze for ferroday_cage::provision::alpine::Observed<'o>
+impl<'o> !core::marker::Send for ferroday_cage::provision::alpine::Observed<'o>
+impl<'o> !core::marker::Sync for ferroday_cage::provision::alpine::Observed<'o>
+impl<'o> core::marker::Unpin for ferroday_cage::provision::alpine::Observed<'o>
+impl<'o> core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::Observed<'o>
+impl<'o> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::Observed<'o>
+impl<'o> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::Observed<'o>
+#[non_exhaustive] pub struct ferroday_cage::provision::alpine::Plan
+pub ferroday_cage::provision::alpine::Plan::architecture: alloc::string::String
+pub ferroday_cage::provision::alpine::Plan::indexes: alloc::vec::Vec<ferroday_cage::provision::alpine::ResolvedIndex>
+pub ferroday_cage::provision::alpine::Plan::packages: alloc::vec::Vec<ferroday_cage::provision::alpine::PlannedPackage>
+pub ferroday_cage::provision::alpine::Plan::release: alloc::string::String
+impl ferroday_cage::provision::alpine::Plan
+pub fn ferroday_cage::provision::alpine::Plan::parse_document(&str) -> core::result::Result<ferroday_cage::provision::alpine::Plan, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::Plan::to_document(&self) -> core::result::Result<alloc::string::String, ferroday_cage::provision::alpine::AlpineError>
+impl core::marker::Freeze for ferroday_cage::provision::alpine::Plan
+impl core::marker::Send for ferroday_cage::provision::alpine::Plan
+impl core::marker::Sync for ferroday_cage::provision::alpine::Plan
+impl core::marker::Unpin for ferroday_cage::provision::alpine::Plan
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::Plan
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::Plan
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::Plan
+#[non_exhaustive] pub struct ferroday_cage::provision::alpine::PlannedPackage
+pub ferroday_cage::provision::alpine::PlannedPackage::architecture: alloc::string::String
+pub ferroday_cage::provision::alpine::PlannedPackage::control_identity: alloc::string::String
+pub ferroday_cage::provision::alpine::PlannedPackage::index: usize
+pub ferroday_cage::provision::alpine::PlannedPackage::installed_size: core::option::Option<u64>
+pub ferroday_cage::provision::alpine::PlannedPackage::name: alloc::string::String
+pub ferroday_cage::provision::alpine::PlannedPackage::origin: core::option::Option<alloc::string::String>
+pub ferroday_cage::provision::alpine::PlannedPackage::size: core::option::Option<u64>
+pub ferroday_cage::provision::alpine::PlannedPackage::version: alloc::string::String
+impl ferroday_cage::provision::alpine::PlannedPackage
+pub fn ferroday_cage::provision::alpine::PlannedPackage::file_name(&self) -> alloc::string::String
+impl core::marker::Freeze for ferroday_cage::provision::alpine::PlannedPackage
+impl core::marker::Send for ferroday_cage::provision::alpine::PlannedPackage
+impl core::marker::Sync for ferroday_cage::provision::alpine::PlannedPackage
+impl core::marker::Unpin for ferroday_cage::provision::alpine::PlannedPackage
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::PlannedPackage
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::PlannedPackage
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::PlannedPackage
+#[non_exhaustive] pub struct ferroday_cage::provision::alpine::Repository
+impl ferroday_cage::provision::alpine::Repository
+pub fn ferroday_cage::provision::alpine::Repository::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::alpine::RepositoryBuilder
+impl core::marker::Freeze for ferroday_cage::provision::alpine::Repository
+impl core::marker::Send for ferroday_cage::provision::alpine::Repository
+impl core::marker::Sync for ferroday_cage::provision::alpine::Repository
+impl core::marker::Unpin for ferroday_cage::provision::alpine::Repository
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::Repository
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::Repository
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::Repository
+pub struct ferroday_cage::provision::alpine::RepositoryBuilder
+impl ferroday_cage::provision::alpine::RepositoryBuilder
+pub fn ferroday_cage::provision::alpine::RepositoryBuilder::build(self) -> core::result::Result<ferroday_cage::provision::alpine::Repository, ferroday_cage::provision::alpine::AlpineError>
+pub fn ferroday_cage::provision::alpine::RepositoryBuilder::components<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn ferroday_cage::provision::alpine::RepositoryBuilder::keys(self, ferroday_cage::provision::alpine::KeySet) -> Self
+pub fn ferroday_cage::provision::alpine::RepositoryBuilder::mirror(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::alpine::RepositoryBuilder::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Debug for ferroday_cage::provision::alpine::RepositoryBuilder
+pub fn ferroday_cage::provision::alpine::RepositoryBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::alpine::RepositoryBuilder
+impl core::marker::Send for ferroday_cage::provision::alpine::RepositoryBuilder
+impl core::marker::Sync for ferroday_cage::provision::alpine::RepositoryBuilder
+impl core::marker::Unpin for ferroday_cage::provision::alpine::RepositoryBuilder
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::RepositoryBuilder
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::RepositoryBuilder
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::RepositoryBuilder
+#[non_exhaustive] pub struct ferroday_cage::provision::alpine::ResolvedIndex
+pub ferroday_cage::provision::alpine::ResolvedIndex::component: core::option::Option<alloc::string::String>
+pub ferroday_cage::provision::alpine::ResolvedIndex::description: core::option::Option<alloc::string::String>
+pub ferroday_cage::provision::alpine::ResolvedIndex::mirror: alloc::string::String
+pub ferroday_cage::provision::alpine::ResolvedIndex::release: alloc::string::String
+pub ferroday_cage::provision::alpine::ResolvedIndex::sha256: alloc::string::String
+pub ferroday_cage::provision::alpine::ResolvedIndex::signed_by: alloc::string::String
+impl core::marker::Freeze for ferroday_cage::provision::alpine::ResolvedIndex
+impl core::marker::Send for ferroday_cage::provision::alpine::ResolvedIndex
+impl core::marker::Sync for ferroday_cage::provision::alpine::ResolvedIndex
+impl core::marker::Unpin for ferroday_cage::provision::alpine::ResolvedIndex
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::ResolvedIndex
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::ResolvedIndex
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::ResolvedIndex
+#[non_exhaustive] pub struct ferroday_cage::provision::alpine::UnheldPin
+pub ferroday_cage::provision::alpine::UnheldPin::package: alloc::string::String
+pub ferroday_cage::provision::alpine::UnheldPin::reason: ferroday_cage::provision::alpine::UnheldReason
+pub ferroday_cage::provision::alpine::UnheldPin::version: alloc::string::String
+impl core::fmt::Display for ferroday_cage::provision::alpine::UnheldPin
+pub fn ferroday_cage::provision::alpine::UnheldPin::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::alpine::UnheldPin
+impl core::marker::Send for ferroday_cage::provision::alpine::UnheldPin
+impl core::marker::Sync for ferroday_cage::provision::alpine::UnheldPin
+impl core::marker::Unpin for ferroday_cage::provision::alpine::UnheldPin
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::UnheldPin
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::UnheldPin
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::UnheldPin
+pub trait ferroday_cage::provision::alpine::AlpineObserver
+pub fn ferroday_cage::provision::alpine::AlpineObserver::cancelled(&mut self) -> bool
+pub fn ferroday_cage::provision::alpine::AlpineObserver::progress(&mut self, ferroday_cage::provision::alpine::AlpineEvent<'_>)
+impl<F: core::ops::function::FnMut(ferroday_cage::provision::alpine::AlpineEvent<'_>)> ferroday_cage::provision::alpine::AlpineObserver for F
+pub fn F::cancelled(&mut self) -> bool
+pub fn F::progress(&mut self, ferroday_cage::provision::alpine::AlpineEvent<'_>)
+pub fn ferroday_cage::provision::alpine::host_architecture() -> alloc::string::String
 pub mod ferroday_cage::provision::debian
 #[non_exhaustive] pub enum ferroday_cage::provision::debian::DebianError
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Config
@@ -234,25 +525,13 @@ impl core::marker::Unpin for ferroday_cage::provision::debian::Available
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Available
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Available
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Available
-pub struct ferroday_cage::provision::debian::BuildLayer
-impl ferroday_cage::provision::debian::BuildLayer
-pub fn ferroday_cage::provision::debian::BuildLayer::path(&self) -> &std::path::Path
-impl core::ops::drop::Drop for ferroday_cage::provision::debian::BuildLayer
-pub fn ferroday_cage::provision::debian::BuildLayer::drop(&mut self)
-impl core::marker::Freeze for ferroday_cage::provision::debian::BuildLayer
-impl core::marker::Send for ferroday_cage::provision::debian::BuildLayer
-impl core::marker::Sync for ferroday_cage::provision::debian::BuildLayer
-impl core::marker::Unpin for ferroday_cage::provision::debian::BuildLayer
-impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::BuildLayer
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::BuildLayer
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::BuildLayer
 pub struct ferroday_cage::provision::debian::Debian<'a>
 impl<'a> ferroday_cage::provision::debian::Debian<'a>
 pub fn ferroday_cage::provision::debian::Debian<'a>::available(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Available, ferroday_cage::provision::debian::DebianError>
 pub fn ferroday_cage::provision::debian::Debian<'a>::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::DebianBuilder<'a>
 pub fn ferroday_cage::provision::debian::Debian<'a>::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
 pub fn ferroday_cage::provision::debian::Debian<'a>::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Debian<'a>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::debian::BuildLayer, ferroday_cage::provision::ProvisionError>
+pub fn ferroday_cage::provision::debian::Debian<'a>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
 impl<'a> ferroday_cage::provision::debian::Debian<'a>
 pub fn ferroday_cage::provision::debian::Debian<'a>::observe<'o>(&'o mut self, &'o mut dyn ferroday_cage::provision::debian::DebianObserver) -> ferroday_cage::provision::debian::Observed<'o, 'a>
 impl core::fmt::Debug for ferroday_cage::provision::debian::Debian<'_>
@@ -315,7 +594,7 @@ impl ferroday_cage::provision::debian::Observed<'_, '_>
 pub fn ferroday_cage::provision::debian::Observed<'_, '_>::available(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Available, ferroday_cage::provision::debian::DebianError>
 pub fn ferroday_cage::provision::debian::Observed<'_, '_>::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
 pub fn ferroday_cage::provision::debian::Observed<'_, '_>::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::debian::BuildLayer, ferroday_cage::provision::ProvisionError>
+pub fn ferroday_cage::provision::debian::Observed<'_, '_>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
 impl core::fmt::Debug for ferroday_cage::provision::debian::Observed<'_, '_>
 pub fn ferroday_cage::provision::debian::Observed<'_, '_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Observed<'_, '_>
@@ -479,6 +758,8 @@ pub fn ferroday_cage::provision::FetchError::io(&'static str, impl core::convert
 pub fn ferroday_cage::provision::FetchError::not_found(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::FetchError
 pub fn ferroday_cage::provision::FetchError::status(impl core::convert::Into<alloc::string::String>, u16) -> ferroday_cage::provision::FetchError
 pub fn ferroday_cage::provision::FetchError::url(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::FetchError
+impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::alpine::AlpineError
+pub fn ferroday_cage::provision::alpine::AlpineError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::alpine::AlpineError
 impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> Self
 impl core::error::Error for ferroday_cage::provision::FetchError
@@ -545,6 +826,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::provision::ProvisionError
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ProvisionError
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ProvisionError
 #[non_exhaustive] pub enum ferroday_cage::provision::ProvisionEvent<'a>
+pub ferroday_cage::provision::ProvisionEvent::Alpine(&'a ferroday_cage::provision::alpine::AlpineEvent<'a>)
 pub ferroday_cage::provision::ProvisionEvent::Debian(&'a ferroday_cage::provision::debian::DebianEvent<'a>)
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionEvent::Entry
 pub ferroday_cage::provision::ProvisionEvent::Entry::path: &'a std::path::Path
@@ -581,6 +863,18 @@ impl core::marker::Unpin for ferroday_cage::provision::SkippedKind
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::SkippedKind
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::SkippedKind
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::SkippedKind
+pub struct ferroday_cage::provision::BuildLayer
+impl ferroday_cage::provision::BuildLayer
+pub fn ferroday_cage::provision::BuildLayer::path(&self) -> &std::path::Path
+impl core::ops::drop::Drop for ferroday_cage::provision::BuildLayer
+pub fn ferroday_cage::provision::BuildLayer::drop(&mut self)
+impl core::marker::Freeze for ferroday_cage::provision::BuildLayer
+impl core::marker::Send for ferroday_cage::provision::BuildLayer
+impl core::marker::Sync for ferroday_cage::provision::BuildLayer
+impl core::marker::Unpin for ferroday_cage::provision::BuildLayer
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::BuildLayer
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::BuildLayer
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::BuildLayer
 pub struct ferroday_cage::provision::CopyIn<'a>
 impl<'a> ferroday_cage::provision::CopyIn<'a>
 pub fn ferroday_cage::provision::CopyIn<'a>::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::CopyIn<'a>
@@ -734,6 +1028,10 @@ pub trait ferroday_cage::provision::Provisioner
 pub fn ferroday_cage::provision::Provisioner::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::Tarball
 pub fn ferroday_cage::provision::Tarball::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::alpine::Alpine
+pub fn ferroday_cage::provision::alpine::Alpine::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::alpine::Observed<'_>
+pub fn ferroday_cage::provision::alpine::Observed<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Debian<'_>
 pub fn ferroday_cage::provision::debian::Debian<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Observed<'_, '_>

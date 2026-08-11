@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::provision::binfmt;
+
 /// The Debian architecture name for the host.
 ///
 /// This is what [`DebianBuilder::architecture`] and [`Pool::architecture`]
@@ -121,74 +123,17 @@ pub(crate) fn preflight_foreign(host: &str, target: &str) -> Result<(), String> 
              handler, and {target} is not a known qemu target; use extract-only instead"
         ));
     };
-    let registration = read_registration(interpreter).ok_or_else(|| {
-        format!(
+    binfmt::ready(interpreter).map_err(|reason| match reason {
+        binfmt::Missing::Unregistered => format!(
             "a full bootstrap for {target} on a {host} host needs the qemu-{interpreter} \
              binfmt handler registered (install qemu-user-static and binfmt support); \
              use extract-only to lay out the rootfs without running target binaries"
-        )
-    })?;
-    check_registration(&parse_registration(&registration)).map_err(|reason| {
-        format!(
+        ),
+        binfmt::Missing::Unusable(reason) => format!(
             "the qemu-{interpreter} binfmt handler is registered but {reason}; a foreign \
              bootstrap needs it enabled and registered with the fix-binary (F) flag"
-        )
+        ),
     })
-}
-
-/// The kernel's registration for the `qemu-<name>` binfmt handler, or `None`
-/// when none is registered.
-fn read_registration(name: &str) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/sys/fs/binfmt_misc/qemu-{name}")).ok()
-}
-
-/// What a `binfmt_misc` registration file says, as fields.
-///
-/// The file is a line-oriented listing: a bare `enabled` or `disabled`, then
-/// `interpreter <path>`, `flags: <letters>`, and the magic and mask this does
-/// not read.
-struct Registration {
-    /// Whether the handler is enabled. A registered-but-disabled handler is a
-    /// distinct state from an absent one: the registration exists and can be
-    /// switched back on.
-    enabled: bool,
-    /// The interpreter path the kernel recorded, absent from a malformed
-    /// registration.
-    interpreter: Option<PathBuf>,
-    /// The flag letters, as written.
-    flags: String,
-}
-
-/// Reads a `binfmt_misc` registration into its fields.
-fn parse_registration(registration: &str) -> Registration {
-    let mut lines = registration.lines().map(str::trim);
-    let enabled = lines.next() == Some("enabled");
-    let mut interpreter = None;
-    let mut flags = String::new();
-    for line in registration.lines().map(str::trim) {
-        if let Some(path) = line.strip_prefix("interpreter ") {
-            interpreter = Some(PathBuf::from(path.trim()));
-        } else if let Some(letters) = line.strip_prefix("flags:") {
-            flags = letters.trim().to_string();
-        }
-    }
-    Registration {
-        enabled,
-        interpreter,
-        flags,
-    }
-}
-
-/// Validates a binfmt_misc registration: enabled, with the `F` flag.
-fn check_registration(registration: &Registration) -> Result<(), &'static str> {
-    if !registration.enabled {
-        return Err("it is disabled");
-    }
-    if registration.flags.contains('F') {
-        Ok(())
-    } else {
-        Err("it lacks the fix-binary (F) flag")
-    }
 }
 
 /// The `qemu-user` interpreter the kernel will execute `architecture` binaries
@@ -251,7 +196,7 @@ pub fn foreign_interpreter(architecture: &str) -> Option<Interpreter> {
         return None;
     }
     let name = qemu_interpreter(architecture)?;
-    let registration = parse_registration(&read_registration(name)?);
+    let registration = binfmt::parse(&binfmt::read(name)?);
     let path = registration.interpreter?;
     Some(Interpreter {
         name: name.to_string(),
@@ -342,53 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn registration_requires_enabled_and_fix_binary() {
-        let good = "enabled\ninterpreter /usr/bin/qemu-aarch64-static\nflags: OCF\n";
-        assert!(check_registration(&parse_registration(good)).is_ok());
-        let disabled = "disabled\nflags: OCF\n";
-        assert!(check_registration(&parse_registration(disabled)).is_err());
-        let no_fix = "enabled\nflags: OC\n";
-        assert_eq!(
-            check_registration(&parse_registration(no_fix)),
-            Err("it lacks the fix-binary (F) flag")
-        );
-    }
-
-    /// A registration as the kernel writes one, with the fields this reads
-    /// surrounded by the ones it does not.
-    const REGISTERED: &str = "enabled\n\
-         interpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P\n\
-         flags: POF\n\
-         offset 0\n\
-         magic 7f454c460201010000000000000000000200b7\n";
-
-    #[test]
-    fn a_registration_reports_its_interpreter_its_state_and_its_flags() {
-        let registration = parse_registration(REGISTERED);
-        assert!(registration.enabled);
-        assert_eq!(
-            registration.interpreter.as_deref(),
-            Some(Path::new("/usr/libexec/qemu-binfmt/aarch64-binfmt-P")),
-        );
-        assert_eq!(registration.flags, "POF");
-    }
-
-    #[test]
-    fn a_disabled_handler_reports_as_registered_and_not_enabled() {
-        // The distinction the preflight needs and a caller wants: the
-        // registration exists, so the remedy is to switch it on rather than to
-        // install it.
-        let registration = parse_registration(&REGISTERED.replacen("enabled", "disabled", 1));
-        assert!(!registration.enabled);
-        assert_eq!(
-            registration.interpreter.as_deref(),
-            Some(Path::new("/usr/libexec/qemu-binfmt/aarch64-binfmt-P")),
-            "everything else is still reported",
-        );
-        assert_eq!(registration.flags, "POF");
-    }
-
-    #[test]
     fn a_native_architecture_has_no_interpreter() {
         // Nothing is emulated, so there is no interpreter to name. An empty
         // string here would fold into a caller's artifact signature as though
@@ -415,7 +313,7 @@ mod tests {
         let wrapper = scratch.join("aarch64-binfmt-P");
         std::os::unix::fs::symlink(&real, &wrapper).expect("the wrapper symlink is creatable");
 
-        let registration = parse_registration(&format!(
+        let registration = binfmt::parse(&format!(
             "enabled\ninterpreter {}\nflags: POF\n",
             wrapper.display()
         ));
@@ -435,7 +333,7 @@ mod tests {
         // A path that does not resolve is a fact, not an error: the handler is
         // registered and enabled, and only the target is unknowable.
         let registration =
-            parse_registration("enabled\ninterpreter /nonexistent/qemu-aarch64\nflags: POF\n");
+            binfmt::parse("enabled\ninterpreter /nonexistent/qemu-aarch64\nflags: POF\n");
         let path = registration.interpreter.expect("the interpreter is named");
         assert_eq!(std::fs::canonicalize(&path).ok(), None);
         assert!(registration.enabled);

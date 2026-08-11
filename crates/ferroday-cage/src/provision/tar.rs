@@ -5,7 +5,12 @@
 //! GNU long-name (`L`)/long-link (`K`) entries and pax extended headers
 //! (`x` per-entry, `g` global) internally, so a consumer only ever sees
 //! concrete file entries with their effective path, link target, size, and
-//! times. Header checksums are verified. Writing is out of scope.
+//! times. Header checksums are verified.
+//!
+//! The writing side is here too, as [`ustar_block`]: one header block, its
+//! checksum, and the padding that follows an entry's data. It is the whole of
+//! what a writer shares with a reader, and keeping the two in one module is
+//! what stops the field offsets being written down twice.
 //!
 //! v7 is a subset rather than a separate format: the first 257 bytes of a
 //! header are laid out identically, and what v7 lacks is everything after them
@@ -16,12 +21,12 @@
 //! produces: an upstream release tarball was produced by whoever released the
 //! software, on whatever machine, in whatever year.
 
-use std::io::Read;
+use std::io::{self, Read, Write};
 
 use super::ProvisionError;
 
 /// The size of a tar block, and of a tar header.
-const BLOCK: u64 = 512;
+pub(crate) const BLOCK: u64 = 512;
 
 /// The largest metadata entry (GNU long name, pax header) accepted.
 ///
@@ -58,6 +63,18 @@ pub(crate) struct Entry {
     pub size: u64,
     /// Modification time, seconds since the epoch.
     pub mtime: i64,
+    /// The SHA-1 an `APK-TOOLS.checksum.SHA1` pax record states for this
+    /// entry, where it carries one.
+    ///
+    /// A vendor record, read for the same reason [`uid`](Self::uid) is: one
+    /// layer needs it and the reader is the only place it can be seen. apk
+    /// writes it for every file and symbolic link of a package's data segment
+    /// — over the contents of a file, over the target of a link — and it is
+    /// what an installed-database record carries as its `Z:` field, so the
+    /// Alpine layer reads it here rather than digesting a tree it has just
+    /// written.
+    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+    pub checksum_sha1: Option<[u8; 20]>,
 }
 
 /// Whether entries of type `typeflag` carry a data stream.
@@ -78,6 +95,7 @@ struct PaxRecords {
     mtime: Option<i64>,
     uid: Option<u32>,
     gid: Option<u32>,
+    checksum_sha1: Option<[u8; 20]>,
 }
 
 impl PaxRecords {
@@ -94,6 +112,7 @@ impl PaxRecords {
             mtime: other.mtime.or(self.mtime),
             uid: other.uid.or(self.uid),
             gid: other.gid.or(self.gid),
+            checksum_sha1: other.checksum_sha1.or(self.checksum_sha1),
         }
     }
 }
@@ -255,6 +274,7 @@ impl<R: Read> TarReader<R> {
                     if let Some(gid) = pax.gid {
                         entry.gid = gid;
                     }
+                    entry.checksum_sha1 = pax.checksum_sha1;
                     return Ok(Some(entry));
                 }
             }
@@ -454,6 +474,8 @@ fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
         gid,
         size,
         mtime,
+        // Stated by a pax record only; a ustar header has no field for it.
+        checksum_sha1: None,
     })
 }
 
@@ -596,6 +618,24 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
                     records.gid = Some(id);
                 }
             }
+            // apk writes one of these for every file and symbolic link of a
+            // package. A record naming a digest this reader does not know is
+            // not an error: the key is namespaced to a vendor, and a reader
+            // that refused an unfamiliar one would refuse an archive apk
+            // itself reads.
+            b"APK-TOOLS.checksum.SHA1" => {
+                let mut digest = [0u8; 20];
+                if value.len() != 2 * digest.len() {
+                    return Err("an apk file checksum record is not a SHA-1");
+                }
+                for (byte, pair) in digest.iter_mut().zip(value.chunks_exact(2)) {
+                    *byte = std::str::from_utf8(pair)
+                        .ok()
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                        .ok_or("an apk file checksum record is not hexadecimal")?;
+                }
+                records.checksum_sha1 = Some(digest);
+            }
             b"mtime" => {
                 // Pax times may carry fractional seconds; whole seconds are
                 // what extraction applies. The fraction floors rather than
@@ -624,8 +664,138 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
     Ok(records)
 }
 
+// The writing side of the same format. The reader above and these share the
+// block size, the field offsets, and the octal encoding, so they are one
+// module: two files describing one header layout drift, and a header this
+// crate writes is one this crate reads back in `export_tar`'s round trip.
+
+/// The largest size the ustar octal `size` field holds (`8^11 - 1`); a larger
+/// file needs a pax `size` record.
+pub(crate) const MAX_USTAR_SIZE: u64 = (1 << 33) - 1;
+/// The length of the ustar `name` field. A longer path is split into `prefix`
+/// and `name` at a separator, or carried in a pax `path` record when it does not
+/// split; a name with no separator in it fits or it does not.
+pub(crate) const MAX_USTAR_NAME: usize = 100;
+/// The length of the ustar `prefix` field, the other half of that split.
+pub(crate) const MAX_USTAR_PREFIX: usize = 155;
+/// The modification-time range the ustar octal `mtime` field holds: zero
+/// through `8^11 - 1` seconds since the epoch, about the year 2242. A time
+/// outside it — a pre-1970 negative time, or one further out than 2242 — is
+/// carried in a pax `mtime` record instead, the ustar field holding a clamped
+/// placeholder the reader ignores, the way an oversized path or file does.
+pub(crate) const MAX_USTAR_MTIME: i64 = (1 << 33) - 1;
+/// The largest value the ustar octal `uid`/`gid` field holds (`8^7 - 1`).
+const MAX_ID: u64 = (1 << 21) - 1;
+
+/// Writes the zero padding after `size` bytes of data, up to the next block.
+pub(crate) fn pad(out: &mut impl Write, size: u64) -> io::Result<()> {
+    let rem = (size % BLOCK) as usize;
+    if rem != 0 {
+        out.write_all(&[0u8; BLOCK as usize][..BLOCK as usize - rem])?;
+    }
+    Ok(())
+}
+
+/// Assembles a 512-byte ustar header block with its checksum.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ustar_block(
+    name: &[u8],
+    prefix: &[u8],
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime: i64,
+    typeflag: u8,
+    linkname: &[u8],
+) -> io::Result<[u8; BLOCK as usize]> {
+    let mut block = [0u8; BLOCK as usize];
+    let name = &name[..name.len().min(MAX_USTAR_NAME)];
+    block[0..name.len()].copy_from_slice(name);
+    octal(&mut block[100..108], u64::from(mode & 0o7777))?;
+    octal_id(&mut block[108..116], u64::from(uid))?;
+    octal_id(&mut block[116..124], u64::from(gid))?;
+    octal(&mut block[124..136], size)?;
+    // Clamp into the field's range: a time outside it is carried in a pax
+    // `mtime` record, so this placeholder is what the reader ignores. Clamping
+    // (rather than failing) keeps one out-of-range stamp from aborting the
+    // export.
+    octal(&mut block[136..148], mtime.clamp(0, MAX_USTAR_MTIME) as u64)?;
+    block[156] = typeflag;
+    let linkname = &linkname[..linkname.len().min(MAX_USTAR_NAME)];
+    block[157..157 + linkname.len()].copy_from_slice(linkname);
+    block[257..263].copy_from_slice(b"ustar\0");
+    block[263..265].copy_from_slice(b"00");
+    octal(&mut block[329..337], 0)?;
+    octal(&mut block[337..345], 0)?;
+    let prefix = &prefix[..prefix.len().min(MAX_USTAR_PREFIX)];
+    block[345..345 + prefix.len()].copy_from_slice(prefix);
+
+    // The checksum: the sum of every byte with the field read as spaces,
+    // written as six octal digits, a NUL, and a space. The field is six full
+    // octal digits (not the NUL-terminated form `octal` produces), so it is
+    // formatted directly.
+    for byte in &mut block[148..156] {
+        *byte = b' ';
+    }
+    let sum: u32 = block.iter().map(|b| u32::from(*b)).sum();
+    let mut v = sum;
+    for slot in block[148..154].iter_mut().rev() {
+        *slot = b'0' + (v & 0o7) as u8;
+        v >>= 3;
+    }
+    block[154] = 0;
+    block[155] = b' ';
+    Ok(block)
+}
+
+/// Formats `value` right-justified as NUL-terminated octal ASCII into `field`,
+/// erroring when it does not fit.
+fn octal(field: &mut [u8], value: u64) -> io::Result<()> {
+    let digits = field.len() - 1;
+    let max = if digits >= 22 {
+        u64::MAX
+    } else {
+        (1u64 << (3 * digits)) - 1
+    };
+    if value > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a tar header field does not fit an octal value",
+        ));
+    }
+    let mut v = value;
+    for slot in field[..digits].iter_mut().rev() {
+        *slot = b'0' + (v & 0o7) as u8;
+        v >>= 3;
+    }
+    field[digits] = 0;
+    Ok(())
+}
+
+/// Formats a uid or gid, erroring past the ustar octal field's reach. The
+/// exported ids are in-map system ids, well under the limit; a larger id was
+/// never established at provision time (see the module docs of
+/// [`bootstrap::configure`](crate::provision) on the ownership boundary).
+fn octal_id(field: &mut [u8], value: u64) -> io::Result<()> {
+    if value > MAX_ID {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "an owner id is too large for the tar header",
+        ));
+    }
+    octal(field, value)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn octal_rejects_an_overlong_value() {
+        let mut field = [0u8; 8];
+        assert!(octal(&mut field, MAX_ID).is_ok());
+        assert!(octal(&mut field, MAX_ID + 1).is_err());
+    }
     use super::*;
 
     #[test]

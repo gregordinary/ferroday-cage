@@ -48,6 +48,8 @@ use rustix::io::Errno;
 
 use crate::mechanism::frame;
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod binfmt;
 #[cfg(feature = "tarball")]
 mod compress;
 mod containment;
@@ -65,11 +67,18 @@ mod extract;
 // walks.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod digest;
+// The plan document's syntax, which every userland layer's plan is written in.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod document;
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod fetch;
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod http;
 mod identity;
+// The overlay upper a layered build installs into, which is a disposal handle
+// rather than anything one userland knows about.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod layer;
 pub(crate) mod rooted;
 #[cfg(feature = "tarball")]
 mod tar;
@@ -83,9 +92,13 @@ pub use export::{Export, export_tar};
 pub use fetch::{Fetch, FetchError, FetchRequest};
 #[cfg(any(feature = "debian", feature = "alpine"))]
 pub use http::{HttpFetch, file_url};
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub use layer::BuildLayer;
 #[cfg(feature = "tarball")]
 pub use tarball::Tarball;
 
+#[cfg(feature = "alpine")]
+pub mod alpine;
 #[cfg(feature = "debian")]
 pub mod debian;
 
@@ -129,6 +142,14 @@ pub enum ProvisionEvent<'a> {
     /// provisioner rather than one per provisioner.
     #[cfg(feature = "debian")]
     Debian(&'a debian::DebianEvent<'a>),
+    /// An Alpine bootstrap's own, richer event.
+    ///
+    /// The same nesting as [`Debian`](Self::Debian), and for the same reason:
+    /// the bootstrap reports fetches, downloads, and the output of the install
+    /// scripts it runs in a cage, which the shared vocabulary above has no place
+    /// for.
+    #[cfg(feature = "alpine")]
+    Alpine(&'a alpine::AlpineEvent<'a>),
 }
 
 /// A progress and cancellation sink for a provisioning run.
@@ -1233,6 +1254,68 @@ fn staging_path(dest: &Path) -> PathBuf {
     staging.push(name);
     staging.push(format!(".{}.partial", crate::host::unique_hex()));
     dir.join(staging)
+}
+
+/// The directory a run downloads its packages into, and whether the run owns it.
+///
+/// A caller that names a cache directory owns it: it survives the run, which is
+/// the whole point of naming one. A run that names none downloads into a derived
+/// sibling of the tree it is building, and that directory is the run's own.
+///
+/// A derived cache is removed when the value is dropped rather than at the end
+/// of the successful path, so a failure disposes of it exactly as a success
+/// does. Every `?` between creating the cache and finishing the bootstrap would
+/// otherwise leave a base system's worth of packages beside a rootfs that was
+/// never published, and nothing later clears it: the publication's own cleanup
+/// removes the staging tree, and [`remove`] removes the destination and its
+/// lock, neither of which this is.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) struct PackageCache {
+    path: PathBuf,
+    owned: bool,
+}
+
+#[cfg(any(feature = "debian", feature = "alpine"))]
+impl PackageCache {
+    /// The cache for a run building `tree`: the caller's, or a sibling of the
+    /// tree named after it with `suffix`.
+    ///
+    /// A sibling, not a child: an extracted package's entries land under the
+    /// tree, so a cache beneath it could be overwritten before it is read, but a
+    /// sibling is out of the extraction's contained reach.
+    ///
+    /// The suffix is the layer's, so two provisioners building one destination
+    /// do not each dispose of the other's downloads.
+    pub(crate) fn beside(tree: &Path, cache_dir: Option<&Path>, suffix: &str) -> PackageCache {
+        match cache_dir {
+            Some(dir) => PackageCache {
+                path: dir.to_path_buf(),
+                owned: false,
+            },
+            None => {
+                let mut sibling = tree.as_os_str().to_os_string();
+                sibling.push(suffix);
+                PackageCache {
+                    path: PathBuf::from(sibling),
+                    owned: true,
+                }
+            }
+        }
+    }
+
+    /// The directory itself, to download into and to read back from.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(any(feature = "debian", feature = "alpine"))]
+impl Drop for PackageCache {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// Writes bytes to `dest` atomically, via a staging file in its directory and a

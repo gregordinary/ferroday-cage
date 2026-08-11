@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use ferroday_cage::provision::alpine::KeySet as AlpineKeySet;
 use ferroday_cage::provision::debian::{Priority, Repository};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ExitStatus, FsAccess, IdRange, Identity,
@@ -101,6 +102,44 @@ Provisioning the root filesystem:
                         'suite=S mirror=URL [mirror-fallback=URL]
                         [components=a,b] [keyring=PATH] [name=NAME]
                         [trust-unsigned] [allow-stale-release]'. Repeatable
+  --provision-alpine RELEASE
+                        Bootstrap --rootfs as an Alpine RELEASE (e.g. v3.23)
+                        from the archive; given without a command, provision
+                        and exit
+  --alpine-arch ARCH    Target architecture for --provision-alpine (default:
+                        the host architecture)
+  --alpine-mirror URL   Archive mirror (default:
+                        http://dl-cdn.alpinelinux.org/alpine)
+  --alpine-components L Comma-separated components (default: main; repeatable)
+  --alpine-include L    Packages to install (comma-separated, repeatable).
+                        apk has no priority band, so nothing is installed that
+                        was not named here or required by something that was
+  --alpine-exclude L    Packages to keep out of the resolution (comma-separated,
+                        repeatable)
+  --alpine-extract-only Lay out files and register them without running any
+                        install script (for a foreign architecture)
+  --alpine-cache DIR    Cache downloaded packages in DIR, reused across runs
+  --alpine-keys SOURCE  The keys the archive is verified against: 'alpine' (the
+                        bundled set for the target architecture, the default),
+                        'postmarketos', or a directory of PEM public keys named
+                        as the repository publishes them
+  --alpine-mirror-fallback URL
+                        A further URL for the same archive, tried when the
+                        primary mirror does not serve a resource (repeatable,
+                        in order)
+  --alpine-pre-configure-overlay DIR
+                        Overlay DIR onto the root after the files are laid
+                        out and before any install script runs
+  --alpine-identity-map M
+                        Identity map for the bootstrap's own cages, in the
+                        form --identity-map takes
+  --alpine-repository SPEC
+                        An additional archive source, merged into the same
+                        resolution. SPEC is space-separated key=value fields:
+                        'release=R mirror=URL keys=SOURCE [mirror-fallback=URL]
+                        [components=a,b]'. Naming no components selects the
+                        <release>/<architecture> layout postmarketOS publishes.
+                        Repeatable
   --remove-rootfs DIR   Delete the provisioned rootfs at DIR and exit,
                         including one a range-mapped sandbox wrote and a plain
                         'rm -rf' cannot remove. Give the --identity-map the
@@ -366,6 +405,19 @@ struct Options {
     debian_pre_configure_overlay: Option<PathBuf>,
     debian_identity_map: Option<IdentityMap>,
     debian_repositories: Vec<Repository>,
+    provision_alpine: Option<String>,
+    alpine_arch: Option<String>,
+    alpine_mirror: Option<String>,
+    alpine_components: Vec<String>,
+    alpine_include: Vec<String>,
+    alpine_exclude: Vec<String>,
+    alpine_extract_only: bool,
+    alpine_cache: Option<PathBuf>,
+    alpine_keys: Option<AlpineKeys>,
+    alpine_mirror_fallback: Vec<String>,
+    alpine_pre_configure_overlay: Option<PathBuf>,
+    alpine_identity_map: Option<IdentityMap>,
+    alpine_repositories: Vec<AlpineRepositorySpec>,
     command_line: Vec<OsString>,
     path_lookup: Option<bool>,
     /// Binds and raw mounts in one sequence, so `--bind` and `--raw-mount`
@@ -696,6 +748,19 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         debian_pre_configure_overlay: None,
         debian_identity_map: None,
         debian_repositories: Vec::new(),
+        provision_alpine: None,
+        alpine_arch: None,
+        alpine_mirror: None,
+        alpine_components: Vec::new(),
+        alpine_include: Vec::new(),
+        alpine_exclude: Vec::new(),
+        alpine_extract_only: false,
+        alpine_cache: None,
+        alpine_keys: None,
+        alpine_mirror_fallback: Vec::new(),
+        alpine_pre_configure_overlay: None,
+        alpine_identity_map: None,
+        alpine_repositories: Vec::new(),
         command_line: Vec::new(),
         path_lookup: None,
         mounts: Vec::new(),
@@ -1006,6 +1071,103 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
                     "--debian-repository",
                     value,
                 )?)?);
+        } else if arg == "--provision-alpine" {
+            options.provision_alpine = Some(string_value("--provision-alpine", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--provision-alpine=") {
+            options.provision_alpine = Some(into_string("--provision-alpine", value)?);
+        } else if arg == "--alpine-arch" {
+            options.alpine_arch = Some(string_value("--alpine-arch", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--alpine-arch=") {
+            options.alpine_arch = Some(into_string("--alpine-arch", value)?);
+        } else if arg == "--alpine-mirror" {
+            options.alpine_mirror = Some(string_value("--alpine-mirror", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--alpine-mirror=") {
+            options.alpine_mirror = Some(into_string("--alpine-mirror", value)?);
+        } else if arg == "--alpine-mirror-fallback" {
+            options
+                .alpine_mirror_fallback
+                .push(string_value("--alpine-mirror-fallback", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--alpine-mirror-fallback=") {
+            options
+                .alpine_mirror_fallback
+                .push(into_string("--alpine-mirror-fallback", value)?);
+        } else if arg == "--alpine-components" {
+            extend_comma(
+                &mut options.alpine_components,
+                &string_value("--alpine-components", &mut args)?,
+            );
+        } else if let Some(value) = flag_value(&arg, b"--alpine-components=") {
+            extend_comma(
+                &mut options.alpine_components,
+                &into_string("--alpine-components", value)?,
+            );
+        } else if arg == "--alpine-include" {
+            extend_comma(
+                &mut options.alpine_include,
+                &string_value("--alpine-include", &mut args)?,
+            );
+        } else if let Some(value) = flag_value(&arg, b"--alpine-include=") {
+            extend_comma(
+                &mut options.alpine_include,
+                &into_string("--alpine-include", value)?,
+            );
+        } else if arg == "--alpine-exclude" {
+            extend_comma(
+                &mut options.alpine_exclude,
+                &string_value("--alpine-exclude", &mut args)?,
+            );
+        } else if let Some(value) = flag_value(&arg, b"--alpine-exclude=") {
+            extend_comma(
+                &mut options.alpine_exclude,
+                &into_string("--alpine-exclude", value)?,
+            );
+        } else if arg == "--alpine-extract-only" {
+            options.alpine_extract_only = true;
+        } else if arg == "--alpine-cache" {
+            options.alpine_cache = Some(PathBuf::from(value_for("--alpine-cache", &mut args)?));
+        } else if let Some(value) = flag_value(&arg, b"--alpine-cache=") {
+            options.alpine_cache = Some(PathBuf::from(value));
+        } else if arg == "--alpine-keys" {
+            options.alpine_keys = Some(parse_alpine_keys(
+                "--alpine-keys",
+                &string_value("--alpine-keys", &mut args)?,
+            ));
+        } else if let Some(value) = flag_value(&arg, b"--alpine-keys=") {
+            options.alpine_keys = Some(parse_alpine_keys(
+                "--alpine-keys",
+                &into_string("--alpine-keys", value)?,
+            ));
+        } else if arg == "--alpine-pre-configure-overlay" {
+            options.alpine_pre_configure_overlay = Some(PathBuf::from(value_for(
+                "--alpine-pre-configure-overlay",
+                &mut args,
+            )?));
+        } else if let Some(value) = flag_value(&arg, b"--alpine-pre-configure-overlay=") {
+            options.alpine_pre_configure_overlay = Some(PathBuf::from(value));
+        } else if arg == "--alpine-identity-map" {
+            options.alpine_identity_map = Some(parse_identity_map(
+                "--alpine-identity-map",
+                &string_value("--alpine-identity-map", &mut args)?,
+            )?);
+        } else if let Some(value) = flag_value(&arg, b"--alpine-identity-map=") {
+            options.alpine_identity_map = Some(parse_identity_map(
+                "--alpine-identity-map",
+                &into_string("--alpine-identity-map", value)?,
+            )?);
+        } else if arg == "--alpine-repository" {
+            options
+                .alpine_repositories
+                .push(parse_alpine_repository(&string_value(
+                    "--alpine-repository",
+                    &mut args,
+                )?)?);
+        } else if let Some(value) = flag_value(&arg, b"--alpine-repository=") {
+            options
+                .alpine_repositories
+                .push(parse_alpine_repository(&into_string(
+                    "--alpine-repository",
+                    value,
+                )?)?);
         } else if arg == "--restrict" {
             options.restrict = true;
         } else if arg == "--landlock-ro" {
@@ -1161,6 +1323,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             (options.provision_tar.is_some(), "--provision-tar"),
             (options.provision_debian.is_some(), "--provision-debian"),
             (has_debian_modifiers(&options), "the --debian-* options"),
+            (options.provision_alpine.is_some(), "--provision-alpine"),
+            (has_alpine_modifiers(&options), "the --alpine-* options"),
             (
                 options
                     .mounts
@@ -1254,21 +1418,36 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
                 .to_string(),
         );
     }
-    if options.provision_tar.is_some() && options.provision_debian.is_some() {
-        return Err("--provision-tar and --provision-debian are mutually exclusive".to_string());
+    // One rootfs is provisioned one way, and by something that was told where
+    // to put it. Both refusals name the flag rather than reporting "a
+    // provisioner", so the two are enumerated once here.
+    let provisioners: Vec<&str> = [
+        (options.provision_tar.is_some(), "--provision-tar"),
+        (options.provision_debian.is_some(), "--provision-debian"),
+        (options.provision_alpine.is_some(), "--provision-alpine"),
+    ]
+    .into_iter()
+    .filter_map(|(given, flag)| given.then_some(flag))
+    .collect();
+    if let [first, second, ..] = provisioners[..] {
+        return Err(format!("{first} and {second} are mutually exclusive"));
     }
-    if options.provision_tar.is_some() && options.rootfs.is_none() {
-        return Err("--provision-tar requires --rootfs to name the destination".to_string());
-    }
-    if options.provision_debian.is_some() && options.rootfs.is_none() {
-        return Err("--provision-debian requires --rootfs to name the destination".to_string());
+    if let [only] = provisioners[..]
+        && options.rootfs.is_none()
+    {
+        return Err(format!("{only} requires --rootfs to name the destination"));
     }
     if options.provision_debian.is_none() && has_debian_modifiers(&options) {
         return Err("the --debian-* options require --provision-debian".to_string());
     }
+    if options.provision_alpine.is_none() && has_alpine_modifiers(&options) {
+        return Err("the --alpine-* options require --provision-alpine".to_string());
+    }
     // A provisioning run without a command provisions and exits; otherwise a
     // command (or a profile that names one) is required.
-    let provisioning = options.provision_tar.is_some() || options.provision_debian.is_some();
+    let provisioning = options.provision_tar.is_some()
+        || options.provision_debian.is_some()
+        || options.provision_alpine.is_some();
     if options.command_line.is_empty() && options.profile.is_none() && !provisioning {
         return Err("no command given".to_string());
     }
@@ -1303,8 +1482,11 @@ fn first_launch_flag(args: &[OsString]) -> Option<String> {
 
 /// Whether `flag` configures the provisioning rather than the launch.
 fn provisions(flag: &str) -> bool {
-    matches!(flag, "--rootfs" | "--provision-tar" | "--provision-debian")
-        || flag.starts_with("--debian-")
+    matches!(
+        flag,
+        "--rootfs" | "--provision-tar" | "--provision-debian" | "--provision-alpine"
+    ) || flag.starts_with("--debian-")
+        || flag.starts_with("--alpine-")
 }
 
 /// Records the profile to load, refusing a mix of the two trust models.
@@ -1495,6 +1677,22 @@ fn has_debian_modifiers(options: &Options) -> bool {
         || options.debian_pre_configure_overlay.is_some()
         || options.debian_identity_map.is_some()
         || !options.debian_repositories.is_empty()
+}
+
+/// Whether any `--alpine-*` modifier flag was given.
+fn has_alpine_modifiers(options: &Options) -> bool {
+    options.alpine_arch.is_some()
+        || options.alpine_mirror.is_some()
+        || !options.alpine_components.is_empty()
+        || !options.alpine_include.is_empty()
+        || !options.alpine_exclude.is_empty()
+        || options.alpine_extract_only
+        || options.alpine_cache.is_some()
+        || options.alpine_keys.is_some()
+        || !options.alpine_mirror_fallback.is_empty()
+        || options.alpine_pre_configure_overlay.is_some()
+        || options.alpine_identity_map.is_some()
+        || !options.alpine_repositories.is_empty()
 }
 
 /// Whether any `--netstack-*` modifier flag was given.
@@ -1764,6 +1962,140 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
     builder
         .build()
         .map_err(|error| format!("--debian-repository: {error}"))
+}
+
+/// Where an apk repository's trusted keys come from.
+///
+/// Resolved after the whole command line is read rather than as the flag is
+/// parsed, because the bundled Alpine set is per architecture and
+/// `--alpine-arch` may come later. The spelling is checked here; only the
+/// lookup waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AlpineKeys {
+    /// The bundled Alpine set for the bootstrap's architecture.
+    Alpine,
+    /// The bundled postmarketOS key, which serves every architecture it
+    /// publishes.
+    PostmarketOs,
+    /// A directory of PEM public keys, each held under its file name.
+    Dir(PathBuf),
+}
+
+/// A `--alpine-repository` specification, read but not yet built.
+///
+/// Held in this shape for the same reason [`AlpineKeys`] is: a repository is
+/// built once the architecture its keys are chosen by is known.
+#[derive(Debug, Clone)]
+struct AlpineRepositorySpec {
+    release: String,
+    /// The primary mirror first, then any backstops, as the builder takes them.
+    mirrors: Vec<String>,
+    components: Vec<String>,
+    keys: AlpineKeys,
+}
+
+/// Reads a key-set selector: `alpine`, `postmarketos`, or a directory path.
+///
+/// `flag` is unused today and taken so the two callers read alike; a path is
+/// accepted without being examined, since whether a directory holds usable keys
+/// is [`alpine_key_set`]'s question and its answer names the file.
+fn parse_alpine_keys(_flag: &str, value: &str) -> AlpineKeys {
+    match value {
+        "alpine" => AlpineKeys::Alpine,
+        "postmarketos" => AlpineKeys::PostmarketOs,
+        path => AlpineKeys::Dir(PathBuf::from(path)),
+    }
+}
+
+/// Builds the key set `keys` names, for a bootstrap targeting `architecture`.
+///
+/// A directory is read as `/etc/apk/keys` is: every regular file in it is a PEM
+/// public key held under its own file name, which is the name a signature spells
+/// its key by. The directory is read in name order so that two runs over one
+/// directory report the same first failure.
+fn alpine_key_set(
+    flag: &str,
+    keys: &AlpineKeys,
+    architecture: &str,
+) -> Result<AlpineKeySet, String> {
+    let directory = match keys {
+        AlpineKeys::Alpine => {
+            return AlpineKeySet::alpine(architecture).map_err(|err| format!("{flag}: {err}"));
+        }
+        AlpineKeys::PostmarketOs => return Ok(AlpineKeySet::postmarketos()),
+        AlpineKeys::Dir(directory) => directory,
+    };
+
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(directory)
+        .map_err(|err| format!("{flag}: reading {}: {err}", directory.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|err| format!("{flag}: reading {}: {err}", directory.display()))
+        })
+        .collect::<Result<_, _>>()?;
+    entries.sort();
+
+    let mut set = AlpineKeySet::new();
+    for path in entries {
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(format!(
+                "{flag}: {} is not a usable key name; a signature names its key by exactly the \
+                 file name the repository publishes it under",
+                path.display(),
+            ));
+        };
+        let pem = std::fs::read_to_string(&path)
+            .map_err(|err| format!("{flag}: reading {}: {err}", path.display()))?;
+        set.insert(name, &pem)
+            .map_err(|err| format!("{flag}: {err}"))?;
+    }
+    if set.is_empty() {
+        return Err(format!(
+            "{flag}: {} holds no keys, so nothing the repository serves could be verified",
+            directory.display(),
+        ));
+    }
+    Ok(set)
+}
+
+/// Parses an `--alpine-repository` specification:
+/// `release=R mirror=URL keys=SOURCE [mirror-fallback=URL] [components=a,b]`.
+fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
+    let mut release = None;
+    let mut mirrors: Vec<String> = Vec::new();
+    let mut components: Vec<String> = Vec::new();
+    let mut keys = None;
+    for (key, value) in spec_pairs("--alpine-repository", spec)? {
+        match key {
+            "release" => release = Some(value.to_string()),
+            "mirror" => mirrors.insert(0, value.to_string()),
+            "mirror-fallback" => mirrors.push(value.to_string()),
+            "components" => extend_comma(&mut components, value),
+            "keys" => keys = Some(parse_alpine_keys("--alpine-repository", value)),
+            other => {
+                return Err(format!(
+                    "--alpine-repository: unknown field {other:?}; expected release, mirror, \
+                     mirror-fallback, components, or keys"
+                ));
+            }
+        }
+    }
+    Ok(AlpineRepositorySpec {
+        release: release.ok_or("--alpine-repository requires a release= field".to_string())?,
+        mirrors,
+        components,
+        // Unlike the primary, an additional repository has no default: its
+        // signing key is its own, and the library refuses one without keys.
+        keys: keys.ok_or(
+            "--alpine-repository requires a keys= field, one of 'alpine', 'postmarketos', or a \
+             directory of PEM public keys"
+                .to_string(),
+        )?,
+    })
 }
 
 /// Consumes the next argument as a required UTF-8 string value.
@@ -2207,6 +2539,12 @@ fn run(options: Options) -> ExitCode {
     if let Some(suite) = &options.provision_debian {
         let rootfs = options.rootfs.as_deref().expect("checked at parse time");
         if let Err(code) = provision_debian(suite, &options, rootfs) {
+            return code;
+        }
+    }
+    if let Some(release) = &options.provision_alpine {
+        let rootfs = options.rootfs.as_deref().expect("checked at parse time");
+        if let Err(code) = provision_alpine(release, &options, rootfs) {
             return code;
         }
     }
@@ -2798,6 +3136,124 @@ fn print_debian_event(event: ferroday_cage::provision::debian::DebianEvent<'_>) 
     }
 }
 
+/// Bootstraps an Alpine rootfs from the archive, printing progress to stderr.
+///
+/// Mirrors [`provision_debian`] flag for flag where the two layers agree. Where
+/// they do not, the difference is the archive's: apk publishes no priority band,
+/// so there is no base-set floor and the install set is exactly what
+/// `--alpine-include` names closed over its dependencies; and it has no unsigned
+/// mode and no freshness window, so there is nothing for a `--debian-*`
+/// counterpart of `trust-unsigned` or `allow-stale-release` to relax.
+fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(), ExitCode> {
+    use ferroday_cage::provision::alpine::{Alpine, Repository};
+
+    let usage = |message: String| {
+        eprintln!("fcage: {message}");
+        ExitCode::from(2)
+    };
+
+    // The architecture the key sets are chosen by: the one named, or the host's,
+    // which is what the builder would default to.
+    let architecture = options
+        .alpine_arch
+        .clone()
+        .unwrap_or_else(ferroday_cage::provision::alpine::host_architecture);
+
+    let mut builder = Alpine::builder(release)
+        .architecture(&architecture)
+        .extract_only(options.alpine_extract_only);
+    if let Some(mirror) = &options.alpine_mirror {
+        builder = builder.mirror(mirror);
+    }
+    for fallback in &options.alpine_mirror_fallback {
+        builder = builder.mirror_fallback(fallback);
+    }
+    if !options.alpine_components.is_empty() {
+        builder = builder.components(options.alpine_components.clone());
+    }
+    if !options.alpine_include.is_empty() {
+        builder = builder.include(options.alpine_include.clone());
+    }
+    if !options.alpine_exclude.is_empty() {
+        builder = builder.exclude(options.alpine_exclude.clone());
+    }
+    if let Some(cache) = &options.alpine_cache {
+        builder = builder.cache_dir(cache);
+    }
+    if let Some(keys) = &options.alpine_keys {
+        builder =
+            builder.keys(alpine_key_set("--alpine-keys", keys, &architecture).map_err(usage)?);
+    }
+    if let Some(overlay) = &options.alpine_pre_configure_overlay {
+        builder = builder.pre_configure_overlay(overlay);
+    }
+    if let Some(map) = &options.alpine_identity_map {
+        builder = builder.identity_map(map.clone());
+    }
+    for spec in &options.alpine_repositories {
+        let mut repository = Repository::builder(&spec.release)
+            .keys(alpine_key_set("--alpine-repository", &spec.keys, &architecture).map_err(usage)?);
+        let mut mirrors = spec.mirrors.iter();
+        if let Some(primary) = mirrors.next() {
+            repository = repository.mirror(primary);
+        }
+        for fallback in mirrors {
+            repository = repository.mirror_fallback(fallback);
+        }
+        if !spec.components.is_empty() {
+            repository = repository.components(spec.components.clone());
+        }
+        builder = builder.repository(
+            repository
+                .build()
+                .map_err(|error| usage(format!("--alpine-repository: {error}")))?,
+        );
+    }
+
+    let mut alpine = builder.build().map_err(|error| {
+        eprintln!("fcage: {error}");
+        ExitCode::from(125)
+    })?;
+    let mut progress = print_alpine_event;
+    ferroday_cage::provision::ensure(rootfs, &mut alpine.observe(&mut progress)).map_err(
+        |error| {
+            eprintln!("fcage: {error}");
+            ExitCode::from(125)
+        },
+    )?;
+    Ok(())
+}
+
+/// Prints an Alpine bootstrap progress event to stderr.
+///
+/// The same shape as [`print_debian_event`], which is the point of
+/// [`AlpineEvent`](ferroday_cage::provision::alpine::AlpineEvent) carrying the
+/// same progress: a consumer reports one layer by changing the type it matches
+/// on.
+fn print_alpine_event(event: ferroday_cage::provision::alpine::AlpineEvent<'_>) {
+    use ferroday_cage::provision::alpine::AlpineEvent;
+    use std::io::Write;
+    match event {
+        AlpineEvent::Fetching { url, .. } => eprintln!("fcage: fetching {url}"),
+        AlpineEvent::Resolving => eprintln!("fcage: resolving the package set"),
+        AlpineEvent::Downloading {
+            package,
+            index,
+            total,
+            ..
+        } => eprintln!("fcage: downloading {package} ({index}/{total})"),
+        AlpineEvent::Extracting { package, .. } => eprintln!("fcage: extracting {package}"),
+        AlpineEvent::Script {
+            package, script, ..
+        } => eprintln!("fcage: {package}: {script}"),
+        // An install script's own output flows straight to stderr.
+        AlpineEvent::CommandOutput { bytes, .. } => {
+            let _ = std::io::stderr().write_all(bytes);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3011,6 +3467,132 @@ mod tests {
                 "/bin/sh",
             ])
             .is_ok()
+        );
+    }
+
+    /// The options of a parsed invocation, or a panic naming what went wrong.
+    fn run_options(args: &[&str]) -> Box<Options> {
+        match parse_args(args) {
+            Ok(Invocation::Run(options)) => options,
+            Ok(_) => panic!("{args:?} should parse as a run"),
+            Err(error) => panic!("{args:?} should parse: {error}"),
+        }
+    }
+
+    #[test]
+    fn the_alpine_options_reach_the_builder_they_mirror() {
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--provision-alpine",
+            "v3.23",
+            "--alpine-arch",
+            "aarch64",
+            "--alpine-include",
+            "build-base,git",
+            "--alpine-include",
+            "curl",
+            "--alpine-exclude",
+            "docs",
+            "--alpine-components",
+            "main,community",
+            "--alpine-cache",
+            "/var/cache/apk",
+            "--alpine-extract-only",
+        ]);
+        assert_eq!(options.provision_alpine.as_deref(), Some("v3.23"));
+        assert_eq!(options.alpine_arch.as_deref(), Some("aarch64"));
+        // Repeatable and comma-separated, as the Debian list flags are.
+        assert_eq!(options.alpine_include, ["build-base", "git", "curl"]);
+        assert_eq!(options.alpine_exclude, ["docs"]);
+        assert_eq!(options.alpine_components, ["main", "community"]);
+        assert!(options.alpine_extract_only);
+    }
+
+    #[test]
+    fn an_overlay_repository_is_spelled_by_naming_no_components() {
+        // postmarketOS's layout, which is the whole of what the flag has to
+        // express that the Debian one does not.
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--provision-alpine",
+            "v3.23",
+            "--alpine-repository",
+            "release=v26.06 mirror=http://mirror.invalid/pmos keys=postmarketos",
+        ]);
+        let [overlay] = &options.alpine_repositories[..] else {
+            panic!(
+                "one repository was given: {:?}",
+                options.alpine_repositories
+            );
+        };
+        assert_eq!(overlay.release, "v26.06");
+        assert_eq!(overlay.mirrors, ["http://mirror.invalid/pmos"]);
+        assert!(overlay.components.is_empty(), "the shallower layout");
+        assert_eq!(overlay.keys, AlpineKeys::PostmarketOs);
+    }
+
+    #[test]
+    fn a_repository_without_keys_is_refused_where_it_is_written() {
+        // An additional repository has no default trust anchor, so the refusal
+        // belongs at the flag rather than at the first signature it cannot
+        // check.
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--provision-alpine",
+            "v3.23",
+            "--alpine-repository",
+            "release=v26.06 mirror=http://mirror.invalid/pmos",
+        ]);
+        assert!(error.contains("keys="), "{error}");
+
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--provision-alpine",
+            "v3.23",
+            "--alpine-repository",
+            "release=v26.06 mirror=http://mirror.invalid/pmos keys=alpine suite=trixie",
+        ]);
+        assert!(
+            error.contains("suite"),
+            "an unknown field is named: {error}"
+        );
+    }
+
+    #[test]
+    fn the_two_provisioners_are_mutually_exclusive_and_need_a_destination() {
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/mixed",
+            "--provision-debian",
+            "trixie",
+            "--provision-alpine",
+            "v3.23",
+        ]);
+        assert!(
+            error.contains("--provision-debian and --provision-alpine"),
+            "{error}",
+        );
+
+        let error = parse_error(&["--provision-alpine", "v3.23"]);
+        assert!(error.contains("--rootfs"), "{error}");
+    }
+
+    #[test]
+    fn the_alpine_options_require_the_provisioner_they_configure() {
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--alpine-include",
+            "build-base",
+            "/bin/sh",
+        ]);
+        assert!(
+            error.contains("the --alpine-* options require --provision-alpine"),
+            "{error}",
         );
     }
 

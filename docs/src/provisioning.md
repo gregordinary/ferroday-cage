@@ -113,7 +113,9 @@ provisioner reports each entry and its progress through the archive; the
 [Debian provisioner](debian.md) reports its own richer events —
 fetches, resolution, downloads, and dpkg's output — through the
 `ProvisionEvent::Debian` variant, and honours the same cancellation check
-between packages.
+between packages. The [Alpine provisioner](alpine.md) reports the same
+progress through `ProvisionEvent::Alpine`, so a consumer reports either
+userland by changing the type it matches on.
 
 ## Removing a rootfs
 
@@ -552,7 +554,9 @@ versioning](stability.md#extension-traits).
 The [Debian userland](debian.md) add-on is a provisioner of this kind: with
 the `debian` feature it bootstraps a Debian suite from the archive, and
 [Building a Debian package](building-a-debian-package.md) works it into a
-consumer that builds a `.deb` from source in a cage.
+consumer that builds a `.deb` from source in a cage. The [Alpine
+userland](alpine.md) is the second, and provisions an Alpine or postmarketOS
+root the same way.
 
 ## The command line
 

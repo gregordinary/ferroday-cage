@@ -238,8 +238,10 @@ the question is not already here under different words.
 | Open a directory the kernel keeps inside a tree | `provision::containment::open_dir` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
 | What may a release, a component, or an architecture contain? | `provision::coordinate::check` |
+| Read or write a plan document | `provision::document` |
 | Name a local path as a `file://` URL | `provision::file_url` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
+| What Alpine architecture is the host? | `provision::alpine::host_architecture` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Report a step over a wire, by number | `wire::wire_enum!` |

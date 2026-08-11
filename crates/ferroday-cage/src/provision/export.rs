@@ -27,26 +27,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::identity::compose_child_map;
+use super::tar::{
+    BLOCK, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad, ustar_block,
+};
 use super::{Delegate, ProvisionError};
 use crate::mechanism::{
     ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
     StartError, kill_export, start_export,
 };
 use crate::{IdMapper, IdentityMap};
-
-/// A tar block, and a tar header.
-const BLOCK: usize = 512;
-/// The largest size the ustar octal `size` field holds (`8^11 - 1`); a larger
-/// file needs a pax `size` record.
-const MAX_USTAR_SIZE: u64 = (1 << 33) - 1;
-/// The modification-time range the ustar octal `mtime` field holds: zero
-/// through `8^11 - 1` seconds since the epoch, about the year 2242. A time
-/// outside it — a pre-1970 negative time, or one further out than 2242 — is
-/// carried in a pax `mtime` record instead, the ustar field holding a clamped
-/// placeholder the reader ignores, the way an oversized path or file does.
-const MAX_USTAR_MTIME: i64 = (1 << 33) - 1;
-/// The largest value the ustar octal `uid`/`gid` field holds (`8^7 - 1`).
-const MAX_ID: u64 = (1 << 21) - 1;
 
 /// An ownership-preserving rootfs export, configured then written.
 ///
@@ -433,7 +422,7 @@ impl<W: Write> TarWriter<W> {
 
     /// Writes two zero blocks: the archive terminator.
     fn finish(&mut self) -> io::Result<()> {
-        self.out.write_all(&[0u8; BLOCK * 2])?;
+        self.out.write_all(&[0u8; BLOCK as usize * 2])?;
         self.out.flush()
     }
 
@@ -487,9 +476,10 @@ impl<W: Write> TarWriter<W> {
 
         // The ustar header. When a pax record overrides a field, the ustar
         // field holds a truncated form the reader ignores.
-        let (name_field, prefix_field) = split.unwrap_or((&path[..path.len().min(100)], &[][..]));
+        let (name_field, prefix_field) =
+            split.unwrap_or((&path[..path.len().min(MAX_USTAR_NAME)], &[][..]));
         let ustar_size = if size_fits { size } else { 0 };
-        let link_field = &linkname[..linkname.len().min(100)];
+        let link_field = &linkname[..linkname.len().min(MAX_USTAR_NAME)];
         let block = ustar_block(
             name_field,
             prefix_field,
@@ -510,7 +500,7 @@ impl<W: Write> TarWriter<W> {
         // path-derived one keeps `tar tvf` legible.
         let mut name = b"PaxHeaders/".to_vec();
         name.extend_from_slice(path);
-        let name = &name[..name.len().min(100)];
+        let name = &name[..name.len().min(MAX_USTAR_NAME)];
         let block = ustar_block(name, &[], 0o644, 0, 0, size as u64, mtime, b'x', &[])?;
         self.out.write_all(&block)
     }
@@ -553,30 +543,22 @@ fn discard(reader: &mut impl Read, n: u64) -> Result<(), CopyError> {
     Ok(())
 }
 
-/// Writes the zero padding after `size` bytes of data, up to the next block.
-fn pad(out: &mut impl Write, size: u64) -> io::Result<()> {
-    let rem = (size % BLOCK as u64) as usize;
-    if rem != 0 {
-        out.write_all(&[0u8; BLOCK][..BLOCK - rem])?;
-    }
-    Ok(())
-}
-
-/// Splits a path into the ustar `name` (<=100) and `prefix` (<=155) fields,
-/// joined by an implicit `/`, or `None` when no split fits and a pax `path`
-/// record is needed.
+/// Splits a path into the ustar `name` and `prefix` fields, joined by an
+/// implicit `/`, or `None` when no split fits and a pax `path` record is needed.
 fn split_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
-    if path.len() <= 100 {
+    if path.len() <= MAX_USTAR_NAME {
         return Some((path, &[]));
     }
-    // name = path[i+1..] must be <=100, so i >= len-101; prefix = path[..i]
-    // must be <=155, so i <= 155. Prefer the largest such split point.
-    let lo = path.len().saturating_sub(101);
-    let hi = path.len().saturating_sub(1).min(155);
+    // name = path[i+1..] must fit `name`, so i >= len-(MAX_USTAR_NAME+1);
+    // prefix = path[..i] must fit `prefix`, so i <= MAX_USTAR_PREFIX. Prefer the
+    // largest such split point.
+    let lo = path.len().saturating_sub(MAX_USTAR_NAME + 1);
+    let hi = path.len().saturating_sub(1).min(MAX_USTAR_PREFIX);
     for i in (lo..=hi).rev() {
         if path[i] == b'/' {
             let (prefix, rest) = (&path[..i], &path[i + 1..]);
-            if !rest.is_empty() && rest.len() <= 100 && prefix.len() <= 155 {
+            if !rest.is_empty() && rest.len() <= MAX_USTAR_NAME && prefix.len() <= MAX_USTAR_PREFIX
+            {
                 return Some((rest, prefix));
             }
         }
@@ -617,94 +599,6 @@ fn decimal_len(n: usize) -> usize {
         digits += 1;
     }
     digits
-}
-
-/// Assembles a 512-byte ustar header block with its checksum.
-#[allow(clippy::too_many_arguments)]
-fn ustar_block(
-    name: &[u8],
-    prefix: &[u8],
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    mtime: i64,
-    typeflag: u8,
-    linkname: &[u8],
-) -> io::Result<[u8; BLOCK]> {
-    let mut block = [0u8; BLOCK];
-    block[0..name.len().min(100)].copy_from_slice(&name[..name.len().min(100)]);
-    octal(&mut block[100..108], u64::from(mode & 0o7777))?;
-    octal_id(&mut block[108..116], u64::from(uid))?;
-    octal_id(&mut block[116..124], u64::from(gid))?;
-    octal(&mut block[124..136], size)?;
-    // Clamp into the field's range: a time outside it is carried in a pax
-    // `mtime` record, so this placeholder is what the reader ignores. Clamping
-    // (rather than failing) keeps one out-of-range stamp from aborting the
-    // export.
-    octal(&mut block[136..148], mtime.clamp(0, MAX_USTAR_MTIME) as u64)?;
-    block[156] = typeflag;
-    block[157..157 + linkname.len().min(100)].copy_from_slice(&linkname[..linkname.len().min(100)]);
-    block[257..263].copy_from_slice(b"ustar\0");
-    block[263..265].copy_from_slice(b"00");
-    octal(&mut block[329..337], 0)?;
-    octal(&mut block[337..345], 0)?;
-    block[345..345 + prefix.len().min(155)].copy_from_slice(&prefix[..prefix.len().min(155)]);
-
-    // The checksum: the sum of every byte with the field read as spaces,
-    // written as six octal digits, a NUL, and a space. The field is six full
-    // octal digits (not the NUL-terminated form `octal` produces), so it is
-    // formatted directly.
-    for byte in &mut block[148..156] {
-        *byte = b' ';
-    }
-    let sum: u32 = block.iter().map(|b| u32::from(*b)).sum();
-    let mut v = sum;
-    for slot in block[148..154].iter_mut().rev() {
-        *slot = b'0' + (v & 0o7) as u8;
-        v >>= 3;
-    }
-    block[154] = 0;
-    block[155] = b' ';
-    Ok(block)
-}
-
-/// Formats `value` right-justified as NUL-terminated octal ASCII into `field`,
-/// erroring when it does not fit.
-fn octal(field: &mut [u8], value: u64) -> io::Result<()> {
-    let digits = field.len() - 1;
-    let max = if digits >= 22 {
-        u64::MAX
-    } else {
-        (1u64 << (3 * digits)) - 1
-    };
-    if value > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a tar header field does not fit an octal value",
-        ));
-    }
-    let mut v = value;
-    for slot in field[..digits].iter_mut().rev() {
-        *slot = b'0' + (v & 0o7) as u8;
-        v >>= 3;
-    }
-    field[digits] = 0;
-    Ok(())
-}
-
-/// Formats a uid or gid, erroring past the ustar octal field's reach. The
-/// exported ids are in-map system ids, well under the limit; a larger id was
-/// never established at provision time (see the module docs of
-/// [`bootstrap::configure`](crate::provision) on the ownership boundary).
-fn octal_id(field: &mut [u8], value: u64) -> io::Result<()> {
-    if value > MAX_ID {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "an owner id is too large for the tar header",
-        ));
-    }
-    octal(field, value)
 }
 
 // Frame decoding: the little-endian shapes the child emits.
@@ -973,13 +867,6 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(declared, record.len());
-    }
-
-    #[test]
-    fn octal_rejects_an_overlong_value() {
-        let mut field = [0u8; 8];
-        assert!(octal(&mut field, MAX_ID).is_ok());
-        assert!(octal(&mut field, MAX_ID + 1).is_err());
     }
 
     #[test]

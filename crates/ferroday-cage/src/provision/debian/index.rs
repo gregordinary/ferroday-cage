@@ -3,9 +3,10 @@
 //! The archive publishes metadata in the deb822 control format: stanzas
 //! separated by blank lines, each a set of `Field: value` lines with
 //! continuation lines folded in. The same parser reads a `Release` file (one
-//! stanza) and a `Packages` index (one stanza per package); [`Stanza`] is the
-//! shared representation, and [`Index`] is the package set built from a
-//! `Packages` file, deduplicated to the highest version of each name.
+//! stanza) and a `Packages` index (one stanza per package). The syntax itself
+//! is [`crate::provision::document`], which every layer's plan documents are
+//! written in as well; [`Index`] is the package set built from a `Packages`
+//! file, deduplicated to the highest version of each name.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -13,68 +14,7 @@ use std::fmt;
 use super::available::Available;
 use super::pin::Pins;
 use super::version;
-
-/// One control-format stanza: its fields in file order.
-///
-/// Field names are matched case-insensitively. A folded value keeps its
-/// continuation lines joined with newlines, so a multi-line field such as a
-/// `Release` file's `SHA256` list is read line by line by the caller.
-pub(crate) struct Stanza {
-    fields: Vec<(String, String)>,
-}
-
-impl Stanza {
-    /// The value of `key`, matched case-insensitively, or `None`.
-    pub(crate) fn get(&self, key: &str) -> Option<&str> {
-        self.fields
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(key))
-            .map(|(_, value)| value.as_str())
-    }
-
-    /// Every field, in the order the stanza wrote them.
-    ///
-    /// For a reader that has to account for fields it does not itself
-    /// understand, rather than only look up the ones it does.
-    pub(crate) fn fields(&self) -> &[(String, String)] {
-        &self.fields
-    }
-}
-
-/// Splits control-format text into stanzas.
-pub(crate) fn parse_stanzas(text: &str) -> Vec<Stanza> {
-    let mut stanzas = Vec::new();
-    let mut fields: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        // A blank line ends a stanza. Whitespace-only counts as blank: deb822
-        // readers treat it so, and a continuation line is one that starts with
-        // a space *and* carries content.
-        if line.trim().is_empty() {
-            if !fields.is_empty() {
-                stanzas.push(Stanza {
-                    fields: std::mem::take(&mut fields),
-                });
-            }
-            continue;
-        }
-        if line.starts_with([' ', '\t']) {
-            // A continuation of the current field. deb822 removes the single
-            // leading space; the newline is kept so multi-line lists split.
-            if let Some((_, value)) = fields.last_mut() {
-                value.push('\n');
-                value.push_str(line.strip_prefix(' ').unwrap_or(line));
-            }
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            fields.push((name.trim().to_string(), value.trim().to_string()));
-        }
-    }
-    if !fields.is_empty() {
-        stanzas.push(Stanza { fields });
-    }
-    stanzas
-}
+use crate::provision::document::{self, Stanza};
 
 /// One package's metadata from a `Packages` index.
 #[derive(Debug, Clone)]
@@ -427,7 +367,7 @@ impl Index {
     ) -> Index {
         let mut by_name: HashMap<String, Package> = HashMap::new();
         for (origin, text) in inputs {
-            for stanza in parse_stanzas(text) {
+            for stanza in document::parse(text) {
                 let Some(mut package) = Package::from_stanza(&stanza) else {
                     continue;
                 };
@@ -582,7 +522,7 @@ fn parse_atom(text: &str) -> Option<DepAtom> {
 /// checkout, or an archive `Sources` stanza — so the source of the metadata is
 /// the caller's to choose.
 pub fn build_depend_names(control: &str) -> Vec<String> {
-    let stanzas = parse_stanzas(control);
+    let stanzas = document::parse(control);
     let Some(source) = stanzas.first() else {
         return Vec::new();
     };
@@ -744,7 +684,7 @@ Multi-Line:
 Package: two
 Version: 1.0
 ";
-        let stanzas = parse_stanzas(text);
+        let stanzas = document::parse(text);
         assert_eq!(stanzas.len(), 2);
         assert_eq!(stanzas[0].get("package"), Some("one"));
         assert_eq!(stanzas[0].get("multi-line"), Some("\nline one\nline two"));
@@ -754,7 +694,7 @@ Version: 1.0
         // deb822 reader; taken as a continuation it would fold the second
         // stanza into the first.
         let padded = "Package: one\n \nPackage: two\n";
-        let stanzas = parse_stanzas(padded);
+        let stanzas = document::parse(padded);
         assert_eq!(stanzas.len(), 2);
         assert_eq!(stanzas[1].get("Package"), Some("two"));
     }

@@ -76,10 +76,10 @@ use flate2::write::GzEncoder;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 
 use super::check_coordinate;
-use super::index::parse_stanzas;
 use super::{DebianError, arch, deb, release, version};
 use crate::mechanism::frame;
 use crate::provision::coordinate::Nesting;
+use crate::provision::document;
 use crate::provision::{file_url, staging_path, write_atomically};
 
 /// A trusted local package pool, configured then published to.
@@ -670,7 +670,7 @@ impl Entry {
     /// paragraph missing either field, which is dropped rather than carried
     /// forward malformed.
     fn from_stanza(text: String) -> Option<Entry> {
-        let stanza = parse_stanzas(&text).into_iter().next()?;
+        let stanza = document::parse(&text).into_iter().next()?;
         Some(Entry {
             name: stanza.get("Package")?.to_string(),
             version: stanza.get("Version")?.to_string(),
@@ -711,7 +711,7 @@ const APPENDED_FIELDS: [&str; 3] = ["Filename", "Size", "SHA256"];
 ///
 /// The control member is one stanza, and it carries none of the fields the pool
 /// appends. Both would otherwise let a `.deb` write its own index entry:
-/// [`Stanza::get`](super::index::Stanza::get) resolves a field by its first
+/// [`Stanza::get`](crate::provision::document::Stanza::get) resolves a field by its first
 /// occurrence, so a control file carrying `SHA256` would shadow the digest taken
 /// from the bytes on disk and a control file carrying `Filename` would name any
 /// other file in the pool; and a control member of two paragraphs would be
@@ -725,7 +725,7 @@ const APPENDED_FIELDS: [&str; 3] = ["Filename", "Size", "SHA256"];
 /// The failure is a bare reason, which the caller attributes to whichever file
 /// it read the stanza from.
 fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
-    let stanzas = parse_stanzas(control);
+    let stanzas = document::parse(control);
     if stanzas.len() > 1 {
         return Err(format!(
             "its control file holds {} paragraphs, and a control file is one",
@@ -1634,7 +1634,7 @@ mod tests {
 
     /// The `Date` a release carries, as the Unix timestamp it names.
     fn release_date(release: &str) -> i64 {
-        let stanza = parse_stanzas(release)
+        let stanza = document::parse(release)
             .into_iter()
             .next()
             .expect("the release has a stanza");
@@ -1711,7 +1711,7 @@ mod tests {
 
     /// The section paths a release names, in the order it names them.
     fn release_sections(release: &str) -> Vec<String> {
-        let stanza = parse_stanzas(release)
+        let stanza = document::parse(release)
             .into_iter()
             .next()
             .expect("the release has a stanza");
@@ -1954,7 +1954,7 @@ mod tests {
             .description("Packages built by the example pipeline");
         named.publish::<&Path>([]).expect("the named publish");
         let release = std::fs::read_to_string(named.release_path().unwrap()).unwrap();
-        let stanza = parse_stanzas(&release)
+        let stanza = document::parse(&release)
             .into_iter()
             .next()
             .expect("the release has a stanza");
