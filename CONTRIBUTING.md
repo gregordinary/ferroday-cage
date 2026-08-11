@@ -239,6 +239,7 @@ the question is not already here under different words.
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
 | What may a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | Read or write a plan document | `provision::document` |
+| Which standard stream did a provisioner's in-cage output come from? | `provision::Stream` |
 | Name a local path as a `file://` URL | `provision::file_url` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |

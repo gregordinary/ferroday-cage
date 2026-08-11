@@ -88,13 +88,14 @@ const _: () = assert_send_sync::<ferroday_cage::provision::Export<'_>>();
 const _: () = assert_send::<ferroday_cage::provision::Tarball>();
 
 // ---------------------------------------------------------------------------
-// What every userland provisioner shares: the transport seam, and the overlay
-// upper a layered build stages into.
+// What every userland provisioner shares: the transport seam, the overlay upper
+// a layered build stages into, and the stream an in-cage command's output is
+// attributed to.
 // ---------------------------------------------------------------------------
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod shared {
-    use ferroday_cage::provision::{BuildLayer, FetchError, FetchRequest, HttpFetch};
+    use ferroday_cage::provision::{BuildLayer, FetchError, FetchRequest, HttpFetch, Stream};
 
     use super::*;
 
@@ -102,6 +103,7 @@ mod shared {
     const _: () = assert_send_sync::<FetchRequest<'_>>();
     const _: () = assert_send_sync::<HttpFetch>();
     const _: () = assert_send_sync::<BuildLayer>();
+    const _: () = assert_send_sync::<Stream>();
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +122,6 @@ mod debian {
     const _: () = assert_send_sync::<debian::Priority>();
     const _: () = assert_send_sync::<debian::Repository>();
     const _: () = assert_send_sync::<debian::RepositoryBuilder>();
-    const _: () = assert_send_sync::<debian::Stream>();
     const _: () = assert_send_sync::<debian::Pool>();
     const _: () = assert_send_sync::<debian::DebianEvent<'_>>();
 

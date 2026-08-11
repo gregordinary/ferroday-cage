@@ -37,6 +37,22 @@ affected.
   particular userland. Every userland provisioner that stages an increment
   returns one. No re-export is left at the old path.
 
+- `Stream` is `provision::Stream`, moved out of `provision::debian` and
+  `provision::alpine`, which each defined their own. The two definitions were
+  identical, down to the documentation: a provisioner that runs a command in a
+  cage has output to attribute to a standard stream whichever archive it
+  provisions from, and the attribution says nothing about the archive.
+  `DebianEvent::CommandOutput::stream` and `AlpineEvent::CommandOutput::stream`
+  both carry the shared type, so code that handles one layer's output handles the
+  other's. The events themselves stay with their layers, since those do speak
+  each archive's own vocabulary. No re-export is left at the old paths.
+
+- A mirror walk advances only past a failure that says *this* mirror could not
+  serve the resource, which is `provision::FetchError`'s own question now rather
+  than one each layer answers. The Alpine index walk advanced past every fetch
+  failure, so a mistyped primary mirror was reported against whichever mirror
+  came last instead of against the one that was wrong.
+
 - Every OS failure a library error carries is now an `io::Error` and is returned
   from `source()`. `Error`, `ConfigError`, `IdMapError`, and `NetStackError`
   stored a raw `errno: i32` and then rendered it by constructing an `io::Error`
@@ -70,6 +86,12 @@ affected.
 - `Debian::observe` takes a `DebianObserver` rather than a bare
   `FnMut(DebianEvent<'_>)` closure. A closure is still an observer — the trait
   carries a blanket impl for one — so existing callers are unaffected.
+
+- A `.PKGINFO` whose `datahash` is not a SHA-256 in lowercase hex is refused as
+  the malformed metadata it is, rather than reaching the data-segment comparison
+  and being reported as a digest mismatch — an authenticity-flavoured answer to a
+  spelling. This is the shape check the Debian layer makes on every
+  archive-supplied digest, now made by both from one place.
 
 ### Added
 
@@ -158,6 +180,17 @@ affected.
   absolute before it does.
 
 ### Fixed
+
+- An Alpine root's files agree with the database that records them when two
+  packages contest a path. Where the earlier package's `replaces` kept the file,
+  the record said so and the extractor wrote the later package's bytes over it
+  anyway — the per-entry hook had no way to say "do not write this one" — so the
+  finished root held a file its own `Z:` digest did not match and `apk audit`
+  reported as modified. Where the later package took the path over, the earlier
+  record went on claiming it, leaving one path under two packages with two
+  digests; which one `apk` read was then a function of the order it walked the
+  records in. Both are closed: the hook decides whether an entry is written, and
+  a replacement takes the path out of the record it took it from.
 
 - The `HttpFetch` transport parses `HTTP://` and `FILE://` as the schemes they
   are. A scheme is case-insensitive (RFC 3986 §3.1), which the crate's scheme
@@ -277,6 +310,17 @@ change where a reader looks.
   occur, and `tools/check-idioms.py` fails CI on any difference, so a second
   answer arrives as a decision in the diff. Writing the census found the
   `HttpFetch` timeout overflow above.
+
+- `is_sha256_hex` is `provision::digest`'s, beside the functions that produce
+  the digests it describes. It lived in the Debian index reader, which is not
+  where "is this a digest, and could it be a path segment" is asked from; the
+  Alpine layer now asks it too, of a `.PKGINFO`'s `datahash`.
+
+- `provision::containment` owns the create-over-what-is-already-there answer,
+  which the extractor and the host-side `Rooted` each spelled: the same
+  unlink-and-retry, the same attempt bound, the same rationale in both comments,
+  differing only in what a failure was called. Each now names its own failures
+  over one errno-level core.
 
 ## [0.2.0] - 2026-08-06
 

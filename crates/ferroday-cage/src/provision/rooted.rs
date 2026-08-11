@@ -69,11 +69,6 @@ const DIR_MODE: u32 = 0o755;
 /// the same reason as [`DIR_MODE`].
 const FILE_MODE: u32 = 0o644;
 
-/// How many times a create is retried when something already occupies the
-/// name. One replacement always suffices; the bound exists so a pathological
-/// filesystem state cannot loop forever.
-const REPLACE_ATTEMPTS: u32 = 3;
-
 /// A directory tree that host-side steps read and write through, with every
 /// path resolved by the kernel against the tree's own root.
 pub(crate) struct Rooted {
@@ -100,13 +95,28 @@ impl Rooted {
 
     /// The host path `relative` names, for an error message. Nothing resolves
     /// through it.
+    ///
+    /// Composed from the components the module's own split produces rather than
+    /// by joining the path as written. [`Path::join`] discards the root it is
+    /// joined to whenever the argument is absolute, so trimming a single leading
+    /// slash would leave `//etc/x` absolute and report the *host's* `/etc/x` as
+    /// the path inside the tree — the one place in the module where a path would
+    /// be composed by `std`'s rules instead of by the rules everything else here
+    /// resolves under.
     pub(crate) fn path(&self, relative: impl AsRef<Path>) -> PathBuf {
         let relative = relative.as_ref();
         let bytes = relative.as_os_str().as_bytes();
-        let trimmed: &Path = Path::new(std::ffi::OsStr::from_bytes(
-            bytes.strip_prefix(b"/").unwrap_or(bytes),
-        ));
-        self.root.join(trimmed)
+        let Ok(components) = path::tree_components(bytes, LeadingSlash::TreeRoot) else {
+            // A path the split refuses names nothing inside the tree, and this
+            // is only ever an error message: the tree's own root is the nearest
+            // true thing to say.
+            return self.root.clone();
+        };
+        let mut host = self.root.clone();
+        for component in components {
+            host.push(std::ffi::OsStr::from_bytes(component));
+        }
+        host
     }
 
     /// Writes `contents` to `relative` at the default mode, creating missing
@@ -224,7 +234,7 @@ impl Rooted {
     pub(crate) fn symlink(&self, target: &str, relative: impl AsRef<Path>) -> io::Result<()> {
         let target = CString::new(target).map_err(|_| Errno::INVAL)?;
         let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Create)?;
-        replacing(&parent, &leaf, || {
+        containment::replacing(&parent, &leaf, || {
             rustix::fs::symlinkat(&target, &parent, &leaf)
         })?;
         Ok(())
@@ -239,7 +249,7 @@ impl Rooted {
     /// on the file this created and on nothing else.
     fn create(&self, relative: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         let (parent, leaf) = self.parent_of(relative, Parents::Create)?;
-        let fd = replacing(&parent, &leaf, || {
+        let fd = containment::replacing(&parent, &leaf, || {
             rustix::fs::openat(
                 &parent,
                 &leaf,
@@ -332,33 +342,6 @@ enum Parents {
     Require,
 }
 
-/// Runs `create`, unlinking whatever occupies the name and trying again on
-/// `EEXIST`.
-fn replacing<T>(
-    parent: &OwnedFd,
-    leaf: &CString,
-    mut create: impl FnMut() -> Result<T, Errno>,
-) -> Result<T, Errno> {
-    for _ in 0..REPLACE_ATTEMPTS {
-        match create() {
-            Ok(value) => return Ok(value),
-            Err(Errno::EXIST) => remove_at(parent, leaf)?,
-            Err(errno) => return Err(errno),
-        }
-    }
-    Err(Errno::EXIST)
-}
-
-/// Removes the entry at `leaf`, whichever kind it is. An empty directory is
-/// removed; a non-empty one keeps the `ENOTEMPTY` the kernel gave.
-fn remove_at(parent: &OwnedFd, leaf: &CString) -> Result<(), Errno> {
-    match rustix::fs::unlinkat(parent, leaf, AtFlags::empty()) {
-        Ok(()) => Ok(()),
-        Err(Errno::ISDIR) => rustix::fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR),
-        Err(errno) => Err(errno),
-    }
-}
-
 /// Splits a tree-relative path into its components.
 ///
 /// [`path::tree_components`] is the split, with a leading `/` naming the tree's
@@ -391,6 +374,23 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let rooted = Rooted::open(&root).unwrap();
         (scratch, rooted)
+    }
+
+    #[test]
+    fn a_reported_host_path_stays_inside_the_tree_however_it_is_spelled() {
+        // Error text only, but the failure it would report is the wrong one:
+        // `Path::join` discards the root whenever what it is joined to is
+        // absolute, so a leading run of slashes trimmed one at a time would name
+        // the *host's* path and read as a write that escaped the tree.
+        let (scratch, tree) = tree("path");
+        let root = scratch.join("tree");
+        for spelling in ["/etc/x", "etc/x", "//etc/x", "/etc//./x"] {
+            assert_eq!(tree.path(spelling), root.join("etc/x"), "{spelling:?}");
+        }
+        // A path naming nothing inside the tree names the tree.
+        for spelling in ["/", "", "."] {
+            assert_eq!(tree.path(spelling), root, "{spelling:?}");
+        }
     }
 
     #[test]

@@ -110,7 +110,25 @@ pub(super) struct Record {
 struct DirectoryLines {
     path: Vec<u8>,
     acl: Option<Vec<u8>>,
-    files: Vec<u8>,
+    files: Vec<FileLines>,
+}
+
+/// One file of a record: the name it is recorded under, and the lines that
+/// describe it.
+///
+/// The name is held apart from the lines, rather than the whole directory being
+/// one appended buffer, because a file line can be taken away again. A package
+/// that takes a path over from an earlier one leaves that earlier record still
+/// claiming it otherwise, and the finished root would list one path under two
+/// packages with two `Z:` digests — of which at most one can match what is on
+/// disk. It is also what makes one package shipping a path twice record it once,
+/// which is the entry the extraction leaves behind.
+struct FileLines {
+    /// The entry name, within its directory, which is what a later claim finds
+    /// it by.
+    name: Vec<u8>,
+    /// The `R:` line and the `a:` and `Z:` lines that follow it.
+    lines: Vec<u8>,
 }
 
 impl Record {
@@ -241,33 +259,58 @@ impl Record {
         self.directory_at(path).acl = acl;
     }
 
-    /// Records a file, symbolic link or hard link the package ships.
+    /// Records a file, symbolic link or hard link the package ships, at the
+    /// root-relative `path`.
     ///
     /// `digest` is the SHA-1 the package's own archive states for it — over the
     /// contents of a file, over the target of a link. A package that states
     /// none leaves the file with no `Z:` line, exactly as `apk` does, and an
     /// audit of the finished root then has nothing to check it against.
+    ///
+    /// A path this record already holds is described again rather than twice:
+    /// tar permits one archive to carry a path more than once, and the entry
+    /// that survives on disk is the last of them.
     pub(super) fn file(
         &mut self,
-        directory: &[u8],
-        name: &[u8],
+        path: &[u8],
         uid: u32,
         gid: u32,
         mode: u32,
         digest: Option<[u8; 20]>,
     ) {
-        let acl = acl_line(b'a', uid, gid, mode, DEFAULT_FILE_ACL);
-        let files = &mut self.directory_at(directory).files;
-        files.extend_from_slice(b"R:");
-        files.extend_from_slice(name);
-        files.push(b'\n');
-        if let Some(acl) = acl {
-            files.extend_from_slice(&acl);
+        let (directory, name) = split_leaf(path);
+        let mut lines = Vec::new();
+        lines.extend_from_slice(b"R:");
+        lines.extend_from_slice(name);
+        lines.push(b'\n');
+        if let Some(acl) = acl_line(b'a', uid, gid, mode, DEFAULT_FILE_ACL) {
+            lines.extend_from_slice(&acl);
         }
         if let Some(digest) = digest {
-            files.extend_from_slice(b"Z:");
-            files.extend_from_slice(sign::identity(&digest).as_bytes());
-            files.push(b'\n');
+            lines.extend_from_slice(b"Z:");
+            lines.extend_from_slice(sign::identity(&digest).as_bytes());
+            lines.push(b'\n');
+        }
+
+        let files = &mut self.directory_at(directory).files;
+        match files.iter_mut().find(|file| file.name == name) {
+            Some(file) => file.lines = lines,
+            None => files.push(FileLines {
+                name: name.to_vec(),
+                lines,
+            }),
+        }
+    }
+
+    /// Stops this record from claiming `path`, where it claimed it.
+    ///
+    /// What a package taking a path over from an earlier one leaves behind. The
+    /// directory itself stays: both packages ship it, which is what makes
+    /// directories shared by construction rather than contested.
+    pub(super) fn remove_file(&mut self, path: &[u8]) {
+        let (directory, name) = split_leaf(path);
+        if let Some(at) = self.at.get(directory) {
+            self.directories[*at].files.retain(|file| file.name != name);
         }
     }
 
@@ -282,10 +325,26 @@ impl Record {
             if let Some(acl) = &directory.acl {
                 out.extend_from_slice(acl);
             }
-            out.extend_from_slice(&directory.files);
+            for file in &directory.files {
+                out.extend_from_slice(&file.lines);
+            }
         }
         out
     }
+}
+
+/// Splits a root-relative path into the directory that holds it and the name
+/// within it, which is how the database records a file: an `R:` line under the
+/// `F:` line naming its directory.
+///
+/// A path with no separator sits in the record's root directory, which is the
+/// empty path — the `F:` line `apk` writes for the top of the tree.
+fn split_leaf(path: &[u8]) -> (&[u8], &[u8]) {
+    path.iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or((&[][..], path), |slash| {
+            (&path[..slash], &path[slash + 1..])
+        })
 }
 
 /// The `<uid>:<gid>:<octal mode>` line for an entry whose ownership or mode
@@ -454,8 +513,12 @@ impl Database {
     /// — nothing is being upgraded and nothing is being removed, so what is
     /// left is what the two packages' `replaces` say about each other:
     ///
-    /// - the later package names the earlier one: it takes the file;
-    /// - the earlier names the later, and no less strongly: it keeps it;
+    /// - the earlier package names the later one *more strongly* than the later
+    ///   names it back — including where the later names it not at all: the
+    ///   earlier keeps the file;
+    /// - otherwise, the later package names the earlier one: it takes the file.
+    ///   Equal priorities fall here, so two packages that name each other at the
+    ///   same strength are settled by install order, as `apk` settles them;
     /// - neither names the other but they were built from one source package:
     ///   the later takes it, since one build shipping a path twice is its own
     ///   business;
@@ -465,6 +528,12 @@ impl Database {
     /// broken. This layer refuses the bootstrap instead: a root is a thing a
     /// caller goes on to build on, and one assembled from packages that
     /// disagree about its contents should not be published quietly.
+    ///
+    /// A replacement also takes the path out of the earlier record. One path
+    /// recorded under two packages would carry two `Z:` digests, and only one
+    /// file can be on disk — `apk audit` reports the other as modified. Which
+    /// of the two `apk` would read is a function of the order it happens to walk
+    /// the records in, which is not a thing a finished root should depend on.
     pub(super) fn claim(&mut self, at: usize, path: &[u8]) -> Claim {
         let Some(&owner) = self.owner.get(path) else {
             self.owner.insert(path.to_vec(), at);
@@ -472,7 +541,8 @@ impl Database {
         };
         if owner == at {
             // The same package shipping one path twice, which tar permits. The
-            // later entry is the one on disk, as it is for the extraction.
+            // later entry is the one on disk, as it is for the extraction, and
+            // `Record::file` describes it again rather than twice.
             return Claim::Replaces;
         }
 
@@ -489,6 +559,7 @@ impl Database {
         };
         if claim == Claim::Replaces {
             self.owner.insert(path.to_vec(), at);
+            self.records[owner].remove_file(path);
         }
         claim
     }
@@ -739,8 +810,8 @@ mod tests {
         let info = info("a", "1-r0", "");
         let mut record = record(&info);
         record.directory(b"etc", 0, 0, 0o755);
-        record.file(b"etc", b"plain", 0, 0, 0o644, None);
-        record.file(b"etc", b"script", 0, 0, 0o755, Some([0xab; 20]));
+        record.file(b"etc/plain", 0, 0, 0o644, None);
+        record.file(b"etc/script", 0, 0, 0o755, Some([0xab; 20]));
         record.directory(b"root", 0, 0, 0o700);
         let rendered = String::from_utf8(record.render()).expect("the record is text");
         let (_, files) = rendered
@@ -766,7 +837,7 @@ mod tests {
         // arrives, still has to place the mode above the file lines.
         let info = info("a", "1-r0", "");
         let mut record = record(&info);
-        record.file(b"var/empty", b"keep", 0, 0, 0o644, None);
+        record.file(b"var/empty/keep", 0, 0, 0o644, None);
         record.directory(b"var/empty", 0, 0, 0o555);
         let rendered = String::from_utf8(record.render()).expect("the record is text");
         assert!(

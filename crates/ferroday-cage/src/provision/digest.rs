@@ -19,6 +19,35 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
+/// Whether `digest` has the shape of a SHA-256: exactly 64 lowercase hex
+/// characters.
+///
+/// This is the only form a repository-supplied digest is ever used in — a cache
+/// filename, a `by-hash` URL segment, and the value a fetch is verified against
+/// — so one carrying anything else is malformed, and refusing it keeps such a
+/// digest from reaching a filesystem path or a request line as, say, a
+/// traversal.
+///
+/// Uppercase is refused rather than folded, and that is what makes every
+/// comparison in the crate a plain `==`: both sides passed through here or came
+/// out of [`hex`], so two spellings of one digest never meet. Folding at the
+/// comparison instead would leave the shape unchecked at the boundary, which is
+/// where the traversal question is asked.
+///
+/// There are two boundaries, one per way a digest arrives, and a digest that
+/// reaches a comparison came through one of them: an index stanza, as it is
+/// parsed, and a plan document, as it is read and again when a plan is handed to
+/// a bootstrap. A digest a plan carries for provenance alone — the one naming
+/// the archive state a resolution happened against — is written back verbatim
+/// and never compared, so it is not held to this.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) fn is_sha256_hex(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// The lowercase hex SHA-256 of everything `reader` yields, with the number of
 /// bytes it yielded.
 ///
@@ -114,6 +143,20 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[cfg(any(feature = "debian", feature = "alpine"))]
+    #[test]
+    fn a_digest_shape_is_sixty_four_lowercase_hex_characters() {
+        assert!(is_sha256_hex(&sha256_hex(b"")));
+        assert!(is_sha256_hex(&"a".repeat(64)));
+        assert!(!is_sha256_hex(&"a".repeat(63)), "too short");
+        assert!(!is_sha256_hex(&"a".repeat(65)), "too long");
+        // Refused rather than folded, so that every comparison in the crate can
+        // be a plain `==` between two values that both came through here.
+        assert!(!is_sha256_hex(&"A".repeat(64)), "uppercase is not accepted");
+        assert!(!is_sha256_hex(&"g".repeat(64)), "non-hex is not accepted");
+        assert!(!is_sha256_hex("../../../etc/foo"));
     }
 
     #[test]

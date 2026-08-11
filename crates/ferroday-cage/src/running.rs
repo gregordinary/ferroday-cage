@@ -106,6 +106,12 @@ pub struct Running<'obs> {
 }
 
 /// Which captured stream a read belongs to.
+///
+/// Deliberately a second answer to the question `provision::Stream` also asks.
+/// That one is public and gated on a userland feature, and provisioning is built
+/// on top of the launch mechanism rather than the other way round, so reaching
+/// for it here would point the dependency backwards and put a feature gate on a
+/// module every build compiles.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Channel {
     Stdout,

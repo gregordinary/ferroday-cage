@@ -31,10 +31,12 @@ use std::io;
 use std::path::Path;
 
 use super::repository::{Repository, Trust};
-use super::{DebianError, DebianEvent, DebianObserver, Stream};
+use super::{DebianError, DebianEvent, DebianObserver};
+use crate::provision::Stream;
 use crate::provision::document;
+use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
-use crate::{Cage, CageBuilder, IdentityMap, Observer, Stdio};
+use crate::{IdentityMap, Observer, Stdio};
 
 /// The core packages configured before the rest, in dependency order, so the
 /// base system (accounts, directories, the C library, dpkg itself) is in
@@ -271,6 +273,7 @@ pub(crate) fn configure(
     run_dpkg(
         "unpack",
         staging,
+        Rooting::Whole,
         archives_host,
         identity_map,
         env,
@@ -295,6 +298,7 @@ pub(crate) fn configure(
     run_dpkg(
         "configure",
         staging,
+        Rooting::Whole,
         archives_host,
         identity_map,
         env,
@@ -379,10 +383,10 @@ pub(crate) fn configure_delta(
     // ownership representable.
     let mut unpack: Vec<&str> = vec!["--force-depends", "--unpack"];
     unpack.extend(installables.iter().map(|p| p.deb_path.as_str()));
-    run_dpkg_overlay(
+    run_dpkg(
         "unpack",
-        lower,
         upper,
+        Rooting::Over(lower),
         archives_host,
         identity_map,
         env,
@@ -397,10 +401,10 @@ pub(crate) fn configure_delta(
         super::super::extract::overlay_tree(upper, source).map_err(DebianError::Overlay)?;
     }
 
-    run_dpkg_overlay(
+    run_dpkg(
         "configure",
-        lower,
         upper,
+        Rooting::Over(lower),
         archives_host,
         identity_map,
         env,
@@ -530,6 +534,9 @@ fn core_install(
         run_dpkg(
             "core install",
             staging,
+            // The core waves are the full bootstrap's alone: a layered build
+            // installs no base system, since its base already carries one.
+            Rooting::Whole,
             archives_host,
             identity_map,
             env,
@@ -573,71 +580,26 @@ fn precreate_shadow(tree: &Rooted) -> Result<(), DebianError> {
     Ok(())
 }
 
-/// Runs one dpkg wave in a cage rooted at the staging tree, under the
-/// bootstrap's identity map.
+/// Runs one dpkg wave in a cage rooted for `staging`, under the bootstrap's
+/// identity map.
+///
+/// `rooting` decides what the wave sees. A full bootstrap roots on the staging
+/// tree alone; a layered build roots on an overlay of the pristine base and the
+/// increment's upper, so dpkg reads the base's configured database and lands its
+/// writes in the disposable upper.
 #[allow(clippy::too_many_arguments)]
 fn run_dpkg(
     wave: &'static str,
     staging: &Path,
+    rooting: Rooting<'_>,
     archives_host: &Path,
     identity_map: &IdentityMap,
     env: &[(String, String)],
     args: &[&str],
     observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
-    run_dpkg_in(
-        wave,
-        Cage::builder().rootfs(staging),
-        archives_host,
-        identity_map,
-        env,
-        args,
-        observer,
-    )
-}
-
-/// Runs one dpkg wave in a cage rooted on an overlay of `lower` with writes in
-/// `upper`, under the layer's identity map.
-///
-/// The layered build's configure waves run here: dpkg sees the merged view of
-/// the pristine base (`lower`) and the increment (`upper`), reads the base's
-/// configured database, and lands its writes in the disposable upper.
-#[allow(clippy::too_many_arguments)]
-fn run_dpkg_overlay(
-    wave: &'static str,
-    lower: &Path,
-    upper: &Path,
-    archives_host: &Path,
-    identity_map: &IdentityMap,
-    env: &[(String, String)],
-    args: &[&str],
-    observer: &mut dyn DebianObserver,
-) -> Result<(), DebianError> {
-    run_dpkg_in(
-        wave,
-        Cage::builder().overlay_rootfs(lower, upper),
-        archives_host,
-        identity_map,
-        env,
-        args,
-        observer,
-    )
-}
-
-/// Runs one dpkg wave in a cage built from `root`, which already carries the
-/// rooting choice (a plain rootfs or an overlay). Shared by the full bootstrap's
-/// plain-rooted waves and the layered build's overlay-rooted ones.
-#[allow(clippy::too_many_arguments)]
-fn run_dpkg_in(
-    wave: &'static str,
-    root: CageBuilder,
-    archives_host: &Path,
-    identity_map: &IdentityMap,
-    env: &[(String, String)],
-    args: &[&str],
-    observer: &mut dyn DebianObserver,
-) -> Result<(), DebianError> {
-    let cage = root
+    let cage = rooting
+        .builder(staging)
         .command("/usr/bin/dpkg")
         .args(args)
         // Read-only so a wave cannot rewrite the caller's package cache, in the

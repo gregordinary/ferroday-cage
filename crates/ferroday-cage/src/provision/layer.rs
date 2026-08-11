@@ -12,21 +12,84 @@
 //! identity map that decides how both are removed. What differs between layers
 //! is how a base's already-installed set is read and how an increment is
 //! configured, and those stay with the layer that knows the archive.
+//!
+//! [`Rooting`] is here for the same reason. Whether a wave's cage is rooted on
+//! the tree being built or on an overlay of a base and that tree is a property
+//! of whether the build is layered, not of the archive it installs from.
 
 use std::path::{Path, PathBuf};
 
-use crate::IdentityMap;
+use crate::{Cage, CageBuilder, IdentityMap};
+
+/// Where a wave of a provisioning run is rooted.
+///
+/// A full bootstrap roots its waves on the tree it is building. A layered build
+/// roots them on an overlay of the pristine base and that tree, which is the
+/// increment's writable upper: the command reads the base's own interpreter, its
+/// accounts and its package database through the merged view, and everything it
+/// writes lands in the upper, so the base comes out of the build untouched.
+#[derive(Clone, Copy)]
+pub(crate) enum Rooting<'a> {
+    /// The tree being built is the whole root.
+    Whole,
+    /// The tree being built is an increment over the base at this path.
+    Over(&'a Path),
+}
+
+impl<'a> Rooting<'a> {
+    /// The rooting a build with `base` runs under: over it when a base was
+    /// configured, on the tree alone when none was.
+    ///
+    /// The Debian layer names the two cases where it decides them and reaches
+    /// for [`Rooting`] already made; only the Alpine layer carries an
+    /// `Option<&Path>` this far, so a build without that feature has no caller.
+    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+    pub(crate) fn over(base: Option<&'a Path>) -> Rooting<'a> {
+        match base {
+            Some(base) => Rooting::Over(base),
+            None => Rooting::Whole,
+        }
+    }
+
+    /// A cage builder rooted for the tree at `staging`, which is the whole root
+    /// or the increment's upper according to which rooting this is.
+    pub(crate) fn builder(self, staging: &Path) -> CageBuilder {
+        match self {
+            Rooting::Whole => Cage::builder().rootfs(staging),
+            // The base is the read-only lower and the tree being built is the
+            // writable upper, so the command sees the merged root and writes
+            // only into the upper.
+            Rooting::Over(base) => Cage::builder().overlay_rootfs(base, staging),
+        }
+    }
+}
 
 /// A staged build layer: the disposable overlay upper an increment was installed
 /// into, removed when the handle is dropped.
 ///
-/// Returned by [`Debian::stage_layer`] and [`Alpine::stage_layer`]. The upper it
-/// owns is the writable layer of a build root — the caller roots a cage on
-/// [`overlay_rootfs(base, layer.path())`](crate::CageBuilder::overlay_rootfs) to
-/// build against the merged `base + increment` view. Dropping the handle removes
-/// the upper and the overlay's work directory beside it, reverting the increment
-/// and leaving the base pristine; the base is a separate directory the handle
-/// never touches.
+// Which provisioners return one depends on the userland features built, and a
+// link to a layer that is not compiled does not resolve. The sentence is
+// therefore written per feature combination, as is each link's definition below.
+#[cfg_attr(
+    all(feature = "debian", feature = "alpine"),
+    doc = "Returned by [`Debian::stage_layer`] and [`Alpine::stage_layer`]."
+)]
+#[cfg_attr(
+    all(feature = "debian", not(feature = "alpine")),
+    doc = "Returned by [`Debian::stage_layer`]."
+)]
+#[cfg_attr(
+    all(feature = "alpine", not(feature = "debian")),
+    doc = "Returned by [`Alpine::stage_layer`]."
+)]
+///
+/// The upper it owns is the writable layer of a build root — the caller roots a
+/// cage on
+/// [`overlay_rootfs(base, layer.path())`](crate::CageBuilder::overlay_rootfs)
+/// to build against the merged `base + increment` view. Dropping the handle
+/// removes the upper and the overlay's work directory beside it, reverting the
+/// increment and leaving the base pristine; the base is a separate directory
+/// the handle never touches.
 ///
 /// Keep the handle alive for as long as the build root is in use, and drop it to
 /// dispose of the increment. The removal is best-effort at drop time — a drop

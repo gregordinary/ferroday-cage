@@ -25,12 +25,29 @@
 //!
 //! Either way the walk cannot leave the tree. The flags differ only in what
 //! they do with a link that names a path from a root.
+//!
+//! # Creating over what is already there
+//!
+//! [`replacing`] is here for the same reason [`open_dir`] is. Both halves of
+//! provisioning create entries in a tree that may already hold something at the
+//! name, and both answer it the same way: unlink whatever is there and create
+//! again. What differs between them is only what a failure is called — the
+//! extractor reports a `ProvisionError` naming the archive entry, the host-side
+//! steps an errno the operation's own error carries — so the errno-level
+//! algorithm is stated once and each caller says what its failures are.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::os::fd::{BorrowedFd, OwnedFd};
 
-use rustix::fs::{Mode, OFlags, ResolveFlags};
+use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
+
+/// How many times a create is retried when something already occupies the name.
+///
+/// One replacement always suffices; the bound exists so a pathological
+/// filesystem state — an entry something else keeps putting back — cannot loop
+/// forever.
+const REPLACE_ATTEMPTS: u32 = 3;
 
 /// Opens `path` as a directory, resolved against `anchor` under `containment`.
 ///
@@ -73,5 +90,44 @@ pub(super) fn open_dir(
             Err(Errno::AGAIN) => continue,
             result => return result,
         }
+    }
+}
+
+/// Runs `create`, unlinking whatever occupies `leaf` in `parent` and trying
+/// again on `EEXIST`.
+///
+/// `EEXIST` is the only failure acted on: every other errno is the caller's to
+/// report, and so is the `EEXIST` that survives [`REPLACE_ATTEMPTS`] rounds.
+///
+/// `parent` is a descriptor for the directory holding the name, so the unlink
+/// and the create act on the same entry the kernel already resolved — nothing
+/// here re-walks a path, and the containment that got the caller its descriptor
+/// is what keeps this inside the tree.
+pub(super) fn replacing<T>(
+    parent: &OwnedFd,
+    leaf: &CString,
+    mut create: impl FnMut() -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    for _ in 0..REPLACE_ATTEMPTS {
+        match create() {
+            Ok(value) => return Ok(value),
+            Err(Errno::EXIST) => remove_at(parent, leaf)?,
+            Err(errno) => return Err(errno),
+        }
+    }
+    Err(Errno::EXIST)
+}
+
+/// Removes the entry at `leaf` in `parent`, whichever kind it is.
+///
+/// An empty directory is removed; a non-empty one keeps the `ENOTEMPTY` the
+/// kernel gave, which is what both callers want to report — a tar entry does not
+/// supersede a directory that still holds entries, and neither does a host-side
+/// write.
+pub(super) fn remove_at(parent: &OwnedFd, leaf: &CString) -> Result<(), Errno> {
+    match rustix::fs::unlinkat(parent, leaf, AtFlags::empty()) {
+        Ok(()) => Ok(()),
+        Err(Errno::ISDIR) => rustix::fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR),
+        Err(errno) => Err(errno),
     }
 }

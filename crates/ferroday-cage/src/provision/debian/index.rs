@@ -179,7 +179,7 @@ impl Package {
             return None;
         }
         let sha256 = stanza.get("SHA256")?.to_string();
-        if !is_sha256_hex(&sha256) {
+        if !crate::provision::digest::is_sha256_hex(&sha256) {
             return None;
         }
         // A stanza that states no size, or states one that does not parse,
@@ -237,19 +237,6 @@ impl Package {
             .as_deref()
             .and_then(|value| value.parse().ok())
     }
-}
-
-/// Whether `digest` has the shape of a SHA-256: exactly 64 lowercase hex
-/// characters. This is the only form an archive-supplied digest is ever used in
-/// — a cache filename, a `by-hash` URL segment, and the fetch verifier's
-/// expected value — so an index or release line carrying anything else is
-/// malformed, and rejecting it keeps an archive-supplied digest from reaching a
-/// filesystem path or a request line as, say, a traversal.
-pub(super) fn is_sha256_hex(digest: &str) -> bool {
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Whether `filename` is a safe pool path: a non-empty relative path with no
@@ -548,13 +535,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn digest_and_pool_path_shapes_are_validated() {
-        assert!(is_sha256_hex(&"a".repeat(64)));
-        assert!(!is_sha256_hex(&"a".repeat(63)), "too short");
-        assert!(!is_sha256_hex(&"A".repeat(64)), "uppercase is not accepted");
-        assert!(!is_sha256_hex(&"g".repeat(64)), "non-hex is not accepted");
-        assert!(!is_sha256_hex("../../../etc/foo"));
-
+    fn pool_path_shapes_are_validated() {
         assert!(is_safe_pool_path("pool/p/pkg/pkg_1.0_amd64.deb"));
         assert!(!is_safe_pool_path(""));
         assert!(!is_safe_pool_path("/etc/passwd"));

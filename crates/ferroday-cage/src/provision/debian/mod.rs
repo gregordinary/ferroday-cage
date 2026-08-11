@@ -66,10 +66,10 @@ pub use pool::Pool;
 pub use repository::{Repository, RepositoryBuilder};
 
 use super::coordinate::{self, Nesting};
-use super::extract::Extraction;
+use super::extract::{Extraction, Placement};
 use super::{
     BuildLayer, Delegate, Fetch, FetchError, FetchRequest, HttpFetch, PackageCache, ProvisionError,
-    ProvisionEvent, ProvisionRequest, Provisioner, staging_path,
+    ProvisionEvent, ProvisionRequest, Provisioner, Stream, staging_path,
 };
 use crate::IdentityMap;
 use crate::status::ExitStatus;
@@ -1833,27 +1833,15 @@ fn fetch_from_mirrors(
     }))
 }
 
-/// Whether an error is one the mirror walk advances past: anything saying that
-/// *this* mirror could not serve the resource.
+/// Whether an error is one the mirror walk advances past.
 ///
-/// A missing resource, a transport failure, and an unsuccessful HTTP status all
-/// qualify. The status case is the one worth naming: a 503 during an outage or
-/// a CDN's 403 for an absent object is exactly what a second mirror, or a
-/// snapshot backstop, exists to answer, and a walk that stopped there would
-/// fail the bootstrap without trying either. The walk keeps the last such error
-/// and reports it if no mirror answers, so the diagnostic survives.
-///
-/// Two kinds do not advance the walk. A malformed or unsupported URL is the
-/// caller's configuration rather than the mirror's state. A digest or signature
-/// failure signals corruption or tampering, and the answer to that is never to
-/// ask somewhere else.
+/// The question is [`FetchError::is_failover`]'s and is shared with every other
+/// layer; this only reaches through the wrapper this layer carries a transport
+/// failure in. A failure that is not a `Fetch` one at all — a digest or
+/// signature mismatch over bytes that did arrive — never advances the walk, and
+/// falls out of the same match.
 fn is_failover(err: &DebianError) -> bool {
-    matches!(
-        err,
-        DebianError::Fetch(
-            FetchError::NotFound { .. } | FetchError::Io { .. } | FetchError::Status { .. }
-        )
-    )
+    matches!(err, DebianError::Fetch(fetch) if fetch.is_failover())
 }
 
 /// Downloads (or reuses from cache) and verifies every selected package.
@@ -2184,11 +2172,13 @@ fn extract_packages(
                         .any(|component| component.contains(&b'\n'))
                     {
                         malformed.get_or_insert_with(|| components.to_vec());
-                        return Ok(());
+                        return Ok(Placement::Write);
                     }
                     statoverride.record(entry.mode, absolute_path(components));
                 }
-                Ok(())
+                // A `.deb`'s files are dpkg's to arbitrate, and this hook only
+                // records ownership as they go past, so every entry is written.
+                Ok(Placement::Write)
             },
         )?;
     }
@@ -2506,16 +2496,6 @@ pub enum DebianEvent<'a> {
         /// The raw output bytes; not line-buffered, not guaranteed UTF-8.
         bytes: &'a [u8],
     },
-}
-
-/// A standard stream of an in-cage command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Stream {
-    /// Standard output.
-    Stdout,
-    /// Standard error.
-    Stderr,
 }
 
 /// An error from bootstrapping a Debian userland.
@@ -2919,7 +2899,38 @@ mod tests {
             "{asked:?}",
         );
         assert_eq!(asked.len(), 1, "the walk stopped at the first mirror");
+        // And it is reported against the mirror that carries the bad URL rather
+        // than against the backstop, which is the whole reason a `Url` failure
+        // does not advance the walk.
+        let reason = result.unwrap_err().to_string();
+        assert!(reason.contains("primary.example"), "{reason}");
+        assert!(!reason.contains("snapshot.example"), "{reason}");
     }
+
+    #[test]
+    fn an_exhausted_walk_is_reported_against_the_mirror_it_asked_last() {
+        // The other attribution: with every mirror declining, the answer names
+        // the one the walk ended on. Keeping the last failure is what makes the
+        // diagnostic survive a walk, and reporting the first would point at a
+        // mirror that may be perfectly healthy.
+        let mut fetcher = Failing {
+            // Every mirror below starts with this, so all of them refuse.
+            primary: "https://".to_string(),
+            refusal: |url: &str| FetchError::status(url, 503),
+            asked: Vec::new(),
+        };
+        let mirrors = [
+            "https://first.example/debian".to_string(),
+            "https://last.example/debian".to_string(),
+        ];
+        let result =
+            fetch_from_mirrors(&mut fetcher, &mirrors, "dists/stable/Release", &mut Silent);
+        assert_eq!(fetcher.asked.len(), 2, "{:?}", fetcher.asked);
+        let reason = result.unwrap_err().to_string();
+        assert!(reason.contains("last.example"), "{reason}");
+        assert!(!reason.contains("first.example"), "{reason}");
+    }
+
     #[test]
     fn the_embedded_keyring_parses() {
         // The vendored keyring must be a valid binary OpenPGP keyring that

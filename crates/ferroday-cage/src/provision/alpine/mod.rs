@@ -63,12 +63,15 @@ pub use repository::{Repository, RepositoryBuilder};
 
 use super::binfmt;
 use super::coordinate::{self, Nesting};
-use super::extract::Extraction;
+use super::extract::{Extraction, Placement};
+// `super::layer` is the shared one; this module has a `layer` of its own, which
+// reads a provisioned base rather than describing how a cage is rooted on it.
+use super::layer::Rooting;
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
     BuildLayer, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter, PackageCache,
-    ProvisionError, ProvisionRequest, Provisioner, digest,
+    ProvisionError, ProvisionRequest, Provisioner, Stream, digest,
 };
 use crate::IdentityMap;
 use bootstrap::ScriptSubject;
@@ -932,10 +935,12 @@ impl AlpineBuilder {
 /// Fetches, verifies and parses one repository index.
 ///
 /// `path` is mirror-relative. The mirror list is walked in order, advancing past
-/// one that reports the index missing or fails at the transport; a mirror that
+/// one that [could not serve the index](FetchError::is_failover); a mirror that
 /// serves something that does not verify is fatal rather than a reason to try
 /// the next, since what it served was answered for by the URL that was asked
-/// for.
+/// for. A URL the transport will not accept is fatal for the same reason it is
+/// everywhere else: it is the configuration rather than the mirror, and walking
+/// past it would report the failure against a mirror that was spelled fine.
 fn read_index(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
@@ -970,7 +975,8 @@ fn read_index(
                     ),
                 ));
             }
-            Err(err) => last_missing = Some(err),
+            Err(err) if err.is_failover() => last_missing = Some(err),
+            Err(err) => return Err(AlpineError::Fetch(err)),
         }
     }
     Err(AlpineError::Fetch(
@@ -1141,16 +1147,6 @@ pub enum AlpineEvent<'a> {
         /// The raw output bytes; not line-buffered, not guaranteed UTF-8.
         bytes: &'a [u8],
     },
-}
-
-/// A standard stream of an in-cage command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Stream {
-    /// Standard output.
-    Stdout,
-    /// Standard error.
-    Stderr,
 }
 
 impl Provisioner for Alpine {
@@ -1449,9 +1445,7 @@ fn install(
     };
     bootstrap::configure(
         into,
-        base.map_or(bootstrap::Rooting::Whole, |base| {
-            bootstrap::Rooting::Over(base.path())
-        }),
+        Rooting::over(base.map(layer::Base::path)),
         &database,
         &subjects,
         &watching,
@@ -1759,19 +1753,24 @@ fn lay_down(
 /// Records one archive entry against the package laying it down, and decides
 /// whether it may.
 ///
-/// The skip on a kept claim is the extraction's own: returning an error would
-/// abandon the package, and what the policy says is that *this file* stays as
-/// the earlier package left it. The extractor calls this before it writes, so a
-/// skip has to be expressed as one — which is why a contested claim is stashed
-/// rather than returned, and reported by the caller once the entry boundary has
-/// passed.
+/// A kept claim skips the entry rather than failing it: returning an error would
+/// abandon the package, and what the policy says is that *this file* stays as the
+/// earlier package left it. The extractor is told so through [`Placement::Skip`],
+/// which is the only way to say it — the record and the tree have to agree, and a
+/// record saying the earlier package still owns the path while the later
+/// package's bytes sat on disk would leave the finished root disagreeing with its
+/// own `Z:` digest.
+///
+/// A contested claim is stashed rather than returned for the same reason it
+/// cannot be an error here, and reported by the caller once the entry boundary
+/// has passed.
 fn record_entry(
     database: &mut Database,
     at: usize,
     entry: &crate::provision::tar::Entry,
     components: &[Vec<u8>],
     collision: &mut Option<AlpineError>,
-) -> Result<(), ProvisionError> {
+) -> Result<Placement, ProvisionError> {
     let path = components.join(&b'/');
     if entry.typeflag == b'5' {
         // Directories are shared by construction — every package ships the ones
@@ -1779,37 +1778,26 @@ fn record_entry(
         database
             .record(at)
             .directory(&path, entry.uid, entry.gid, entry.mode);
-        return Ok(());
+        return Ok(Placement::Write);
     }
 
     match database.claim(at, &path) {
         Claim::Free | Claim::Replaces => {}
-        Claim::Kept => return Ok(()),
+        Claim::Kept => return Ok(Placement::Skip),
         Claim::Contested { owner } => {
             collision.get_or_insert(AlpineError::Collision {
                 owner,
                 claimant: database.record(at).name.clone(),
                 path: String::from_utf8_lossy(&path).into_owned(),
             });
-            return Ok(());
+            return Ok(Placement::Skip);
         }
     }
 
-    let (directory, name) = path
-        .iter()
-        .rposition(|byte| *byte == b'/')
-        .map_or((&[][..], &path[..]), |slash| {
-            (&path[..slash], &path[slash + 1..])
-        });
-    database.record(at).file(
-        directory,
-        name,
-        entry.uid,
-        entry.gid,
-        entry.mode,
-        entry.checksum_sha1,
-    );
-    Ok(())
+    database
+        .record(at)
+        .file(&path, entry.uid, entry.gid, entry.mode, entry.checksum_sha1);
+    Ok(Placement::Write)
 }
 
 /// Checks that a full bootstrap for `target` can execute on `host`.
@@ -2213,6 +2201,27 @@ mod tests {
         }
     }
 
+    /// A transport that refuses one mirror's URLs the way the built-in client
+    /// refuses one it cannot parse or whose scheme it does not speak, and
+    /// delegates everything else.
+    struct Unusable {
+        refuse: &'static str,
+        rest: Box<dyn Fetch>,
+    }
+
+    impl Fetch for Unusable {
+        fn fetch(
+            &mut self,
+            request: &FetchRequest<'_>,
+            sink: &mut dyn Write,
+        ) -> Result<(), FetchError> {
+            if request.url().starts_with(self.refuse) {
+                return Err(FetchError::url(request.url(), "unsupported scheme"));
+            }
+            self.rest.fetch(request, sink)
+        }
+    }
+
     /// A transport serving the two published index fixtures at the paths their
     /// repositories publish them under.
     fn canned() -> Box<dyn Fetch> {
@@ -2346,6 +2355,32 @@ mod tests {
     }
 
     #[test]
+    fn a_mirror_the_transport_will_not_accept_stops_the_walk() {
+        // A `Url` failure is the caller's configuration rather than the
+        // mirror's state, so it is reported against the mirror that carries it
+        // instead of advancing. The backstop here does serve the index, which is
+        // what makes the difference observable: a walk that advanced past the
+        // refusal would succeed and say nothing about the unusable URL.
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://unusable.invalid/alpine")
+            .mirror_fallback("http://mirror.invalid/alpine")
+            .fetcher(Box::new(Unusable {
+                refuse: "http://unusable.invalid/",
+                rest: canned(),
+            }))
+            .build()
+            .expect("the bootstrap configures");
+        let err = alpine
+            .available()
+            .expect_err("the primary's URL is not one the transport accepts");
+        assert!(
+            matches!(err, AlpineError::Fetch(FetchError::Url { .. })),
+            "{err}",
+        );
+    }
+
+    #[test]
     fn no_mirror_serving_the_index_is_reported_as_the_fetch_failure_it_is() {
         let mut alpine = Alpine::builder("v3.23")
             .architecture("x86_64")
@@ -2355,6 +2390,31 @@ mod tests {
             .expect("the bootstrap configures");
         let err = alpine.available().expect_err("no mirror serves it");
         assert!(matches!(err, AlpineError::Fetch(_)), "{err}");
+        // And it names the mirror that was asked, not the path alone: the walk
+        // keeps the last failure so the diagnostic survives the walk.
+        let reason = err.to_string();
+        assert!(reason.contains("http://empty.invalid/alpine"), "{reason}");
+    }
+
+    #[test]
+    fn an_exhausted_walk_is_reported_against_the_mirror_it_asked_last() {
+        // Attribution, which is the whole value of keeping the last failure:
+        // three mirrors, none serving, and the answer has to name the one the
+        // walk ended on rather than the one it started with.
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://empty.invalid/first")
+            .mirror_fallback("http://empty.invalid/second")
+            .mirror_fallback("http://empty.invalid/last")
+            .fetcher(canned())
+            .build()
+            .expect("the bootstrap configures");
+        let reason = alpine
+            .available()
+            .expect_err("no mirror serves it")
+            .to_string();
+        assert!(reason.contains("http://empty.invalid/last"), "{reason}");
+        assert!(!reason.contains("/first"), "{reason}");
     }
 
     #[test]
@@ -3546,6 +3606,132 @@ mod tests {
         let installed = std::fs::read_to_string(root.join("lib/apk/db/installed"))
             .expect("the database is written");
         assert!(installed.contains("\nP:musl\n"), "{installed}");
+    }
+
+    /// A one-entry uncompressed tar holding `path` with `contents`, as a
+    /// package's data segment lays a file down.
+    fn one_file_archive(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(
+            &crate::provision::tar::ustar_block(
+                path.as_bytes(),
+                b"",
+                0o644,
+                0,
+                0,
+                contents.len() as u64,
+                0,
+                b'0',
+                b"",
+            )
+            .expect("the header fields fit"),
+        );
+        out.extend_from_slice(contents);
+        crate::provision::tar::pad(&mut out, contents.len() as u64).expect("padding a vector");
+        // The two zero blocks that end an archive.
+        out.extend_from_slice(&[0u8; 1024]);
+        out
+    }
+
+    /// A record for a package named `name` that carries the extra `.PKGINFO`
+    /// lines in `extra` — `replaces` and `replaces_priority`, for the collision
+    /// policy.
+    fn record_of(name: &str, extra: &str) -> installed::Record {
+        let info = pkginfo::PkgInfo::parse(
+            name,
+            format!("pkgname = {name}\npkgver = 1.0-r0\narch = x86_64\n{extra}").as_bytes(),
+        )
+        .expect("the .PKGINFO reads");
+        installed::Record::open(&info, "x86_64", 1024, format!("Q1{name}"), name.to_string())
+    }
+
+    /// Lays `packages` — each a name, its extra `.PKGINFO` lines, and the
+    /// contents it ships at `CONTESTED` — down in order into a fresh tree, and
+    /// returns that tree with the database written over it.
+    ///
+    /// Drives the real [`Extraction`] and the real [`record_entry`], which is
+    /// the pairing the collision policy lives in: `claim` alone cannot say
+    /// whether the tree agrees with the record of it.
+    fn lay_contested(packages: &[(&str, &str, &[u8])]) -> (Scratch, Database) {
+        const CONTESTED: &str = "usr/bin/tool";
+        let scratch = Scratch::new("alpine-collision");
+        let staging = scratch.join("root");
+        std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
+
+        let mut extraction = Extraction::new(&staging).expect("the root opens");
+        let mut database = Database::default();
+        for (name, extra, contents) in packages {
+            let at = database.add(record_of(name, extra));
+            let archive = one_file_archive(CONTESTED, contents);
+            let mut reader = TarReader::new(&archive[..]);
+            let mut collision = None;
+            extraction
+                .extract(&mut reader, &mut |entry, components| {
+                    record_entry(&mut database, at, entry, components, &mut collision)
+                })
+                .expect("the archive extracts");
+            assert!(collision.is_none(), "{name}: {collision:?}");
+        }
+        extraction.finalize(&staging).expect("the metadata applies");
+        (scratch, database)
+    }
+
+    #[test]
+    fn a_kept_claim_leaves_the_earlier_package_s_file_on_disk() {
+        // The record says the earlier package still owns the path, so the
+        // earlier package's bytes have to be what is there. Without a way to
+        // tell the extractor to skip the entry, the later package's bytes
+        // overwrote them and the finished root disagreed with its own `Z:`
+        // digest — which `apk audit` reports as a modified file.
+        let (scratch, database) = lay_contested(&[
+            (
+                "aaa-earlier",
+                "replaces = zzz-later\nreplaces_priority = 1\n",
+                b"earlier",
+            ),
+            ("zzz-later", "", b"later"),
+        ]);
+        assert_eq!(
+            std::fs::read(scratch.join("root/usr/bin/tool")).expect("the file is there"),
+            b"earlier",
+        );
+        let installed = String::from_utf8(database.installed()).expect("the database is text");
+        assert_eq!(installed.matches("R:tool").count(), 1, "{installed}");
+    }
+
+    #[test]
+    fn a_replacing_claim_leaves_one_owner_whichever_way_the_names_sort() {
+        // The replacer taking the path over has to take the file line with it.
+        // Alpine's own case has the replacer sorting after the replaced, which
+        // hides a stale earlier line: `apk` reads records in name order, so the
+        // replacer's digest survives and matches the disk by luck. Reversing the
+        // sort is what exposes it.
+        for (earlier, later) in [
+            ("aaa-replaced", "zzz-replacer"),
+            ("zzz-replaced", "aaa-replacer"),
+        ] {
+            let (scratch, database) = lay_contested(&[
+                (earlier, "", b"earlier"),
+                (later, &format!("replaces = {earlier}\n"), b"later"),
+            ]);
+            assert_eq!(
+                std::fs::read(scratch.join("root/usr/bin/tool")).expect("the file is there"),
+                b"later",
+                "{later} replaces {earlier}",
+            );
+            // One owner, and it is the one whose bytes are on disk.
+            let installed = String::from_utf8(database.installed()).expect("the database is text");
+            assert_eq!(
+                installed.matches("R:tool").count(),
+                1,
+                "{earlier} then {later}:\n{installed}",
+            );
+            let owner = installed
+                .split("\n\n")
+                .find(|record| record.contains("R:tool"))
+                .expect("some record holds it");
+            assert!(owner.contains(&format!("P:{later}")), "{owner}");
+        }
     }
 
     #[test]

@@ -49,11 +49,6 @@ use super::ProvisionError;
 use super::containment;
 use super::tar::{Entry, TarReader};
 
-/// How many times a create-or-replace is retried when an existing entry
-/// is in the way. One replacement should always suffice; the bound exists
-/// so a pathological filesystem state cannot loop forever.
-const REPLACE_ATTEMPTS: u32 = 3;
-
 /// The mode of a directory the extraction implies but no entry names.
 ///
 /// An archive that carries `usr/lib/x` without an entry for `usr/lib` leaves
@@ -63,10 +58,29 @@ const IMPLIED_DIR_MODE: u32 = 0o755;
 
 /// The per-entry hook the extractor calls before writing each entry.
 ///
-/// Receives the entry's header and its validated path components. Its error
-/// abandons the extraction at an entry boundary, which is what a cancellation
-/// check needs.
-pub(crate) type OnEntry<'f> = dyn FnMut(&Entry, &[Vec<u8>]) -> Result<(), ProvisionError> + 'f;
+/// Receives the entry's header and its validated path components, and answers
+/// whether the entry is written. Its error abandons the extraction at an entry
+/// boundary, which is what a cancellation check needs.
+pub(crate) type OnEntry<'f> =
+    dyn FnMut(&Entry, &[Vec<u8>]) -> Result<Placement, ProvisionError> + 'f;
+
+/// Whether an entry is written, as the per-entry hook decides.
+///
+/// The channel exists because a hook that keeps a record of the tree may know
+/// that an entry must *not* be laid down — an apk package whose file an earlier
+/// package keeps — and an error is the wrong way to say so: it would abandon the
+/// whole archive rather than one entry. Without it a hook could record the
+/// decision and the extractor would write the file anyway, leaving the tree
+/// disagreeing with the record of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// Write the entry, which is what a hook that only observes always answers.
+    Write,
+    /// Leave the entry unwritten and the tree as it is. The archive is read past
+    /// it either way, so the entries after it are unaffected.
+    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+    Skip,
+}
 
 /// Metadata of a directory entry, applied after all entries have been
 /// extracted so that a read-only directory cannot block the extraction of
@@ -147,7 +161,9 @@ impl Extraction {
     /// skipped entries (character and block devices, volume labels) and the `./` root
     /// entry do not call it. It lets a caller act on entry metadata the
     /// extractor itself ignores — recording non-root ownership, reporting
-    /// progress — without a second pass over the archive, and its error
+    /// progress — without a second pass over the archive. It also decides
+    /// whether the entry is written at all ([`Placement`]), so a caller that
+    /// keeps a record of the tree can hold the tree to it; and its error
     /// abandons the extraction at an entry boundary, which is what a
     /// cancellation check needs.
     pub(crate) fn extract<R: Read>(
@@ -187,7 +203,12 @@ impl Extraction {
                 return Err(entry_refused(&entry.path, "the entry path is empty"));
             }
 
-            on_entry(&entry, &components)?;
+            if on_entry(&entry, &components)? == Placement::Skip {
+                // Nothing is created and nothing is resolved: the entry's data
+                // is drained by the next `next_entry`, so a skip costs the read
+                // and no more.
+                continue;
+            }
 
             match entry.typeflag {
                 b'5' => extract_dir(root, &entry, &components, &mut self.dir_meta)?,
@@ -659,51 +680,40 @@ fn extract_fifo(
 
 /// Runs `create`, replacing whatever occupies the name on `EEXIST`: the
 /// tar convention that a later entry supersedes an earlier one.
+///
+/// [`containment::replacing`] is the algorithm; what is here is this side's
+/// vocabulary for its failures, which names the archive entry a caller can act
+/// on rather than the errno the kernel gave. An `EEXIST` that survives the
+/// retries is reported as its own thing: it is not a name that could not be
+/// created but a name that could not be *replaced*, which is what a non-empty
+/// directory standing where a file belongs looks like.
 fn create_replacing<T>(
     entry_path: &[u8],
-    mut create: impl FnMut() -> Result<T, Errno>,
+    create: impl FnMut() -> Result<T, Errno>,
     parent: &OwnedFd,
     leaf: &CString,
 ) -> Result<T, ProvisionError> {
-    for _ in 0..REPLACE_ATTEMPTS {
-        match create() {
-            Ok(value) => return Ok(value),
-            Err(Errno::EXIST) => remove_at(parent, leaf, entry_path)?,
-            Err(errno) => {
-                return Err(ProvisionError::io(
-                    "creating",
-                    bytes_to_path(entry_path),
-                    errno.into(),
-                ));
-            }
+    containment::replacing(parent, leaf, create).map_err(|errno| {
+        if errno == Errno::EXIST {
+            ProvisionError::io(
+                "creating",
+                bytes_to_path(entry_path),
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the name could not be replaced",
+                ),
+            )
+        } else {
+            ProvisionError::io("creating", bytes_to_path(entry_path), errno.into())
         }
-    }
-    Err(ProvisionError::io(
-        "creating",
-        bytes_to_path(entry_path),
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "the name could not be replaced",
-        ),
-    ))
+    })
 }
 
-/// Removes the entry at `leaf`, whichever kind it is. An empty directory
-/// is removed; a non-empty one is an error, as it is for tar itself.
+/// [`containment::remove_at`], reported as this side's failure: naming the
+/// archive entry a caller can act on rather than the errno the kernel gave.
 fn remove_at(parent: &OwnedFd, leaf: &CString, entry_path: &[u8]) -> Result<(), ProvisionError> {
-    match rustix::fs::unlinkat(parent, leaf, AtFlags::empty()) {
-        Ok(()) => Ok(()),
-        Err(Errno::ISDIR) => {
-            rustix::fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR).map_err(|errno| {
-                ProvisionError::io("replacing", bytes_to_path(entry_path), errno.into())
-            })
-        }
-        Err(errno) => Err(ProvisionError::io(
-            "replacing",
-            bytes_to_path(entry_path),
-            errno.into(),
-        )),
-    }
+    containment::remove_at(parent, leaf)
+        .map_err(|errno| ProvisionError::io("replacing", bytes_to_path(entry_path), errno.into()))
 }
 
 /// Applies the deferred directory metadata, deepest first, so a parent's

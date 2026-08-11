@@ -42,9 +42,11 @@ use std::path::Path;
 
 use super::installed::{DB_DIR, Database, EXEC_DIR};
 use super::repository::Repository;
-use super::{AlpineError, AlpineEvent, AlpineObserver, Stream};
+use super::{AlpineError, AlpineEvent, AlpineObserver};
+use crate::provision::Stream;
+use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
-use crate::{Cage, IdentityMap, Observer, Stdio};
+use crate::{IdentityMap, Observer, Stdio};
 
 /// The set the caller asked for, as against the closure it resolved to.
 pub(super) const WORLD: &str = "etc/apk/world";
@@ -66,21 +68,6 @@ const KEYS_DIR: &str = "etc/apk/keys";
 /// `TERM`, which is also what makes what it does a function of the root rather
 /// than of the machine the bootstrap ran on.
 const SCRIPT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
-
-/// Where the scripts of one wave run.
-///
-/// A full bootstrap roots them on the tree it is building. A layered build roots
-/// them on an overlay of the pristine base and that tree, which is the
-/// increment's writable upper: the script reads the base's `/bin/sh` and the
-/// base's accounts through the merged view, and everything it writes lands in
-/// the upper, so the base comes out of the build untouched.
-#[derive(Clone, Copy)]
-pub(super) enum Rooting<'a> {
-    /// The tree being built is the whole root.
-    Whole,
-    /// The tree being built is an increment over the base at this path.
-    Over(&'a Path),
-}
 
 /// The state a finished root hands back to `apk`, beside its database.
 ///
@@ -279,13 +266,8 @@ fn launch(
     identity_map: &IdentityMap,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
-    let root = match rooting {
-        Rooting::Whole => Cage::builder().rootfs(staging),
-        // The base is the read-only lower and the increment the writable upper,
-        // so the script sees the merged root and writes only into the upper.
-        Rooting::Over(base) => Cage::builder().overlay_rootfs(base, staging),
-    };
-    let cage = root
+    let cage = rooting
+        .builder(staging)
         .command(script)
         .args(args)
         .env("PATH", SCRIPT_PATH)

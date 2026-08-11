@@ -144,12 +144,30 @@ pub enum ProvisionEvent<'a> {
     Debian(&'a debian::DebianEvent<'a>),
     /// An Alpine bootstrap's own, richer event.
     ///
-    /// The same nesting as [`Debian`](Self::Debian), and for the same reason:
-    /// the bootstrap reports fetches, downloads, and the output of the install
-    /// scripts it runs in a cage, which the shared vocabulary above has no place
-    /// for.
+    /// The bootstrap reports fetches, resolution, downloads, and the output of
+    /// the install scripts it runs in a cage — detail the shared vocabulary
+    /// above has no place for. Nesting it here keeps one observer for every
+    /// provisioner rather than one per provisioner.
     #[cfg(feature = "alpine")]
     Alpine(&'a alpine::AlpineEvent<'a>),
+}
+
+/// A standard stream of a command a provisioner runs in a cage.
+///
+/// Every userland layer's own event carries this in its `CommandOutput` variant,
+/// which is why it is here rather than in one of them: a provisioner that runs a
+/// command in a cage has output to attribute to a stream whichever archive it
+/// provisions from, and the attribution says nothing about the archive. The
+/// events themselves stay with their layers, nested in [`ProvisionEvent`] — they
+/// speak each archive's own vocabulary, and this does not.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Stream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
 }
 
 /// A progress and cancellation sink for a provisioning run.

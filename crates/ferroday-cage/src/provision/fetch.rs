@@ -235,6 +235,32 @@ impl FetchError {
         let url = url.into();
         move |source| FetchError::Io { op, url, source }
     }
+
+    /// Whether this failure says that *this* source could not serve the
+    /// resource, so a caller walking a list of interchangeable mirrors advances
+    /// to the next one.
+    ///
+    /// A missing resource, a transport failure, and an unsuccessful status all
+    /// qualify. The status case is the one worth naming: a 503 during an outage
+    /// or a CDN's 403 for an absent object is exactly what a second mirror, or a
+    /// snapshot backstop, exists to answer, and a walk that stopped there would
+    /// fail without trying either. A walk keeps the last such failure and
+    /// reports it when no mirror answers, so the diagnostic survives.
+    ///
+    /// [`Url`](Self::Url) does not qualify. A malformed or unsupported URL is
+    /// the caller's configuration rather than the mirror's state, and a walk
+    /// that advanced past it would report the failure against the last mirror in
+    /// the list rather than the one that was spelled wrong.
+    ///
+    /// This asks only about the transport. A digest or signature failure is not
+    /// a `FetchError` at all — it is the layer's own, raised over bytes that did
+    /// arrive — and the answer to one is never to ask somewhere else.
+    pub(crate) fn is_failover(&self) -> bool {
+        matches!(
+            self,
+            FetchError::NotFound { .. } | FetchError::Io { .. } | FetchError::Status { .. }
+        )
+    }
 }
 
 impl fmt::Display for FetchError {
@@ -257,6 +283,54 @@ impl std::error::Error for FetchError {
         match self {
             FetchError::Io { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mirror_walk_advances_past_what_this_mirror_could_not_serve() {
+        // The question every layer's mirror walk asks, pinned here rather than
+        // only through each walk that asks it: three failures say "ask
+        // somewhere else" and one says "you asked wrongly".
+        for failure in [
+            FetchError::not_found("http://mirror.invalid/x"),
+            FetchError::status("http://mirror.invalid/x", 503),
+            FetchError::status("http://mirror.invalid/x", 403),
+            FetchError::io(
+                "connecting",
+                "http://mirror.invalid/x",
+                io::Error::from(io::ErrorKind::ConnectionRefused),
+            ),
+        ] {
+            assert!(failure.is_failover(), "{failure}");
+        }
+
+        // A URL the transport will not accept is the caller's configuration
+        // rather than the mirror's state. A walk that advanced past it would
+        // report the failure against whichever mirror came last instead of
+        // against the one that was spelled wrong.
+        let malformed = FetchError::url("gopher://mirror.invalid/x", "unsupported scheme");
+        assert!(!malformed.is_failover(), "{malformed}");
+    }
+
+    #[test]
+    fn only_an_os_failure_carries_a_source() {
+        let source = FetchError::io(
+            "connecting",
+            "http://mirror.invalid/x",
+            io::Error::from(io::ErrorKind::ConnectionRefused),
+        );
+        assert!(std::error::Error::source(&source).is_some());
+        for bare in [
+            FetchError::not_found("http://mirror.invalid/x"),
+            FetchError::status("http://mirror.invalid/x", 503),
+            FetchError::url("gopher://mirror.invalid/x", "unsupported scheme"),
+        ] {
+            assert!(std::error::Error::source(&bare).is_none(), "{bare}");
         }
     }
 }

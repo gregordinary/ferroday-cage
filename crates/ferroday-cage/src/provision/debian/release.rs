@@ -901,7 +901,7 @@ impl Release {
                 let mut fields = line.split_whitespace();
                 if let (Some(digest), Some(size), Some(path)) =
                     (fields.next(), fields.next(), fields.next())
-                    && super::index::is_sha256_hex(digest)
+                    && crate::provision::digest::is_sha256_hex(digest)
                     && let Ok(size) = size.parse()
                 {
                     hashes.insert(path.to_string(), (size, digest.to_string()));

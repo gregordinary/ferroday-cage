@@ -7,7 +7,7 @@ use std::io::{BufReader, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::extract::extract_archive;
+use super::extract::{Placement, extract_archive};
 use super::tar::TarReader;
 use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, compress};
 
@@ -196,7 +196,9 @@ impl Provisioner for Tarball {
                 path.push(OsStr::from_bytes(component));
             }
             request.report(ProvisionEvent::Entry { path: &path });
-            Ok(())
+            // A tarball provisioner unpacks what the archive holds and keeps no
+            // record to hold it to, so every entry is written.
+            Ok(Placement::Write)
         });
         match outcome {
             Ok(()) => Ok(()),

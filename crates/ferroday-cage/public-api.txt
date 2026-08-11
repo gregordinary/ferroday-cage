@@ -159,7 +159,7 @@ impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine:
 #[non_exhaustive] pub enum ferroday_cage::provision::alpine::AlpineEvent<'a>
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::CommandOutput
 pub ferroday_cage::provision::alpine::AlpineEvent::CommandOutput::bytes: &'a [u8]
-pub ferroday_cage::provision::alpine::AlpineEvent::CommandOutput::stream: ferroday_cage::provision::alpine::Stream
+pub ferroday_cage::provision::alpine::AlpineEvent::CommandOutput::stream: ferroday_cage::provision::Stream
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Downloading
 pub ferroday_cage::provision::alpine::AlpineEvent::Downloading::index: usize
 pub ferroday_cage::provision::alpine::AlpineEvent::Downloading::package: &'a str
@@ -181,16 +181,6 @@ impl<'a> core::marker::Unpin for ferroday_cage::provision::alpine::AlpineEvent<'
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::AlpineEvent<'a>
 impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::AlpineEvent<'a>
 impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::AlpineEvent<'a>
-#[non_exhaustive] pub enum ferroday_cage::provision::alpine::Stream
-pub ferroday_cage::provision::alpine::Stream::Stderr
-pub ferroday_cage::provision::alpine::Stream::Stdout
-impl core::marker::Freeze for ferroday_cage::provision::alpine::Stream
-impl core::marker::Send for ferroday_cage::provision::alpine::Stream
-impl core::marker::Sync for ferroday_cage::provision::alpine::Stream
-impl core::marker::Unpin for ferroday_cage::provision::alpine::Stream
-impl core::marker::UnsafeUnpin for ferroday_cage::provision::alpine::Stream
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::alpine::Stream
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::Stream
 #[non_exhaustive] pub enum ferroday_cage::provision::alpine::UnheldReason
 pub ferroday_cage::provision::alpine::UnheldReason::Absent
 pub ferroday_cage::provision::alpine::UnheldReason::Identity
@@ -451,7 +441,7 @@ impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian:
 #[non_exhaustive] pub enum ferroday_cage::provision::debian::DebianEvent<'a>
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::CommandOutput
 pub ferroday_cage::provision::debian::DebianEvent::CommandOutput::bytes: &'a [u8]
-pub ferroday_cage::provision::debian::DebianEvent::CommandOutput::stream: ferroday_cage::provision::debian::Stream
+pub ferroday_cage::provision::debian::DebianEvent::CommandOutput::stream: ferroday_cage::provision::Stream
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Downloading
 pub ferroday_cage::provision::debian::DebianEvent::Downloading::index: usize
 pub ferroday_cage::provision::debian::DebianEvent::Downloading::package: &'a str
@@ -488,16 +478,6 @@ impl core::marker::Unpin for ferroday_cage::provision::debian::Priority
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Priority
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Priority
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Priority
-#[non_exhaustive] pub enum ferroday_cage::provision::debian::Stream
-pub ferroday_cage::provision::debian::Stream::Stderr
-pub ferroday_cage::provision::debian::Stream::Stdout
-impl core::marker::Freeze for ferroday_cage::provision::debian::Stream
-impl core::marker::Send for ferroday_cage::provision::debian::Stream
-impl core::marker::Sync for ferroday_cage::provision::debian::Stream
-impl core::marker::Unpin for ferroday_cage::provision::debian::Stream
-impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Stream
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Stream
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Stream
 #[non_exhaustive] pub enum ferroday_cage::provision::debian::UnheldReason
 pub ferroday_cage::provision::debian::UnheldReason::Absent
 pub ferroday_cage::provision::debian::UnheldReason::Digest
@@ -863,6 +843,16 @@ impl core::marker::Unpin for ferroday_cage::provision::SkippedKind
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::SkippedKind
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::SkippedKind
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::SkippedKind
+#[non_exhaustive] pub enum ferroday_cage::provision::Stream
+pub ferroday_cage::provision::Stream::Stderr
+pub ferroday_cage::provision::Stream::Stdout
+impl core::marker::Freeze for ferroday_cage::provision::Stream
+impl core::marker::Send for ferroday_cage::provision::Stream
+impl core::marker::Sync for ferroday_cage::provision::Stream
+impl core::marker::Unpin for ferroday_cage::provision::Stream
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::Stream
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Stream
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Stream
 pub struct ferroday_cage::provision::BuildLayer
 impl ferroday_cage::provision::BuildLayer
 pub fn ferroday_cage::provision::BuildLayer::path(&self) -> &std::path::Path

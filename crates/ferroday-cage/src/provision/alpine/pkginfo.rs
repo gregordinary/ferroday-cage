@@ -184,6 +184,20 @@ impl PkgInfo {
                 .map(std::string::ToString::to_string)
         };
 
+        // Held to the shape here rather than compared leniently where it is
+        // used. `abuild` writes lowercase hex and the digest recomputed over the
+        // data segment is lowercase hex, so a value spelled any other way is
+        // malformed — and saying so is a better answer than the digest mismatch
+        // an equal value spelled differently would otherwise be reported as.
+        let datahash = optional("datahash");
+        if let Some(datahash) = &datahash
+            && !crate::provision::digest::is_sha256_hex(datahash)
+        {
+            return Err(malformed(format!(
+                "states a datahash of {datahash:?}, which is not a SHA-256 in lowercase hex",
+            )));
+        }
+
         Ok(PkgInfo {
             name: required("pkgname")?.to_string(),
             version: required("pkgver")?.to_string(),
@@ -203,7 +217,7 @@ impl PkgInfo {
             replaces,
             replaces_priority: count(subject, &single, "replaces_priority")?,
             triggers,
-            datahash: optional("datahash"),
+            datahash,
         })
     }
 }

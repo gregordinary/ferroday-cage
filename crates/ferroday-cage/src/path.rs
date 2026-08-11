@@ -126,11 +126,15 @@ pub(crate) enum Refused {
 /// [`absolute_components`], performed here over bytes. Every component that
 /// survives satisfies [`is_ordinary_component`].
 ///
-/// A path that normalizes to nothing at all — `/`, `.`, the empty path — splits
-/// into an empty slice rather than a refusal, because the two callers disagree
-/// about it: an archive's `./` entry describes the extraction root and is
-/// meaningful, while a host-side write has nothing to write to. Deciding that
-/// is the caller's, the same way the bare root is for [`absolute_components`].
+/// A path that normalizes to nothing at all — `.`, the empty path, and under
+/// [`LeadingSlash::TreeRoot`] the bare `/` too — splits into an empty slice
+/// rather than a refusal, because the two callers disagree about it: an
+/// archive's `./` entry describes the extraction root and is meaningful, while
+/// a host-side write has nothing to write to. Deciding that is the caller's, the
+/// same way the bare root is for [`absolute_components`]. `/` is on that list
+/// only for the caller that admits a leading slash at all: the leading-slash
+/// rule is applied first, so [`LeadingSlash::Refused`] refuses it as
+/// [`Refused::Absolute`] before there is anything to normalize.
 pub(crate) fn tree_components(path: &[u8], leading: LeadingSlash) -> Result<Vec<&[u8]>, Refused> {
     if path.contains(&0) {
         return Err(Refused::Nul);
@@ -271,6 +275,20 @@ mod tests {
                 in_tree(path, LeadingSlash::TreeRoot),
                 Ok(vec![]),
                 "{path:?}"
+            );
+        }
+
+        // Except where the leading slash itself is refused, which is decided
+        // before there is anything to normalize: for that caller `/` is an
+        // absolute path rather than a path that came to nothing.
+        for path in ["", ".", "./"] {
+            assert_eq!(in_tree(path, LeadingSlash::Refused), Ok(vec![]), "{path:?}");
+        }
+        for path in ["/", "//."] {
+            assert_eq!(
+                in_tree(path, LeadingSlash::Refused),
+                Err(Refused::Absolute),
+                "{path:?}",
             );
         }
     }
