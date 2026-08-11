@@ -8,16 +8,23 @@
 //! provisioned root or in the read-write caches the caller binds.
 //!
 //! ```sh
-//! ebuild-sandbox --stage3 stage3-amd64-openrc.tar.xz --rootfs ./gentoo \
+//! ebuild-sandbox --variant amd64-openrc --rootfs ./gentoo \
 //!     --repo /var/db/repos/gentoo --distfiles ./distfiles \
 //!     app-misc/hello
 //! ```
 //!
+//! The stage3 comes from the archive, verified: `--variant` names one of the
+//! builds Gentoo publishes, and the layer follows the signed pointer to the
+//! current build, holds the tarball to the SHA-512 a signed digest document
+//! records for it, and extracts it. `--stage3 FILE` provisions from a tarball
+//! already on the host instead, which is what an air-gapped machine or a
+//! locally built stage3 needs.
+//!
 //! It exists to exercise the library's provisioning path from the vantage of a
 //! real consumer: it is the worked example that calls
 //! [`provision::ensure`](ferroday_cage::provision::ensure) itself — extracting
-//! a multi-hundred-megabyte stage3 through the tarball provisioner — rather
-//! than taking a rootfs prepared elsewhere. The build posture is nothing more
+//! a multi-hundred-megabyte stage3 — rather than taking a rootfs prepared
+//! elsewhere. The build posture is nothing more
 //! than ordinary builder calls: a read-only `bind_ro` for the tree,
 //! read-write `bind`s for the distfiles and binary-package caches, and
 //! `Network::Host` for fetches.
@@ -64,12 +71,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ferroday_cage::provision::{self, Provisioned, Tarball};
+use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent};
+use ferroday_cage::provision::{self, ProvisionEvent, Provisioned, Tarball};
 use ferroday_cage::{Cage, ConfigError, Error, IdentityMap, Network};
 
 mod common;
 
-use common::{flag_value, usage_error, value_for};
+use common::{flag_value, into_string, string_value, usage_error, value_for};
 
 /// Where the host portage tree is bound, read-only, inside the sandbox.
 const REPO_DEST: &str = "/var/db/repos/gentoo";
@@ -90,6 +98,11 @@ const EMERGE: &str = "/usr/bin/emerge";
 /// `--env FEATURES=...` from the caller replaces it.
 const FEATURES: &str = "-sandbox -usersandbox -ipc-sandbox -network-sandbox -pid-sandbox userpriv";
 
+/// The architecture `--variant` is published under unless the caller says
+/// otherwise. Gentoo publishes one autobuilds tree per architecture, and this
+/// is the one an ebuild developer is overwhelmingly on.
+const DEFAULT_ARCHITECTURE: &str = "amd64";
+
 const USAGE: &str = "\
 Provision a Gentoo stage3 and build packages in an isolated sandbox.
 
@@ -98,9 +111,14 @@ Usage:
   ebuild-sandbox [OPTIONS] -- COMMAND [ARGS...]
 
 Root filesystem:
-  --stage3 FILE         Provision the root from this stage3 tarball (any
-                        compression) before launching; skipped, and fast, once
-                        the root exists
+  --variant NAME        Provision the root from the stage3 Gentoo publishes as
+                        NAME (e.g. amd64-openrc), verified against the vendored
+                        keyring; skipped, and fast, once the root exists
+  --arch ARCH           The architecture --variant is published under
+                        (default: amd64)
+  --stage3 FILE         Provision the root from this stage3 tarball already on
+                        the host (any compression) instead of from the archive
+  --stage3-cache DIR    Keep the downloaded stage3 in DIR, reused across runs
   --rootfs DIR          The provisioned stage3 root filesystem (required)
 
 Mounts:
@@ -132,11 +150,25 @@ exist, and 2 a usage error.
 enum Invocation {
     Help,
     Version,
-    Run(Config),
+    /// Boxed because a run's configuration is much the largest of the three,
+    /// and the enum is otherwise the size of the largest variant everywhere it
+    /// is returned.
+    Run(Box<Config>),
+}
+
+/// Where the stage3 comes from.
+enum Source {
+    /// The archive, verified: a provisioner and the variant it was built for.
+    Archive(Box<Gentoo>, String),
+    /// A tarball already on this host.
+    File(PathBuf),
 }
 
 /// A resolved `run` configuration.
 struct Config {
+    variant: Option<String>,
+    architecture: String,
+    stage3_cache: Option<PathBuf>,
     stage3: Option<PathBuf>,
     rootfs: PathBuf,
     repo: Option<PathBuf>,
@@ -165,13 +197,16 @@ fn main() -> ExitCode {
             println!("ebuild-sandbox {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(Invocation::Run(config)) => run(config),
+        Ok(Invocation::Run(config)) => run(*config),
         Err(message) => usage_error("ebuild-sandbox", &message),
     }
 }
 
 /// Parses the command line, excluding the program name.
 fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
+    let mut variant = None;
+    let mut architecture = None;
+    let mut stage3_cache = None;
     let mut stage3 = None;
     let mut rootfs = None;
     let mut repo = None;
@@ -190,6 +225,18 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         } else if arg == "--" {
             command_line = Some(args.by_ref().collect::<Vec<_>>());
             break;
+        } else if arg == "--variant" {
+            variant = Some(string_value("--variant", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--variant=") {
+            variant = Some(into_string("--variant", value)?);
+        } else if arg == "--arch" {
+            architecture = Some(string_value("--arch", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--arch=") {
+            architecture = Some(into_string("--arch", value)?);
+        } else if arg == "--stage3-cache" {
+            stage3_cache = Some(PathBuf::from(value_for("--stage3-cache", &mut args)?));
+        } else if let Some(value) = flag_value(&arg, b"--stage3-cache=") {
+            stage3_cache = Some(PathBuf::from(value));
         } else if arg == "--stage3" {
             stage3 = Some(PathBuf::from(value_for("--stage3", &mut args)?));
         } else if let Some(value) = flag_value(&arg, b"--stage3=") {
@@ -240,7 +287,10 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         None => Task::Emerge(packages),
     };
 
-    Ok(Invocation::Run(Config {
+    Ok(Invocation::Run(Box::new(Config {
+        variant,
+        architecture: architecture.unwrap_or_else(|| DEFAULT_ARCHITECTURE.to_string()),
+        stage3_cache,
         stage3,
         rootfs,
         repo,
@@ -249,17 +299,60 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         env,
         offline,
         task,
-    }))
+    })))
 }
 
 /// Provisions the root if asked, composes the sandbox, and launches it.
 fn run(config: Config) -> ExitCode {
-    if let Some(stage3) = &config.stage3 {
-        match provision::ensure(&config.rootfs, &mut Tarball::new(stage3)) {
+    // Two sources, one publication. The archive's is verified end to end; a
+    // local tarball is whatever the caller vouches for themselves, which is
+    // what an air-gapped host or a stage3 built on the machine needs.
+    let source = match (&config.variant, &config.stage3) {
+        (Some(_), Some(_)) => {
+            return usage_error(
+                "ebuild-sandbox",
+                "--variant and --stage3 are alternatives: one provisions from the archive, \
+                 the other from a tarball already on this host",
+            );
+        }
+        (Some(variant), None) => {
+            let mut builder = Gentoo::builder(&config.architecture).variant(variant);
+            if let Some(cache) = &config.stage3_cache {
+                builder = builder.cache_dir(cache);
+            }
+            match builder.build() {
+                Ok(gentoo) => Some(Source::Archive(Box::new(gentoo), variant.clone())),
+                Err(error) => {
+                    eprintln!("ebuild-sandbox: {error}");
+                    return ExitCode::from(125);
+                }
+            }
+        }
+        (None, Some(stage3)) => Some(Source::File(stage3.clone())),
+        (None, None) => None,
+    };
+
+    if let Some(source) = source {
+        let (described, published) = match source {
+            Source::Archive(mut gentoo, variant) => (
+                format!("the {variant} stage3 the archive publishes"),
+                provision::Provision::new(&config.rootfs)
+                    .observe(&mut |event: ProvisionEvent<'_>| {
+                        if let ProvisionEvent::Gentoo(GentooEvent::Fetching { url, .. }) = event {
+                            eprintln!("ebuild-sandbox: fetching {url}");
+                        }
+                    })
+                    .run(&mut *gentoo),
+            ),
+            Source::File(path) => (
+                path.display().to_string(),
+                provision::ensure(&config.rootfs, &mut Tarball::new(&path)),
+            ),
+        };
+        match published {
             Ok(Provisioned::Created) => eprintln!(
-                "ebuild-sandbox: provisioned {} from {}",
+                "ebuild-sandbox: provisioned {} from {described}",
                 config.rootfs.display(),
-                stage3.display()
             ),
             // A published root is reused silently, so the flag stays in an
             // invocation permanently at no cost after the first run.
@@ -273,7 +366,8 @@ fn run(config: Config) -> ExitCode {
         return usage_error(
             "ebuild-sandbox",
             &format!(
-                "root filesystem {} does not exist; pass --stage3 FILE to provision it",
+                "root filesystem {} does not exist; pass --variant NAME to provision it from \
+                 the archive, or --stage3 FILE from a tarball",
                 config.rootfs.display()
             ),
         );

@@ -210,6 +210,59 @@ affected.
 
 ### Added
 
+- The `gentoo` feature: a provisioner for a Gentoo userland, reached through
+  `provision::gentoo::{Gentoo, GentooBuilder, GentooError, GentooEvent, Stage3,
+  Available, CertificateHorizon}`. It resolves a stage3 variant to the build the
+  archive currently publishes, verifies the two cleartext-signed documents that
+  vouch for it against a vendored keyring, holds the tarball to the SHA-512 one
+  of them records, and extracts it. `Gentoo` implements `Provisioner`, so a
+  caller drives it through `provision::ensure` as they drive every other one.
+
+  The layer is deliberately smaller than the other two: Gentoo publishes no
+  package resolution for a stage3, so there is no plan document, no dependency
+  graph, and no install-script wave. `Stage3` is the record a resolution
+  produces, and `GentooBuilder::{build_id, stage3}` are how a caller provisions
+  the same build again -- for about five weeks, which is how long the archive
+  keeps one.
+
+  A variant is the whole compound the archive publishes -- `amd64-openrc`,
+  `x32-openrc` -- matched exactly against the signed enumeration
+  `Gentoo::available` reports, since amd64's own document lists those two as
+  siblings. An unknown one is refused before anything is fetched, naming what
+  the architecture does offer.
+
+  Gentoo publishes no `Valid-Until` and signs nothing with an expiration, so the
+  regeneration timestamp inside the signed pointer is the only bound on how old
+  a correctly signed document may be; without one a mirror could replay a
+  months-old pointer indefinitely and pass every other check. It is bounded at
+  thirty days, and `GentooBuilder::max_pointer_age` relaxes or clears it.
+
+  `Gentoo::keyring_horizon` reports what each certificate of the vendored
+  keyring can still be trusted to do and until when. Per certificate rather than
+  as one date: Gentoo's eleven do not share an expiry, and one of them can vouch
+  for nothing at all, so a single number would misreport the anchor's shelf life
+  in both directions.
+
+- `fcage --provision-gentoo ARCH` provisions a root from a signed stage3, with
+  `--gentoo-variant`, `--gentoo-build-id`, `--gentoo-mirror`,
+  `--gentoo-mirror-fallback`, `--gentoo-cache` and `--gentoo-max-pointer-age`
+  mirroring the builder they configure. `--gentoo-variants ARCH` prints what an
+  architecture publishes and `--gentoo-keyring-horizon` prints the keyring; both
+  answer without provisioning anything, and the second reaches no network.
+
+- The `ebuild-sandbox` example provisions its stage3 from the archive with
+  `--variant`, rather than only from a tarball the caller had already obtained.
+  `--stage3 FILE` stays, for an air-gapped host or a locally built stage3; the
+  two are alternatives.
+
+- `tools/check-keyrings.py` compares every vendored trust anchor -- Debian's
+  archive keyring, Alpine's and postmarketOS's signing keys, and Gentoo's
+  service keys -- against what its distribution publishes today, and fails on a
+  key that changed, one that appeared, or one that is vendored and no longer
+  published. It runs weekly in a workflow of its own and never on a pull
+  request: keyring drift moves on a scale of months, and it reaches the network
+  to do its job.
+
 - The `alpine` feature: a provisioner for an Alpine Linux userland, reached
   through `provision::alpine::{Alpine, AlpineBuilder, AlpineError, AlpineEvent}`.
   It resolves a package set from one or more apk repositories, verifies each
@@ -295,6 +348,17 @@ affected.
   absolute before it does.
 
 ### Fixed
+
+- A tar entry whose real path arrived in a GNU long-name entry or a pax record
+  is read as the file it is, rather than as a directory when its header's own
+  truncated name happens to end in a separator. A header's name field holds at
+  most a hundred bytes, so for such an entry it is a truncation of the real
+  path, and the trailing-slash rule -- an old convention marking a directory
+  where the typeflag predates being reliably set -- was applied to it. A
+  directory carries no data, so the file's bytes were then read as the next
+  header and the rest of the archive was lost with them. Found in a real Gentoo
+  stage3, where one C++ header out of 134,477 members has a path whose hundredth
+  byte is the separator.
 
 - An Alpine root's files agree with the database that records them when two
   packages contest a path. Where the earlier package's `replaces` kept the file,

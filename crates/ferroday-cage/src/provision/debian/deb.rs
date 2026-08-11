@@ -11,7 +11,8 @@
 //! over and the members after it are never touched: [`extract_deb`] streams the
 //! `data.tar` through the decompressor into the extractor, and
 //! [`read_control_from`] reads only the control member. Digests are taken in
-//! chunks on the way past — [`sha256_stream`] on a read, [`DigestWriter`] on a
+//! chunks on the way past — [`digest::stream`](crate::provision::digest::stream)
+//! on a read, [`DigestWriter`](crate::provision::digest::DigestWriter) on a
 //! write. So installing or publishing a 90 MB kernel package costs what a shell
 //! script costs.
 

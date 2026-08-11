@@ -66,6 +66,7 @@ pub use pool::Pool;
 pub use repository::{Repository, RepositoryBuilder};
 
 use super::coordinate::{self, Nesting};
+use super::digest::{self, Algorithm};
 use super::extract::{Extraction, Placement};
 use super::{
     BuildLayer, Delegate, Fetch, FetchError, FetchRequest, HttpFetch, PackageCache, ProvisionError,
@@ -79,7 +80,8 @@ use pin::Pins;
 
 /// The suffix a run-owned `.deb` cache takes on the tree it is building.
 const DEB_CACHE: &str = ".fcage-debs";
-use release::{Keyring, Release};
+use crate::provision::openpgp::Keyring;
+use release::Release;
 
 /// The mode a bootstrapped rootfs's own root directory takes.
 ///
@@ -91,7 +93,11 @@ const ROOTFS_ROOT_MODE: u32 = 0o755;
 /// The Debian archive keyring shipped with the crate, the binary
 /// `debian-archive-keyring`. A caller can substitute their own with
 /// [`DebianBuilder::keyring`].
-const EMBEDDED_KEYRING: &[u8] = include_bytes!("keyring/debian-archive-keyring.gpg");
+///
+/// Visible to the crate because the verification apparatus is tested against it:
+/// a real archive keyring exercises the subkey walk and the expiry arithmetic in
+/// ways a synthesized certificate cannot.
+pub(crate) const EMBEDDED_KEYRING: &[u8] = include_bytes!("keyring/debian-archive-keyring.gpg");
 
 /// The default mirror: the Debian content-delivery front end.
 const DEFAULT_MIRROR: &str = "http://deb.debian.org/debian";
@@ -1652,10 +1658,10 @@ fn fetch_release(
             let suffix = format!("dists/{suite}/InRelease");
             let (bytes, mirror) =
                 fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, observer)?;
-            let keyring = Keyring::parse(keyring_bytes).map_err(DebianError::from)?;
+            let keyring = Keyring::parse(keyring_bytes).map_err(release::ReleaseError::from)?;
             let verified = keyring
                 .verify(&bytes, !repository.allow_stale)
-                .map_err(DebianError::from)?;
+                .map_err(release::ReleaseError::from)?;
             (
                 verified.body,
                 Served {
@@ -1904,7 +1910,7 @@ fn acquire_debs(
         // in this crate keeps. A corrupt or truncated entry is simply
         // re-downloaded.
         let cached = std::fs::File::open(&dest)
-            .and_then(|mut file| crate::provision::digest::sha256_stream(&mut file))
+            .and_then(|mut file| digest::stream(Algorithm::Sha256, &mut file))
             .is_ok_and(|(digest, _)| digest == package.sha256);
         if !cached {
             observer.progress(DebianEvent::Downloading {
@@ -2006,7 +2012,7 @@ fn fetch_verified(
         .open(&staged)
         .map_err(DebianError::at("staging a package", &staged))?;
 
-    let mut sink = crate::provision::digest::DigestWriter::new(file);
+    let mut sink = digest::DigestWriter::new(Algorithm::Sha256, file);
     let request = FetchRequest::new(url);
     let fetched = match size {
         Some(size) => {
@@ -2175,7 +2181,7 @@ fn extract_packages(
         // property the download and `Pool::publish` both keep, held to here as
         // well. `extract_deb` rewinds before it seeks to the data member, so the
         // digest pass leaving the file at its end costs nothing.
-        let (actual, _) = crate::provision::digest::sha256_stream(&mut file)
+        let (actual, _) = digest::stream(Algorithm::Sha256, &mut file)
             .map_err(|err| ProvisionError::io("reading the package", &path, err))?;
         if actual != installable.sha256 {
             return Err(wrap(DebianError::HashMismatch {
@@ -2292,7 +2298,7 @@ fn fetch_bytes(
 /// Verifies bytes against an expected SHA-256, naming the resource on
 /// mismatch.
 fn verify_digest(path: &str, bytes: &[u8], expected: &str) -> Result<(), DebianError> {
-    let actual = crate::provision::digest::sha256_hex(bytes);
+    let actual = Algorithm::Sha256.hex_of(bytes);
     if actual == expected {
         Ok(())
     } else {
@@ -2755,9 +2761,9 @@ impl From<resolve::ResolveError> for DebianError {
 impl From<release::ReleaseError> for DebianError {
     fn from(err: release::ReleaseError) -> Self {
         match err {
-            release::ReleaseError::Keyring(reason) | release::ReleaseError::Signature(reason) => {
-                DebianError::Signature { reason }
-            }
+            release::ReleaseError::OpenPgp(err) => DebianError::Signature {
+                reason: err.to_string(),
+            },
             release::ReleaseError::Release(reason) => DebianError::Release { reason },
         }
     }
@@ -2847,12 +2853,9 @@ mod tests {
             .expect("the fixture is a cleartext-signed document");
         assert_eq!(
             release.sha256(),
-            crate::provision::digest::sha256_hex(message.signed_text().as_bytes()),
+            Algorithm::Sha256.hex_of(message.signed_text().as_bytes()),
         );
-        assert_ne!(
-            release.sha256(),
-            crate::provision::digest::sha256_hex(INRELEASE)
-        );
+        assert_ne!(release.sha256(), Algorithm::Sha256.hex_of(INRELEASE));
 
         // And it is a property of those bytes rather than of the fetch, so a
         // second pass over the same release records the same digest.
@@ -3109,7 +3112,7 @@ mod tests {
         std::fs::create_dir_all(archives).expect("the archive directory is creatable");
         debs.iter()
             .map(|(name, bytes)| {
-                let sha256 = crate::provision::digest::sha256_hex(bytes);
+                let sha256 = Algorithm::Sha256.hex_of(bytes);
                 std::fs::write(archives.join(format!("{sha256}.deb")), bytes)
                     .expect("the package is writable");
                 Installable {
@@ -3202,7 +3205,7 @@ mod tests {
         let err = fetch_verified(
             &mut Canned(b"not what the archive recorded"),
             "file:///ignored-by-the-canned-transport",
-            &crate::provision::digest::sha256_hex(b"the recorded bytes"),
+            &Algorithm::Sha256.hex_of(b"the recorded bytes"),
             None,
             &dest,
         )
@@ -3218,7 +3221,7 @@ mod tests {
         fetch_verified(
             &mut Canned(b"the recorded bytes"),
             "file:///ignored-by-the-canned-transport",
-            &crate::provision::digest::sha256_hex(b"the recorded bytes"),
+            &Algorithm::Sha256.hex_of(b"the recorded bytes"),
             Some(b"the recorded bytes".len() as u64),
             &dest,
         )
@@ -3240,7 +3243,7 @@ mod tests {
         let err = fetch_verified(
             &mut Canned(&[b'x'; 4096]),
             "file:///ignored-by-the-canned-transport",
-            &crate::provision::digest::sha256_hex(&[b'x'; 4096]),
+            &Algorithm::Sha256.hex_of(&[b'x'; 4096]),
             Some(16),
             &dest,
         )

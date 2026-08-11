@@ -29,6 +29,7 @@ use flate2::bufread::GzDecoder;
 use super::AlpineError;
 use super::keyring::KeySet;
 use super::sign::Signatures;
+use crate::provision::digest::{self, Algorithm};
 use crate::provision::tar::TarReader;
 use crate::provision::{LimitedWriter, ProvisionError};
 
@@ -531,7 +532,7 @@ pub(super) fn read_package<R: Read>(
     // It is also why nothing is decompressed here. The pass that lays the tree
     // down is the only one that decodes it, so verifying before extracting
     // costs a second read of the file rather than a second decompression of it.
-    let mut digest = crate::provision::digest::DigestWriter::new(io::sink());
+    let mut digest = digest::DigestWriter::new(Algorithm::Sha256, io::sink());
     let length = segments.drain(&mut digest).map_err(|err| {
         AlpineError::container(subject, format!("its data segment is unreadable: {err}"))
     })?;
@@ -932,11 +933,7 @@ mod tests {
                 "66692c0f6859bb53d39bf1fccff97397fa51b5faf11de7f02438d898af684a1a",
             ),
         ] {
-            assert_eq!(
-                crate::provision::digest::sha256_hex(bytes),
-                digest,
-                "{name}"
-            );
+            assert_eq!(Algorithm::Sha256.hex_of(bytes), digest, "{name}");
         }
     }
 

@@ -109,7 +109,7 @@ impl Pins {
                     })
                 }
                 // A plain `==`, as everywhere else in the crate: both sides came
-                // through `is_sha256_hex`, the index's on the way out of a
+                // through `Algorithm::is_hex`, the index's on the way out of a
                 // stanza and the pin's on the way into `pin()`, so two spellings
                 // of one digest never meet here.
                 Some(offered) if offered.sha256 != pinned.sha256 => Some(UnheldReason::Digest {

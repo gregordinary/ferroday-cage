@@ -53,7 +53,7 @@ mod binfmt;
 #[cfg(feature = "tarball")]
 mod compress;
 mod containment;
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod coordinate;
 mod copyin;
 #[cfg(feature = "tarball")]
@@ -64,21 +64,28 @@ mod extract;
 // every userland provisioner that talks to an archive, so they are compiled for
 // each of them rather than gaining a feature of their own — a feature nothing
 // could enable on purpose would only widen the powerset the `features` job
-// walks.
-#[cfg(any(feature = "debian", feature = "alpine"))]
+// walks. Each such gate names all three layers, and gains the next one the same
+// way.
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod digest;
 // The plan document's syntax, which every userland layer's plan is written in.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod document;
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod fetch;
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod http;
 mod identity;
 // The overlay upper a layered build installs into, which is a disposal handle
 // rather than anything one userland knows about.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod layer;
+// Establishing that a cleartext-signed document is authentic against a keyring,
+// which is a question about the signature rather than about any archive that
+// asks it. Alpine verifies RSA PKCS#1 over its own containers and reaches none
+// of this, so the gate names the two layers whose trust chains are OpenPGP.
+#[cfg(any(feature = "debian", feature = "gentoo"))]
+mod openpgp;
 pub(crate) mod rooted;
 #[cfg(feature = "tarball")]
 mod tar;
@@ -88,9 +95,9 @@ mod tarball;
 pub use copyin::{CopyIn, CopyReport, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, export_tar};
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub use fetch::{Fetch, FetchError, FetchRequest};
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub use http::{HttpFetch, file_url};
 #[cfg(any(feature = "debian", feature = "alpine"))]
 pub use layer::BuildLayer;
@@ -101,6 +108,8 @@ pub use tarball::Tarball;
 pub mod alpine;
 #[cfg(feature = "debian")]
 pub mod debian;
+#[cfg(feature = "gentoo")]
+pub mod gentoo;
 
 /// Something a provisioner is doing, reported to a [`ProvisionObserver`].
 ///
@@ -150,6 +159,14 @@ pub enum ProvisionEvent<'a> {
     /// provisioner rather than one per provisioner.
     #[cfg(feature = "alpine")]
     Alpine(&'a alpine::AlpineEvent<'a>),
+    /// A Gentoo bootstrap's own event.
+    ///
+    /// The bootstrap reports the documents it fetches, what it resolved, and
+    /// the verification and extraction of the tarball — detail the shared
+    /// vocabulary above has no place for. Nesting it here keeps one observer for
+    /// every provisioner rather than one per provisioner.
+    #[cfg(feature = "gentoo")]
+    Gentoo(&'a gentoo::GentooEvent<'a>),
 }
 
 /// A standard stream of a command a provisioner runs in a cage.
@@ -1216,13 +1233,13 @@ fn remove_tree(
 /// gzip segment is free to expand a kilobyte into a gigabyte. In every case the
 /// digest that would catch the substitution runs only after the bytes have been
 /// spent, so the sink is where the ceiling belongs.
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub(crate) struct LimitedWriter<'a> {
     inner: &'a mut dyn io::Write,
     remaining: u64,
 }
 
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 impl<'a> LimitedWriter<'a> {
     /// Wraps `inner`, failing the write that would carry it past `limit` bytes
     /// in total.
@@ -1234,7 +1251,7 @@ impl<'a> LimitedWriter<'a> {
     }
 }
 
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 impl io::Write for LimitedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() as u64 > self.remaining {
@@ -1253,6 +1270,21 @@ impl io::Write for LimitedWriter<'_> {
     }
 }
 
+/// The current time as a Unix timestamp, or `None` if the clock is before
+/// the epoch (which would make a freshness check meaningless).
+///
+/// Here rather than in any one layer because reading the wall clock is nobody's
+/// question: a signature's validity window, a release's deadline, and the
+/// timestamp a published pool stamps are three layers' worth of caller, and a
+/// second reading of the clock is a second answer to when it is.
+#[cfg(any(feature = "debian", feature = "gentoo"))]
+pub(crate) fn now_epoch() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs() as i64)
+}
+
 /// The path of a staging file for `dest`: a hidden name beside it, unique to
 /// the call that asked for it.
 ///
@@ -1264,7 +1296,7 @@ impl io::Write for LimitedWriter<'_> {
 ///
 /// The staging file is a sibling of the destination, so the rename that
 /// publishes it stays within one directory and one filesystem.
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 fn staging_path(dest: &Path) -> PathBuf {
     let dir = dest.parent().unwrap_or(Path::new("."));
     let name = dest.file_name().unwrap_or(dest.as_os_str());
@@ -1287,13 +1319,13 @@ fn staging_path(dest: &Path) -> PathBuf {
 /// never published, and nothing later clears it: the publication's own cleanup
 /// removes the staging tree, and [`remove`] removes the destination and its
 /// lock, neither of which this is.
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub(crate) struct PackageCache {
     path: PathBuf,
     owned: bool,
 }
 
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 impl PackageCache {
     /// The cache for a run building `tree`: the caller's, or a sibling of the
     /// tree named after it with `suffix`.
@@ -1327,7 +1359,7 @@ impl PackageCache {
     }
 }
 
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 impl Drop for PackageCache {
     fn drop(&mut self) {
         if self.owned {

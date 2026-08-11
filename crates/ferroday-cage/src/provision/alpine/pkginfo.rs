@@ -39,6 +39,7 @@ use std::collections::HashMap;
 
 use super::AlpineError;
 use super::index::Dependency;
+use crate::provision::digest::Algorithm;
 
 /// The separator between a key and its value: one space either side, which is
 /// what `abuild` writes and what `apk` splits on.
@@ -191,7 +192,7 @@ impl PkgInfo {
         // an equal value spelled differently would otherwise be reported as.
         let datahash = optional("datahash");
         if let Some(datahash) = &datahash
-            && !crate::provision::digest::is_sha256_hex(datahash)
+            && !Algorithm::Sha256.is_hex(datahash)
         {
             return Err(malformed(format!(
                 "states a datahash of {datahash:?}, which is not a SHA-256 in lowercase hex",

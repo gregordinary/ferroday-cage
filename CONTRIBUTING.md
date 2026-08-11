@@ -75,20 +75,22 @@ a subordinate id allocation for your user (`usermod --add-subuids
 
 ### The network suites
 
-Two integration suites bootstrap from a live repository, and both are **off by
+Three integration suites bootstrap from a live archive, and all are **off by
 default**, so `cargo test --workspace --all-features` — CI included — resolves
-against no repository unless it is asked to. Each is opted into with its own
+against no archive unless it is asked to. Each is opted into with its own
 variable:
 
 | Variable | Runs |
 | --- | --- |
 | `FERRODAY_CAGE_DEBIAN_NETWORK_TEST` | `tests/debian.rs`'s live bootstraps, against a Debian mirror |
 | `FERRODAY_CAGE_ALPINE_NETWORK_TEST` | `tests/alpine.rs`'s live bootstraps, against Alpine and postmarketOS mirrors |
+| `FERRODAY_CAGE_GENTOO_NETWORK_TEST` | `tests/gentoo.rs`'s live resolution and stage3 bootstrap, against the Gentoo archive |
 
-These are the proofs that a produced root is one the distribution's own tools
-agree with — `apt` and `dpkg` on the Debian side, `apk audit` and `busybox` on
-the Alpine one — so run them before a release and after any change to a
-provisioner. They are happy-path suites by design; the failure paths are covered
+These are the proofs that a produced root is one the distribution's own files
+and tools agree with — `apt` and `dpkg` on the Debian side, `apk audit` and
+`busybox` on the Alpine one, and on the Gentoo side the release files and
+portage's own tooling in the extracted stage3 — so run them before a release and
+after any change to a provisioner. They are happy-path suites by design; the failure paths are covered
 by the hermetic unit tests beside the code, which run always.
 
 `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` turns *not* opting in into a failure, which
@@ -174,6 +176,16 @@ Two further gates matter when the public API moves:
   `Sync` for every public type, including the ones that deliberately have
   neither. Losing an auto trait is a breaking change; if a change withdraws
   one, the assertion and its recorded reason both need updating.
+
+One gate deliberately does not run here. `tools/check-keyrings.py` compares
+each vendored trust anchor -- Debian's archive keyring, Alpine's and
+postmarketOS's signing keys, Gentoo's service keys -- against what its
+distribution publishes today, and it reaches the network to do it. It runs
+weekly on a schedule of its own and by hand, never on a pull request: keyring
+drift moves on a scale of months, and four archive fetches on every push would
+make the always-run checks non-hermetic for nothing. Run it before a release,
+and after refreshing a vendored keyring, to confirm the new bytes are the
+published ones.
 
 If a doc comment on shared code links a feature-gated item, the `cargo doc`
 above will not catch it: the link resolves under `--all-features` and under
@@ -278,6 +290,8 @@ the question is not already here under different words.
 | Open a directory the kernel keeps inside a tree | `provision::containment::open_dir` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
 | What may a release, a component, or an architecture contain? | `provision::coordinate::check` |
+| What may a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
+| Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | Read or write a plan document | `provision::document` |
 | Which standard stream did a provisioner's in-cage output come from? | `provision::Stream` |
 | Name a local path as a `file://` URL | `provision::file_url` |

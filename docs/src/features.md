@@ -24,6 +24,7 @@ cargo add ferroday-cage --features serde,tarball,hardening
 | [`tarball`](provisioning.md#the-tarball-provisioner) | The `Tarball` provisioner (gzip, xz, and zstd, detected by content) and `export_tar`, its ownership-preserving counterpart | `flate2`, `lzma-rust2`, `ruzstd` |
 | [`debian`](debian.md) | The Debian provisioner: bootstrap a suite and architecture from the archive, with signature verification and dependency resolution. Implies `tarball` | `pgp`, `sha2`, and `tarball`'s |
 | [`alpine`](alpine.md) | The Alpine provisioner: resolve and install a package set from an apk repository, with signature verification. Serves postmarketOS's repositories too. Implies `tarball` | `rsa`, `sha1`, `sha2`, and `tarball`'s |
+| [`gentoo`](gentoo.md) | The Gentoo provisioner: resolve a stage3 variant to the build the archive currently publishes and extract it, verified against a vendored keyring. Implies `tarball` | `pgp`, `sha2`, and `tarball`'s |
 | [`hardening`](hardening.md) | Landlock filesystem and network rules, seccomp syscall filters, capability drops, and the [restriction fallback](restriction-fallback.md) for hosts without user namespaces | `seccompiler` |
 | [`netstack`](userspace-networking.md) | A native userspace TCP/IP stack giving the isolated network outbound IPv4 and IPv6, terminated in-process | `smoltcp` |
 | [`subid`](identity-maps.md) | The subordinate-id delegate: uid/gid range maps established through the shadow suite's `newuidmap`/`newgidmap` | nothing (see below) |

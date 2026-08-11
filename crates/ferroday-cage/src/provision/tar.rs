@@ -263,7 +263,6 @@ impl<R: Read> TarReader<R> {
                     }
                     if let Some(size) = pax.size {
                         entry.size = size;
-                        self.set_current(&entry);
                     }
                     if let Some(mtime) = pax.mtime {
                         entry.mtime = mtime;
@@ -275,6 +274,27 @@ impl<R: Read> TarReader<R> {
                         entry.gid = gid;
                     }
                     entry.checksum_sha1 = pax.checksum_sha1;
+                    // A trailing slash marks a directory, whatever the typeflag
+                    // says. The oldest archives predate a reliably-set typeflag
+                    // and mark a directory this way and no other.
+                    //
+                    // Read from the *resolved* path rather than from the
+                    // header's own name field, which is what a long name or a
+                    // pax record has just replaced. A header's name field holds
+                    // at most 100 bytes, so for such an entry it is a truncation
+                    // of the real path -- and a truncation that happens to land
+                    // just after a separator would otherwise turn a regular file
+                    // into a directory. That is not a cosmetic misreading: a
+                    // directory carries no data, so the file's bytes would be
+                    // read as the next header, and the rest of the archive with
+                    // them. A real Gentoo stage3 is where that was found.
+                    if entry.typeflag == b'0' && entry.path.last() == Some(&b'/') {
+                        entry.typeflag = b'5';
+                    }
+                    // The size and the type recorded when the header was parsed
+                    // may both have changed since; the data bookkeeping follows
+                    // the entry as it finally reads.
+                    self.set_current(&entry);
                     return Ok(Some(entry));
                 }
             }
@@ -449,20 +469,11 @@ fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
     let gid = unsigned_field(&block[116..124])?;
     let size = u64::try_from(numeric_field(&block[124..136])?).map_err(|_| HeaderFlaw::Numeric)?;
     let mtime = numeric_field(&block[136..148])?;
-    let mut typeflag = match block[156] {
+    let typeflag = match block[156] {
         // An old (v7-style) NUL typeflag is a regular file.
         0 => b'0',
         flag => flag,
     };
-    // A trailing slash marks a directory, whatever the typeflag says. The
-    // oldest archives predate a reliably-set typeflag and mark a directory this
-    // way and no other; both GNU tar's own `--format=v7` output and the archive
-    // that prompted this do set `5`, so it may never fire. It is safe to apply
-    // to every format, a regular file having no business with a name that ends
-    // in a separator.
-    if typeflag == b'0' && path.last() == Some(&b'/') {
-        typeflag = b'5';
-    }
     let link_target = field_bytes(&block[157..257]).to_vec();
 
     Ok(Entry {
@@ -953,6 +964,70 @@ mod tests {
         block
     }
 
+    /// A ustar header block for a file of `size` bytes with `typeflag`, with
+    /// `name` in the 100-byte name field.
+    fn sized_header(name: &[u8], size: u64, typeflag: u8) -> [u8; BLOCK as usize] {
+        let mut block = ustar_header(&name[..name.len().min(MAX_USTAR_NAME)], b"");
+        block[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        block[156] = typeflag;
+        checksum(&mut block);
+        block
+    }
+
+    #[test]
+    fn a_long_name_truncated_after_a_separator_is_still_the_file_it_is() {
+        // The defect a real Gentoo stage3 found. A GNU long name puts the real
+        // path in an `L` entry, and what the file's own header carries is the
+        // first hundred bytes of it. When that truncation happens to land just
+        // after a separator, a rule reading the header's name would take a
+        // regular file for a directory -- and a directory carries no data, so
+        // the file's bytes would be read as the next header and the rest of the
+        // archive lost with them.
+        //
+        // A hundred bytes of directory, then the file: the name field holds
+        // exactly the directory part, trailing separator and all.
+        let long_name = format!("./{}/deep.hpp", "d".repeat(97));
+        assert_eq!(long_name.as_bytes()[MAX_USTAR_NAME - 1], b'/');
+        let body = b"the contents of a file that is not a directory\n";
+
+        let mut archive = Vec::new();
+        // The `L` entry naming it, its data NUL-terminated as GNU writes it.
+        archive.extend_from_slice(&sized_header(
+            b"././@LongLink",
+            long_name.len() as u64 + 1,
+            b'L',
+        ));
+        archive.extend_from_slice(long_name.as_bytes());
+        archive.push(0);
+        pad(&mut archive, long_name.len() as u64 + 1).unwrap();
+        // The file itself, its own name field truncated to the directory part.
+        archive.extend_from_slice(&sized_header(long_name.as_bytes(), body.len() as u64, b'0'));
+        archive.extend_from_slice(body);
+        pad(&mut archive, body.len() as u64).unwrap();
+        // A second entry, which is only reachable if the first was skipped by
+        // the right number of bytes.
+        archive.extend_from_slice(&sized_header(b"after.txt", 0, b'0'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+
+        let mut reader = TarReader::new(&archive[..]);
+        let entry = reader.next_entry().unwrap().expect("the long-named entry");
+        assert_eq!(entry.path, long_name.as_bytes());
+        assert_eq!(entry.typeflag, b'0', "a regular file, not a directory");
+        assert_eq!(entry.size, body.len() as u64);
+        let mut read = vec![0u8; body.len()];
+        let mut filled = 0;
+        while filled < read.len() {
+            let got = reader.read_data(&mut read[filled..]).unwrap();
+            assert_ne!(got, 0, "the data is the file's own");
+            filled += got;
+        }
+        assert_eq!(read, body);
+
+        let next = reader.next_entry().unwrap().expect("the entry after it");
+        assert_eq!(next.path, &b"after.txt"[..]);
+        assert!(reader.next_entry().unwrap().is_none(), "the archive ends");
+    }
+
     #[test]
     fn a_posix_prefix_joins_onto_the_name() {
         // A ustar path too long for the 100-byte name field splits across the
@@ -1013,7 +1088,15 @@ mod tests {
         // The convention the oldest writers used in place of a typeflag. GNU
         // tar's own `--format=v7` output sets `5` as well, so this is the
         // belt to that archive's braces.
-        let entry = parse_header(&v7_header(b"olddir/")).unwrap();
+        //
+        // Read by the reader rather than by the header parse, which knows only
+        // the header's own name field: for an entry whose real path arrived in
+        // a long-name or pax record, that field is a truncation, and a rule
+        // applied to it would take a truncated regular file for a directory.
+        let mut archive = v7_header(b"olddir/").to_vec();
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let mut reader = TarReader::new(&archive[..]);
+        let entry = reader.next_entry().unwrap().expect("the directory");
         assert_eq!(entry.typeflag, b'5');
     }
 

@@ -719,6 +719,144 @@ pub fn F::progress(&mut self, ferroday_cage::provision::debian::DebianEvent<'_>)
 pub fn ferroday_cage::provision::debian::build_depend_names(&str) -> alloc::vec::Vec<alloc::string::String>
 pub fn ferroday_cage::provision::debian::foreign_interpreter(&str) -> core::option::Option<ferroday_cage::provision::debian::Interpreter>
 pub fn ferroday_cage::provision::debian::host_architecture() -> alloc::string::String
+pub mod ferroday_cage::provision::gentoo
+#[non_exhaustive] pub enum ferroday_cage::provision::gentoo::GentooError
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Config
+pub ferroday_cage::provision::gentoo::GentooError::Config::reason: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Digest
+pub ferroday_cage::provision::gentoo::GentooError::Digest::actual: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Digest::expected: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Digest::subject: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Document
+pub ferroday_cage::provision::gentoo::GentooError::Document::reason: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Document::subject: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Fetch(ferroday_cage::provision::FetchError)
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Io
+pub ferroday_cage::provision::gentoo::GentooError::Io::op: &'static str
+pub ferroday_cage::provision::gentoo::GentooError::Io::path: std::path::PathBuf
+pub ferroday_cage::provision::gentoo::GentooError::Io::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Signature
+pub ferroday_cage::provision::gentoo::GentooError::Signature::reason: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Signature::subject: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Stale
+pub ferroday_cage::provision::gentoo::GentooError::Stale::age: core::option::Option<core::time::Duration>
+pub ferroday_cage::provision::gentoo::GentooError::Stale::limit: core::time::Duration
+pub ferroday_cage::provision::gentoo::GentooError::Stale::published: core::option::Option<i64>
+impl ferroday_cage::provision::gentoo::GentooError
+pub fn ferroday_cage::provision::gentoo::GentooError::at(&'static str, impl core::convert::Into<std::path::PathBuf>) -> impl core::ops::function::FnOnce(core::io::error::Error) -> ferroday_cage::provision::gentoo::GentooError
+pub fn ferroday_cage::provision::gentoo::GentooError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::gentoo::GentooError
+impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::gentoo::GentooError
+pub fn ferroday_cage::provision::gentoo::GentooError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::gentoo::GentooError
+impl core::convert::From<ferroday_cage::provision::gentoo::GentooError> for ferroday_cage::provision::ProvisionError
+pub fn ferroday_cage::provision::ProvisionError::from(ferroday_cage::provision::gentoo::GentooError) -> ferroday_cage::provision::ProvisionError
+impl core::error::Error for ferroday_cage::provision::gentoo::GentooError
+pub fn ferroday_cage::provision::gentoo::GentooError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for ferroday_cage::provision::gentoo::GentooError
+pub fn ferroday_cage::provision::gentoo::GentooError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::GentooError
+impl core::marker::Send for ferroday_cage::provision::gentoo::GentooError
+impl core::marker::Sync for ferroday_cage::provision::gentoo::GentooError
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::GentooError
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::GentooError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::GentooError
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::GentooError
+#[non_exhaustive] pub enum ferroday_cage::provision::gentoo::GentooEvent<'a>
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Extracting
+pub ferroday_cage::provision::gentoo::GentooEvent::Extracting::path: &'a std::path::Path
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Fetching
+pub ferroday_cage::provision::gentoo::GentooEvent::Fetching::url: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Resolved
+pub ferroday_cage::provision::gentoo::GentooEvent::Resolved::stage3: &'a ferroday_cage::provision::gentoo::Stage3
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Verifying
+pub ferroday_cage::provision::gentoo::GentooEvent::Verifying::path: &'a std::path::Path
+impl<'a> core::marker::Freeze for ferroday_cage::provision::gentoo::GentooEvent<'a>
+impl<'a> core::marker::Send for ferroday_cage::provision::gentoo::GentooEvent<'a>
+impl<'a> core::marker::Sync for ferroday_cage::provision::gentoo::GentooEvent<'a>
+impl<'a> core::marker::Unpin for ferroday_cage::provision::gentoo::GentooEvent<'a>
+impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::GentooEvent<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::GentooEvent<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::GentooEvent<'a>
+pub struct ferroday_cage::provision::gentoo::Available
+impl ferroday_cage::provision::gentoo::Available
+pub fn ferroday_cage::provision::gentoo::Available::build_id(&self, &str) -> core::option::Option<&str>
+pub fn ferroday_cage::provision::gentoo::Available::contains(&self, &str) -> bool
+pub fn ferroday_cage::provision::gentoo::Available::published(&self) -> core::option::Option<i64>
+pub fn ferroday_cage::provision::gentoo::Available::size(&self, &str) -> core::option::Option<u64>
+pub fn ferroday_cage::provision::gentoo::Available::variants(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+impl core::fmt::Debug for ferroday_cage::provision::gentoo::Available
+pub fn ferroday_cage::provision::gentoo::Available::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Available
+impl core::marker::Send for ferroday_cage::provision::gentoo::Available
+impl core::marker::Sync for ferroday_cage::provision::gentoo::Available
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Available
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Available
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Available
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Available
+#[non_exhaustive] pub struct ferroday_cage::provision::gentoo::CertificateHorizon
+pub ferroday_cage::provision::gentoo::CertificateHorizon::expires: core::option::Option<i64>
+pub ferroday_cage::provision::gentoo::CertificateHorizon::fingerprint: alloc::string::String
+pub ferroday_cage::provision::gentoo::CertificateHorizon::signs: bool
+pub ferroday_cage::provision::gentoo::CertificateHorizon::user_id: core::option::Option<alloc::string::String>
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::CertificateHorizon
+impl core::marker::Send for ferroday_cage::provision::gentoo::CertificateHorizon
+impl core::marker::Sync for ferroday_cage::provision::gentoo::CertificateHorizon
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::CertificateHorizon
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::CertificateHorizon
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::CertificateHorizon
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::CertificateHorizon
+pub struct ferroday_cage::provision::gentoo::Gentoo
+impl ferroday_cage::provision::gentoo::Gentoo
+pub fn ferroday_cage::provision::gentoo::Gentoo::architecture(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::Gentoo::available(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Available, ferroday_cage::provision::gentoo::GentooError>
+pub fn ferroday_cage::provision::gentoo::Gentoo::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::Gentoo::keyring_horizon(&self) -> alloc::vec::Vec<ferroday_cage::provision::gentoo::CertificateHorizon>
+pub fn ferroday_cage::provision::gentoo::Gentoo::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Stage3, ferroday_cage::provision::gentoo::GentooError>
+impl core::fmt::Debug for ferroday_cage::provision::gentoo::Gentoo
+pub fn ferroday_cage::provision::gentoo::Gentoo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::gentoo::Gentoo
+pub fn ferroday_cage::provision::gentoo::Gentoo::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Gentoo
+impl core::marker::Send for ferroday_cage::provision::gentoo::Gentoo
+impl !core::marker::Sync for ferroday_cage::provision::gentoo::Gentoo
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Gentoo
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Gentoo
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Gentoo
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Gentoo
+pub struct ferroday_cage::provision::gentoo::GentooBuilder
+impl ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::build(self) -> core::result::Result<ferroday_cage::provision::gentoo::Gentoo, ferroday_cage::provision::gentoo::GentooError>
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::build_id(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::cache_dir(self, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::fetcher(self, alloc::boxed::Box<dyn ferroday_cage::provision::Fetch>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::max_pointer_age(self, impl core::convert::Into<core::option::Option<core::time::Duration>>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::mirror(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::stage3(self, ferroday_cage::provision::gentoo::Stage3) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::variant(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
+impl core::fmt::Debug for ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::GentooBuilder
+impl core::marker::Send for ferroday_cage::provision::gentoo::GentooBuilder
+impl !core::marker::Sync for ferroday_cage::provision::gentoo::GentooBuilder
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::GentooBuilder
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::GentooBuilder
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::GentooBuilder
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::GentooBuilder
+pub struct ferroday_cage::provision::gentoo::Stage3
+impl ferroday_cage::provision::gentoo::Stage3
+pub fn ferroday_cage::provision::gentoo::Stage3::build_id(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::Stage3::certificate(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::Stage3::path(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::Stage3::sha512(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::Stage3::size(&self) -> u64
+pub fn ferroday_cage::provision::gentoo::Stage3::variant(&self) -> &str
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Stage3
+impl core::marker::Send for ferroday_cage::provision::gentoo::Stage3
+impl core::marker::Sync for ferroday_cage::provision::gentoo::Stage3
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Stage3
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Stage3
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Stage3
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Stage3
 #[non_exhaustive] pub enum ferroday_cage::provision::FetchError
 #[non_exhaustive] pub ferroday_cage::provision::FetchError::Io
 pub ferroday_cage::provision::FetchError::Io::op: &'static str
@@ -742,6 +880,8 @@ impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage
 pub fn ferroday_cage::provision::alpine::AlpineError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::alpine::AlpineError
 impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> Self
+impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::gentoo::GentooError
+pub fn ferroday_cage::provision::gentoo::GentooError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::gentoo::GentooError
 impl core::error::Error for ferroday_cage::provision::FetchError
 pub fn ferroday_cage::provision::FetchError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::provision::FetchError
@@ -794,6 +934,8 @@ impl ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::at(&'static str, impl core::convert::Into<std::path::PathBuf>) -> impl core::ops::function::FnOnce(core::io::error::Error) -> ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::other(impl core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>) -> ferroday_cage::provision::ProvisionError
+impl core::convert::From<ferroday_cage::provision::gentoo::GentooError> for ferroday_cage::provision::ProvisionError
+pub fn ferroday_cage::provision::ProvisionError::from(ferroday_cage::provision::gentoo::GentooError) -> ferroday_cage::provision::ProvisionError
 impl core::error::Error for ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::provision::ProvisionError
@@ -810,6 +952,7 @@ pub ferroday_cage::provision::ProvisionEvent::Alpine(&'a ferroday_cage::provisio
 pub ferroday_cage::provision::ProvisionEvent::Debian(&'a ferroday_cage::provision::debian::DebianEvent<'a>)
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionEvent::Entry
 pub ferroday_cage::provision::ProvisionEvent::Entry::path: &'a std::path::Path
+pub ferroday_cage::provision::ProvisionEvent::Gentoo(&'a ferroday_cage::provision::gentoo::GentooEvent<'a>)
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionEvent::Read
 pub ferroday_cage::provision::ProvisionEvent::Read::done: u64
 pub ferroday_cage::provision::ProvisionEvent::Read::total: core::option::Option<u64>
@@ -1026,6 +1169,8 @@ impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian:
 pub fn ferroday_cage::provision::debian::Debian<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Observed<'_, '_>
 pub fn ferroday_cage::provision::debian::Observed<'_, '_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::gentoo::Gentoo
+pub fn ferroday_cage::provision::gentoo::Gentoo::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::ensure(impl core::convert::AsRef<std::path::Path>, &mut dyn ferroday_cage::provision::Provisioner) -> core::result::Result<ferroday_cage::provision::Provisioned, ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::export_tar<W: std::io::Write>(impl core::convert::AsRef<std::path::Path>, W, ferroday_cage::IdentityMap) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::file_url(&std::path::Path) -> core::result::Result<alloc::string::String, ferroday_cage::provision::FetchError>

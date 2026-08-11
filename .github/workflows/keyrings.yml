@@ -1,0 +1,35 @@
+name: Keyrings
+
+# The vendored trust anchors against what their distributions publish today.
+#
+# Its own workflow rather than a job in CI, because it is the one check here
+# that reaches the network on purpose. Keyring drift moves on a scale of months,
+# while putting four archive fetches -- one of them a `.deb` resolved through a
+# 10 MB index -- on every pull request would make the always-run checks
+# non-hermetic and flaky for no benefit.
+on:
+  schedule:
+    # Weekly, early on a Monday. The cadence is the drift's, not the project's.
+    - cron: "17 5 * * 1"
+  # Started by hand, which is what a maintainer refreshing a keyring reaches
+  # for to confirm the new bytes are the published ones.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  keyrings:
+    name: Vendored keyrings against upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare each vendored keyring against what its distribution ships
+        # Fails loudly and gates nothing: no release and no merge waits on it,
+        # and what it produces is a maintainer noticing that an anchor has
+        # moved. A failure is read, not worked around -- a key that appeared
+        # upstream is a key this crate would begin to trust.
+        run: python3 tools/check-keyrings.py

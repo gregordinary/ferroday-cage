@@ -556,7 +556,9 @@ the `debian` feature it bootstraps a Debian suite from the archive, and
 [Building a Debian package](building-a-debian-package.md) works it into a
 consumer that builds a `.deb` from source in a cage. The [Alpine
 userland](alpine.md) is the second, and provisions an Alpine or postmarketOS
-root the same way.
+root the same way. The [Gentoo userland](gentoo.md) is the third, and is the
+one whose archive publishes no package resolution at all: it verifies a signed
+stage3 and extracts it.
 
 ## The command line
 

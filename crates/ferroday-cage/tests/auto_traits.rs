@@ -157,6 +157,28 @@ mod alpine {
 }
 
 // ---------------------------------------------------------------------------
+// The Gentoo provisioner.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gentoo")]
+mod gentoo {
+    use ferroday_cage::provision::gentoo;
+
+    use super::*;
+
+    const _: () = assert_send_sync::<gentoo::CertificateHorizon>();
+    const _: () = assert_send_sync::<gentoo::GentooError>();
+    const _: () = assert_send_sync::<gentoo::Stage3>();
+    const _: () = assert_send_sync::<gentoo::Available>();
+
+    // Send and not Sync, for the reason the Debian and Alpine provisioners
+    // are: the provisioner owns its transport, and every operation that uses
+    // one takes `&mut self`.
+    const _: () = assert_send::<gentoo::Gentoo>();
+    const _: () = assert_send::<gentoo::GentooBuilder>();
+}
+
+// ---------------------------------------------------------------------------
 // Hardening.
 // ---------------------------------------------------------------------------
 

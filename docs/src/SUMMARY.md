@@ -21,4 +21,5 @@
 - [A Debian userland](debian.md)
 - [Building a Debian package](building-a-debian-package.md)
 - [An Alpine userland](alpine.md)
+- [A Gentoo userland](gentoo.md)
 - [Stability and versioning](stability.md)

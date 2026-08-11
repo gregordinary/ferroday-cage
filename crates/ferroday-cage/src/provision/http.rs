@@ -473,7 +473,7 @@ fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
 /// interpolates the parsed path verbatim into `GET <path> HTTP/1.1`, and every
 /// other URL this crate composes has already passed a check of its own —
 /// `coordinate::check` for a layer's own coordinates, `is_safe_pool_path` for a
-/// pool path, `is_sha256_hex` for a digest. A redirect `Location` has passed
+/// pool path, `Algorithm::is_hex` for a digest. A redirect `Location` has passed
 /// none: it is a hostile mirror's string, and one holding a CR or an LF would
 /// otherwise write headers of its own into the follow-up request. Refusing here
 /// covers the whole URL rather than the path alone, since the host reaches the

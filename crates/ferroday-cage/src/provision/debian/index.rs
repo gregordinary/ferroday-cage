@@ -14,6 +14,7 @@ use std::fmt;
 use super::available::Available;
 use super::pin::Pins;
 use super::version;
+use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
 
 /// One package's metadata from a `Packages` index.
@@ -179,7 +180,7 @@ impl Package {
             return None;
         }
         let sha256 = stanza.get("SHA256")?.to_string();
-        if !crate::provision::digest::is_sha256_hex(&sha256) {
+        if !Algorithm::Sha256.is_hex(&sha256) {
             return None;
         }
         // A stanza that states no size, or states one that does not parse,

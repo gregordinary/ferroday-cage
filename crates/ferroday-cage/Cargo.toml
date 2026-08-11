@@ -47,8 +47,10 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
 lzma-rust2 = { version = "0.18", optional = true, default-features = false, features = ["std", "xz"] }
 ruzstd = { version = "0.9", optional = true }
-# The Debian userland add-on: OpenPGP verification of the archive signature
-# (pure Rust, no C backend) and SHA-256 hashing of the release chain.
+# The Debian and Gentoo userland add-on: OpenPGP verification of the archive's
+# signed documents (pure Rust, no C backend), and the hashing their trust chains
+# are defined over -- SHA-256 for Debian's release chain, SHA-512 for Gentoo's
+# digest documents.
 pgp = { version = "0.20", optional = true, default-features = false }
 sha2 = { version = "0.11", optional = true }
 # The Alpine userland add-on: RSA PKCS#1 v1.5 verification of the apk signature
@@ -91,6 +93,11 @@ debian = ["tarball", "dep:pgp", "dep:sha2"]
 # an apk repository, and postmarketOS's repositories beside it. Builds on the
 # tarball extractor for the packages' data segments.
 alpine = ["tarball", "dep:rsa", "dep:sha1", "dep:sha2"]
+# The Gentoo userland provisioner: bootstrap a rootfs from a signed stage3
+# tarball. It selects the same dependencies the Debian layer does, which is what
+# it costs to add: OpenPGP for the signed pointer and digest documents, and the
+# SHA-512 those record. Builds on the tarball extractor for the stage3 itself.
+gentoo = ["tarball", "dep:pgp", "dep:sha2"]
 # The hardening layer: opt-in Landlock filesystem rules, seccomp syscall
 # filters, and capability drops applied to the sandboxed command.
 hardening = ["dep:seccompiler"]
@@ -160,6 +167,13 @@ required-features = ["debian"]
 name = "alpine"
 required-features = ["alpine", "tarball"]
 
+# The Gentoo tests read the live archive and download a half-gigabyte stage3,
+# so every one of them is gated within the binary; the hermetic tests sit beside
+# the code, over documents signed by a key the test generates.
+[[test]]
+name = "gentoo"
+required-features = ["gentoo"]
+
 # The native-stack tests additionally need a host with /dev/net/tun; they
 # skip (explicitly, on stderr) where it is unavailable.
 [[test]]
@@ -192,12 +206,13 @@ required-features = ["serde"]
 
 # A worked consumer: an ebuild development sandbox that provisions a Gentoo
 # stage3 and builds packages in it under a subordinate uid/gid range map, so
-# portage's own ids exist inside. It provisions the root through the tarball
-# provisioner and establishes the map through the subid delegate, so it
+# portage's own ids exist inside. It provisions the root through the Gentoo
+# provisioner -- or from a tarball already on the host, through the tarball one
+# `gentoo` implies -- and establishes the map through the subid delegate, so it
 # builds only when both features are enabled.
 [[example]]
 name = "ebuild-sandbox"
-required-features = ["tarball", "subid"]
+required-features = ["gentoo", "subid"]
 
 # A worked consumer: a Debian source-package build sandbox that bootstraps a
 # suite with build tooling and builds a .deb from source. It provisions the

@@ -79,6 +79,7 @@ use super::check_coordinate;
 use super::{DebianError, arch, deb, release, version};
 use crate::mechanism::frame;
 use crate::provision::coordinate::Nesting;
+use crate::provision::digest::{self, Algorithm};
 use crate::provision::document;
 use crate::provision::{file_url, staging_path, write_atomically};
 
@@ -432,7 +433,7 @@ impl Pool {
             // A clock before the epoch stamps the epoch rather than failing:
             // the field records when the pool was published and gates nothing,
             // so an odd clock is not a reason to refuse to publish.
-            None => release::now_epoch().unwrap_or(0),
+            None => crate::provision::now_epoch().unwrap_or(0),
         };
         let claims = Claims {
             suite,
@@ -648,7 +649,7 @@ fn lock_pool(pool_dir: &Path) -> Result<std::os::fd::OwnedFd, DebianError> {
 /// later publish supersedes is what a reader still working from the release
 /// that named it resolves against.
 fn write_by_hash(by_hash_dir: &Path, bytes: &[u8]) -> Result<(), DebianError> {
-    let path = by_hash_dir.join(crate::provision::digest::sha256_hex(bytes));
+    let path = by_hash_dir.join(Algorithm::Sha256.hex_of(bytes));
     if path.exists() {
         return Ok(());
     }
@@ -979,7 +980,7 @@ fn describe(
     let control = control_of(path, deb_path, architecture, expected)?;
     let mut file =
         File::open(path).map_err(DebianError::at("digesting a .deb in the pool", path))?;
-    let digest = crate::provision::digest::sha256_stream(&mut file)
+    let digest = digest::stream(Algorithm::Sha256, &mut file)
         .map_err(DebianError::at("digesting a .deb in the pool", path))?;
     Ok((control, digest))
 }
@@ -1005,8 +1006,8 @@ fn already_published(dest: &Path, source: &mut File) -> Option<(String, u64)> {
     }
 
     source.rewind().ok()?;
-    let (offered, _) = crate::provision::digest::sha256_stream(source).ok()?;
-    let (held, size) = crate::provision::digest::sha256_stream(&mut published).ok()?;
+    let (offered, _) = digest::stream(Algorithm::Sha256, source).ok()?;
+    let (held, size) = digest::stream(Algorithm::Sha256, &mut published).ok()?;
     (offered == held).then_some((held, size))
 }
 
@@ -1207,7 +1208,7 @@ fn read_indexes(
         }
         let digesting = DebianError::at("digesting a pool index", &path);
         let mut file = File::open(&path).map_err(digesting)?;
-        let (digest, size) = crate::provision::digest::sha256_stream(&mut file)
+        let (digest, size) = digest::stream(Algorithm::Sha256, &mut file)
             .map_err(DebianError::at("digesting a pool index", &path))?;
         sections.push(Section {
             component: component.to_string(),
@@ -1597,7 +1598,7 @@ mod tests {
             architecture: architecture.to_string(),
             path: format!("{component}/binary-{architecture}/{name}"),
             size: bytes.len() as u64,
-            digest: crate::provision::digest::sha256_hex(bytes),
+            digest: Algorithm::Sha256.hex_of(bytes),
         }
     }
 
@@ -1627,7 +1628,7 @@ mod tests {
             parsed.digest("main/binary-amd64/Packages"),
             Some((
                 packages.len() as u64,
-                crate::provision::digest::sha256_hex(packages).as_str()
+                Algorithm::Sha256.hex_of(packages).as_str()
             )),
         );
     }
@@ -1662,7 +1663,7 @@ mod tests {
         );
         // Stamping does not disturb the digest list the field sits above.
         let parsed = release::Release::parse(&release).expect("the stamped Release parses");
-        let empty = crate::provision::digest::sha256_hex(b"");
+        let empty = Algorithm::Sha256.hex_of(b"");
         assert_eq!(
             parsed.digest("main/binary-amd64/Packages"),
             Some((0, empty.as_str())),
@@ -1699,7 +1700,7 @@ mod tests {
         // Left unpinned, the same pool stamps the clock instead. The two need
         // not differ — a second publish within the same second stamps the same
         // date — but the field must be present and current either way.
-        let now = release::now_epoch().expect("the clock is after the epoch");
+        let now = crate::provision::now_epoch().expect("the clock is after the epoch");
         let unpinned = Pool::at(&dir).suite("local");
         unpinned.publish::<&Path>([]).expect("the unpinned publish");
         let release = std::fs::read_to_string(unpinned.release_path().unwrap()).unwrap();

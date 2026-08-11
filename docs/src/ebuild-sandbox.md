@@ -11,14 +11,21 @@ ships one as a worked example.
 Where [Building an orchestrator](building-an-orchestrator.md) composes a
 prepared rootfs with profile data, this example is the one that *provisions* its
 root: it is the worked consumer of the [provisioning](provisioning.md) module,
-extracting a stage3 tarball through the tarball provisioner before it launches
+fetching a stage3 through the [Gentoo provisioner](gentoo.md) before it launches
 anything.
 
 ```sh
-ebuild-sandbox --stage3 stage3-amd64-openrc.tar.xz --rootfs ./gentoo \
+ebuild-sandbox --variant amd64-openrc --rootfs ./gentoo \
     --repo /var/db/repos/gentoo --distfiles ./distfiles \
     app-misc/hello
 ```
+
+`--variant` names one of the stage3s Gentoo publishes and the layer does the
+rest: it follows the signed pointer to the build that variant currently points
+at, holds the tarball to the SHA-512 a signed digest document records for it, and
+extracts it. `--stage3 FILE` provisions from a tarball already on the host
+instead, which is what an air-gapped machine or a locally built stage3 needs; the
+two are alternatives.
 
 ## The build posture
 
@@ -27,8 +34,10 @@ an ordinary builder call:
 
 - **The root is provisioned, once.** `provision::ensure` extracts the stage3
   into the `--rootfs` directory and publishes it atomically. The first run pays
-  for the extraction; every later run finds the root already published and skips
-  it, so the `--stage3` flag can stay in an invocation permanently.
+  for the download and the extraction; every later run finds the root already
+  published and skips both, so the flag can stay in an invocation permanently.
+  `--stage3-cache` keeps the downloaded tarball across runs, which is what a
+  caller building more than one root from a build wants.
 - **The tree is read-only.** `--repo` binds a host portage tree read-only at
   `/var/db/repos/gentoo`. The build reads ebuilds and eclasses through the bind
   but cannot write back to the host's tree.
@@ -109,23 +118,24 @@ map through the subid delegate, so it builds with the `tarball` and `subid`
 features:
 
 ```sh
-cargo run --example ebuild-sandbox --features tarball,subid -- --help
+cargo run --example ebuild-sandbox --features gentoo,subid -- --help
 ```
 
-A complete invocation needs a stage3 tarball and a portage tree of your own.
-Both come from a Gentoo mirror: a stage3 from `releases/`, and a tree from the
-`gentoo-latest.tar.xz` snapshot under `snapshots/`, which extracts to a
-`gentoo/` directory to point `--repo` at.
+A complete invocation needs a portage tree of your own; the stage3 the example
+fetches itself. The tree comes from the `gentoo-latest.tar.xz` snapshot under a
+Gentoo mirror's `snapshots/`, which extracts to a `gentoo/` directory to point
+`--repo` at.
 
 ```sh
 # Provision the root and build a package into it:
-cargo run --example ebuild-sandbox --features tarball,subid -- \
-    --stage3 stage3-amd64-openrc.tar.xz --rootfs ./gentoo-root \
+cargo run --example ebuild-sandbox --features gentoo,subid -- \
+    --variant amd64-openrc --rootfs ./gentoo-root \
+    --stage3-cache ./stage3-cache \
     --repo ./gentoo --distfiles ./distfiles \
     app-misc/hello
 
 # A shell in the same posture, for interactive work:
-cargo run --example ebuild-sandbox --features tarball,subid -- \
+cargo run --example ebuild-sandbox --features gentoo,subid -- \
     --rootfs ./gentoo-root --repo ./gentoo -- /bin/bash
 ```
 

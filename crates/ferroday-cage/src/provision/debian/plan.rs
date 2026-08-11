@@ -12,6 +12,7 @@
 
 use super::DebianError;
 use super::index::Package;
+use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Carried, Draft};
 
 /// The document's first field, naming the format and its version.
@@ -228,7 +229,8 @@ impl PlannedPackage {
     ///
     /// A package resolved from an index passed
     /// [`index::is_safe_pool_path`](super::index::is_safe_pool_path) and
-    /// [`is_sha256_hex`](crate::provision::digest::is_sha256_hex) on the way in,
+    /// [`Algorithm::is_hex`](crate::provision::digest::Algorithm::is_hex) on the
+    /// way in,
     /// so this is the same gate for the way a plan arrives instead: a document a
     /// caller kept and may have edited, or a [`Plan`] taken from
     /// [`resolve`](super::Debian::resolve) and modified, neither of which has an
@@ -242,7 +244,7 @@ impl PlannedPackage {
                 self.name, self.filename,
             ));
         }
-        if !crate::provision::digest::is_sha256_hex(&self.sha256) {
+        if !Algorithm::Sha256.is_hex(&self.sha256) {
             return Some(format!(
                 "the plan states {} at digest {:?}, which is not 64 lowercase hex characters",
                 self.name, self.sha256,

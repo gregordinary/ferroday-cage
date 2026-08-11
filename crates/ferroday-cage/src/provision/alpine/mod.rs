@@ -63,6 +63,7 @@ pub use repository::{Repository, RepositoryBuilder};
 
 use super::binfmt;
 use super::coordinate::{self, Nesting};
+use super::digest::Algorithm;
 use super::extract::{Extraction, Placement};
 // `super::layer` is the shared one; this module has a `layer` of its own, which
 // reads a provisioned base rather than describing how a cage is rooted on it.
@@ -71,7 +72,7 @@ use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
     BuildLayer, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter, PackageCache,
-    ProvisionError, ProvisionRequest, Provisioner, Stream, digest,
+    ProvisionError, ProvisionRequest, Provisioner, Stream,
 };
 use crate::IdentityMap;
 use bootstrap::ScriptSubject;
@@ -1193,7 +1194,7 @@ fn read_index(
                         // Over the container as it arrived, signature segment
                         // included, so the value names the exact bytes whose
                         // signature was checked.
-                        digest::sha256_hex(&bytes),
+                        Algorithm::Sha256.hex_of(&bytes),
                         signed_by,
                         description,
                     ),
@@ -2890,10 +2891,7 @@ mod tests {
         assert_eq!(index.mirror, "http://mirror.invalid/alpine");
         assert_eq!(index.component.as_deref(), Some("main"));
         assert_eq!(index.signed_by, fixtures::ALPINE_KEY_NAME);
-        assert_eq!(
-            index.sha256,
-            crate::provision::digest::sha256_hex(fixtures::INDEX),
-        );
+        assert_eq!(index.sha256, Algorithm::Sha256.hex_of(fixtures::INDEX),);
         assert!(
             index
                 .description
