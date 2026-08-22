@@ -2648,7 +2648,12 @@ impl DebianObserver for ObservedRun<'_, '_, '_> {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DebianEvent<'a> {
-    /// A URL is being fetched.
+    /// A URL is about to be fetched.
+    ///
+    /// The event announces an intent, not a transfer in flight. Where several
+    /// resources are fetched at once, every URL in a batch is announced before
+    /// any of them is asked for, so the order is the order they were queued in
+    /// rather than the order they arrive.
     #[non_exhaustive]
     Fetching {
         /// The URL.

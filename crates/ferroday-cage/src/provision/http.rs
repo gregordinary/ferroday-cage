@@ -135,6 +135,10 @@ impl HttpFetch {
     /// take, or `None` to remove the bound. The default is one hour per file;
     /// raise it only to fetch an unusually large artifact over a slow link.
     ///
+    /// One fetch means one call, whatever it takes to answer: a redirect chain
+    /// and the retry a connection reused from an earlier fetch is allowed both
+    /// come out of this budget rather than starting a fresh one.
+    ///
     /// A timeout beyond what the clock can express removes the bound as well:
     /// there is no faithful deadline for one, and asking to wait that long is
     /// asking to wait.
@@ -187,9 +191,21 @@ impl Fetch for HttpFetch {
         if let Some(path) = strip_scheme(url, "file://") {
             return fetch_file(url, path, sink, cap);
         }
+        // Bound the whole fetch rather than each request inside it: the
+        // deadline covers the redirect chain and the one retry a reused
+        // connection is allowed, so `request_timeout` is the ceiling its
+        // documentation states rather than a per-attempt budget that a chain
+        // multiplies by the hops it takes.
+        //
+        // A timeout the clock cannot express is a fetch without a deadline,
+        // which is what a caller asking to wait some hundreds of billions of
+        // years asked for; the addition would otherwise overflow and panic.
+        let deadline = self
+            .request_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
         let mut current = url.to_string();
         for _ in 0..=self.max_redirects {
-            match self.request(&current, sink, cap)? {
+            match self.request(&current, sink, cap, deadline)? {
                 Step::Done => return Ok(()),
                 Step::Redirect(next) => current = next,
             }
@@ -338,7 +354,13 @@ impl HttpFetch {
     /// before the body has begun is retried once on a fresh one -- which is the
     /// whole of what makes reuse safe, since that failure is indistinguishable
     /// from a peer that closed while the request was in flight.
-    fn request(&mut self, url: &str, sink: &mut dyn Write, cap: u64) -> Result<Step, FetchError> {
+    fn request(
+        &mut self,
+        url: &str,
+        sink: &mut dyn Write,
+        cap: u64,
+        deadline: Option<Instant>,
+    ) -> Result<Step, FetchError> {
         let parsed = parse_http_url(url)?;
 
         let kept = self
@@ -346,9 +368,9 @@ impl HttpFetch {
             .take()
             .filter(|kept| kept.host == parsed.host && kept.port == parsed.port);
         let reused = kept.is_some();
-        match self.exchange(url, &parsed, kept, sink, cap) {
+        match self.exchange(url, &parsed, kept, sink, cap, deadline) {
             Err(Exchange::BeforeBody(_)) if reused => self
-                .exchange(url, &parsed, None, sink, cap)
+                .exchange(url, &parsed, None, sink, cap, deadline)
                 .map_err(Exchange::into_error),
             outcome => outcome.map_err(Exchange::into_error),
         }
@@ -363,24 +385,14 @@ impl HttpFetch {
         kept: Option<Kept>,
         sink: &mut dyn Write,
         cap: u64,
+        deadline: Option<Instant>,
     ) -> Result<Step, Exchange> {
         let io = |op: &'static str| FetchError::at(op, url);
 
-        // Bound the whole response, not just each read: the deadline is checked
-        // before every underlying read, so a mirror that trickles bytes to keep
-        // the per-read timeout from firing still fails once the deadline passes.
-        //
-        // A timeout the clock cannot express is a fetch without a deadline,
-        // which is what a caller asking to wait some hundreds of billions of
-        // years asked for; the addition would otherwise overflow and panic.
-        let deadline = self
-            .request_timeout
-            .and_then(|timeout| Instant::now().checked_add(timeout));
-
         let mut reader = match kept {
             Some(mut kept) => {
-                // The deadline is this request's, not the one the connection
-                // was opened under.
+                // The deadline is this fetch's, not the one the connection was
+                // opened under.
                 kept.reader.get_mut().deadline = deadline;
                 kept.reader
             }
@@ -426,7 +438,7 @@ impl HttpFetch {
             .map_err(io("sending the request"))
             .map_err(Exchange::BeforeBody)?;
 
-        let code = read_status(&mut reader)
+        let status = read_status(&mut reader)
             .map_err(io("reading the response"))
             .map_err(Exchange::BeforeBody)?;
         let headers = read_headers(&mut reader)
@@ -435,10 +447,15 @@ impl HttpFetch {
 
         // Whether the connection can serve another request. A response with no
         // definite framing ends at end of stream, so there is nothing after it
-        // to read; a peer that said `Connection: close` is about to close.
+        // to read; a peer that said `Connection: close` is about to close; and
+        // a peer speaking anything older than HTTP/1.1 promised nothing either
+        // way, since a persistent connection is 1.1's own default and nothing
+        // earlier's. `Connection: close` is how 1.1 departs from that default,
+        // so its absence from a 1.0 response says nothing at all.
         let framed = headers.chunked || headers.content_length.is_some();
+        let persistent = framed && !headers.close && status.version >= (1, 1);
         let mut keep = |reader| {
-            if framed && !headers.close {
+            if persistent {
                 self.idle = Some(Kept {
                     host: parsed.host.clone(),
                     port: parsed.port,
@@ -447,13 +464,13 @@ impl HttpFetch {
             }
         };
 
-        match code {
+        match status.code {
             200 => {}
             301 | 302 | 303 | 307 | 308 => {
                 let location = headers
                     .location
                     .clone()
-                    .ok_or_else(|| FetchError::status(url, code))
+                    .ok_or_else(|| FetchError::status(url, status.code))
                     .map_err(Exchange::AfterBody)?;
                 // A redirect carries a body of its own, framed like any other,
                 // and the connection is only reusable once it has been read
@@ -796,54 +813,94 @@ fn read_line_limited<R: BufRead>(reader: &mut R, line: &mut String) -> io::Resul
     Ok(read)
 }
 
-/// Reads and parses the status line, returning the status code.
+/// A response's status line.
+#[derive(Debug, PartialEq, Eq)]
+struct Status {
+    /// Major and minor, as `HTTP/<major>.<minor>` spells them.
+    version: (u8, u8),
+    code: u16,
+}
+
+/// Reads and parses the status line.
 ///
-/// The version token is checked, not merely skipped over. Reading the second
+/// The version token is parsed, not merely skipped over. Reading the second
 /// word of any line that happens to parse as a number would take a mail or SSH
 /// server's greeting for a response — the digest chain makes that harmless, but
 /// a mirror URL pointed at the wrong port then fails somewhere further on
-/// instead of saying what it found. `HTTP/` is the whole of the check: the
-/// version that follows is a thing this client neither negotiates nor acts on.
-fn read_status<R: BufRead>(reader: &mut R) -> io::Result<u16> {
+/// instead of saying what it found. The version itself is acted on in one
+/// place: whether the connection can be held for another request.
+fn read_status<R: BufRead>(reader: &mut R) -> io::Result<Status> {
     let mut line = String::new();
     read_line_limited(reader, &mut line)?;
     let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed status line");
     let mut words = line.split_whitespace();
-    // Compared as bytes: the token is arbitrary input, and slicing a `str` at a
-    // fixed index would panic where that index is not a character boundary.
-    if !words.next().is_some_and(|version| {
-        let bytes = version.as_bytes();
-        bytes.len() > 5 && bytes[..5].eq_ignore_ascii_case(b"HTTP/")
-    }) {
-        return Err(malformed());
-    }
-    words
+    let version = words.next().and_then(parse_version).ok_or_else(malformed)?;
+    let code = words
         .next()
         .and_then(|code| code.parse().ok())
-        .ok_or_else(malformed)
+        .ok_or_else(malformed)?;
+    Ok(Status { version, code })
 }
 
-/// Reads headers up to the blank separator line.
+/// Parses an `HTTP/<major>.<minor>` version token, which RFC 9112 spells with
+/// exactly one digit on each side of the dot.
+fn parse_version(token: &str) -> Option<(u8, u8)> {
+    // Split as bytes: the token is arbitrary input, and slicing a `str` at a
+    // fixed index would panic where that index is not a character boundary.
+    let (name, version) = token.as_bytes().split_at_checked(5)?;
+    if !name.eq_ignore_ascii_case(b"HTTP/") {
+        return None;
+    }
+    match version {
+        [major, b'.', minor] if major.is_ascii_digit() && minor.is_ascii_digit() => {
+            Some((major - b'0', minor - b'0'))
+        }
+        _ => None,
+    }
+}
+
+/// Reads a field section, handing each field line to `field` and stopping at
+/// the blank line that ends it. `section` names it in a failure.
 ///
-/// Only the blank separator ends the section. A stream that ends inside it is
+/// A response has two: the headers, and the trailer section that follows a
+/// chunked body. They are the same grammar and carry the same hazards, so they
+/// are read the same way — all that differs is what a caller does with a line.
+///
+/// Only the blank separator ends a section. A stream that ends inside one is
 /// a truncated response — an overloaded backend, a proxy that dropped the
 /// response — and is refused rather than read as a complete section with no
 /// framing, which would deliver an empty body as a successful fetch.
-fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
-    let mut headers = Headers::default();
+fn read_field_section<R: BufRead>(
+    reader: &mut R,
+    section: &str,
+    mut field: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<()> {
     for _ in 0..MAX_HEADERS {
         let mut line = String::new();
         if read_line_limited(reader, &mut line)? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "the response ended inside the header section",
+                format!("the response ended inside the {section} section"),
             ));
         }
         let line = line.trim_end();
         if line.is_empty() {
-            // The blank separator ends the header section.
-            return Ok(headers);
+            return Ok(());
         }
+        field(line)?;
+    }
+    // More field lines than the cap without a blank separator: a hostile or
+    // broken mirror, refused rather than read on.
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the response sent more {section} lines than the cap"),
+    ))
+}
+
+/// Reads the response headers up to the blank separator line.
+fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
+    let mut headers = Headers::default();
+    read_field_section(reader, "header", |line| {
         if let Some((name, value)) = line.split_once(':') {
             let (name, value) = (name.trim(), value.trim());
             if name.eq_ignore_ascii_case("content-length") {
@@ -879,13 +936,38 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
                 headers.close = true;
             }
         }
+        Ok(())
+    })?;
+    // Two framings in one response are two answers to where the body ends.
+    // This client would take the chunked one, as it is required to, but an
+    // intermediary that took the other disagrees about where the *next*
+    // response begins — and a connection held across that disagreement serves
+    // the following request whatever the two left behind. It is the shape a
+    // response-splitting attack has, and it is refused for the same reason a
+    // self-contradicting Content-Length is: framing a recipient has to guess at
+    // is not framing.
+    if headers.chunked && headers.content_length.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the response declared both chunked framing and a Content-Length",
+        ));
     }
-    // More header lines than the cap without a blank separator: a hostile or
-    // broken mirror, refused rather than read on.
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "the response sent more headers than the cap",
-    ))
+    Ok(headers)
+}
+
+/// Reads the trailer section that ends a chunked body, discarding its fields.
+///
+/// The section is there even when it carries none: RFC 9112 ends it with a
+/// blank line either way, so a chunked response is not fully read until that
+/// line has been. Stopping at the last chunk costs nothing on a connection
+/// about to be closed and poisons one held for the next request, whose status
+/// line is then read from what this response left on the socket.
+///
+/// The fields themselves are discarded because nothing here acts on one, and
+/// the fields that would matter — framing above all — are not allowed to appear
+/// in a trailer.
+fn read_trailers<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    read_field_section(reader, "trailer", |_| Ok(()))
 }
 
 /// Copies exactly `length` bytes from `reader` to `sink`.
@@ -945,7 +1027,9 @@ fn read_chunked<R: BufRead>(reader: &mut R, sink: &mut dyn Write) -> io::Result<
         let size = u64::from_str_radix(line.trim().split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed chunk size"))?;
         if size == 0 {
-            break;
+            // The last chunk is followed by the trailer section, which is part
+            // of this response and not of the next one.
+            return read_trailers(reader);
         }
         // Stream the chunk body in bounded pieces (`io::copy` uses a fixed
         // internal buffer) rather than allocating the whole announced size up
@@ -971,7 +1055,6 @@ fn read_chunked<R: BufRead>(reader: &mut R, sink: &mut dyn Write) -> io::Result<
             ));
         }
     }
-    Ok(())
 }
 
 /// A reader that fails once a wall-clock deadline passes, bounding the total
@@ -1094,6 +1177,237 @@ mod tests {
             }
         });
         (url, accepted, served)
+    }
+
+    /// Serves one canned response to every request it is asked, on as many
+    /// connections as the client opens, and reports how many that was.
+    ///
+    /// [`serving_one_connection`] cannot ask what a *failure* of reuse costs:
+    /// it stops once its scripted responses run out, so a client that discards
+    /// an answer and asks again meets a closed listener rather than a peer that
+    /// is still there, and the test then fails on the retry's `ConnectionReset`
+    /// instead of on the connection count. What a reuse failure actually costs
+    /// is a second request against a peer that is still answering.
+    ///
+    /// Stops when it is dropped, which is why the test drops the fetcher first:
+    /// a connection the client still holds is one this is still reading.
+    struct Serving {
+        url: String,
+        port: u16,
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        served: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Serving {
+        fn new(response: Vec<u8>) -> Serving {
+            Serving::answering(move |_| Some(response.clone()))
+        }
+
+        /// As [`Serving::new`], with the response chosen per request from the
+        /// count of requests already answered on this listener.
+        fn answering(respond: impl FnMut(usize) -> Option<Vec<u8>> + Send + 'static) -> Serving {
+            let mut respond = respond;
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("a loopback listener binds");
+            let addr = listener.local_addr().expect("the listener is bound");
+            let url = format!("http://{addr}/x");
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (counter, halt) = (
+                std::sync::Arc::clone(&accepted),
+                std::sync::Arc::clone(&stop),
+            );
+            let served = std::thread::spawn(move || {
+                let stopping = || halt.load(std::sync::atomic::Ordering::SeqCst);
+                let mut answered = 0;
+                'accept: while !stopping() {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    if stopping() {
+                        // The connection that woke the accept, not a client's.
+                        return;
+                    }
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // So a connection the client is holding idle does not park
+                    // this thread past the point the test wants it to stop.
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                    let mut request =
+                        BufReader::new(stream.try_clone().expect("the stream clones"));
+                    loop {
+                        let mut line = String::new();
+                        match request.read_line(&mut line) {
+                            Ok(0) => continue 'accept,
+                            Ok(_) => {}
+                            Err(error) if would_block(&error) => match stopping() {
+                                true => return,
+                                false => continue,
+                            },
+                            Err(_) => continue 'accept,
+                        }
+                        if line != "\r\n" {
+                            continue;
+                        }
+                        let Some(response) = respond(answered) else {
+                            return;
+                        };
+                        answered += 1;
+                        if stream.write_all(&response).is_err() {
+                            continue 'accept;
+                        }
+                    }
+                }
+            });
+            Serving {
+                url,
+                port: addr.port(),
+                accepted,
+                stop,
+                served: Some(served),
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Wakes the thread where it is parked in `accept`; the connection
+            // is never answered, and the thread counts it as none.
+            let _ = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, self.port));
+            if let Some(served) = self.served.take() {
+                let _ = served.join();
+            }
+        }
+    }
+
+    /// Whether a read failed because nothing had arrived within its timeout,
+    /// which a socket reports as either of two kinds depending on the platform.
+    fn would_block(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        )
+    }
+
+    /// Fetches `url` `times` over one fetcher, asserting each answer.
+    fn fetch_repeatedly(fetcher: &mut HttpFetch, url: &str, times: usize, body: &[u8]) {
+        for _ in 0..times {
+            let mut out = Vec::new();
+            fetcher
+                .fetch(&FetchRequest::new(url), &mut out)
+                .expect("each fetch answers");
+            assert_eq!(out, body);
+        }
+    }
+
+    #[test]
+    fn a_chunked_response_leaves_the_connection_reusable() {
+        // A chunked body ends with a trailer section, which is empty here and
+        // is still two bytes of this response. Leaving them on the socket puts
+        // them where the next response's status line is read from, which costs
+        // a wasted request and the reconnect it was already paying -- so a
+        // mirror that chunks would be slower with reuse than without it.
+        let served = Serving::new(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              5\r\nfirst\r\n0\r\n\r\n"
+                .to_vec(),
+        );
+        let mut fetcher = HttpFetch::new();
+        fetch_repeatedly(&mut fetcher, &served.url, 3, b"first");
+        assert_eq!(
+            served.connections(),
+            1,
+            "three fetches down one held connection, as a framed body already manages",
+        );
+        drop(fetcher);
+    }
+
+    #[test]
+    fn a_chunked_trailer_leaves_the_connection_reusable() {
+        // The same, for the section a mirror actually puts fields in. Nothing
+        // here reads them; what matters is that they are read *off*.
+        let served = Serving::new(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              5\r\nfirst\r\n0\r\nExpires: never\r\nX-Checksum: 00\r\n\r\n"
+                .to_vec(),
+        );
+        let mut fetcher = HttpFetch::new();
+        fetch_repeatedly(&mut fetcher, &served.url, 3, b"first");
+        assert_eq!(served.connections(), 1, "a trailer section is read off too");
+        drop(fetcher);
+    }
+
+    #[test]
+    fn an_http_1_0_peer_is_not_held_open() {
+        // A persistent connection is HTTP/1.1's default and nothing earlier's,
+        // so a 1.0 peer that did not say `Connection: close` has still promised
+        // nothing -- holding it buys a wasted request per fetch.
+        let served = Serving::new(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nfirst".to_vec());
+        let mut fetcher = HttpFetch::new();
+        fetch_repeatedly(&mut fetcher, &served.url, 1, b"first");
+        assert!(
+            fetcher.idle.is_none(),
+            "a peer older than HTTP/1.1 is not held open",
+        );
+        drop(fetcher);
+    }
+
+    #[test]
+    fn a_response_framed_two_ways_is_refused() {
+        // Chunked framing wins over a Content-Length by rule, but an
+        // intermediary that read the other one disagrees about where the next
+        // response starts. Nothing is served from a connection held across that
+        // disagreement, so the response is refused instead.
+        let served = Serving::new(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n\
+              5\r\nfirst\r\n0\r\n\r\n"
+                .to_vec(),
+        );
+        let mut fetcher = HttpFetch::new();
+        let mut out = Vec::new();
+        let err = fetcher
+            .fetch(&FetchRequest::new(&served.url), &mut out)
+            .expect_err("two framings in one response are refused");
+        assert!(err.to_string().contains("reading the response"), "{err}");
+        assert!(out.is_empty(), "nothing is delivered from it");
+        drop(fetcher);
+    }
+
+    #[test]
+    fn one_fetch_shares_one_deadline_with_the_redirects_it_follows() {
+        // `request_timeout` is documented as the ceiling on one fetch. A
+        // deadline computed per request instead would give each hop of a chain
+        // a fresh budget, so a chain of them could run to several times the
+        // ceiling -- five redirects being what the default allows.
+        //
+        // Each hop here waits, and their waits together pass the ceiling while
+        // no single one comes near it.
+        const HOP: Duration = Duration::from_millis(60);
+        let served = Serving::answering(|answered| {
+            std::thread::sleep(HOP);
+            Some(
+                match answered {
+                    // Same host and port, which the same-origin rule requires.
+                    0..=2 => format!(
+                        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /{answered}\r\n\r\n"
+                    ),
+                    _ => "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst".to_string(),
+                }
+                .into_bytes(),
+            )
+        });
+        let mut fetcher = HttpFetch::new().request_timeout(Some(HOP * 5 / 2));
+        let mut out = Vec::new();
+        let err = fetcher
+            .fetch(&FetchRequest::new(&served.url), &mut out)
+            .expect_err("the chain runs past the fetch's deadline");
+        assert!(err.to_string().contains("deadline"), "{err}");
+        drop(fetcher);
     }
 
     #[test]
@@ -1702,10 +2016,22 @@ mod tests {
 
     #[test]
     fn only_an_http_status_line_is_read_as_one() {
-        assert_eq!(read_status(&mut &b"HTTP/1.1 200 OK\r\n"[..]).unwrap(), 200);
-        // The version is compared case-insensitively and its number is not
-        // acted on, since this client negotiates none.
-        assert_eq!(read_status(&mut &b"http/1.0 404 x\r\n"[..]).unwrap(), 404);
+        assert_eq!(
+            read_status(&mut &b"HTTP/1.1 200 OK\r\n"[..]).unwrap(),
+            Status {
+                version: (1, 1),
+                code: 200
+            },
+        );
+        // The name is compared case-insensitively, and the version travels with
+        // the code because whether the connection may be held turns on it.
+        assert_eq!(
+            read_status(&mut &b"http/1.0 404 x\r\n"[..]).unwrap(),
+            Status {
+                version: (1, 0),
+                code: 404
+            },
+        );
         for line in [
             // A greeting whose second word parses as a number is not a status
             // line; a mirror URL pointed at the wrong port should say so here
@@ -1715,6 +2041,12 @@ mod tests {
             &b"HTTP/ 200 OK\r\n"[..],
             &b"HTTP/1.1\r\n"[..],
             &b"\r\n"[..],
+            // RFC 9112 spells a version with one digit on each side of the
+            // dot, and this client reads the digits, so a token that is not
+            // one is refused rather than read as some version or other.
+            &b"HTTP/11 200 OK\r\n"[..],
+            &b"HTTP/1.x 200 OK\r\n"[..],
+            &b"HTTP/1.10 200 OK\r\n"[..],
             // A non-ASCII first token must be refused, not panicked on.
             "\u{e9}\u{e9}\u{e9} 200 OK\r\n".as_bytes(),
         ] {

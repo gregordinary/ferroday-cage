@@ -25,6 +25,8 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-22
+
 ### Added
 
 - The `gentoo` feature installs prebuilt packages from the archive's
@@ -79,10 +81,16 @@ consumer upgrading can skip it.
 - `Signals` documents what dropping the handle costs.
 - `Fetch` and `FetchRequest::url` document that a URL's scheme compares case-
   insensitively (RFC 3986 §3.1).
+- `DebianEvent::Fetching` documents that it announces an intent to fetch, which
+  a batch emits for every URL before asking for any of them.
 - `HttpFetch` holds a connection open between requests, as HTTP/1.1 does by
-  default, instead of sending `Connection: close` on every one.
+  default, instead of sending `Connection: close` on every one. A response of
+  either framing is held; a peer speaking anything older than HTTP/1.1 is not.
 - `HttpFetch` fetches four resources at once through `Fetch::fetch_all`, each
   on a connection of its own; `HttpFetch::concurrency` changes how many.
+- `HttpFetch::request_timeout` bounds one fetch rather than one request inside
+  it: a redirect chain and the retry a reused connection is allowed come out of
+  a single budget.
 
 ### Fixed
 
@@ -90,6 +98,8 @@ consumer upgrading can skip it.
   LZMA2 dictionary over 128 MiB is refused from the header, before the decoder
   allocates and zeroes it. This is a robustness fix on the provisioning path,
   not a sandbox escape.
+- A response that declares both chunked framing and a `Content-Length` is
+  refused rather than read by the chunked framing alone.
 - The Debian resolver enforces the version constraint a dependency declares,
   where it previously parsed it away.
 - A dependency group nothing satisfies fails the resolve rather than being
@@ -871,7 +881,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.3...v0.1.4

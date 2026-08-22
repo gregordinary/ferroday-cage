@@ -438,7 +438,7 @@ impl<'fd> Relay<'fd> {
                 // is pending on the descriptor.
                 Signal::TSTP => {
                     if let Some(guard) = guard {
-                        guard.restore();
+                        guard.restore_for_stop();
                     }
                     rustix::process::kill_process(rustix::process::getpid(), Signal::STOP)
                         .map_err(RelayError::at("stopping the relaying process"))?;

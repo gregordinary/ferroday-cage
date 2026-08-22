@@ -145,13 +145,26 @@ impl<'fd> RawMode<'fd> {
         Ok(RawMode { fd, original })
     }
 
-    /// Restores this guard's terminal, flushing what was typed at the session
+    /// Restores this guard's terminal, discarding what was typed at the session
     /// that is ending.
     ///
     /// Idempotent: the stop path restores before stopping and the drop restores
     /// again, and replaying settings that are already in force changes nothing.
     pub(super) fn restore(&self) {
         let _ = termios::tcsetattr(self.fd, OptionalActions::Flush, &self.original);
+    }
+
+    /// Restores this guard's terminal for a stop, keeping what was typed.
+    ///
+    /// The two restores differ in what they do with input already in the queue,
+    /// because the sessions they end are not the same. A session that is over
+    /// leaves keystrokes aimed at something that no longer exists, and
+    /// discarding them beats letting half an escape sequence land at the
+    /// caller's prompt. A stopped session is not over: what was typed ahead of
+    /// `^Z` was typed at the session `fg` resumes, so it waits there instead.
+    /// Draining is what `ssh` and `less` do across a stop for the same reason.
+    pub(super) fn restore_for_stop(&self) {
+        let _ = termios::tcsetattr(self.fd, OptionalActions::Drain, &self.original);
     }
 
     /// Re-enters raw mode after a stop, from the settings this guard saved.
@@ -195,7 +208,9 @@ pub(super) fn window_size(fd: BorrowedFd<'_>) -> Option<(u16, u16)> {
 mod tests {
     use std::os::fd::AsFd as _;
 
-    use rustix::termios::LocalModes;
+    use std::time::Duration;
+
+    use rustix::termios::{LocalModes, SpecialCodeIndex};
 
     use super::*;
     use crate::terminal::{Terminal, allocate};
@@ -246,7 +261,7 @@ mod tests {
 
         let raw = RawMode::enter(replica.as_fd()).expect("raw mode is enterable");
         // What the stop path does before it stops the process.
-        raw.restore();
+        raw.restore_for_stop();
         assert_eq!(
             termios::tcgetattr(&primary)
                 .expect("the settings are readable")
@@ -262,6 +277,58 @@ mod tests {
                 .expect("the settings are readable")
                 .local_modes
                 .intersects(LocalModes::ICANON | LocalModes::ECHO),
+        );
+    }
+
+    #[test]
+    fn a_stop_keeps_the_type_ahead_that_an_ending_session_discards() {
+        // The two restores differ only in what they do with input already in
+        // the queue, so the terminal here is one whose baseline is already
+        // non-canonical: a read then answers from the queue directly, and the
+        // canonical line discipline's own rules about a line that arrived while
+        // it was off are not what is being measured.
+        let (primary, replica) = pair();
+        let mut baseline = termios::tcgetattr(&replica).expect("the settings are readable");
+        baseline
+            .local_modes
+            .remove(LocalModes::ICANON | LocalModes::ECHO);
+        // A read answers with whatever is queued rather than waiting for a byte
+        // that a discarded queue will never bring.
+        baseline.special_codes[SpecialCodeIndex::VMIN] = 0;
+        baseline.special_codes[SpecialCodeIndex::VTIME] = 0;
+        termios::tcsetattr(&replica, OptionalActions::Now, &baseline)
+            .expect("the baseline is settable");
+
+        let raw = RawMode::enter(replica.as_fd()).expect("raw mode is enterable");
+        let queued = |restore: &dyn Fn()| {
+            rustix::io::write(&primary, b"ahead").expect("the terminal takes input");
+            // The kernel hands a pseudoterminal's input to the line discipline
+            // from a thread of its own, so the queue is waited for rather than
+            // assumed: what a restore does to a *filled* queue is the question,
+            // and a flush that ran first would answer a different one.
+            let mut watched = [rustix::event::PollFd::new(
+                &replica,
+                rustix::event::PollFlags::IN,
+            )];
+            let wait = crate::poll::timeout(Duration::from_secs(5));
+            let ready =
+                rustix::event::poll(&mut watched, Some(&wait)).expect("the queue is pollable");
+            assert_eq!(ready, 1, "the input reached the line discipline");
+
+            restore();
+            let mut buffer = [0u8; 16];
+            let read = rustix::io::read(&replica, &mut buffer).expect("the queue is readable");
+            buffer[..read].to_vec()
+        };
+
+        assert_eq!(
+            queued(&|| raw.restore_for_stop()),
+            b"ahead",
+            "what was typed ahead of a stop was typed at the session that resumes",
+        );
+        assert!(
+            queued(&|| raw.restore()).is_empty(),
+            "what was typed at a session that is over goes nowhere",
         );
     }
 
