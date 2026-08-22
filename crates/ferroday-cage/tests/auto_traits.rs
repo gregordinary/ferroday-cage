@@ -65,6 +65,14 @@ const _: () = assert_send_sync::<ferroday_cage::DirectMapper>();
 #[cfg(feature = "subid")]
 const _: () = assert_send_sync::<ferroday_cage::SubidMapper>();
 
+// The terminal relay. Every one of these holds descriptors, flags, and
+// instants and nothing that is neither, so a program that builds a session on
+// one thread and drives it on another is not stopped by the types.
+const _: () = assert_send_sync::<ferroday_cage::relay::Relay<'_>>();
+const _: () = assert_send_sync::<ferroday_cage::relay::Signals>();
+const _: () = assert_send_sync::<ferroday_cage::relay::Escalation>();
+const _: () = assert_send_sync::<ferroday_cage::relay::RelayError>();
+
 // Host probes.
 const _: () = assert_send_sync::<ferroday_cage::host::UsernsBlocker>();
 const _: () = assert_send_sync::<ferroday_cage::host::RangeMapBlocker>();

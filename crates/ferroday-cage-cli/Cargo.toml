@@ -38,9 +38,10 @@ serde = "1.0"
 # Resolves seccomp syscall names to numbers for the host architecture, the
 # same crate and native table the library uses.
 syscalls = { version = "0.8", default-features = false }
-# The terminal relay: termios, poll, and the blocked-signal descriptor. The
-# library already builds rustix; this is the same build, named directly.
-rustix = { version = "1.1.4", features = ["event", "fs", "process", "runtime", "stdio", "termios"] }
+# The two ambient readings `--terminal` makes of the terminal `fcage` was
+# started from: whether it is one, and what size it reports. The relay itself is
+# the library's, and needs nothing here.
+rustix = { version = "1.1.4", features = ["stdio", "termios"] }
 
 [dev-dependencies]
 # The workspace's shared test fixtures. The relay's tests need the rootfs and a

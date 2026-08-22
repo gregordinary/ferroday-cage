@@ -206,12 +206,15 @@ impl Default for Terminal {
 /// # }
 /// ```
 ///
-/// An interactive caller needs both directions at once, which needs
-/// concurrency: writes to the primary block too once its input buffer fills, so
-/// a large paste into a command that is not reading stalls a relay that writes
-/// from the thread it also reads on. Two threads — a reader beside the main
-/// thread in the wait — is the right minimum, and a wait that must be bounded is
-/// bounded with [`wait_deadline`](crate::Running::wait_deadline) and
+/// An interactive caller needs both directions at once, and
+/// [`relay::Relay`](crate::relay::Relay) is the answer: one poll loop over the
+/// primary, the caller's terminal, and the signals a session has to handle,
+/// with raw mode and its restoration. A caller composing its own instead needs
+/// concurrency, because writes to the primary block too once its input buffer
+/// fills, so a large paste into a command that is not reading stalls a loop that
+/// writes from the thread it also reads on. Two threads — a reader beside the
+/// main thread in the wait — is the right minimum, and a wait that must be
+/// bounded is bounded with [`wait_deadline`](crate::Running::wait_deadline) and
 /// [`kill_handle`](crate::Running::kill_handle) from the other thread.
 ///
 /// # Lifecycle

@@ -36,6 +36,12 @@ impl<'a> FetchRequest<'a> {
     }
 
     /// The URL to fetch.
+    ///
+    /// The scheme is case-insensitive (RFC 3986 §3.1); the rest of the URL is
+    /// not. An implementation that routes on the scheme — handing `https://`
+    /// URLs to a TLS transport and delegating the rest, say — must compare it
+    /// case-insensitively, as [`HttpFetch`](super::HttpFetch) does, or the two
+    /// layers disagree about which URLs name TLS.
     pub fn url(&self) -> &'a str {
         self.url
     }
@@ -77,7 +83,8 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 /// implementation, so a consumer can substitute a transport the built-in
 /// client does not provide — HTTPS, a proxy, an on-disk cache, a private
 /// mirror protocol. The default is [`HttpFetch`](super::HttpFetch), which
-/// speaks plain HTTP and `file://`.
+/// speaks plain HTTP and `file://`. A substitute that routes by scheme
+/// compares it case-insensitively; [`FetchRequest::url`] states the rule.
 ///
 /// A fetch writes the resource to `sink` as it arrives. A missing resource
 /// must be reported as [`FetchError::not_found`] rather than a generic error,

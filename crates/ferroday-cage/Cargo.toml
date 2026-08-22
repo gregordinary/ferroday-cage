@@ -141,6 +141,13 @@ required-features = ["tarball"]
 name = "terminal"
 required-features = ["tarball"]
 
+# The relay tests drive interactive sessions against the rootfs fixture; the
+# restriction case runs a host binary and is gated on `hardening` within the
+# binary.
+[[test]]
+name = "relay"
+required-features = ["tarball"]
+
 [[test]]
 name = "network_seam"
 required-features = ["tarball"]
@@ -263,8 +270,12 @@ required-features = ["alpine"]
 ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = [
     "tarball",
     "debian",
+    "pty",
 ] }
-rustix = "1.1.4"
+# The relay's tests drive a session through a pseudoterminal pair of their own
+# and raise the relayed signals at the thread the relay runs on, neither of
+# which the library's own feature selection covers.
+rustix = { version = "1.1.4", features = ["pty", "runtime", "thread"] }
 toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"

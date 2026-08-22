@@ -19,6 +19,50 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Added
+
+- `relay` drives the caller's side of an interactive terminal session:
+  `relay::Relay` is the byte loop between the caller's terminal and the
+  sandbox's, `relay::Signals` blocks the eight signals such a session handles
+  and reads them back as data, and `relay::restore_terminal` with
+  `relay::install_panic_restore` undo raw mode on every exit the process can
+  observe. The library previously shipped the terminal and left the loop to
+  every consumer, which meant every consumer wrote one, and a fix to any of them
+  reached nobody else.
+
+  The boundary the old position protected is kept as the rule the module obeys:
+  nothing process-global happens as a side effect, and nothing is read from the
+  environment. Blocking the signals is `Signals::install`'s explicit call, the
+  panic hook is `install_panic_restore`'s, raw mode is off until `Relay::raw`
+  asks for it, and the terminal a window change follows is the descriptor the
+  caller supplied rather than the process's own.
+
+- `relay::Escalation` states the `timeout(1)` policy — terminate at the
+  deadline, kill after the grace, report no status either way — as a value a
+  waiter drives. `Relay::run` drives one from its poll loop and a plain
+  `Running::wait_deadline` loop drives the same type, so the two cannot disagree
+  about what a timeout means. `Running`'s own waits are unchanged: a deadline of
+  theirs still kills nothing.
+
+### Changed
+
+- `Fetch` and `FetchRequest::url` document that a URL's scheme compares
+  case-insensitively (RFC 3986 §3.1). `HttpFetch` has compared it so since
+  0.3.0, and a consumer's transport that routes on the scheme — TLS in front
+  of the bundled client, which is the substitution the seam exists for — must
+  make the same comparison, or the two layers disagree about which URLs name
+  TLS. The rule was stated only on the crate's internal scheme extractor.
+
+### Internal
+
+- `fcage --terminal` drives the library's relay rather than a copy of its own.
+  Its behaviour is unchanged, down to the exit codes and the restoration
+  discipline, and the suite that proves so passed unaltered across the move.
+  What is left in the binary is the readings a library will not make for a
+  caller: whether its standard input is a terminal, what size that terminal
+  reports, and whether to install a panic hook. `fcage` now contains no `unsafe`
+  at all.
+
 ## [0.3.0] - 2026-08-11
 
 ### Changed

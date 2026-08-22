@@ -1176,6 +1176,64 @@ pub fn ferroday_cage::provision::ensure(impl core::convert::AsRef<std::path::Pat
 pub fn ferroday_cage::provision::export_tar<W: std::io::Write>(impl core::convert::AsRef<std::path::Path>, W, ferroday_cage::IdentityMap) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::file_url(&std::path::Path) -> core::result::Result<alloc::string::String, ferroday_cage::provision::FetchError>
 pub fn ferroday_cage::provision::remove(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+pub mod ferroday_cage::relay
+#[non_exhaustive] pub enum ferroday_cage::relay::RelayError
+pub ferroday_cage::relay::RelayError::Cage(ferroday_cage::Error)
+#[non_exhaustive] pub ferroday_cage::relay::RelayError::Io
+pub ferroday_cage::relay::RelayError::Io::op: &'static str
+pub ferroday_cage::relay::RelayError::Io::source: core::io::error::Error
+impl core::convert::From<ferroday_cage::Error> for ferroday_cage::relay::RelayError
+pub fn ferroday_cage::relay::RelayError::from(ferroday_cage::Error) -> ferroday_cage::relay::RelayError
+impl core::error::Error for ferroday_cage::relay::RelayError
+pub fn ferroday_cage::relay::RelayError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for ferroday_cage::relay::RelayError
+pub fn ferroday_cage::relay::RelayError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::relay::RelayError
+impl core::marker::Send for ferroday_cage::relay::RelayError
+impl core::marker::Sync for ferroday_cage::relay::RelayError
+impl core::marker::Unpin for ferroday_cage::relay::RelayError
+impl core::marker::UnsafeUnpin for ferroday_cage::relay::RelayError
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::relay::RelayError
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::relay::RelayError
+pub struct ferroday_cage::relay::Escalation
+impl ferroday_cage::relay::Escalation
+pub fn ferroday_cage::relay::Escalation::deadline(&self) -> core::option::Option<std::time::Instant>
+pub fn ferroday_cage::relay::Escalation::expire(&mut self, &mut ferroday_cage::Running<'_>) -> core::result::Result<(), ferroday_cage::Error>
+pub fn ferroday_cage::relay::Escalation::new(core::option::Option<core::time::Duration>, core::time::Duration) -> ferroday_cage::relay::Escalation
+pub fn ferroday_cage::relay::Escalation::outcome(&self, ferroday_cage::ExitStatus) -> core::option::Option<ferroday_cage::ExitStatus>
+pub fn ferroday_cage::relay::Escalation::passed(&self) -> bool
+impl core::marker::Freeze for ferroday_cage::relay::Escalation
+impl core::marker::Send for ferroday_cage::relay::Escalation
+impl core::marker::Sync for ferroday_cage::relay::Escalation
+impl core::marker::Unpin for ferroday_cage::relay::Escalation
+impl core::marker::UnsafeUnpin for ferroday_cage::relay::Escalation
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::relay::Escalation
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::relay::Escalation
+pub struct ferroday_cage::relay::Relay<'fd>
+impl<'fd> ferroday_cage::relay::Relay<'fd>
+pub fn ferroday_cage::relay::Relay<'fd>::escalation(self, ferroday_cage::relay::Escalation) -> ferroday_cage::relay::Relay<'fd>
+pub fn ferroday_cage::relay::Relay<'fd>::new(std::os::fd::owned::BorrowedFd<'fd>, std::os::fd::owned::BorrowedFd<'fd>) -> ferroday_cage::relay::Relay<'fd>
+pub fn ferroday_cage::relay::Relay<'fd>::raw(self, bool) -> ferroday_cage::relay::Relay<'fd>
+pub fn ferroday_cage::relay::Relay<'fd>::run(self, &mut ferroday_cage::Running<'_>, &ferroday_cage::Pty, &ferroday_cage::relay::Signals) -> core::result::Result<core::option::Option<ferroday_cage::ExitStatus>, ferroday_cage::relay::RelayError>
+impl<'fd> core::marker::Freeze for ferroday_cage::relay::Relay<'fd>
+impl<'fd> core::marker::Send for ferroday_cage::relay::Relay<'fd>
+impl<'fd> core::marker::Sync for ferroday_cage::relay::Relay<'fd>
+impl<'fd> core::marker::Unpin for ferroday_cage::relay::Relay<'fd>
+impl<'fd> core::marker::UnsafeUnpin for ferroday_cage::relay::Relay<'fd>
+impl<'fd> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::relay::Relay<'fd>
+impl<'fd> core::panic::unwind_safe::UnwindSafe for ferroday_cage::relay::Relay<'fd>
+pub struct ferroday_cage::relay::Signals
+impl ferroday_cage::relay::Signals
+pub fn ferroday_cage::relay::Signals::install() -> core::result::Result<ferroday_cage::relay::Signals, ferroday_cage::relay::RelayError>
+impl core::marker::Freeze for ferroday_cage::relay::Signals
+impl core::marker::Send for ferroday_cage::relay::Signals
+impl core::marker::Sync for ferroday_cage::relay::Signals
+impl core::marker::Unpin for ferroday_cage::relay::Signals
+impl core::marker::UnsafeUnpin for ferroday_cage::relay::Signals
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::relay::Signals
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::relay::Signals
+pub fn ferroday_cage::relay::install_panic_restore()
+pub fn ferroday_cage::relay::restore_terminal()
 #[non_exhaustive] pub enum ferroday_cage::Capability
 pub ferroday_cage::Capability::AuditControl
 pub ferroday_cage::Capability::AuditRead
@@ -1350,6 +1408,8 @@ impl core::convert::From<ferroday_cage::ConfigError> for ferroday_cage::Error
 pub fn ferroday_cage::Error::from(ferroday_cage::ConfigError) -> Self
 impl core::convert::From<ferroday_cage::Error> for ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::Error) -> Self
+impl core::convert::From<ferroday_cage::Error> for ferroday_cage::relay::RelayError
+pub fn ferroday_cage::relay::RelayError::from(ferroday_cage::Error) -> ferroday_cage::relay::RelayError
 impl core::error::Error for ferroday_cage::Error
 pub fn ferroday_cage::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::Error

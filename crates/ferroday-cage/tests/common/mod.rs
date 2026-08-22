@@ -10,6 +10,7 @@
 #![allow(unused_imports)]
 
 pub use ferroday_cage_testkit::fixture::{fixture_rootfs, scratch_rootfs};
+pub use ferroday_cage_testkit::pty::drain_until;
 pub use ferroday_cage_testkit::scratch::{
     download_cache, force_remove_dir_all, scratch_dir, tun_available,
 };

@@ -58,7 +58,8 @@ the host:
   because a terminal's size changes over the life of a session and no
   launch-time constant can track it. See [Resizing](#resizing).
 - **The caller's own terminal**, which an interactive session must put into raw
-  mode. See [The relay](#the-relay).
+  mode and restore afterwards. `ferroday_cage::relay` does both; what stays the
+  caller's is saying so. See [The relay](#the-relay).
 
 ## Draining, and the one order that deadlocks
 
@@ -82,11 +83,17 @@ caller's, and a wait that must be bounded is bounded.
 terminates on its own — the example above is the whole pattern, and its second
 line is the part worth understanding.
 
-**An interactive caller** needs both directions at once, which needs
-concurrency: writes to the primary block too once its input buffer fills, so a
-large paste into a command that is not reading stalls a relay that writes from
-the thread it also reads on. Two threads is the right minimum — a reader beside
-the main thread in the wait:
+**An interactive caller** needs both directions at once, and
+[the relay](#the-relay) is the answer: one poll loop that cannot be stalled by
+either direction, with the signal handling and the raw-mode discipline an
+interactive session also owes. Everything below is for a caller composing
+something else out of a `Pty` — a recorder, a test harness, a driver that is not
+a terminal session at all.
+
+Both directions at once needs concurrency: writes to the primary block too once
+its input buffer fills, so a large paste into a command that is not reading
+stalls a loop that writes from the thread it also reads on. Two threads is the
+right minimum — a reader beside the main thread in the wait:
 
 ```rust,no_run
 use std::io::Read as _;
@@ -288,38 +295,119 @@ of its own, at 80x24.
 
 ## The relay
 
-`fcage`'s relay is the reference implementation for a consumer building the same
-thing. It lives in one self-contained module,
-[`crates/ferroday-cage-cli/src/terminal.rs`][relay], and this is its design.
+`ferroday_cage::relay` is the caller's side of an interactive session: one poll
+loop over the sandbox's terminal, the caller's own terminal, and the signals a
+session has to handle, with raw mode and its restoration on every exit the
+process can observe.
 
-The library deliberately does not do any of it. Whoever sets raw mode must
-restore it on normal exit, on error, on panic, on `SIGINT`/`SIGTERM`/`SIGQUIT`,
-and on a leaked handle — and a library that can leave the user's shell unusable
-is a worse failure than the one this feature started from. A binary can own
-process-global state; a library cannot.
+```rust,no_run
+use std::os::fd::AsFd as _;
+use std::time::Duration;
 
-**Raw mode is entered last.** The order is: parse, build, spawn the terminal
-launch, and only then — immediately before the relay loop — save the caller's
-termios and enter raw mode. Every failure before that point exits with the
-terminal untouched, which shrinks the restoration problem to one region with
-known exits. On the way out the order reverses: the loop ends, the terminal is
-restored, and only then are diagnostics printed and the exit status mapped.
+use ferroday_cage::relay::{Escalation, Relay, Signals, install_panic_restore};
+use ferroday_cage::{Cage, Terminal};
 
-**One restorer, three triggers.** The original termios is saved into a
-process-global before raw mode is entered, and restoring replays it with a
-flush. Restoring is idempotent, so every path may call it without coordination.
-The flush is deliberate: input pending at restoration is raw bytes typed at a
-session that no longer exists, and discarding them beats letting half an escape
-sequence land at the caller's prompt. Three triggers cover every exit the
-process can observe:
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // First of all: blocking the relayed signals is process-wide, and a thread
+    // inherits the signal mask of the thread that created it.
+    let signals = Signals::install()?;
+    // Restores the terminal before a backtrace prints, which a guard cannot.
+    install_panic_restore();
 
-- a guard in the relay's frame, dropped on normal exit, on error, and on panic
-  unwind;
-- a panic hook, installed once, that restores *before* delegating to the default
-  hook — with `OPOST` off a backtrace prints stair-stepped, so restoration must
-  precede the message, which a drop alone cannot arrange;
-- the stop path below, which restores before the process stops and re-enters raw
-  mode when it continues.
+    let cage = Cage::builder()
+        .rootfs("/srv/rootfs/alpine")
+        .command("/bin/sh")
+        .env("TERM", "xterm-256color")
+        .build()?;
+    let (mut running, pty) = cage.spawn_terminal(&Terminal::new().size(30, 100))?;
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let outcome = Relay::new(stdin.as_fd(), stdout.as_fd())
+        .raw(true)
+        .escalation(Escalation::new(
+            Some(Duration::from_secs(3600)),
+            Duration::from_secs(5),
+        ))
+        .run(&mut running, &pty, &signals)?;
+
+    match outcome {
+        Some(status) => println!("the session ended with {status:?}"),
+        None => println!("the session ran out of time"),
+    }
+    Ok(())
+}
+```
+
+### What stays yours
+
+The relay does nothing process-global as a side effect and reads nothing from
+the environment, so four decisions belong to the program driving the session:
+
+- **Installing `Signals`**, early and on the main thread. Blocking the relayed
+  set is process-wide, so it is an explicit call rather than something `run`
+  does on the way past — and it must precede every thread the run may start,
+  because a thread inherits the mask of the thread that created it. The library
+  starts one thread of its own — the [native network
+  stack](userspace-networking.md)'s pump — so a program composing a relay with a
+  stack installs the signals before it attaches one.
+- **Raw mode.** `Relay::raw` is off unless asked. Whether the caller's own
+  standard input *is* a terminal is the program's reading to make; `fcage` asks
+  `tcgetattr` and passes the answer.
+- **The panic hook.** `install_panic_restore()` is one call, or a program with a
+  hook of its own calls `restore_terminal()` from it.
+- **The sandbox's terminal.** `Terminal` states a size; a program that wants its
+  own window's size reads it and passes it, because the library reads nothing of
+  the host. See [Resizing](#resizing).
+
+### What the loop does
+
+One thread, one poll: the primary, the signal descriptor, and the caller's
+input — in that order, because the input is the one channel that retires and a
+retired channel must leave the polled set rather than be given an empty events
+mask. `poll` reports `POLLHUP`, `POLLERR`, and `POLLNVAL` whatever the requested
+events are, so a muted slot on a hung-up pipe is ready on every pass and the
+loop stops blocking; dropping the slot is what keeps `producer | fcage --terminal
+...` from burning a core after the producer exits.
+
+The primary is set non-blocking so a large paste cannot stall the loop; bytes
+that do not fit yet wait in a pending buffer behind `POLLOUT`, and the input is
+left unwatched while that buffer is occupied, so it cannot grow without bound.
+End of input sends `VEOF` to the primary — read from the replica's *current*
+settings rather than assumed, since a program inside is free to have changed it
+— and retires that channel. An invalid input (`fcage --terminal ... 0<&-`) takes
+the same path, since it says the same thing. End-of-file on the primary ends the
+loop. An `Escalation` is the poll deadline, consulted on every wakeup rather
+than only on the one `poll` timed out on, so a sandbox printing without pause
+cannot postpone its own expiry.
+
+Signals are read as data rather than handled: no library code runs in signal
+context, so there are no handlers, no async-signal-safety reasoning, and no
+shared flags. `SIGWINCH` resizes the sandbox's terminal;
+`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` from *outside* terminate the sandbox and a
+second one kills it, while a typed `^C` is a byte the sandbox's own line
+discipline acts on; `SIGTSTP` restores and stops; `SIGCONT` re-enters raw mode
+and re-reads the size. The module's own documentation carries the whole table,
+including why `SIGTTOU` is blocked and `SIGTTIN` deliberately is not.
+
+The two directions are not symmetric: the caller-bound one is a plain blocking
+write, outside the poll. Making it symmetric would need `O_NONBLOCK` on the
+output descriptor, and that flag lives on the open file description rather than
+on the descriptor — setting it would set it for the caller's shell and for every
+other process in the pipeline the program was started from. What is given up is
+that a stopped downstream reader stalls the loop, including the signal channel;
+`ssh` has the same shape for the same reason.
+
+### What restoration promises
+
+Raw mode is entered last — everything fallible happens first, so a failure
+before the loop leaves the caller's terminal untouched — and undone by three
+things that between them cover every exit the process can observe: a guard in
+`run`'s own frame, dropped on normal exit, on error, and on a panic unwinding
+through it; the optional panic hook, which restores *before* the default hook
+prints, because with `OPOST` off a backtrace prints stair-stepped and a drop
+runs after the hook; and the stop path, which restores before the process stops
+and re-enters raw mode when it continues.
 
 `SIGKILL` and `SIGSTOP` are uncatchable and out of scope, with the same honesty
 the leaked-handle case gets: the remedy is `stty sane`, and no process can
@@ -327,70 +415,18 @@ promise otherwise. Restoration means *termios*. Screen contents — an alternate
 screen left active, a hidden cursor — were written by the sandboxed program
 through the relay verbatim and belong to it, exactly as `ssh` treats them.
 
-**Signals are data.** The relay blocks `SIGWINCH`, `SIGINT`, `SIGTERM`,
-`SIGHUP`, `SIGQUIT`, `SIGTSTP`, `SIGCONT`, and `SIGTTOU` before anything else
-starts — in particular before any thread the run may create, since a thread
-inherits the creating thread's mask — and reads them as one channel of its poll
-loop, from a signal descriptor. No relay code runs in signal context: there are
-no handlers, no async-signal-safety reasoning, and no shared flags.
+`restore_terminal()` reaches the *first* terminal a raw session was entered on,
+which is what a panic hook with no argument can name. Sequential sessions on the
+same terminal restore correctly, and so does every session's own exit, because
+`run` restores from its own guard. A program relaying raw sessions on different
+terminals over its lifetime is the case the hook does not cover.
 
-- **`SIGWINCH`** — read the caller terminal's size and call `Pty::resize`.
-- **`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`** — forward: terminate the sandbox
-  and keep relaying. The sandbox's exit closes the replicas, end-of-file ends
-  the loop, and restoration happens on the normal path. A second such signal
-  escalates to a kill. These arrive only from *outside*: in raw mode a typed
-  `^C` is a byte the relay forwards, which the sandbox's own line discipline
-  turns into the sandbox's own `SIGINT`, delivered to the sandbox's own
-  foreground process group. Forwarding the four from outside is what keeps the
-  caller's shell managing `fcage` as one job and `fcage` passing that on.
-- **`SIGTSTP`** — restore the terminal, then stop with a self-directed
-  `SIGSTOP`.
-- **`SIGCONT`** — re-enter raw mode and re-read the window size, which may have
-  changed while stopped. The discipline `less` follows.
-- **`SIGTTOU`** — blocked for the effect of blocking it, and otherwise ignored.
-  A `tcsetattr` from a background process group raises it and its default action
-  stops the process, so a backgrounded relay would stop *inside* the restoration
-  and leave the caller's terminal raw. Blocked, the call succeeds and the
-  restoration discipline holds from the background as it does from the
-  foreground. `SIGTTIN` is deliberately not blocked: a backgrounded relay
-  stopping when it tries to read the terminal is the conventional behavior, and
-  the one the caller's shell reports.
+### The worked consumer
 
-**The loop.** One thread, one poll: the primary, the signal descriptor, and the
-caller's standard input — in that order, because standard input is the one
-channel that retires and a retired channel must leave the polled set rather than
-be given an empty events mask. `poll` reports `POLLHUP`, `POLLERR`, and
-`POLLNVAL` whatever the requested events are, so a muted slot on a hung-up pipe
-is ready on every pass and the loop stops blocking; dropping the slot is what
-keeps `producer | fcage --terminal ...` from burning a core after the producer
-exits.
+`fcage --terminal` is this, configured: it reads whether its standard input is a
+terminal and what size it reports, installs the hook when it is one, and hands
+the relay descriptors 0 and 1. Everything else it does with a session is a
+library call. [`crates/ferroday-cage-cli/src/terminal.rs`][fcage-relay] is the
+whole of what is left.
 
-The primary is set non-blocking so a large paste cannot stall the loop; bytes
-that do not fit yet wait in a pending buffer behind `POLLOUT`, and standard
-input is left unwatched while that buffer is occupied, so it cannot grow without
-bound. End-of-file on the caller's standard input sends `VEOF` to the primary —
-read from the replica's *current* settings rather than assumed, since a program
-inside is free to have changed it — and retires that channel. An invalid
-standard input (`fcage --terminal ... 0<&-`) takes the same path, since it says
-the same thing. End-of-file on the primary ends the loop. `--timeout` is the
-poll deadline, answered with the same terminate-then-kill escalation the
-non-terminal path uses.
-
-The two directions are not symmetric: the caller-bound one is a plain blocking
-write, outside the poll. Making it symmetric would need `O_NONBLOCK` on
-descriptor 1, and that flag lives on the open file description rather than on
-the descriptor — setting it would set it for the caller's shell and for every
-other process in the pipeline `fcage` was started from. What is given up is that
-a stopped downstream reader stalls the loop, including the signal channel; `ssh`
-has the same shape for the same reason.
-
-When `fcage`'s own standard input is not a terminal, raw mode, the size copy,
-and resize are all skipped and the relay still relays. A terminal that reports a
-size of zero in either dimension is treated as reporting none: that is what a
-pseudoterminal nobody has sized says, and passing it through would hand the
-sandbox a terminal that answers "no size" to everything that asks it.
-`Terminal::size` takes the same position, leaving a zero dimension at its
-default, so a library caller plumbing the same reading in lands in the same
-place.
-
-[relay]: https://github.com/gregordinary/ferroday-cage/blob/main/crates/ferroday-cage-cli/src/terminal.rs
+[fcage-relay]: https://github.com/gregordinary/ferroday-cage/blob/main/crates/ferroday-cage-cli/src/terminal.rs

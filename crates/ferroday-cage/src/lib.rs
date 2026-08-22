@@ -91,6 +91,10 @@
 //! sandbox runs jobs of its own — against a terminal the caller does not
 //! share, and reaching nothing of the caller's own. See [`Terminal`].
 //!
+//! [`relay`] drives an interactive session from the caller's own terminal:
+//! [`Relay::run`](relay::Relay::run) is the byte loop, the signal discipline,
+//! and raw mode with its restoration on every exit the process can observe.
+//!
 //! # Userspace networking
 //!
 //! The default network is an isolated namespace whose only interface is
@@ -301,6 +305,7 @@ mod observer;
 mod path;
 mod poll;
 pub mod provision;
+pub mod relay;
 mod resolved;
 #[cfg(feature = "hardening")]
 mod restrict;

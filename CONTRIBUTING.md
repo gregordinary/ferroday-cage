@@ -244,11 +244,11 @@ older line replaces the crate page with that line's metadata.
 - **Documentation is part of the change.** Public items carry rustdoc, and
   internal items carry it wherever the behavior is not obvious. Comments
   explain *why*, not *what*.
-- **`unsafe` is confined** to three modules: the library's launch mechanism and
-  the network stack's tap layer, and `fcage`'s terminal relay, which blocks its
-  signals and opens the descriptor they arrive on. Both crates deny it by
-  default; each block that needs it carries a `SAFETY:` comment stating the
-  invariant it relies on, which is enforced by
+- **`unsafe` is confined** to three modules, all in the library: the launch
+  mechanism, the network stack's tap layer, and the terminal relay's signals,
+  which blocks the relayed set and opens the descriptor they arrive on. `fcage`
+  has none. Both crates deny it by default; each block that needs it carries a
+  `SAFETY:` comment stating the invariant it relies on, which is enforced by
   `clippy::undocumented_unsafe_blocks`. Every consumer of the *library* is safe
   Rust: nothing in its public API requires a caller to write `unsafe`.
 - **The post-fork stages must not allocate, lock, panic, or call libc.** They
@@ -316,7 +316,8 @@ the question is not already here under different words.
 | Report an OS failure with its operation and its subject | each error type's `io` and `at` constructors |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code` |
 | Make a scratch tree that clears itself | `scratch::Scratch`, or `common::scratch_dir` from a test suite |
-| What does `fcage` do when `--timeout` runs out? | `escalation::Escalation` |
+| What happens when a run's timeout runs out? | `relay::Escalation` |
+| Drive an interactive terminal session from the caller's terminal | `relay::Relay` |
 | Parse an argument in an example | `examples/common` |
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
 

@@ -27,7 +27,6 @@
 //! pair has no flag at all: a shell already spells both of its dispositions,
 //! and a profile carries `stdout` and `stderr` where they belong.
 
-mod escalation;
 mod terminal;
 
 use std::ffi::{OsStr, OsString};
@@ -39,6 +38,7 @@ use std::time::Duration;
 
 use ferroday_cage::provision::alpine::KeySet as AlpineKeySet;
 use ferroday_cage::provision::debian::{Priority, Repository};
+use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ExitStatus, FsAccess, IdRange, Identity,
     IdentityMap, Limit, Mount, NetAccess, NetStack, Network, Overlay, RawMount, Resource,
@@ -46,8 +46,6 @@ use ferroday_cage::{
     SeccompPolicy, SeccompRules, Stdio,
 };
 use serde::Deserialize as _;
-
-use escalation::Escalation;
 
 const USAGE: &str = "\
 Run a command inside an unprivileged Linux sandbox.
@@ -3085,7 +3083,7 @@ fn run_on_a_terminal(
     timeout: Option<Duration>,
     kill_after: Duration,
 ) -> ExitCode {
-    let signals = match terminal::Signals::install() {
+    let signals = match Signals::install() {
         Ok(signals) => signals,
         Err(error) => return conclude_relay(Err(error)),
     };
@@ -3107,12 +3105,12 @@ fn run_on_a_terminal(
 /// The library's own failures go through [`conclude`], so a launch that fails
 /// the same way with and without a terminal exits the same way. The relay's own
 /// plumbing failing is a `fcage` failure, which is 125.
-fn conclude_relay(outcome: Result<Option<ExitStatus>, terminal::RelayError>) -> ExitCode {
+fn conclude_relay(outcome: Result<Option<ExitStatus>, RelayError>) -> ExitCode {
     match outcome {
         Ok(outcome) => conclude(Ok(outcome)),
-        Err(terminal::RelayError::Cage(error)) => conclude(Err(error)),
-        Err(terminal::RelayError::Io(error)) => {
-            eprintln!("fcage: the terminal relay failed: {error}");
+        Err(RelayError::Cage(error)) => conclude(Err(error)),
+        Err(error) => {
+            eprintln!("fcage: {error}");
             ExitCode::from(125)
         }
     }
@@ -3134,7 +3132,7 @@ fn run_with_netstack(
     // mask and no process-directed signal can be delivered behind the relay's
     // back. Nothing is allocated for a run without a terminal.
     let signals = if terminal {
-        match terminal::Signals::install() {
+        match Signals::install() {
             Ok(signals) => Some(signals),
             Err(error) => return conclude_relay(Err(error)),
         }
@@ -3311,7 +3309,7 @@ fn run_restricted(options: Options) -> ExitCode {
     if options.terminal {
         // A host-allocated pseudoterminal needs no devpts instance, so the
         // fallback gets the same interactive story a cage does.
-        let signals = match terminal::Signals::install() {
+        let signals = match Signals::install() {
             Ok(signals) => signals,
             Err(error) => return conclude_relay(Err(error)),
         };

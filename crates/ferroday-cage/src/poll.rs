@@ -2,9 +2,8 @@
 //! watching a channel it is finished with.
 //!
 //! Both answers are subtle enough to be worth stating once. The supervisor
-//! loop and the network stack's pump each block in `poll` with a deadline and
-//! each retire channels as they close, and the `fcage` binary's terminal relay
-//! does the same a crate away.
+//! loop, the network stack's pump, and the terminal relay each block in `poll`
+//! with a deadline and each retire channels as they close.
 
 use std::os::fd::OwnedFd;
 use std::time::Duration;
@@ -46,7 +45,8 @@ pub(crate) fn timeout(duration: Duration) -> Timespec {
 ///
 /// The placeholder here is the supervisor's own pidfd, which the loop owns for
 /// its whole life, so the first technique holds. A loop whose retiring channel
-/// is naturally last — the terminal relay's standard input — uses the second.
+/// is naturally last — the terminal relay's caller-side input — uses the
+/// second.
 pub(crate) fn slot<'fd>(fd: &'fd Option<OwnedFd>, placeholder: &'fd OwnedFd) -> PollFd<'fd> {
     match fd {
         Some(fd) => PollFd::new(fd, PollFlags::IN),
