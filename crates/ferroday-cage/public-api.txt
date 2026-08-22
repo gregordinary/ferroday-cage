@@ -453,6 +453,10 @@ pub ferroday_cage::provision::debian::DebianEvent::Fetching::url: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Resolved
 pub ferroday_cage::provision::debian::DebianEvent::Resolved::plan: &'a ferroday_cage::provision::debian::Plan
 pub ferroday_cage::provision::debian::DebianEvent::Resolving
+#[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Unsatisfiable
+pub ferroday_cage::provision::debian::DebianEvent::Unsatisfiable::reason: &'a str
+pub ferroday_cage::provision::debian::DebianEvent::Unsatisfiable::required_by: &'a str
+pub ferroday_cage::provision::debian::DebianEvent::Unsatisfiable::requirement: &'a str
 impl<'a> core::marker::Freeze for ferroday_cage::provision::debian::DebianEvent<'a>
 impl<'a> core::marker::Send for ferroday_cage::provision::debian::DebianEvent<'a>
 impl<'a> core::marker::Sync for ferroday_cage::provision::debian::DebianEvent<'a>
@@ -1175,6 +1179,7 @@ impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Exp
 pub struct ferroday_cage::provision::FetchRequest<'a>
 impl<'a> ferroday_cage::provision::FetchRequest<'a>
 pub fn ferroday_cage::provision::FetchRequest<'a>::new(&'a str) -> ferroday_cage::provision::FetchRequest<'a>
+pub fn ferroday_cage::provision::FetchRequest<'a>::scheme(&self) -> core::option::Option<&'a str>
 pub fn ferroday_cage::provision::FetchRequest<'a>::size(&self) -> core::option::Option<u64>
 pub fn ferroday_cage::provision::FetchRequest<'a>::sized(self, u64) -> ferroday_cage::provision::FetchRequest<'a>
 pub fn ferroday_cage::provision::FetchRequest<'a>::url(&self) -> &'a str

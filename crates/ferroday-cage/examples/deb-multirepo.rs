@@ -416,6 +416,12 @@ fn print_progress(event: DebianEvent<'_>) {
     match event {
         DebianEvent::Fetching { url, .. } => eprintln!("deb-multirepo: fetching {url}"),
         DebianEvent::Resolving => eprintln!("deb-multirepo: resolving the package set"),
+        DebianEvent::Unsatisfiable {
+            requirement,
+            required_by,
+            reason,
+            ..
+        } => eprintln!("deb-multirepo: {required_by} requires {requirement}, and {reason}"),
         DebianEvent::Downloading {
             package,
             index,

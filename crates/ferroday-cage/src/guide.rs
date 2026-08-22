@@ -36,6 +36,7 @@ chapters! {
     "alpine.md" => alpine,
     "building-a-debian-package.md" => building_a_debian_package,
     "building-an-orchestrator.md" => building_an_orchestrator,
+    "cross-architecture.md" => cross_architecture,
     "debian.md" => debian,
     "ebuild-sandbox.md" => ebuild_sandbox,
     "embedding.md" => embedding,

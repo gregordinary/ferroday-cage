@@ -294,12 +294,20 @@ Each row is a question the workspace answers once. Before writing something
 that answers one of them, reach for the answer; before adding a row, check that
 the question is not already here under different words.
 
-Three rows below name one answer per package format rather than one answer
-outright. That is deliberate: each format defines its own version ordering, so
-a shared comparator would have to be told which set of rules to apply, which is
-the format's identity and not a parameter. The rows are here so the next
-constraint question is answered by extending its format's `version` module
-rather than by a fourth mechanism somewhere else.
+Four rows below name one answer per package format rather than one answer
+outright. Three of them are deliberate for one reason: each format defines its
+own version ordering, so a shared comparator would have to be told which set of
+rules to apply, which is the format's identity and not a parameter. The rows
+are here so the next constraint question is answered by extending its format's
+`version` module rather than by a fourth mechanism somewhere else.
+
+The fourth, `Refusals`, is split for a different reason. Both layers collect
+every refusal and fail once, which is the discipline; what they collect is not
+the same set. A portage resolution refuses in three shapes — an atom nothing
+answers, a blocker, and two builds contending for one slot — and the last two
+have no Debian meaning, so a shared type would carry collections that are
+always empty on one side. Alpine reports one refusal at a time and has no such
+type yet; when it grows one, it is this row it extends.
 
 | The question | The answer |
 | --- | --- |
@@ -312,6 +320,7 @@ rather than by a fourth mechanism somewhere else.
 | Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `alpine::version::Constraint::satisfied_by`, `debian::version::Constraint::satisfied_by` |
 | What version does a `Provides`-style entry supply a name at? | `provision::alpine::version::Constraint::exact_version`, `debian::version::Constraint::exact_version` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
+| What did one resolution refuse, and how does it read? | `provision::gentoo::resolve::Refusals`, `debian::resolve::Refusals` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What may a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |
 | What may a release, a component, or an architecture contain? | `provision::coordinate::check` |

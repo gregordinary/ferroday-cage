@@ -61,7 +61,10 @@ distribution's own archive. See [Provisioning a rootfs](provisioning.md); [An
 ebuild development sandbox](ebuild-sandbox.md) provisions a Gentoo stage3 and
 builds a package in it, and [Building a Debian
 package](building-a-debian-package.md) bootstraps a Debian suite and builds a
-`.deb` from source.
+`.deb` from source. A bootstrapped root need not be for the host's own
+architecture: [A foreign-architecture test run](cross-architecture.md) builds
+and runs arm64 binaries on an x86_64 host through the `qemu-user` binfmt
+handler.
 
 The default profile is a rootless convenience for code you trust: a controlled
 filesystem view, isolated namespaces, and a clean environment. Untrusted code

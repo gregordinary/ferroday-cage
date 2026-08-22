@@ -245,6 +245,13 @@ required-features = ["gentoo"]
 name = "deb-build"
 required-features = ["debian"]
 
+# A worked consumer: a foreign-architecture build-and-test sandbox that
+# bootstraps a Debian root for an architecture the host cannot execute and
+# compiles and runs a C program inside it, through the qemu-user binfmt handler.
+[[example]]
+name = "cross-arch-test"
+required-features = ["debian", "hardening"]
+
 # A worked consumer: a multi-repository provisioning sandbox that bootstraps a
 # root from the archive mirror plus local trusted repositories. It exercises the
 # Debian provisioner's repository builder, so it builds only when the `debian`

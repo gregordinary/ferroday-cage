@@ -369,6 +369,11 @@ impl<'a> Debian<'a> {
     /// failure, a release that does not offer the requested suite,
     /// architecture, or components, or a caller `include` that resolves to no
     /// package.
+    ///
+    /// A resolution that cannot be satisfied reports every refusal it met as a
+    /// [`DebianEvent::Unsatisfiable`] and then fails once with all of them
+    /// named, so an install list with four mistakes in it is corrected in one
+    /// pass rather than four.
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
         self.resolve_reporting(&mut Silent)
     }
@@ -405,14 +410,15 @@ impl<'a> Debian<'a> {
     /// identity map, and serves a foreign architecture the host cannot execute.
     ///
     /// This is a different question from [`resolve`](Self::resolve), and the
-    /// resolvers cannot stand in for it. A top-level
-    /// [`include`](DebianBuilder::include) naming nothing fails the whole
-    /// resolve, so asking about a batch of names that way answers whether they
-    /// were all there and never which were not; and a transitive dependency
-    /// nothing satisfies fails the resolve too, which reports the first such
-    /// group rather than enumerating every missing name. Asking here costs one
-    /// pass over the index for any number of names, where a resolve per name
-    /// re-fetches and re-parses it every time.
+    /// resolvers cannot stand in for it. A resolve *fails* where a name cannot
+    /// be satisfied rather than answering a question about it — and it fails
+    /// about a whole closure, so a name that is perfectly available appears in
+    /// the failure when something else in its dependency tree is not. A resolve
+    /// does name every refusal rather than the first, which makes a failed one
+    /// a usable list of what to correct, but that is a list of what this
+    /// particular closure could not have and not an answer about a set of
+    /// names. Asking here costs one pass over the index for any number of
+    /// names, where a resolve per name re-fetches and re-parses it every time.
     ///
     /// The builder's [`include`](DebianBuilder::include),
     /// [`exclude`](DebianBuilder::exclude), and
@@ -1503,11 +1509,37 @@ fn resolve_packages(
     observer.progress(DebianEvent::Resolving);
     let mut base = index.base_seed(base_priority);
     base.push("apt".to_string());
-    let packages =
-        resolve::resolve(&index, &base, includes, excludes).map_err(DebianError::from)?;
+    let (packages, refusals) = resolve::resolve(&index, &base, includes, excludes);
+    report_refusals(refusals, observer)?;
 
     let packages = emit_resolved(repositories, architecture, packages, &archives, observer);
     Ok((packages, archives))
+}
+
+/// Reports every refusal a resolution collected, then fails with all of them
+/// named. A resolution that refused nothing returns `Ok` and reports nothing.
+///
+/// The two halves are both the point. The events let a caller watching progress
+/// see each refusal as its own item, which is what a list a user has to correct
+/// wants to be; the error carries the same set as one sentence, for the caller
+/// who only ever sees the failure. Neither is a summary of the other.
+fn report_refusals(
+    refusals: resolve::Refusals,
+    observer: &mut dyn DebianObserver,
+) -> Result<(), DebianError> {
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    for refusal in refusals.iter() {
+        observer.progress(DebianEvent::Unsatisfiable {
+            requirement: refusal.requirement(),
+            required_by: refusal.required_by(),
+            reason: &refusal.reason(),
+        });
+    }
+    Err(DebianError::Resolve {
+        reason: refusals.describe(),
+    })
 }
 
 /// Resolves the increment a layered build installs over its base.
@@ -1532,8 +1564,9 @@ fn resolve_delta(
     let (index, archives) = merged_index(fetcher, repositories, architecture, pins, observer)?;
 
     observer.progress(DebianEvent::Resolving);
-    let packages = resolve::resolve_seeded(&index, &[], includes, excludes, assume_installed)
-        .map_err(DebianError::from)?;
+    let (packages, refusals) =
+        resolve::resolve_seeded(&index, &[], includes, excludes, assume_installed);
+    report_refusals(refusals, observer)?;
 
     let packages = emit_resolved(repositories, architecture, packages, &archives, observer);
     Ok((packages, archives))
@@ -2488,6 +2521,27 @@ pub enum DebianEvent<'a> {
     },
     /// The dependency closure is being resolved.
     Resolving,
+    /// A dependency the resolver could not satisfy: a name no configured
+    /// archive carries, a name it carries only at a version the constraint
+    /// rules out, or one an exclusion removed that a hard dependency needed.
+    ///
+    /// Reported for every such refusal before the run fails, so a caller fixing
+    /// an install list sees the whole list rather than the first entry of it.
+    /// The failure that follows carries the same set as one sentence.
+    #[non_exhaustive]
+    Unsatisfiable {
+        /// What could not be supplied: the dependency group as the archive
+        /// declares it, alternatives included, or the package name where the
+        /// caller named one directly.
+        requirement: &'a str,
+        /// Who asked for it: the selected package whose dependency it was, or
+        /// the install list.
+        required_by: &'a str,
+        /// What the wall was, as the clause following "and": that the name is
+        /// absent, that it is excluded, or what is available instead of what
+        /// the constraint asked for.
+        reason: &'a str,
+    },
     /// The dependency closure has been resolved, carrying the plan the
     /// bootstrap will install.
     ///
@@ -2747,14 +2801,6 @@ impl std::error::Error for DebianError {
 impl From<FetchError> for DebianError {
     fn from(err: FetchError) -> Self {
         DebianError::Fetch(err)
-    }
-}
-
-impl From<resolve::ResolveError> for DebianError {
-    fn from(err: resolve::ResolveError) -> Self {
-        DebianError::Resolve {
-            reason: err.to_string(),
-        }
     }
 }
 

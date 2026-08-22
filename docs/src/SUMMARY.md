@@ -20,6 +20,7 @@
 - [An ebuild development sandbox](ebuild-sandbox.md)
 - [A Debian userland](debian.md)
 - [Building a Debian package](building-a-debian-package.md)
+- [A foreign-architecture test run](cross-architecture.md)
 - [An Alpine userland](alpine.md)
 - [A Gentoo userland](gentoo.md)
 - [Stability and versioning](stability.md)

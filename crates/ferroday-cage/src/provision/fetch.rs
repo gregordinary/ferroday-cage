@@ -39,11 +39,44 @@ impl<'a> FetchRequest<'a> {
     ///
     /// The scheme is case-insensitive (RFC 3986 §3.1); the rest of the URL is
     /// not. An implementation that routes on the scheme — handing `https://`
-    /// URLs to a TLS transport and delegating the rest, say — must compare it
-    /// case-insensitively, as [`HttpFetch`](super::HttpFetch) does, or the two
-    /// layers disagree about which URLs name TLS.
+    /// URLs to a TLS transport and delegating the rest, say — reaches it
+    /// through [`scheme`](Self::scheme) rather than by splitting this string,
+    /// so that the two layers cannot disagree about which URLs name TLS.
     pub fn url(&self) -> &'a str {
         self.url
+    }
+
+    /// The scheme the URL names, or `None` for a reference that names none.
+    ///
+    /// This is the accessor a transport routes on. The scheme is the text
+    /// before `://`, spelled `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` by
+    /// RFC 3986 §3.1, so a path reference that happens to contain `://` does
+    /// not read as one. `None` is a real input rather than a broken one: a
+    /// caller may name a mirror by a bare path, and a transport that serves
+    /// only absolute URLs answers it with [`FetchError::url`].
+    ///
+    /// It is returned exactly as written. Schemes are case-insensitive, so a
+    /// comparison against it must be too — this crate's own client matches
+    /// `HTTP://` and `http://` alike, and a transport that matched literally
+    /// would refuse URLs the layer above it had already accepted.
+    ///
+    /// # Example
+    ///
+    /// Routing by scheme, compared the way the rule requires:
+    ///
+    /// ```
+    /// use ferroday_cage::provision::FetchRequest;
+    ///
+    /// let request = FetchRequest::new("HTTPS://deb.debian.org/debian/Release");
+    /// let scheme = request.scheme().unwrap_or_default();
+    ///
+    /// // `eq_ignore_ascii_case`, not `==`: the archive may be configured in
+    /// // any case, and the two spellings name one transport.
+    /// assert!(scheme.eq_ignore_ascii_case("https"));
+    /// assert_eq!(scheme, "HTTPS", "the scheme is returned as written");
+    /// ```
+    pub fn scheme(&self) -> Option<&'a str> {
+        scheme_of(self.url)
     }
 
     /// The size the body is expected to be, or `None` where nothing declares
@@ -68,6 +101,9 @@ impl<'a> FetchRequest<'a> {
 /// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` — so a path reference that
 /// happens to contain `://` does not read as one. It is returned as written;
 /// schemes are case-insensitive, so a comparison against it must be too.
+///
+/// This is the crate's one answer to the question, reached from inside by the
+/// client's own routing and from outside through [`FetchRequest::scheme`].
 pub(super) fn scheme_of(url: &str) -> Option<&str> {
     let (scheme, _) = url.split_once("://")?;
     let mut bytes = scheme.bytes();
@@ -83,8 +119,8 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 /// implementation, so a consumer can substitute a transport the built-in
 /// client does not provide — HTTPS, a proxy, an on-disk cache, a private
 /// mirror protocol. The default is [`HttpFetch`](super::HttpFetch), which
-/// speaks plain HTTP and `file://`. A substitute that routes by scheme
-/// compares it case-insensitively; [`FetchRequest::url`] states the rule.
+/// speaks plain HTTP and `file://`. A substitute that routes by scheme takes
+/// it from [`FetchRequest::scheme`] and compares it case-insensitively.
 ///
 /// A fetch writes the resource to `sink` as it arrives. A missing resource
 /// must be reported as [`FetchError::not_found`] rather than a generic error,
@@ -303,6 +339,43 @@ impl std::error::Error for FetchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accessor hands back the scheme as the URL spells it, rather than a
+    /// case-folded copy.
+    ///
+    /// Folding here would look helpful and cost the caller the ability to
+    /// report what was configured, and it would answer a question the caller
+    /// has to ask anyway: a router comparing case-insensitively is correct
+    /// whether or not the accessor folds, and one comparing literally is wrong
+    /// either way.
+    #[test]
+    fn the_scheme_is_returned_as_written() {
+        for (url, expected) in [
+            ("http://deb.debian.org/debian/x", "http"),
+            ("HTTPS://deb.debian.org/debian/x", "HTTPS"),
+            ("Http://deb.debian.org/debian/x", "Http"),
+            ("file:///var/cache/x", "file"),
+        ] {
+            let request = FetchRequest::new(url);
+            assert_eq!(request.scheme(), Some(expected), "{url}");
+            assert!(
+                request
+                    .scheme()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case(expected)),
+                "{url}: the documented comparison holds",
+            );
+        }
+    }
+
+    /// A reference naming no scheme is a real input, so it answers `None`
+    /// rather than inventing one. A path that merely contains `://` is such a
+    /// reference: the text before it is not a scheme.
+    #[test]
+    fn a_reference_naming_no_scheme_answers_none() {
+        for url in ["/var/cache/archives/x.deb", "deb.debian.org/debian/x", ""] {
+            assert_eq!(FetchRequest::new(url).scheme(), None, "{url}");
+        }
+    }
 
     #[test]
     fn a_mirror_walk_advances_past_what_this_mirror_could_not_serve() {

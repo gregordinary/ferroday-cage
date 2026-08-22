@@ -3657,6 +3657,12 @@ fn print_debian_event(event: ferroday_cage::provision::debian::DebianEvent<'_>) 
     match event {
         DebianEvent::Fetching { url, .. } => eprintln!("fcage: fetching {url}"),
         DebianEvent::Resolving => eprintln!("fcage: resolving the package set"),
+        DebianEvent::Unsatisfiable {
+            requirement,
+            required_by,
+            reason,
+            ..
+        } => eprintln!("fcage: {required_by} requires {requirement}, and {reason}"),
         DebianEvent::Downloading {
             package,
             index,

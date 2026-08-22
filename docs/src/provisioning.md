@@ -413,6 +413,15 @@ an upstream release tarball was written by whoever released the software, on
 whatever machine, in whatever year, and a sample of Debian trixie's
 `.orig.tar.*` files finds roughly one in twelve is v7.
 
+Two of the three compressions let the archive name its own memory cost, in a
+header far smaller than the allocation it asks for: a zstd frame declares the
+window the decoder buffers, and an xz block declares the dictionary the decoder
+allocates and zeroes. Both are capped at 128 MiB, which is twice the largest
+either uses in the archives this library reads, and both are refused from the
+header rather than partway through the payload. An archive over the cap fails
+the provisioning run; nothing published by Debian, Alpine, postmarketOS, or
+Gentoo comes close to it.
+
 The archive comes from a path or from any reader:
 
 ```rust,no_run

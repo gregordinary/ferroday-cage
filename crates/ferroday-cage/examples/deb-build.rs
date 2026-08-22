@@ -378,6 +378,12 @@ fn print_progress(event: DebianEvent<'_>) {
     match event {
         DebianEvent::Fetching { url, .. } => eprintln!("deb-build: fetching {url}"),
         DebianEvent::Resolving => eprintln!("deb-build: resolving the package set"),
+        DebianEvent::Unsatisfiable {
+            requirement,
+            required_by,
+            reason,
+            ..
+        } => eprintln!("deb-build: {required_by} requires {requirement}, and {reason}"),
         DebianEvent::Downloading {
             package,
             index,

@@ -169,6 +169,24 @@ remove it. A hard dependency that only an excluded package can satisfy fails the
 bootstrap rather than producing a broken closure, as does excluding a package
 that is also an `include`.
 
+### What a resolution refuses
+
+A dependency nothing can satisfy fails the resolution: a name no configured
+archive carries, a name carried only at a version the declared constraint rules
+out, or one an exclusion removed that a hard dependency needed. Installing
+anyway would succeed — dpkg configures with `--force-depends` — and leave a root
+whose packages cannot work, so the resolution refuses instead.
+
+Every refusal is reported before the run fails, and the failure names all of
+them. A resolution reports each one as a `DebianEvent::Unsatisfiable` carrying
+what could not be supplied, who asked for it, and what the wall was, so an
+install list with four mistakes in it is corrected in one pass rather than in
+four bootstraps. The resolution keeps walking past a refusal to find the next:
+a group nothing satisfies contributes nothing to the selection, so the rest of
+the closure is unaffected by it. Two packages needing one absent name produce
+two refusals rather than one, which is the fact rather than noise — both have
+to change.
+
 ## Repositories
 
 A bootstrap resolves against one or more repositories. The
@@ -990,12 +1008,15 @@ for provider in available.providers("awk") {
 ```
 
 `resolve` cannot stand in for this, and neither of its behaviours is a defect.
-A resolve fails on the first name it cannot satisfy — a top-level `include` that
-names nothing, or a transitive dependency nothing supplies — so asking about a
-list of names that way reports whether they were *all* there and never which
-were not. Nor is the cost the same: one `available` pass answers any number of
-names, where a resolve per name re-fetches and re-parses the index every time —
-a `Packages.xz` for trixie amd64 is around 9 MB, and `cache_dir` caches `.deb`
+A resolve *fails* where a name cannot be satisfied — a top-level `include` that
+names nothing, or a transitive dependency nothing supplies — rather than
+answering a question about it. It does name every one of them rather than the
+first, so a failed resolve is a usable list of what to correct; but it is still
+a failure, and it is a failure about a whole closure. A name that is perfectly
+available can appear in one because something else in its dependency tree is
+not. Nor is the cost the same: one `available` pass answers any number of names,
+where a resolve per name re-fetches and re-parses the index every time — a
+`Packages.xz` for trixie amd64 is around 9 MB, and `cache_dir` caches `.deb`
 files, not indexes.
 
 Availability is answered at the level of the name: `contains` reports that the
@@ -1132,7 +1153,10 @@ unsigned repository must be `file://` or `https://`. Any other scheme is
 refused, `http://` among them. The rule is an allow-list rather than a refusal
 of `http://` because a refusal names only the plaintext scheme it was written
 for, and a caller-supplied transport can speak any of them; schemes are
-compared case-insensitively, as [RFC 3986 §3.1] defines them.
+compared case-insensitively, as [RFC 3986 §3.1] defines them. A transport
+routing on the scheme itself reads it from [`FetchRequest::scheme`], which
+applies the same rule, so the two layers cannot disagree about which URLs name
+which transport.
 
 The signature alone does not say which suite was delivered — a single archive
 key signs every suite — so the release is also bound to the request: its
@@ -1359,6 +1383,7 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`Pool`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html
 [`Pool::mirror_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.mirror_url
 [`file_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/fn.file_url.html
+[`FetchRequest::scheme`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/struct.FetchRequest.html#method.scheme
 [`Pool::release_path`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.release_path
 [`Pool::dists_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.dists_dir
 [`Pool::date`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.date

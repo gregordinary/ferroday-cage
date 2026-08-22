@@ -120,7 +120,48 @@ consumer upgrading can skip it.
   about what a timeout means. `Running`'s own waits are unchanged: a deadline of
   theirs still kills nothing.
 
+- `FetchRequest::scheme` answers what scheme a request's URL names, so a
+  transport that routes on it reaches the crate's own answer instead of
+  splitting the URL itself. The scheme is case-insensitive and the rest of the
+  URL is not, which is a rule a router has to apply rather than read: the
+  accessor returns the scheme as written and its documentation shows the
+  comparison. The rule was previously stated in prose at the seam, which left
+  the comparison for each consumer to write.
+
+- `DebianEvent::Unsatisfiable` reports one dependency the resolver could not
+  satisfy, carrying what could not be supplied, who asked for it, and what the
+  wall was. One is reported for every refusal a resolution meets, before the
+  run fails.
+
+- A `cross-arch-test` example and a guide chapter for it: a sandbox that
+  bootstraps a Debian root for an architecture the host cannot execute, then
+  compiles and runs a C program inside it through the `qemu-user` binfmt
+  handler. It is the one supported host mode the project claimed and never
+  demonstrated end to end.
+
+  The question it was built to answer is whether anything above the provisioner
+  assumes the command's architecture is the host's, and nothing does. The cage
+  is told a root filesystem and a command and asks what neither was built for;
+  a seccomp filter gates on the audit architecture of the task making the
+  syscall, which under emulation is the emulator, so a filter compiled for the
+  host applies with nothing to translate. Verified against arm64 and ppc64el
+  roots, with and without the curated seccomp policy, and through the terminal
+  relay, which behaves as it does with a native root.
+
 ### Changed
+
+- A Debian resolution reports every refusal rather than stopping at the first.
+  The walk continues past a group nothing satisfies, collects each one, and
+  fails once with all of them named; a group nothing satisfies contributes
+  nothing to the selection, which is what makes continuing possible. A caller
+  correcting an install list with four mistakes in it now does so in one pass
+  rather than in four bootstraps, learning the next mistake only after fixing
+  the last. Contradictions in the caller's own arguments — a name the archives
+  do not carry, a name both included and excluded — collect the same way and
+  for the same reason.
+
+  This brings Debian in line with the Gentoo layer, which already enumerated.
+  Alpine still reports one refusal at a time.
 
 - `Signals` documents what dropping the handle costs. Nothing restores the
   process's signal mask — the type says why, and the reasoning is unchanged —
@@ -139,6 +180,29 @@ consumer upgrading can skip it.
   TLS. The rule was stated only on the crate's internal scheme extractor.
 
 ### Fixed
+
+- An xz archive can no longer name its own memory cost. Every block of an xz
+  stream declares the dictionary its LZMA2 filter wants, in a single header byte
+  that can ask for up to 4 GiB, and the decoder allocates and zeroes all of it
+  before reading any of the block — so a 69-byte input can cost gigabytes of
+  resident memory. A dictionary over 128 MiB is now refused from the header:
+  the same bound zstd's window already had, and twice the largest dictionary any
+  archive this library reads uses.
+
+  The bound is applied by walking the xz container ahead of the decoder, block
+  by block, because checking only the front of the file would not be worth
+  having. Each block declares its own dictionary and each is allocated, so a
+  file whose first block declares 8 MiB and whose second declares 2 GiB costs
+  the 2 GiB and then decodes successfully, reporting nothing. Real archives are
+  routinely many blocks — a Gentoo stage3 is seventy-five — and every one of
+  them is now checked. The walk stops, and stops checking, at a block header
+  that declares no compressed size, since the next header is then findable only
+  by decoding; and it refuses nothing it merely fails to understand, so an
+  archive the decoder accepts is never broken by the guard.
+
+  This is a robustness fix on the provisioning path, not a sandbox escape.
+  Nothing here was exploitable beyond making the calling process take memory it
+  never agreed to.
 
 - The Debian resolver enforces the version constraint a dependency declares,
   where it previously parsed it away. The rationale for dropping it was that a
