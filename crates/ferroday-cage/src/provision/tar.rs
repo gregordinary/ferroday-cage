@@ -654,7 +654,9 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
                 if value.len() != 2 * digest.len() {
                     return Err("an apk file checksum record is not a SHA-1");
                 }
-                for (byte, pair) in digest.iter_mut().zip(value.chunks_exact(2)) {
+                // The length check above is what leaves no remainder to drop.
+                let (pairs, _) = value.as_chunks::<2>();
+                for (byte, pair) in digest.iter_mut().zip(pairs) {
                     *byte = std::str::from_utf8(pair)
                         .ok()
                         .and_then(|pair| u8::from_str_radix(pair, 16).ok())
@@ -902,6 +904,36 @@ mod tests {
         // which is exactly the value the record exists to correct.
         assert!(parse_pax(b"13 uid=-1000\n").is_err());
         assert!(parse_pax(b"12 gid=zzzz\n").is_err());
+    }
+
+    #[test]
+    fn an_apk_file_checksum_record_decodes_to_the_digest_it_states() {
+        // apk writes one of these for every file and symbolic link, and the
+        // Alpine layer verifies an extracted file against it. A record that
+        // decoded to the wrong bytes would fail every file it covers, so the
+        // decoding is pinned here rather than only through that layer.
+        let hex = b"000102030405060708090a0b0c0d0e0f10111213";
+        let mut data = Vec::from(&b"68 APK-TOOLS.checksum.SHA1="[..]);
+        data.extend_from_slice(hex);
+        data.push(b'\n');
+        let records = parse_pax(&data).unwrap();
+        assert_eq!(
+            records.checksum_sha1,
+            Some(std::array::from_fn(|index| index as u8)),
+        );
+
+        // A value that is not twenty bytes of hexadecimal is a malformed
+        // record, not one to skip: skipping would leave the file unverified
+        // while the archive claimed to state a digest for it.
+        let mut short = Vec::from(&b"66 APK-TOOLS.checksum.SHA1="[..]);
+        short.extend_from_slice(&hex[2..]);
+        short.push(b'\n');
+        assert!(parse_pax(&short).is_err());
+
+        let mut not_hex = Vec::from(&b"68 APK-TOOLS.checksum.SHA1="[..]);
+        not_hex.extend_from_slice(b"g00102030405060708090a0b0c0d0e0f10111213");
+        not_hex.push(b'\n');
+        assert!(parse_pax(&not_hex).is_err());
     }
 
     #[test]

@@ -138,6 +138,41 @@ consumer upgrading can skip it.
   make the same comparison, or the two layers disagree about which URLs name
   TLS. The rule was stated only on the crate's internal scheme extractor.
 
+### Fixed
+
+- The Debian resolver enforces the version constraint a dependency declares,
+  where it previously parsed it away. The rationale for dropping it was that a
+  single coherent suite is internally consistent, which holds for a full
+  bootstrap and not for `Debian::stage_layer` or `DebianBuilder::base_layer`:
+  those close an increment over a base provisioned earlier, possibly against an
+  older archive, so the two sides describe different archive states by design.
+  `libc6 (>= 2.43)` was therefore answered by the base carrying *a* libc6. A
+  base at 2.42 resolved clean, staged clean, and failed an hour into a compile
+  with a link error naming a library that was present and correct.
+
+  The base's own versions are now read from the status database rather than
+  discarded, `Provides` carries the version it supplies a name at, and Debian
+  Policy 7.5 decides what that satisfies: a bare `Provides: foo` answers an
+  unversioned dependency only, while `Provides: foo (= 1.2)` also answers a
+  versioned one that 1.2 meets. An alternative ruled out by its version is no
+  longer an answer, so `a (>= 2) | b` falls through to `b` rather than stopping
+  at `a`.
+
+- A dependency group nothing satisfies fails the resolve rather than being
+  dropped from the closure. The omission was deliberate, on the grounds that
+  dpkg configures with `--force-depends` and the post-install check catches a
+  missing dependency by name. That check cannot: it verifies that every
+  *selected* package reached `install ok installed`, and a group dropped here
+  was never selected, so nothing downstream was in a position to notice. A root
+  assembled from an incoherent set was produced silently.
+
+  The new error names the group as declared and what is actually available for
+  its names, which is what separates a package no archive carries from one
+  carried at a version the constraint rules out. Both reach a caller as
+  `DebianError::Resolve`, so no public type changes; a resolve that succeeded
+  and should not have now fails, which is a behaviour break under the pre-1.0
+  rule.
+
 ### Internal
 
 - A binary package's download is bounded by this layer's own ceiling as well as

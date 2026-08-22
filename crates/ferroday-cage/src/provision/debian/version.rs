@@ -6,10 +6,17 @@
 //! subtlety worth stating is the character ordering: `~` sorts before
 //! everything, including the end of a string, so `1.0~rc1` precedes `1.0`.
 //!
-//! Only comparison is needed, and only to keep the highest version when the
-//! same package name appears more than once across an index.
+//! Comparison keeps the highest version when the same package name appears
+//! more than once across an index. [`Constraint`] builds on it to answer the
+//! resolver's question: whether a candidate version satisfies what a
+//! dependency declares. This mirrors [`alpine::version`], which holds that
+//! format's comparison and its own `Constraint` together for the same reason —
+//! a constraint is meaningless apart from the ordering it is evaluated under.
+//!
+//! [`alpine::version`]: crate::provision::alpine::version
 
 use std::cmp::Ordering;
+use std::fmt;
 
 /// Compares two Debian version strings.
 pub(crate) fn compare(a: &str, b: &str) -> Ordering {
@@ -113,8 +120,208 @@ fn order(c: u8) -> i32 {
     }
 }
 
+/// A version constraint on a dependency: `(>= 2.43)` and its siblings.
+///
+/// The constraint is kept rather than dropped at parse time because the
+/// resolver cannot assume a single coherent archive state. A layered resolve
+/// closes over an increment against a base provisioned earlier, possibly from
+/// an older archive, so `libc6 (>= 2.43)` is a question the base's actual
+/// version has to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Constraint {
+    /// The relation a candidate must bear to [`version`](Self::version).
+    pub relation: Relation,
+    /// The version named in the relationship, verbatim.
+    pub version: String,
+}
+
+impl fmt::Display for Constraint {
+    /// Writes the operator and the version as a dependency spells them, so an
+    /// error naming a group renders it the way the archive declares it. The
+    /// deprecated `<` and `>` render as the `<=` and `>=` they mean.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.relation.as_str(), self.version)
+    }
+}
+
+impl Constraint {
+    /// Reads the inside of a dependency's `(...)` clause — `">= 2.43"` — or
+    /// `None` when it is not a constraint dpkg defines.
+    ///
+    /// A clause that cannot be read yields `None` rather than failing the
+    /// parse, leaving an unversioned dependency on the name. The alternative
+    /// would be to drop the whole atom, which turns a malformed constraint into
+    /// a silently missing dependency; the resolver's job is to report what it
+    /// cannot satisfy, not to lose the relationship.
+    pub(crate) fn parse(inner: &str) -> Option<Constraint> {
+        let inner = inner.trim();
+        // The operator is the leading run of relation characters; the version is
+        // the rest. Splitting on the first character that starts neither keeps a
+        // version like `1.0~rc1` intact whether or not a space follows the
+        // operator.
+        let split = inner
+            .find(|c: char| !matches!(c, '<' | '>' | '='))
+            .unwrap_or(inner.len());
+        let (operator, version) = inner.split_at(split);
+        let relation = Relation::parse(operator.trim())?;
+        let version = version.trim();
+        (!version.is_empty()).then(|| Constraint {
+            relation,
+            version: version.to_string(),
+        })
+    }
+
+    /// The version this states as a plain equality, or `None` for any other
+    /// relation.
+    ///
+    /// A `Provides` states the version it supplies a name at this way and no
+    /// other — Debian Policy 7.5 permits no other relation there — so this is
+    /// how one is read back out of the shared grammar.
+    pub(crate) fn exact_version(&self) -> Option<&str> {
+        (self.relation == Relation::Exactly).then_some(self.version.as_str())
+    }
+
+    /// Whether `candidate` satisfies this constraint under dpkg's version
+    /// ordering.
+    pub(crate) fn satisfied_by(&self, candidate: &str) -> bool {
+        self.relation.holds(compare(candidate, &self.version))
+    }
+}
+
+/// The relation of a version constraint.
+///
+/// Debian Policy 7.1 defines `<<`, `<=`, `=`, `>=` and `>>`. The bare `<` and
+/// `>` are deprecated spellings dpkg still accepts, meaning `<=` and `>=` — not
+/// the strict comparisons their spelling suggests — so they are read that way
+/// rather than rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relation {
+    /// `<<`: strictly earlier.
+    Earlier,
+    /// `<=`, and the deprecated `<`.
+    EarlierEqual,
+    /// `=`: exactly.
+    Exactly,
+    /// `>=`, and the deprecated `>`.
+    LaterEqual,
+    /// `>>`: strictly later.
+    Later,
+}
+
+impl Relation {
+    /// The canonical spelling. The deprecated `<` and `>` render as the `<=`
+    /// and `>=` they mean.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Earlier => "<<",
+            Self::EarlierEqual => "<=",
+            Self::Exactly => "=",
+            Self::LaterEqual => ">=",
+            Self::Later => ">>",
+        }
+    }
+
+    /// Reads a relation operator, or `None` when it is not one dpkg defines.
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "<<" => Some(Self::Earlier),
+            "<=" | "<" => Some(Self::EarlierEqual),
+            "=" => Some(Self::Exactly),
+            ">=" | ">" => Some(Self::LaterEqual),
+            ">>" => Some(Self::Later),
+            _ => None,
+        }
+    }
+
+    /// Whether the ordering of a candidate against the constrained version
+    /// satisfies this relation.
+    fn holds(self, ordering: Ordering) -> bool {
+        match self {
+            Self::Earlier => ordering == Ordering::Less,
+            Self::EarlierEqual => ordering != Ordering::Greater,
+            Self::Exactly => ordering == Ordering::Equal,
+            Self::LaterEqual => ordering != Ordering::Less,
+            Self::Later => ordering == Ordering::Greater,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_constraint_reads_every_relation_dpkg_defines() {
+        for (text, relation) in [
+            ("<< 1.0", Relation::Earlier),
+            ("<= 1.0", Relation::EarlierEqual),
+            ("= 1.0", Relation::Exactly),
+            (">= 1.0", Relation::LaterEqual),
+            (">> 1.0", Relation::Later),
+        ] {
+            let constraint = Constraint::parse(text).expect("a defined relation parses");
+            assert_eq!(constraint.relation, relation);
+            assert_eq!(constraint.version, "1.0");
+        }
+    }
+
+    #[test]
+    fn the_deprecated_operators_mean_the_inclusive_comparisons() {
+        // dpkg reads a bare `<` as `<=` and `>` as `>=`, not as the strict
+        // comparisons they look like, so 1.0 satisfies both.
+        assert!(Constraint::parse("< 1.0").unwrap().satisfied_by("1.0"));
+        assert!(Constraint::parse("> 1.0").unwrap().satisfied_by("1.0"));
+        assert!(!Constraint::parse("<< 1.0").unwrap().satisfied_by("1.0"));
+        assert!(!Constraint::parse(">> 1.0").unwrap().satisfied_by("1.0"));
+    }
+
+    #[test]
+    fn a_constraint_is_evaluated_under_the_formats_own_ordering() {
+        // `~` sorts before the end of a string, so 1.0~rc1 precedes 1.0 --
+        // the subtlety a lexical comparison would get backwards.
+        let constraint = Constraint::parse(">= 1.0").expect("it parses");
+        assert!(constraint.satisfied_by("1.0"));
+        assert!(constraint.satisfied_by("1.0-1"));
+        assert!(!constraint.satisfied_by("1.0~rc1"));
+        // An epoch outranks the upstream version entirely.
+        assert!(constraint.satisfied_by("1:0.1"));
+    }
+
+    #[test]
+    fn a_constraint_needs_no_space_after_its_operator() {
+        let constraint = Constraint::parse(">=2.43").expect("it parses");
+        assert_eq!(constraint.relation, Relation::LaterEqual);
+        assert_eq!(constraint.version, "2.43");
+    }
+
+    #[test]
+    fn an_unreadable_constraint_is_no_constraint_rather_than_an_error() {
+        // Degrading to `None` leaves an unversioned dependency on the name.
+        // Failing instead would turn a malformed clause into a silently missing
+        // dependency, which is the failure this whole mechanism exists to stop.
+        assert_eq!(Constraint::parse(">>>= 1.0"), None);
+        assert_eq!(Constraint::parse(">="), None);
+        assert_eq!(Constraint::parse(""), None);
+        assert_eq!(Constraint::parse("1.0"), None);
+    }
+
+    #[test]
+    fn only_an_equality_reads_back_as_a_provided_version() {
+        // Policy 7.5 permits only `=` in a Provides, so any other relation has
+        // no version to hand back and satisfies no versioned dependency.
+        assert_eq!(
+            Constraint::parse("= 1.2").unwrap().exact_version(),
+            Some("1.2")
+        );
+        assert_eq!(Constraint::parse(">= 1.2").unwrap().exact_version(), None);
+    }
+
+    #[test]
+    fn a_constraint_renders_the_way_a_dependency_spells_it() {
+        assert_eq!(Constraint::parse(">= 2.43").unwrap().to_string(), ">= 2.43");
+        // The deprecated spellings render as what they mean.
+        assert_eq!(Constraint::parse("> 2.43").unwrap().to_string(), ">= 2.43");
+    }
+
     use super::*;
 
     fn lt(a: &str, b: &str) {

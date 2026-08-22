@@ -294,6 +294,13 @@ Each row is a question the workspace answers once. Before writing something
 that answers one of them, reach for the answer; before adding a row, check that
 the question is not already here under different words.
 
+Three rows below name one answer per package format rather than one answer
+outright. That is deliberate: each format defines its own version ordering, so
+a shared comparator would have to be told which set of rules to apply, which is
+the format's identity and not a parameter. The rows are here so the next
+constraint question is answered by extending its format's `version` module
+rather than by a fourth mechanism somewhere else.
+
 | The question | The answer |
 | --- | --- |
 | What may a configured absolute path contain? | `path::absolute_components` |
@@ -301,8 +308,9 @@ the question is not already here under different words.
 | What may one path component contain? | `path::is_ordinary_component` |
 | Open a directory the kernel keeps inside a tree | `provision::containment::open_dir` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
-| How do two Gentoo versions compare? | `provision::gentoo::version::compare` |
-| Does this build satisfy this dependency atom? | `provision::gentoo::atom::Atom::matches` |
+| How do two versions of a package format compare? | `provision::gentoo::version::compare`, `alpine::version::compare`, `debian::version::compare` |
+| Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `alpine::version::Constraint::satisfied_by`, `debian::version::Constraint::satisfied_by` |
+| What version does a `Provides`-style entry supply a name at? | `provision::alpine::version::Constraint::exact_version`, `debian::version::Constraint::exact_version` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What may a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |

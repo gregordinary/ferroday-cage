@@ -13,15 +13,30 @@
 //! orchestration lives in the [parent module](super) beside the full-bootstrap
 //! pipeline it reuses.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::DebianError;
 use super::index::parse_provides;
 use crate::provision::document;
 
-/// Reads a base layer's already-installed set: every configured package's name
-/// and the virtual packages those packages provide, in one set.
+/// What a base layer supplies, as the resolver has to ask about it: a name
+/// mapped to every version that name is available at.
+///
+/// One name can carry more than one version because a name can be supplied more
+/// than one way — as a real package, and as a virtual that one or more packages
+/// `Provides`. A `None` version is a bare `Provides`, which Debian Policy 7.5
+/// says satisfies only an unversioned dependency; a real package always
+/// contributes `Some`, since the status database records its version.
+///
+/// The versions matter because a base is provisioned once and resolved against
+/// later: `libc6 (>= 2.43)` is not answered by "the base has a libc6", and
+/// treating it as though it were is what lets an aged base pass a resolve and
+/// fail the compile.
+pub(super) type InstalledSet = HashMap<String, Vec<Option<String>>>;
+
+/// Reads a base layer's already-installed set: every configured package and the
+/// virtual packages those packages provide, each with the version it supplies.
 ///
 /// The set seeds a delta resolution as pre-satisfied, so the increment
 /// [`Debian::stage_layer`] resolves closes only over packages the base does not
@@ -43,7 +58,7 @@ use crate::provision::document;
 /// whose contents decide what the increment resolves against.
 ///
 /// [`Debian::stage_layer`]: super::Debian::stage_layer
-pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianError> {
+pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianError> {
     let text = match super::bootstrap::read_base_status(base) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -64,7 +79,7 @@ pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianE
         }
     };
 
-    let mut installed = HashSet::new();
+    let mut installed = InstalledSet::new();
     for stanza in document::parse(&text) {
         let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status")) else {
             continue;
@@ -74,12 +89,21 @@ pub(super) fn read_installed_set(base: &Path) -> Result<HashSet<String>, DebianE
         if !is_configured(status) {
             continue;
         }
-        installed.insert(name.to_string());
+        // A stanza with no `Version` is malformed rather than versionless, and
+        // recording it as a bare supply is the conservative reading: it still
+        // satisfies unversioned dependencies, and no versioned one silently.
+        let version = stanza.get("Version").map(str::to_string);
+        installed.entry(name.to_string()).or_default().push(version);
         // A package's provided virtuals satisfy dependencies named against them,
-        // so folding them into the set lets one membership test in the resolver
+        // so folding them into the same map lets one lookup in the resolver
         // cover a base that satisfies a group either by real name or by virtual.
         if let Some(provides) = stanza.get("Provides") {
-            installed.extend(parse_provides(provides));
+            for provided in parse_provides(provides) {
+                installed
+                    .entry(provided.name)
+                    .or_default()
+                    .push(provided.version);
+            }
         }
     }
 
@@ -133,13 +157,28 @@ mod tests {
              Package: half\nStatus: install ok unpacked\nVersion: 1.0\n",
         );
         let set = read_installed_set(&dir).expect("the status database reads");
-        assert!(set.contains("libc6"));
-        assert!(set.contains("mawk"));
-        assert!(set.contains("awk"), "a provided virtual is in the set");
+        assert_eq!(set.get("libc6").unwrap(), &[Some("2.41".to_string())]);
+        assert_eq!(set.get("mawk").unwrap(), &[Some("1.3".to_string())]);
+        // The virtual is present, and bare: `Provides: awk` names no version,
+        // so it answers an unversioned dependency and no versioned one.
+        assert_eq!(set.get("awk").unwrap(), &[None]);
         assert!(
-            !set.contains("half"),
+            !set.contains_key("half"),
             "a package not `install ok installed` is not assumed",
         );
+    }
+
+    #[test]
+    fn a_versioned_provides_records_the_version_it_supplies() {
+        let dir = Scratch::for_test("layer", "versioned-provides");
+        base_with_status(
+            &dir,
+            "Package: libfoo1\nStatus: install ok installed\nVersion: 1.4-2\n\
+             Provides: libfoo (= 1.4)\n",
+        );
+        let set = read_installed_set(&dir).expect("the status database reads");
+        assert_eq!(set.get("libfoo1").unwrap(), &[Some("1.4-2".to_string())]);
+        assert_eq!(set.get("libfoo").unwrap(), &[Some("1.4".to_string())]);
     }
 
     #[test]

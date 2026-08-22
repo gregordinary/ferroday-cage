@@ -990,20 +990,21 @@ for provider in available.providers("awk") {
 ```
 
 `resolve` cannot stand in for this, and neither of its behaviours is a defect.
-A top-level `include` naming nothing fails the whole resolve, so asking about a
-list of names that way reports whether they were all there and never which were
-not; and a transitive dependency nothing satisfies is dropped rather than
-reported, since dpkg configures with `--force-depends`. Nor is the cost the
-same: one `available` pass answers any number of names, where a resolve per name
-re-fetches and re-parses the index every time — a `Packages.xz` for trixie amd64
-is around 9 MB, and `cache_dir` caches `.deb` files, not indexes.
+A resolve fails on the first name it cannot satisfy — a top-level `include` that
+names nothing, or a transitive dependency nothing supplies — so asking about a
+list of names that way reports whether they were *all* there and never which
+were not. Nor is the cost the same: one `available` pass answers any number of
+names, where a resolve per name re-fetches and re-parses the index every time —
+a `Packages.xz` for trixie amd64 is around 9 MB, and `cache_dir` caches `.deb`
+files, not indexes.
 
-Availability is answered at the level of the name, which is the level the
-resolver works at: a dependency's version constraint and architecture qualifier
-are parsed away, on the grounds that a single suite is internally consistent.
-So `contains` reports that the archives offer a name, not that they offer a
-version satisfying some constraint; answering the second question would be a
-version-constraint solver, which this is not.
+Availability is answered at the level of the name: `contains` reports that the
+archives offer a name, not that they offer a version satisfying some
+constraint. The resolver does enforce a dependency's version constraint — it
+has to, since a layered resolve closes over a base provisioned at some earlier
+archive state — but that is a question about a particular closure, and this
+query computes none. Answering it here would mean resolving, which is the cost
+`available` exists to avoid.
 
 The builder's `include`, `exclude`, and `base_priority` shape a resolution and
 so do not apply; the suite, the architecture, the repositories, and the fetcher

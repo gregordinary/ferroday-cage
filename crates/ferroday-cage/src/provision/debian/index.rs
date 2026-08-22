@@ -13,7 +13,7 @@ use std::fmt;
 
 use super::available::Available;
 use super::pin::Pins;
-use super::version;
+use super::version::{self, Constraint};
 use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
 
@@ -33,8 +33,9 @@ pub(crate) struct Package {
     pub sha256: String,
     pub depends: Vec<Dependency>,
     pub pre_depends: Vec<Dependency>,
-    /// Virtual package names this package provides (versions stripped).
-    pub provides: Vec<String>,
+    /// The virtual package names this package provides, each with the version
+    /// it is provided at when the stanza declares one.
+    pub provides: Vec<Provided>,
     pub essential: bool,
     pub priority: Option<String>,
     /// The archive's `Installed-Size:` in kibibytes, when the stanza carries
@@ -55,12 +56,42 @@ pub(crate) struct Package {
 /// satisfies it. `a | b` parses to two atoms; a plain dependency to one.
 pub(crate) type Dependency = Vec<DepAtom>;
 
-/// One alternative within a dependency: a package name. Version constraints
-/// and architecture qualifiers are parsed away, since a single coherent
-/// suite is internally consistent and the bootstrap installs one architecture.
+/// One alternative within a dependency: a package name and, when the
+/// relationship declares one, the version constraint it must meet.
+///
+/// The architecture qualifier (`libc6:arm64`, `python3:any`) is parsed away —
+/// a bootstrap installs one architecture, so a qualifier never selects between
+/// two candidates — as are build-profile restriction lists, which say *when* a
+/// dependency applies rather than what satisfies it.
+///
+/// The constraint itself is [`version::Constraint`], which lives beside the
+/// comparison it is evaluated under. A layered resolve
+/// ([`resolve_seeded`](super::resolve::resolve_seeded)) closes over an
+/// increment against a base that was provisioned earlier, possibly from an
+/// older archive, so `libc6 (>= 2.43)` is a question the base's actual version
+/// has to answer.
 #[derive(Debug, Clone)]
 pub(crate) struct DepAtom {
     pub name: String,
+    /// The declared version constraint, when there is one. `None` is an
+    /// unversioned dependency, which any version of the name satisfies.
+    pub constraint: Option<Constraint>,
+}
+
+/// A virtual package name a real package provides, and the version it provides
+/// it at.
+///
+/// Debian Policy 7.5 gives the version its meaning: a bare `Provides: foo`
+/// satisfies only an *unversioned* dependency on `foo`, while
+/// `Provides: foo (= 1.2)` additionally satisfies a versioned one that 1.2
+/// meets. Carrying the version is what lets the resolver keep those apart
+/// instead of treating every provider as satisfying everything.
+#[derive(Debug, Clone)]
+pub(crate) struct Provided {
+    /// The virtual name.
+    pub name: String,
+    /// The version it is provided at, or `None` for a bare `Provides`.
+    pub version: Option<String>,
 }
 
 /// A Debian package priority, the `Priority:` field of the archive's control
@@ -386,9 +417,9 @@ impl Index {
 
         let mut providers: HashMap<String, Vec<String>> = HashMap::new();
         for package in by_name.values() {
-            for virtual_name in &package.provides {
+            for provided in &package.provides {
                 providers
-                    .entry(virtual_name.clone())
+                    .entry(provided.name.clone())
                     .or_default()
                     .push(package.name.clone());
             }
@@ -453,12 +484,25 @@ fn parse_relations(value: &str) -> Vec<Dependency> {
         .collect()
 }
 
-/// Parses a `Provides` value into virtual package names.
-pub(crate) fn parse_provides(value: &str) -> Vec<String> {
+/// Parses a `Provides` value into the virtual names and the versions they are
+/// provided at.
+///
+/// Only `=` carries meaning in a `Provides` — Policy 7.5 permits no other
+/// relation there — so an entry with any other operator is read as a bare
+/// provide rather than as a constraint, which is the conservative reading: it
+/// satisfies unversioned dependencies and no versioned one.
+pub(crate) fn parse_provides(value: &str) -> Vec<Provided> {
     value
         .split(',')
         .filter_map(parse_atom)
-        .map(|atom| atom.name)
+        .map(|atom| Provided {
+            name: atom.name,
+            version: atom
+                .constraint
+                .as_ref()
+                .and_then(Constraint::exact_version)
+                .map(str::to_string),
+        })
         .collect()
 }
 
@@ -479,15 +523,40 @@ fn source_name(value: &str, package: &str) -> Option<String> {
     (!name.is_empty() && name != package).then_some(name)
 }
 
-/// Parses one dependency alternative into its package name, dropping the
-/// version constraint, architecture qualifier, and any restriction lists.
+/// Parses one dependency alternative into its package name and version
+/// constraint, dropping the architecture qualifier and any restriction lists.
+///
+/// A constraint that cannot be read — an operator dpkg does not define, or a
+/// parenthesis with no version in it — yields `None` for the constraint rather
+/// than failing the parse, leaving an unversioned dependency on the name. The
+/// alternative would be to drop the whole atom, which turns a malformed
+/// constraint into a silently missing dependency; the resolver's job is to
+/// report what it cannot satisfy, not to lose the relationship.
 fn parse_atom(text: &str) -> Option<DepAtom> {
+    let text = text.trim();
     let name: String = text
-        .trim()
         .chars()
         .take_while(|c| !c.is_whitespace() && !matches!(c, '(' | ':' | '[' | '<'))
         .collect();
-    (!name.is_empty()).then_some(DepAtom { name })
+    if name.is_empty() {
+        return None;
+    }
+    let constraint = parse_constraint(text);
+    Some(DepAtom { name, constraint })
+}
+
+/// Reads the `(<relation> <version>)` clause of a dependency atom, when it has
+/// one that parses.
+///
+/// The restriction list (`<!nocheck>`) and the architecture list (`[!armhf]`)
+/// are not version clauses, so only a parenthesised group is considered, and
+/// only the first: Policy allows one per alternative. What is inside the
+/// parentheses is the version grammar's to read, so
+/// [`Constraint::parse`](version::Constraint::parse) reads it.
+fn parse_constraint(text: &str) -> Option<Constraint> {
+    let open = text.find('(')?;
+    let close = text[open..].find(')')? + open;
+    Constraint::parse(&text[open + 1..close])
 }
 
 /// The build dependencies of a source package, read from a `debian/control`
@@ -682,21 +751,48 @@ Version: 1.0
     }
 
     #[test]
-    fn relations_parse_alternatives_and_strip_constraints() {
+    fn relations_parse_alternatives_and_keep_constraints() {
         let deps = parse_relations("libc6 (>= 2.41), mawk | gawk | awk, foo:any");
         assert_eq!(deps.len(), 3);
         assert_eq!(deps[0][0].name, "libc6");
+        // The constraint is carried, not stripped: it is the question a layered
+        // resolve has to put to the base's actual version.
+        assert_eq!(
+            deps[0][0].constraint.as_ref().unwrap().to_string(),
+            ">= 2.41"
+        );
         assert_eq!(
             deps[1].iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             ["mawk", "gawk", "awk"]
         );
+        // An unversioned alternative carries no constraint, which any version
+        // of the name satisfies.
+        assert!(deps[1][0].constraint.is_none());
+        // An architecture qualifier is not a version clause.
         assert_eq!(deps[2][0].name, "foo");
+        assert!(deps[2][0].constraint.is_none());
     }
 
     #[test]
-    fn provides_strip_versions() {
+    fn provides_carry_the_version_they_declare() {
         let provided = parse_provides("awk, libz.so (= 1.0), mail-transport-agent");
-        assert_eq!(provided, ["awk", "libz.so", "mail-transport-agent"]);
+        let names: Vec<&str> = provided.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["awk", "libz.so", "mail-transport-agent"]);
+        // A bare provide has no version to compare, so it answers only an
+        // unversioned dependency; `= 1.0` answers a versioned one too.
+        assert_eq!(provided[0].version, None);
+        assert_eq!(provided[1].version.as_deref(), Some("1.0"));
+        assert_eq!(provided[2].version, None);
+    }
+
+    #[test]
+    fn a_provides_relation_other_than_equals_is_read_as_bare() {
+        // Policy permits only `=` in a Provides. Anything else is not a
+        // constraint this may act on, and reading it as bare is the
+        // conservative choice: it satisfies no versioned dependency.
+        let provided = parse_provides("weird (>= 2.0)");
+        assert_eq!(provided[0].name, "weird");
+        assert_eq!(provided[0].version, None);
     }
 
     #[test]

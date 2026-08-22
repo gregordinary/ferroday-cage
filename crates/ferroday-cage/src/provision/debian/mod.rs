@@ -52,7 +52,7 @@ mod repository;
 mod resolve;
 mod version;
 
-use std::collections::HashSet;
+use layer::InstalledSet;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -409,10 +409,10 @@ impl<'a> Debian<'a> {
     /// [`include`](DebianBuilder::include) naming nothing fails the whole
     /// resolve, so asking about a batch of names that way answers whether they
     /// were all there and never which were not; and a transitive dependency
-    /// nothing satisfies is dropped rather than reported, deliberately, since
-    /// dpkg configures with `--force-depends`. Asking here costs one pass over
-    /// the index for any number of names, where a resolve per name re-fetches
-    /// and re-parses it every time.
+    /// nothing satisfies fails the resolve too, which reports the first such
+    /// group rather than enumerating every missing name. Asking here costs one
+    /// pass over the index for any number of names, where a resolve per name
+    /// re-fetches and re-parses it every time.
     ///
     /// The builder's [`include`](DebianBuilder::include),
     /// [`exclude`](DebianBuilder::exclude), and
@@ -1525,7 +1525,7 @@ fn resolve_delta(
     architecture: &str,
     includes: &[String],
     excludes: &[String],
-    assume_installed: &HashSet<String>,
+    assume_installed: &InstalledSet,
     pins: &Pins,
     observer: &mut dyn DebianObserver,
 ) -> Result<(Vec<Package>, Vec<ResolvedArchive>), DebianError> {
