@@ -45,7 +45,7 @@ use rustix::process::Pid;
 use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
-use super::child::{MapDuty, MapFailure, MapStep};
+use super::child::{MapDuty, MapFailure};
 use crate::idmap::IdMapError;
 use crate::wire::wire_enum;
 
@@ -59,23 +59,18 @@ wire_enum! {
     /// release takes the next free value rather than renumbering the ones it
     /// was declared among.
     pub(crate) enum RemoveStep {
+        map {
+            ResetSignals = 1 => "resetting the removal process's signal dispositions",
+            SweepFds = 2 => "closing the removal process's inherited descriptors",
+            Unshare = 3 => "unsharing the removal namespace",
+            DenySetgroups = 7 => "denying setgroups in the removal namespace",
+            WriteGidMap = 8 => "writing the removal gid map",
+            WriteUidMap = 9 => "writing the removal uid map",
+            AwaitMap = 4 => "establishing the removal identity map",
+        }
         /// Forking the removal process or speaking to it. Reported by the
         /// caller alone: the child has no channel to report it on.
         Spawn = 6 => "spawning the removal process",
-        /// The child could not reset its inherited signal dispositions.
-        ResetSignals = 1 => "resetting the removal process's signal dispositions",
-        /// The child could not close the descriptors it inherited.
-        SweepFds = 2 => "closing the removal process's inherited descriptors",
-        /// The child could not unshare its user namespace.
-        Unshare = 3 => "unsharing the removal namespace",
-        /// The child could not deny `setgroups` in its own user namespace.
-        DenySetgroups = 7 => "denying setgroups in the removal namespace",
-        /// The child could not write its own gid map.
-        WriteGidMap = 8 => "writing the removal gid map",
-        /// The child could not write its own uid map.
-        WriteUidMap = 9 => "writing the removal uid map",
-        /// The child died or was abandoned at the map gate.
-        AwaitMap = 4 => "establishing the removal identity map",
         /// The deletion itself failed inside the mapped namespace.
         Delete = 5 => "deleting the tree inside the mapped namespace",
     }
@@ -231,20 +226,6 @@ fn decode_record(record: [u8; super::RECORD_LEN]) -> RemoveFailure {
     }
 }
 
-/// The step a removal reports for a shared map step: the removal's own name for
-/// the same step, one for one.
-fn remove_step(step: MapStep) -> RemoveStep {
-    match step {
-        MapStep::ResetSignals => RemoveStep::ResetSignals,
-        MapStep::SweepFds => RemoveStep::SweepFds,
-        MapStep::Unshare => RemoveStep::Unshare,
-        MapStep::DenySetgroups => RemoveStep::DenySetgroups,
-        MapStep::WriteGidMap => RemoveStep::WriteGidMap,
-        MapStep::WriteUidMap => RemoveStep::WriteUidMap,
-        MapStep::AwaitMap => RemoveStep::AwaitMap,
-    }
-}
-
 /// The child: unshare, map, delete, report. Never returns.
 fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty<'_>) -> ! {
     let report = |wire: u32, errno: Errno| {
@@ -263,7 +244,7 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
             // diagnostic, and the gate a report would travel on is closed.
             MapFailure::Abandoned => runtime::exit_group(127),
             MapFailure::Step(step, errno) => {
-                report(remove_step(step).wire(), errno);
+                report(RemoveStep::from(step).wire(), errno);
                 runtime::exit_group(127)
             }
         }

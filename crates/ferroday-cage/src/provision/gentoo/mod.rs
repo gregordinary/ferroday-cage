@@ -86,10 +86,12 @@ use super::layer::BuildLayer;
 use super::openpgp::{Keyring, OpenPgpError};
 use super::rooted::Rooted;
 use super::{
-    Delegate, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter, PackageCache,
-    ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball,
+    Delegate, Failover, Fetch, FetchError, FetchJob, FetchRequest, HttpFetch, LimitedWriter,
+    PackageCache, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball,
+    mirror_url, walk_mirrors,
 };
 use crate::IdentityMap;
+use crate::failure::path_io_error;
 
 /// The archive the layer reads unless the caller names another.
 const DEFAULT_MIRROR: &str = "http://distfiles.gentoo.org";
@@ -412,25 +414,16 @@ impl GentooError {
             reason: reason.into(),
         }
     }
+}
 
-    /// A host I/O failure, naming what the operation was doing and the path it
-    /// concerned.
-    ///
-    /// Arguments run operation, then locator, then cause, which is the order
-    /// every constructor in the crate takes them in.
-    pub fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> GentooError {
-        GentooError::Io {
-            op,
-            path: path.into(),
-            source,
-        }
-    }
+path_io_error!(GentooError);
 
-    /// The same failure as a [`map_err`](Result::map_err) argument: names the
-    /// operation and the path now, and takes the cause when it arrives.
-    pub fn at(op: &'static str, path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> GentooError {
-        let path = path.into();
-        move |source| GentooError::Io { op, path, source }
+impl Failover for GentooError {
+    /// Reaches through the wrapper this layer carries a transport failure in.
+    /// A failure that is not a `Fetch` one at all — a signature or digest
+    /// mismatch over bytes that did arrive — never advances a walk.
+    fn is_failover(&self) -> bool {
+        matches!(self, GentooError::Fetch(fetch) if fetch.is_failover())
     }
 }
 
@@ -890,11 +883,7 @@ impl Gentoo {
     /// # }
     /// ```
     pub fn available(&mut self) -> Result<Available, GentooError> {
-        let pointer = self.read_pointer(None)?;
-        Ok(Available {
-            published: pointer.published(),
-            entries: pointer.entries().to_vec(),
-        })
+        self.observe(&mut Silent).available()
     }
 
     /// What the configured binhost publishes.
@@ -929,7 +918,7 @@ impl Gentoo {
     /// # }
     /// ```
     pub fn packages(&mut self) -> Result<Catalogue, GentooError> {
-        Ok(self.read_index(None)?.into_catalogue())
+        self.observe(&mut Silent).packages()
     }
 
     /// What installing the configured atoms into the root at `root` would
@@ -980,20 +969,29 @@ impl Gentoo {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// A resolution reports which atom blocked which, which packages form a
+    /// cycle, and which slot two builds contended for. Those are events rather
+    /// than part of the plan, so a caller that wants them binds a sink with
+    /// [`observe`](Self::observe) and calls
+    /// [`Observed::resolve_packages`] instead.
     pub fn resolve_packages(&mut self, root: impl AsRef<Path>) -> Result<Plan, GentooError> {
-        let installed = installed::installed(root)?;
-        self.resolve_install(&installed, None)
+        self.observe(&mut Silent).resolve_packages(root)
     }
 
     /// The resolution, with somewhere to report to.
     ///
     /// Shared by [`resolve_packages`](Self::resolve_packages) and the install
     /// wave, so the answer a caller previews and the answer a run installs come
-    /// from one code path and cannot drift apart.
+    /// from one code path -- and, since both reach it with an observer, say the
+    /// same things about how they got there. A preview taken through
+    /// [`Gentoo::observe`] sees every [`GentooEvent::Conflict`],
+    /// [`GentooEvent::DependencyCycle`] and [`GentooEvent::Occupied`] the
+    /// resolution met, which is the half a preview is for.
     fn resolve_install(
         &mut self,
         installed: &Installed,
-        to: Reporting<'_, '_>,
+        to: Reporting<'_>,
     ) -> Result<Plan, GentooError> {
         // A plan is a caller saying what to install, so there is nothing to
         // resolve and no index to fetch.
@@ -1013,53 +1011,41 @@ impl Gentoo {
             ));
         }
         let index = self.read_index(to)?;
-        report(
-            to,
-            GentooEvent::Index {
-                builds: index.records().len(),
-                skipped: index.skipped(),
-                generated: index.preamble().generated,
-            },
-        );
+        to.progress(GentooEvent::Index {
+            builds: index.records().len(),
+            skipped: index.skipped(),
+            generated: index.preamble().generated,
+        });
         let (resolved, refusals) =
             resolve::resolve(&index, installed, &self.install, &self.prefer_use);
         for cycle in &resolved.cycles {
-            report(to, GentooEvent::DependencyCycle { packages: cycle });
+            to.progress(GentooEvent::DependencyCycle { packages: cycle });
         }
         if !refusals.is_empty() {
             for unmet in &refusals.unsatisfied {
-                report(
-                    to,
-                    GentooEvent::Unsatisfiable {
-                        atom: &unmet.atom,
-                        wanted_by: &unmet.wanted_by,
-                        reason: &unmet.reason,
-                    },
-                );
+                to.progress(GentooEvent::Unsatisfiable {
+                    atom: &unmet.atom,
+                    wanted_by: &unmet.wanted_by,
+                    reason: &unmet.reason,
+                });
             }
             for conflict in &refusals.conflicts {
-                report(
-                    to,
-                    GentooEvent::Conflict {
-                        atom: &conflict.atom,
-                        stated_by: &conflict.stated_by,
-                        blocks: &conflict.blocks,
-                        installed: conflict.installed,
-                    },
-                );
+                to.progress(GentooEvent::Conflict {
+                    atom: &conflict.atom,
+                    stated_by: &conflict.stated_by,
+                    blocks: &conflict.blocks,
+                    installed: conflict.installed,
+                });
             }
             for taken in &refusals.occupied {
-                report(
-                    to,
-                    GentooEvent::Occupied {
-                        package: &taken.name,
-                        slot: &taken.slot,
-                        held: &taken.held,
-                        second: &taken.second,
-                        atom: &taken.atom,
-                        wanted_by: &taken.wanted_by,
-                    },
-                );
+                to.progress(GentooEvent::Occupied {
+                    package: &taken.name,
+                    slot: &taken.slot,
+                    held: &taken.held,
+                    second: &taken.second,
+                    atom: &taken.atom,
+                    wanted_by: &taken.wanted_by,
+                });
             }
             return Err(GentooError::Resolve {
                 reason: refusals.describe(),
@@ -1074,7 +1060,7 @@ impl Gentoo {
     }
 
     /// Fetches and parses the binary-package index.
-    fn read_index(&mut self, to: Reporting<'_, '_>) -> Result<index::Index, GentooError> {
+    fn read_index(&mut self, to: Reporting<'_>) -> Result<index::Index, GentooError> {
         let Some(binhost) = self.binhost.clone() else {
             return Err(GentooError::config(
                 "no binhost sub-architecture was named; call GentooBuilder::binhost with one of \
@@ -1082,21 +1068,20 @@ impl Gentoo {
             ));
         };
         let directory = index::directory(&self.architecture, &binhost);
-        let mut unserved = None;
         // The compressed form first and the plain one behind it, each walked
         // across every mirror: a mirror that publishes only the plain form is a
-        // mirror to fall back to rather than one to give up on.
-        for name in index::NAMES {
-            let suffix = format!("{directory}/{name}");
-            match self.read_bytes(&suffix, MAX_INDEX_BYTES, to) {
-                Ok(served) => return read_index_body(&served),
-                Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
-                Err(err) => return Err(err),
-            }
-        }
-        Err(GentooError::Fetch(
-            unserved.unwrap_or_else(|| no_mirror(&directory)),
-        ))
+        // mirror to fall back to rather than one to give up on. This is the
+        // walk rule one level up from the mirrors, which is why it is the same
+        // call.
+        walk_mirrors(
+            &index::NAMES,
+            |name| {
+                let suffix = format!("{directory}/{name}");
+                let served = self.read_bytes(&suffix, MAX_INDEX_BYTES, to)?;
+                read_index_body(&served)
+            },
+            || GentooError::Fetch(no_mirror(&directory)),
+        )
     }
 
     /// Fetches one unsigned document, walking the mirrors as
@@ -1112,26 +1097,24 @@ impl Gentoo {
         &mut self,
         suffix: &str,
         limit: u64,
-        to: Reporting<'_, '_>,
+        to: Reporting<'_>,
     ) -> Result<Fetched, GentooError> {
-        let mut unserved = None;
-        for mirror in &self.mirrors {
-            stop_if_cancelled(to)?;
-            let url = format!("{}/{suffix}", mirror.trim_end_matches('/'));
-            report(to, GentooEvent::Fetching { url: &url });
-            let mut bytes = Vec::new();
-            match self.fetcher.fetch(
-                &FetchRequest::new(&url).sized(limit),
-                &mut LimitedWriter::new(&mut bytes, limit),
-            ) {
-                Ok(()) => return Ok(Fetched { url, body: bytes }),
-                Err(err) if err.is_failover() => unserved = Some(err),
-                Err(err) => return Err(GentooError::Fetch(err)),
-            }
-        }
-        Err(GentooError::Fetch(
-            unserved.unwrap_or_else(|| no_mirror(suffix)),
-        ))
+        let fetcher = &mut self.fetcher;
+        walk_mirrors(
+            &self.mirrors,
+            |mirror| {
+                stop_if_cancelled(to)?;
+                let url = mirror_url(mirror, suffix);
+                to.progress(GentooEvent::Fetching { url: &url });
+                let mut bytes = Vec::new();
+                fetcher.fetch(
+                    &FetchRequest::new(&url).sized(limit),
+                    &mut LimitedWriter::new(&mut bytes, limit),
+                )?;
+                Ok(Fetched { url, body: bytes })
+            },
+            || GentooError::Fetch(no_mirror(suffix)),
+        )
     }
 
     /// Resolves the configured variant to a build, and that build to the digest
@@ -1154,7 +1137,7 @@ impl Gentoo {
     /// variant was named or the named one is not in the enumeration — which
     /// names what the architecture does offer.
     pub fn resolve(&mut self) -> Result<Stage3, GentooError> {
-        self.resolve_reporting(None)
+        self.observe(&mut Silent).resolve()
     }
 
     /// The resolution, with somewhere to report to.
@@ -1162,7 +1145,7 @@ impl Gentoo {
     /// Shared by [`resolve`](Self::resolve) and the bootstrap, so the answer a
     /// caller previews and the answer a bootstrap installs come from one code
     /// path and cannot drift apart.
-    fn resolve_reporting(&mut self, to: Reporting<'_, '_>) -> Result<Stage3, GentooError> {
+    fn resolve_reporting(&mut self, to: Reporting<'_>) -> Result<Stage3, GentooError> {
         if let Some(stage3) = &self.stage3 {
             return Ok(stage3.clone());
         }
@@ -1212,7 +1195,7 @@ impl Gentoo {
     }
 
     /// Fetches the pointer document, verifies it, and holds it to the age bound.
-    fn read_pointer(&mut self, to: Reporting<'_, '_>) -> Result<Pointer, GentooError> {
+    fn read_pointer(&mut self, to: Reporting<'_>) -> Result<Pointer, GentooError> {
         let suffix = self.url("latest-stage3.txt");
         let served = self.read_signed(&suffix, MAX_POINTER_BYTES, to)?;
         let pointer = Pointer::parse(&served.url, &served.body)?;
@@ -1267,42 +1250,39 @@ impl Gentoo {
         &mut self,
         suffix: &str,
         limit: u64,
-        to: Reporting<'_, '_>,
+        to: Reporting<'_>,
     ) -> Result<Served, GentooError> {
-        let mut unserved = None;
-        for mirror in &self.mirrors {
-            // Before each mirror rather than before the walk: an unreachable
-            // mirror costs a connect timeout, so a list of them is a step long
-            // enough to want stopping in the middle of.
-            stop_if_cancelled(to)?;
-            let url = format!("{}/{suffix}", mirror.trim_end_matches('/'));
-            // Reported per mirror rather than per document: this walk spends one
-            // mirror timeout per unreachable mirror, and an observer that saw
-            // only the resolution would watch a bootstrap that looks stopped.
-            report(to, GentooEvent::Fetching { url: &url });
-            let mut bytes = Vec::new();
-            match self.fetcher.fetch(
-                &FetchRequest::new(&url).sized(limit),
-                &mut LimitedWriter::new(&mut bytes, limit),
-            ) {
-                Ok(()) => {
-                    let verified = self
-                        .keyring
-                        .verify(&bytes, true)
-                        .map_err(|err| GentooError::signature(&url, err))?;
-                    return Ok(Served {
-                        url,
-                        body: verified.body,
-                        certificate: verified.certificate,
-                    });
-                }
-                Err(err) if err.is_failover() => unserved = Some(err),
-                Err(err) => return Err(GentooError::Fetch(err)),
-            }
-        }
-        Err(GentooError::Fetch(
-            unserved.unwrap_or_else(|| no_mirror(suffix)),
-        ))
+        let fetcher = &mut self.fetcher;
+        let keyring = &self.keyring;
+        walk_mirrors(
+            &self.mirrors,
+            |mirror| {
+                // Before each mirror rather than before the walk: an
+                // unreachable mirror costs a connect timeout, so a list of them
+                // is a step long enough to want stopping in the middle of.
+                stop_if_cancelled(to)?;
+                let url = mirror_url(mirror, suffix);
+                // Reported per mirror rather than per document: this walk spends
+                // one mirror timeout per unreachable mirror, and an observer
+                // that saw only the resolution would watch a bootstrap that
+                // looks stopped.
+                to.progress(GentooEvent::Fetching { url: &url });
+                let mut bytes = Vec::new();
+                fetcher.fetch(
+                    &FetchRequest::new(&url).sized(limit),
+                    &mut LimitedWriter::new(&mut bytes, limit),
+                )?;
+                let verified = keyring
+                    .verify(&bytes, true)
+                    .map_err(|err| GentooError::signature(&url, err))?;
+                Ok(Served {
+                    url,
+                    body: verified.body,
+                    certificate: verified.certificate,
+                })
+            },
+            || GentooError::Fetch(no_mirror(suffix)),
+        )
     }
 
     /// The mirror-relative path of something in this architecture's autobuilds
@@ -1413,12 +1393,62 @@ impl Provisioner for Gentoo {
     /// file of several hundred megabytes, with no package boundary to break it
     /// up.
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        let stage3 = self.resolve_reporting(Some(request))?;
-        report(Some(request), GentooEvent::Resolved { stage3: &stage3 });
+        self.provision_reporting(request, &mut RunObserver { request })
+    }
+}
+
+impl Gentoo {
+    /// Binds a [`GentooObserver`] for one call, returning a view that reports
+    /// to it.
+    ///
+    /// A closure is an observer, so a caller that only wants events writes one
+    /// and never names the trait; a caller that also wants to *stop* the work
+    /// implements [`GentooObserver`] and answers its
+    /// [`cancelled`](GentooObserver::cancelled).
+    ///
+    /// The sink is borrowed for the returned value's lifetime, not the
+    /// provisioner's, so a `Gentoo` outlives every observed call and whatever
+    /// the sink borrows is free again as soon as the call ends:
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent};
+    ///
+    /// let mut gentoo = Gentoo::builder("amd64")
+    ///     .binhost("x86-64")
+    ///     .install(["dev-vcs/git"])
+    ///     .build()?;
+    /// let mut refused: Vec<String> = Vec::new();
+    ///
+    /// let mut sink = |event: GentooEvent<'_>| {
+    ///     if let GentooEvent::Conflict { atom, blocks, .. } = event {
+    ///         refused.push(format!("{atom} blocks {blocks}"));
+    ///     }
+    /// };
+    /// let plan = gentoo.observe(&mut sink).resolve_packages("/var/lib/machines/gentoo");
+    /// drop(sink);
+    ///
+    /// // `refused` is free here, and `gentoo` is still usable.
+    /// println!("{} conflicts on the way to {:?}", refused.len(), plan.is_ok());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn observe<'o>(&'o mut self, sink: &'o mut dyn GentooObserver) -> Observed<'o> {
+        Observed { gentoo: self, sink }
+    }
+
+    /// The body of [`Provisioner::provision`], reporting to `to`.
+    fn provision_reporting(
+        &mut self,
+        request: &ProvisionRequest<'_>,
+        to: Reporting<'_>,
+    ) -> Result<(), ProvisionError> {
+        let stage3 = self.resolve_reporting(to)?;
+        to.progress(GentooEvent::Resolved { stage3: &stage3 });
         // The resolution is two small documents and the download is not, so a
         // caller who cancelled during it should not be committed to the
         // download by having asked what would be downloaded.
-        stop_if_cancelled(Some(request))?;
+        stop_if_cancelled(to)?;
 
         // The cache is the caller's if they named one, and otherwise a sibling
         // of the tree being built that goes with this frame however it ends: a
@@ -1436,26 +1466,20 @@ impl Provisioner for Gentoo {
         // once. That makes the cache-hit path and the fresh-download path one
         // code path, whichever produced the file.
         if !tarball.is_file() {
-            self.download(&stage3, &tarball, Some(request))?;
+            self.download(&stage3, &tarball, to)?;
         }
         // A digest pass over the whole tarball is the second long step, and
         // what precedes it is a complete file in a cache that outlives the run,
         // so stopping here costs the download nothing.
-        stop_if_cancelled(Some(request))?;
-        report(
-            Some(request),
-            GentooEvent::Verifying {
-                path: tarball.as_path(),
-            },
-        );
+        stop_if_cancelled(to)?;
+        to.progress(GentooEvent::Verifying {
+            path: tarball.as_path(),
+        });
         verify(&tarball, stage3.sha512())?;
 
-        report(
-            Some(request),
-            GentooEvent::Extracting {
-                path: tarball.as_path(),
-            },
-        );
+        to.progress(GentooEvent::Extracting {
+            path: tarball.as_path(),
+        });
         // The bytes are verified before the extractor sees them, rather than
         // streamed through it as they arrive: an archive that turns out not to
         // be the one the signed document named would otherwise already have
@@ -1467,12 +1491,10 @@ impl Provisioner for Gentoo {
         if self.install.is_empty() && self.plan.is_none() {
             return Ok(());
         }
-        self.install_wave(request.staging(), None, Some(request))?;
+        self.install_wave(request.staging(), None, to)?;
         Ok(())
     }
-}
 
-impl Gentoo {
     /// Stages the configured install as a disposable overlay upper over the
     /// [`base_layer`](GentooBuilder::base_layer).
     ///
@@ -1512,7 +1534,15 @@ impl Gentoo {
     /// # }
     /// ```
     pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
-        let upper = upper.as_ref();
+        self.stage_layer_reporting(upper.as_ref(), &mut Silent)
+    }
+
+    /// The body of [`stage_layer`](Self::stage_layer), reporting to `to`.
+    fn stage_layer_reporting(
+        &mut self,
+        upper: &Path,
+        to: Reporting<'_>,
+    ) -> Result<BuildLayer, ProvisionError> {
         let Some(base) = self.base_layer.clone() else {
             return Err(GentooError::config(
                 "no base layer was named; call GentooBuilder::base_layer with the Gentoo root the \
@@ -1527,7 +1557,7 @@ impl Gentoo {
         // increment instead of orphaning it: there is no handle in an `Err` for
         // the caller to drop.
         let layer = BuildLayer::new(upper, IdentityMap::Single);
-        self.install_wave(upper, Some(&base), None)?;
+        self.install_wave(upper, Some(&base), to)?;
         Ok(layer)
     }
 
@@ -1547,20 +1577,17 @@ impl Gentoo {
         &mut self,
         root: &Path,
         over: Option<&Path>,
-        to: Reporting<'_, '_>,
+        to: Reporting<'_>,
     ) -> Result<(), ProvisionError> {
         let installed = match over {
             Some(base) => installed::merged(base, root)?,
             None => installed::installed(root)?,
         };
         let plan = self.resolve_install(&installed, to)?;
-        report(
-            to,
-            GentooEvent::Planned {
-                packages: plan.packages.len(),
-                bytes: plan.packages.iter().map(|package| package.size).sum(),
-            },
-        );
+        to.progress(GentooEvent::Planned {
+            packages: plan.packages.len(),
+            bytes: plan.packages.iter().map(|package| package.size).sum(),
+        });
         // The resolution is one document and the downloads are not, so a caller
         // who cancelled during it is not committed to them by having asked what
         // would be installed.
@@ -1581,31 +1608,43 @@ impl Gentoo {
             let below = Rooted::open(base).map_err(GentooError::at("opening the base", base))?;
             counter = counter.max(vdb::counter_of(base, &below)?);
         }
+        // The cache pass, before anything is fetched: the paths a merge will
+        // read, and which of them are not there yet.
+        let mut cached: Vec<PathBuf> = Vec::with_capacity(plan.packages.len());
         for planned in &plan.packages {
-            stop_if_cancelled(to)?;
             // The path came out of an index or a plan document and passed
             // `coordinate::check` either way, so it names something under the
             // cache and under the binhost directory and nothing else.
-            let cached = cache.path().join(&planned.path);
-            if let Some(parent) = cached.parent() {
+            let path = cache.path().join(&planned.path);
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(GentooError::at("creating the download cache", parent))?;
             }
+            cached.push(path);
+        }
+        let missing: Vec<(&PlannedPackage, &Path)> = plan
+            .packages
+            .iter()
+            .zip(&cached)
+            .filter(|(_, path)| !path.is_file())
+            .map(|(planned, path)| (planned, path.as_path()))
+            .collect();
+        self.prefetch_packages(&directory, &missing, to)?;
+
+        for (planned, cached) in plan.packages.iter().zip(&cached) {
+            stop_if_cancelled(to)?;
             // A cached container is bytes on a disk this crate does not own, so
             // it is verified on the read rather than trusted for having been
             // verified once -- which makes the cache-hit path and the
             // fresh-download path one code path.
             if !cached.is_file() {
-                self.download_package(&directory, planned, &cached, to)?;
+                self.download_package(&directory, planned, cached, to)?;
             }
-            report(
-                to,
-                GentooEvent::Merging {
-                    package: &planned.name,
-                    version: &planned.version,
-                },
-            );
-            let package = match gpkg::Package::open(&cached, planned, &self.keyring) {
+            to.progress(GentooEvent::Merging {
+                package: &planned.name,
+                version: &planned.version,
+            });
+            let package = match gpkg::Package::open(cached, planned, &self.keyring) {
                 Ok(package) => package,
                 Err(err) => {
                     // A container that is not what it should be is not the
@@ -1614,12 +1653,86 @@ impl Gentoo {
                     // which reads as a permanent failure rather than as a
                     // mirror that served the wrong bytes once. The same rule
                     // the stage3's digest check applies.
-                    let _ = std::fs::remove_file(&cached);
+                    let _ = std::fs::remove_file(cached);
                     return Err(err.into());
                 }
             };
             counter += 1;
-            vdb::merge(root, &rooted, &cached, &package, planned, counter)?;
+            vdb::merge(root, &rooted, cached, &package, planned, counter)?;
+        }
+        Ok(())
+    }
+
+    /// How many packages one batch asks for.
+    ///
+    /// Each job holds an open staging file for as long as the batch runs, so
+    /// this is a bound on descriptors rather than on the transport, which
+    /// decides for itself how many of a batch to have in flight. It is also the
+    /// granularity a cancelled wave stops at, which is the reason it is not
+    /// larger.
+    const BATCH: usize = 32;
+
+    /// Fills the cache with the packages a wave is about to merge, several at a
+    /// time, through [`Fetch::fetch_all`].
+    ///
+    /// Every job asks the first mirror, which is the one the walk would ask
+    /// first too. A job that does not arrive leaves the cache without that
+    /// package and the walk that follows fetches it with every mirror available
+    /// to it, so this is an optimization and nothing more. What the rename
+    /// publishes is a complete container rather than a verified one, exactly as
+    /// [`download_package`](Self::download_package) does: the verification is
+    /// the read that follows, which is the same read a cache hit goes through.
+    fn prefetch_packages(
+        &mut self,
+        directory: &str,
+        missing: &[(&PlannedPackage, &Path)],
+        to: Reporting<'_>,
+    ) -> Result<(), GentooError> {
+        let Some(mirror) = self.mirrors.first().cloned() else {
+            return Ok(());
+        };
+        for batch in missing.chunks(Self::BATCH) {
+            stop_if_cancelled(to)?;
+            let mut staged = Vec::with_capacity(batch.len());
+            for (planned, dest) in batch {
+                let url = mirror_url(&mirror, &format!("{directory}/{}", planned.path));
+                to.progress(GentooEvent::Fetching { url: &url });
+                let path = super::staging_path(dest);
+                let Ok(file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                else {
+                    continue;
+                };
+                // Capped as the per-package download is, at the smaller of the
+                // index's number and this layer's own ceiling: nothing signs
+                // the index, so its number can be wrong in both directions,
+                // and a transport is free to ignore the size on the request.
+                let sink = io::BufWriter::new(file);
+                let cap = planned.size.min(MAX_PACKAGE_BYTES);
+                staged.push((*planned, *dest, url, path, LimitedWriter::new(sink, cap)));
+            }
+
+            let outcomes = {
+                let mut jobs: Vec<FetchJob<'_>> = staged
+                    .iter_mut()
+                    .map(|(planned, _dest, url, _path, sink)| {
+                        let bound = planned.size.min(MAX_PACKAGE_BYTES);
+                        FetchJob::new(FetchRequest::new(url).sized(bound), sink)
+                    })
+                    .collect();
+                self.fetcher.fetch_all(&mut jobs)
+            };
+
+            for ((_planned, dest, _url, path, sink), outcome) in staged.into_iter().zip(outcomes) {
+                let published = outcome.is_ok()
+                    && sink.into_inner().into_inner().is_ok()
+                    && std::fs::rename(&path, dest).is_ok();
+                if !published {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
         Ok(())
     }
@@ -1639,27 +1752,20 @@ impl Gentoo {
         directory: &str,
         planned: &PlannedPackage,
         dest: &Path,
-        to: Reporting<'_, '_>,
+        to: Reporting<'_>,
     ) -> Result<(), GentooError> {
-        let mut unserved = None;
-        for mirror in &self.mirrors {
-            stop_if_cancelled(to)?;
-            let url = format!(
-                "{}/{directory}/{}",
-                mirror.trim_end_matches('/'),
-                planned.path,
-            );
-            report(to, GentooEvent::Fetching { url: &url });
-            let bound = planned.size.min(MAX_PACKAGE_BYTES);
-            match fetch_to(self.fetcher.as_mut(), &url, bound, dest, BINARY_PACKAGE, to) {
-                Ok(()) => return Ok(()),
-                Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
-                Err(err) => return Err(err),
-            }
-        }
-        Err(GentooError::Fetch(
-            unserved.unwrap_or_else(|| no_mirror(&planned.path)),
-        ))
+        let fetcher = &mut self.fetcher;
+        walk_mirrors(
+            &self.mirrors,
+            |mirror| {
+                stop_if_cancelled(to)?;
+                let url = mirror_url(mirror, &format!("{directory}/{}", planned.path));
+                to.progress(GentooEvent::Fetching { url: &url });
+                let bound = planned.size.min(MAX_PACKAGE_BYTES);
+                fetch_to(fetcher.as_mut(), &url, bound, dest, BINARY_PACKAGE, to)
+            },
+            || GentooError::Fetch(no_mirror(&planned.path)),
+        )
     }
 
     /// Downloads a stage3 into the cache, atomically.
@@ -1677,27 +1783,23 @@ impl Gentoo {
         &mut self,
         stage3: &Stage3,
         dest: &Path,
-        to: Reporting<'_, '_>,
+        to: Reporting<'_>,
     ) -> Result<(), GentooError> {
-        let mut unserved = None;
-        for mirror in &self.mirrors {
-            stop_if_cancelled(to)?;
-            let url = format!(
-                "{}/releases/{}/autobuilds/{}",
-                mirror.trim_end_matches('/'),
-                self.architecture,
-                stage3.path,
-            );
-            report(to, GentooEvent::Fetching { url: &url });
-            match fetch_to(self.fetcher.as_mut(), &url, stage3.size, dest, STAGE3, to) {
-                Ok(()) => return Ok(()),
-                Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
-                Err(err) => return Err(err),
-            }
-        }
-        Err(GentooError::Fetch(
-            unserved.unwrap_or_else(|| no_mirror(&stage3.path)),
-        ))
+        let fetcher = &mut self.fetcher;
+        let architecture = &self.architecture;
+        walk_mirrors(
+            &self.mirrors,
+            |mirror| {
+                stop_if_cancelled(to)?;
+                let url = mirror_url(
+                    mirror,
+                    &format!("releases/{architecture}/autobuilds/{}", stage3.path),
+                );
+                to.progress(GentooEvent::Fetching { url: &url });
+                fetch_to(fetcher.as_mut(), &url, stage3.size, dest, STAGE3, to)
+            },
+            || GentooError::Fetch(no_mirror(&stage3.path)),
+        )
     }
 }
 
@@ -1743,7 +1845,7 @@ fn fetch_to(
     size: u64,
     dest: &Path,
     what: Downloading,
-    to: Reporting<'_, '_>,
+    to: Reporting<'_>,
 ) -> Result<(), GentooError> {
     let staged = super::staging_path(dest);
     let file = std::fs::OpenOptions::new()
@@ -1809,17 +1911,15 @@ fn fetch_to(
 /// transport returns: a `Fetch` implementation is a caller's own and may report
 /// a failed write however it likes, and this is the one thing about it this
 /// crate knows first-hand.
-struct CancellableWriter<'a, 'r, W> {
+struct CancellableWriter<'a, W> {
     inner: W,
-    to: Reporting<'a, 'r>,
+    to: Reporting<'a>,
     cancelled: bool,
 }
 
-impl<W: io::Write> io::Write for CancellableWriter<'_, '_, W> {
+impl<W: io::Write> io::Write for CancellableWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(request) = self.to
-            && request.cancelled()
-        {
+        if self.to.cancelled() {
             self.cancelled = true;
             // Not `Interrupted`, which `io::copy` and `write_all` retry: a
             // cancellation is the one write failure that must not be retried.
@@ -1855,13 +1955,13 @@ fn verify(tarball: &Path, expected: &str) -> Result<(), GentooError> {
     Ok(())
 }
 
-/// Something the Gentoo provisioner is doing, reported to a run's observer.
+/// Something the Gentoo provisioner is doing, reported to a [`GentooObserver`]
+/// or to a run's observer.
 ///
 /// Nested in [`ProvisionEvent::Gentoo`], so one observer attached with
-/// [`Provision::observe`](super::Provision::observe) covers every provisioner.
-/// The set is small because the work is: there is no dependency closure to
-/// resolve, no configure wave, and nothing running in a cage, so a bootstrap is
-/// a fetch, a digest and an extraction.
+/// [`Provision::observe`](super::Provision::observe) covers every provisioner;
+/// [`Gentoo::observe`] binds a sink that receives these directly, including on
+/// the read-half calls no run drives.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum GentooEvent<'a> {
@@ -2000,34 +2100,177 @@ pub enum GentooEvent<'a> {
     },
 }
 
-/// Where a step reports to, when anything is listening.
+/// Receives progress from a Gentoo resolution or bootstrap, and decides whether
+/// it should stop.
 ///
-/// A resolve reached directly has nothing to report to: this layer offers no
-/// observer of its own, its read half being two small fetches rather than the
-/// long resolve the other userlands attach one for. One reached through
-/// [`provision::ensure`](super::ensure) reports into that run's observer.
-type Reporting<'a, 'r> = Option<&'a ProvisionRequest<'r>>;
+/// Bound for one call with [`Gentoo::observe`]. A closure is an observer, so a
+/// caller that only wants events writes one and never names the trait; a caller
+/// that also wants to *stop* the work implements this and answers its
+/// [`cancelled`](GentooObserver::cancelled).
+///
+/// Every method has a default body, so a later release adding one does not
+/// break an implementation.
+pub trait GentooObserver {
+    /// Receives one progress event.
+    fn progress(&mut self, event: GentooEvent<'_>) {
+        let _ = event;
+    }
 
-/// Reports `event` where anything is listening.
-fn report(to: Reporting<'_, '_>, event: GentooEvent<'_>) {
-    if let Some(request) = to {
-        request.report(ProvisionEvent::Gentoo(&event));
+    /// Whether the work should stop.
+    ///
+    /// Consulted at the boundaries where stopping is clean — a mirror in a
+    /// walk, a package boundary, either side of a long download. Returning
+    /// `true` aborts with [`GentooError::Cancelled`], and a run driven through
+    /// [`provision::ensure`](super::ensure) then removes the staging tree, so a
+    /// cancelled bootstrap leaves no destination behind.
+    ///
+    /// The default is `false`: work that is never cancelled.
+    fn cancelled(&mut self) -> bool {
+        false
     }
 }
 
-/// Stops where the run has been cancelled.
+/// A closure is an observer that reports and never cancels.
+impl<F: FnMut(GentooEvent<'_>)> GentooObserver for F {
+    fn progress(&mut self, event: GentooEvent<'_>) {
+        self(event);
+    }
+}
+
+/// The observer an unobserved call reports to: nowhere, and never cancelled.
+struct Silent;
+
+impl GentooObserver for Silent {}
+
+/// An observer that reports nowhere of its own and takes both answers from the
+/// provisioning run: what an unobserved [`Gentoo`] uses as a [`Provisioner`].
+///
+/// The events still reach the run's own observer, wrapped in the shared
+/// vocabulary — that is the one channel every provisioner reports through.
+struct RunObserver<'a, 'r> {
+    request: &'a ProvisionRequest<'r>,
+}
+
+impl GentooObserver for RunObserver<'_, '_> {
+    fn progress(&mut self, event: GentooEvent<'_>) {
+        self.request.report(ProvisionEvent::Gentoo(&event));
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.request.cancelled()
+    }
+}
+
+/// An observer that reports to a sink the caller bound with [`Gentoo::observe`]
+/// and takes its cancellation from the provisioning run.
+///
+/// The caller chose the richer, Gentoo-specific channel for events; a
+/// [`Provision::observe`](crate::provision::Provision::observe) observer can
+/// still stop a bootstrap it is not reporting on.
+struct ObservedRun<'a, 'r, 'o> {
+    sink: &'o mut dyn GentooObserver,
+    request: &'a ProvisionRequest<'r>,
+}
+
+impl GentooObserver for ObservedRun<'_, '_, '_> {
+    fn progress(&mut self, event: GentooEvent<'_>) {
+        self.sink.progress(event);
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.sink.cancelled() || self.request.cancelled()
+    }
+}
+
+/// A [`Gentoo`] with a progress sink bound for one call.
+///
+/// Returned by [`Gentoo::observe`]. It implements [`Provisioner`], so it is
+/// what a caller hands to [`provision::ensure`](super::ensure) when it wants
+/// progress; and it mirrors the provisioner's own entry points so a resolution
+/// or a staged layer reports too.
+pub struct Observed<'o> {
+    gentoo: &'o mut Gentoo,
+    sink: &'o mut dyn GentooObserver,
+}
+
+impl fmt::Debug for Observed<'_> {
+    /// Renders the provisioner being observed. The sink is a caller's closure,
+    /// so it renders as its presence rather than its contents.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Observed")
+            .field("gentoo", &self.gentoo)
+            .field("sink", &Delegate("dyn GentooObserver"))
+            .finish()
+    }
+}
+
+impl Observed<'_> {
+    /// Reports what the architecture publishes. See [`Gentoo::available`].
+    pub fn available(&mut self) -> Result<Available, GentooError> {
+        let pointer = self.gentoo.read_pointer(self.sink)?;
+        Ok(Available {
+            published: pointer.published(),
+            entries: pointer.entries().to_vec(),
+        })
+    }
+
+    /// Reports what the binhost publishes. See [`Gentoo::packages`].
+    pub fn packages(&mut self) -> Result<Catalogue, GentooError> {
+        Ok(self.gentoo.read_index(self.sink)?.into_catalogue())
+    }
+
+    /// Resolves the install closure against `root`, reporting every refusal it
+    /// met on the way. See [`Gentoo::resolve_packages`].
+    pub fn resolve_packages(&mut self, root: impl AsRef<Path>) -> Result<Plan, GentooError> {
+        let installed = installed::installed(root)?;
+        self.gentoo.resolve_install(&installed, self.sink)
+    }
+
+    /// Resolves the configured variant to a build. See [`Gentoo::resolve`].
+    pub fn resolve(&mut self) -> Result<Stage3, GentooError> {
+        self.gentoo.resolve_reporting(self.sink)
+    }
+
+    /// Stages the configured install over the base layer. See
+    /// [`Gentoo::stage_layer`].
+    pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
+        self.gentoo.stage_layer_reporting(upper.as_ref(), self.sink)
+    }
+}
+
+impl Provisioner for Observed<'_> {
+    /// Reports to the sink bound here rather than to the run's observer: the
+    /// caller chose the richer, Gentoo-specific channel by using
+    /// [`Gentoo::observe`]. Cancellation comes from either, so a
+    /// [`Provision::observe`](crate::provision::Provision::observe) observer
+    /// can stop a bootstrap it is not reporting on.
+    fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
+        let mut observer = ObservedRun {
+            sink: self.sink,
+            request,
+        };
+        self.gentoo.provision_reporting(request, &mut observer)
+    }
+}
+
+/// Where a step reports to.
+///
+/// A step never asks whether anything is listening: [`Silent`] is what an
+/// unobserved call passes, [`RunObserver`] is what a run through
+/// [`provision::ensure`](super::ensure) passes, and a caller's own sink is what
+/// [`Gentoo::observe`] passes.
+type Reporting<'a> = &'a mut dyn GentooObserver;
+
+/// Stops where the observer has cancelled the work.
 ///
 /// Consulted at the boundaries where stopping is clean: nothing has been
 /// published, and the staging tree [`provision::ensure`](super::ensure) removes
-/// on any failure is what a partial bootstrap amounts to. A read half reached
-/// directly has no request to ask, which is the same thing [`Reporting`] models
-/// for progress — nothing is driving the call, so nothing can have cancelled
-/// it.
-fn stop_if_cancelled(to: Reporting<'_, '_>) -> Result<(), GentooError> {
-    match to {
-        Some(request) if request.cancelled() => Err(GentooError::Cancelled),
-        _ => Ok(()),
+/// on any failure is what a partial bootstrap amounts to.
+fn stop_if_cancelled(to: Reporting<'_>) -> Result<(), GentooError> {
+    if to.cancelled() {
+        return Err(GentooError::Cancelled);
     }
+    Ok(())
 }
 
 /// A [`Gentoo`] under construction.

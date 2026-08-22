@@ -1,0 +1,126 @@
+# What each userland reaches for outside the provisioning seam.
+#
+# `provision` is the seam three archive layers sit on: the `Provisioner` trait,
+# `Fetch`, `ProvisionError`, `BuildLayer`, and the shared tar, compress,
+# extract, digest, document and OpenPGP machinery. A layer reaching only
+# through it is a layer that could be its own crate; every other name it uses
+# is a thing that would have to move, be re-exported, or become public first.
+#
+# This file is that list. `tools/check-seam.py` compares it against the tree and
+# fails on any difference, which makes each reach past the seam a decision in a
+# diff rather than one nobody made. It is not a ban: several of these are the
+# library's own public API, which a separate crate would depend on anyway.
+#
+# `kind` says what a reach costs if the layers ever move out:
+#
+#   public    Already public API. A separate crate would depend on this crate
+#             and use exactly this name.
+#   internal  Not public. Moving the layer means making it public, moving it,
+#             or writing the layer a copy.
+
+[[layer]]
+name = "debian"
+
+[[layer.reach]]
+name = "Error"
+count = 3
+kind = "public"
+why = "A launch failure, wrapped as `DebianError::Launch`."
+
+[[layer.reach]]
+name = "IdentityMap"
+count = 1
+kind = "public"
+why = "The map the bootstrap's own cages run under."
+
+[[layer.reach]]
+name = "host"
+count = 1
+kind = "public"
+why = "`host::overlay_blocker`, the preflight a layered build makes."
+
+[[layer.reach]]
+name = "status"
+count = 1
+kind = "public"
+why = "`ExitStatus`, the outcome a dpkg wave reports."
+
+[[layer.reach]]
+name = "idmap"
+count = 2
+kind = "internal"
+why = """\
+`idmap::resolve_default_chain`, the preflight that refuses an unavailable range \
+map before anything is downloaded. Nothing public answers the question."""
+
+[[layer.reach]]
+name = "mechanism"
+count = 1
+kind = "internal"
+why = "`mechanism::frame::write_full`, the short-write loop the workspace shares."
+
+[[layer.reach]]
+name = "failure"
+count = 1
+kind = "internal"
+why = "`failure::path_io_error!`, which declares the layer's `io` and `at` constructors."
+
+[[layer]]
+name = "alpine"
+
+[[layer.reach]]
+name = "Error"
+count = 1
+kind = "public"
+why = "A launch failure, wrapped as `AlpineError::Launch`."
+
+[[layer.reach]]
+name = "ExitStatus"
+count = 1
+kind = "public"
+why = "The outcome an install script reports."
+
+[[layer.reach]]
+name = "IdentityMap"
+count = 1
+kind = "public"
+why = "The map the bootstrap's own cages run under."
+
+[[layer.reach]]
+name = "host"
+count = 1
+kind = "public"
+why = "`host::overlay_blocker`, the preflight a layered build makes."
+
+[[layer.reach]]
+name = "idmap"
+count = 1
+kind = "internal"
+why = "`idmap::resolve_default_chain`, as in the Debian layer."
+
+[[layer.reach]]
+name = "failure"
+count = 1
+kind = "internal"
+why = "`failure::path_io_error!`, as in the Debian layer."
+
+[[layer.reach]]
+name = "roster"
+count = 1
+kind = "internal"
+why = "`roster::roster_enum!`, which declares `ScriptKind` and its roster."
+
+[[layer]]
+name = "gentoo"
+
+[[layer.reach]]
+name = "IdentityMap"
+count = 1
+kind = "public"
+why = "The map a staged layer records."
+
+[[layer.reach]]
+name = "failure"
+count = 1
+kind = "internal"
+why = "`failure::path_io_error!`, as in the other two layers."

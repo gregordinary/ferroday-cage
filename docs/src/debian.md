@@ -1212,9 +1212,30 @@ read as a path relative to the current directory. [`file_url`] builds the URL
 for a local path, and is what [`Pool::mirror_url`] answers with: it makes a
 relative path absolute, since such a URL carries a path from a root and has no
 way to spell one that is not. A transport is `Send`, because the provisioner owns it and is
-itself `Send` — see [thread bounds](stability.md#thread-bounds). Fetches run on
-the thread that called into the provisioner, so a transport is never used from
-two threads at once.
+itself `Send` — see [thread bounds](stability.md#thread-bounds).
+
+The bundled fetcher holds its connection open between requests, as HTTP/1.1 does
+by default, so a bootstrap installing a few hundred packages from one host pays
+one handshake rather than a few hundred.
+
+A bootstrap is nearly all network on a cold cache, so the packages it is about to
+install are asked for in batches through `Fetch::fetch_all` before the
+package-by-package wave runs. That method has a default body — one `fetch` per
+job, in order — so a transport that overrides nothing behaves exactly as it did
+before it existed. `HttpFetch` overrides it and runs four at once, each on a
+connection of its own; `HttpFetch::concurrency` changes how many. The ceiling is
+deliberately low: an archive mirror is usually somebody else's bandwidth, and the
+win is in overlapping latency rather than in saturating a link.
+
+The batch decides nothing. A job it does not deliver simply leaves the cache
+without that package, and the wave behind it downloads that package with every
+mirror available to it, exactly as though the batch had not run. Whether a
+package is present is still the rename, and the rename happens only over bytes
+that verified.
+
+A transport therefore sees calls from more than one thread only when it says so,
+by overriding `fetch_all`; the default body, and every `fetch`, run on the thread
+that called into the provisioner.
 
 ## Ownership
 

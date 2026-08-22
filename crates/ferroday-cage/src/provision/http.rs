@@ -17,9 +17,11 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use super::fetch::{Fetch, FetchError, FetchRequest};
+use super::fetch::{Fetch, FetchError, FetchJob, FetchRequest};
 
 /// The ceiling on a single response body, buffered in memory before its digest
 /// is checked. It sits far above any Debian index or `.deb`, so it never bites
@@ -40,18 +42,64 @@ const MAX_LINE: usize = 16 * 1024;
 const MAX_HEADERS: usize = 256;
 
 /// The default HTTP and `file://` fetcher.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HttpFetch {
     connect_timeout: Duration,
     io_timeout: Duration,
     request_timeout: Option<Duration>,
     max_redirects: u32,
     cross_host_redirects: bool,
+    concurrency: usize,
+    /// The connection the last request left open, held for the next one.
+    ///
+    /// A bootstrap fetches a few hundred resources from one host, so a
+    /// connection per resource is a few hundred DNS lookups, handshakes and
+    /// slow-start ramps against a peer that was already answering. HTTP/1.1
+    /// keeps a connection open by default and this client already does the
+    /// hard part -- it reads `Content-Length` and chunked framing, which is
+    /// what tells it where a response ends without waiting for the socket to
+    /// close.
+    ///
+    /// One connection rather than a pool: `fetch` takes `&mut self` and so
+    /// runs one request at a time, and [`fetch_all`](Fetch::fetch_all) gives
+    /// each of its workers a fetcher of its own.
+    idle: Option<Kept>,
+}
+
+/// A connection held open between requests, with whatever the reader had
+/// buffered past the end of the last response.
+///
+/// The buffer travels with it because it must: a framed body ends where the
+/// framing says, and anything the reader had already pulled from the socket
+/// past that point is the next response's first bytes.
+#[derive(Debug)]
+struct Kept {
+    host: String,
+    port: u16,
+    reader: BufReader<DeadlineReader<TcpStream>>,
+}
+
+impl Clone for HttpFetch {
+    /// A clone is a fetcher with the same settings and no connection: a
+    /// connection belongs to whoever is using it, and two fetchers reading one
+    /// socket would interleave their responses.
+    fn clone(&self) -> HttpFetch {
+        HttpFetch {
+            connect_timeout: self.connect_timeout,
+            io_timeout: self.io_timeout,
+            request_timeout: self.request_timeout,
+            max_redirects: self.max_redirects,
+            cross_host_redirects: self.cross_host_redirects,
+            concurrency: self.concurrency,
+            idle: None,
+        }
+    }
 }
 
 impl Default for HttpFetch {
     fn default() -> Self {
         HttpFetch {
+            idle: None,
             connect_timeout: Duration::from_secs(30),
             io_timeout: Duration::from_secs(120),
             // A whole-request wall-clock ceiling. The per-read timeout alone
@@ -63,6 +111,9 @@ impl Default for HttpFetch {
             request_timeout: Some(Duration::from_secs(3600)),
             max_redirects: 5,
             cross_host_redirects: false,
+            // Four connections hide almost all of the per-request round trip
+            // against one host without asking much of a volunteer mirror.
+            concurrency: 4,
         }
     }
 }
@@ -89,6 +140,19 @@ impl HttpFetch {
     /// asking to wait.
     pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Sets how many resources [`fetch_all`](Fetch::fetch_all) fetches at once
+    /// (the default is 4, and 0 means 1).
+    ///
+    /// The ceiling is deliberately low. An archive mirror is usually somebody
+    /// else's bandwidth and somebody else's connection table, and the win here
+    /// is in overlapping latency rather than in saturating a link: four
+    /// connections hide almost all of the per-request round trip, and more of
+    /// them mostly asks a volunteer mirror for more.
+    pub fn concurrency(mut self, at_once: usize) -> Self {
+        self.concurrency = at_once.max(1);
         self
     }
 
@@ -142,12 +206,101 @@ impl Fetch for HttpFetch {
             ),
         ))
     }
+
+    /// Fetches up to [`concurrency`](HttpFetch::concurrency) of the jobs at
+    /// once, each on a connection of its own.
+    ///
+    /// A cold bootstrap is nearly all network: a few hundred small files from
+    /// one host, each costing a round trip that nothing overlaps. Workers take
+    /// the next job as they finish one, so a batch holding one large package
+    /// and a hundred small ones does not wait on the large one.
+    ///
+    /// Each worker carries a fetcher of its own, cloned from this one, and so
+    /// keeps its own connection open across the jobs it takes. This fetcher's
+    /// own connection is not shared with them: one socket carrying two
+    /// interleaved responses is not HTTP.
+    fn fetch_all(&mut self, jobs: &mut [FetchJob<'_>]) -> Vec<Result<(), FetchError>> {
+        let workers = self.concurrency.min(jobs.len());
+        if workers <= 1 {
+            return jobs
+                .iter_mut()
+                .map(|job| {
+                    let (request, sink) = job.parts();
+                    self.fetch(request, sink)
+                })
+                .collect();
+        }
+
+        // Each outcome is written by whichever worker took that job, so the
+        // slots are handed out one per job and never shared.
+        let mut outcomes: Vec<Option<Result<(), FetchError>>> =
+            (0..jobs.len()).map(|_| None).collect();
+        let queue = Mutex::new(
+            jobs.iter_mut()
+                .zip(outcomes.iter_mut())
+                .collect::<Vec<_>>()
+                .into_iter(),
+        );
+
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                let queue = &queue;
+                let settings = self.clone();
+                scope.spawn(move || {
+                    let mut fetcher = settings;
+                    loop {
+                        // The lock is held only long enough to take the next
+                        // job, never across a fetch.
+                        let next = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .next();
+                        let Some((job, outcome)) = next else {
+                            return;
+                        };
+                        let (request, sink) = job.parts();
+                        *outcome = Some(fetcher.fetch(request, sink));
+                    }
+                });
+            }
+        });
+
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every job was taken by a worker"))
+            .collect()
+    }
 }
 
 /// The result of one request: the body was delivered, or a redirect target.
 enum Step {
     Done,
     Redirect(String),
+}
+
+/// Where in an exchange a failure happened.
+///
+/// The distinction exists for one reason: a connection reused from a previous
+/// request may have been closed by the peer while it was idle, and a peer says
+/// nothing when it does. That failure is indistinguishable from a mirror that
+/// closed mid-request, so a reused connection gets one fresh attempt -- but
+/// only where nothing has reached the caller's sink yet, since a retry cannot
+/// unwrite what was already delivered.
+enum Exchange {
+    /// The request was not answered: nothing has been written to the sink.
+    BeforeBody(FetchError),
+    /// The response had begun, so a retry would deliver a second copy of
+    /// whatever the first attempt already wrote.
+    AfterBody(FetchError),
+}
+
+impl Exchange {
+    /// The failure itself, once where it happened has been acted on.
+    fn into_error(self) -> FetchError {
+        match self {
+            Exchange::BeforeBody(err) | Exchange::AfterBody(err) => err,
+        }
+    }
 }
 
 /// A parsed `http://` URL.
@@ -178,34 +331,40 @@ impl HttpUrl {
 impl HttpFetch {
     /// Performs one HTTP request, streaming a 2xx body to `sink` and refusing
     /// one that runs past `cap` bytes.
-    fn request(&self, url: &str, sink: &mut dyn Write, cap: u64) -> Result<Step, FetchError> {
+    ///
+    /// Reuses the connection the last request left open where it goes to the
+    /// same host and port. A peer is free to close an idle connection at any
+    /// time and says nothing when it does, so a reused connection that fails
+    /// before the body has begun is retried once on a fresh one -- which is the
+    /// whole of what makes reuse safe, since that failure is indistinguishable
+    /// from a peer that closed while the request was in flight.
+    fn request(&mut self, url: &str, sink: &mut dyn Write, cap: u64) -> Result<Step, FetchError> {
         let parsed = parse_http_url(url)?;
+
+        let kept = self
+            .idle
+            .take()
+            .filter(|kept| kept.host == parsed.host && kept.port == parsed.port);
+        let reused = kept.is_some();
+        match self.exchange(url, &parsed, kept, sink, cap) {
+            Err(Exchange::BeforeBody(_)) if reused => self
+                .exchange(url, &parsed, None, sink, cap)
+                .map_err(Exchange::into_error),
+            outcome => outcome.map_err(Exchange::into_error),
+        }
+    }
+
+    /// One request-and-response over `kept`, or over a fresh connection where
+    /// there is none to reuse.
+    fn exchange(
+        &mut self,
+        url: &str,
+        parsed: &HttpUrl,
+        kept: Option<Kept>,
+        sink: &mut dyn Write,
+        cap: u64,
+    ) -> Result<Step, Exchange> {
         let io = |op: &'static str| FetchError::at(op, url);
-
-        let addrs = (parsed.host.as_str(), parsed.port)
-            .to_socket_addrs()
-            .map_err(io("resolving the address"))?;
-        let stream = self.connect(url, addrs)?;
-        stream
-            .set_read_timeout(Some(self.io_timeout))
-            .map_err(io("connecting"))?;
-        stream
-            .set_write_timeout(Some(self.io_timeout))
-            .map_err(io("connecting"))?;
-
-        let host_header = if parsed.port == 80 {
-            parsed.authority_host().into_owned()
-        } else {
-            format!("{}:{}", parsed.authority_host(), parsed.port)
-        };
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: ferroday-cage\r\n\
-             Accept: */*\r\nConnection: close\r\n\r\n",
-            parsed.path,
-        );
-        (&stream)
-            .write_all(request.as_bytes())
-            .map_err(io("sending the request"))?;
 
         // Bound the whole response, not just each read: the deadline is checked
         // before every underlying read, so a mirror that trickles bytes to keep
@@ -217,28 +376,105 @@ impl HttpFetch {
         let deadline = self
             .request_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
-        let mut reader = BufReader::new(DeadlineReader {
-            inner: stream,
-            deadline,
-        });
-        let code = read_status(&mut reader).map_err(io("reading the response"))?;
-        let headers = read_headers(&mut reader).map_err(io("reading the response"))?;
+
+        let mut reader = match kept {
+            Some(mut kept) => {
+                // The deadline is this request's, not the one the connection
+                // was opened under.
+                kept.reader.get_mut().deadline = deadline;
+                kept.reader
+            }
+            None => {
+                let addrs = (parsed.host.as_str(), parsed.port)
+                    .to_socket_addrs()
+                    .map_err(io("resolving the address"))
+                    .map_err(Exchange::BeforeBody)?;
+                let stream = self.connect(url, addrs).map_err(Exchange::BeforeBody)?;
+                BufReader::new(DeadlineReader {
+                    inner: stream,
+                    deadline,
+                })
+            }
+        };
+        {
+            let stream = &reader.get_ref().inner;
+            stream
+                .set_read_timeout(Some(self.io_timeout))
+                .map_err(io("connecting"))
+                .map_err(Exchange::BeforeBody)?;
+            stream
+                .set_write_timeout(Some(self.io_timeout))
+                .map_err(io("connecting"))
+                .map_err(Exchange::BeforeBody)?;
+        }
+
+        let host_header = if parsed.port == 80 {
+            parsed.authority_host().into_owned()
+        } else {
+            format!("{}:{}", parsed.authority_host(), parsed.port)
+        };
+        // No `Connection:` header at all, which is HTTP/1.1's own default of
+        // keeping the connection open. A peer that will not is required to say
+        // so, and `Headers::close` is what reads that back.
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: ferroday-cage\r\n\
+             Accept: */*\r\n\r\n",
+            parsed.path,
+        );
+        (&reader.get_ref().inner)
+            .write_all(request.as_bytes())
+            .map_err(io("sending the request"))
+            .map_err(Exchange::BeforeBody)?;
+
+        let code = read_status(&mut reader)
+            .map_err(io("reading the response"))
+            .map_err(Exchange::BeforeBody)?;
+        let headers = read_headers(&mut reader)
+            .map_err(io("reading the response"))
+            .map_err(Exchange::BeforeBody)?;
+
+        // Whether the connection can serve another request. A response with no
+        // definite framing ends at end of stream, so there is nothing after it
+        // to read; a peer that said `Connection: close` is about to close.
+        let framed = headers.chunked || headers.content_length.is_some();
+        let mut keep = |reader| {
+            if framed && !headers.close {
+                self.idle = Some(Kept {
+                    host: parsed.host.clone(),
+                    port: parsed.port,
+                    reader,
+                });
+            }
+        };
 
         match code {
             200 => {}
             301 | 302 | 303 | 307 | 308 => {
                 let location = headers
                     .location
-                    .ok_or_else(|| FetchError::status(url, code))?;
+                    .clone()
+                    .ok_or_else(|| FetchError::status(url, code))
+                    .map_err(Exchange::AfterBody)?;
+                // A redirect carries a body of its own, framed like any other,
+                // and the connection is only reusable once it has been read
+                // off. It is bounded by the same cap and thrown away.
+                if framed {
+                    let mut discard = io::sink();
+                    read_body(&mut reader, &headers, &mut discard, cap)
+                        .map_err(io("reading the body"))
+                        .map_err(Exchange::AfterBody)?;
+                    keep(reader);
+                }
                 let next = resolve_redirect(url, &location);
-                self.check_redirect_host(url, &next)?;
+                self.check_redirect_host(url, &next)
+                    .map_err(Exchange::AfterBody)?;
                 return Ok(Step::Redirect(next));
             }
             404 => {
-                return Err(FetchError::not_found(url));
+                return Err(Exchange::AfterBody(FetchError::not_found(url)));
             }
             other => {
-                return Err(FetchError::status(url, other));
+                return Err(Exchange::AfterBody(FetchError::status(url, other)));
             }
         }
 
@@ -246,28 +482,10 @@ impl HttpFetch {
         // may weigh — the signed length where one is stated, `MAX_BODY`
         // otherwise — so a hostile mirror cannot drive unbounded buffering by
         // announcing a huge framing or never closing the connection.
-        let mut sink = super::LimitedWriter::new(sink, cap);
-        if headers.chunked {
-            read_chunked(&mut reader, &mut sink).map_err(io("reading the body"))?;
-        } else if let Some(length) = headers.content_length {
-            if length > cap {
-                // The refusal `LimitedWriter` makes when a body runs past the
-                // cap, made here before a byte is read because this response
-                // said in advance how big it was. Reported identically, so
-                // which of the two a mirror meets -- and whether a walk over
-                // several of them advances past it -- does not depend on the
-                // framing that mirror chose.
-                return Err(io("reading the body")(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("the response is {length} bytes, over the {cap}-byte cap"),
-                )));
-            }
-            read_sized(&mut reader, length, &mut sink).map_err(io("reading the body"))?;
-        } else {
-            // No framing: the body runs to end of stream, which Connection:
-            // close guarantees.
-            io::copy(&mut reader, &mut sink).map_err(io("reading the body"))?;
-        }
+        read_body(&mut reader, &headers, sink, cap)
+            .map_err(io("reading the body"))
+            .map_err(Exchange::AfterBody)?;
+        keep(reader);
         Ok(Step::Done)
     }
 
@@ -554,6 +772,12 @@ struct Headers {
     content_length: Option<u64>,
     chunked: bool,
     location: Option<String>,
+    /// Whether the peer said it will close the connection after this response.
+    ///
+    /// HTTP/1.1 keeps a connection open unless a response says otherwise, so
+    /// this is what decides whether the connection can be held for the next
+    /// request.
+    close: bool,
 }
 
 /// Reads one line through its newline into `line`, capping its length at
@@ -644,6 +868,15 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
                 headers.chunked = true;
             } else if name.eq_ignore_ascii_case("location") {
                 headers.location = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("connection")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+            {
+                // The peer will close after this response, so the connection is
+                // not one to hold for the next request. A comma-separated list
+                // is legal here and `close` may be anywhere in it.
+                headers.close = true;
             }
         }
     }
@@ -656,6 +889,42 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
 }
 
 /// Copies exactly `length` bytes from `reader` to `sink`.
+/// Reads one response body, however it is framed, into `sink`.
+///
+/// `cap` is what this resource may weigh -- the signed length where one is
+/// stated, `MAX_BODY` otherwise -- and every path streams through a writer held
+/// to it, so a hostile mirror cannot drive unbounded buffering by announcing a
+/// huge framing or never closing the connection.
+fn read_body<R: BufRead>(
+    reader: &mut R,
+    headers: &Headers,
+    sink: &mut dyn Write,
+    cap: u64,
+) -> io::Result<()> {
+    let mut sink = super::LimitedWriter::new(sink, cap);
+    if headers.chunked {
+        read_chunked(reader, &mut sink)
+    } else if let Some(length) = headers.content_length {
+        if length > cap {
+            // The refusal `LimitedWriter` makes when a body runs past the cap,
+            // made here before a byte is read because this response said in
+            // advance how big it was. Reported identically, so which of the two
+            // a mirror meets -- and whether a walk over several of them
+            // advances past it -- does not depend on the framing that mirror
+            // chose.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the response is {length} bytes, over the {cap}-byte cap"),
+            ));
+        }
+        read_sized(reader, length, &mut sink)
+    } else {
+        // No framing: the body runs to end of stream, which the peer's own
+        // `Connection: close` is what promises.
+        io::copy(reader, &mut sink).map(|_| ())
+    }
+}
+
 fn read_sized<R: Read>(reader: &mut R, length: u64, sink: &mut dyn Write) -> io::Result<()> {
     let copied = io::copy(&mut reader.take(length), sink)?;
     if copied != length {
@@ -710,6 +979,7 @@ fn read_chunked<R: BufRead>(reader: &mut R, sink: &mut dyn Write) -> io::Result<
 /// the per-read timeout from firing. The deadline is checked before each read,
 /// so total time is bounded by the deadline plus one read timeout. `None`
 /// removes the bound.
+#[derive(Debug)]
 struct DeadlineReader<R> {
     inner: R,
     deadline: Option<Instant>,
@@ -767,6 +1037,273 @@ mod tests {
             }
         });
         (url, served)
+    }
+
+    /// Serves `responses` in order down *one* connection, and reports how many
+    /// connections were accepted.
+    ///
+    /// The count is the whole point: a client that reuses its connection
+    /// accepts one, and a client that opens a fresh one per request accepts as
+    /// many as it made.
+    fn serving_one_connection(
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback listener binds");
+        let url = format!(
+            "http://{}/x",
+            listener.local_addr().expect("the listener is bound"),
+        );
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&accepted);
+        let served = std::thread::spawn(move || {
+            let mut remaining = responses.into_iter().peekable();
+            'accept: while remaining.peek().is_some() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = BufReader::new(stream.try_clone().expect("the stream clones"));
+                loop {
+                    let mut line = String::new();
+                    // End of input means the client is done with this
+                    // connection; whatever is left goes to the next one.
+                    match request.read_line(&mut line) {
+                        Ok(0) | Err(_) => continue 'accept,
+                        Ok(_) => {}
+                    }
+                    if line != "\r\n" {
+                        continue;
+                    }
+                    let Some(response) = remaining.next() else {
+                        return;
+                    };
+                    if stream.write_all(&response).is_err() {
+                        continue 'accept;
+                    }
+                    // Serving the last one ends the thread, so a test that
+                    // joins it does not wait for a connection nobody will make.
+                    if remaining.peek().is_none() {
+                        return;
+                    }
+                }
+            }
+        });
+        (url, accepted, served)
+    }
+
+    #[test]
+    fn a_second_fetch_reuses_the_connection_the_first_left_open() {
+        // The win this buys: a bootstrap fetches a few hundred resources from
+        // one host, and a connection per resource is a few hundred handshakes
+        // and slow-start ramps against a peer that was already answering.
+        let response = |body: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            )
+            .into_bytes()
+        };
+        let (url, accepted, served) =
+            serving_one_connection(vec![response("first"), response("second")]);
+
+        let mut fetcher = HttpFetch::new();
+        let mut first = Vec::new();
+        fetcher
+            .fetch(&FetchRequest::new(&url), &mut first)
+            .expect("the first fetch answers");
+        let mut second = Vec::new();
+        fetcher
+            .fetch(&FetchRequest::new(&url), &mut second)
+            .expect("the second fetch answers");
+
+        assert_eq!(first, b"first");
+        assert_eq!(second, b"second");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second request should have gone down the first connection",
+        );
+        drop(fetcher);
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
+    fn a_peer_that_says_it_will_close_is_not_held_open() {
+        // `Connection: close` is the peer saying this connection serves one
+        // response. Holding it would make the next request fail and retry,
+        // which is correct but wasteful, so it is not held.
+        let body = "only";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+        .into_bytes();
+        let (url, served) = serving(2, response);
+
+        let mut fetcher = HttpFetch::new();
+        for _ in 0..2 {
+            let mut out = Vec::new();
+            fetcher
+                .fetch(&FetchRequest::new(&url), &mut out)
+                .expect("each fetch answers");
+            assert_eq!(out, b"only");
+        }
+        assert!(fetcher.idle.is_none(), "a closing peer is not held open");
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
+    fn a_connection_the_peer_closed_while_idle_is_retried_once() {
+        // The failure reuse has to survive: a peer may close an idle connection
+        // at any time and says nothing when it does, so the second request goes
+        // out on a socket the peer has already gone from. Nothing has reached
+        // the caller's sink at that point, so one fresh attempt is safe -- and
+        // it is what keeps reuse from turning a working bootstrap into a flaky
+        // one.
+        let body = "served";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        )
+        .into_bytes();
+        // Each connection serves exactly one response and is then dropped,
+        // while the client believes both are reusable.
+        let (url, served) = serving(2, response);
+
+        let mut fetcher = HttpFetch::new();
+        let mut first = Vec::new();
+        fetcher
+            .fetch(&FetchRequest::new(&url), &mut first)
+            .expect("the first fetch answers");
+        let mut second = Vec::new();
+        fetcher
+            .fetch(&FetchRequest::new(&url), &mut second)
+            .expect("the retry on a fresh connection answers");
+        assert_eq!(first, b"served");
+        assert_eq!(second, b"served");
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
+    fn a_batch_fetches_several_at_once() {
+        // The property, measured rather than asserted structurally: the server
+        // holds every response back until it has seen `at_once` requests, so a
+        // client that fetched them one at a time would deadlock on the first
+        // and this test would time out rather than fail. What it proves is that
+        // several are in flight together.
+        const AT_ONCE: usize = 4;
+        const JOBS: usize = 8;
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback listener binds");
+        let url = format!(
+            "http://{}/x",
+            listener.local_addr().expect("the listener is bound"),
+        );
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        let held = std::sync::Arc::clone(&gate);
+        let served = std::thread::spawn(move || {
+            let mut streams = Vec::new();
+            for _ in 0..AT_ONCE {
+                let (stream, _) = listener.accept().expect("a connection arrives");
+                let mut request = BufReader::new(stream.try_clone().expect("the stream clones"));
+                let mut line = String::new();
+                while request.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                streams.push(stream);
+            }
+            // Every worker is now blocked on a response, which is the thing
+            // being proved. Release them, then serve the rest one per request.
+            {
+                let (lock, notify) = &*held;
+                *lock.lock().expect("the gate is not poisoned") = AT_ONCE;
+                notify.notify_all();
+            }
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            for mut stream in streams {
+                let _ = stream.write_all(response);
+            }
+            for _ in AT_ONCE..JOBS {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = BufReader::new(stream.try_clone().expect("the stream clones"));
+                let mut line = String::new();
+                while request.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let _ = stream.write_all(response);
+            }
+        });
+
+        let mut sinks: Vec<Vec<u8>> = (0..JOBS).map(|_| Vec::new()).collect();
+        let outcomes = {
+            let mut jobs: Vec<FetchJob<'_>> = sinks
+                .iter_mut()
+                .map(|sink| FetchJob::new(FetchRequest::new(&url), sink))
+                .collect();
+            HttpFetch::new().concurrency(AT_ONCE).fetch_all(&mut jobs)
+        };
+
+        assert_eq!(outcomes.len(), JOBS);
+        for outcome in &outcomes {
+            assert!(outcome.is_ok(), "{outcome:?}");
+        }
+        for sink in &sinks {
+            assert_eq!(sink, b"ok");
+        }
+        let (lock, _) = &*gate;
+        assert_eq!(
+            *lock.lock().expect("the gate is not poisoned"),
+            AT_ONCE,
+            "the server released the workers only once all four had asked",
+        );
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
+    fn a_batch_answers_per_job_so_one_failure_does_not_take_the_rest() {
+        // What the per-job answer is for: a caller retries what did not arrive
+        // against the next mirror and keeps what did.
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+        let missing =
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (found_url, found) = serving(1, ok);
+        let (absent_url, absent) = serving(1, missing);
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let outcomes = {
+            let mut jobs = vec![
+                FetchJob::new(FetchRequest::new(&found_url), &mut first),
+                FetchJob::new(FetchRequest::new(&absent_url), &mut second),
+            ];
+            // One at a time, which is the default body every other transport
+            // inherits: the answer must be per job there too.
+            HttpFetch::new().concurrency(1).fetch_all(&mut jobs)
+        };
+
+        assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
+        assert!(
+            matches!(outcomes[1], Err(FetchError::NotFound { .. })),
+            "{:?}",
+            outcomes[1],
+        );
+        assert_eq!(first, b"ok");
+        found.join().expect("the server thread ends");
+        absent.join().expect("the server thread ends");
     }
 
     #[test]

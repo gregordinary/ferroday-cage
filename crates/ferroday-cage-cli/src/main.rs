@@ -47,352 +47,1705 @@ use ferroday_cage::{
 };
 use serde::Deserialize as _;
 
-const USAGE: &str = "\
+/// What follows a flag's name on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arity {
+    /// Nothing: the flag is the whole argument.
+    Bare,
+    /// One value, written `--flag VALUE` or `--flag=VALUE`.
+    One,
+    /// Two, written `--flag FIRST SECOND`. Only the mount and environment
+    /// flags take a pair, and none of them has a joined form: `--bind=A B`
+    /// would put one of the two on the wrong side of the `=`.
+    Two,
+}
+
+/// The invocation a flag belongs to.
+///
+/// `fcage` is several programs behind one name, and each mode's parser accepts
+/// only its own flags. What the modes share is where the command begins, which
+/// is why every flag is here whether a launch takes it or not: the pre-scan
+/// that routes an invocation has to walk past a flag's value to find the first
+/// positional argument, and it can only do that if it knows what each flag
+/// takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The ordinary invocation: build a sandbox and run a command in it.
+    Launch,
+    /// `--remove-rootfs`.
+    Remove,
+    /// `--export-rootfs`.
+    Export,
+    /// `--gentoo-variants`.
+    GentooVariants,
+    /// `--gentoo-packages`.
+    GentooPackages,
+    /// `--gentoo-installed`.
+    GentooInstalled,
+    /// `--gentoo-keyring-horizon`.
+    GentooKeyring,
+    /// `--help`.
+    Help,
+    /// `--version`.
+    Version,
+}
+
+/// Where `--help` lists a flag.
+///
+/// The order here is the order the sections are printed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Provisioning,
+    Profiles,
+    Identity,
+    Command,
+    Networking,
+    Hardening,
+    Off,
+    Help,
+    /// Named in the closing prose rather than listed: the counterpart toggles,
+    /// each of which overrides a profile in the direction its named partner
+    /// does not.
+    Counterpart,
+}
+
+impl Section {
+    /// Every section, in the order `--help` prints them.
+    const ALL: &'static [Section] = &[
+        Section::Provisioning,
+        Section::Profiles,
+        Section::Identity,
+        Section::Command,
+        Section::Networking,
+        Section::Hardening,
+        Section::Off,
+        Section::Help,
+        Section::Counterpart,
+    ];
+
+    /// The heading `--help` prints above it, or `None` for the flags the
+    /// closing prose names instead of listing.
+    const fn heading(self) -> Option<&'static str> {
+        match self {
+            Section::Provisioning => Some("Provisioning the root filesystem"),
+            Section::Profiles => Some("Profiles, overlays, and mounts"),
+            Section::Identity => Some("Identity and limits"),
+            Section::Command => Some("The command and its process"),
+            Section::Networking => Some("Networking"),
+            Section::Hardening => Some("Hardening"),
+            Section::Off => Some("Turning off what is on by default"),
+            Section::Help => Some("Help and version"),
+            Section::Counterpart => None,
+        }
+    }
+}
+
+/// What a launch does with a flag, and what the flag takes.
+///
+/// The two are one field rather than two, so that a flag's arity is the shape
+/// of the function that applies it and cannot disagree with it.
+#[derive(Clone, Copy)]
+enum Take {
+    /// A flag with nothing after it.
+    Bare(fn(&mut Options)),
+    /// A flag taking one value.
+    One(fn(&mut Options, &'static str, OsString) -> Result<(), String>),
+    /// A flag taking two.
+    Two(fn(&mut Options, &'static str, OsString, OsString) -> Result<(), String>),
+    /// A flag a launch refuses, because it belongs to another mode. The arity
+    /// is still recorded: the pre-scan walks past such a flag's value like any
+    /// other's, and reading its value as the command is how a mode used to be
+    /// chosen by accident.
+    Refused(Arity),
+}
+
+/// One flag `fcage` accepts, wherever it accepts it.
+///
+/// This is the parser's vocabulary, the help's contents, and the suggester's
+/// candidate list, declared once. Each of those used to be derived from one of
+/// the others by scraping text -- the help read out of a 371-line string
+/// constant, and the parser's vocabulary read out of this file's own source --
+/// which meant a pattern that stopped matching produced an empty list and an
+/// empty list passed.
+#[derive(Clone, Copy)]
+struct Flag {
+    /// The name, with its leading dashes.
+    long: &'static str,
+    /// A one-letter alias, where the flag has one.
+    short: Option<&'static str>,
+    /// What `--help` writes after the name: `DIR`, `SRC DEST`, or nothing.
+    placeholder: &'static str,
+    /// Where `--help` lists it.
+    section: Section,
+    /// What `--help` says about it, one entry per line of the entry's body.
+    ///
+    /// Held as written rather than as a paragraph to wrap: the help is prose
+    /// broken where it reads well rather than at a column, and re-wrapping it
+    /// would move a line break the person who wrote the sentence chose.
+    help: &'static [&'static str],
+    /// Whether a roster generated from the library follows the entry.
+    roster: bool,
+    /// The invocation it belongs to.
+    mode: Mode,
+    /// Whether naming this flag is what selects its mode.
+    selects: bool,
+    /// What a missing value is reported as: `--flag requires {needs}`.
+    needs: &'static str,
+    /// What a launch does with it, and what it takes.
+    take: Take,
+}
+
+impl Flag {
+    /// The fields most flags share, so an entry states only what is its own.
+    const DEFAULTS: Flag = Flag {
+        long: "",
+        short: None,
+        placeholder: "",
+        section: Section::Command,
+        help: &[],
+        roster: false,
+        mode: Mode::Launch,
+        selects: false,
+        needs: "a value",
+        take: Take::Refused(Arity::Bare),
+    };
+
+    /// What follows this flag's name.
+    const fn arity(&self) -> Arity {
+        match self.take {
+            Take::Bare(_) => Arity::Bare,
+            Take::One(_) => Arity::One,
+            Take::Two(_) => Arity::Two,
+            Take::Refused(arity) => arity,
+        }
+    }
+
+    /// The name and its placeholder, as `--help` writes them.
+    fn spelled(&self) -> String {
+        let mut out = String::new();
+        if let Some(short) = self.short {
+            out.push_str(short);
+            out.push_str(", ");
+        }
+        out.push_str(self.long);
+        if !self.placeholder.is_empty() {
+            out.push(' ');
+            out.push_str(self.placeholder);
+        }
+        out
+    }
+}
+
+/// Every flag `fcage` accepts, in the order `--help` lists them.
+const FLAGS: &[Flag] = &[
+    Flag {
+        long: "--rootfs",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &["Directory to present as the sandbox root filesystem"],
+        take: Take::One(|options, _flag, value| {
+            options.rootfs = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--provision-tar",
+        section: Section::Provisioning,
+        placeholder: "FILE",
+        help: &[
+            "Provision --rootfs from a tar archive (plain, gzip,",
+            "xz, or zstd) when the directory does not exist yet",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.provision_tar = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--provision-debian",
+        section: Section::Provisioning,
+        placeholder: "SUITE",
+        help: &[
+            "Bootstrap --rootfs as a Debian SUITE (e.g. trixie)",
+            "from the archive; given without a command, provision",
+            "and exit",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.provision_debian = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-arch",
+        section: Section::Provisioning,
+        placeholder: "ARCH",
+        help: &[
+            "Target architecture for --provision-debian (default:",
+            "the host architecture)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.debian_arch = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-mirror",
+        section: Section::Provisioning,
+        placeholder: "URL",
+        help: &["Archive mirror (default: http://deb.debian.org/debian)"],
+        take: Take::One(|options, flag, value| {
+            options.debian_mirror = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-components",
+        section: Section::Provisioning,
+        placeholder: "L",
+        help: &["Comma-separated components (default: main; repeatable)"],
+        take: Take::One(|options, flag, value| {
+            extend_comma(&mut options.debian_components, &into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-include",
+        section: Section::Provisioning,
+        placeholder: "L",
+        help: &["Extra packages to install (comma-separated, repeatable)"],
+        take: Take::One(|options, flag, value| {
+            extend_comma(&mut options.debian_include, &into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-exclude",
+        section: Section::Provisioning,
+        placeholder: "L",
+        help: &[
+            "Packages to keep out of the resolution, with their",
+            "dependents (comma-separated, repeatable)",
+        ],
+        take: Take::One(|options, flag, value| {
+            extend_comma(&mut options.debian_exclude, &into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-extract-only",
+        section: Section::Provisioning,
+        help: &[
+            "Lay out files without configuring them (runs no",
+            "maintainer scripts; for a foreign architecture)",
+        ],
+        take: Take::Bare(|options| {
+            options.debian_extract_only = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-cache",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &["Cache downloaded packages in DIR, reused across runs"],
+        take: Take::One(|options, _flag, value| {
+            options.debian_cache = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-keyring",
+        section: Section::Provisioning,
+        placeholder: "FILE",
+        help: &["Verify the archive with FILE, not the embedded keyring"],
+        take: Take::One(|options, _flag, value| {
+            options.debian_keyring = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-mirror-fallback",
+        section: Section::Provisioning,
+        placeholder: "URL",
+        help: &[
+            "A further URL for the same archive, tried when the",
+            "primary mirror does not serve a resource (repeatable,",
+            "in order)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .debian_mirror_fallback
+                .push(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-base-priority",
+        section: Section::Provisioning,
+        placeholder: "P",
+        help: &[
+            "The priority floor the base set is drawn from:",
+            "required (default), important, standard, optional,",
+            "or extra",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.debian_base_priority = Some(parse_priority(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-trust-unsigned",
+        section: Section::Provisioning,
+        help: &[
+            "Accept the archive without verifying its signature.",
+            "Every mirror must then be file:// or https://, the",
+            "transports that authenticate what they serve",
+        ],
+        take: Take::Bare(|options| {
+            options.debian_trust_unsigned = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-allow-stale-release",
+        section: Section::Provisioning,
+        help: &["Accept a signed release whose validity has expired"],
+        take: Take::Bare(|options| {
+            options.debian_allow_stale_release = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-pre-configure-overlay",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &[
+            "Overlay DIR onto the root after the files are laid",
+            "out and before any maintainer script runs",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.debian_pre_configure_overlay = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-identity-map",
+        section: Section::Provisioning,
+        placeholder: "M",
+        help: &[
+            "Identity map for the bootstrap's own cages, in the",
+            "form --identity-map takes; a range map records real",
+            "ownership instead of the single-map stubs",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.debian_identity_map =
+                Some(parse_identity_map(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--debian-repository",
+        section: Section::Provisioning,
+        placeholder: "SPEC",
+        help: &[
+            "An additional archive source, merged into the same",
+            "resolution. SPEC is space-separated key=value fields:",
+            "'suite=S mirror=URL [mirror-fallback=URL]",
+            "[components=a,b] [keyring=PATH] [name=NAME]",
+            "[trust-unsigned] [allow-stale-release]'. Repeatable",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .debian_repositories
+                .push(parse_repository(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--provision-alpine",
+        section: Section::Provisioning,
+        placeholder: "RELEASE",
+        help: &[
+            "Bootstrap --rootfs as an Alpine RELEASE (e.g. v3.23)",
+            "from the archive; given without a command, provision",
+            "and exit",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.provision_alpine = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-arch",
+        section: Section::Provisioning,
+        placeholder: "ARCH",
+        help: &[
+            "Target architecture for --provision-alpine (default:",
+            "the host architecture)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.alpine_arch = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-mirror",
+        section: Section::Provisioning,
+        placeholder: "URL",
+        help: &[
+            "Archive mirror (default:",
+            "http://dl-cdn.alpinelinux.org/alpine)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.alpine_mirror = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-components",
+        section: Section::Provisioning,
+        placeholder: "L",
+        help: &["Comma-separated components (default: main; repeatable)"],
+        take: Take::One(|options, flag, value| {
+            extend_comma(&mut options.alpine_components, &into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-include",
+        section: Section::Provisioning,
+        placeholder: "L",
+        help: &[
+            "Packages to install (comma-separated, repeatable).",
+            "apk has no priority band, so nothing is installed that",
+            "was not named here or required by something that was",
+        ],
+        take: Take::One(|options, flag, value| {
+            extend_comma(&mut options.alpine_include, &into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-exclude",
+        section: Section::Provisioning,
+        placeholder: "L",
+        help: &[
+            "Packages to keep out of the resolution (comma-separated,",
+            "repeatable)",
+        ],
+        take: Take::One(|options, flag, value| {
+            extend_comma(&mut options.alpine_exclude, &into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-extract-only",
+        section: Section::Provisioning,
+        help: &[
+            "Lay out files and register them without running any",
+            "install script (for a foreign architecture)",
+        ],
+        take: Take::Bare(|options| {
+            options.alpine_extract_only = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-cache",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &["Cache downloaded packages in DIR, reused across runs"],
+        take: Take::One(|options, _flag, value| {
+            options.alpine_cache = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-keys",
+        section: Section::Provisioning,
+        placeholder: "SOURCE",
+        help: &[
+            "The keys the archive is verified against: 'alpine' (the",
+            "bundled set for the target architecture, the default),",
+            "'postmarketos', or a directory of PEM public keys named",
+            "as the repository publishes them",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.alpine_keys = Some(parse_alpine_keys(flag, &into_string(flag, value)?));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-mirror-fallback",
+        section: Section::Provisioning,
+        placeholder: "URL",
+        help: &[
+            "A further URL for the same archive, tried when the",
+            "primary mirror does not serve a resource (repeatable,",
+            "in order)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .alpine_mirror_fallback
+                .push(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-pre-configure-overlay",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &[
+            "Overlay DIR onto the root after the files are laid",
+            "out and before any install script runs",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.alpine_pre_configure_overlay = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-identity-map",
+        section: Section::Provisioning,
+        placeholder: "M",
+        help: &[
+            "Identity map for the bootstrap's own cages, in the",
+            "form --identity-map takes",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.alpine_identity_map =
+                Some(parse_identity_map(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--alpine-repository",
+        section: Section::Provisioning,
+        placeholder: "SPEC",
+        help: &[
+            "An additional archive source, merged into the same",
+            "resolution. SPEC is space-separated key=value fields:",
+            "'release=R mirror=URL keys=SOURCE [mirror-fallback=URL]",
+            "[components=a,b]'. Naming no components selects the",
+            "<release>/<architecture> layout postmarketOS publishes.",
+            "Repeatable",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .alpine_repositories
+                .push(parse_alpine_repository(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--provision-gentoo",
+        section: Section::Provisioning,
+        placeholder: "ARCH",
+        help: &[
+            "Bootstrap --rootfs from a signed Gentoo stage3 for",
+            "ARCH (e.g. amd64); given without a command, provision",
+            "and exit. Gentoo publishes one tree per architecture",
+            "rather than a release, so ARCH is the coordinate",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.provision_gentoo = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-variant",
+        section: Section::Provisioning,
+        placeholder: "NAME",
+        help: &[
+            "The stage3 to install, as the archive spells it:",
+            "'amd64-openrc', 'amd64-hardened-systemd', 'x32-openrc'.",
+            "--gentoo-variants lists what an architecture offers",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.gentoo_variant = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-build-id",
+        section: Section::Provisioning,
+        placeholder: "ID",
+        help: &[
+            "Install the build in directory ID (e.g.",
+            "20260810T204554Z) rather than the current one. The",
+            "archive keeps about five weeks of builds, so a pinned",
+            "id resolves against it for roughly a month and against",
+            "a populated --gentoo-cache indefinitely",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.gentoo_build_id = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-binhost",
+        section: Section::Provisioning,
+        placeholder: "SUBARCH",
+        help: &[
+            "Install binary packages from the binhost tree for",
+            "SUBARCH ('x86-64', 'x86-64-v3', 'x86-64_hardened',",
+            "'x32'). There is no default: nothing signed enumerates",
+            "the trees, so a wrong one is a 404 rather than a",
+            "silently different userland",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.gentoo_binhost = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-install",
+        section: Section::Provisioning,
+        placeholder: "ATOM",
+        help: &[
+            "Install ATOM and its runtime dependencies from the",
+            "binhost, in Gentoo's own dependency grammar:",
+            "'dev-vcs/git', '>=dev-lang/python-3.12',",
+            "'dev-libs/openssl:0'. Repeatable. A USE dependency in",
+            "an atom is a constraint -- 'dev-vcs/git[keyring]'",
+            "refuses to install a build without the flag",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.gentoo_install.push(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-prefer-use",
+        section: Section::Provisioning,
+        placeholder: "FLAGS",
+        help: &[
+            "Prefer builds carrying these space-separated USE flags,",
+            "and builds without the ones written '-flag'. A",
+            "preference, not a constraint: it reorders the candidate",
+            "builds and cannot make an atom unsatisfiable. Repeatable",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.gentoo_prefer_use.extend(
+                into_string(flag, value)?
+                    .split_ascii_whitespace()
+                    .map(str::to_string),
+            );
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-plan",
+        section: Section::Provisioning,
+        placeholder: "FILE",
+        help: &[
+            "Install exactly the packages FILE names, resolving",
+            "nothing. FILE is a plan document a previous run wrote;",
+            "it supersedes --gentoo-install and --gentoo-prefer-use",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.gentoo_plan = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-mirror",
+        section: Section::Provisioning,
+        placeholder: "URL",
+        help: &["Archive mirror (default:", "http://distfiles.gentoo.org)"],
+        take: Take::One(|options, flag, value| {
+            options.gentoo_mirror = Some(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-mirror-fallback",
+        section: Section::Provisioning,
+        placeholder: "URL",
+        help: &[
+            "A further URL for the same archive, tried when the",
+            "primary mirror does not serve a resource (repeatable,",
+            "in order)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .gentoo_mirror_fallback
+                .push(into_string(flag, value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-cache",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &[
+            "Cache the downloaded stage3 and binary packages in DIR,",
+            "reused across runs",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.gentoo_cache = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-max-pointer-age",
+        section: Section::Provisioning,
+        placeholder: "DAYS",
+        help: &[
+            "Refuse a signed pointer document regenerated more than",
+            "DAYS ago (default: 30), or 'none' to accept one of any",
+            "age. Gentoo publishes no expiry of any kind, so this",
+            "timestamp is the only thing that says when a document",
+            "stopped being current; clearing the bound accepts a",
+            "replayed one, which is what an archived mirror needs",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.gentoo_max_pointer_age = Some(parse_pointer_age(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-variants",
+        section: Section::Provisioning,
+        placeholder: "ARCH",
+        help: &[
+            "Print the stage3 variants ARCH publishes, from the",
+            "signed enumeration, and exit. Takes --gentoo-mirror,",
+            "--gentoo-mirror-fallback and --gentoo-max-pointer-age",
+        ],
+        mode: Mode::GentooVariants,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-packages",
+        section: Section::Provisioning,
+        placeholder: "ARCH",
+        help: &[
+            "Print what the binhost publishes for ARCH: every",
+            "package name and its versions, and exit. Takes",
+            "--gentoo-binhost, --gentoo-mirror and",
+            "--gentoo-mirror-fallback",
+        ],
+        mode: Mode::GentooPackages,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-installed",
+        section: Section::Provisioning,
+        placeholder: "ROOT",
+        help: &[
+            "Print what the Gentoo root at ROOT already has",
+            "installed, from its own package database, and exit.",
+            "Reaches no network",
+        ],
+        mode: Mode::GentooInstalled,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--gentoo-keyring-horizon",
+        section: Section::Provisioning,
+        help: &[
+            "Print the vendored Gentoo keyring: every certificate,",
+            "whether it can still sign, and when its authority",
+            "lapses. Reaches no network",
+        ],
+        mode: Mode::GentooKeyring,
+        selects: true,
+        take: Take::Refused(Arity::Bare),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--remove-rootfs",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &[
+            "Delete the provisioned rootfs at DIR and exit,",
+            "including one a range-mapped sandbox wrote and a plain",
+            "'rm -rf' cannot remove. Give the --identity-map the",
+            "tree was provisioned under; the default is",
+            "'subordinate'. Removing a path that is not there",
+            "succeeds, so the call is repeatable. Takes no other",
+            "option: it removes a rootfs rather than running a",
+            "command in one",
+        ],
+        mode: Mode::Remove,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--export-rootfs",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &[
+            "Write the provisioned rootfs at DIR to a tar archive",
+            "and exit, preserving the ownership the tree intends",
+            "and the extended attributes a host-side 'tar' cannot",
+            "read. Give the --identity-map the tree was provisioned",
+            "under; the default is 'subordinate'. Takes no other",
+            "option: it exports a rootfs rather than running a",
+            "command in one",
+        ],
+        mode: Mode::Export,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--export-to",
+        section: Section::Provisioning,
+        placeholder: "FILE",
+        help: &[
+            "Where --export-rootfs writes. The default is standard",
+            "output, so the archive pipes into a compressor without",
+            "a temporary file; writing one to a terminal is refused",
+        ],
+        mode: Mode::Export,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--clamp-mtime",
+        section: Section::Provisioning,
+        placeholder: "EPOCH",
+        help: &[
+            "Cap every modification time --export-rootfs records at",
+            "EPOCH, a Unix timestamp in seconds. With it the archive",
+            "is byte-reproducible given the tree",
+        ],
+        mode: Mode::Export,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--profile",
+        section: Section::Profiles,
+        placeholder: "FILE",
+        help: &[
+            "Load a TOML sandbox profile; flags given alongside",
+            "override its settings, binds and variables extend it,",
+            "and any [hardening] table it carries takes effect. A",
+            "profile is trusted like a script: it can bind any host",
+            "path, issue raw mounts, share the host network, and",
+            "share the host PID namespace. Load only a profile you",
+            "trust, or use --restricted-profile",
+        ],
+        take: Take::One(|options, _flag, value| {
+            let path = PathBuf::from(value);
+            set_profile(options, path, false)?;
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--restricted-profile",
+        section: Section::Profiles,
+        placeholder: "FILE",
+        help: &[
+            "Load a TOML profile from an untrusted source: like",
+            "--profile, but the operations that map host resources",
+            "into the sandbox or share a host namespace (binds, raw",
+            "mounts, host networking, the host PID namespace) are",
+            "refused. The rootfs it names still grants access to that",
+            "host subtree, so pass a rootfs you control",
+        ],
+        take: Take::One(|options, _flag, value| {
+            let path = PathBuf::from(value);
+            set_profile(options, path, true)?;
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--overlay-lower",
+        section: Section::Profiles,
+        placeholder: "DIR",
+        help: &[
+            "Root the sandbox on an overlay whose base is DIR",
+            "(repeatable and ordered: the first is the base, each",
+            "later one is laid over it). Alternative to --rootfs",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.overlay_lowers.push(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--overlay-upper",
+        section: Section::Profiles,
+        placeholder: "DIR",
+        help: &[
+            "Where the overlay's writes land; DIR persists after",
+            "the sandbox exits, so discarding it reverts the run.",
+            "Required with --overlay-lower",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.overlay_upper = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--overlay-work",
+        section: Section::Profiles,
+        placeholder: "DIR",
+        help: &[
+            "Override the overlay's work directory, which must sit",
+            "on the same filesystem as the upper",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.overlay_work = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--bind",
+        section: Section::Profiles,
+        placeholder: "SRC DEST",
+        help: &["Bind-mount host path SRC read-write at DEST"],
+        needs: "a source and a target",
+        take: Take::Two(|options, _flag, value, second| {
+            let source = value;
+            let target = second;
+            options.mounts.push(Mount::Bind(
+                Bind::new(PathBuf::from(source), PathBuf::from(target)).read_only(false),
+            ));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--ro-bind",
+        section: Section::Profiles,
+        placeholder: "SRC DEST",
+        help: &["Bind-mount host path SRC read-only at DEST"],
+        needs: "a source and a target",
+        take: Take::Two(|options, _flag, value, second| {
+            let source = value;
+            let target = second;
+            options.mounts.push(Mount::Bind(
+                Bind::new(PathBuf::from(source), PathBuf::from(target)).read_only(true),
+            ));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--raw-mount",
+        section: Section::Profiles,
+        placeholder: "SPEC",
+        help: &[
+            "A mount the typed options do not model, passed to the",
+            "kernel as given. SPEC is space-separated key=value",
+            "fields: 'target=/sys fstype=sysfs flags=0xE",
+            "[source=...] [data=...]'. Only the target is validated",
+            "and confined. Repeatable.",
+            "Mounts apply in the order these flags appear, so a",
+            "--raw-mount tmpfs followed by --bind flags into it",
+            "builds a directory the sandbox owns outright",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .mounts
+                .push(Mount::Raw(parse_raw_mount(&into_string(flag, value)?)?));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--identity-map",
+        section: Section::Identity,
+        placeholder: "M",
+        help: &[
+            "How the user namespace maps identities: 'single'",
+            "(default: root inside is you outside, and no other id",
+            "exists), 'subordinate' (root plus your whole",
+            "subordinate allocation, through newuidmap/newgidmap),",
+            "or explicit extents,",
+            "'uid=IN:OUT:COUNT[,...] gid=IN:OUT:COUNT[,...]'",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.identity_map = Some(parse_identity_map(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--run-as",
+        section: Section::Identity,
+        placeholder: "UID:GID[:G,...]",
+        help: &[
+            "Run the command as a non-root identity inside the",
+            "sandbox, with optional supplementary groups. Every id",
+            "must be contained in the identity map; groups need a",
+            "range gid map",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.run_as = Some(parse_run_as(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--rlimit",
+        section: Section::Identity,
+        placeholder: "RES=SOFT[:HARD]",
+        help: &[
+            "Set a resource limit on the command, inherited by",
+            "every process it starts. A value may be 'unlimited',",
+            "and an omitted hard limit repeats the soft one.",
+            "Repeatable (e.g. --rlimit processes=64 --rlimit",
+            "address-space=536870912). RES is one of:",
+        ],
+        roster: true,
+        take: Take::One(|options, flag, value| {
+            options
+                .rlimits
+                .push(parse_rlimit(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--path-lookup",
+        section: Section::Command,
+        help: &[
+            "Resolve a command with no slash against the sandbox's",
+            "PATH, the way a shell does",
+        ],
+        take: Take::Bare(|options| {
+            options.path_lookup = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--setenv",
+        section: Section::Command,
+        placeholder: "NAME VALUE",
+        help: &["Set an environment variable for the command"],
+        needs: "a name and a value",
+        take: Take::Two(|options, flag, value, second| {
+            // Validated here so a bad name is the usage error it is (exit 2),
+            // rather than deferring to the library's build-time rejection
+            // (exit 125). The rule matches the library's.
+            if value.is_empty() || value.as_bytes().contains(&b'=') {
+                return Err(format!(
+                    "{flag}: {value:?} is not a valid environment variable name \
+                     (it is empty or contains '=')"
+                ));
+            }
+            options.setenv.push((value, second));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--hostname",
+        section: Section::Command,
+        placeholder: "NAME",
+        help: &["Set the hostname inside the sandbox"],
+        take: Take::One(|options, _flag, value| {
+            options.hostname = Some(value);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--chdir",
+        section: Section::Command,
+        placeholder: "DIR",
+        help: &["Working directory inside the sandbox (default /)"],
+        take: Take::One(|options, _flag, value| {
+            options.chdir = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--stdin",
+        section: Section::Command,
+        placeholder: "MODE",
+        help: &[
+            "Standard input: inherit (default) or null. With null",
+            "the command also runs in a session of its own, so the",
+            "terminal fcage was started from is not its controlling",
+            "terminal; an interrupt there stops fcage, which stops",
+            "the sandbox. Standard output and standard error still",
+            "reach that terminal unless redirected, which a shell",
+            "already spells and a profile carries as stdout/stderr",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.stdin = Some(parse_stdin(&value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--terminal",
+        section: Section::Command,
+        help: &[
+            "Give the sandbox a pseudoterminal of its own and relay",
+            "this terminal to it: interactive programs work, and the",
+            "sandbox reaches nothing of the terminal fcage was",
+            "started from. TERM passes through as ever, so set it",
+            "with --setenv TERM to override. From a script, where",
+            "fcage's own input is not a terminal, this degrades to a",
+            "plain byte relay around a sandbox that still has a real",
+            "terminal of its own, at 80x24",
+        ],
+        take: Take::Bare(|options| {
+            options.terminal = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--timeout",
+        section: Section::Command,
+        placeholder: "SECS",
+        help: &[
+            "Terminate the command after SECS seconds, kill it",
+            "--kill-after seconds later, and exit 124",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.timeout = Some(parse_seconds(flag, &value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--kill-after",
+        section: Section::Command,
+        placeholder: "SECS",
+        help: &["Grace between terminate and kill (default 10)"],
+        take: Take::One(|options, flag, value| {
+            options.kill_after = parse_seconds(flag, &value)?;
+            options.kill_after_given = true;
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--stop-with-caller",
+        section: Section::Command,
+        help: &[
+            "Stop the sandbox when fcage itself exits (the default;",
+            "--no-stop-with-caller leaves it running)",
+        ],
+        take: Take::Bare(|options| {
+            options.stop_with_caller = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--share-net",
+        section: Section::Networking,
+        help: &["Share the host network (default: isolated loopback)"],
+        take: Take::Bare(|options| {
+            options.network = Some(Network::Host);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--deny-net",
+        section: Section::Networking,
+        help: &[
+            "Isolated network with loopback left down (no",
+            "connectivity at all, not even 127.0.0.1)",
+        ],
+        take: Take::Bare(|options| {
+            options.network = Some(Network::None);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack",
+        section: Section::Networking,
+        help: &[
+            "Attach the native userspace network stack: outbound",
+            "IPv4 and IPv6 for the isolated network, forwarded over",
+            "host sockets with no external helper. Composes the",
+            "sandbox's resolv.conf from the host's routable",
+            "nameservers unless --no-resolv-conf or",
+            "--no-managed-mounts is given; a host with only loopback",
+            "nameservers composes nothing, leaving the rootfs's own",
+            "resolv.conf in place",
+        ],
+        take: Take::Bare(|options| {
+            options.netstack = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-cidr",
+        section: Section::Networking,
+        placeholder: "V4/LEN",
+        help: &[
+            "IPv4 network for --netstack (default 10.0.2.0/24; the",
+            "gateway is host 2, the guest host 15)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.netstack_cidr = Some(parse_cidr(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-mtu",
+        section: Section::Networking,
+        placeholder: "N",
+        help: &["Interface MTU for --netstack (default 1500)"],
+        take: Take::One(|options, flag, value| {
+            options.netstack_mtu = Some(parse_mtu(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-host-loopback",
+        section: Section::Networking,
+        help: &[
+            "Map connections to the gateway address onto the host's",
+            "127.0.0.1, port preserved, to reach a service bound",
+            "there (off by default; every other loopback destination",
+            "stays blocked, including a resolver on another loopback",
+            "address such as systemd-resolved's 127.0.0.53 stub)",
+        ],
+        take: Take::Bare(|options| {
+            options.netstack_host_loopback = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--restrict",
+        section: Section::Hardening,
+        help: &[
+            "Confine the command with Landlock and seccomp only:",
+            "no namespaces, no root filesystem swap, and paths are",
+            "host paths. The fallback for hosts without",
+            "unprivileged user namespaces; requires at least one",
+            "--landlock-* or --seccomp flag, and accepts only",
+            "those plus --setenv, --no-base-env, --chdir,",
+            "--stdin, --terminal, --timeout, --kill-after,",
+            "--rlimit, and --stop-with-caller",
+        ],
+        take: Take::Bare(|options| {
+            options.restrict = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--landlock-ro",
+        section: Section::Hardening,
+        placeholder: "PATH",
+        help: &[
+            "Grant the command read and execute beneath PATH under",
+            "a Landlock ruleset (repeatable; enrolling any grant",
+            "denies all filesystem access not granted)",
+        ],
+        take: Take::One(|options, _flag, value| {
+            let path = value;
+            options.landlock.push((PathBuf::from(path), false));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--landlock-rw",
+        section: Section::Hardening,
+        placeholder: "PATH",
+        help: &[
+            "Grant read, write, and execute beneath PATH",
+            "(repeatable)",
+        ],
+        take: Take::One(|options, _flag, value| {
+            let path = value;
+            options.landlock.push((PathBuf::from(path), true));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--landlock-bind",
+        section: Section::Hardening,
+        placeholder: "PORT",
+        help: &[
+            "Allow binding a TCP socket to PORT under a Landlock",
+            "ruleset (repeatable; enrolling any network grant denies",
+            "every bind and connect not granted; port 0 permits a",
+            "kernel-assigned ephemeral port; needs Landlock ABI 4)",
+        ],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            options
+                .landlock_net
+                .push((parse_port(flag, &value)?, NetAccess::BIND));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--landlock-connect",
+        section: Section::Hardening,
+        placeholder: "PORT",
+        help: &["Allow connecting a TCP socket to PORT (repeatable)"],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            options
+                .landlock_net
+                .push((parse_port(flag, &value)?, NetAccess::CONNECT));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--seccomp",
+        section: Section::Hardening,
+        placeholder: "curated",
+        help: &[
+            "Apply the curated seccomp deny-list of dangerous",
+            "syscalls to the command",
+        ],
+        take: Take::One(|options, flag, value| {
+            parse_seccomp(&into_string(flag, value)?, &mut options.seccomp_curated)?;
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--seccomp-allow",
+        section: Section::Hardening,
+        placeholder: "LIST",
+        help: &[
+            "Allow only these syscalls, denying the rest with EPERM",
+            "(comma-separated names, repeatable; must name every",
+            "syscall the command needs)",
+        ],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            parse_seccomp_names(flag, &value, &mut options.seccomp_allow)?;
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--seccomp-deny",
+        section: Section::Hardening,
+        placeholder: "LIST",
+        help: &[
+            "Deny these syscalls with EPERM, allowing the rest",
+            "(comma-separated names, repeatable)",
+        ],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            parse_seccomp_names(flag, &value, &mut options.seccomp_deny)?;
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--seccomp-allow-rule",
+        section: Section::Hardening,
+        placeholder: "RULE",
+        help: &[
+            "Allow a syscall only when its arguments match; RULE is",
+            "a syscall name and comma-separated conditions, each of",
+            "the form 'arg=N len=dword|qword op=OP value=V', with",
+            "op one of eq, ne, ge, gt, le, lt, or masked-eq (which",
+            "also takes mask=M). Repeatable; repeating a syscall",
+            "accepts any of the rules. Example:",
+            "'ioctl arg=1 len=dword op=eq value=0x5413'",
+        ],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            options
+                .seccomp_allow_rules
+                .push(parse_seccomp_rule(flag, &value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--seccomp-deny-rule",
+        section: Section::Hardening,
+        placeholder: "RULE",
+        help: &[
+            "Deny a syscall only when its arguments match, in the",
+            "same form as --seccomp-allow-rule",
+        ],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            options
+                .seccomp_deny_rules
+                .push(parse_seccomp_rule(flag, &value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--drop-caps",
+        section: Section::Hardening,
+        help: &["Drop every capability from the command"],
+        take: Take::Bare(|options| {
+            options.caps = Some(CapsChoice::DropAll);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--keep-caps",
+        section: Section::Hardening,
+        placeholder: "LIST",
+        help: &[
+            "Drop every capability except LIST (comma-separated,",
+            "e.g. net-bind-service,sys-chroot)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.caps = Some(CapsChoice::Keep(parse_caps(&into_string(flag, value)?)?));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--share-pid",
+        section: Section::Off,
+        help: &["Share the host PID namespace (default: isolated)"],
+        take: Take::Bare(|options| {
+            options.pid_namespace = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-proc",
+        section: Section::Off,
+        help: &[
+            "Do not mount /proc. A cage needs a procfs from",
+            "somewhere -- the nested user namespace that locks its",
+            "mount flags establishes its identity map through one --",
+            "so a run that sets this supplies its own with --bind",
+        ],
+        take: Take::Bare(|options| {
+            options.mount_proc = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-dev",
+        section: Section::Off,
+        help: &["Do not assemble the minimal /dev"],
+        take: Take::Bare(|options| {
+            options.mount_dev = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-tmp",
+        section: Section::Off,
+        help: &["Do not mount a tmpfs on /tmp"],
+        take: Take::Bare(|options| {
+            options.mount_tmp = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-resolv-conf",
+        section: Section::Off,
+        help: &[
+            "Do not bind the host resolv.conf: neither the bind",
+            "--share-net makes nor the one --netstack composes",
+        ],
+        take: Take::Bare(|options| {
+            options.resolv_conf = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-managed-mounts",
+        section: Section::Off,
+        help: &[
+            "Establish no mount of the library's own, so the sandbox",
+            "carries exactly the --bind and --raw-mount flags given.",
+            "Unlike the individual --no-* toggles this also excludes",
+            "any managed mount a later release adds. One of the flags",
+            "given must supply a procfs; see --no-proc",
+        ],
+        take: Take::Bare(|options| {
+            options.managed_mounts = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-base-env",
+        section: Section::Off,
+        help: &[
+            "Give the command exactly the --setenv variables, with",
+            "no PATH or HOME supplied underneath them",
+        ],
+        take: Take::Bare(|options| {
+            options.base_env = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--isolate-net",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.network = Some(Network::Isolated);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--pid-ns",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.pid_namespace = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--proc",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.mount_proc = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--dev",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.mount_dev = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--tmp",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.mount_tmp = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--resolv-conf",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.resolv_conf = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--managed-mounts",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.managed_mounts = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--base-env",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.base_env = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-path-lookup",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.path_lookup = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-stop-with-caller",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.stop_with_caller = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--help",
+        section: Section::Help,
+        short: Some("-h"),
+        help: &["Print this help"],
+        mode: Mode::Help,
+        take: Take::Refused(Arity::Bare),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--version",
+        section: Section::Help,
+        short: Some("-V"),
+        help: &["Print the version"],
+        mode: Mode::Version,
+        take: Take::Refused(Arity::Bare),
+        ..Flag::DEFAULTS
+    },
+];
+
+/// What `--help` prints above the option sections.
+const SYNOPSIS: &str = "\
 Run a command inside an unprivileged Linux sandbox.
 
 Usage: fcage [--rootfs DIR | --overlay-lower DIR | --profile FILE | --restricted-profile FILE | --restrict] [OPTIONS] [--] [COMMAND [ARGS...]]
        fcage --remove-rootfs DIR [--identity-map M]
        fcage --export-rootfs DIR [--export-to FILE] [--identity-map M] [--clamp-mtime EPOCH]
+";
 
-Provisioning the root filesystem:
-  --rootfs DIR          Directory to present as the sandbox root filesystem
-  --provision-tar FILE  Provision --rootfs from a tar archive (plain, gzip,
-                        xz, or zstd) when the directory does not exist yet
-  --provision-debian SUITE
-                        Bootstrap --rootfs as a Debian SUITE (e.g. trixie)
-                        from the archive; given without a command, provision
-                        and exit
-  --debian-arch ARCH    Target architecture for --provision-debian (default:
-                        the host architecture)
-  --debian-mirror URL   Archive mirror (default: http://deb.debian.org/debian)
-  --debian-components L Comma-separated components (default: main; repeatable)
-  --debian-include L    Extra packages to install (comma-separated, repeatable)
-  --debian-exclude L    Packages to keep out of the resolution, with their
-                        dependents (comma-separated, repeatable)
-  --debian-extract-only Lay out files without configuring them (runs no
-                        maintainer scripts; for a foreign architecture)
-  --debian-cache DIR    Cache downloaded packages in DIR, reused across runs
-  --debian-keyring FILE Verify the archive with FILE, not the embedded keyring
-  --debian-mirror-fallback URL
-                        A further URL for the same archive, tried when the
-                        primary mirror does not serve a resource (repeatable,
-                        in order)
-  --debian-base-priority P
-                        The priority floor the base set is drawn from:
-                        required (default), important, standard, optional,
-                        or extra
-  --debian-trust-unsigned
-                        Accept the archive without verifying its signature.
-                        Every mirror must then be file:// or https://, the
-                        transports that authenticate what they serve
-  --debian-allow-stale-release
-                        Accept a signed release whose validity has expired
-  --debian-pre-configure-overlay DIR
-                        Overlay DIR onto the root after the files are laid
-                        out and before any maintainer script runs
-  --debian-identity-map M
-                        Identity map for the bootstrap's own cages, in the
-                        form --identity-map takes; a range map records real
-                        ownership instead of the single-map stubs
-  --debian-repository SPEC
-                        An additional archive source, merged into the same
-                        resolution. SPEC is space-separated key=value fields:
-                        'suite=S mirror=URL [mirror-fallback=URL]
-                        [components=a,b] [keyring=PATH] [name=NAME]
-                        [trust-unsigned] [allow-stale-release]'. Repeatable
-  --provision-alpine RELEASE
-                        Bootstrap --rootfs as an Alpine RELEASE (e.g. v3.23)
-                        from the archive; given without a command, provision
-                        and exit
-  --alpine-arch ARCH    Target architecture for --provision-alpine (default:
-                        the host architecture)
-  --alpine-mirror URL   Archive mirror (default:
-                        http://dl-cdn.alpinelinux.org/alpine)
-  --alpine-components L Comma-separated components (default: main; repeatable)
-  --alpine-include L    Packages to install (comma-separated, repeatable).
-                        apk has no priority band, so nothing is installed that
-                        was not named here or required by something that was
-  --alpine-exclude L    Packages to keep out of the resolution (comma-separated,
-                        repeatable)
-  --alpine-extract-only Lay out files and register them without running any
-                        install script (for a foreign architecture)
-  --alpine-cache DIR    Cache downloaded packages in DIR, reused across runs
-  --alpine-keys SOURCE  The keys the archive is verified against: 'alpine' (the
-                        bundled set for the target architecture, the default),
-                        'postmarketos', or a directory of PEM public keys named
-                        as the repository publishes them
-  --alpine-mirror-fallback URL
-                        A further URL for the same archive, tried when the
-                        primary mirror does not serve a resource (repeatable,
-                        in order)
-  --alpine-pre-configure-overlay DIR
-                        Overlay DIR onto the root after the files are laid
-                        out and before any install script runs
-  --alpine-identity-map M
-                        Identity map for the bootstrap's own cages, in the
-                        form --identity-map takes
-  --alpine-repository SPEC
-                        An additional archive source, merged into the same
-                        resolution. SPEC is space-separated key=value fields:
-                        'release=R mirror=URL keys=SOURCE [mirror-fallback=URL]
-                        [components=a,b]'. Naming no components selects the
-                        <release>/<architecture> layout postmarketOS publishes.
-                        Repeatable
-  --provision-gentoo ARCH
-                        Bootstrap --rootfs from a signed Gentoo stage3 for
-                        ARCH (e.g. amd64); given without a command, provision
-                        and exit. Gentoo publishes one tree per architecture
-                        rather than a release, so ARCH is the coordinate
-  --gentoo-variant NAME The stage3 to install, as the archive spells it:
-                        'amd64-openrc', 'amd64-hardened-systemd', 'x32-openrc'.
-                        --gentoo-variants lists what an architecture offers
-  --gentoo-build-id ID  Install the build in directory ID (e.g.
-                        20260810T204554Z) rather than the current one. The
-                        archive keeps about five weeks of builds, so a pinned
-                        id resolves against it for roughly a month and against
-                        a populated --gentoo-cache indefinitely
-  --gentoo-binhost SUBARCH
-                        Install binary packages from the binhost tree for
-                        SUBARCH ('x86-64', 'x86-64-v3', 'x86-64_hardened',
-                        'x32'). There is no default: nothing signed enumerates
-                        the trees, so a wrong one is a 404 rather than a
-                        silently different userland
-  --gentoo-install ATOM Install ATOM and its runtime dependencies from the
-                        binhost, in Gentoo's own dependency grammar:
-                        'dev-vcs/git', '>=dev-lang/python-3.12',
-                        'dev-libs/openssl:0'. Repeatable. A USE dependency in
-                        an atom is a constraint -- 'dev-vcs/git[keyring]'
-                        refuses to install a build without the flag
-  --gentoo-prefer-use FLAGS
-                        Prefer builds carrying these space-separated USE flags,
-                        and builds without the ones written '-flag'. A
-                        preference, not a constraint: it reorders the candidate
-                        builds and cannot make an atom unsatisfiable. Repeatable
-  --gentoo-plan FILE    Install exactly the packages FILE names, resolving
-                        nothing. FILE is a plan document a previous run wrote;
-                        it supersedes --gentoo-install and --gentoo-prefer-use
-  --gentoo-mirror URL   Archive mirror (default:
-                        http://distfiles.gentoo.org)
-  --gentoo-mirror-fallback URL
-                        A further URL for the same archive, tried when the
-                        primary mirror does not serve a resource (repeatable,
-                        in order)
-  --gentoo-cache DIR    Cache the downloaded stage3 and binary packages in DIR,
-                        reused across runs
-  --gentoo-max-pointer-age DAYS
-                        Refuse a signed pointer document regenerated more than
-                        DAYS ago (default: 30), or 'none' to accept one of any
-                        age. Gentoo publishes no expiry of any kind, so this
-                        timestamp is the only thing that says when a document
-                        stopped being current; clearing the bound accepts a
-                        replayed one, which is what an archived mirror needs
-  --gentoo-variants ARCH
-                        Print the stage3 variants ARCH publishes, from the
-                        signed enumeration, and exit. Takes --gentoo-mirror,
-                        --gentoo-mirror-fallback and --gentoo-max-pointer-age
-  --gentoo-packages ARCH
-                        Print what the binhost publishes for ARCH: every
-                        package name and its versions, and exit. Takes
-                        --gentoo-binhost, --gentoo-mirror and
-                        --gentoo-mirror-fallback
-  --gentoo-installed ROOT
-                        Print what the Gentoo root at ROOT already has
-                        installed, from its own package database, and exit.
-                        Reaches no network
-  --gentoo-keyring-horizon
-                        Print the vendored Gentoo keyring: every certificate,
-                        whether it can still sign, and when its authority
-                        lapses. Reaches no network
-  --remove-rootfs DIR   Delete the provisioned rootfs at DIR and exit,
-                        including one a range-mapped sandbox wrote and a plain
-                        'rm -rf' cannot remove. Give the --identity-map the
-                        tree was provisioned under; the default is
-                        'subordinate'. Removing a path that is not there
-                        succeeds, so the call is repeatable. Takes no other
-                        option: it removes a rootfs rather than running a
-                        command in one
-  --export-rootfs DIR   Write the provisioned rootfs at DIR to a tar archive
-                        and exit, preserving the ownership the tree intends
-                        and the extended attributes a host-side 'tar' cannot
-                        read. Give the --identity-map the tree was provisioned
-                        under; the default is 'subordinate'. Takes no other
-                        option: it exports a rootfs rather than running a
-                        command in one
-  --export-to FILE      Where --export-rootfs writes. The default is standard
-                        output, so the archive pipes into a compressor without
-                        a temporary file; writing one to a terminal is refused
-  --clamp-mtime EPOCH   Cap every modification time --export-rootfs records at
-                        EPOCH, a Unix timestamp in seconds. With it the archive
-                        is byte-reproducible given the tree
-
-Profiles, overlays, and mounts:
-  --profile FILE        Load a TOML sandbox profile; flags given alongside
-                        override its settings, binds and variables extend it,
-                        and any [hardening] table it carries takes effect. A
-                        profile is trusted like a script: it can bind any host
-                        path, issue raw mounts, share the host network, and
-                        share the host PID namespace. Load only a profile you
-                        trust, or use --restricted-profile
-  --restricted-profile FILE
-                        Load a TOML profile from an untrusted source: like
-                        --profile, but the operations that map host resources
-                        into the sandbox or share a host namespace (binds, raw
-                        mounts, host networking, the host PID namespace) are
-                        refused. The rootfs it names still grants access to that
-                        host subtree, so pass a rootfs you control
-  --overlay-lower DIR   Root the sandbox on an overlay whose base is DIR
-                        (repeatable and ordered: the first is the base, each
-                        later one is laid over it). Alternative to --rootfs
-  --overlay-upper DIR   Where the overlay's writes land; DIR persists after
-                        the sandbox exits, so discarding it reverts the run.
-                        Required with --overlay-lower
-  --overlay-work DIR    Override the overlay's work directory, which must sit
-                        on the same filesystem as the upper
-  --bind SRC DEST       Bind-mount host path SRC read-write at DEST
-  --ro-bind SRC DEST    Bind-mount host path SRC read-only at DEST
-  --raw-mount SPEC      A mount the typed options do not model, passed to the
-                        kernel as given. SPEC is space-separated key=value
-                        fields: 'target=/sys fstype=sysfs flags=0xE
-                        [source=...] [data=...]'. Only the target is validated
-                        and confined. Repeatable.
-                        Mounts apply in the order these flags appear, so a
-                        --raw-mount tmpfs followed by --bind flags into it
-                        builds a directory the sandbox owns outright
-
-Identity and limits:
-  --identity-map M      How the user namespace maps identities: 'single'
-                        (default: root inside is you outside, and no other id
-                        exists), 'subordinate' (root plus your whole
-                        subordinate allocation, through newuidmap/newgidmap),
-                        or explicit extents,
-                        'uid=IN:OUT:COUNT[,...] gid=IN:OUT:COUNT[,...]'
-  --run-as UID:GID[:G,...]
-                        Run the command as a non-root identity inside the
-                        sandbox, with optional supplementary groups. Every id
-                        must be contained in the identity map; groups need a
-                        range gid map
-  --rlimit RES=SOFT[:HARD]
-                        Set a resource limit on the command, inherited by
-                        every process it starts. A value may be 'unlimited',
-                        and an omitted hard limit repeats the soft one.
-                        Repeatable (e.g. --rlimit processes=64 --rlimit
-                        address-space=536870912). RES is one of:
-{rlimit-resources}
-
-The command and its process:
-  --path-lookup         Resolve a command with no slash against the sandbox's
-                        PATH, the way a shell does
-  --setenv NAME VALUE   Set an environment variable for the command
-  --hostname NAME       Set the hostname inside the sandbox
-  --chdir DIR           Working directory inside the sandbox (default /)
-  --stdin MODE          Standard input: inherit (default) or null. With null
-                        the command also runs in a session of its own, so the
-                        terminal fcage was started from is not its controlling
-                        terminal; an interrupt there stops fcage, which stops
-                        the sandbox. Standard output and standard error still
-                        reach that terminal unless redirected, which a shell
-                        already spells and a profile carries as stdout/stderr
-  --terminal            Give the sandbox a pseudoterminal of its own and relay
-                        this terminal to it: interactive programs work, and the
-                        sandbox reaches nothing of the terminal fcage was
-                        started from. TERM passes through as ever, so set it
-                        with --setenv TERM to override. From a script, where
-                        fcage's own input is not a terminal, this degrades to a
-                        plain byte relay around a sandbox that still has a real
-                        terminal of its own, at 80x24
-  --timeout SECS        Terminate the command after SECS seconds, kill it
-                        --kill-after seconds later, and exit 124
-  --kill-after SECS     Grace between terminate and kill (default 10)
-  --stop-with-caller    Stop the sandbox when fcage itself exits (the default;
-                        --no-stop-with-caller leaves it running)
-
-Networking:
-  --share-net           Share the host network (default: isolated loopback)
-  --deny-net            Isolated network with loopback left down (no
-                        connectivity at all, not even 127.0.0.1)
-  --netstack            Attach the native userspace network stack: outbound
-                        IPv4 and IPv6 for the isolated network, forwarded over
-                        host sockets with no external helper. Composes the
-                        sandbox's resolv.conf from the host's routable
-                        nameservers unless --no-resolv-conf or
-                        --no-managed-mounts is given; a host with only loopback
-                        nameservers composes nothing, leaving the rootfs's own
-                        resolv.conf in place
-  --netstack-cidr V4/LEN
-                        IPv4 network for --netstack (default 10.0.2.0/24; the
-                        gateway is host 2, the guest host 15)
-  --netstack-mtu N      Interface MTU for --netstack (default 1500)
-  --netstack-host-loopback
-                        Map connections to the gateway address onto the host's
-                        127.0.0.1, port preserved, to reach a service bound
-                        there (off by default; every other loopback destination
-                        stays blocked, including a resolver on another loopback
-                        address such as systemd-resolved's 127.0.0.53 stub)
-
-Hardening:
-  --restrict            Confine the command with Landlock and seccomp only:
-                        no namespaces, no root filesystem swap, and paths are
-                        host paths. The fallback for hosts without
-                        unprivileged user namespaces; requires at least one
-                        --landlock-* or --seccomp flag, and accepts only
-                        those plus --setenv, --no-base-env, --chdir,
-                        --stdin, --terminal, --timeout, --kill-after,
-                        --rlimit, and --stop-with-caller
-  --landlock-ro PATH    Grant the command read and execute beneath PATH under
-                        a Landlock ruleset (repeatable; enrolling any grant
-                        denies all filesystem access not granted)
-  --landlock-rw PATH    Grant read, write, and execute beneath PATH
-                        (repeatable)
-  --landlock-bind PORT  Allow binding a TCP socket to PORT under a Landlock
-                        ruleset (repeatable; enrolling any network grant denies
-                        every bind and connect not granted; port 0 permits a
-                        kernel-assigned ephemeral port; needs Landlock ABI 4)
-  --landlock-connect PORT
-                        Allow connecting a TCP socket to PORT (repeatable)
-  --seccomp curated     Apply the curated seccomp deny-list of dangerous
-                        syscalls to the command
-  --seccomp-allow LIST  Allow only these syscalls, denying the rest with EPERM
-                        (comma-separated names, repeatable; must name every
-                        syscall the command needs)
-  --seccomp-deny LIST   Deny these syscalls with EPERM, allowing the rest
-                        (comma-separated names, repeatable)
-  --seccomp-allow-rule RULE
-                        Allow a syscall only when its arguments match; RULE is
-                        a syscall name and comma-separated conditions, each of
-                        the form 'arg=N len=dword|qword op=OP value=V', with
-                        op one of eq, ne, ge, gt, le, lt, or masked-eq (which
-                        also takes mask=M). Repeatable; repeating a syscall
-                        accepts any of the rules. Example:
-                        'ioctl arg=1 len=dword op=eq value=0x5413'
-  --seccomp-deny-rule RULE
-                        Deny a syscall only when its arguments match, in the
-                        same form as --seccomp-allow-rule
-  --drop-caps           Drop every capability from the command
-  --keep-caps LIST      Drop every capability except LIST (comma-separated,
-                        e.g. net-bind-service,sys-chroot)
-
-Turning off what is on by default:
-  --share-pid           Share the host PID namespace (default: isolated)
-  --no-proc             Do not mount /proc. A cage needs a procfs from
-                        somewhere -- the nested user namespace that locks its
-                        mount flags establishes its identity map through one --
-                        so a run that sets this supplies its own with --bind
-  --no-dev              Do not assemble the minimal /dev
-  --no-tmp              Do not mount a tmpfs on /tmp
-  --no-resolv-conf      Do not bind the host resolv.conf: neither the bind
-                        --share-net makes nor the one --netstack composes
-  --no-managed-mounts   Establish no mount of the library's own, so the sandbox
-                        carries exactly the --bind and --raw-mount flags given.
-                        Unlike the individual --no-* toggles this also excludes
-                        any managed mount a later release adds. One of the flags
-                        given must supply a procfs; see --no-proc
-  --no-base-env         Give the command exactly the --setenv variables, with
-                        no PATH or HOME supplied underneath them
-
-Help and version:
-  -h, --help            Print this help
-  -V, --version         Print the version
-
+/// What `--help` prints below them.
+///
+/// Prose rather than entries, so it stays written out: it names flags in
+/// sentences, and the ten counterpart toggles are documented here rather
+/// than listed above. A test holds every name it uses to [`FLAGS`], which is
+/// what stops it drifting from the vocabulary it describes.
+const CLOSING: &str = "\
 Each toggle has a counterpart to override a profile in the other direction:
 --isolate-net, --pid-ns, --proc, --dev, --tmp, --resolv-conf,
 --managed-mounts, --base-env, --stop-with-caller, and --no-path-lookup.
@@ -554,6 +1907,19 @@ struct Options {
     landlock: Vec<(PathBuf, bool)>,
     landlock_net: Vec<(u16, NetAccess)>,
     seccomp: Option<SeccompPolicy>,
+    /// The seccomp flags as they were given, reconciled into
+    /// [`seccomp`](Self::seccomp) once the whole command line has been read.
+    ///
+    /// The curated posture and the allow and deny sides are mutually
+    /// constrained, so they are gathered rather than applied: which of them is
+    /// legal depends on what else was given, and the flag that decides can come
+    /// last. They live here rather than beside the argument loop because a
+    /// flag's own applier reaches exactly one value, and that value is this.
+    seccomp_curated: bool,
+    seccomp_allow: Vec<i64>,
+    seccomp_deny: Vec<i64>,
+    seccomp_allow_rules: Vec<(i64, Vec<SeccompArg>)>,
+    seccomp_deny_rules: Vec<(i64, Vec<SeccompArg>)>,
     caps: Option<CapsChoice>,
     restrict: bool,
     netstack: bool,
@@ -576,25 +1942,51 @@ enum CapsChoice {
 /// second copy here, so a resource the library gains is offered by `--help` as
 /// soon as `--rlimit` accepts it.
 fn usage() -> String {
-    USAGE.replace(
-        "{rlimit-resources}",
-        &wrapped(
-            &Resource::ALL
-                .iter()
-                .map(|r| r.spelling())
-                .collect::<Vec<_>>(),
-        ),
-    )
-}
+    /// The column an entry's description starts in, and the widest name that
+    /// still shares a line with it.
+    const DESCRIPTION: usize = 24;
+    const NAME_ROOM: usize = DESCRIPTION - 2 - 1;
 
-/// The options that belong to the export mode rather than to a launch.
-///
-/// The suggester reads its candidates out of the help, and the help documents
-/// every mode, so a launch would otherwise answer a stray `--export-to` by
-/// suggesting the very flag it had just refused. Naming the mode that owns it is
-/// the useful answer instead. The roster is short and a test pins it, failing if
-/// an entry stops being an export's alone.
-const EXPORT_ONLY_FLAGS: [&str; 2] = ["--export-to", "--clamp-mtime"];
+    let mut out = String::from(SYNOPSIS);
+    for section in Section::ALL {
+        let Some(heading) = section.heading() else {
+            continue;
+        };
+        out.push('\n');
+        out.push_str(heading);
+        out.push_str(":\n");
+        for flag in FLAGS.iter().filter(|flag| flag.section == *section) {
+            let name = flag.spelled();
+            let mut body = flag.help.iter();
+            // A name too wide to leave room takes a line of its own, and the
+            // description begins on the next.
+            if name.len() <= NAME_ROOM
+                && let Some(first) = body.next()
+            {
+                out.push_str(&format!(
+                    "  {name:<width$}{first}\n",
+                    width = DESCRIPTION - 2
+                ));
+            } else {
+                out.push_str(&format!("  {name}\n"));
+            }
+            for line in body {
+                out.push_str(&format!("{:DESCRIPTION$}{line}\n", ""));
+            }
+            if flag.roster {
+                // The resource names come from the library's own roster rather
+                // than a second copy here, so a resource the library gains is
+                // offered by --help as soon as --rlimit accepts it.
+                let names: Vec<&str> = Resource::ALL.iter().map(|r| r.spelling()).collect();
+                out.push_str(&wrapped(&names));
+                out.push('\n');
+            }
+        }
+    }
+    out.push('\n');
+    out.push_str(CLOSING);
+    out
+}
 
 /// The usage error for an option the launch parser does not know, offering the
 /// nearest flag the help documents when one is close.
@@ -617,9 +2009,12 @@ fn unrecognized_option(arg: &OsStr) -> String {
              its own.",
         );
     }
-    let usage = usage();
-    let candidates: Vec<&str> = documented_flags(&usage)
-        .into_iter()
+    // The candidates are the table itself. They used to be scraped out of the
+    // rendered help, which is now rendered from the table -- so the roster and
+    // the vocabulary are one list rather than two that have to agree.
+    let candidates: Vec<&str> = FLAGS
+        .iter()
+        .map(|flag| flag.long)
         .filter(|flag| export_only_owner(flag).is_none())
         .collect();
     match nearest_flag(name, &candidates) {
@@ -636,10 +2031,22 @@ fn flag_name(arg: &str) -> &str {
 
 /// The mode flag that owns `flag`, when `flag` belongs to a mode of its own
 /// rather than to a launch.
+///
+/// A flag of another mode is not a misspelling, so the suggester never offers
+/// one; naming the flag that selects the owning mode is the useful answer.
 fn export_only_owner(flag: &str) -> Option<&'static str> {
-    EXPORT_ONLY_FLAGS
-        .contains(&flag)
-        .then_some("--export-rootfs")
+    let entry = FLAGS.iter().find(|entry| entry.long == flag)?;
+    // A flag that *selects* its mode is not an option of another mode: it is
+    // the mode, and typing it is how a caller asks for one. Only a flag that
+    // belongs to a mode without selecting it -- `--export-to` -- is the case
+    // this answers.
+    if entry.mode == Mode::Launch || entry.selects {
+        return None;
+    }
+    FLAGS
+        .iter()
+        .find(|other| other.selects && other.mode == entry.mode)
+        .map(|other| other.long)
 }
 
 /// The usage error for an argument a mode's parser does not accept.
@@ -655,33 +2062,6 @@ fn mode_conflict(arg: &OsStr, mode: &str, vocabulary: &[&'static str]) -> String
         Some(flag) => format!("unrecognized option {given}\nTry 'fcage {flag}'."),
         None => format!("{given} cannot be used with {mode}"),
     }
-}
-
-/// Every long flag the help text names.
-///
-/// The roster is read out of the help rather than kept beside it, which is what
-/// stops the two from drifting: a flag the help does not name is one the
-/// suggester cannot offer, and that is a gap in the help either way. A second
-/// hand-maintained table would instead fall quietly behind the parser.
-///
-/// Flags named in prose count, not only those introducing an entry, so the
-/// toggles the closing paragraphs list — `--proc`, `--tmp`, and the rest of the
-/// counterparts — can be suggested too. The punctuation the prose wraps them in
-/// is trimmed off.
-///
-/// Two things that look like flags are not. A bare `--` is the end-of-options
-/// separator, and the help names a family as `--landlock-*` or `--no-*`, which
-/// trims to a trailing hyphen. No flag ends in one, so that is what tells them
-/// apart, and neither is a name to suggest.
-fn documented_flags(usage: &str) -> Vec<&str> {
-    let mut flags: Vec<&str> = usage
-        .split_whitespace()
-        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
-        .filter(|token| token.starts_with("--") && token.len() > 2 && !token.ends_with('-'))
-        .collect();
-    flags.sort_unstable();
-    flags.dedup();
-    flags
 }
 
 /// The documented flag nearest `given`, or `None` when none is near enough to
@@ -773,6 +2153,108 @@ fn wrapped(items: &[&str]) -> String {
         .join("\n")
 }
 
+/// The mode an invocation selects, and where the command begins.
+///
+/// A mode flag chooses the invocation, so it has to be found before the launch
+/// vocabulary is parsed. What "before" means is the whole of this function: an
+/// argument past the command belongs to the command, so a tool with an
+/// `--export-rootfs` flag of its own must still be runnable inside a sandbox.
+///
+/// The command begins at `--`, or at the first argument that is neither an
+/// option nor the value of one. Deciding the second half is why every flag is
+/// in [`FLAGS`] whether a launch takes it or not: without each flag's arity
+/// this walk would read `--export-to /tmp/out` as the command `/tmp/out` and
+/// stop, or read a launch's command as a flag and go on.
+fn selected_mode(args: &[OsString]) -> Option<Mode> {
+    let mut selected = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" {
+            break;
+        }
+        let Some(flag) = named(arg) else {
+            if arg.as_bytes().starts_with(b"-") && arg != "-" {
+                // An option this does not know: not a mode, and the launch
+                // parser is where it is reported.
+                continue;
+            }
+            // The command.
+            break;
+        };
+        if flag.selects && selected.is_none() {
+            selected = Some(flag.mode);
+        }
+        // A separated value is the flag's, not the command.
+        if flag.arity() != Arity::Bare && !joined(arg) {
+            let count = if flag.arity() == Arity::Two { 2 } else { 1 };
+            for _ in 0..count {
+                if rest.next().is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    selected
+}
+
+/// Whether `arg` is a flag written with its value joined on.
+fn joined(arg: &OsStr) -> bool {
+    arg.as_bytes().contains(&b'=')
+}
+
+/// The flag `arg` names, whether it is written joined or separated.
+///
+/// A joined value is only split off for a flag that takes one value: `--bind=A`
+/// would leave the pair's second half on the wrong side of the `=`, and
+/// `--no-proc=1` names a flag that takes nothing. Both stay unrecognized, which
+/// is what they were.
+fn named(arg: &OsStr) -> Option<&'static Flag> {
+    let text = arg.to_str()?;
+    if let Some(flag) = FLAGS.iter().find(|flag| flag.long == text) {
+        return Some(flag);
+    }
+    let (name, _) = text.split_once('=')?;
+    FLAGS
+        .iter()
+        .find(|flag| flag.long == name && flag.arity() == Arity::One)
+}
+
+/// Applies one flag to the options a launch is being built from.
+///
+/// `joined` is the value written after an `=`, where it was; the lookup only
+/// splits one off for a flag that takes exactly one value.
+fn apply_flag(
+    flag: &Flag,
+    options: &mut Options,
+    joined: Option<OsString>,
+    args: &mut dyn Iterator<Item = OsString>,
+) -> Result<(), String> {
+    let missing = || format!("{} requires {}", flag.long, flag.needs);
+    match flag.take {
+        Take::Bare(set) => {
+            set(options);
+            Ok(())
+        }
+        Take::One(set) => {
+            let value = match joined {
+                Some(value) => value,
+                None => args.next().ok_or_else(missing)?,
+            };
+            set(options, flag.long, value)
+        }
+        Take::Two(set) => {
+            let first = args.next().ok_or_else(missing)?;
+            let second = args.next().ok_or_else(missing)?;
+            set(options, flag.long, first, second)
+        }
+        // A flag of another mode, written before the command of a launch. The
+        // pre-scan routed nothing here, so it is one that belongs to a mode
+        // without selecting it -- and the message names the mode rather than
+        // suggesting the spelling that was just refused.
+        Take::Refused(_) => Err(unrecognized_option(OsStr::new(flag.long))),
+    }
+}
+
 fn main() -> ExitCode {
     match parse(std::env::args_os().skip(1)) {
         Ok(Invocation::Help) => {
@@ -826,41 +2308,20 @@ fn main() -> ExitCode {
 /// Parses the command line, excluding the program name.
 fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     let args: Vec<OsString> = args.collect();
-    // A removal is a mode of its own rather than a launch, so it is recognized
-    // before the launch vocabulary is parsed and accepts only its own flags.
-    // Splitting it this way is what keeps the two in step: a flag added to a
-    // launch is refused alongside --remove-rootfs by the same `else` that
-    // refuses every other one, rather than being silently accepted and then
-    // ignored by a removal that never reads it.
-    //
-    // The scan stops at `--`, since past it every argument belongs to the
-    // command: a tool with an `--export-rootfs` flag of its own must still be
-    // runnable inside a sandbox. Nothing before `--` can belong to the command,
-    // so the flags this finds are fcage's.
-    let configuring = &args[..args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(args.len())];
-    if configuring.iter().any(|arg| names_gentoo_variants(arg)) {
-        return parse_gentoo_variants(args);
-    }
-    if configuring.iter().any(|arg| names_gentoo_packages(arg)) {
-        return parse_gentoo_packages(args);
-    }
-    if configuring.iter().any(|arg| names_gentoo_installed(arg)) {
-        return parse_gentoo_installed(args);
-    }
-    if configuring
-        .iter()
-        .any(|arg| arg == "--gentoo-keyring-horizon")
-    {
-        return parse_gentoo_keyring(args);
-    }
-    if configuring.iter().any(|arg| names_removal(arg)) {
-        return parse_removal(args);
-    }
-    if configuring.iter().any(|arg| names_export(arg)) {
-        return parse_export(args);
+    // A mode is a program of its own behind the same name, so it is recognized
+    // before the launch vocabulary is parsed and its parser accepts only its
+    // own flags. Splitting it this way is what keeps the two in step: a flag
+    // added to a launch is refused alongside --remove-rootfs by the same `else`
+    // that refuses every other one, rather than being silently accepted and
+    // then ignored by a removal that never reads it.
+    match selected_mode(&args) {
+        Some(Mode::GentooVariants) => return parse_gentoo_variants(args),
+        Some(Mode::GentooPackages) => return parse_gentoo_packages(args),
+        Some(Mode::GentooInstalled) => return parse_gentoo_installed(args),
+        Some(Mode::GentooKeyring) => return parse_gentoo_keyring(args),
+        Some(Mode::Remove) => return parse_removal(args),
+        Some(Mode::Export) => return parse_export(args),
+        _ => {}
     }
     // Kept for the no-effect check at the end, which asks what was written
     // rather than what it parsed to.
@@ -946,6 +2407,11 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         landlock: Vec::new(),
         landlock_net: Vec::new(),
         seccomp: None,
+        seccomp_curated: false,
+        seccomp_allow: Vec::new(),
+        seccomp_deny: Vec::new(),
+        seccomp_allow_rules: Vec::new(),
+        seccomp_deny_rules: Vec::new(),
         caps: None,
         restrict: false,
         netstack: false,
@@ -954,559 +2420,43 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack_host_loopback: false,
     };
 
-    // Seccomp is assembled after the argument loop: the curated posture and the
-    // allow/deny lists and rules are mutually constrained, so they are gathered
-    // first and reconciled once, into `options.seccomp`.
-    let mut seccomp_curated = false;
-    let mut seccomp_allow: Vec<i64> = Vec::new();
-    let mut seccomp_deny: Vec<i64> = Vec::new();
-    let mut seccomp_allow_rules: Vec<(i64, Vec<SeccompArg>)> = Vec::new();
-    let mut seccomp_deny_rules: Vec<(i64, Vec<SeccompArg>)> = Vec::new();
-
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
             return Ok(Invocation::Help);
-        } else if arg == "-V" || arg == "--version" {
+        }
+        if arg == "-V" || arg == "--version" {
             return Ok(Invocation::Version);
-        } else if arg == "--rootfs" {
-            options.rootfs = Some(PathBuf::from(value_for("--rootfs", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--rootfs=") {
-            options.rootfs = Some(PathBuf::from(value));
-        } else if arg == "--provision-tar" {
-            options.provision_tar = Some(PathBuf::from(value_for("--provision-tar", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--provision-tar=") {
-            options.provision_tar = Some(PathBuf::from(value));
-        } else if arg == "--provision-debian" {
-            options.provision_debian = Some(string_value("--provision-debian", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--provision-debian=") {
-            options.provision_debian = Some(into_string("--provision-debian", value)?);
-        } else if arg == "--debian-arch" {
-            options.debian_arch = Some(string_value("--debian-arch", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--debian-arch=") {
-            options.debian_arch = Some(into_string("--debian-arch", value)?);
-        } else if arg == "--debian-mirror" {
-            options.debian_mirror = Some(string_value("--debian-mirror", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--debian-mirror=") {
-            options.debian_mirror = Some(into_string("--debian-mirror", value)?);
-        } else if arg == "--debian-components" {
-            extend_comma(
-                &mut options.debian_components,
-                &string_value("--debian-components", &mut args)?,
-            );
-        } else if let Some(value) = flag_value(&arg, b"--debian-components=") {
-            extend_comma(
-                &mut options.debian_components,
-                &into_string("--debian-components", value)?,
-            );
-        } else if arg == "--debian-include" {
-            extend_comma(
-                &mut options.debian_include,
-                &string_value("--debian-include", &mut args)?,
-            );
-        } else if let Some(value) = flag_value(&arg, b"--debian-include=") {
-            extend_comma(
-                &mut options.debian_include,
-                &into_string("--debian-include", value)?,
-            );
-        } else if arg == "--debian-cache" {
-            options.debian_cache = Some(PathBuf::from(value_for("--debian-cache", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--debian-cache=") {
-            options.debian_cache = Some(PathBuf::from(value));
-        } else if arg == "--debian-keyring" {
-            options.debian_keyring = Some(PathBuf::from(value_for("--debian-keyring", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--debian-keyring=") {
-            options.debian_keyring = Some(PathBuf::from(value));
-        } else if arg == "--debian-extract-only" {
-            options.debian_extract_only = true;
-        } else if arg == "--profile" {
-            let path = PathBuf::from(value_for("--profile", &mut args)?);
-            set_profile(&mut options, path, false)?;
-        } else if let Some(value) = flag_value(&arg, b"--profile=") {
-            set_profile(&mut options, PathBuf::from(value), false)?;
-        } else if arg == "--restricted-profile" {
-            let path = PathBuf::from(value_for("--restricted-profile", &mut args)?);
-            set_profile(&mut options, path, true)?;
-        } else if let Some(value) = flag_value(&arg, b"--restricted-profile=") {
-            set_profile(&mut options, PathBuf::from(value), true)?;
-        } else if arg == "--bind" || arg == "--ro-bind" {
-            let name = if arg == "--bind" {
-                "--bind"
-            } else {
-                "--ro-bind"
-            };
-            let source = value_for(name, &mut args)?;
-            let target = args
-                .next()
-                .ok_or(format!("{name} requires a source and a target"))?;
-            options.mounts.push(Mount::Bind(
-                Bind::new(PathBuf::from(source), PathBuf::from(target))
-                    .read_only(name == "--ro-bind"),
-            ));
-        } else if arg == "--setenv" {
-            let name = value_for("--setenv", &mut args)?;
-            // Validate the name here so a bad one is the usage error it is
-            // (exit 2), rather than deferring to the library's build-time
-            // rejection (exit 125). The rule matches the library's.
-            if name.is_empty() || name.as_bytes().contains(&b'=') {
-                return Err(format!(
-                    "--setenv: {name:?} is not a valid environment variable name \
-                     (it is empty or contains '=')"
-                ));
-            }
-            let value = args
-                .next()
-                .ok_or("--setenv requires a name and a value".to_string())?;
-            options.setenv.push((name, value));
-        } else if arg == "--hostname" {
-            options.hostname = Some(value_for("--hostname", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--hostname=") {
-            options.hostname = Some(value);
-        } else if arg == "--chdir" {
-            options.chdir = Some(PathBuf::from(value_for("--chdir", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--chdir=") {
-            options.chdir = Some(PathBuf::from(value));
-        } else if arg == "--stdin" {
-            options.stdin = Some(parse_stdin(&value_for("--stdin", &mut args)?)?);
-        } else if let Some(value) = flag_value(&arg, b"--stdin=") {
-            options.stdin = Some(parse_stdin(&value)?);
-        } else if arg == "--terminal" {
-            options.terminal = true;
-        } else if arg == "--timeout" {
-            options.timeout = Some(parse_seconds(
-                "--timeout",
-                &value_for("--timeout", &mut args)?,
-            )?);
-        } else if let Some(value) = flag_value(&arg, b"--timeout=") {
-            options.timeout = Some(parse_seconds("--timeout", &value)?);
-        } else if arg == "--kill-after" {
-            options.kill_after =
-                parse_seconds("--kill-after", &value_for("--kill-after", &mut args)?)?;
-            options.kill_after_given = true;
-        } else if let Some(value) = flag_value(&arg, b"--kill-after=") {
-            options.kill_after = parse_seconds("--kill-after", &value)?;
-            options.kill_after_given = true;
-        } else if arg == "--share-net" {
-            options.network = Some(Network::Host);
-        } else if arg == "--isolate-net" {
-            options.network = Some(Network::Isolated);
-        } else if arg == "--deny-net" {
-            options.network = Some(Network::None);
-        } else if arg == "--netstack" {
-            options.netstack = true;
-        } else if arg == "--netstack-cidr" {
-            options.netstack_cidr = Some(parse_cidr(&string_value("--netstack-cidr", &mut args)?)?);
-        } else if let Some(value) = flag_value(&arg, b"--netstack-cidr=") {
-            options.netstack_cidr = Some(parse_cidr(&into_string("--netstack-cidr", value)?)?);
-        } else if arg == "--netstack-mtu" {
-            options.netstack_mtu = Some(parse_mtu(&string_value("--netstack-mtu", &mut args)?)?);
-        } else if let Some(value) = flag_value(&arg, b"--netstack-mtu=") {
-            options.netstack_mtu = Some(parse_mtu(&into_string("--netstack-mtu", value)?)?);
-        } else if arg == "--netstack-host-loopback" {
-            options.netstack_host_loopback = true;
-        } else if arg == "--path-lookup" {
-            options.path_lookup = Some(true);
-        } else if arg == "--no-path-lookup" {
-            options.path_lookup = Some(false);
-        } else if arg == "--raw-mount" {
-            options
-                .mounts
-                .push(Mount::Raw(parse_raw_mount(&string_value(
-                    "--raw-mount",
-                    &mut args,
-                )?)?));
-        } else if let Some(value) = flag_value(&arg, b"--raw-mount=") {
-            options.mounts.push(Mount::Raw(parse_raw_mount(&into_string(
-                "--raw-mount",
-                value,
-            )?)?));
-        } else if arg == "--overlay-lower" {
-            options
-                .overlay_lowers
-                .push(PathBuf::from(value_for("--overlay-lower", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--overlay-lower=") {
-            options.overlay_lowers.push(PathBuf::from(value));
-        } else if arg == "--overlay-upper" {
-            options.overlay_upper = Some(PathBuf::from(value_for("--overlay-upper", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--overlay-upper=") {
-            options.overlay_upper = Some(PathBuf::from(value));
-        } else if arg == "--overlay-work" {
-            options.overlay_work = Some(PathBuf::from(value_for("--overlay-work", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--overlay-work=") {
-            options.overlay_work = Some(PathBuf::from(value));
-        } else if arg == "--identity-map" {
-            options.identity_map = Some(parse_identity_map(
-                "--identity-map",
-                &string_value("--identity-map", &mut args)?,
-            )?);
-        } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
-            options.identity_map = Some(parse_identity_map(
-                "--identity-map",
-                &into_string("--identity-map", value)?,
-            )?);
-        } else if arg == "--run-as" {
-            options.run_as = Some(parse_run_as(&string_value("--run-as", &mut args)?)?);
-        } else if let Some(value) = flag_value(&arg, b"--run-as=") {
-            options.run_as = Some(parse_run_as(&into_string("--run-as", value)?)?);
-        } else if arg == "--rlimit" {
-            options
-                .rlimits
-                .push(parse_rlimit(&string_value("--rlimit", &mut args)?)?);
-        } else if let Some(value) = flag_value(&arg, b"--rlimit=") {
-            options
-                .rlimits
-                .push(parse_rlimit(&into_string("--rlimit", value)?)?);
-        } else if arg == "--debian-exclude" {
-            extend_comma(
-                &mut options.debian_exclude,
-                &string_value("--debian-exclude", &mut args)?,
-            );
-        } else if let Some(value) = flag_value(&arg, b"--debian-exclude=") {
-            extend_comma(
-                &mut options.debian_exclude,
-                &into_string("--debian-exclude", value)?,
-            );
-        } else if arg == "--debian-mirror-fallback" {
-            options
-                .debian_mirror_fallback
-                .push(string_value("--debian-mirror-fallback", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--debian-mirror-fallback=") {
-            options
-                .debian_mirror_fallback
-                .push(into_string("--debian-mirror-fallback", value)?);
-        } else if arg == "--debian-base-priority" {
-            options.debian_base_priority = Some(parse_priority(&string_value(
-                "--debian-base-priority",
-                &mut args,
-            )?)?);
-        } else if let Some(value) = flag_value(&arg, b"--debian-base-priority=") {
-            options.debian_base_priority = Some(parse_priority(&into_string(
-                "--debian-base-priority",
-                value,
-            )?)?);
-        } else if arg == "--debian-trust-unsigned" {
-            options.debian_trust_unsigned = true;
-        } else if arg == "--debian-allow-stale-release" {
-            options.debian_allow_stale_release = true;
-        } else if arg == "--debian-pre-configure-overlay" {
-            options.debian_pre_configure_overlay = Some(PathBuf::from(value_for(
-                "--debian-pre-configure-overlay",
-                &mut args,
-            )?));
-        } else if let Some(value) = flag_value(&arg, b"--debian-pre-configure-overlay=") {
-            options.debian_pre_configure_overlay = Some(PathBuf::from(value));
-        } else if arg == "--debian-identity-map" {
-            options.debian_identity_map = Some(parse_identity_map(
-                "--debian-identity-map",
-                &string_value("--debian-identity-map", &mut args)?,
-            )?);
-        } else if let Some(value) = flag_value(&arg, b"--debian-identity-map=") {
-            options.debian_identity_map = Some(parse_identity_map(
-                "--debian-identity-map",
-                &into_string("--debian-identity-map", value)?,
-            )?);
-        } else if arg == "--debian-repository" {
-            options
-                .debian_repositories
-                .push(parse_repository(&string_value(
-                    "--debian-repository",
-                    &mut args,
-                )?)?);
-        } else if let Some(value) = flag_value(&arg, b"--debian-repository=") {
-            options
-                .debian_repositories
-                .push(parse_repository(&into_string(
-                    "--debian-repository",
-                    value,
-                )?)?);
-        } else if arg == "--provision-alpine" {
-            options.provision_alpine = Some(string_value("--provision-alpine", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--provision-alpine=") {
-            options.provision_alpine = Some(into_string("--provision-alpine", value)?);
-        } else if arg == "--alpine-arch" {
-            options.alpine_arch = Some(string_value("--alpine-arch", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--alpine-arch=") {
-            options.alpine_arch = Some(into_string("--alpine-arch", value)?);
-        } else if arg == "--alpine-mirror" {
-            options.alpine_mirror = Some(string_value("--alpine-mirror", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--alpine-mirror=") {
-            options.alpine_mirror = Some(into_string("--alpine-mirror", value)?);
-        } else if arg == "--alpine-mirror-fallback" {
-            options
-                .alpine_mirror_fallback
-                .push(string_value("--alpine-mirror-fallback", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--alpine-mirror-fallback=") {
-            options
-                .alpine_mirror_fallback
-                .push(into_string("--alpine-mirror-fallback", value)?);
-        } else if arg == "--alpine-components" {
-            extend_comma(
-                &mut options.alpine_components,
-                &string_value("--alpine-components", &mut args)?,
-            );
-        } else if let Some(value) = flag_value(&arg, b"--alpine-components=") {
-            extend_comma(
-                &mut options.alpine_components,
-                &into_string("--alpine-components", value)?,
-            );
-        } else if arg == "--alpine-include" {
-            extend_comma(
-                &mut options.alpine_include,
-                &string_value("--alpine-include", &mut args)?,
-            );
-        } else if let Some(value) = flag_value(&arg, b"--alpine-include=") {
-            extend_comma(
-                &mut options.alpine_include,
-                &into_string("--alpine-include", value)?,
-            );
-        } else if arg == "--alpine-exclude" {
-            extend_comma(
-                &mut options.alpine_exclude,
-                &string_value("--alpine-exclude", &mut args)?,
-            );
-        } else if let Some(value) = flag_value(&arg, b"--alpine-exclude=") {
-            extend_comma(
-                &mut options.alpine_exclude,
-                &into_string("--alpine-exclude", value)?,
-            );
-        } else if arg == "--alpine-extract-only" {
-            options.alpine_extract_only = true;
-        } else if arg == "--alpine-cache" {
-            options.alpine_cache = Some(PathBuf::from(value_for("--alpine-cache", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--alpine-cache=") {
-            options.alpine_cache = Some(PathBuf::from(value));
-        } else if arg == "--provision-gentoo" {
-            options.provision_gentoo = Some(string_value("--provision-gentoo", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--provision-gentoo=") {
-            options.provision_gentoo = Some(into_string("--provision-gentoo", value)?);
-        } else if arg == "--gentoo-variant" {
-            options.gentoo_variant = Some(string_value("--gentoo-variant", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-variant=") {
-            options.gentoo_variant = Some(into_string("--gentoo-variant", value)?);
-        } else if arg == "--gentoo-binhost" {
-            options.gentoo_binhost = Some(string_value("--gentoo-binhost", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-binhost=") {
-            options.gentoo_binhost = Some(into_string("--gentoo-binhost", value)?);
-        } else if arg == "--gentoo-install" {
-            options
-                .gentoo_install
-                .push(string_value("--gentoo-install", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-install=") {
-            options
-                .gentoo_install
-                .push(into_string("--gentoo-install", value)?);
-        } else if arg == "--gentoo-prefer-use" {
-            options.gentoo_prefer_use.extend(
-                string_value("--gentoo-prefer-use", &mut args)?
-                    .split_ascii_whitespace()
-                    .map(str::to_string),
-            );
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-prefer-use=") {
-            options.gentoo_prefer_use.extend(
-                into_string("--gentoo-prefer-use", value)?
-                    .split_ascii_whitespace()
-                    .map(str::to_string),
-            );
-        } else if arg == "--gentoo-plan" {
-            options.gentoo_plan = Some(PathBuf::from(value_for("--gentoo-plan", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-plan=") {
-            options.gentoo_plan = Some(PathBuf::from(value));
-        } else if arg == "--gentoo-build-id" {
-            options.gentoo_build_id = Some(string_value("--gentoo-build-id", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-build-id=") {
-            options.gentoo_build_id = Some(into_string("--gentoo-build-id", value)?);
-        } else if arg == "--gentoo-mirror" {
-            options.gentoo_mirror = Some(string_value("--gentoo-mirror", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror=") {
-            options.gentoo_mirror = Some(into_string("--gentoo-mirror", value)?);
-        } else if arg == "--gentoo-mirror-fallback" {
-            options
-                .gentoo_mirror_fallback
-                .push(string_value("--gentoo-mirror-fallback", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror-fallback=") {
-            options
-                .gentoo_mirror_fallback
-                .push(into_string("--gentoo-mirror-fallback", value)?);
-        } else if arg == "--gentoo-cache" {
-            options.gentoo_cache = Some(PathBuf::from(value_for("--gentoo-cache", &mut args)?));
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-cache=") {
-            options.gentoo_cache = Some(PathBuf::from(value));
-        } else if arg == "--gentoo-max-pointer-age" {
-            options.gentoo_max_pointer_age = Some(parse_pointer_age(&string_value(
-                "--gentoo-max-pointer-age",
-                &mut args,
-            )?)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-max-pointer-age=") {
-            options.gentoo_max_pointer_age = Some(parse_pointer_age(&into_string(
-                "--gentoo-max-pointer-age",
-                value,
-            )?)?);
-        } else if arg == "--alpine-keys" {
-            options.alpine_keys = Some(parse_alpine_keys(
-                "--alpine-keys",
-                &string_value("--alpine-keys", &mut args)?,
-            ));
-        } else if let Some(value) = flag_value(&arg, b"--alpine-keys=") {
-            options.alpine_keys = Some(parse_alpine_keys(
-                "--alpine-keys",
-                &into_string("--alpine-keys", value)?,
-            ));
-        } else if arg == "--alpine-pre-configure-overlay" {
-            options.alpine_pre_configure_overlay = Some(PathBuf::from(value_for(
-                "--alpine-pre-configure-overlay",
-                &mut args,
-            )?));
-        } else if let Some(value) = flag_value(&arg, b"--alpine-pre-configure-overlay=") {
-            options.alpine_pre_configure_overlay = Some(PathBuf::from(value));
-        } else if arg == "--alpine-identity-map" {
-            options.alpine_identity_map = Some(parse_identity_map(
-                "--alpine-identity-map",
-                &string_value("--alpine-identity-map", &mut args)?,
-            )?);
-        } else if let Some(value) = flag_value(&arg, b"--alpine-identity-map=") {
-            options.alpine_identity_map = Some(parse_identity_map(
-                "--alpine-identity-map",
-                &into_string("--alpine-identity-map", value)?,
-            )?);
-        } else if arg == "--alpine-repository" {
-            options
-                .alpine_repositories
-                .push(parse_alpine_repository(&string_value(
-                    "--alpine-repository",
-                    &mut args,
-                )?)?);
-        } else if let Some(value) = flag_value(&arg, b"--alpine-repository=") {
-            options
-                .alpine_repositories
-                .push(parse_alpine_repository(&into_string(
-                    "--alpine-repository",
-                    value,
-                )?)?);
-        } else if arg == "--restrict" {
-            options.restrict = true;
-        } else if arg == "--landlock-ro" {
-            let path = value_for("--landlock-ro", &mut args)?;
-            options.landlock.push((PathBuf::from(path), false));
-        } else if let Some(value) = flag_value(&arg, b"--landlock-ro=") {
-            options.landlock.push((PathBuf::from(value), false));
-        } else if arg == "--landlock-rw" {
-            let path = value_for("--landlock-rw", &mut args)?;
-            options.landlock.push((PathBuf::from(path), true));
-        } else if let Some(value) = flag_value(&arg, b"--landlock-rw=") {
-            options.landlock.push((PathBuf::from(value), true));
-        } else if arg == "--landlock-bind" {
-            let value = string_value("--landlock-bind", &mut args)?;
-            options
-                .landlock_net
-                .push((parse_port("--landlock-bind", &value)?, NetAccess::BIND));
-        } else if let Some(value) = flag_value(&arg, b"--landlock-bind=") {
-            let value = into_string("--landlock-bind", value)?;
-            options
-                .landlock_net
-                .push((parse_port("--landlock-bind", &value)?, NetAccess::BIND));
-        } else if arg == "--landlock-connect" {
-            let value = string_value("--landlock-connect", &mut args)?;
-            options.landlock_net.push((
-                parse_port("--landlock-connect", &value)?,
-                NetAccess::CONNECT,
-            ));
-        } else if let Some(value) = flag_value(&arg, b"--landlock-connect=") {
-            let value = into_string("--landlock-connect", value)?;
-            options.landlock_net.push((
-                parse_port("--landlock-connect", &value)?,
-                NetAccess::CONNECT,
-            ));
-        } else if arg == "--seccomp" {
-            parse_seccomp(&string_value("--seccomp", &mut args)?, &mut seccomp_curated)?;
-        } else if let Some(value) = flag_value(&arg, b"--seccomp=") {
-            parse_seccomp(&into_string("--seccomp", value)?, &mut seccomp_curated)?;
-        } else if arg == "--seccomp-allow" {
-            let value = string_value("--seccomp-allow", &mut args)?;
-            parse_seccomp_names("--seccomp-allow", &value, &mut seccomp_allow)?;
-        } else if let Some(value) = flag_value(&arg, b"--seccomp-allow=") {
-            let value = into_string("--seccomp-allow", value)?;
-            parse_seccomp_names("--seccomp-allow", &value, &mut seccomp_allow)?;
-        } else if arg == "--seccomp-deny" {
-            let value = string_value("--seccomp-deny", &mut args)?;
-            parse_seccomp_names("--seccomp-deny", &value, &mut seccomp_deny)?;
-        } else if let Some(value) = flag_value(&arg, b"--seccomp-deny=") {
-            let value = into_string("--seccomp-deny", value)?;
-            parse_seccomp_names("--seccomp-deny", &value, &mut seccomp_deny)?;
-        } else if arg == "--seccomp-allow-rule" {
-            let value = string_value("--seccomp-allow-rule", &mut args)?;
-            seccomp_allow_rules.push(parse_seccomp_rule("--seccomp-allow-rule", &value)?);
-        } else if let Some(value) = flag_value(&arg, b"--seccomp-allow-rule=") {
-            let value = into_string("--seccomp-allow-rule", value)?;
-            seccomp_allow_rules.push(parse_seccomp_rule("--seccomp-allow-rule", &value)?);
-        } else if arg == "--seccomp-deny-rule" {
-            let value = string_value("--seccomp-deny-rule", &mut args)?;
-            seccomp_deny_rules.push(parse_seccomp_rule("--seccomp-deny-rule", &value)?);
-        } else if let Some(value) = flag_value(&arg, b"--seccomp-deny-rule=") {
-            let value = into_string("--seccomp-deny-rule", value)?;
-            seccomp_deny_rules.push(parse_seccomp_rule("--seccomp-deny-rule", &value)?);
-        } else if arg == "--drop-caps" {
-            options.caps = Some(CapsChoice::DropAll);
-        } else if arg == "--keep-caps" {
-            options.caps = Some(CapsChoice::Keep(parse_caps(&string_value(
-                "--keep-caps",
-                &mut args,
-            )?)?));
-        } else if let Some(value) = flag_value(&arg, b"--keep-caps=") {
-            options.caps = Some(CapsChoice::Keep(parse_caps(&into_string(
-                "--keep-caps",
-                value,
-            )?)?));
-        } else if arg == "--share-pid" {
-            options.pid_namespace = Some(false);
-        } else if arg == "--pid-ns" {
-            options.pid_namespace = Some(true);
-        } else if arg == "--no-proc" {
-            options.mount_proc = Some(false);
-        } else if arg == "--proc" {
-            options.mount_proc = Some(true);
-        } else if arg == "--no-dev" {
-            options.mount_dev = Some(false);
-        } else if arg == "--dev" {
-            options.mount_dev = Some(true);
-        } else if arg == "--no-tmp" {
-            options.mount_tmp = Some(false);
-        } else if arg == "--tmp" {
-            options.mount_tmp = Some(true);
-        } else if arg == "--no-managed-mounts" {
-            options.managed_mounts = Some(false);
-        } else if arg == "--managed-mounts" {
-            options.managed_mounts = Some(true);
-        } else if arg == "--no-base-env" {
-            options.base_env = Some(false);
-        } else if arg == "--base-env" {
-            options.base_env = Some(true);
-        } else if arg == "--no-resolv-conf" {
-            options.resolv_conf = Some(false);
-        } else if arg == "--resolv-conf" {
-            options.resolv_conf = Some(true);
-        } else if arg == "--stop-with-caller" {
-            options.stop_with_caller = Some(true);
-        } else if arg == "--no-stop-with-caller" {
-            options.stop_with_caller = Some(false);
-        } else if arg == "--" {
-            options.command_line.extend(args);
-            break;
-        } else if arg.as_bytes().starts_with(b"-") && arg != "-" {
-            return Err(unrecognized_option(&arg));
-        } else {
-            // The first positional argument is the command; everything after
-            // it belongs to the command, dashes included.
-            options.command_line.push(arg);
+        }
+        if arg == "--" {
             options.command_line.extend(args);
             break;
         }
+        if let Some(flag) = named(&arg) {
+            // The joined form's value, where the argument carries one. The
+            // lookup only matches a joined argument against a flag that takes
+            // exactly one value, so this is `Some` for those and nothing else.
+            let joined = flag_value(&arg, format!("{}=", flag.long).as_bytes());
+            apply_flag(flag, &mut options, joined, &mut args)?;
+            continue;
+        }
+        if arg.as_bytes().starts_with(b"-") && arg != "-" {
+            return Err(unrecognized_option(&arg));
+        }
+        // The first positional argument is the command; everything after it
+        // belongs to the command, dashes included.
+        options.command_line.push(arg);
+        options.command_line.extend(args);
+        break;
     }
 
+    // Reconciled after the loop: the curated posture and the allow and deny
+    // sides are mutually constrained, and the flag that decides can come last.
     options.seccomp = assemble_seccomp(
-        seccomp_curated,
-        seccomp_allow,
-        seccomp_deny,
-        seccomp_allow_rules,
-        seccomp_deny_rules,
+        options.seccomp_curated,
+        std::mem::take(&mut options.seccomp_allow),
+        std::mem::take(&mut options.seccomp_deny),
+        std::mem::take(&mut options.seccomp_allow_rules),
+        std::mem::take(&mut options.seccomp_deny_rules),
     )?;
 
     // --kill-after is the grace period before the SIGKILL that follows a
@@ -1763,12 +2713,6 @@ fn help_or_version(args: &[OsString]) -> Option<Invocation> {
     None
 }
 
-/// Whether `arg` names the removal flag, in either the separated or the
-/// `=`-joined form.
-fn names_removal(arg: &OsStr) -> bool {
-    arg == "--remove-rootfs" || arg.as_bytes().starts_with(b"--remove-rootfs=")
-}
-
 /// Parses a `--remove-rootfs` command line, excluding the program name.
 ///
 /// A removal takes the destination and the identity map the tree was written
@@ -1815,11 +2759,6 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     // argument vector, not an invariant of this module.
     let dest = dest.ok_or_else(|| "--remove-rootfs requires a value".to_string())?;
     Ok(Invocation::Remove { dest, map })
-}
-
-/// Whether `arg` names the variant listing, in either form.
-fn names_gentoo_variants(arg: &OsStr) -> bool {
-    arg == "--gentoo-variants" || arg.as_bytes().starts_with(b"--gentoo-variants=")
 }
 
 /// Parses a `--gentoo-variants` command line, excluding the program name.
@@ -1912,11 +2851,6 @@ fn parse_gentoo_keyring(args: Vec<OsString>) -> Result<Invocation, String> {
     Ok(Invocation::GentooKeyring)
 }
 
-/// Whether `arg` names the binhost listing flag, in either form.
-fn names_gentoo_packages(arg: &OsStr) -> bool {
-    arg == "--gentoo-packages" || arg.as_bytes().starts_with(b"--gentoo-packages=")
-}
-
 /// Parses a `--gentoo-packages` command line, excluding the program name.
 ///
 /// A listing reads the binhost index and prints it, so it takes the
@@ -1974,11 +2908,6 @@ fn parse_gentoo_packages(args: Vec<OsString>) -> Result<Invocation, String> {
     }
 }
 
-/// Whether `arg` names the installed-set listing flag, in either form.
-fn names_gentoo_installed(arg: &OsStr) -> bool {
-    arg == "--gentoo-installed" || arg.as_bytes().starts_with(b"--gentoo-installed=")
-}
-
 /// Parses a `--gentoo-installed` command line, excluding the program name.
 ///
 /// It reads a root's own package database and reaches nothing else, so it takes
@@ -2006,12 +2935,6 @@ fn parse_gentoo_installed(args: Vec<OsString>) -> Result<Invocation, String> {
         Some(root) => Ok(Invocation::GentooInstalled { root }),
         None => Err("--gentoo-installed requires a value".to_string()),
     }
-}
-
-/// Whether `arg` names the export flag, in either the separated or the
-/// `=`-joined form.
-fn names_export(arg: &OsStr) -> bool {
-    arg == "--export-rootfs" || arg.as_bytes().starts_with(b"--export-rootfs=")
 }
 
 /// Parses an `--export-rootfs` command line, excluding the program name.
@@ -3072,10 +3995,11 @@ fn run(options: Options) -> ExitCode {
         }
     }
 
-    if let (Some(architecture), Some(rootfs)) = (&options.provision_gentoo, &options.rootfs)
-        && let Err(code) = provision_gentoo(architecture, &options, rootfs)
-    {
-        return code;
+    if let Some(architecture) = &options.provision_gentoo {
+        let rootfs = options.rootfs.as_deref().expect("checked at parse time");
+        if let Err(code) = provision_gentoo(architecture, &options, rootfs) {
+            return code;
+        }
     }
 
     // A provisioning run with no command and no profile provisions and exits.
@@ -4124,38 +5048,6 @@ mod tests {
         }
     }
 
-    /// Every long flag the parser compares an argument against, read out of
-    /// this file's own source.
-    ///
-    /// There is no roster to read instead — the parser is a chain of
-    /// comparisons — and a list written out here would be the second table the
-    /// suggester exists to avoid. The scan stops at the test module, so a flag
-    /// spelled in a test is not mistaken for one the parser accepts.
-    fn parser_flags() -> Vec<&'static str> {
-        const SOURCE: &str = include_str!("main.rs");
-        let parser = SOURCE
-            .split_once("\n#[cfg(test)]")
-            .map_or(SOURCE, |(before, _)| before);
-
-        let mut flags = Vec::new();
-        // `arg == "--flag"`, and the inline-value form `--flag=VALUE`.
-        for (opening, closing) in [("== \"", '"'), ("starts_with(b\"", '=')] {
-            for (offset, _) in parser.match_indices(opening) {
-                let rest = &parser[offset + opening.len()..];
-                let Some(end) = rest.find(closing) else {
-                    continue;
-                };
-                let flag = &rest[..end];
-                if flag.starts_with("--") && flag.len() > 2 {
-                    flags.push(flag);
-                }
-            }
-        }
-        flags.sort_unstable();
-        flags.dedup();
-        flags
-    }
-
     #[test]
     fn a_misspelled_flag_suggests_the_one_it_was_meant_to_be() {
         // With this many flags, several sharing long prefixes, a report that
@@ -4260,11 +5152,68 @@ mod tests {
     }
 
     #[test]
+    fn a_commands_own_flags_do_not_choose_the_mode_without_a_separator() {
+        // `--` is optional, and the synopsis says so: the command is the first
+        // argument that is neither an option nor the value of one, and
+        // everything after it is the command's. A pre-scan that stopped only at
+        // `--` read a mode flag out of the command's own arguments, ran the
+        // mode's parser, and reported the launch flag it then met as the
+        // problem -- blaming --rootfs for an export nobody asked for.
+        let invocation = parse_args(&[
+            "--rootfs",
+            "/srv/alpine",
+            "/bin/mytool",
+            "--export-rootfs",
+            "/tmp/out",
+        ])
+        .expect("the launch parses");
+        let Invocation::Run(options) = invocation else {
+            panic!("the invocation is a launch, not a mode");
+        };
+        assert_eq!(
+            options.command_line,
+            ["/bin/mytool", "--export-rootfs", "/tmp/out"],
+        );
+    }
+
+    #[test]
+    fn a_mode_flag_after_another_flags_value_still_chooses_the_mode() {
+        // The other half of the same rule: a flag's value is not the command,
+        // so the walk goes past it. Reading `/tmp/out` as the command would
+        // stop the scan before it reached the flag that selects the mode.
+        let invocation = parse_args(&["--export-to", "/tmp/out", "--export-rootfs", "/roots/a"])
+            .expect("the export parses");
+        assert!(
+            matches!(invocation, Invocation::Export { .. }),
+            "the invocation is an export",
+        );
+    }
+
+    #[test]
+    fn a_two_value_flag_does_not_hide_the_command() {
+        // A pair counts as two, so the argument after them is the command
+        // rather than the second half of the pair.
+        let invocation = parse_args(&["--rootfs", "/srv/a", "--setenv", "K", "V", "/bin/sh"])
+            .expect("the launch parses");
+        let Invocation::Run(options) = invocation else {
+            panic!("the invocation is a launch, not a mode");
+        };
+        assert_eq!(options.command_line, ["/bin/sh"]);
+        assert_eq!(options.setenv.len(), 1);
+    }
+
+    #[test]
     fn the_export_only_roster_holds_only_export_options() {
-        // The roster is written out rather than derived, so this is what keeps
-        // it honest: every entry must be one a launch refuses and an export
-        // accepts, or the suggester attributes a flag to the wrong mode.
-        for flag in EXPORT_ONLY_FLAGS {
+        // The roster is the table's `mode`, so this is what keeps that honest:
+        // every flag it calls an export's must be one a launch refuses and an
+        // export accepts, or the suggester attributes a flag to the wrong mode.
+        let export_only: Vec<&str> = FLAGS
+            .iter()
+            .filter(|flag| flag.mode == Mode::Export && !flag.selects)
+            .map(|flag| flag.long)
+            .collect();
+        assert!(!export_only.is_empty(), "the roster is not empty");
+        for flag in export_only {
             let launch = parse_error(&["--rootfs", "/srv/alpine", flag, "/bin/sh"]);
             assert!(
                 launch.contains("unrecognized option"),
@@ -4840,37 +5789,67 @@ mod tests {
 
     #[test]
     fn every_flag_the_parser_accepts_is_in_the_help() {
-        // The suggester offers what the help documents, so a flag the help
-        // does not name is one it can never offer. That is a gap in the help
-        // whether or not anything suggests it, which is why the check is here
-        // rather than left to the reader of a second table.
+        // The parser's vocabulary and the help's contents are one list, so
+        // most of what this used to check is now unwritable. What is left is
+        // the flags the help documents in prose rather than as an entry: the
+        // counterpart toggles, each named in the closing paragraphs. A flag
+        // filed there and then forgotten in the prose is documented nowhere,
+        // and the suggester could never offer it.
         let usage = usage();
-        let documented = documented_flags(&usage);
-        for flag in parser_flags() {
+        for flag in FLAGS {
+            if flag.section != Section::Counterpart {
+                // Rendered from the table, so its presence is not a question.
+                assert!(
+                    usage.contains(&format!("  {}", flag.spelled())),
+                    "the help does not list {}, which is not a prose entry",
+                    flag.long,
+                );
+                continue;
+            }
             assert!(
-                documented.contains(&flag),
-                "the parser accepts {flag}, which --help never names",
+                usage.contains(flag.long),
+                "the parser accepts {}, which --help never names",
+                flag.long,
+            );
+        }
+    }
+
+    #[test]
+    fn every_flag_the_help_names_in_prose_is_one_the_parser_accepts() {
+        // The other direction over the same prose, and what keeps the closing
+        // paragraphs from naming a flag that no longer exists. The entries
+        // themselves come from the table and cannot.
+        let usage = usage();
+        let prose = usage
+            .split_once("Each toggle")
+            .expect("the closing prose")
+            .1;
+        for token in prose.split_whitespace() {
+            let name = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+            if !name.starts_with("--") || name.len() <= 2 || name.ends_with('-') {
+                continue;
+            }
+            assert!(
+                FLAGS.iter().any(|flag| flag.long == name),
+                "the closing prose names {name}, which no flag is",
             );
         }
     }
 
     #[test]
     fn every_flag_the_help_names_is_one_the_parser_accepts() {
-        // The other direction, and what keeps the derived candidate list
-        // honest: a suggestion the parser would then refuse is worse than no
-        // suggestion, and it is what a stray token scanned out of the prose
-        // would produce.
-        //
         // A flag is offered to each mode's vocabulary in turn, since some
         // belong to one mode only -- `--clamp-mtime` is an export's -- and
-        // trying all three is what covers them without a table recording which
-        // flag belongs where.
-        let usage = usage();
-        for flag in documented_flags(&usage) {
+        // trying all of them is what covers the whole table.
+        for flag in FLAGS {
+            if matches!(flag.mode, Mode::Help | Mode::Version) {
+                continue;
+            }
+            let long = flag.long;
             let vocabularies: [Vec<&str>; 3] = [
-                vec![flag],
-                vec!["--remove-rootfs", "/roots/a", flag],
-                vec!["--export-rootfs", "/roots/a", flag],
+                vec![long],
+                vec!["--remove-rootfs", "/roots/a", long],
+                vec!["--export-rootfs", "/roots/a", long],
             ];
             let recognized = vocabularies.iter().any(|args| match parse_args(args) {
                 // A flag needing a value reports that, which is recognition.
@@ -4882,7 +5861,7 @@ mod tests {
             });
             assert!(
                 recognized,
-                "--help names {flag}, which no mode's parser accepts",
+                "the table holds {long}, which no mode's parser accepts",
             );
         }
     }

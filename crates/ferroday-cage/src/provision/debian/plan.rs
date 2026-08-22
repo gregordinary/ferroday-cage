@@ -150,7 +150,12 @@ pub struct ResolvedArchive {
     /// Empty exactly when [`signed_by`](Self::signed_by) is.
     pub signing_key: Vec<String>,
     /// Fields this archive's stanza carried that this version does not know.
-    carried: Carried,
+    ///
+    /// Reachable within the layer so a live resolution can build the record as
+    /// a struct literal, naming each field: the four `String` and `Vec<String>`
+    /// fields above sit in transposable pairs, and a positional constructor
+    /// over them compiles either way round and writes a wrong plan document.
+    pub(super) carried: Carried,
 }
 
 /// One package in a [`Plan`]: enough to identify the exact `.deb` and to key a
@@ -462,37 +467,6 @@ impl Plan {
             archives: archives.to_vec(),
             // A plan built from a live resolution has no document behind it,
             // so there is nothing to carry.
-            carried: Carried::new(),
-        }
-    }
-}
-
-impl ResolvedArchive {
-    /// Records one repository's state as a live resolution observed it.
-    ///
-    /// A constructor rather than a struct literal because the carried-field
-    /// list is private: a record built from a resolution has no document behind
-    /// it, so there is nothing to carry.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn resolved(
-        mirror: String,
-        suite: String,
-        components: Vec<String>,
-        release_sha256: String,
-        date: Option<String>,
-        valid_until: Option<String>,
-        signed_by: Vec<String>,
-        signing_key: Vec<String>,
-    ) -> ResolvedArchive {
-        ResolvedArchive {
-            mirror,
-            suite,
-            components,
-            release_sha256,
-            date,
-            valid_until,
-            signed_by,
-            signing_key,
             carried: Carried::new(),
         }
     }

@@ -179,6 +179,75 @@ pub trait Fetch: Send {
     /// Fetches the resource `request` names, writing its body to `sink`.
     fn fetch(&mut self, request: &FetchRequest<'_>, sink: &mut dyn Write)
     -> Result<(), FetchError>;
+
+    /// Fetches every job in `jobs`, answering one outcome per job, in order.
+    ///
+    /// This is where a transport says it can do more than one at a time. The
+    /// default body is [`fetch`](Self::fetch) per job in order, so an
+    /// implementation that overrides nothing behaves exactly as it did before
+    /// this method existed; [`HttpFetch`](super::HttpFetch) overrides it and
+    /// runs several at once.
+    ///
+    /// The jobs are independent. One that fails does not stop the others, and
+    /// the answer at index `i` is the outcome of the job at index `i` -- which
+    /// is what lets a caller retry only what did not arrive.
+    ///
+    /// A caller batches what it can afford to have in flight together, since
+    /// each job holds an open sink for as long as the batch runs. Nothing here
+    /// bounds that: how many is a question about the caller's file descriptors
+    /// and memory, not about the transport.
+    fn fetch_all(&mut self, jobs: &mut [FetchJob<'_>]) -> Vec<Result<(), FetchError>> {
+        jobs.iter_mut()
+            .map(|job| {
+                let (request, sink) = job.parts();
+                self.fetch(request, sink)
+            })
+            .collect()
+    }
+}
+
+/// One entry of a batch: what to fetch, and where its body goes.
+///
+/// Handed to [`Fetch::fetch_all`]. The sink is `Send` because a transport that
+/// fetches several at once writes each body from a thread of its own; it is
+/// borrowed rather than owned so that a caller keeps whatever it needs to
+/// finish the job -- a digest to check, a staging file to rename -- and gets it
+/// back when the batch ends.
+pub struct FetchJob<'a> {
+    request: FetchRequest<'a>,
+    sink: &'a mut (dyn Write + Send),
+}
+
+impl<'a> FetchJob<'a> {
+    /// A job fetching `request` into `sink`.
+    pub fn new(request: FetchRequest<'a>, sink: &'a mut (dyn Write + Send)) -> FetchJob<'a> {
+        FetchJob { request, sink }
+    }
+
+    /// What this job fetches.
+    pub fn request(&self) -> &FetchRequest<'a> {
+        &self.request
+    }
+
+    /// What to fetch and where it goes, borrowed apart.
+    ///
+    /// One method rather than two, because a transport needs both at once and
+    /// the request is behind the same borrow as the sink. `pub(crate)`: a batch
+    /// is driven by the transport, and handing a caller a second way to write
+    /// into someone else's sink answers no question a consumer has.
+    pub(crate) fn parts(&mut self) -> (&FetchRequest<'a>, &mut (dyn Write + Send)) {
+        (&self.request, self.sink)
+    }
+}
+
+impl fmt::Debug for FetchJob<'_> {
+    /// Renders the request. The sink is the caller's writer, so it renders as
+    /// its presence rather than its contents.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchJob")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A failure fetching a URL.
@@ -334,6 +403,75 @@ impl std::error::Error for FetchError {
             _ => None,
         }
     }
+}
+
+/// A failure a mirror walk may advance past.
+///
+/// Every archive layer walks a list of mirrors the same way: try one, and on a
+/// failure that says "ask somewhere else" try the next, keeping the last such
+/// failure to report when none is left. What differs between the layers is the
+/// error type the walk carries, and this is the one question
+/// [`walk_mirrors`] has to ask of it.
+///
+/// The predicate itself is [`FetchError::is_failover`] in every implementation.
+/// A layer that wraps a transport failure in its own error reaches through the
+/// wrapper; a failure that is not a transport one at all -- a digest or
+/// signature mismatch over bytes that did arrive -- never advances a walk,
+/// because the answer to one is never to ask somewhere else.
+pub(crate) trait Failover {
+    /// Whether this failure is one to try the next mirror for.
+    fn is_failover(&self) -> bool;
+}
+
+impl Failover for FetchError {
+    fn is_failover(&self) -> bool {
+        FetchError::is_failover(self)
+    }
+}
+
+/// Tries `attempt` against each entry of `over` in turn, taking the first that
+/// answers.
+///
+/// A failure [`Failover`] recognizes advances to the next entry and is kept;
+/// any other failure ends the walk where it happened. When the list runs out,
+/// the last kept failure is what is reported, so the diagnostic describes a
+/// mirror rather than the walk -- and `exhausted` supplies an error only for
+/// the case where nothing was tried at all, which an empty list is.
+///
+/// Generic over the entry rather than fixed to a mirror URL, because two of the
+/// walks here are over something else: the Debian index walk tries several
+/// index encodings within each mirror, which is the same rule one level down
+/// and nests as one call inside another. What the entry means is the caller's;
+/// what this owns is the rule for advancing past a failure and for which
+/// failure is reported at the end.
+pub(crate) fn walk_mirrors<Entry, T, E: Failover>(
+    over: &[Entry],
+    mut attempt: impl FnMut(&Entry) -> Result<T, E>,
+    exhausted: impl FnOnce() -> E,
+) -> Result<T, E> {
+    let mut unserved = None;
+    for entry in over {
+        match attempt(entry) {
+            Ok(answered) => return Ok(answered),
+            Err(err) if err.is_failover() => unserved = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(unserved.unwrap_or_else(exhausted))
+}
+
+/// Joins a mirror-relative path onto a mirror's URL.
+///
+/// A configured mirror may or may not end in a slash and a composed suffix may
+/// or may not begin with one, so the join owns both: `http://mirror/debian/`
+/// and `http://mirror/debian` address the same archive, and a doubled or
+/// missing separator addresses neither.
+pub(crate) fn mirror_url(mirror: &str, suffix: &str) -> String {
+    format!(
+        "{}/{}",
+        mirror.trim_end_matches('/'),
+        suffix.trim_start_matches('/'),
+    )
 }
 
 #[cfg(test)]

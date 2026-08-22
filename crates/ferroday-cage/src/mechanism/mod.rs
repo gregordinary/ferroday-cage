@@ -314,8 +314,16 @@ impl StdioPlan {
 /// a `prlimit64` per entry.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RlimitPlan {
-    /// The kernel resource.
-    pub(crate) resource: rustix::process::Resource,
+    /// The resource as the caller named it.
+    ///
+    /// Carried beside the kernel's own, rather than recovered from it, so that
+    /// [`ResolvedInputs`](crate::ResolvedInputs) reports the resource a
+    /// provenance record is asked about instead of searching for one that
+    /// translates to the same kernel number. It joins `op_labels`, `exec_label`
+    /// and `rlimit_labels` as caller-side data the sandbox stages never read.
+    pub(crate) resource: crate::Resource,
+    /// The kernel resource the limit is applied against.
+    pub(crate) kernel: rustix::process::Resource,
     /// The soft and hard values, with `None` meaning `RLIM_INFINITY`.
     pub(crate) limit: rustix::process::Rlimit,
 }

@@ -78,7 +78,7 @@ pub(super) fn open_dir(
     loop {
         // The call `clippy.toml` sends every other site here for: this is that
         // answer.
-        #[allow(clippy::disallowed_methods)]
+        #[expect(clippy::disallowed_methods)]
         let opened = rustix::fs::openat2(
             anchor,
             path,

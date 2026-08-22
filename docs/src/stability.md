@@ -15,6 +15,34 @@ by entry, in the [changelog](https://github.com/gregordinary/ferroday-cage/blob/
 compatibility contract is its flags, exit codes, and output format, so a
 library release does not move it and a library break does not force one.
 
+### The userlands version with the library, deliberately
+
+`provision::debian`, `provision::alpine` and `provision::gentoo` are a little
+over a third of the library's public functions, and their shape is driven by
+three external archives' formats rather than by this library's design. That is
+the part of the surface most likely to have to move, tied to the version number
+of the part least likely to: a Debian layer that has to break to follow a change
+in the archive would break the whole library's minor version with it.
+
+They stay in the library for now, and the reason is that nothing has needed the
+break. The argument for splitting is real and gets stronger with each release;
+the argument against splitting *today* is that four crates cost four release
+cycles, four sets of feature plumbing, and a set of items that are internal
+today becoming public because a separate crate would need them.
+
+Two things would settle it. A userland needing a breaking change the rest of the
+library does not is the direct one. So is a consumer who wants one archive
+format without the others' dependency weight: the Debian layer pulls
+`flate2/zlib-rs` in through `pgp`, which every build that enables it carries.
+
+What keeps the decision cheap in the meantime is that the layers already sit on
+a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
+tar, compress, extract, digest, document and OpenPGP machinery -- and reach
+around it in nineteen places, eight of which are internal. `tools/seam.toml`
+records every one with what it would cost, `tools/check-seam.py` fails on any
+difference, and a layer naming another layer is refused outright. A split, when
+it comes, is that list plus the mechanical work.
+
 ## What the Rust API promises
 
 Within a compatible release series:
@@ -114,6 +142,13 @@ implementations something and buy nothing.
 takes `&mut self` — a shared reference to one cannot do any work, so requiring
 `Sync` would only rule out a transport that caches behind a `Cell`. The
 requirement is on *moving* a transport, never on calling it concurrently.
+
+That `&mut self` is also why fetching several resources at once is a method
+rather than something a caller can arrange from outside: the provisioner holds
+the only handle. `Fetch::fetch_all` is that method. It carries a default body —
+one `fetch` per job, in order — so it is not a requirement on an implementation,
+and a transport that can overlap requests says so by overriding it. Every method
+added to this trait in a later release will carry one, for the same reason.
 
 The consequence for a consumer: `Debian` and `DebianBuilder` are `Send`, so a
 provisioner can be built on one thread and run on another. `Running`, `Pending`,
@@ -229,3 +264,4 @@ Policy that only lives in a document decays. These are enforced:
 | The MSRV holds | A CI build at the declared `rust-version` |
 | The profile key set is deliberate | Explicit `#[serde(rename)]` on every field, plus a test pinning the key set |
 | The untrusted-profile surface cannot widen silently | `check_restricted` destructures `CageBuilder` exhaustively, so a new field fails to compile until it is classified |
+| A userland reaching past the provisioning seam is a decision | `tools/check-seam.py` against the record in `tools/seam.toml` |

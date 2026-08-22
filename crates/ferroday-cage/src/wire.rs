@@ -14,6 +14,13 @@
 //! so a value used twice is a compile error rather than a test failure: the
 //! enum refuses the duplicate discriminant, and the decoder's match refuses the
 //! duplicate pattern.
+//!
+//! Three of these helpers — the copy-in child, the export child, the removal
+//! child — begin with the same seven steps, because each takes a forked child
+//! into a mapped user namespace before it does its own work. `child::MapStep`
+//! is that sequence; what differs between the three is only the noun each
+//! phrase uses, so each declares the seven in a `map` block and gets its own
+//! wire values, its own phrases, and the `From<MapStep>` that names them.
 
 /// Declares a wire-encoded step enum.
 ///
@@ -39,7 +46,98 @@
 ///     }
 /// }
 /// ```
+///
+/// A helper that takes its forked child into a mapped user namespace first
+/// declares those seven steps in a `map` block, ahead of its own. The block
+/// gives each its wire value and its phrase — the phrase is the only thing
+/// that differs between the three helpers, since it names the helper — and the
+/// macro supplies the variants, their documentation, and
+/// `From<child::MapStep>`:
+///
+/// ```ignore
+/// wire_enum! {
+///     pub(crate) enum WidgetStep {
+///         map {
+///             ResetSignals = 1 => "resetting the widget process's signal dispositions",
+///             SweepFds = 2 => "closing the widget process's inherited descriptors",
+///             Unshare = 3 => "unsharing the widget namespace",
+///             DenySetgroups = 4 => "denying setgroups in the widget namespace",
+///             WriteGidMap = 5 => "writing the widget gid map",
+///             WriteUidMap = 6 => "writing the widget uid map",
+///             AwaitMap = 7 => "establishing the widget identity map",
+///         }
+///         /// Forking the widget process.
+///         Spawn = 8 => "forking the widget process",
+///     }
+/// }
+/// ```
+///
+/// The seven names are matched literally, so the set, its order and its
+/// completeness belong to the macro rather than to each helper: one left out
+/// does not match the rule and does not compile.
 macro_rules! wire_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            map {
+                ResetSignals = $reset:literal => $reset_says:literal,
+                SweepFds = $sweep:literal => $sweep_says:literal,
+                Unshare = $unshare:literal => $unshare_says:literal,
+                DenySetgroups = $deny:literal => $deny_says:literal,
+                WriteGidMap = $gid:literal => $gid_says:literal,
+                WriteUidMap = $uid:literal => $uid_says:literal,
+                AwaitMap = $await_map:literal => $await_says:literal,
+            }
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident = $value:literal => $describe:literal,
+            )+
+        }
+    ) => {
+        wire_enum! {
+            $(#[$enum_meta])*
+            $vis enum $name {
+                /// The child could not reset its inherited signal dispositions.
+                ResetSignals = $reset => $reset_says,
+                /// The child could not close the descriptors it inherited.
+                SweepFds = $sweep => $sweep_says,
+                /// The child could not unshare its user namespace.
+                Unshare = $unshare => $unshare_says,
+                /// The child could not deny `setgroups` in its own user
+                /// namespace.
+                DenySetgroups = $deny => $deny_says,
+                /// The child could not write its own gid map.
+                WriteGidMap = $gid => $gid_says,
+                /// The child could not write its own uid map.
+                WriteUidMap = $uid => $uid_says,
+                /// The child died or was abandoned at the map gate.
+                AwaitMap = $await_map => $await_says,
+                $(
+                    $(#[$variant_meta])*
+                    $variant = $value => $describe,
+                )+
+            }
+        }
+
+        impl From<crate::mechanism::child::MapStep> for $name {
+            /// This helper's own name for a step of the shared map sequence,
+            /// one for one.
+            fn from(step: crate::mechanism::child::MapStep) -> $name {
+                use crate::mechanism::child::MapStep;
+
+                match step {
+                    MapStep::ResetSignals => $name::ResetSignals,
+                    MapStep::SweepFds => $name::SweepFds,
+                    MapStep::Unshare => $name::Unshare,
+                    MapStep::DenySetgroups => $name::DenySetgroups,
+                    MapStep::WriteGidMap => $name::WriteGidMap,
+                    MapStep::WriteUidMap => $name::WriteUidMap,
+                    MapStep::AwaitMap => $name::AwaitMap,
+                }
+            }
+        }
+    };
+
     (
         $(#[$enum_meta:meta])*
         $vis:vis enum $name:ident {

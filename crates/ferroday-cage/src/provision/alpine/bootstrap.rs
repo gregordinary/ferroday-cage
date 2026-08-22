@@ -93,23 +93,37 @@ pub(super) struct State<'a> {
 /// Runs every package's install scripts, fires the triggers they registered,
 /// and writes the state the finished root hands back to `apk`.
 ///
+/// Where a maintainer script runs: the tree, how a cage is rooted on it, and the
+/// map that cage runs under.
+///
+/// The three travel together through every step of the configure wave and were
+/// threaded through each positionally. `Copy`, because they are three borrows
+/// and every step passes all three on.
+#[derive(Clone, Copy)]
+pub(super) struct Site<'a> {
+    /// The tree the scripts run against.
+    pub(super) staging: &'a Path,
+    /// Whole, or over a base layer for a layered build.
+    pub(super) rooting: Rooting<'a>,
+    /// The map the script cages run under.
+    pub(super) identity_map: &'a IdentityMap,
+}
+
 /// `order` is the dependency order the closure was laid down in, and the one the
 /// scripts run in. `carried` is the trigger subjects of packages a layered
 /// build's base already holds, empty for a full bootstrap; they fire for the
 /// directories this wave created exactly as the closure's own do, because a
 /// trigger belongs to the installed root rather than to the transaction that ran
 /// it.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn configure(
-    staging: &Path,
-    rooting: Rooting<'_>,
+    site: Site<'_>,
     database: &Database,
     order: &[ScriptSubject],
     carried: &[ScriptSubject],
     state: &State<'_>,
-    identity_map: &IdentityMap,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
+    let staging = site.staging;
     let tree = Rooted::open(staging).map_err(AlpineError::at("opening the tree", staging))?;
     write_state(&tree, database, state)?;
 
@@ -126,29 +140,18 @@ pub(super) fn configure(
                 script: kind.name(),
             });
             run(
-                staging,
-                rooting,
+                site,
                 &tree,
                 subject,
                 kind,
                 body,
                 std::slice::from_ref(&subject.version),
-                identity_map,
                 observer,
             )?;
         }
     }
 
-    fire_triggers(
-        staging,
-        rooting,
-        &tree,
-        database,
-        order,
-        carried,
-        identity_map,
-        observer,
-    )
+    fire_triggers(site, &tree, database, order, carried, observer)
 }
 
 /// Runs the `.trigger` script of every package whose watched paths the finished
@@ -168,15 +171,12 @@ pub(super) fn configure(
 /// A layered build's `carried` subjects are the base's own trigger-watching
 /// packages, and they run first: they were installed first, and a base's trigger
 /// is the one that knows what to do about the directory it watches.
-#[allow(clippy::too_many_arguments)]
 fn fire_triggers(
-    staging: &Path,
-    rooting: Rooting<'_>,
+    site: Site<'_>,
     tree: &Rooted,
     database: &Database,
     order: &[ScriptSubject],
     carried: &[ScriptSubject],
-    identity_map: &IdentityMap,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
     let directories = database.directories();
@@ -196,14 +196,12 @@ fn fire_triggers(
             script: ScriptKind::Trigger.name(),
         });
         run(
-            staging,
-            rooting,
+            site,
             tree,
             subject,
             ScriptKind::Trigger,
             body,
             &matched,
-            identity_map,
             observer,
         )?;
     }
@@ -215,16 +213,13 @@ fn fire_triggers(
 /// The script is removed afterwards whether it succeeded or not, so a finished
 /// root carries none: `apk` removes its own the same way, and one left behind
 /// would be an executable in the image that nothing installed.
-#[allow(clippy::too_many_arguments)]
 fn run(
-    staging: &Path,
-    rooting: Rooting<'_>,
+    site: Site<'_>,
     tree: &Rooted,
     subject: &ScriptSubject,
     kind: ScriptKind,
     body: &[u8],
     args: &[String],
-    identity_map: &IdentityMap,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
     // The name apk gives it, so a script that inspects `$0` sees what it would
@@ -238,16 +233,7 @@ fn run(
     tree.write_mode(&relative, body, 0o755)
         .map_err(AlpineError::at("writing a script", tree.path(&relative)))?;
 
-    let outcome = launch(
-        staging,
-        rooting,
-        &format!("/{relative}"),
-        subject,
-        kind,
-        args,
-        identity_map,
-        observer,
-    );
+    let outcome = launch(site, &format!("/{relative}"), subject, kind, args, observer);
     let removed = tree
         .remove(&relative)
         .map_err(AlpineError::at("removing a script", tree.path(&relative)));
@@ -255,17 +241,19 @@ fn run(
 }
 
 /// Builds and runs the cage one script executes in.
-#[allow(clippy::too_many_arguments)]
 fn launch(
-    staging: &Path,
-    rooting: Rooting<'_>,
+    site: Site<'_>,
     script: &str,
     subject: &ScriptSubject,
     kind: ScriptKind,
     args: &[String],
-    identity_map: &IdentityMap,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
+    let Site {
+        staging,
+        rooting,
+        identity_map,
+    } = site;
     let cage = rooting
         .builder(staging)
         .command(script)

@@ -725,7 +725,12 @@ pub(crate) fn pad(out: &mut impl Write, size: u64) -> io::Result<()> {
 }
 
 /// Assembles a 512-byte ustar header block with its checksum.
-#[allow(clippy::too_many_arguments)]
+///
+/// The parameters are the header's own fields, in the header's own order, so
+/// they are a record rather than a bundle threaded down through call levels:
+/// gathering them into a struct would put a copy of the ustar header beside the
+/// ustar header. The suppression stays for that reason.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn ustar_block(
     name: &[u8],
     prefix: &[u8],

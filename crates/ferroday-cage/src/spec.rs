@@ -2312,6 +2312,12 @@ impl CageBuilder {
         // surface cannot widen by omission. A knob that reaches the host belongs
         // in the forbidden group below; anything else is bound to `_` here as a
         // deliberate record that it was considered and allowed.
+        //
+        // It carries a second duty. `RestrictionBuilder` is this type's
+        // deliberate twin, and a field added here without a counterpart there
+        // is how the two come apart; the test beside that type destructures it
+        // the same way, and between them neither grows a field the other has
+        // not been asked about.
         let CageBuilder {
             // Reaches host resources, and is refused below.
             mounts,
@@ -3451,7 +3457,7 @@ pub(crate) fn entry_in_root(root: Option<&OwnedFd>, relative: &Path) -> Presence
     // Not `provision::containment::open_dir`: the question is whether a *leaf*
     // is there, of whatever kind, so this opens with `O_NOFOLLOW` and without
     // `O_DIRECTORY`, and every failure becomes a verdict rather than an error.
-    #[allow(clippy::disallowed_methods)]
+    #[expect(clippy::disallowed_methods)]
     let opened = rustix::fs::openat2(
         root,
         relative.as_c_str(),
@@ -3556,7 +3562,8 @@ pub(crate) fn lower_rlimits(
             .into());
         }
         plans.push(RlimitPlan {
-            resource: resource.to_kernel(),
+            resource: *resource,
+            kernel: resource.to_kernel(),
             limit: rustix::process::Rlimit {
                 current: soft.amount(),
                 maximum: hard.amount(),

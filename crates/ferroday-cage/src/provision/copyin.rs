@@ -42,35 +42,19 @@ use crate::path;
 // from a no-feature `cargo doc`.
 #[cfg_attr(
     feature = "tarball",
-    doc = "The mirror image of [`Export`](super::Export). An export forks a child into"
+    doc = "
+The mirror image of [`Export`](super::Export). An export forks a child into
+the map to *read* a tree at the ownership it intends; this forks one to
+*write* one.
+
+The mirroring is of the mechanism, not of the entry types. An export
+describes a rootfs the cage built, for a runtime that will supply its own
+device nodes and pipes; a copy lays down a tree the caller wrote by hand,
+where every entry is there because someone put it there. So the copy creates
+everything it can create — a named pipe included — and names the rest.
+
+"
 )]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "the map to *read* a tree at the ownership it intends; this forks one to"
-)]
-#[cfg_attr(feature = "tarball", doc = "*write* one.")]
-#[cfg_attr(feature = "tarball", doc = "")]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "The mirroring is of the mechanism, not of the entry types. An export"
-)]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "describes a rootfs the cage built, for a runtime that will supply its own"
-)]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "device nodes and pipes; a copy lays down a tree the caller wrote by hand,"
-)]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "where every entry is there because someone put it there. So the copy creates"
-)]
-#[cfg_attr(
-    feature = "tarball",
-    doc = "everything it can create — a named pipe included — and names the rest."
-)]
-#[cfg_attr(feature = "tarball", doc = "")]
 /// A source entry's host ownership is read back through the map to the id it
 /// means inside the rootfs. So a tree an earlier mapped sandbox produced copies
 /// in owned as it was written, and a tree the caller staged as themselves lands

@@ -1,4 +1,28 @@
 //! Typed errors for sandbox configuration, spawn, setup, and wait failures.
+//!
+//! # Every `Display` here is written out, and none is derived
+//!
+//! The crate carries roughly 1,100 lines of hand-written `Display` and
+//! `source`, one match arm per variant, and a derive macro would remove almost
+//! all of it. It is written out on purpose.
+//!
+//! What these messages are is the reason. Several are three sentences of
+//! guidance — what failed, what it was operating on, and what to do about it —
+//! and one of them is chosen by a guard rather than by a variant:
+//! `CommandNotAbsolute` says something different about a bare name than about
+//! a relative path with a slash, because path lookup is the remedy for one and
+//! misdirection for the other. Attribute strings hold a label well and a
+//! paragraph badly, and the paragraph is what a caller acts on.
+//!
+//! The cost is real and worth naming: a variant, its message, and its cause sit
+//! in three places in this file. What the arrangement buys is that the messages
+//! read as prose someone wrote, and that the crate's manifest still justifies
+//! every dependency in it — a rendering convenience is not a reason to add a
+//! proc macro to a sandbox library's build.
+//!
+//! The `Io { op, path, source }` shape those errors share *is* declared once,
+//! by `failure::path_io_error!`; it is the constructors that were four copies,
+//! not the messages.
 
 use std::fmt;
 use std::io;

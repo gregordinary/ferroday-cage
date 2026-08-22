@@ -13,13 +13,12 @@
 //!
 #![cfg_attr(
     feature = "hardening",
-    doc = "The restriction fallback carries the same knob as"
+    doc = "
+The restriction fallback carries the same knob as
+[`RestrictionBuilder::rlimit`](crate::RestrictionBuilder::rlimit).
+
+"
 )]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "[`RestrictionBuilder::rlimit`](crate::RestrictionBuilder::rlimit)."
-)]
-#![cfg_attr(feature = "hardening", doc = "")]
 //! With the `serde` feature a cage's limits are part of the profile format, as
 //! an `[rlimit]` table keyed by resource name:
 //!
@@ -502,10 +501,10 @@ mod tests {
 
     /// `ALL` is the roster, and it holds every resource.
     ///
-    /// The omission this catches would be quiet rather than loud: `Resolved`
-    /// recovers a public resource by scanning `ALL` and falls back to
-    /// `AddressSpace`, so a variant left out of it is misreported in a
-    /// provenance record rather than refused anywhere.
+    /// The omission this catches would be quiet rather than loud: `ALL` is what
+    /// `fcage` offers under `--help` and searches to parse a `--rlimit`, so a
+    /// variant left out of it is a limit the command line cannot name and the
+    /// help does not list, refused nowhere and reported nowhere.
     #[test]
     fn the_roster_holds_every_resource_in_the_documented_order() {
         let mut chain = vec![Resource::AddressSpace];

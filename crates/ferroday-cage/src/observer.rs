@@ -142,9 +142,11 @@ impl<F: FnMut(Progress)> Observer for F {
 // its intra-doc link — is gated with it, per the crate-level convention.
 #[cfg_attr(
     feature = "hardening",
-    doc = "[`Restriction::output`](crate::Restriction::output) produces the same type for a"
+    doc = "
+[`Restriction::output`](crate::Restriction::output) produces the same type for a
+restriction.
+"
 )]
-#[cfg_attr(feature = "hardening", doc = "restriction.")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Output {

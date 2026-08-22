@@ -33,6 +33,7 @@ use rustix::thread::CapabilitySet;
 
 use crate::error::ConfigError;
 use crate::mechanism::{HardeningPlan, LandlockNetRule, LandlockRule, SockFilter};
+use crate::roster::roster_enum;
 
 /// Declares the text side of a letter-set access type: its
 /// [`Display`](fmt::Display), its [`FromStr`], the parse error it produces, and
@@ -877,6 +878,7 @@ impl SeccompRules {
 }
 
 /// A seccomp syscall-filtering policy for the sandboxed command.
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum SeccompPolicy {
     /// A curated default-deny of dangerous and rarely-legitimate syscalls,
@@ -913,7 +915,7 @@ impl SeccompPolicy {
 }
 
 // A hand-written Debug so the escape-hatch program prints its length, not
-// every instruction.
+// every instruction. `Clone` is derived on the type, being structural.
 impl std::fmt::Debug for SeccompPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1060,251 +1062,113 @@ fn curated_ioctl_rules() -> Vec<SyscallRule> {
         .collect()
 }
 
-/// A named capability, for [`CageBuilder::keep_capabilities`].
-///
-/// In a fresh user namespace the command is mapped to root and holds every
-/// capability *within that namespace* — none of which confers authority over
-/// the host, but which do grant power inside the sandbox.
-/// [`drop_all_capabilities`](crate::CageBuilder::drop_all_capabilities) sheds
-/// them; a keep-list retains the named few.
-///
-/// Each capability has a canonical kebab-case name (`net-bind-service`),
-/// printed by [`Display`](std::fmt::Display) and parsed by
-/// [`FromStr`](std::str::FromStr). Parsing also accepts the snake-case form
-/// and an optional `cap-`/`cap_` prefix, and is case-insensitive, so
-/// `CAP_SYS_ADMIN`, `sys_admin`, and `sys-admin` all parse to
-/// [`SysAdmin`](Self::SysAdmin). [`ALL`](Self::ALL) lists every variant.
-///
-/// [`CageBuilder::keep_capabilities`]: crate::CageBuilder::keep_capabilities
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Capability {
-    /// `CAP_CHOWN`.
-    Chown,
-    /// `CAP_DAC_OVERRIDE`.
-    DacOverride,
-    /// `CAP_DAC_READ_SEARCH`.
-    DacReadSearch,
-    /// `CAP_FOWNER`.
-    Fowner,
-    /// `CAP_FSETID`.
-    Fsetid,
-    /// `CAP_KILL`.
-    Kill,
-    /// `CAP_SETGID`.
-    Setgid,
-    /// `CAP_SETUID`.
-    Setuid,
-    /// `CAP_SETPCAP`.
-    Setpcap,
-    /// `CAP_LINUX_IMMUTABLE`.
-    LinuxImmutable,
-    /// `CAP_NET_BIND_SERVICE`.
-    NetBindService,
-    /// `CAP_NET_BROADCAST`.
-    NetBroadcast,
-    /// `CAP_NET_ADMIN`.
-    NetAdmin,
-    /// `CAP_NET_RAW`.
-    NetRaw,
-    /// `CAP_IPC_LOCK`.
-    IpcLock,
-    /// `CAP_IPC_OWNER`.
-    IpcOwner,
-    /// `CAP_SYS_MODULE`.
-    SysModule,
-    /// `CAP_SYS_RAWIO`.
-    SysRawio,
-    /// `CAP_SYS_CHROOT`.
-    SysChroot,
-    /// `CAP_SYS_PTRACE`.
-    SysPtrace,
-    /// `CAP_SYS_PACCT`.
-    SysPacct,
-    /// `CAP_SYS_ADMIN`.
-    SysAdmin,
-    /// `CAP_SYS_BOOT`.
-    SysBoot,
-    /// `CAP_SYS_NICE`.
-    SysNice,
-    /// `CAP_SYS_RESOURCE`.
-    SysResource,
-    /// `CAP_SYS_TIME`.
-    SysTime,
-    /// `CAP_SYS_TTY_CONFIG`.
-    SysTtyConfig,
-    /// `CAP_MKNOD`.
-    Mknod,
-    /// `CAP_LEASE`.
-    Lease,
-    /// `CAP_AUDIT_WRITE`.
-    AuditWrite,
-    /// `CAP_AUDIT_CONTROL`.
-    AuditControl,
-    /// `CAP_SETFCAP`.
-    Setfcap,
-    /// `CAP_MAC_OVERRIDE`.
-    MacOverride,
-    /// `CAP_MAC_ADMIN`.
-    MacAdmin,
-    /// `CAP_SYSLOG`.
-    Syslog,
-    /// `CAP_WAKE_ALARM`.
-    WakeAlarm,
-    /// `CAP_BLOCK_SUSPEND`.
-    BlockSuspend,
-    /// `CAP_AUDIT_READ`.
-    AuditRead,
-    /// `CAP_PERFMON`.
-    Perfmon,
-    /// `CAP_BPF`.
-    Bpf,
-    /// `CAP_CHECKPOINT_RESTORE`.
-    CheckpointRestore,
-}
-
-impl Capability {
-    /// The single-bit capability set naming this capability.
-    fn to_set(self) -> CapabilitySet {
-        match self {
-            Capability::Chown => CapabilitySet::CHOWN,
-            Capability::DacOverride => CapabilitySet::DAC_OVERRIDE,
-            Capability::DacReadSearch => CapabilitySet::DAC_READ_SEARCH,
-            Capability::Fowner => CapabilitySet::FOWNER,
-            Capability::Fsetid => CapabilitySet::FSETID,
-            Capability::Kill => CapabilitySet::KILL,
-            Capability::Setgid => CapabilitySet::SETGID,
-            Capability::Setuid => CapabilitySet::SETUID,
-            Capability::Setpcap => CapabilitySet::SETPCAP,
-            Capability::LinuxImmutable => CapabilitySet::LINUX_IMMUTABLE,
-            Capability::NetBindService => CapabilitySet::NET_BIND_SERVICE,
-            Capability::NetBroadcast => CapabilitySet::NET_BROADCAST,
-            Capability::NetAdmin => CapabilitySet::NET_ADMIN,
-            Capability::NetRaw => CapabilitySet::NET_RAW,
-            Capability::IpcLock => CapabilitySet::IPC_LOCK,
-            Capability::IpcOwner => CapabilitySet::IPC_OWNER,
-            Capability::SysModule => CapabilitySet::SYS_MODULE,
-            Capability::SysRawio => CapabilitySet::SYS_RAWIO,
-            Capability::SysChroot => CapabilitySet::SYS_CHROOT,
-            Capability::SysPtrace => CapabilitySet::SYS_PTRACE,
-            Capability::SysPacct => CapabilitySet::SYS_PACCT,
-            Capability::SysAdmin => CapabilitySet::SYS_ADMIN,
-            Capability::SysBoot => CapabilitySet::SYS_BOOT,
-            Capability::SysNice => CapabilitySet::SYS_NICE,
-            Capability::SysResource => CapabilitySet::SYS_RESOURCE,
-            Capability::SysTime => CapabilitySet::SYS_TIME,
-            Capability::SysTtyConfig => CapabilitySet::SYS_TTY_CONFIG,
-            Capability::Mknod => CapabilitySet::MKNOD,
-            Capability::Lease => CapabilitySet::LEASE,
-            Capability::AuditWrite => CapabilitySet::AUDIT_WRITE,
-            Capability::AuditControl => CapabilitySet::AUDIT_CONTROL,
-            Capability::Setfcap => CapabilitySet::SETFCAP,
-            Capability::MacOverride => CapabilitySet::MAC_OVERRIDE,
-            Capability::MacAdmin => CapabilitySet::MAC_ADMIN,
-            Capability::Syslog => CapabilitySet::SYSLOG,
-            Capability::WakeAlarm => CapabilitySet::WAKE_ALARM,
-            Capability::BlockSuspend => CapabilitySet::BLOCK_SUSPEND,
-            Capability::AuditRead => CapabilitySet::AUDIT_READ,
-            Capability::Perfmon => CapabilitySet::PERFMON,
-            Capability::Bpf => CapabilitySet::BPF,
-            Capability::CheckpointRestore => CapabilitySet::CHECKPOINT_RESTORE,
-        }
-    }
-
-    /// Every capability variant, in declaration order.
+roster_enum! {
+    /// A named capability, for [`CageBuilder::keep_capabilities`].
     ///
-    /// The roster tracks the kernel's own, which grows: a capability Linux
-    /// adds appears here in a later release. The slice type deliberately keeps
-    /// that length out of the signature, so the addition stays additive.
-    pub const ALL: &'static [Capability] = &[
-        Capability::Chown,
-        Capability::DacOverride,
-        Capability::DacReadSearch,
-        Capability::Fowner,
-        Capability::Fsetid,
-        Capability::Kill,
-        Capability::Setgid,
-        Capability::Setuid,
-        Capability::Setpcap,
-        Capability::LinuxImmutable,
-        Capability::NetBindService,
-        Capability::NetBroadcast,
-        Capability::NetAdmin,
-        Capability::NetRaw,
-        Capability::IpcLock,
-        Capability::IpcOwner,
-        Capability::SysModule,
-        Capability::SysRawio,
-        Capability::SysChroot,
-        Capability::SysPtrace,
-        Capability::SysPacct,
-        Capability::SysAdmin,
-        Capability::SysBoot,
-        Capability::SysNice,
-        Capability::SysResource,
-        Capability::SysTime,
-        Capability::SysTtyConfig,
-        Capability::Mknod,
-        Capability::Lease,
-        Capability::AuditWrite,
-        Capability::AuditControl,
-        Capability::Setfcap,
-        Capability::MacOverride,
-        Capability::MacAdmin,
-        Capability::Syslog,
-        Capability::WakeAlarm,
-        Capability::BlockSuspend,
-        Capability::AuditRead,
-        Capability::Perfmon,
-        Capability::Bpf,
-        Capability::CheckpointRestore,
-    ];
+    /// In a fresh user namespace the command is mapped to root and holds every
+    /// capability *within that namespace* — none of which confers authority over
+    /// the host, but which do grant power inside the sandbox.
+    /// [`drop_all_capabilities`](crate::CageBuilder::drop_all_capabilities) sheds
+    /// them; a keep-list retains the named few.
+    ///
+    /// Each capability has a canonical kebab-case name (`net-bind-service`),
+    /// printed by [`Display`](std::fmt::Display) and parsed by
+    /// [`FromStr`](std::str::FromStr). Parsing also accepts the snake-case form
+    /// and an optional `cap-`/`cap_` prefix, and is case-insensitive, so
+    /// `CAP_SYS_ADMIN`, `sys_admin`, and `sys-admin` all parse to
+    /// [`SysAdmin`](Self::SysAdmin). [`ALL`](Self::ALL) lists every variant.
+    ///
+    /// [`CageBuilder::keep_capabilities`]: crate::CageBuilder::keep_capabilities
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[non_exhaustive]
+    pub enum Capability {
+        /// The single-bit capability set naming this capability.
+        fn to_set -> CapabilitySet;
+        /// The canonical kebab-case name, without the `cap-` prefix.
+        fn as_str;
 
-    /// The canonical kebab-case name, without the `cap-` prefix.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Capability::Chown => "chown",
-            Capability::DacOverride => "dac-override",
-            Capability::DacReadSearch => "dac-read-search",
-            Capability::Fowner => "fowner",
-            Capability::Fsetid => "fsetid",
-            Capability::Kill => "kill",
-            Capability::Setgid => "setgid",
-            Capability::Setuid => "setuid",
-            Capability::Setpcap => "setpcap",
-            Capability::LinuxImmutable => "linux-immutable",
-            Capability::NetBindService => "net-bind-service",
-            Capability::NetBroadcast => "net-broadcast",
-            Capability::NetAdmin => "net-admin",
-            Capability::NetRaw => "net-raw",
-            Capability::IpcLock => "ipc-lock",
-            Capability::IpcOwner => "ipc-owner",
-            Capability::SysModule => "sys-module",
-            Capability::SysRawio => "sys-rawio",
-            Capability::SysChroot => "sys-chroot",
-            Capability::SysPtrace => "sys-ptrace",
-            Capability::SysPacct => "sys-pacct",
-            Capability::SysAdmin => "sys-admin",
-            Capability::SysBoot => "sys-boot",
-            Capability::SysNice => "sys-nice",
-            Capability::SysResource => "sys-resource",
-            Capability::SysTime => "sys-time",
-            Capability::SysTtyConfig => "sys-tty-config",
-            Capability::Mknod => "mknod",
-            Capability::Lease => "lease",
-            Capability::AuditWrite => "audit-write",
-            Capability::AuditControl => "audit-control",
-            Capability::Setfcap => "setfcap",
-            Capability::MacOverride => "mac-override",
-            Capability::MacAdmin => "mac-admin",
-            Capability::Syslog => "syslog",
-            Capability::WakeAlarm => "wake-alarm",
-            Capability::BlockSuspend => "block-suspend",
-            Capability::AuditRead => "audit-read",
-            Capability::Perfmon => "perfmon",
-            Capability::Bpf => "bpf",
-            Capability::CheckpointRestore => "checkpoint-restore",
-        }
+        /// `CAP_CHOWN`.
+        Chown = CapabilitySet::CHOWN => "chown",
+        /// `CAP_DAC_OVERRIDE`.
+        DacOverride = CapabilitySet::DAC_OVERRIDE => "dac-override",
+        /// `CAP_DAC_READ_SEARCH`.
+        DacReadSearch = CapabilitySet::DAC_READ_SEARCH => "dac-read-search",
+        /// `CAP_FOWNER`.
+        Fowner = CapabilitySet::FOWNER => "fowner",
+        /// `CAP_FSETID`.
+        Fsetid = CapabilitySet::FSETID => "fsetid",
+        /// `CAP_KILL`.
+        Kill = CapabilitySet::KILL => "kill",
+        /// `CAP_SETGID`.
+        Setgid = CapabilitySet::SETGID => "setgid",
+        /// `CAP_SETUID`.
+        Setuid = CapabilitySet::SETUID => "setuid",
+        /// `CAP_SETPCAP`.
+        Setpcap = CapabilitySet::SETPCAP => "setpcap",
+        /// `CAP_LINUX_IMMUTABLE`.
+        LinuxImmutable = CapabilitySet::LINUX_IMMUTABLE => "linux-immutable",
+        /// `CAP_NET_BIND_SERVICE`.
+        NetBindService = CapabilitySet::NET_BIND_SERVICE => "net-bind-service",
+        /// `CAP_NET_BROADCAST`.
+        NetBroadcast = CapabilitySet::NET_BROADCAST => "net-broadcast",
+        /// `CAP_NET_ADMIN`.
+        NetAdmin = CapabilitySet::NET_ADMIN => "net-admin",
+        /// `CAP_NET_RAW`.
+        NetRaw = CapabilitySet::NET_RAW => "net-raw",
+        /// `CAP_IPC_LOCK`.
+        IpcLock = CapabilitySet::IPC_LOCK => "ipc-lock",
+        /// `CAP_IPC_OWNER`.
+        IpcOwner = CapabilitySet::IPC_OWNER => "ipc-owner",
+        /// `CAP_SYS_MODULE`.
+        SysModule = CapabilitySet::SYS_MODULE => "sys-module",
+        /// `CAP_SYS_RAWIO`.
+        SysRawio = CapabilitySet::SYS_RAWIO => "sys-rawio",
+        /// `CAP_SYS_CHROOT`.
+        SysChroot = CapabilitySet::SYS_CHROOT => "sys-chroot",
+        /// `CAP_SYS_PTRACE`.
+        SysPtrace = CapabilitySet::SYS_PTRACE => "sys-ptrace",
+        /// `CAP_SYS_PACCT`.
+        SysPacct = CapabilitySet::SYS_PACCT => "sys-pacct",
+        /// `CAP_SYS_ADMIN`.
+        SysAdmin = CapabilitySet::SYS_ADMIN => "sys-admin",
+        /// `CAP_SYS_BOOT`.
+        SysBoot = CapabilitySet::SYS_BOOT => "sys-boot",
+        /// `CAP_SYS_NICE`.
+        SysNice = CapabilitySet::SYS_NICE => "sys-nice",
+        /// `CAP_SYS_RESOURCE`.
+        SysResource = CapabilitySet::SYS_RESOURCE => "sys-resource",
+        /// `CAP_SYS_TIME`.
+        SysTime = CapabilitySet::SYS_TIME => "sys-time",
+        /// `CAP_SYS_TTY_CONFIG`.
+        SysTtyConfig = CapabilitySet::SYS_TTY_CONFIG => "sys-tty-config",
+        /// `CAP_MKNOD`.
+        Mknod = CapabilitySet::MKNOD => "mknod",
+        /// `CAP_LEASE`.
+        Lease = CapabilitySet::LEASE => "lease",
+        /// `CAP_AUDIT_WRITE`.
+        AuditWrite = CapabilitySet::AUDIT_WRITE => "audit-write",
+        /// `CAP_AUDIT_CONTROL`.
+        AuditControl = CapabilitySet::AUDIT_CONTROL => "audit-control",
+        /// `CAP_SETFCAP`.
+        Setfcap = CapabilitySet::SETFCAP => "setfcap",
+        /// `CAP_MAC_OVERRIDE`.
+        MacOverride = CapabilitySet::MAC_OVERRIDE => "mac-override",
+        /// `CAP_MAC_ADMIN`.
+        MacAdmin = CapabilitySet::MAC_ADMIN => "mac-admin",
+        /// `CAP_SYSLOG`.
+        Syslog = CapabilitySet::SYSLOG => "syslog",
+        /// `CAP_WAKE_ALARM`.
+        WakeAlarm = CapabilitySet::WAKE_ALARM => "wake-alarm",
+        /// `CAP_BLOCK_SUSPEND`.
+        BlockSuspend = CapabilitySet::BLOCK_SUSPEND => "block-suspend",
+        /// `CAP_AUDIT_READ`.
+        AuditRead = CapabilitySet::AUDIT_READ => "audit-read",
+        /// `CAP_PERFMON`.
+        Perfmon = CapabilitySet::PERFMON => "perfmon",
+        /// `CAP_BPF`.
+        Bpf = CapabilitySet::BPF => "bpf",
+        /// `CAP_CHECKPOINT_RESTORE`.
+        CheckpointRestore = CapabilitySet::CHECKPOINT_RESTORE => "checkpoint-restore",
     }
 }
 
@@ -1382,16 +1246,6 @@ pub(crate) struct Request {
     landlock_net: Vec<NetGrant>,
     seccomp: Option<SeccompPolicy>,
     capabilities: CapabilityPosture,
-}
-
-impl Clone for SeccompPolicy {
-    fn clone(&self) -> SeccompPolicy {
-        match self {
-            SeccompPolicy::Curated => SeccompPolicy::Curated,
-            SeccompPolicy::Rules(rules) => SeccompPolicy::Rules(rules.clone()),
-            SeccompPolicy::Program(program) => SeccompPolicy::Program(program.clone()),
-        }
-    }
 }
 
 impl Request {
@@ -2865,6 +2719,27 @@ mod tests {
         assert!(err.to_string().contains("not-a-cap"));
     }
 
+    /// `SeccompPolicy` is `Clone`, and stays so.
+    ///
+    /// It was a hand-written impl and is now a derive, which the committed API
+    /// snapshot omits as noise along with every other derived impl in the
+    /// crate. Losing the trait would therefore no longer show up in that diff,
+    /// so it is pinned here instead — where the type is, rather than in the
+    /// snapshot the change moved it out of.
+    #[test]
+    fn a_seccomp_policy_clones() {
+        let program =
+            compile_seccomp(&SeccompPolicy::Curated).expect("the curated policy compiles");
+        for policy in [
+            SeccompPolicy::Curated,
+            SeccompPolicy::Rules(SeccompRules::denying([libc::SYS_ptrace])),
+            SeccompPolicy::Program(program),
+        ] {
+            let copy = policy.clone();
+            assert_eq!(format!("{policy:?}"), format!("{copy:?}"));
+        }
+    }
+
     #[test]
     fn capability_all_has_no_duplicates() {
         let mut names: Vec<&str> = Capability::ALL.iter().map(|cap| cap.as_str()).collect();
@@ -2872,6 +2747,33 @@ mod tests {
         let count = names.len();
         names.dedup();
         assert_eq!(names.len(), count, "capability names must be unique");
+    }
+
+    /// The roster names every capability bit the kernel defines.
+    ///
+    /// `ALL` is derived from the declaration, so a variant cannot be missing
+    /// from it; what this catches is the other direction, which nothing else
+    /// can. A capability the kernel gained and this enum has not is one a
+    /// keep-list cannot name, and it shows up here as a bit no variant claims.
+    ///
+    /// Asked against the bits `rustix` gives a name, rather than against every
+    /// bit of the word: the set is a bitflags type with a catch-all, so its
+    /// `all()` holds the reserved high bits too, and `iter_names` is the set
+    /// the kernel actually defines.
+    #[test]
+    fn every_capability_bit_has_a_variant() {
+        let claimed = Capability::ALL
+            .iter()
+            .fold(CapabilitySet::empty(), |set, cap| set | cap.to_set());
+        let unclaimed: Vec<&str> = CapabilitySet::all()
+            .iter_names()
+            .filter(|(_, bit)| !claimed.contains(*bit))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            unclaimed.is_empty(),
+            "capabilities the kernel defines and this enum does not name: {unclaimed:?}",
+        );
     }
 
     #[test]

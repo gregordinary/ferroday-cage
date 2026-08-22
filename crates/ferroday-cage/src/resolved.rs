@@ -92,11 +92,10 @@ pub struct ResolvedInputs {
     )]
     #[cfg_attr(
         feature = "netstack",
-        doc = "a pending launch after the cage is built, so what this reports is the"
-    )]
-    #[cfg_attr(
-        feature = "netstack",
-        doc = "namespace the sandbox creates, not what may later be plugged into it."
+        doc = "
+a pending launch after the cage is built, so what this reports is the
+namespace the sandbox creates, not what may later be plugged into it.
+"
     )]
     pub network: Network,
     /// Where the command's three standard streams are wired.
@@ -526,20 +525,14 @@ fn project_identity(plan: &LaunchPlan) -> ResolvedIdentity {
 
 /// Projects one frozen resource limit.
 ///
-/// The plan holds the kernel's own resource, so the public one is recovered by
-/// searching the roster. That roster is ten entries and the lookup happens once
-/// per limit on an inspection path, so the linear scan costs nothing and keeps
-/// one direction of the mapping authoritative.
+/// The plan carries the resource the caller named alongside the kernel number
+/// it was lowered to, so this reads it back rather than searching for a
+/// resource that translates to the same number. A provenance record is the one
+/// value that cannot afford to answer approximately, and a reverse lookup has
+/// no honest answer when it finds nothing.
 fn project_rlimit(plan: &crate::mechanism::RlimitPlan) -> ResolvedRlimit {
-    let resource = Resource::ALL
-        .iter()
-        .copied()
-        .find(|resource| resource.to_kernel() == plan.resource)
-        // Unreachable: every plan entry was lowered from a `Resource`. Naming
-        // the address-space limit beats panicking in an inspection method.
-        .unwrap_or(Resource::AddressSpace);
     ResolvedRlimit {
-        resource,
+        resource: plan.resource,
         soft: plan.limit.current.map_or(Limit::UNLIMITED, Limit::of),
         hard: plan.limit.maximum.map_or(Limit::UNLIMITED, Limit::of),
     }

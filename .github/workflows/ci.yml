@@ -46,6 +46,13 @@ jobs:
         # decision in the diff rather than as drift. Needs tomllib, so Python
         # 3.11 or newer -- the runner image is well past that.
         run: python3 tools/check-idioms.py
+      - name: Provisioning seam
+        # The three userlands sit on the `provision` seam, and whether they ever
+        # become crates of their own is a decision for later. What keeps that
+        # decision cheap is that a layer reaches only through the seam;
+        # tools/seam.toml records every name that does not, with what it would
+        # cost, and this fails on any difference.
+        run: python3 tools/check-seam.py
       - name: Check (default features)
         run: cargo check --workspace --all-targets
       - name: Enable the sandbox facilities

@@ -184,6 +184,16 @@ Two further gates matter when the public API moves:
   neither. Losing an auto trait is a breaking change; if a change withdraws
   one, the assertion and its recorded reason both need updating.
 
+- **The provisioning seam.** `tools/check-seam.py` records what each userland
+  reaches for outside `provision`, and fails on any difference. The three
+  layers sit on a seam they could one day be crates of their own on, and this
+  keeps that decision cheap: a new reach past the seam is recorded in
+  `tools/seam.toml` with what it would cost. It also refuses a userland naming
+  another outright, since the three formats are deliberately not shared. The
+  [stability
+  chapter](https://gregordinary.github.io/ferroday-cage/stability.html) records
+  the decision itself and what would settle it.
+
 One gate deliberately does not run here. `tools/check-keyrings.py` compares
 each vendored trust anchor -- Debian's archive keyring, Alpine's and
 postmarketOS's signing keys, Gentoo's service keys -- against what its
@@ -214,6 +224,15 @@ what the guide publishes.
 1. Settle `CHANGELOG.md`: the release's section carries its entries, its
    heading carries the date, and a fresh `Unreleased` section sits above it
    with the comparison links updated at the foot of the file.
+
+   An entry says what changed, in a paragraph. Why it changed that way belongs
+   in the doc comment of the thing it explains, or in the guide chapter that
+   covers it — which is where it stays true, and where a reader looking for it
+   will be. A changelog entry that carries the reasoning as well makes it three
+   places to keep right, and turns the file a consumer reads to decide whether
+   to upgrade into a design record. A **Security** entry and a **Breaking.**
+   one get the room to say what a consumer must act on; nothing else needs
+   more.
 2. Bump the version. The library and `fcage` version independently, so bump
    only what changed.
 3. Tag the release and publish, **library first**:
@@ -301,6 +320,13 @@ rules to apply, which is the format's identity and not a parameter. The rows
 are here so the next constraint question is answered by extending its format's
 `version` module rather than by a fourth mechanism somewhere else.
 
+The three comparators do not share a signature, and that is the formats
+speaking rather than three opinions: dpkg's algorithm is defined over every
+string, so `debian::version::compare` answers an `Ordering` and has nothing to
+refuse, while an apk or a portage version is a token grammar and a string
+outside it is one the mirror should not have published, which is what the other
+two report as `None`. Each module's own documentation states which it is.
+
 The fourth, `Refusals`, is split for a different reason. Both layers collect
 every refusal and fail once, which is the discipline; what they collect is not
 the same set. A portage resolution refuses in three shapes — an atom nothing
@@ -328,6 +354,10 @@ type yet; when it grows one, it is this row it extends.
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | Read or write a plan document | `provision::document` |
 | Which standard stream did a provisioner's in-cage output come from? | `provision::Stream` |
+| Take the first mirror that serves a resource, past those that do not | `provision::walk_mirrors` |
+| Fetch several resources at once, where the transport can | `provision::Fetch::fetch_all` |
+| Join a mirror-relative path onto a mirror | `provision::mirror_url` |
+| Is this failure one to ask the next mirror about? | `provision::Failover` |
 | Name a local path as a `file://` URL | `provision::file_url` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |
@@ -336,8 +366,9 @@ type yet; when it grows one, it is this row it extends.
 | Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
+| Declare an enum together with the roster of its own variants | `roster::roster_enum!` |
 | State a `poll` deadline, or retire a `poll` slot | `poll::timeout`, `poll::slot` |
-| Report an OS failure with its operation and its subject | each error type's `io` and `at` constructors |
+| Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code` |
 | Make a scratch tree that clears itself | `scratch::Scratch`, or `common::scratch_dir` from a test suite |
 | What happens when a run's timeout runs out? | `relay::Escalation` |

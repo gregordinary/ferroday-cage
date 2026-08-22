@@ -462,6 +462,13 @@ fn validate_ranges(which: &str, ranges: &[IdRange]) -> Result<(), String> {
 
 /// Rejects overlapping extents on one side of a mapping, `key` selecting
 /// which side is examined.
+///
+/// The arithmetic is checked rather than plain, though both preconditions that
+/// would make it wrap hold at the only call site: `validate_ranges` has already
+/// refused a zero count and an extent running past the last usable id. This is
+/// the identity map's validator and a release build wraps rather than panics,
+/// so a wrapped comparison here would accept the overlap the function exists to
+/// refuse — a cost out of all proportion to the two operations it saves.
 fn check_overlap(
     which: &str,
     side: &str,
@@ -472,7 +479,8 @@ fn check_overlap(
     sorted.sort_by_key(|range| key(range));
     for pair in sorted.windows(2) {
         let (a, b) = (pair[0], pair[1]);
-        if key(a) + (a.count - 1) >= key(b) {
+        let last = key(a).saturating_add(a.count.saturating_sub(1));
+        if last >= key(b) {
             return Err(format!(
                 "the {which} extents at {side} ids {} and {} overlap",
                 key(a),

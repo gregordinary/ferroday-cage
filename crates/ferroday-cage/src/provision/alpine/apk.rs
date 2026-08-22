@@ -32,6 +32,7 @@ use super::sign::Signatures;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::tar::TarReader;
 use crate::provision::{LimitedWriter, ProvisionError};
+use crate::roster::roster_enum;
 
 /// The ceiling on a signature segment, decompressed and compressed alike.
 ///
@@ -379,56 +380,40 @@ pub(super) fn read_metadata<R: Read>(
     })
 }
 
-/// One of the scripts a package may carry, named as apk names it.
-///
-/// The names are the format's twice over: they are the control-segment member
-/// names with their leading dot removed, and they are the suffix the installed
-/// database's script archive files each script under. A member whose name is
-/// not one of these is not a script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum ScriptKind {
-    /// Runs before the package's files are laid down.
-    PreInstall,
-    /// Runs once they are.
-    PostInstall,
-    PreDeinstall,
-    PostDeinstall,
-    PreUpgrade,
-    PostUpgrade,
-    /// Runs when a directory the package watches has changed.
-    Trigger,
+roster_enum! {
+    /// One of the scripts a package may carry, named as apk names it.
+    ///
+    /// The names are the format's twice over: they are the control-segment
+    /// member names with their leading dot removed, and they are the suffix
+    /// the installed database's script archive files each script under. A
+    /// member whose name is not one of these is not a script.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub(super) enum ScriptKind {
+        /// The name apk knows this script by.
+        pub(super) fn name;
+
+        /// Runs before the package's files are laid down.
+        PreInstall => "pre-install",
+        /// Runs once they are.
+        PostInstall => "post-install",
+        PreDeinstall => "pre-deinstall",
+        PostDeinstall => "post-deinstall",
+        PreUpgrade => "pre-upgrade",
+        PostUpgrade => "post-upgrade",
+        /// Runs when a directory the package watches has changed.
+        Trigger => "trigger",
+    }
 }
 
 impl ScriptKind {
-    /// Every kind, in the order a record's scripts are archived.
-    pub(super) const ALL: [ScriptKind; 7] = [
-        ScriptKind::PreInstall,
-        ScriptKind::PostInstall,
-        ScriptKind::PreDeinstall,
-        ScriptKind::PostDeinstall,
-        ScriptKind::PreUpgrade,
-        ScriptKind::PostUpgrade,
-        ScriptKind::Trigger,
-    ];
-
-    /// The name apk knows this script by.
-    pub(super) fn name(self) -> &'static str {
-        match self {
-            ScriptKind::PreInstall => "pre-install",
-            ScriptKind::PostInstall => "post-install",
-            ScriptKind::PreDeinstall => "pre-deinstall",
-            ScriptKind::PostDeinstall => "post-deinstall",
-            ScriptKind::PreUpgrade => "pre-upgrade",
-            ScriptKind::PostUpgrade => "post-upgrade",
-            ScriptKind::Trigger => "trigger",
-        }
-    }
-
     /// The kind a control-segment member name states, or `None` for a member
     /// that is not a script.
     fn of_member(name: &str) -> Option<ScriptKind> {
         let name = name.strip_prefix('.')?;
-        ScriptKind::ALL.into_iter().find(|kind| kind.name() == name)
+        ScriptKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.name() == name)
     }
 }
 

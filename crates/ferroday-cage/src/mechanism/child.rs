@@ -622,7 +622,7 @@ fn exec_search(context: &Context<'_>) -> Errno {
 /// the caller resolves to the limit's label.
 fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
     for (index, entry) in context.plan.rlimits.iter().enumerate() {
-        process::setrlimit(entry.resource, entry.limit).map_err(|errno| {
+        process::setrlimit(entry.kernel, entry.limit).map_err(|errno| {
             (
                 SetupStep::SetRlimit,
                 errno,
@@ -1946,7 +1946,7 @@ fn remount_read_only(root: BorrowedFd<'_>, target: &CStr) -> Result<(), Errno> {
     // Not `provision::containment::open_dir`: this runs post-fork, and a bind
     // target is whatever the caller named — a file as readily as a directory —
     // so the `O_DIRECTORY` that helper folds in would refuse half of them.
-    #[allow(clippy::disallowed_methods)]
+    #[expect(clippy::disallowed_methods)]
     let target = fs::openat2(
         root,
         target,
@@ -2100,7 +2100,7 @@ fn open_in_root_with(
     oflags: OFlags,
     mode: Mode,
 ) -> Result<OwnedFd, Errno> {
-    #[allow(clippy::disallowed_methods)]
+    #[expect(clippy::disallowed_methods)]
     fs::openat2(root, path, oflags, mode, ResolveFlags::IN_ROOT)
 }
 

@@ -10,18 +10,14 @@
 // and all — from a no-feature `cargo doc`.
 #![cfg_attr(
     feature = "tarball",
-    doc = "With the `tarball` feature, [`Tarball`] provisions from a tar archive"
+    doc = "
+With the `tarball` feature, [`Tarball`] provisions from a tar archive
+(plain, gzip, xz, or zstd, detected by content), extracting with
+kernel-enforced containment so a hostile archive cannot write outside
+the destination.
+
+"
 )]
-#![cfg_attr(
-    feature = "tarball",
-    doc = "(plain, gzip, xz, or zstd, detected by content), extracting with"
-)]
-#![cfg_attr(
-    feature = "tarball",
-    doc = "kernel-enforced containment so a hostile archive cannot write outside"
-)]
-#![cfg_attr(feature = "tarball", doc = "the destination.")]
-#![cfg_attr(feature = "tarball", doc = "")]
 //! # Example
 //!
 //! ```no_run
@@ -46,6 +42,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::failure::path_io_error;
 use crate::mechanism::frame;
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
@@ -98,7 +95,9 @@ pub use copyin::{CopyIn, CopyReport, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, export_tar};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-pub use fetch::{Fetch, FetchError, FetchRequest};
+pub(crate) use fetch::{Failover, mirror_url, walk_mirrors};
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+pub use fetch::{Fetch, FetchError, FetchJob, FetchRequest};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub use http::{HttpFetch, file_url};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
@@ -542,9 +541,11 @@ pub enum ProvisionError {
     // and all — from a no-feature `cargo doc`.
     #[cfg_attr(
         feature = "tarball",
-        doc = "It is the mirror of [`ExportUnprivileged`](Self::ExportUnprivileged),"
+        doc = "
+It is the mirror of [`ExportUnprivileged`](Self::ExportUnprivileged),
+which arises for the same reason.
+"
     )]
-    #[cfg_attr(feature = "tarball", doc = "which arises for the same reason.")]
     #[non_exhaustive]
     CopyUnprivileged {
         /// The rootfs that could not be copied into.
@@ -590,23 +591,10 @@ impl ProvisionError {
             source: source.into(),
         }
     }
+}
 
-    /// A host I/O failure, naming what the operation was doing and the path it
-    /// concerned.
-    ///
-    /// Arguments run operation, then locator, then cause, which is the order
-    /// every constructor in the crate takes them in.
-    pub fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> ProvisionError {
-        ProvisionError::Io {
-            op,
-            path: path.into(),
-            source,
-        }
-    }
-
-    /// The same failure as a [`map_err`](Result::map_err) argument: names the
-    /// operation and the path now, and takes the cause when it arrives.
-    ///
+path_io_error! {
+    ProvisionError,
     /// ```
     /// use std::fs;
     ///
@@ -616,13 +604,6 @@ impl ProvisionError {
     /// fs::read(path).map_err(ProvisionError::at("reading", path))
     /// # }
     /// ```
-    pub fn at(
-        op: &'static str,
-        path: impl Into<PathBuf>,
-    ) -> impl FnOnce(io::Error) -> ProvisionError {
-        let path = path.into();
-        move |source| ProvisionError::Io { op, path, source }
-    }
 }
 
 impl fmt::Display for ProvisionError {
@@ -1236,25 +1217,34 @@ fn remove_tree(
 /// digest that would catch the substitution runs only after the bytes have been
 /// spent, so the sink is where the ceiling belongs.
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-pub(crate) struct LimitedWriter<'a> {
-    inner: &'a mut dyn io::Write,
+pub(crate) struct LimitedWriter<W> {
+    inner: W,
     remaining: u64,
 }
 
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-impl<'a> LimitedWriter<'a> {
+impl<W: io::Write> LimitedWriter<W> {
     /// Wraps `inner`, failing the write that would carry it past `limit` bytes
     /// in total.
-    pub(crate) fn new(inner: &'a mut dyn io::Write, limit: u64) -> LimitedWriter<'a> {
+    ///
+    /// Generic over the writer rather than fixed to a `&mut dyn Write`, because
+    /// a batched fetch hands each job a sink of its own to own for the length
+    /// of the batch. A borrowed writer still fits: `&mut W` is a `Write`.
+    pub(crate) fn new(inner: W, limit: u64) -> LimitedWriter<W> {
         LimitedWriter {
             inner,
             remaining: limit,
         }
     }
+
+    /// The writer back, once the cap has done its work.
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
 }
 
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-impl io::Write for LimitedWriter<'_> {
+impl<W: io::Write> io::Write for LimitedWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() as u64 > self.remaining {
             return Err(io::Error::new(

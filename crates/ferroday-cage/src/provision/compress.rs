@@ -500,6 +500,21 @@ enum XzStage {
 /// stops the tracking rather than failing the archive. The decoder decides what
 /// is valid; a guard that refused what the decoder would have accepted would
 /// break real archives in order to bound a hypothetical one.
+///
+/// # It is a second xz parser, and the two are not held to each other
+///
+/// A reader meeting this module cold finds two parsers of the same container in
+/// one process: `lzma-rust2`'s, which decodes, and this one, which polices.
+/// Nothing holds them to reading a container the same way, and nothing could
+/// without reimplementing the decoder — so where they disagree, the disagreement
+/// is a hole in the bound rather than a decode error, which is the fail-open
+/// posture the section above describes from the other side.
+///
+/// That is the cost of the arrangement, and it is worth paying only for as long
+/// as the decoder offers no bound of its own. The durable fix is upstream: a
+/// maximum dictionary size on `lzma-rust2`'s decoder, applied where the
+/// allocation happens, after which everything here but [`MAX_XZ_DICTIONARY`]
+/// deletes.
 struct XzDictionaryGuard<R> {
     source: R,
     stage: XzStage,

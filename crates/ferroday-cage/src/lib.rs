@@ -111,35 +111,21 @@
 // (with its intra-doc links) says so instead.
 #![cfg_attr(
     not(feature = "netstack"),
-    doc = "An external stack (`pasta`, `slirp4netns`) is the caller's to run and"
-)]
-#![cfg_attr(
-    not(feature = "netstack"),
-    doc = "manage against that seam; the library ships the seam, not a stack."
-)]
-#![cfg_attr(
-    feature = "netstack",
-    doc = "An external stack (`pasta`, `slirp4netns`) can attach there, and with"
+    doc = "
+An external stack (`pasta`, `slirp4netns`) is the caller's to run and
+manage against that seam; the library ships the seam, not a stack.
+"
 )]
 #![cfg_attr(
     feature = "netstack",
-    doc = "the `netstack` feature the library brings its own:"
-)]
-#![cfg_attr(
-    feature = "netstack",
-    doc = "[`NetStack::attach`] creates a tap device inside the sandbox's"
-)]
-#![cfg_attr(
-    feature = "netstack",
-    doc = "namespace and terminates the guest's TCP and UDP flows in the"
-)]
-#![cfg_attr(
-    feature = "netstack",
-    doc = "caller's process, forwarding each over an ordinary host socket —"
-)]
-#![cfg_attr(
-    feature = "netstack",
-    doc = "self-contained, unprivileged outbound connectivity."
+    doc = "
+An external stack (`pasta`, `slirp4netns`) can attach there, and with
+the `netstack` feature the library brings its own:
+[`NetStack::attach`] creates a tap device inside the sandbox's
+namespace and terminates the guest's TCP and UDP flows in the
+caller's process, forwarding each over an ordinary host socket —
+self-contained, unprivileged outbound connectivity.
+"
 )]
 //!
 //! # Profiles
@@ -156,87 +142,38 @@
 // items, so their doc text (with its intra-doc links) is gated on the feature
 // too: it appears in the canonical all-features build and is absent — links
 // and all — when the feature is off, keeping a no-feature `cargo doc` clean.
-#![cfg_attr(feature = "hardening", doc = "# Hardening")]
-#![cfg_attr(feature = "hardening", doc = "")]
 #![cfg_attr(
     feature = "hardening",
-    doc = "With the `hardening` feature, the default rootless-convenience profile can"
+    doc = "
+# Hardening
+
+With the `hardening` feature, the default rootless-convenience profile can
+be tightened into a boundary against untrusted code. Opt-in Landlock
+filesystem rules ([`landlock_fs`](CageBuilder::landlock_fs)) and TCP
+port rules ([`landlock_net`](CageBuilder::landlock_net)), seccomp
+syscall filters ([`seccomp`](CageBuilder::seccomp)), capability drops
+([`drop_all_capabilities`](CageBuilder::drop_all_capabilities)), and a
+fully denied network ([`Network::None`]) apply to the command and the
+processes it starts. The restrictions are compiled at build time and
+enforced in the command stage after the pivot, immediately before the
+command executes.
+
+# The restriction fallback
+
+A host that disables unprivileged user namespaces cannot run the cage at
+all; a launch there fails with [`Error::UsernsUnavailable`]. With the
+`hardening` feature, [`Restriction`] is the degraded mode for such hosts:
+it spawns a command directly on the host, confined by Landlock rules and
+a seccomp filter. The command sees the host filesystem as far as the grants
+allow, the host
+network, and the host PID space, so a restriction is a weaker boundary
+configured with host paths, sharing the cage's process model, streaming,
+and handle. A caller that wants to degrade catches
+[`Error::UsernsUnavailable`] from the cage and runs its separately
+configured restriction.
+
+"
 )]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "be tightened into a boundary against untrusted code. Opt-in Landlock"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "filesystem rules ([`landlock_fs`](CageBuilder::landlock_fs)) and TCP"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "port rules ([`landlock_net`](CageBuilder::landlock_net)), seccomp"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "syscall filters ([`seccomp`](CageBuilder::seccomp)), capability drops"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "([`drop_all_capabilities`](CageBuilder::drop_all_capabilities)), and a"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "fully denied network ([`Network::None`]) apply to the command and the"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "processes it starts. The restrictions are compiled at build time and"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "enforced in the command stage after the pivot, immediately before the"
-)]
-#![cfg_attr(feature = "hardening", doc = "command executes.")]
-#![cfg_attr(feature = "hardening", doc = "")]
-#![cfg_attr(feature = "hardening", doc = "# The restriction fallback")]
-#![cfg_attr(feature = "hardening", doc = "")]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "A host that disables unprivileged user namespaces cannot run the cage at"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "all; a launch there fails with [`Error::UsernsUnavailable`]. With the"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "`hardening` feature, [`Restriction`] is the degraded mode for such hosts:"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "it spawns a command directly on the host, confined by Landlock rules and"
-)]
-#![cfg_attr(feature = "hardening", doc = "a seccomp filter. The")]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "command sees the host filesystem as far as the grants allow, the host"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "network, and the host PID space, so a restriction is a weaker boundary"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "configured with host paths, sharing the cage's process model, streaming,"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "and handle. A caller that wants to degrade catches"
-)]
-#![cfg_attr(
-    feature = "hardening",
-    doc = "[`Error::UsernsUnavailable`] from the cage and runs its separately"
-)]
-#![cfg_attr(feature = "hardening", doc = "configured restriction.")]
-#![cfg_attr(feature = "hardening", doc = "")]
 //! # Provisioning
 //!
 //! The [`provision`] module produces the rootfs a sandbox runs against:
@@ -245,22 +182,20 @@
 //! directory either does not exist or is complete.
 #![cfg_attr(
     feature = "tarball",
-    doc = "With the `tarball` feature, [`Tarball`](provision::Tarball) provisions"
-)]
-#![cfg_attr(
-    feature = "tarball",
-    doc = "from a tar archive (plain, gzip, xz, or zstd) with kernel-enforced"
-)]
-#![cfg_attr(feature = "tarball", doc = "containment.")]
-#![cfg_attr(
-    feature = "debian",
-    doc = "With the `debian` feature, [`Debian`](provision::debian::Debian)"
+    doc = "
+With the `tarball` feature, [`Tarball`](provision::Tarball) provisions
+from a tar archive (plain, gzip, xz, or zstd) with kernel-enforced
+containment.
+"
 )]
 #![cfg_attr(
     feature = "debian",
-    doc = "bootstraps a Debian suite from the archive and configures it inside a"
+    doc = "
+With the `debian` feature, [`Debian`](provision::debian::Debian)
+bootstraps a Debian suite from the archive and configures it inside a
+cage of its own.
+"
 )]
-#![cfg_attr(feature = "debian", doc = "cage of its own.")]
 //!
 //! # Host requirements
 //!
@@ -277,6 +212,7 @@
 //! stable.
 
 mod error;
+mod failure;
 // The guide's Rust blocks, compiled as doctests of this crate. Every feature is
 // named because the guide documents the whole library, and the module is a
 // test-time one either way: `doctest` collects the blocks, `test` runs the
@@ -309,6 +245,10 @@ pub mod relay;
 mod resolved;
 #[cfg(feature = "hardening")]
 mod restrict;
+// The two enums declared through it are each behind a feature, so a build with
+// neither has no roster to declare.
+#[cfg(any(feature = "hardening", feature = "alpine"))]
+mod roster;
 mod running;
 #[cfg(test)]
 mod scratch;

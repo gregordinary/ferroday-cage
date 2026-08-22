@@ -640,6 +640,48 @@ impl RestrictionBuilder {
 mod tests {
     use super::*;
 
+    /// Every field of a restriction's builder is classified against the cage
+    /// builder's, and stays classified because this stops compiling otherwise.
+    ///
+    /// The two types are deliberate twins: a restriction is the degraded mode a
+    /// cage's caller falls back to, and the point is that the same
+    /// configuration reads the same way. What holds them together is prose --
+    /// each setter says what its knob means *under a restriction* -- so the
+    /// pair cannot be generated from one source without losing the thing that
+    /// makes two worth having. What can be held mechanically is that neither
+    /// grows a field the other has not considered.
+    ///
+    /// The destructure below is exhaustive, with no `..`, the technique
+    /// `CageBuilder::check_restricted` uses: a field added to
+    /// `RestrictionBuilder` fails to compile here until someone classifies it.
+    /// The other direction is that same `check_restricted`, which destructures
+    /// `CageBuilder` exhaustively for its own reason -- so a field added there
+    /// is already refused until it is classified, and this comment is where a
+    /// reader is told the pair is what the two destructures are about.
+    #[test]
+    fn every_restriction_builder_field_is_classified_against_the_cage_builder() {
+        let RestrictionBuilder {
+            // The same field, meaning the same thing, on `CageBuilder`. A
+            // change to one of these is a change to both.
+            command: _,
+            args: _,
+            env: _,
+            workdir: _,
+            stdin: _,
+            stdout: _,
+            stderr: _,
+            rlimits: _,
+            hardening: _,
+            // Deliberately different in type. `CageBuilder` holds an
+            // `Option<bool>` for each, because a profile that says nothing has
+            // to be distinguishable from one that says `false` when the two are
+            // merged. A restriction has no profile, so the two-state form is
+            // the whole question here.
+            base_env: _,
+            stop_with_caller: _,
+        } = RestrictionBuilder::default();
+    }
+
     fn restricted_true() -> RestrictionBuilder {
         Restriction::builder()
             .command("/bin/true")

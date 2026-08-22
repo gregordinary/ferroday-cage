@@ -24,7 +24,7 @@ use super::version;
 
 /// The versions and digests a pin holds a resolution to, keyed by package name.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Pins {
+pub(super) struct Pins {
     by_name: HashMap<String, Pinned>,
 }
 
@@ -38,7 +38,7 @@ struct Pinned {
 impl Pins {
     /// No pin: every name resolves to the highest version offered, as an
     /// unpinned resolution does.
-    pub(crate) fn none() -> Pins {
+    pub(super) fn none() -> Pins {
         Pins::default()
     }
 
@@ -51,7 +51,7 @@ impl Pins {
     /// entries for one name state two versions to hold it at and there is no
     /// answer to which governs. A plan this library resolved cannot contain
     /// one; a hand-written document can.
-    pub(crate) fn of(plan: &Plan) -> Result<Pins, DebianError> {
+    pub(super) fn of(plan: &Plan) -> Result<Pins, DebianError> {
         let mut by_name: HashMap<String, Pinned> = HashMap::with_capacity(plan.packages.len());
         for package in &plan.packages {
             let pinned = Pinned {
@@ -72,7 +72,7 @@ impl Pins {
     }
 
     /// Whether this pin names `package` at all.
-    pub(crate) fn names(&self, package: &str) -> bool {
+    pub(super) fn names(&self, package: &str) -> bool {
         self.by_name.contains_key(package)
     }
 
@@ -81,7 +81,7 @@ impl Pins {
     /// Compared as Debian versions rather than as strings, so a pin written
     /// with an explicit zero epoch matches an index that omits it, and the
     /// reverse. Answers `false` for a package the pin does not name.
-    pub(crate) fn holds(&self, package: &str, version: &str) -> bool {
+    pub(super) fn holds(&self, package: &str, version: &str) -> bool {
         self.by_name
             .get(package)
             .is_some_and(|pinned| version::compare(&pinned.version, version).is_eq())
@@ -98,7 +98,7 @@ impl Pins {
     ///
     /// [`DebianError::Pin`] naming every package that could not be held, in
     /// name order, and for each of them what the archives offer instead.
-    pub(crate) fn check(&self, index: &Index) -> Result<(), DebianError> {
+    pub(super) fn check(&self, index: &Index) -> Result<(), DebianError> {
         let mut unheld: Vec<UnheldPin> = Vec::new();
         for (package, pinned) in &self.by_name {
             let reason = match index.get(package) {

@@ -56,7 +56,11 @@ impl Tar {
     }
 
     /// An entry of any type, for a fixture that needs one this has no name for.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The escape hatch under the named builders above, and its parameters are
+    /// the tar header's own fields; a fixture that wants them named reaches for
+    /// `file`, `dir`, `symlink` or `hardlink` instead.
+    #[expect(clippy::too_many_arguments)]
     pub fn entry(
         &mut self,
         path: &str,

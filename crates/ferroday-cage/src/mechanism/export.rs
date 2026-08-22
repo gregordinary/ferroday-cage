@@ -55,7 +55,7 @@ use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
 use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
-use super::child::{MapFailure, MapStep};
+use super::child::MapFailure;
 use super::frame;
 use crate::idmap::IdMapError;
 use crate::wire::wire_enum;
@@ -81,23 +81,18 @@ wire_enum! {
     /// ends of a single build write and read. They are not a stable protocol: a
     /// step inserted in a later release may renumber the ones after it.
     pub(crate) enum ExportStep {
+        map {
+            ResetSignals = 1 => "resetting the export process's signal dispositions",
+            SweepFds = 2 => "closing the export process's inherited descriptors",
+            Unshare = 3 => "unsharing the export namespace",
+            DenySetgroups = 4 => "denying setgroups in the export namespace",
+            WriteGidMap = 14 => "writing the export gid map",
+            WriteUidMap = 15 => "writing the export uid map",
+            AwaitMap = 5 => "establishing the export identity map",
+        }
         /// Forking the export process or speaking to it. Reported by the caller
         /// alone: the child has no channel to report it on.
         Spawn = 0 => "spawning the export process",
-        /// The child could not reset its inherited signal dispositions.
-        ResetSignals = 1 => "resetting the export process's signal dispositions",
-        /// The child could not close the descriptors it inherited.
-        SweepFds = 2 => "closing the export process's inherited descriptors",
-        /// The child could not unshare its user namespace.
-        Unshare = 3 => "unsharing the export namespace",
-        /// The child could not deny `setgroups` in its own user namespace.
-        DenySetgroups = 4 => "denying setgroups in the export namespace",
-        /// The child could not write its own gid map.
-        WriteGidMap = 14 => "writing the export gid map",
-        /// The child could not write its own uid map.
-        WriteUidMap = 15 => "writing the export uid map",
-        /// The child was abandoned at the map gate.
-        AwaitMap = 5 => "establishing the export identity map",
         /// Reading a directory's entries failed.
         ReadDir = 6 => "reading a directory in the exported tree",
         /// Stat-ing an entry failed.
@@ -253,20 +248,6 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
     }
 }
 
-/// The step an export reports for a shared map step: the export's own name for
-/// the same step, one for one.
-fn export_step(step: MapStep) -> ExportStep {
-    match step {
-        MapStep::ResetSignals => ExportStep::ResetSignals,
-        MapStep::SweepFds => ExportStep::SweepFds,
-        MapStep::Unshare => ExportStep::Unshare,
-        MapStep::DenySetgroups => ExportStep::DenySetgroups,
-        MapStep::WriteGidMap => ExportStep::WriteGidMap,
-        MapStep::WriteUidMap => ExportStep::WriteUidMap,
-        MapStep::AwaitMap => ExportStep::AwaitMap,
-    }
-}
-
 /// The child: unshare, establish the map, walk, and stream. Never returns.
 ///
 /// Takes the gate by value so the handshake can close it: past the go byte the
@@ -294,7 +275,7 @@ fn export_child(
             // diagnostic, and it is no longer reading the stream a report
             // would travel on.
             MapFailure::Abandoned => runtime::exit_group(1),
-            MapFailure::Step(step, errno) => fail(export_step(step), errno),
+            MapFailure::Step(step, errno) => fail(step.into(), errno),
         }
     }
     // The map is in force and the gate has served its purpose; the walk below
@@ -513,7 +494,7 @@ impl Walker<'_> {
             put(stream, &stat.st_ino.to_le_bytes())?;
             // `st_nlink` is u32 or u64 depending on rustix's `Stat` backing;
             // normalize to the 8-byte field the parent decodes.
-            #[allow(clippy::useless_conversion)]
+            #[expect(clippy::useless_conversion)]
             let nlink = u64::from(stat.st_nlink);
             put(stream, &nlink.to_le_bytes())?;
         }

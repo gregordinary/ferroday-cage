@@ -150,6 +150,44 @@ count = 1
 why = "The same decision, for the same reason, in a consumer of the public API."
 
 [[idiom]]
+name = "a mirror-relative URL built by hand"
+pattern = "trim_end_matches\\('/'\\)"
+answer = """\
+`provision::mirror_url`. A configured mirror may or may not end in a slash and \
+a composed suffix may or may not begin with one, so the join owns both; eight \
+sites decided it separately before, and a doubled or missing separator \
+addresses no archive."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/fetch.rs"
+count = 1
+why = "The answer."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/debian/deb.rs"
+count = 1
+why = """\
+Not a URL at all: it trims the trailing slash off a `Multi-Arch` directory \
+value read out of a control stanza."""
+
+[[idiom]]
+name = "a hand-rolled mirror walk"
+# Anchored on the accumulator such a walk keeps, which is what tells it apart
+# from an ordinary loop over a list: the last failure worth reporting.
+pattern = 'let mut (?:last_missing|unserved) = None;'
+answer = """\
+`provision::walk_mirrors`, with the layer's error answering \
+`provision::Failover`. Eight copies of the same nine lines existed across the \
+three userlands, and the round-3 review found a bug in exactly one of them -- \
+the oversized-body case advancing or stopping depending on the transfer \
+encoding. A single walk is a single place to get that right."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/fetch.rs"
+count = 1
+why = "The answer."
+
+[[idiom]]
 name = "the host's temporary directory"
 pattern = 'env::temp_dir\(\)'
 answer = """\

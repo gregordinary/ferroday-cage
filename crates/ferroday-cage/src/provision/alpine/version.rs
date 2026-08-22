@@ -295,6 +295,13 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
 /// ones, so this reports `None` only for a version that reached it unchecked —
 /// and reporting it is what keeps such a version from silently ordering above or
 /// below a real one.
+///
+/// Partial, where [`debian::version::compare`] is total. That is this format
+/// speaking: an apk version is a token grammar and a string outside it is not
+/// a low version but one the mirror should not have published. dpkg's
+/// algorithm is defined over every string and so has nothing to refuse.
+///
+/// [`debian::version::compare`]: crate::provision::debian::version::compare
 pub(super) fn compare(a: &str, b: &str) -> Option<Ordering> {
     Some(parse(a)?.cmp(&parse(b)?))
 }

@@ -13,13 +13,30 @@
 //! format's comparison and its own `Constraint` together for the same reason —
 //! a constraint is meaningless apart from the ordering it is evaluated under.
 //!
+//! # This comparison is total, and the other two are not
+//!
+//! `compare` here answers an [`Ordering`](std::cmp::Ordering), where
+//! [`alpine::version::compare`] and [`gentoo::version::compare`] answer an
+//! `Option<Ordering>`. That is the formats speaking, not three opinions about
+//! error handling: dpkg's algorithm is defined over *every* string. It reads a
+//! version as alternating non-digit and digit runs, and any string at all is
+//! such a sequence, so there is no input it declines to order and no refusal to
+//! report. An apk or a portage version is a token grammar, and a string outside
+//! it is not a version to be ordered low — it is a version the mirror should
+//! not have published, which is what their `None` says.
+//!
 //! [`alpine::version`]: crate::provision::alpine::version
+//! [`alpine::version::compare`]: crate::provision::alpine::version::compare
+//! [`gentoo::version::compare`]: crate::provision::gentoo::version::compare
 
 use std::cmp::Ordering;
 use std::fmt;
 
 /// Compares two Debian version strings.
-pub(crate) fn compare(a: &str, b: &str) -> Ordering {
+///
+/// Total: see this module's documentation for why this format has no
+/// unorderable version and the other two do.
+pub(super) fn compare(a: &str, b: &str) -> Ordering {
     let (ea, ua, ra) = split(a);
     let (eb, ub, rb) = split(b);
     ea.cmp(&eb)

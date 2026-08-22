@@ -90,7 +90,7 @@ use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
 use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
-use super::child::{MapFailure, MapStep};
+use super::child::MapFailure;
 use super::frame;
 use crate::idmap::IdMapError;
 use crate::path;
@@ -121,23 +121,18 @@ wire_enum! {
     /// release takes the next free value rather than renumbering the ones it
     /// was declared among.
     pub(crate) enum CopyStep {
+        map {
+            ResetSignals = 1 => "resetting the copy process's signal dispositions",
+            SweepFds = 2 => "closing the copy process's inherited descriptors",
+            Unshare = 3 => "unsharing the copy process's user namespace",
+            DenySetgroups = 4 => "denying setgroups in the copy process's user namespace",
+            WriteGidMap = 19 => "writing the copy process's gid map",
+            WriteUidMap = 20 => "writing the copy process's uid map",
+            AwaitMap = 5 => "waiting for the identity map to be applied",
+        }
         /// Forking the copy process or speaking to it. Reported by the caller
         /// alone: the child has no channel to report it on.
         Spawn = 0 => "forking the copy process",
-        /// The child could not reset its inherited signal dispositions.
-        ResetSignals = 1 => "resetting the copy process's signal dispositions",
-        /// The child could not close the descriptors it inherited.
-        SweepFds = 2 => "closing the copy process's inherited descriptors",
-        /// The child could not unshare its user namespace.
-        Unshare = 3 => "unsharing the copy process's user namespace",
-        /// The child could not deny `setgroups` in its own user namespace.
-        DenySetgroups = 4 => "denying setgroups in the copy process's user namespace",
-        /// The child could not write its own gid map.
-        WriteGidMap = 19 => "writing the copy process's gid map",
-        /// The child could not write its own uid map.
-        WriteUidMap = 20 => "writing the copy process's uid map",
-        /// The child died or was abandoned at the map gate.
-        AwaitMap = 5 => "waiting for the identity map to be applied",
         /// The destination rootfs could not be opened.
         OpenRoot = 6 => "opening the destination rootfs",
         /// A frame could not be read from the parent.
@@ -404,20 +399,6 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
     }
 }
 
-/// The step a copy reports for a shared map step: the copy's own name for the
-/// same step, one for one.
-fn copy_step(step: MapStep) -> CopyStep {
-    match step {
-        MapStep::ResetSignals => CopyStep::ResetSignals,
-        MapStep::SweepFds => CopyStep::SweepFds,
-        MapStep::Unshare => CopyStep::Unshare,
-        MapStep::DenySetgroups => CopyStep::DenySetgroups,
-        MapStep::WriteGidMap => CopyStep::WriteGidMap,
-        MapStep::WriteUidMap => CopyStep::WriteUidMap,
-        MapStep::AwaitMap => CopyStep::AwaitMap,
-    }
-}
-
 /// The child: unshare, gate, create, report. Never returns.
 fn copy_child(
     stream: BorrowedFd<'_>,
@@ -438,7 +419,7 @@ fn copy_child(
             // The caller left without applying the map; its own error is the
             // diagnostic, and the gate a report would travel on is closed.
             MapFailure::Abandoned => runtime::exit_group(1),
-            MapFailure::Step(step, errno) => fail(copy_step(step), errno),
+            MapFailure::Step(step, errno) => fail(step.into(), errno),
         }
     }
 

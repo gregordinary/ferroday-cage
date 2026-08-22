@@ -16,6 +16,7 @@ use super::AlpineError;
 use super::index::Record;
 use super::version;
 use crate::provision::document::{self, Carried, Draft};
+use crate::provision::mirror_url;
 
 /// The suffix every apk file carries.
 const PACKAGE_SUFFIX: &str = ".apk";
@@ -148,7 +149,12 @@ pub struct ResolvedIndex {
     /// to mean.
     pub description: Option<String>,
     /// Fields this index's stanza carried that this version does not know.
-    carried: Carried,
+    ///
+    /// Reachable within the layer so a live resolution can build the record as
+    /// a struct literal, naming each field: the fields above sit in
+    /// transposable runs of one type, and a positional constructor over them
+    /// compiles either way round and writes a wrong plan document.
+    pub(super) carried: Carried,
 }
 
 /// One package in a [`Plan`]: enough to identify the exact `.apk` and to key a
@@ -206,64 +212,12 @@ pub struct PlannedPackage {
     /// single repository with two components.
     pub index: usize,
     /// Fields this package's stanza carried that this version does not know.
-    carried: Carried,
-}
-
-impl PlannedPackage {
-    /// Records one package as a live resolution selected it.
     ///
-    /// A constructor rather than a struct literal for [`ResolvedIndex::resolved`]'s
-    /// reason: the carried-field list is private, and a package selected from an
-    /// index has no document behind it to carry anything from.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolved(
-        name: String,
-        version: String,
-        architecture: String,
-        control_identity: String,
-        size: Option<u64>,
-        installed_size: Option<u64>,
-        origin: Option<String>,
-        index: usize,
-    ) -> PlannedPackage {
-        PlannedPackage {
-            name,
-            version,
-            architecture,
-            control_identity,
-            size,
-            installed_size,
-            origin,
-            index,
-            carried: Carried::new(),
-        }
-    }
-}
-
-impl ResolvedIndex {
-    /// Records one index's state as a live resolution observed it.
-    ///
-    /// A constructor rather than a struct literal because the carried-field
-    /// list is private: a record built from a resolution has no document behind
-    /// it, so there is nothing to carry.
-    pub(super) fn resolved(
-        mirror: String,
-        release: String,
-        component: Option<String>,
-        sha256: String,
-        signed_by: String,
-        description: Option<String>,
-    ) -> ResolvedIndex {
-        ResolvedIndex {
-            mirror,
-            release,
-            component,
-            sha256,
-            signed_by,
-            description,
-            carried: Carried::new(),
-        }
-    }
+    /// Reachable within the layer so a live resolution can build the record as
+    /// a struct literal, naming each field: the fields above sit in
+    /// transposable runs of one type, and a positional constructor over them
+    /// compiles either way round and writes a wrong plan document.
+    pub(super) carried: Carried,
 }
 
 impl ResolvedIndex {
@@ -278,10 +232,9 @@ impl ResolvedIndex {
     /// because a download walks the mirrors its repository is configured with
     /// and the recorded one names only where the index came from.
     pub(super) fn directory_under(&self, mirror: &str) -> String {
-        let mirror = mirror.trim_end_matches('/');
         match &self.component {
-            Some(component) => format!("{mirror}/{}/{component}", self.release),
-            None => format!("{mirror}/{}", self.release),
+            Some(component) => mirror_url(mirror, &format!("{}/{component}", self.release)),
+            None => mirror_url(mirror, &self.release),
         }
     }
 }
@@ -560,18 +513,19 @@ impl Plan {
             packages: packages
                 .iter()
                 .map(|record| {
-                    PlannedPackage::resolved(
-                        record.name.clone(),
-                        record.version.clone(),
-                        record.architecture.clone(),
-                        record.control_identity.clone(),
-                        record.size,
-                        record.installed_size,
-                        record.origin.clone(),
+                    PlannedPackage {
+                        name: record.name.clone(),
+                        version: record.version.clone(),
+                        architecture: record.architecture.clone(),
+                        control_identity: record.control_identity.clone(),
+                        size: record.size,
+                        installed_size: record.installed_size,
+                        origin: record.origin.clone(),
                         // The merge tags each retained record with the index it
                         // was read from, which is exactly this list's ordering.
-                        record.from,
-                    )
+                        index: record.from,
+                        carried: Carried::new(),
+                    }
                 })
                 .collect(),
             indexes: indexes.to_vec(),
@@ -626,24 +580,26 @@ mod tests {
             release: "v3.23".to_string(),
             architecture: "x86_64".to_string(),
             indexes: vec![
-                ResolvedIndex::resolved(
-                    "http://dl-cdn.alpinelinux.org/alpine".to_string(),
-                    "v3.23".to_string(),
-                    Some("main".to_string()),
-                    "9f3a".repeat(16),
-                    "alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub".to_string(),
-                    Some("v3.23.5-111-g2a2e55ba802".to_string()),
-                ),
+                ResolvedIndex {
+                    mirror: "http://dl-cdn.alpinelinux.org/alpine".to_string(),
+                    release: "v3.23".to_string(),
+                    component: Some("main".to_string()),
+                    sha256: "9f3a".repeat(16),
+                    signed_by: "alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub".to_string(),
+                    description: Some("v3.23.5-111-g2a2e55ba802".to_string()),
+                    carried: Carried::new(),
+                },
                 // postmarketOS's shape: no component, and a timestamp where
                 // Alpine writes a build string.
-                ResolvedIndex::resolved(
-                    "http://mirror.postmarketos.org/postmarketos".to_string(),
-                    "v26.06".to_string(),
-                    None,
-                    "1c0f".repeat(16),
-                    "build.postmarketos.org.rsa.pub".to_string(),
-                    None,
-                ),
+                ResolvedIndex {
+                    mirror: "http://mirror.postmarketos.org/postmarketos".to_string(),
+                    release: "v26.06".to_string(),
+                    component: None,
+                    sha256: "1c0f".repeat(16),
+                    signed_by: "build.postmarketos.org.rsa.pub".to_string(),
+                    description: None,
+                    carried: Carried::new(),
+                },
             ],
             packages: vec![
                 PlannedPackage {

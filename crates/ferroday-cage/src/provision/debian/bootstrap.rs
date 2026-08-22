@@ -183,24 +183,47 @@ fn record_path(line: &str) -> Option<&str> {
 
 /// Configures every unpacked package, leaving a consistent dpkg database.
 ///
+/// What a configure wave installs, and the environment it installs it in.
+///
+/// The same five values travel from a bootstrap down through `configure`,
+/// `core_install` and `run_dpkg`, and were threaded through each positionally.
+/// Gathered here, a step names what it reads.
+pub(crate) struct Configure<'a> {
+    /// The host directory the `.deb` files were downloaded into, bound
+    /// read-only into each dpkg cage.
+    pub(crate) archives_host: &'a Path,
+    /// The packages to install, in the order they were resolved.
+    pub(crate) installables: &'a [Installable],
+    /// The ownership and mode records dpkg is seeded with.
+    pub(crate) statoverride: &'a StatOverride,
+    /// The map the wave's cages run under, deciding whether the
+    /// single-identity ownership reconciliation happens at all.
+    pub(crate) identity_map: &'a IdentityMap,
+    /// The maintainer-script environment.
+    pub(crate) env: &'a [(String, String)],
+}
+
 /// `env` is the maintainer-script environment; `repositories` compose the
 /// `sources.list` and `sources.list.d` entries written into the finished
 /// rootfs, each signed repository's keyring written there as its `signed-by`
 /// trust anchor so the sources verify. `identity_map` is the map the cages run
 /// under, deciding whether the single-identity ownership reconciliation happens
 /// at all. `progress` receives dpkg's output.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn configure(
     staging: &Path,
-    archives_host: &Path,
-    installables: &[Installable],
-    statoverride: &StatOverride,
-    identity_map: &IdentityMap,
-    env: &[(String, String)],
+    wave: &Configure<'_>,
     repositories: &[Repository],
     overlay: Option<&Path>,
     observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
+    let &Configure {
+        installables,
+        statoverride,
+        identity_map,
+        // Read by the dpkg waves this hands the gathered value down to.
+        archives_host: _,
+        env: _,
+    } = wave;
     // Under a range map every id Debian assigns is real and every chown
     // works; the reconciliation below exists solely for the single-identity
     // map, where no id but root can be represented.
@@ -226,15 +249,7 @@ pub(crate) fn configure(
     // every subsequent invocation. A range map wants the packages' own
     // ownership and modes, so no override is seeded and the shadow files are
     // left for pwconv to create with their real root:shadow ownership.
-    core_install(
-        installables,
-        "base-passwd",
-        staging,
-        archives_host,
-        identity_map,
-        env,
-        observer,
-    )?;
+    core_install("base-passwd", staging, wave, observer)?;
     if single {
         write_statoverride(&tree, statoverride)?;
         precreate_shadow(&tree)?;
@@ -242,27 +257,11 @@ pub(crate) fn configure(
 
     // The rest of the base system.
     for name in &CORE_ORDER[1..] {
-        core_install(
-            installables,
-            name,
-            staging,
-            archives_host,
-            identity_map,
-            env,
-            observer,
-        )?;
+        core_install(name, staging, wave, observer)?;
     }
     // The real mawk replaces the temporary awk symlink.
     remove_awk_symlink(&tree)?;
-    core_install(
-        installables,
-        "mawk",
-        staging,
-        archives_host,
-        identity_map,
-        env,
-        observer,
-    )?;
+    core_install("mawk", staging, wave, observer)?;
 
     // Unpack registers every package in the database and lays its files;
     // this re-lays coreutils, so the ownership stubs are reinstalled before
@@ -270,16 +269,7 @@ pub(crate) fn configure(
     write_dselect_method(&tree)?;
     let mut unpack: Vec<&str> = vec!["--force-depends", "--unpack"];
     unpack.extend(installables.iter().map(|p| p.deb_path.as_str()));
-    run_dpkg(
-        "unpack",
-        staging,
-        Rooting::Whole,
-        archives_host,
-        identity_map,
-        env,
-        &unpack,
-        observer,
-    )?;
+    run_dpkg("unpack", staging, Rooting::Whole, &unpack, wave, observer)?;
 
     if single {
         install_ownership_stubs(&tree)?;
@@ -299,15 +289,13 @@ pub(crate) fn configure(
         "configure",
         staging,
         Rooting::Whole,
-        archives_host,
-        identity_map,
-        env,
         &[
             "--configure",
             "--pending",
             "--force-configure-any",
             "--force-depends",
         ],
+        wave,
         observer,
     )?;
 
@@ -349,18 +337,21 @@ pub(crate) fn configure(
 /// afterward. `overlay_source` is the caller's pre-configure overlay, laid over
 /// the upper between the unpack and configure waves exactly as for a full
 /// bootstrap.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn configure_delta(
     lower: &Path,
     upper: &Path,
-    archives_host: &Path,
-    installables: &[Installable],
-    statoverride: &StatOverride,
-    identity_map: &IdentityMap,
-    env: &[(String, String)],
+    wave: &Configure<'_>,
     overlay_source: Option<&Path>,
     observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
+    let &Configure {
+        installables,
+        statoverride,
+        identity_map,
+        // Read by the dpkg waves this hands the gathered value down to.
+        archives_host: _,
+        env: _,
+    } = wave;
     let single = matches!(identity_map, IdentityMap::Single);
 
     // The increment's own tree, which every host-side step below is anchored
@@ -387,10 +378,8 @@ pub(crate) fn configure_delta(
         "unpack",
         upper,
         Rooting::Over(lower),
-        archives_host,
-        identity_map,
-        env,
         &unpack,
+        wave,
         observer,
     )?;
 
@@ -405,15 +394,13 @@ pub(crate) fn configure_delta(
         "configure",
         upper,
         Rooting::Over(lower),
-        archives_host,
-        identity_map,
-        env,
         &[
             "--configure",
             "--pending",
             "--force-configure-any",
             "--force-depends",
         ],
+        wave,
         observer,
     )?;
 
@@ -520,16 +507,13 @@ impl Observer for DpkgOutput<'_> {
 }
 
 /// Installs one core package by name, if it is in the selection.
-#[allow(clippy::too_many_arguments)]
 fn core_install(
-    installables: &[Installable],
     name: &str,
     staging: &Path,
-    archives_host: &Path,
-    identity_map: &IdentityMap,
-    env: &[(String, String)],
+    wave: &Configure<'_>,
     observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
+    let installables = wave.installables;
     if let Some(package) = installables.iter().find(|p| p.name == name) {
         run_dpkg(
             "core install",
@@ -537,10 +521,8 @@ fn core_install(
             // The core waves are the full bootstrap's alone: a layered build
             // installs no base system, since its base already carries one.
             Rooting::Whole,
-            archives_host,
-            identity_map,
-            env,
             &["--force-depends", "--install", &package.deb_path],
+            wave,
             observer,
         )?;
     }
@@ -587,17 +569,23 @@ fn precreate_shadow(tree: &Rooted) -> Result<(), DebianError> {
 /// tree alone; a layered build roots on an overlay of the pristine base and the
 /// increment's upper, so dpkg reads the base's configured database and lands its
 /// writes in the disposable upper.
-#[allow(clippy::too_many_arguments)]
 fn run_dpkg(
-    wave: &'static str,
+    name: &'static str,
     staging: &Path,
     rooting: Rooting<'_>,
-    archives_host: &Path,
-    identity_map: &IdentityMap,
-    env: &[(String, String)],
     args: &[&str],
+    wave: &Configure<'_>,
     observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
+    let &Configure {
+        archives_host,
+        identity_map,
+        env,
+        // The wave's own selection is spelled out in `args` by the caller,
+        // which is what dpkg is told to act on.
+        installables: _,
+        statoverride: _,
+    } = wave;
     let cage = rooting
         .builder(staging)
         .command("/usr/bin/dpkg")
@@ -625,7 +613,7 @@ fn run_dpkg(
     if status.success() {
         Ok(())
     } else {
-        Err(DebianError::Configure { wave, status })
+        Err(DebianError::Configure { wave: name, status })
     }
 }
 

@@ -720,9 +720,41 @@ Provision::new("/var/lib/machines/gentoo")
 # }
 ```
 
-Four events rather than the other layers' larger sets, because the work is
-smaller: the documents fetched, what was resolved, the verification, and the
-extraction.
+A read-half call drives no run and so has no run observer to report through.
+`Gentoo::observe` binds a `GentooObserver` for one call instead, which is how a
+caller previewing an install sees what the resolution refused:
+
+```rust,no_run
+use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut gentoo = Gentoo::builder("amd64")
+    .binhost("x86-64")
+    .install(["dev-vcs/git"])
+    .build()?;
+
+let mut sink = |event: GentooEvent<'_>| match event {
+    GentooEvent::Conflict { atom, blocks, .. } => eprintln!("{atom} blocks {blocks}"),
+    GentooEvent::DependencyCycle { packages, .. } => {
+        eprintln!("cycle: {}", packages.join(" -> "));
+    }
+    _ => {}
+};
+let plan = gentoo
+    .observe(&mut sink)
+    .resolve_packages("/var/lib/machines/gentoo")?;
+drop(sink);
+
+println!("{} packages", plan.packages.len());
+# Ok(())
+# }
+```
+
+`Conflict`, `DependencyCycle` and `Occupied` describe how a resolution reached
+its answer, which is the half a preview is for: `resolve_packages` returns the
+plan, and the sink says which atom blocked which, whether the blocker is already
+installed, and which packages form a cycle. An observed call reports the same
+events a bootstrap does, because both go through one code path.
 
 The same observer stops the run. `ProvisionObserver::cancelled` is consulted at
 each step boundary — before a document is fetched, once the resolution is in

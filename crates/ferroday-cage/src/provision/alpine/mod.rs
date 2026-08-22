@@ -71,10 +71,11 @@ use super::layer::Rooting;
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
-    BuildLayer, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter, PackageCache,
-    ProvisionError, ProvisionRequest, Provisioner, Stream,
+    BuildLayer, Failover, Fetch, FetchError, FetchJob, FetchRequest, HttpFetch, LimitedWriter,
+    PackageCache, ProvisionError, ProvisionRequest, Provisioner, Stream, mirror_url, walk_mirrors,
 };
 use crate::IdentityMap;
+use crate::failure::path_io_error;
 use bootstrap::ScriptSubject;
 use index::{Index, Record};
 use installed::{Carried, Claim, Database};
@@ -282,19 +283,7 @@ impl Alpine {
     /// that cannot be read or verified, and [`AlpineError::Resolve`] for a
     /// closure the repositories cannot supply.
     pub fn resolve(&mut self) -> Result<Plan, AlpineError> {
-        self.resolve_reporting(&mut Silent)
-    }
-
-    /// The resolution, with an observer already chosen.
-    ///
-    /// Shared by [`resolve`](Self::resolve) and the bootstrap, so the plan a
-    /// caller previews and the plan a bootstrap installs come from one code path
-    /// and cannot drift apart.
-    fn resolve_reporting(
-        &mut self,
-        observer: &mut dyn AlpineObserver,
-    ) -> Result<Plan, AlpineError> {
-        self.resolve_over(None, observer)
+        self.observe(&mut Silent).resolve()
     }
 
     /// The resolution, over a base layer where there is one.
@@ -359,17 +348,7 @@ impl Alpine {
     /// no base layer is set or the base is not a provisioned Alpine root of this
     /// architecture.
     pub fn resolve_layer(&mut self) -> Result<Plan, AlpineError> {
-        self.resolve_layer_reporting(&mut Silent)
-    }
-
-    /// The body of [`resolve_layer`](Self::resolve_layer), reporting to
-    /// `observer`.
-    fn resolve_layer_reporting(
-        &mut self,
-        observer: &mut dyn AlpineObserver,
-    ) -> Result<Plan, AlpineError> {
-        let base = self.read_base_layer("resolve_layer")?;
-        self.resolve_over(Some(&base), observer)
+        self.observe(&mut Silent).resolve_layer()
     }
 
     /// Reads the configured base layer, refusing a provisioner that has none.
@@ -442,24 +421,7 @@ impl Alpine {
     /// [`AlpineError::Index`] when the records it carries are not the ones the
     /// format defines.
     pub fn available(&mut self) -> Result<Available, AlpineError> {
-        self.available_reporting(&mut Silent)
-    }
-
-    /// The catalogue, with an observer already chosen.
-    ///
-    /// Split out for the same reason [`resolve_reporting`](Self::resolve_reporting)
-    /// is, and it matters more here: this call is nothing *but* the index walk,
-    /// which spends one mirror timeout per unreachable mirror, so an observed
-    /// caller watching a long silence has nothing else to learn it from.
-    fn available_reporting(
-        &mut self,
-        observer: &mut dyn AlpineObserver,
-    ) -> Result<Available, AlpineError> {
-        // Unpinned whatever the builder holds: this reports what the
-        // repositories offer, and a pin describes a selection from it rather
-        // than a bound on what may be asked about.
-        let (records, _indexes) = self.read_indexes(observer)?;
-        Ok(Index::merge(records, &self.architecture, &Pins::none()).into_available())
+        self.observe(&mut Silent).available()
     }
 
     /// Stages this provisioner's packages as an increment over the base layer,
@@ -523,10 +485,13 @@ impl Alpine {
     /// unmet host precondition, a base that is not a provisioned Alpine root, or
     /// no base layer set.
     pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
-        self.stage_layer_reporting(upper.as_ref(), &mut Silent)
+        self.observe(&mut Silent).stage_layer(upper)
     }
 
     /// The body of [`stage_layer`](Self::stage_layer), reporting to `observer`.
+    ///
+    /// One body for the two public entry points -- the unobserved one above and
+    /// [`Observed::stage_layer`] -- rather than a body on each.
     fn stage_layer_reporting(
         &mut self,
         upper: &Path,
@@ -1168,51 +1133,49 @@ fn read_index(
     from: usize,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(Vec<Record>, ResolvedIndex), AlpineError> {
-    let mut last_missing = None;
-    for mirror in &repository.mirrors {
-        let url = format!("{}/{path}", mirror.trim_end_matches('/'));
-        // Reported for the same reason a package fetch is: this walk spends one
-        // mirror timeout per unreachable mirror, and it is the slowest part of a
-        // resolve. An observer that saw only `Resolving` would watch a bootstrap
-        // that looks stopped.
-        observer.progress(AlpineEvent::Fetching { url: &url });
-        let mut bytes = Vec::new();
-        let request = FetchRequest::new(&url);
-        match fetcher.fetch(
-            &request,
-            &mut LimitedWriter::new(&mut bytes, MAX_INDEX_FETCH),
-        ) {
-            Ok(()) => {
-                let (records, signed_by, description) =
-                    parse_index(&url, &bytes, repository, from)?;
-                return Ok((
-                    records,
-                    ResolvedIndex::resolved(
-                        mirror.clone(),
-                        repository.release().to_string(),
-                        component.map(str::to_string),
-                        // Over the container as it arrived, signature segment
-                        // included, so the value names the exact bytes whose
-                        // signature was checked.
-                        Algorithm::Sha256.hex_of(&bytes),
-                        signed_by,
-                        description,
-                    ),
-                ));
-            }
-            Err(err) if err.is_failover() => last_missing = Some(err),
-            Err(err) => return Err(AlpineError::Fetch(err)),
-        }
-    }
-    Err(AlpineError::Fetch(
-        last_missing.unwrap_or_else(|| FetchError::not_found(path.to_string())),
-    ))
+    walk_mirrors(
+        &repository.mirrors,
+        |mirror| {
+            let url = mirror_url(mirror, path);
+            // Reported for the same reason a package fetch is: this walk spends
+            // one mirror timeout per unreachable mirror, and it is the slowest
+            // part of a resolve. An observer that saw only `Resolving` would
+            // watch a bootstrap that looks stopped.
+            observer.progress(AlpineEvent::Fetching { url: &url });
+            let mut bytes = Vec::new();
+            let request = FetchRequest::new(&url);
+            fetcher.fetch(
+                &request,
+                &mut LimitedWriter::new(&mut bytes, MAX_INDEX_FETCH),
+            )?;
+            let (records, signed_by, description) = parse_index(&url, &bytes, repository, from)?;
+            Ok((
+                records,
+                ResolvedIndex {
+                    mirror: mirror.clone(),
+                    release: repository.release().to_string(),
+                    component: component.map(str::to_string),
+                    // Over the container as it arrived, signature segment
+                    // included, so the value names the exact bytes whose
+                    // signature was checked.
+                    sha256: Algorithm::Sha256.hex_of(&bytes),
+                    signed_by,
+                    description,
+                    // A record built from a live resolution has no document
+                    // behind it, so there is nothing to carry. Qualified: this
+                    // module's own `Carried` is the installed database's, a
+                    // different question with the same name.
+                    carried: super::document::Carried::new(),
+                },
+            ))
+        },
+        || AlpineError::Fetch(FetchError::not_found(path.to_string())),
+    )
 }
 
 /// Verifies an index container and reads the records it carries.
 ///
 /// `url` names where it came from, for the errors.
-#[allow(clippy::type_complexity)]
 fn parse_index(
     url: &str,
     bytes: &[u8],
@@ -1425,7 +1388,7 @@ impl fmt::Debug for Observed<'_> {
 impl Observed<'_> {
     /// [`Alpine::resolve`], reporting to the attached sink.
     pub fn resolve(&mut self) -> Result<Plan, AlpineError> {
-        self.alpine.resolve_reporting(self.sink)
+        self.alpine.resolve_over(None, self.sink)
     }
 
     /// [`Alpine::available`], reporting to the attached sink.
@@ -1433,12 +1396,17 @@ impl Observed<'_> {
     /// The sink sees one [`Fetching`](AlpineEvent::Fetching) per index, which is
     /// the whole of what this call does.
     pub fn available(&mut self) -> Result<Available, AlpineError> {
-        self.alpine.available_reporting(self.sink)
+        // Unpinned whatever the builder holds: this reports what the
+        // repositories offer, and a pin describes a selection from it rather
+        // than a bound on what may be asked about.
+        let (records, _indexes) = self.alpine.read_indexes(self.sink)?;
+        Ok(Index::merge(records, &self.alpine.architecture, &Pins::none()).into_available())
     }
 
     /// [`Alpine::resolve_layer`], reporting to the attached sink.
     pub fn resolve_layer(&mut self) -> Result<Plan, AlpineError> {
-        self.alpine.resolve_layer_reporting(self.sink)
+        let base = self.alpine.read_base_layer("resolve_layer")?;
+        self.alpine.resolve_over(Some(&base), self.sink)
     }
 
     /// [`Alpine::stage_layer`], reporting to the attached sink.
@@ -1689,13 +1657,15 @@ fn install(
         None => Vec::new(),
     };
     bootstrap::configure(
-        into,
-        Rooting::over(base.map(layer::Base::path)),
+        bootstrap::Site {
+            staging: into,
+            rooting: Rooting::over(base.map(layer::Base::path)),
+            identity_map: &alpine.identity_map,
+        },
         &database,
         &subjects,
         &watching,
         &state,
-        &alpine.identity_map,
         observer,
     )
     .map_err(wrap)
@@ -1741,10 +1711,12 @@ fn acquire(
     // Positional, and `validate_plan` has already held the plan to it, so a slot
     // a package names is one this resolves.
     let slots = index_slots(repositories, architecture);
-    let mut acquired = Vec::with_capacity(plan.packages.len());
+
+    // The cache pass and the announcement, before anything is fetched: what a
+    // caller is told it is downloading is what the batch and the walk between
+    // them go on to fetch, in the order the plan names them.
+    let mut missing: Vec<Missing<'_>> = Vec::new();
     for (position, planned) in plan.packages.iter().enumerate() {
-        // A package boundary: whatever has been downloaded is complete and the
-        // staging tree is untouched, so stopping here costs nothing.
         if observer.cancelled() {
             return Err(ProvisionError::Cancelled);
         }
@@ -1776,30 +1748,138 @@ fn acquire(
 
         // A cached entry that does not read back as this package is not an
         // error; it is a download waiting to happen.
-        let held = match read_acquired(&path, planned, architecture) {
-            Ok(held) => held,
-            Err(_) => {
-                observer.progress(AlpineEvent::Downloading {
-                    package: &planned.name,
-                    index: position + 1,
-                    total: plan.packages.len(),
-                });
-                download_over(
-                    fetcher,
-                    mirrors,
-                    index,
-                    planned,
-                    architecture,
-                    &path,
-                    observer,
-                )
-                .map_err(wrap)?;
-                read_acquired(&path, planned, architecture).map_err(wrap)?
-            }
-        };
-        acquired.push(held);
+        if read_acquired(&path, planned, architecture).is_err() {
+            observer.progress(AlpineEvent::Downloading {
+                package: &planned.name,
+                index: position + 1,
+                total: plan.packages.len(),
+            });
+            missing.push(Missing {
+                planned,
+                index,
+                mirrors,
+                path,
+            });
+        }
     }
-    Ok(acquired)
+
+    prefetch(fetcher, &missing, architecture, observer)?;
+
+    for entry in &missing {
+        // A package boundary: whatever has been downloaded is complete and the
+        // staging tree is untouched, so stopping here costs nothing.
+        if observer.cancelled() {
+            return Err(ProvisionError::Cancelled);
+        }
+        if read_acquired(&entry.path, entry.planned, architecture).is_ok() {
+            continue;
+        }
+        download_over(
+            fetcher,
+            entry.mirrors,
+            entry.index,
+            entry.planned,
+            architecture,
+            &entry.path,
+            observer,
+        )
+        .map_err(wrap)?;
+    }
+
+    plan.packages
+        .iter()
+        .map(|planned| {
+            read_acquired(&cache.join(planned.file_name()), planned, architecture).map_err(wrap)
+        })
+        .collect()
+}
+
+/// A package the cache does not hold, and where to fetch it from.
+struct Missing<'a> {
+    planned: &'a PlannedPackage,
+    index: &'a ResolvedIndex,
+    mirrors: &'a [String],
+    path: PathBuf,
+}
+
+/// How many packages one batch asks for.
+///
+/// Each job holds an open staging file for as long as the batch runs, so this
+/// is a bound on descriptors rather than on the transport, which decides for
+/// itself how many of a batch to have in flight. It is also the granularity a
+/// cancelled bootstrap stops at, which is the reason it is not larger.
+const BATCH: usize = 32;
+
+/// Fills the cache with the packages a bootstrap is about to install, several
+/// at a time, through [`Fetch::fetch_all`].
+///
+/// Every job asks the package's own first mirror, which is the one the walk
+/// would ask first too. A job that does not arrive leaves the cache without
+/// that package and the walk that follows fetches it with every mirror
+/// available to it, so this is an optimization and nothing more. What the
+/// rename publishes is a *complete* body rather than a verified one, exactly as
+/// [`download`] does: the verification is the read that follows, which is the
+/// same read a cache hit goes through.
+fn prefetch(
+    fetcher: &mut dyn Fetch,
+    missing: &[Missing<'_>],
+    architecture: &str,
+    observer: &mut dyn AlpineObserver,
+) -> Result<(), ProvisionError> {
+    for batch in missing.chunks(BATCH) {
+        if observer.cancelled() {
+            return Err(ProvisionError::Cancelled);
+        }
+        let mut staged = Vec::with_capacity(batch.len());
+        for entry in batch {
+            let Some(mirror) = entry.mirrors.first() else {
+                continue;
+            };
+            let url = mirror_url(
+                &entry.index.directory_under(mirror),
+                &format!("{architecture}/{}", entry.planned.file_name()),
+            );
+            observer.progress(AlpineEvent::Fetching { url: &url });
+            let path = super::staging_path(&entry.path);
+            let Ok(file) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            else {
+                continue;
+            };
+            // Capped as the per-package download is: the size travels with
+            // the request, but a transport is free to ignore it.
+            let sink = std::io::BufWriter::new(file);
+            let cap = entry.planned.size.unwrap_or(u64::MAX);
+            staged.push((entry, url, path, LimitedWriter::new(sink, cap)));
+        }
+
+        let outcomes = {
+            let mut jobs: Vec<FetchJob<'_>> = staged
+                .iter_mut()
+                .map(|(entry, url, _path, sink)| {
+                    let request = FetchRequest::new(url);
+                    let request = match entry.planned.size {
+                        Some(size) => request.sized(size),
+                        None => request,
+                    };
+                    FetchJob::new(request, sink)
+                })
+                .collect();
+            fetcher.fetch_all(&mut jobs)
+        };
+
+        for ((entry, _url, path, sink), outcome) in staged.into_iter().zip(outcomes) {
+            let published = outcome.is_ok()
+                && sink.into_inner().into_inner().is_ok()
+                && std::fs::rename(&path, &entry.path).is_ok();
+            if !published {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reads a cached `.apk` and holds it to the plan entry it answers.
@@ -1887,7 +1967,6 @@ fn read_acquired(
 /// Nothing else advances it: a body that arrives and does not verify is refused
 /// where it is read, since what arrived was answered for by the URL that was
 /// asked for.
-#[allow(clippy::too_many_arguments)]
 fn download_over(
     fetcher: &mut dyn Fetch,
     mirrors: &[String],
@@ -1897,23 +1976,18 @@ fn download_over(
     dest: &Path,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
-    let mut last_missing = None;
-    for mirror in mirrors {
-        let url = format!(
-            "{}/{architecture}/{}",
-            index.directory_under(mirror),
-            planned.file_name(),
-        );
-        observer.progress(AlpineEvent::Fetching { url: &url });
-        match download(fetcher, &url, planned, dest) {
-            Ok(()) => return Ok(()),
-            Err(AlpineError::Fetch(err)) if err.is_failover() => last_missing = Some(err),
-            Err(err) => return Err(err),
-        }
-    }
-    Err(AlpineError::Fetch(last_missing.unwrap_or_else(|| {
-        FetchError::not_found(planned.file_name())
-    })))
+    walk_mirrors(
+        mirrors,
+        |mirror| {
+            let url = mirror_url(
+                &index.directory_under(mirror),
+                &format!("{architecture}/{}", planned.file_name()),
+            );
+            observer.progress(AlpineEvent::Fetching { url: &url });
+            download(fetcher, &url, planned, dest)
+        },
+        || AlpineError::Fetch(FetchError::not_found(planned.file_name())),
+    )
 }
 
 /// Downloads one package into the cache, atomically.
@@ -2310,26 +2384,6 @@ pub enum AlpineError {
 }
 
 impl AlpineError {
-    /// A host I/O failure, naming what the operation was doing and the path it
-    /// concerned.
-    ///
-    /// Arguments run operation, then locator, then cause, which is the order
-    /// every constructor in the crate takes them in.
-    pub fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> AlpineError {
-        AlpineError::Io {
-            op,
-            path: path.into(),
-            source,
-        }
-    }
-
-    /// The same failure as a [`map_err`](Result::map_err) argument: names the
-    /// operation and the path now, and takes the cause when it arrives.
-    pub fn at(op: &'static str, path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> AlpineError {
-        let path = path.into();
-        move |source| AlpineError::Io { op, path, source }
-    }
-
     /// A malformed container, naming what was being read and what was wrong.
     pub(crate) fn container(subject: impl Into<String>, reason: impl Into<String>) -> AlpineError {
         AlpineError::Container {
@@ -2352,6 +2406,17 @@ impl AlpineError {
             subject: subject.into(),
             reason: reason.into(),
         }
+    }
+}
+
+path_io_error!(AlpineError);
+
+impl Failover for AlpineError {
+    /// Reaches through the wrapper this layer carries a transport failure in.
+    /// A failure that is not a `Fetch` one at all — a signature or digest
+    /// mismatch over bytes that did arrive — never advances a walk.
+    fn is_failover(&self) -> bool {
+        matches!(self, AlpineError::Fetch(fetch) if fetch.is_failover())
     }
 }
 
@@ -3297,16 +3362,17 @@ mod tests {
             MAX_CONTROL_SEGMENT,
         )
         .expect("the fixture reads");
-        PlannedPackage::resolved(
-            read.info.name.clone(),
-            read.info.version.clone(),
-            architecture.to_string(),
-            read.control_identity,
-            Some(container.len() as u64),
-            read.info.installed_size,
-            read.info.origin.clone(),
-            0,
-        )
+        PlannedPackage {
+            name: read.info.name.clone(),
+            version: read.info.version.clone(),
+            architecture: architecture.to_string(),
+            control_identity: read.control_identity,
+            size: Some(container.len() as u64),
+            installed_size: read.info.installed_size,
+            origin: read.info.origin.clone(),
+            index: 0,
+            carried: crate::provision::document::Carried::new(),
+        }
     }
 
     #[test]

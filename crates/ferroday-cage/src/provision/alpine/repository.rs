@@ -22,6 +22,7 @@
 //! empty component list formats the shallower path and postmarketOS costs no
 //! code of its own.
 
+use crate::provision::mirror_url;
 use std::fmt;
 
 use super::keyring::KeySet;
@@ -136,14 +137,13 @@ impl Repository {
         let Some(mirror) = self.mirrors.first() else {
             return Vec::new();
         };
-        let mirror = mirror.trim_end_matches('/');
         let release = &self.release;
         if self.components.is_empty() {
-            return vec![format!("{mirror}/{release}")];
+            return vec![mirror_url(mirror, release)];
         }
         self.components
             .iter()
-            .map(|component| format!("{mirror}/{release}/{component}"))
+            .map(|component| mirror_url(mirror, &format!("{release}/{component}")))
             .collect()
     }
 

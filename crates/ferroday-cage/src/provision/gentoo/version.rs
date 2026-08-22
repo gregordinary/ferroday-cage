@@ -284,6 +284,14 @@ fn is_digits(text: &str) -> bool {
 }
 
 /// Orders two versions, or `None` where either is not one this format defines.
+///
+/// Partial, where [`debian::version::compare`] is total, for the reason
+/// [`alpine::version::compare`] is: a portage version is a token grammar, and
+/// a string outside it is a version the archive should not have published
+/// rather than one to be ordered low.
+///
+/// [`debian::version::compare`]: crate::provision::debian::version::compare
+/// [`alpine::version::compare`]: crate::provision::alpine::version::compare
 pub(super) fn compare(a: &str, b: &str) -> Option<Ordering> {
     Some(parse(a)?.cmp(&parse(b)?))
 }
