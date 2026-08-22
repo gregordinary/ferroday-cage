@@ -304,6 +304,8 @@ the question is not already here under different words.
 | How do two Gentoo versions compare? | `provision::gentoo::version::compare` |
 | Does this build satisfy this dependency atom? | `provision::gentoo::atom::Atom::matches` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
+| Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
+| What may a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |
 | What may a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | What may a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
@@ -313,6 +315,8 @@ the question is not already here under different words.
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
+| Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |
+| Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
 | State a `poll` deadline, or retire a `poll` slot | `poll::timeout`, `poll::slot` |

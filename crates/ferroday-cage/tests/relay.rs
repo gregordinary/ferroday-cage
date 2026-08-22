@@ -49,6 +49,10 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// the assertion that matters is what the session did, not how fast.
 const PATIENCE: Duration = Duration::from_secs(30);
 
+/// The relay's own read buffer, which a paste has to exceed several times over
+/// to be sure it met the pending path rather than passing through in one write.
+const RELAY_BUF: usize = 8192;
+
 /// How long a driver waits for something the session is about to print.
 const PROMPTLY: Duration = Duration::from_secs(5);
 
@@ -571,6 +575,78 @@ fn end_of_input_reaches_the_sandbox_as_end_of_file() {
         "{}",
         session.seen
     );
+}
+
+/// A paste larger than the sandbox's terminal will take is buffered and drained
+/// rather than dropped or spun on.
+///
+/// The relay's defence against exactly that: the primary is non-blocking, so a
+/// write that only takes part of what was read leaves the rest in a pending
+/// buffer behind `POLLOUT`, and the caller's input leaves the poll set while
+/// that buffer is occupied — reading more would grow it without bound. A loop
+/// that dropped the short write's remainder would deliver a truncated paste,
+/// and one that kept reading would grow the buffer for as long as the caller
+/// kept typing.
+///
+/// The payload is far larger than a pseudoterminal's own buffer, which is a few
+/// kilobytes, so the path is entered many times over rather than at a boundary
+/// the test would have to hit exactly.
+#[test]
+fn a_paste_larger_than_the_sandboxs_terminal_arrives_whole() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Nothing reads the sandbox's terminal for the first second, so its input
+    // queue -- a few kilobytes -- fills and the primary stops accepting long
+    // before the paste has been delivered. That is what puts the loop on the
+    // pending path deterministically rather than depending on `cat` losing a
+    // race it usually wins.
+    let cage = shell(rootfs, "sleep 1; exec /bin/cat");
+    // Line-shaped, since the sandbox's own line discipline is canonical and
+    // delivers a line only when it ends. Thirty-two kilobytes: many times the
+    // terminal's own buffer and many times the relay's read buffer, and well
+    // inside the pipe the driver writes it to, so the driver is never blocked
+    // in the write while the relay waits for it to drain the other direction.
+    const LINES: usize = 4096;
+    let paste: String = (0..LINES).map(|at| format!("line-{at:04}\n")).collect();
+    assert!(
+        paste.len() > 4 * RELAY_BUF && paste.len() < 64 * 1024,
+        "{}",
+        paste.len()
+    );
+
+    let session = relayed(
+        Wiring::PipeInput,
+        (24, 80),
+        None,
+        |terminal| cage.spawn_terminal(terminal),
+        {
+            let paste = paste.clone();
+            move |caller| {
+                caller.send(&paste);
+                // The last line is the one that can only arrive after every
+                // pending buffer before it has drained. The patience covers the
+                // sandbox's first second of not reading.
+                assert!(
+                    caller.read_until(&format!("line-{:04}", LINES - 1), PATIENCE),
+                    "the paste's last line never came back:\n{}",
+                    caller.seen,
+                );
+                caller.close_input();
+            }
+        },
+    );
+
+    assert!(session.status().success(), "{}", session.seen);
+    // Every line, in order, and each of them once. `cat` writes what it read
+    // and the replica echoes it, so each appears twice; what is asserted is
+    // that none went missing.
+    for at in 0..LINES {
+        assert!(
+            session.seen.contains(&format!("line-{at:04}")),
+            "line {at} of the paste never arrived",
+        );
+    }
 }
 
 /// An expired deadline is reported as no status at all, whatever became of the

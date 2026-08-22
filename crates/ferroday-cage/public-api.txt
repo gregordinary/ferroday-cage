@@ -793,6 +793,13 @@ pub ferroday_cage::provision::gentoo::GentooEvent::Index::skipped: usize
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Merging
 pub ferroday_cage::provision::gentoo::GentooEvent::Merging::package: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Merging::version: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Occupied
+pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::atom: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::held: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::package: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::second: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::slot: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::wanted_by: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Planned
 pub ferroday_cage::provision::gentoo::GentooEvent::Planned::bytes: u64
 pub ferroday_cage::provision::gentoo::GentooEvent::Planned::packages: usize

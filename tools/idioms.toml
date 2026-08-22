@@ -171,3 +171,62 @@ consumer of the public API and nothing more — cannot reach it. The tree it \
 names holds subordinate-owned entries anyway, which `Scratch` could not remove: \
 it is cleared through `provision::remove` at the start of each run, the same \
 answer `tests/export.rs` reaches for."""
+
+[[idiom]]
+name = "a write whose zero-byte case is decided inline"
+# Anchored on the `match` over a write with an `Ok(0)` arm directly under it,
+# which is what a hand-rolled short-write loop looks like whatever it does with
+# the zero.
+pattern = 'io::write\([^\n]*\) \{\n\s+Ok\(0\)'
+answer = """\
+`mechanism::frame::write_full`, which loops over short writes, retries `EINTR`, \
+and reports a zero-byte write on a descriptor that is neither full nor closed \
+as the anomaly it is. The vocabulary table listed `mechanism::frame` as the \
+framed protocol between a helper child and its caller, which did not advertise \
+that its byte-level readers and writers are reusable on their own -- and a \
+review found the relay had written a second one."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/mechanism/frame.rs"
+count = 1
+why = "The answer."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/relay/mod.rs"
+count = 1
+why = """\
+The relay's sandbox-bound direction, which is not a short-write loop at all: \
+the primary is non-blocking and what it will not take waits in a pending buffer \
+behind `POLLOUT`, so a zero here means "no more for now" and the loop returns \
+rather than treating it as an anomaly or spinning on it. The caller-bound \
+direction, which *is* the loop, reaches for the answer."""
+
+[[idiom]]
+name = "portage's database directory, spelled out"
+pattern = '"var/db/pkg"'
+answer = """\
+`provision::gentoo::DB_DIR`. The pair that must agree is the writer and the \
+reader -- `vdb` registers an entry under this path and `installed` reads one \
+back -- and a spelling that moved in one alone would register packages where \
+the layer will not find them, so resolution would report a populated root as \
+empty and install every dependency it already had."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/mod.rs"
+count = 1
+why = "The answer."
+
+[[idiom]]
+name = "the bytes a USE flag's name may contain"
+pattern = "matches!\\(byte, b'\\+' \\| b'_' \\| b'-' \\| b'@'\\)"
+answer = """\
+`provision::gentoo::atom::is_flag_byte`. A flag is named in two places -- an \
+atom's USE dependency and a caller's build preference -- and the two must admit \
+the same names: a preference naming a flag no atom could name would silently \
+never be met, which is a resolution quietly ignoring what the caller asked \
+for rather than a failure."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/atom.rs"
+count = 1
+why = "The answer."

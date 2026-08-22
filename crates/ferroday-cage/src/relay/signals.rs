@@ -89,6 +89,21 @@ const SFD_NONBLOCK: usize = OFlags::NONBLOCK.bits() as usize;
 /// signals it exists to handle were fatal again, and a program that relays one
 /// session usually relays another.
 ///
+/// # Keep the handle for as long as the program should answer a signal
+///
+/// Dropping it closes the descriptor and does not unblock anything, because
+/// nothing here restores the mask. From that point the eight signals are
+/// blocked with nowhere to be read from, so the process ignores them entirely:
+/// a shell's `^C` and a supervisor's `SIGTERM` both do nothing, and `SIGKILL` is
+/// what is left.
+///
+/// For a program whose whole job is one session — `fcage --terminal` is the
+/// worked example — the handle lives to process exit and the question does not
+/// arise. For a library consumer relaying a session inside a longer-lived
+/// program, which is the consumer this module was extracted for, holding the
+/// handle for the program's life is the shape to build: it is the same handle
+/// every later session needs, and one process wants exactly one.
+///
 /// # What it costs
 ///
 /// Nothing the standard library depends on. It installs handlers only for
@@ -122,12 +137,8 @@ impl Signals {
     /// consumes it. One per process is the shape to build.
     pub fn install() -> Result<Signals, RelayError> {
         let mut blocked = KernelSigSet::empty();
-        let mut mask = 0u64;
         for signal in RELAYED {
             blocked.insert(signal);
-            // The kernel's `sigset_t` numbers signals from zero, so signal `n`
-            // is bit `n - 1`. Every relayed signal is well under 64.
-            mask |= 1u64 << (signal.as_raw() - 1);
         }
         // SAFETY: `blocked` is a live local of exactly the type the call takes.
         // Blocking the relayed set interferes with nothing in the process: the
@@ -136,17 +147,18 @@ impl Signals {
         unsafe { rustix::runtime::kernel_sigprocmask(How::BLOCK, Some(&blocked)) }
             .map_err(RelayError::at("blocking the relayed signals"))?;
 
-        // SAFETY: `mask` is a live local `u64`, whose size is passed alongside
-        // it and matches the kernel's `sigset_t` on every architecture this
-        // crate builds for. The first argument, -1, asks for a new descriptor
-        // rather than modifying an existing one, and the call returns an owned
-        // file descriptor on success.
+        // SAFETY: `blocked` is a live local, and `KernelSigSet` is a transparent
+        // wrapper over the kernel's own `sigset_t` -- so the pointer is one to
+        // that type and the size passed alongside it is that type's, which is
+        // what `signalfd4` compares against. The first argument, -1, asks for a
+        // new descriptor rather than modifying an existing one, and the call
+        // returns an owned file descriptor on success.
         let fd = unsafe {
             syscalls::syscall!(
                 Sysno::signalfd4,
                 -1i32,
-                &mask as *const u64,
-                size_of::<u64>(),
+                std::ptr::from_ref(&blocked),
+                size_of::<KernelSigSet>(),
                 SFD_CLOEXEC | SFD_NONBLOCK
             )
         }

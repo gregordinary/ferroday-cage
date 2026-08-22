@@ -267,12 +267,20 @@ fn an_external_interrupt_ends_the_session_and_restores_the_terminal() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut session = Session::start(rootfs, &["/bin/sh"], winsize(24, 80));
+    // A non-interactive shell running `sleep`, not an interactive one: an
+    // interactive shell ignores SIGTERM, so the termination request the relay
+    // forwards would leave it running and the session would never end. That is
+    // what a *second* interrupt is for, and it is not what this test is about.
+    let mut session = Session::start(
+        rootfs,
+        &["/bin/sh", "-c", "echo ready; sleep 30"],
+        winsize(24, 80),
+    );
     let before = session.settings();
-    // Wait for the shell to be running before interrupting, so the signal
-    // cannot race the launch.
-    session.send("echo ready\n");
-    assert!(session.read_until("ready", 2).contains("ready"));
+    // The marker comes from inside -- nothing is typed here, so the caller's
+    // own line discipline cannot have echoed it -- which is what says the
+    // sandbox is up and the signal cannot race the launch.
+    assert!(session.read_until("ready", 5).contains("ready"));
 
     session.signal(rustix::process::Signal::INT);
     let status = session.finish();
@@ -283,7 +291,97 @@ fn an_external_interrupt_ends_the_session_and_restores_the_terminal() {
     assert_termios_eq(&before, &session.settings());
 }
 
+/// A stop restores the caller's terminal before the process stops, and a
+/// continue re-enters raw mode from the settings the relay saved.
+///
+/// The branch whose failure is the worst of any here: a relay that stopped
+/// without restoring would leave the shell that resumes with a terminal in raw
+/// mode and nothing left running to fix it, and one that never re-entered would
+/// hand the resumed session a cooked terminal the sandbox is not expecting.
+///
+/// Driven against the built binary because the relay stops the *process*: a
+/// `SIGSTOP` stops every thread, so an in-process test would stop the test
+/// harness alongside it with nothing left to continue either.
+#[test]
+fn a_stop_restores_the_terminal_and_a_continue_re_enters_raw_mode() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut session = Session::start(rootfs, &["/bin/sh"], winsize(24, 80));
+    let cooked = session.settings();
+    session.await_sandbox("ready");
+    assert!(is_raw(&session.settings()), "the session's terminal is raw");
+
+    session.signal(rustix::process::Signal::TSTP);
+    session.await_state(b'T');
+    // Restored *before* the process stopped, which is the whole discipline: the
+    // shell that gets the terminal back gets it as it left it.
+    assert_termios_eq(&cooked, &session.settings());
+
+    // Continued, and relaying again: the marker can only have come from inside
+    // the sandbox, so seeing it says the loop is back in the poll. Signals are
+    // handled ahead of the input in one pass of that loop, so the re-entry has
+    // happened by the time the marker comes back.
+    session.signal(rustix::process::Signal::CONT);
+    session.await_sandbox("continued");
+    assert!(
+        is_raw(&session.settings()),
+        "the continued session re-enters raw mode",
+    );
+
+    session.send("exit 0\n");
+    let status = session.finish();
+    assert!(status.success(), "{status}");
+    assert_termios_eq(&cooked, &session.settings());
+}
+
+/// A caller started with its standard input closed relays the session's output
+/// and ends on the command's own terms.
+///
+/// `fcage --terminal ... 0<&-` is the shape: descriptor 0 names no open file
+/// description at all, so `poll` answers `POLLNVAL` and a read answers `EBADF`.
+/// Both take the retiring path end-of-input takes -- there is nothing to relay
+/// and never will be -- and the caller-bound direction carries on alone. A loop
+/// that treated `POLLNVAL` as nothing to act on would spin on a slot that is
+/// ready forever.
+#[test]
+fn a_caller_with_no_standard_input_at_all_still_relays() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // `sh -c` with the descriptor closed by the shell, since `Command` has no
+    // way to spawn a child with a descriptor absent rather than redirected.
+    let script = format!(
+        "exec {} --rootfs {} --terminal -- /bin/sh -c 'echo marker-from-inside; exit 3' 0<&-",
+        shell_quote(FCAGE),
+        shell_quote(rootfs.to_str().expect("a UTF-8 rootfs path")),
+    );
+    let started = Instant::now();
+    let output = Command::new("/bin/sh")
+        .args(["-c", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("fcage starts");
+    let seen = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        seen.contains("marker-from-inside"),
+        "{seen}{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    // A spin would still have produced the right answer; that it produced one
+    // promptly is what says the closed slot was retired rather than polled.
+    assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
+}
+
 // -- Helpers ------------------------------------------------------------------
+
+/// Quotes `text` for a single-quoted shell word.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
 
 /// Runs `fcage --terminal` over a pipe carrying `input`, and collects the
 /// result. The pipe is closed after the write, which retires the relay's
@@ -510,6 +608,48 @@ impl Session {
         self.seen.clone()
     }
 
+    /// Types a command whose output the caller's own line discipline cannot
+    /// have produced, and waits for that output.
+    ///
+    /// The distinction matters for every assertion about raw mode. A cooked
+    /// caller terminal echoes what is typed at it, so a marker typed literally
+    /// comes back whether or not the session is relaying — and a test that
+    /// waited for one would be reading its own echo and asserting against a
+    /// relay that had not started yet. The shell inside is the only thing that
+    /// can do the arithmetic.
+    fn await_sandbox(&mut self, marker: &str) {
+        self.send(&format!("echo {marker}-$((20 + 2))\n"));
+        let wanted = format!("{marker}-22");
+        let seen = self.read_until(&wanted, 5);
+        assert!(
+            seen.contains(&wanted),
+            "the sandbox never printed {wanted:?}: {seen}"
+        );
+    }
+
+    /// Waits until the relay's process reaches `state` -- `T` stopped, `S`
+    /// sleeping -- failing the test if it does not.
+    ///
+    /// Read from `/proc/<pid>/stat` rather than waited for with `WUNTRACED`,
+    /// because this test is not the child's parent for signal purposes and a
+    /// stop it consumed would be a stop the harness could not then continue
+    /// from. The field is the third, after the comm in parentheses, which is
+    /// the only field that can itself contain one.
+    fn await_state(&mut self, state: u8) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if process_state(self.child.id()) == Some(state) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "the relay never reached state {}; it is in {:?}",
+            state as char,
+            process_state(self.child.id()).map(|held| held as char),
+        );
+    }
+
     /// Reads whatever the primary has ready, waiting no later than `deadline`.
     ///
     /// Returns whether the session is still producing: `false` at end of file,
@@ -552,6 +692,28 @@ impl Drop for Session {
             let _ = self.child.wait();
         }
     }
+}
+
+/// Whether `settings` describe a terminal in raw mode.
+///
+/// Canonical input and echo are the two `make_raw` clears that a user would
+/// notice immediately, and the two the relay's whole reason for entering raw
+/// mode rests on.
+fn is_raw(settings: &termios::Termios) -> bool {
+    !settings
+        .local_modes
+        .intersects(termios::LocalModes::ICANON | termios::LocalModes::ECHO)
+}
+
+/// The process state `pid` is in, from `/proc/<pid>/stat`.
+///
+/// The third field, and the parse starts after the last `)` because the second
+/// is the executable name in parentheses and is the one field that can contain
+/// one.
+fn process_state(pid: u32) -> Option<u8> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().next()?.bytes().next()
 }
 
 /// `TIOCSCTTY`: make the terminal on `fd` this session's controlling terminal.

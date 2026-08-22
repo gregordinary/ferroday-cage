@@ -306,7 +306,41 @@ in a root built against the other init system — 27 of 50 are
 Every refusal is reported before the run fails, so a caller fixing an install
 list sees the whole list rather than its first entry, and each names which wall
 it hit: the package the binhost does not publish, the version, the slot, or the
-USE flag.
+USE flag. Where the binhost publishes the package in no version and the root has
+it anyway — the `app-crypt/pinentry` shape again — the refusal names the version
+the root has, which is the half a caller can act on.
+
+### One instance per slot
+
+Portage keeps one instance of each `(package, slot)` and reports a root holding
+two as a conflict. A resolution that would produce one is therefore refused with
+both builds named, rather than merged: merging both would lay two images down
+with the second overwriting the first's shared paths, and report success.
+
+It is reached by an ordinary install list rather than by a contrived one. Two
+atoms constraining one package from opposite directions both select:
+
+```text
+--gentoo-install '<dev-libs/foo-2' --gentoo-install '>=dev-libs/foo-2'
+```
+
+and so does a closure holding one package constrained upward and another
+constrained downward on the same dependency, with no caller writing the pair by
+hand. The likelier trigger is a USE constraint: ask for `dev-vcs/git` and for
+something that needs `dev-vcs/git[keyring]`, and the first takes the build
+without the flag while the second needs the build with it. Both are `git` in
+slot `0`, so the second is refused naming both builds — constrain the first atom
+the same way, or state the flag as a `prefer_use` and let one build answer both.
+
+Since nothing backtracks, the resolution keeps the build it chose first and
+reports what could not join it. The order is a resolution's own and is stable,
+so the same install list is refused the same way every time.
+
+Two *slots* of one package are a different thing and are not a conflict. The
+archive publishes `dev-lang/python` in `3.11` and `3.12`, `llvm`, `gcc`, `ruby`,
+`postgresql` and `qt` in several each, and Gentoo installs them side by side.
+The install order carries an edge to each of them, so a package depending on two
+slots merges after both.
 
 ### The plan is the reproducibility story
 
@@ -335,6 +369,14 @@ reason: the autobuilds tree keeps about five weeks of stage3 builds, while the
 binhost keeps a published version far longer, so a plan replays for as long as
 the archive carries what it names.
 
+A plan also names the architecture and the binhost it was resolved for, and
+`build()` refuses one that does not agree with the builder. The builder above
+names both and they match; a builder that named a different architecture would
+otherwise compose its own with the plan's binhost, fetch a directory neither of
+them names, and report a 404 against a mirror that was spelled correctly. A
+builder that names no binhost takes the plan's, which is what it resolved
+against.
+
 The stanza order *is* the install order, which is where this format departs from
 the other two layers' plans. That order is a resolution's own output — a
 topological sort over runtime dependencies — and a plan that lost it would have
@@ -351,6 +393,14 @@ An entry is the container's own metadata directory plus the three files portage
 computes at merge — `CONTENTS`, `COUNTER` and `BINPKGMD5` — which is exactly
 what a stage3's own entries turn out to be. The merge ordinal continues the
 root's sequence rather than starting again.
+
+`CONTENTS` uses portage's own line types: `dir` for a directory, `obj` with a
+digest and an mtime for a file, `sym` with its target for a symbolic link, and
+`fif` for a named pipe. A fifo has no contents to digest and is recorded without
+one — opening it to look for some would block until something opened the write
+end, which inside a provisioning run nothing does. Character and block devices
+never appear: laying one down needs privilege the layer does not have, and the
+sandbox provides its own `/dev`.
 
 **Phase functions are not run.** Around 30% of packages define a `pkg_postinst`
 or a `pkg_preinst`, and they live in the container's `environment.bz2` as a
@@ -475,6 +525,17 @@ called on one more document.
 in any form, and its own per-package digests are MD5 and SHA-1. So a hostile
 mirror can decide *which* package a resolution asks for, even though it cannot
 forge the package it then serves.
+
+It also decides each download's declared size, which is why the layer keeps a
+ceiling of its own beside it. The index's `SIZE` bounds a fetch, and an
+understated one fails closed — the download stops short and the container fails
+its digest. An overstated one only relaxes the bound, since a transport caps at
+the smaller of the declared size and its own ceiling, so a hundred packages each
+declaring `SIZE: 18446744073709551615` would buy that ceiling a hundred times
+over before anything was verified. The layer's own bound is 1 GiB per package —
+above the 796 MB a whole stage3 weighs, and below the bundled client's own
+2 GiB, so it binds where the transport does not. The smaller of the two wins, as
+a ceiling should.
 
 **And a Manifest proves authorship, not identity.** Its lines are `DATA <member>
 <size> SHA512 <hex> BLAKE2B <hex>` and there is no field naming the package.
@@ -605,7 +666,15 @@ once: what sits at a cache path is bytes on a disk this crate does not own, so a
 cache hit and a fresh download go through the same check. A tarball that does not
 match is removed rather than left behind — it is not the archive's file whatever
 it is, and keeping it would make every later run of that build fail identically
-out of its own cache.
+out of its own cache. Binary packages are cached the same way and on the same
+terms.
+
+**The cache directory is inside the trust boundary.** A container is verified in
+one pass and extracted in a second, both over the file on disk, so anything able
+to write the directory between the two substitutes content nothing verified into
+the merge. In normal use nobody else can: the cache is `cache_dir`, or a sibling
+of the tree being built where you name none. Pointing `cache_dir` at a shared or
+world-writable location extends the boundary to whoever can write there.
 
 ## Mirrors
 

@@ -137,6 +137,15 @@ const MAX_CONTENTS_ENTRIES: usize = 1_000_000;
 /// named no directory of their own.
 const PACKAGE_CACHE: &str = ".fcage-binpkgs";
 
+/// Where portage keeps its database inside a root.
+///
+/// Here rather than in either half that names it, because the pair is what must
+/// agree: [`vdb`] writes an entry under this path and [`installed`] reads one
+/// back, and a spelling that moved in one alone would register packages where
+/// the layer will not find them — resolution would report a populated root as
+/// empty and install every dependency it already had.
+pub(super) const DB_DIR: &str = "var/db/pkg";
+
 /// The ceiling on a stage3 tarball where nothing declares its size.
 ///
 /// A fetch is normally bounded by the exact size the signed enumeration
@@ -152,6 +161,29 @@ const PACKAGE_CACHE: &str = ".fcage-binpkgs";
 /// any published stage3; where they differ, the smaller wins, as a ceiling
 /// should.
 const MAX_STAGE3_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The ceiling on one binary package, over and above the size the index
+/// published for it.
+///
+/// The index's own `SIZE` bounds the download, and for an understated one that
+/// is enough: the fetch stops short and fails closed. An *overstated* one only
+/// relaxes the bound, because a transport caps at the smaller of the declared
+/// size and its own ceiling — so an index declaring `SIZE:
+/// 18446744073709551615` for each of a hundred packages buys whatever the
+/// transport's ceiling is, a hundred times over, before anything is verified.
+///
+/// Nothing signs the index, ever, which puts the binary-package path
+/// permanently where a build-id pin puts the stage3 path: holding a number no
+/// signature stands behind. [`MAX_STAGE3_BYTES`] is that path's answer and this
+/// is this one's.
+///
+/// The value is this layer's judgement rather than a measurement of the
+/// archive. What it has to be is smaller than the transport's own ceiling —
+/// the bundled client's is 2 GiB, and a bound above it would never bind — and
+/// larger than any package the archive publishes. A stage3 is a whole base
+/// system at 796 MB, and this is above that, so a single package reaching it
+/// would be a bound to raise rather than a package to refuse.
+const MAX_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The suffix of the cache a run downloads into when the caller named no
 /// directory of their own.
@@ -1016,6 +1048,19 @@ impl Gentoo {
                     },
                 );
             }
+            for taken in &refusals.occupied {
+                report(
+                    to,
+                    GentooEvent::Occupied {
+                        package: &taken.name,
+                        slot: &taken.slot,
+                        held: &taken.held,
+                        second: &taken.second,
+                        atom: &taken.atom,
+                        wanted_by: &taken.wanted_by,
+                    },
+                );
+            }
             return Err(GentooError::Resolve {
                 reason: refusals.describe(),
             });
@@ -1581,10 +1626,14 @@ impl Gentoo {
 
     /// Downloads one binary package into the cache, atomically.
     ///
-    /// Bounded by the exact length the index published for it. That number is
-    /// unsigned, which makes it a bound rather than a promise: it can only be
-    /// wrong in the direction of refusing a container larger than advertised,
-    /// and the fetch fails closed.
+    /// Bounded by the length the index published for it *and* by
+    /// [`MAX_PACKAGE_BYTES`], because the index's number can be wrong in both
+    /// directions and only one of them fails closed. Understated, it stops the
+    /// download short and the container fails its digest. Overstated, it merely
+    /// relaxes the bound — a transport caps at the smaller of the declared size
+    /// and its own ceiling — so a hostile or damaged index buys whatever that
+    /// ceiling is, once per package. Nothing signs the index, so this layer
+    /// keeps a ceiling of its own and the smaller of the two wins.
     fn download_package(
         &mut self,
         directory: &str,
@@ -1601,7 +1650,8 @@ impl Gentoo {
                 planned.path,
             );
             report(to, GentooEvent::Fetching { url: &url });
-            match fetch_to(self.fetcher.as_mut(), &url, planned.size, dest, to) {
+            let bound = planned.size.min(MAX_PACKAGE_BYTES);
+            match fetch_to(self.fetcher.as_mut(), &url, bound, dest, BINARY_PACKAGE, to) {
                 Ok(()) => return Ok(()),
                 Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
                 Err(err) => return Err(err),
@@ -1639,7 +1689,7 @@ impl Gentoo {
                 stage3.path,
             );
             report(to, GentooEvent::Fetching { url: &url });
-            match fetch_to(self.fetcher.as_mut(), &url, stage3.size, dest, to) {
+            match fetch_to(self.fetcher.as_mut(), &url, stage3.size, dest, STAGE3, to) {
                 Ok(()) => return Ok(()),
                 Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
                 Err(err) => return Err(err),
@@ -1651,6 +1701,37 @@ impl Gentoo {
     }
 }
 
+/// What a download is of, so the three operations [`fetch_to`] can fail at name
+/// their subject.
+///
+/// Spelled out per caller rather than composed from one noun, because an error's
+/// operation is a `&'static str` throughout this crate: naming what failed is
+/// part of the convention, and formatting the subject in would make each
+/// operation a `String` that outlives nothing.
+#[derive(Clone, Copy)]
+struct Downloading {
+    /// Creating the staging file beside the destination.
+    staging: &'static str,
+    /// Writing the body into it.
+    writing: &'static str,
+    /// Renaming it onto the destination.
+    publishing: &'static str,
+}
+
+/// A stage3 tarball.
+const STAGE3: Downloading = Downloading {
+    staging: "staging a stage3",
+    writing: "writing a stage3",
+    publishing: "publishing a stage3",
+};
+
+/// A binary package's container.
+const BINARY_PACKAGE: Downloading = Downloading {
+    staging: "staging a binary package",
+    writing: "writing a binary package",
+    publishing: "publishing a binary package",
+};
+
 /// Writes one URL's body to `dest` through a staging file beside it.
 ///
 /// A cancelled run stops mid-body rather than at the end of it: the write is
@@ -1661,6 +1742,7 @@ fn fetch_to(
     url: &str,
     size: u64,
     dest: &Path,
+    what: Downloading,
     to: Reporting<'_, '_>,
 ) -> Result<(), GentooError> {
     let staged = super::staging_path(dest);
@@ -1668,7 +1750,7 @@ fn fetch_to(
         .write(true)
         .create_new(true)
         .open(&staged)
-        .map_err(GentooError::at("staging a stage3", &staged))?;
+        .map_err(GentooError::at(what.staging, &staged))?;
 
     let mut sink = io::BufWriter::new(file);
     let (fetched, cancelled) = {
@@ -1689,7 +1771,7 @@ fn fetch_to(
     let flushed = sink
         .into_inner()
         .map(|_| ())
-        .map_err(|err| GentooError::at("writing a stage3", &staged)(err.into_error()));
+        .map_err(|err| GentooError::at(what.writing, &staged)(err.into_error()));
 
     // A stopped write reaches the transport as a write failure, which is what
     // the sink has to answer it with; what it means is the run's own outcome,
@@ -1702,7 +1784,7 @@ fn fetch_to(
             .map_err(GentooError::Fetch)
             .and(flushed)
             .and_then(|()| {
-                std::fs::rename(&staged, dest).map_err(GentooError::at("publishing a stage3", dest))
+                std::fs::rename(&staged, dest).map_err(GentooError::at(what.publishing, dest))
             })
     };
     if published.is_err() {
@@ -1718,6 +1800,10 @@ fn fetch_to(
 /// stage3 is a single file of several hundred megabytes, and a check that ran
 /// only at the step boundaries around it would answer a caller who asked to stop
 /// once the whole thing had arrived.
+///
+/// The binary packages go through it too, since they share [`fetch_to`]. There
+/// the argument is weaker per file and stronger per run: a package is a few
+/// megabytes, and an install wave is a hundred of them.
 ///
 /// The stop is recorded here rather than read back out of the [`io::Error`] the
 /// transport returns: a `Fetch` implementation is a caller's own and may report
@@ -1888,6 +1974,29 @@ pub enum GentooEvent<'a> {
         /// Whether what it matched is already in the root, rather than
         /// something this same resolution would install.
         installed: bool,
+    },
+    /// Two builds the resolution would have chosen occupy one slot of one
+    /// package.
+    ///
+    /// Portage keeps one instance per `(package, slot)` and reports a root
+    /// holding two as a conflict, so this is refused rather than merged. It is
+    /// reached whenever the closure constrains one package from two directions
+    /// at once — an atom holding it below a version and another holding it at or
+    /// above one.
+    #[non_exhaustive]
+    Occupied {
+        /// The package, as `category/name`.
+        package: &'a str,
+        /// The slot both would occupy, without a sub-slot.
+        slot: &'a str,
+        /// The build already chosen, as `category/name-version build N`.
+        held: &'a str,
+        /// The build that would have joined it, spelled the same way.
+        second: &'a str,
+        /// The atom that asked for the second, as it was written.
+        atom: &'a str,
+        /// Who asked for it: the caller, or the package whose dependency it is.
+        wanted_by: &'a str,
     },
 }
 
@@ -2242,10 +2351,35 @@ impl GentooBuilder {
             .map(|text| resolve::Preference::parse(text))
             .collect::<Result<Vec<_>, String>>()
             .map_err(GentooError::config)?;
-        if let Some(plan) = &self.plan
-            && let Some(reason) = plan.unusable()
-        {
-            return Err(GentooError::config(reason));
+        if let Some(plan) = &self.plan {
+            if let Some(reason) = plan.unusable() {
+                return Err(GentooError::config(reason));
+            }
+            // A plan names the architecture and the binhost it was resolved
+            // for, and the install wave composes a URL from the builder's
+            // architecture and the plan's binhost. Left unchecked, a plan
+            // resolved for one architecture and replayed through a builder for
+            // another fetches `releases/<builder>/binpackages/23.0/<plan>/...`
+            // and 404s against a mirror that was spelled correctly -- and where
+            // the two happen to publish a tree of the same name, it does not
+            // fail at all. Refusing the pair here is the diagnostic that names
+            // what is actually wrong.
+            if plan.architecture != self.architecture {
+                return Err(GentooError::config(format!(
+                    "the plan was resolved for the architecture {:?} and this builder provisions \
+                     {:?}; build the plan's own architecture, or resolve a plan for this one",
+                    plan.architecture, self.architecture,
+                )));
+            }
+            if let Some(binhost) = &self.binhost
+                && *binhost != plan.binhost
+            {
+                return Err(GentooError::config(format!(
+                    "the plan names the binhost {:?} and this builder names {:?}; a plan installs \
+                     the containers it resolved, so the two cannot differ",
+                    plan.binhost, binhost,
+                )));
+            }
         }
         let keyring = Keyring::parse(EMBEDDED_KEYRING)
             .map_err(|err| GentooError::signature("the vendored Gentoo keyring", err))?;
@@ -2968,6 +3102,48 @@ mod tests {
         let err = gentoo.packages().expect_err("no binhost was named");
         assert!(matches!(err, GentooError::Config { .. }), "{err:?}");
         assert!(err.to_string().contains("binhost"), "{err}");
+    }
+
+    #[test]
+    fn a_plan_resolved_for_other_coordinates_is_refused_before_anything_is_fetched() {
+        // The install wave composes the *builder's* architecture with the
+        // *plan's* binhost, so a mismatch that reached the wave would fetch
+        // `releases/<builder>/binpackages/23.0/<plan>/...` and 404 against a
+        // mirror that was spelled correctly -- and where the two publish a tree
+        // of the same name it would not fail at all. The refusal says which
+        // pair disagrees, which is what a 404 cannot.
+        let plan = Plan::parse_document(
+            "Format: ferroday-cage-gentoo-plan 1\nArchitecture: arm64\nBinhost: arm64\n",
+        )
+        .expect("a fixture plan");
+
+        let err = Gentoo::builder("amd64")
+            .plan(plan.clone())
+            .build()
+            .expect_err("a plan for another architecture is refused");
+        assert!(matches!(err, GentooError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("arm64"), "{err}");
+
+        // The same for a binhost the builder named and the plan does not agree
+        // with; a builder that names none takes the plan's, which is what it
+        // resolved against.
+        let err = Gentoo::builder("arm64")
+            .binhost("x86-64")
+            .plan(plan.clone())
+            .build()
+            .expect_err("a plan for another binhost is refused");
+        assert!(matches!(err, GentooError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("binhost"), "{err}");
+
+        Gentoo::builder("arm64")
+            .plan(plan.clone())
+            .build()
+            .expect("a plan whose architecture is the builder's builds");
+        Gentoo::builder("arm64")
+            .binhost("arm64")
+            .plan(plan)
+            .build()
+            .expect("a plan that agrees with the builder on both builds");
     }
 
     #[test]

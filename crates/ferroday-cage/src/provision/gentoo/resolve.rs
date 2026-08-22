@@ -57,9 +57,9 @@
 
 use std::collections::HashMap;
 
-use super::atom::{Atom, Dependency, Unmet};
+use super::atom::{self, Atom, Dependency, Unmet};
 use super::index::{Index, Record};
-use super::installed::Installed;
+use super::installed::{Installed, InstalledPackage};
 use super::version;
 
 /// A USE flag the caller would rather a build carried, or rather it did not.
@@ -82,11 +82,9 @@ impl Preference {
             Some(flag) => (false, flag),
             None => (true, text),
         };
-        if flag.is_empty()
-            || !flag.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-' | b'@')
-            })
-        {
+        // The atom grammar's own byte class, not a second one: a preference
+        // naming a flag an atom could not name would silently never be met.
+        if flag.is_empty() || !flag.bytes().all(atom::is_flag_byte) {
             return Err(format!("{text:?} does not name a USE flag"));
         }
         Ok(Preference {
@@ -135,17 +133,40 @@ pub(super) struct Conflict {
     pub installed: bool,
 }
 
+/// Two builds one resolution chose that would occupy one slot of one package.
+///
+/// Portage keeps one instance per `(package, slot)` and refuses to create a
+/// second, so a root holding two is a root `emerge` reports as a conflict. A
+/// resolution that produced one and merged it anyway would lay both images down
+/// with the second overwriting the first's shared paths, and report success.
+pub(super) struct Occupied {
+    /// The package, as `category/name`.
+    pub name: String,
+    /// The slot both would occupy, without a sub-slot.
+    pub slot: String,
+    /// The build already chosen, as `category/name-version`, and which build of
+    /// it.
+    pub held: String,
+    /// The build the second atom would have chosen, spelled the same way.
+    pub second: String,
+    /// The atom that asked for the second, as it was written.
+    pub atom: String,
+    /// Who asked for it: the caller, or the package whose dependency it is.
+    pub wanted_by: String,
+}
+
 /// Everything one resolution refused, in the order it met them.
 #[derive(Default)]
 pub(super) struct Refusals {
     pub unsatisfied: Vec<Unsatisfied>,
     pub conflicts: Vec<Conflict>,
+    pub occupied: Vec<Occupied>,
 }
 
 impl Refusals {
     /// Whether the resolution can be acted on.
     pub(super) fn is_empty(&self) -> bool {
-        self.unsatisfied.is_empty() && self.conflicts.is_empty()
+        self.unsatisfied.is_empty() && self.conflicts.is_empty() && self.occupied.is_empty()
     }
 
     /// The whole refusal as one sentence a caller reads.
@@ -169,6 +190,13 @@ impl Refusals {
                 } else {
                     "be installed by this same resolution"
                 },
+            ));
+        }
+        for taken in &self.occupied {
+            parts.push(format!(
+                "{} requires {}, and {} would occupy slot {} of {}, which {} already takes in this \
+                 same resolution",
+                taken.wanted_by, taken.atom, taken.second, taken.slot, taken.name, taken.held,
             ));
         }
         parts.join("; ")
@@ -250,6 +278,34 @@ pub(super) fn resolve(
             });
             continue;
         };
+        // One instance per slot, which is the invariant portage's own database
+        // keeps: the atom is not answered by what is already chosen -- that was
+        // asked two steps above -- so a chosen build sharing its slot is a
+        // second version of one package in one slot. Merging both would lay two
+        // images down with the second overwriting the first's shared paths, and
+        // leave a `/var/db/pkg` portage reads as a conflict.
+        //
+        // Reported rather than resolved around, which is the module's stance on
+        // a conflict generally: nothing here backtracks, and the caller's atoms
+        // are what would have to change.
+        if let Some(taken) = chosen
+            .iter()
+            .find(|held| held.name == record.name && slot_of(&held.slot) == slot_of(&record.slot))
+        {
+            refusals.occupied.push(Occupied {
+                name: record.name.clone(),
+                slot: slot_of(&record.slot).to_string(),
+                held: describe_build(taken),
+                second: describe_build(&record),
+                atom: alternatives
+                    .iter()
+                    .map(|atom| atom.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                wanted_by: pending.wanted_by,
+            });
+            continue;
+        }
         let wanted_by = record.cpv();
         for dependency in record.rdepend.iter().chain(&record.pdepend) {
             queue.push(Pending {
@@ -285,6 +341,26 @@ pub(super) fn resolve(
 
     let (packages, cycles) = order(chosen);
     (Resolved { packages, cycles }, refusals)
+}
+
+/// The slot proper of a `slot` or `slot/subslot` spelling.
+///
+/// The sub-slot records what a dependent must be rebuilt against and is not part
+/// of what a slot *is*: portage installs one instance per `(package, slot)`, and
+/// two builds differing only in their sub-slot are two versions of one instance
+/// rather than two.
+fn slot_of(slot: &str) -> &str {
+    slot.split_once('/').map_or(slot, |(slot, _)| slot)
+}
+
+/// How a refusal names one build: its `CPV` and which build of it.
+///
+/// The build id is part of the name here where it is not elsewhere, because the
+/// two builds a slot collision names can be two builds of one version -- and a
+/// message naming them both `dev-vcs/git-2.54.0` would read as a bug in the
+/// refusal rather than as the collision it is.
+fn describe_build(record: &Record) -> String {
+    format!("{} build {}", record.cpv(), record.build_id)
 }
 
 /// Whether anything already answers `atom`.
@@ -350,12 +426,19 @@ fn rank(record: &Record, prefer: &[Preference]) -> (usize, std::cmp::Reverse<usi
 /// the archive does not publish is a package to install another way, a flag no
 /// build carries is a build nobody produced, and a slot or a version is a
 /// request the archive has moved past.
+///
+/// A name the binhost publishes in no version is named with what the root has
+/// of it, where the root has anything. That is the measured case rather than an
+/// edge: the stage3 ships packages the binhost publishes in no version at all,
+/// so an atom on one of them walls on the archive's silence *and* on the
+/// version the root happens to hold, and the second is the half a caller can
+/// act on.
 fn wall(index: &Index, installed: &Installed, alternatives: &[&Atom]) -> String {
     let mut furthest: Option<Unmet> = None;
     let mut unpublished = Vec::new();
     for atom in alternatives {
-        if !index.publishes(atom.name()) && !installed.holds(atom.name()) {
-            unpublished.push(atom.name());
+        if !index.publishes(atom.name()) {
+            unpublished.push(unserved(installed, atom.name()));
             continue;
         }
         for record in index.builds(atom.name()) {
@@ -374,6 +457,19 @@ fn wall(index: &Index, installed: &Installed, alternatives: &[&Atom]) -> String 
     }
 }
 
+/// How a refusal names a package the binhost publishes in no version: the name,
+/// and what the root has of it where the root has anything.
+fn unserved(installed: &Installed, name: &str) -> String {
+    let held: Vec<&str> = installed
+        .under(name)
+        .map(InstalledPackage::version)
+        .collect();
+    match held.is_empty() {
+        true => name.to_string(),
+        false => format!("{name}, which the root has at {}", held.join(" and ")),
+    }
+}
+
 /// Puts the chosen builds in an order each can be merged in.
 ///
 /// A topological sort over runtime dependencies alone. `PDEPEND` is left out on
@@ -386,11 +482,16 @@ fn wall(index: &Index, installed: &Installed, alternatives: &[&Atom]) -> String 
 /// emitted and the cycle is reported. That rule is stable, so a cycle broken in
 /// one run is broken the same way in the next.
 fn order(chosen: Vec<Record>) -> (Vec<Record>, Vec<Vec<String>>) {
-    let at: HashMap<String, usize> = chosen
-        .iter()
-        .enumerate()
-        .map(|(at, record)| (record.name.clone(), at))
-        .collect();
+    // Every index a name was chosen at, rather than one. A closure legitimately
+    // holds two slots of a package -- `dev-lang/python:3.11` and `:3.12`, two
+    // `llvm` or `gcc` slots -- which the archive publishes and Gentoo installs
+    // side by side, and a map keeping only the last index would drop the edge to
+    // whichever slot lost. The dependent would then be free to merge before the
+    // slot it names.
+    let mut at: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index_of, record) in chosen.iter().enumerate() {
+        at.entry(record.name.as_str()).or_default().push(index_of);
+    }
     // `needs[i]` is what package `i` must be merged after.
     let mut needs: Vec<Vec<usize>> = vec![Vec::new(); chosen.len()];
     for (index_of, record) in chosen.iter().enumerate() {
@@ -404,11 +505,13 @@ fn order(chosen: Vec<Record>) -> (Vec<Record>, Vec<Vec<String>>) {
             if atom.blocker().is_some() {
                 continue;
             }
-            if let Some(&needed) = at.get(atom.name())
-                && needed != index_of
-                && atom.matches(&chosen[needed])
-            {
-                needs[index_of].push(needed);
+            // An edge to every chosen build the atom admits. At most one per
+            // slot survives resolution, but a `:*` or an unconstrained atom
+            // legitimately names two slots, and a dependent on both needs both.
+            for &needed in at.get(atom.name()).map_or(&[][..], Vec::as_slice) {
+                if needed != index_of && atom.matches(&chosen[needed]) {
+                    needs[index_of].push(needed);
+                }
             }
         }
     }
@@ -549,6 +652,33 @@ MD5: 3a61f698748c7323c87081584f383b3d
 PATH: dev-lang/ruby/ruby-3.4.9-1.gpkg.tar
 SIZE: 10
 SLOT: 3.4
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 98
+CPV: dev-lang/python-3.11.14
+MD5: 4a61f698748c7323c87081584f383b3d
+PATH: dev-lang/python/python-3.11.14-1.gpkg.tar
+SIZE: 10
+SLOT: 3.11
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 99
+CPV: dev-lang/python-3.12.12
+MD5: 5a61f698748c7323c87081584f383b3d
+PATH: dev-lang/python/python-3.12.12-1.gpkg.tar
+SIZE: 10
+SLOT: 3.12
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 101
+CPV: dev-python/two-slot-1.0
+MD5: 6a61f698748c7323c87081584f383b3d
+PATH: dev-python/two-slot/two-slot-1.0-1.gpkg.tar
+RDEPEND: dev-lang/python:3.11 dev-lang/python:3.12
+SIZE: 10
 USE: amd64
 ";
 
@@ -807,6 +937,80 @@ USE: amd64
                 .map(Record::cpv)
                 .collect::<Vec<_>>(),
             ["dev-lang/perl-5.42", "dev-perl/Module-Build-0.42"],
+        );
+    }
+
+    #[test]
+    fn two_versions_of_one_package_in_one_slot_are_refused() {
+        // The state portage will not create and reports as a conflict when it
+        // finds one. Two atoms constraining `sys-libs/zlib` from opposite
+        // directions both select, and merging both would lay two images down
+        // with the second overwriting the first's shared paths -- into a
+        // `/var/db/pkg` that says the root holds two instances of one slot.
+        let (resolved, refusals) = run(
+            &root(&[]),
+            &["<sys-libs/zlib-1.3.2", ">=sys-libs/zlib-1.3.2"],
+            &[],
+        );
+        assert_eq!(refusals.occupied.len(), 1, "{}", refusals.describe());
+        let taken = &refusals.occupied[0];
+        assert_eq!(taken.name, "sys-libs/zlib");
+        assert_eq!(taken.slot, "0");
+        assert_eq!(taken.held, "sys-libs/zlib-1.3.1 build 1");
+        assert_eq!(taken.second, "sys-libs/zlib-1.3.2 build 1");
+        assert!(
+            refusals
+                .describe()
+                .contains("would occupy slot 0 of sys-libs/zlib"),
+            "{}",
+            refusals.describe(),
+        );
+        // The refusal is the outcome; what resolved before it is not installed.
+        assert!(!refusals.is_empty());
+        // The first of the two is still chosen, so the refusal names one pair
+        // rather than reporting the same collision from both sides.
+        assert_eq!(installing(&resolved), ["sys-libs/zlib-1.3.1"]);
+    }
+
+    #[test]
+    fn two_slots_of_one_package_both_resolve_and_both_carry_their_edge() {
+        // The archive publishes `dev-lang/python` in `3.11` and `3.12` and
+        // Gentoo installs them side by side, so a closure holding both is not a
+        // conflict -- and the dependent must merge after each of them, which is
+        // what an install order keyed by name alone would get wrong for
+        // whichever slot lost.
+        let (resolved, refusals) = run(&root(&[]), &["dev-python/two-slot"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        let order = installing(&resolved);
+        let position = |cpv: &str| {
+            order
+                .iter()
+                .position(|held| held == cpv)
+                .unwrap_or_else(|| panic!("{cpv} is installed: {order:?}"))
+        };
+        assert!(position("dev-lang/python-3.11.14") < position("dev-python/two-slot-1.0"));
+        assert!(position("dev-lang/python-3.12.12") < position("dev-python/two-slot-1.0"));
+        assert!(resolved.cycles.is_empty());
+    }
+
+    #[test]
+    fn an_atom_the_root_holds_and_the_binhost_does_not_publish_names_the_version() {
+        // The measured shape, one version further on: the stage3 ships
+        // `app-crypt/pinentry` and the binhost publishes it in no version, so
+        // an atom asking for more than the root has walls on both at once. The
+        // absence alone is not actionable -- what a caller can act on is that
+        // the root has it, and at what.
+        let installed = root(&["app-crypt/pinentry-1.3.2"]);
+        let refusals = run(&installed, &[">=app-crypt/pinentry-1.4"], &[]).1;
+        assert_eq!(refusals.unsatisfied.len(), 1);
+        let described = refusals.describe();
+        assert!(
+            described.contains("app-crypt/pinentry, which the root has at 1.3.2"),
+            "{described}",
+        );
+        assert!(
+            described.contains("is published by this binhost at all"),
+            "{described}"
         );
     }
 

@@ -147,6 +147,15 @@ jobs:
         # carry whatever the test fixtures need, and a library item reachable
         # only through that addition would compile here and fail for the
         # consumer who selected the combination on its own.
+        #
+        # `-D warnings`, as the all-features clippy step has. The warning it
+        # asserts on is `dead_code`, and this is the only step that can see it:
+        # an item every combination but one has a caller for compiles clean
+        # under `--all-features` and is dead for whoever selected that one, so a
+        # step that printed the warning rather than failing on it left the class
+        # to be noticed by a reader.
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo hack check -p ferroday-cage --feature-powerset --depth 2 --no-dev-deps
       - name: Check the feature powerset's targets
         # The same matrix over the tests and examples. A test target declaring
@@ -154,6 +163,8 @@ jobs:
         # them, so one reaching past what it declared is invisible to an
         # ordinary package check and to every all-features command a contributor
         # runs locally.
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo hack check -p ferroday-cage --feature-powerset --depth 2 --all-targets
       - name: Document the feature powerset
         # The same matrix over rustdoc, because a doc link is resolved against

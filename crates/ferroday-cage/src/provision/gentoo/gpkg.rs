@@ -48,6 +48,20 @@
 //! for. Nothing is decompressed before its digest matches, which is what GLEP
 //! 78 asks of a reader that finds a bad signature.
 //!
+//! # The cache directory is inside the trust boundary
+//!
+//! What the two passes establish is that the *bytes the first pass read* were
+//! the ones the Manifest vouched for. The second pass opens the file again, so
+//! anything able to write the cache between them substitutes content nothing
+//! verified into the merge.
+//!
+//! In normal use nobody else can: the cache is
+//! [`cache_dir`](super::GentooBuilder::cache_dir), or a sibling of the tree
+//! being built where the caller named none. A caller who points `cache_dir` at a
+//! world-writable or shared location is extending the trust boundary to whoever
+//! can write there, and is entitled to know that is the decision they are
+//! making.
+//!
 //! # What is deliberately not read
 //!
 //! The two `.sig` members. The cleartext-signed Manifest binds the same bytes,
@@ -152,11 +166,6 @@ impl Package {
             metadata,
             image: scan.image.clone(),
         })
-    }
-
-    /// One metadata file's contents, or `None` where the package ships none.
-    pub(super) fn metadata(&self, name: &str) -> Option<&[u8]> {
-        self.metadata.get(name).map(Vec::as_slice)
     }
 
     /// Every metadata file, by name, in name order.
@@ -587,9 +596,30 @@ fn check_identity(
             "carries no CATEGORY, PF or BUILD_ID, so it cannot say which package it is",
         ));
     };
+    // Field by field rather than as one joined string, because where the splits
+    // fall is the container's to choose and the joins are ambiguous: a container
+    // with `PF = "pkg"` and `BUILD_ID = "1.0-5"` joins to the same text as a
+    // planned `pkg`, `1.0`, `5`. Nothing today reaches that — the plan's own
+    // version has to parse under the Gentoo grammar, two modules away — but this
+    // step is the one thing standing between a correctly signed package and the
+    // wrong package, and it should not rest on a property established elsewhere.
+    //
+    // `PF` is the name and the version with no category and no build id, so it
+    // is split at the same place the plan holds the two halves apart.
     let named = format!("{category}/{pf}-{build_id}");
-    let wanted = format!("{}-{}-{}", planned.name, planned.version, planned.build_id,);
-    if named != wanted {
+    let wanted = format!("{}-{}-{}", planned.name, planned.version, planned.build_id);
+    let matched = planned
+        .name
+        .split_once('/')
+        .is_some_and(|(want_cat, name)| {
+            category == want_cat
+                && pf
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|version| version == planned.version)
+                && build_id.parse::<u64>() == Ok(planned.build_id)
+        });
+    if !matched {
         return Err(container(
             path,
             format!(
@@ -655,27 +685,55 @@ pub(super) mod fixture {
     fn metadata(cpv: &str, build_id: u64) -> Vec<u8> {
         let (category, package, version) =
             super::super::version::split_cpv(cpv).expect("a fixture CPV");
+        metadata_named(
+            category,
+            &format!("{package}-{version}"),
+            &build_id.to_string(),
+        )
+    }
+
+    /// The same, with the three identity fields spelled out.
+    ///
+    /// What a test needs to bend where the container's *splits* fall rather
+    /// than what it says: `PF` and `BUILD_ID` are the container's own to divide
+    /// as it likes, and a test for the identity check has to be able to divide
+    /// them somewhere else.
+    pub(in crate::provision::gentoo) fn metadata_named(
+        category: &str,
+        pf: &str,
+        build_id: &str,
+    ) -> Vec<u8> {
         tarball(&[
             ("metadata/", Vec::new()),
             ("metadata/CATEGORY", format!("{category}\n").into_bytes()),
-            ("metadata/PF", format!("{package}-{version}\n").into_bytes()),
-            ("metadata/BUILD_ID", build_id.to_string().into_bytes()),
+            ("metadata/PF", format!("{pf}\n").into_bytes()),
+            ("metadata/BUILD_ID", build_id.as_bytes().to_vec()),
             ("metadata/SLOT", b"0/1\n".to_vec()),
             ("metadata/USE", b"amd64 minizip\n".to_vec()),
         ])
     }
 
     /// The image archive a container carries: one directory, one file, one
-    /// symbolic link.
-    fn image() -> Vec<u8> {
+    /// symbolic link, and a named pipe where `fifo` asks for one.
+    ///
+    /// The fifo is optional because it is what a package ships rarely and the
+    /// merge has to answer for anyway: the layer records portage's own `fif`
+    /// line for it and never opens it, where reading it as an ordinary file
+    /// would block until something opened the write end -- and inside a
+    /// provisioning run nothing will.
+    fn image(fifo: bool) -> Vec<u8> {
         let mut out = Vec::new();
-        for (name, target, mode, size, typeflag) in [
+        let mut entries: Vec<(&str, &str, u32, u64, u8)> = vec![
             ("image/", "", 0o755, 0u64, b'5'),
             ("image/usr/", "", 0o755, 0, b'5'),
             ("image/usr/lib/", "", 0o755, 0, b'5'),
             ("image/usr/lib/libz.so.1.3.2", "", 0o755, 4, b'0'),
             ("image/usr/lib/libz.so", "libz.so.1.3.2", 0o777, 0, b'2'),
-        ] {
+        ];
+        if fifo {
+            entries.push(("image/usr/lib/zlib.pipe", "", 0o644, 0, b'6'));
+        }
+        for (name, target, mode, size, typeflag) in entries {
             out.extend_from_slice(
                 &tar::ustar_block(
                     name.as_bytes(),
@@ -714,6 +772,8 @@ pub(super) mod fixture {
         pub marked: bool,
         /// A member whose recorded SHA-512 is wrong, by name.
         pub corrupt: Option<&'static str>,
+        /// Whether the image ships a named pipe beside its ordinary files.
+        pub fifo: bool,
     }
 
     impl Built {
@@ -726,6 +786,7 @@ pub(super) mod fixture {
                 phantom: Vec::new(),
                 marked: true,
                 corrupt: None,
+                fifo: false,
             }
         }
 
@@ -737,7 +798,7 @@ pub(super) mod fixture {
             }
             members.push(("metadata.tar".to_string(), self.metadata));
             members.push(("metadata.tar.sig".to_string(), b"not read\n".to_vec()));
-            members.push(("image.tar".to_string(), image()));
+            members.push(("image.tar".to_string(), image(self.fifo)));
             members.push(("image.tar.sig".to_string(), b"not read\n".to_vec()));
 
             let mut manifest = String::new();
@@ -791,7 +852,7 @@ pub(super) mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{Built, CPV, planned};
+    use super::fixture::{Built, CPV, metadata_named, planned};
     use super::*;
     use crate::provision::openpgp::fixture;
     use crate::scratch::Scratch;
@@ -811,15 +872,18 @@ mod tests {
         let package = open("ordinary", Built::ordinary(), &planned(CPV, 1))
             .expect("an ordinary container opens");
         assert_eq!(
-            package.metadata("CATEGORY").map(String::from_utf8_lossy),
-            Some("sys-libs\n".into()),
-        );
-        assert_eq!(
             package
                 .metadata_files()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>(),
             ["BUILD_ID", "CATEGORY", "PF", "SLOT", "USE"],
+        );
+        assert_eq!(
+            package
+                .metadata_files()
+                .find(|(name, _)| *name == "CATEGORY")
+                .map(|(_, bytes)| String::from_utf8_lossy(bytes)),
+            Some("sys-libs\n".into()),
         );
     }
 
@@ -855,6 +919,52 @@ mod tests {
         // version differ in what they were compiled with.
         let err = open("build-id", Built::ordinary(), &planned(CPV, 7))
             .expect_err("another build is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn the_identity_is_compared_field_by_field_rather_than_as_one_string() {
+        // Where the container's own splits fall is the container's to choose,
+        // and the joined spellings are ambiguous: `PF = "zlib-1.3"` with
+        // `BUILD_ID = "2-1"` joins to `sys-libs/zlib-1.3-2-1`, which is what
+        // the planned `sys-libs/zlib`, `1.3.2`, `1` joins to as well. Comparing
+        // the joined strings would accept it, and this step is the one thing
+        // standing between a correctly signed package and the wrong package.
+        let err = open(
+            "ambiguous-split",
+            Built {
+                metadata: metadata_named("sys-libs", "zlib-1.3", "2-1"),
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+        )
+        .expect_err("a container whose splits fall elsewhere is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+        assert!(err.to_string().contains("the signature holds"), "{err}");
+
+        // The build id is compared as the number the plan holds, so a container
+        // that spells it with a leading zero is the same build and opens.
+        open(
+            "padded-build-id",
+            Built {
+                metadata: metadata_named("sys-libs", "zlib-1.3.2", "01"),
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+        )
+        .expect("a build id spelled 01 is build 1");
+
+        // And one that is not a number is not the plan's build id, whatever it
+        // renders as beside the other two fields.
+        let err = open(
+            "unnumbered-build-id",
+            Built {
+                metadata: metadata_named("sys-libs", "zlib-1.3.2", "1st"),
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+        )
+        .expect_err("a build id that is not a number is refused");
         assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
     }
 

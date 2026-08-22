@@ -124,19 +124,7 @@ impl Record {
 
     /// Whether the build was compiled with `flag`.
     pub(super) fn has_use(&self, flag: &str) -> bool {
-        self.use_flags
-            .split_ascii_whitespace()
-            .any(|held| held == flag)
-    }
-
-    /// Whether the package knows `flag` at all, whether or not it is enabled.
-    ///
-    /// The `+` and `-` prefixes an `IUSE` entry may carry state the ebuild's
-    /// own default and are not part of the name, so they are stripped here.
-    fn knows_use(&self, flag: &str) -> bool {
-        self.iuse
-            .split_ascii_whitespace()
-            .any(|held| held.trim_start_matches(['+', '-']) == flag)
+        atom::holds(&self.use_flags, flag)
     }
 
     /// Why this record's `PATH` cannot be fetched, or `None` where it can.
@@ -165,18 +153,7 @@ impl atom::Candidate for Record {
     }
 
     fn use_flag(&self, flag: &str) -> Option<bool> {
-        // Enabled beats known: a build's `USE` carries flags its `IUSE` does
-        // not — `amd64`, `elibc_glibc`, `kernel_linux` are in every record's
-        // `USE` and in no package's `IUSE` — so asking `IUSE` first would
-        // report an enabled flag as unknown and hand the answer to the atom's
-        // default.
-        if self.has_use(flag) {
-            Some(true)
-        } else if self.knows_use(flag) {
-            Some(false)
-        } else {
-            None
-        }
+        atom::use_flag(&self.use_flags, &self.iuse, flag)
     }
 }
 

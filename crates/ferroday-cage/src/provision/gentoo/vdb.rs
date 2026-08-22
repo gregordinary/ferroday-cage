@@ -62,14 +62,11 @@ use std::path::Path;
 
 use super::gpkg::{IMAGE_DIR, Package};
 use super::plan::PlannedPackage;
-use super::{GentooError, MAX_CONTENTS_ENTRIES};
+use super::{DB_DIR, GentooError, MAX_CONTENTS_ENTRIES};
 use crate::provision::ProvisionError;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::extract::{Extraction, Placement};
 use crate::provision::rooted::Rooted;
-
-/// Where portage keeps its database inside a root.
-const DB_DIR: &str = "var/db/pkg";
 
 /// Where portage keeps the ordinal it stamps each merge with.
 const COUNTER_FILE: &str = "var/cache/edb/counter";
@@ -92,6 +89,19 @@ enum Laid {
     File(String, i64),
     /// A symbolic link: `sym <path> -> <target> <mtime>`.
     Link(String, String, i64),
+    /// A named pipe: `fif <path>`.
+    ///
+    /// Portage's own line type for one, and the reason this is a variant rather
+    /// than an `obj`: a fifo has no contents to digest, and opening one to look
+    /// for some blocks until something opens the write end — which, inside a
+    /// provisioning run, nothing will. Recording it as a file would hang the
+    /// merge rather than fail it.
+    ///
+    /// Character and block devices have a line type of portage's too, `dev`, and
+    /// no variant here: the extractor skips them before the hook sees them,
+    /// since laying one down needs privilege the layer does not have and the
+    /// sandbox provides its own `/dev`.
+    Fifo(String),
 }
 
 /// Merges `package` into the root and registers its database entry.
@@ -112,7 +122,7 @@ pub(super) fn merge(
     planned: &PlannedPackage,
     counter: u64,
 ) -> Result<(), ProvisionError> {
-    let entry = entry_dir(root, package)?;
+    let entry = entry_dir(planned);
     let laid = extract_image(root, container, package)?;
     let contents = render_contents(root, rooted, &laid)?;
 
@@ -164,26 +174,27 @@ pub(super) fn merge(
 
 /// The database directory this package's entry belongs at.
 ///
-/// Composed from the container's own `CATEGORY` and `PF`, which
-/// [`Package::open`](super::gpkg::Package::open) has already held to the index
-/// record — so this is the verified identity rather than a second reading of
-/// the same bytes.
-fn entry_dir(root: &Path, package: &Package) -> Result<String, GentooError> {
-    let field = |name: &str| {
-        package
-            .metadata(name)
-            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
-            .filter(|value| {
-                !value.is_empty() && !value.contains('/') && value != "." && value != ".."
-            })
-    };
-    let (Some(category), Some(pf)) = (field("CATEGORY"), field("PF")) else {
-        return Err(GentooError::database(
-            root,
-            "a container carries no CATEGORY or PF that can name a database entry",
-        ));
-    };
-    Ok(format!("{DB_DIR}/{category}/{pf}"))
+/// Composed from the plan rather than from the container. The two say the same
+/// thing — [`Package::open`](super::gpkg::Package::open) refuses a container
+/// whose `CATEGORY`, `PF` and `BUILD_ID` are not the ones the plan named — and
+/// composing from the plan is what makes that a statement about one reading
+/// instead of two: the bytes the identity check held are the bytes the path is
+/// built from, with no second parse of the metadata to keep in step with the
+/// first.
+///
+/// `PF` is the package's name and version with no category and no build id,
+/// which is exactly what portage names an entry directory. The plan holds the
+/// two halves separately, so the entry directory is the pair rejoined.
+fn entry_dir(planned: &PlannedPackage) -> String {
+    // Both halves passed `PlannedPackage::unusable` on the way in: the name is a
+    // package the atom grammar admits, so it is one category and one name with
+    // neither able to be `.`, `..`, or carry a separator, and the version parses
+    // under the Gentoo grammar.
+    let (category, name) = planned
+        .name
+        .split_once('/')
+        .expect("a planned package names a category and a name");
+    format!("{DB_DIR}/{category}/{name}-{}", planned.version)
 }
 
 /// Extracts the container's image into the root, recording what it laid down.
@@ -223,6 +234,9 @@ fn extract_image(
                 String::from_utf8_lossy(&entry.link_target).into_owned(),
                 entry.mtime,
             ),
+            b'6' => Laid::Fifo(path),
+            // Regular files, and the unknown typeflags POSIX says to treat as
+            // regular files -- which is what the extractor does with them too.
             _ => Laid::File(path, entry.mtime),
         });
         Ok(Placement::Write)
@@ -248,6 +262,9 @@ fn render_contents(root: &Path, rooted: &Rooted, laid: &[Laid]) -> Result<String
             }
             Laid::Link(path, target, mtime) => {
                 let _ = writeln!(out, "sym /{path} -> {target} {mtime}");
+            }
+            Laid::Fifo(path) => {
+                let _ = writeln!(out, "fif /{path}");
             }
             Laid::File(path, mtime) => {
                 let mut file = rooted.reader(path).map_err(|err| {
@@ -294,10 +311,15 @@ mod tests {
 
     /// Merges the fixture container into a fresh root and returns it.
     fn merged(tag: &str, counter: u64) -> Scratch {
+        merged_container(tag, counter, Built::ordinary())
+    }
+
+    /// The same, for a container a test has bent.
+    fn merged_container(tag: &str, counter: u64, built: Built) -> Scratch {
         let dir = Scratch::for_test("gentoo-vdb", tag);
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let container = dir.join("package.gpkg.tar");
-        Built::ordinary().write(&container, &key);
+        built.write(&container, &key);
         let root = dir.join("root");
         std::fs::create_dir_all(&root).expect("the root is created");
         let rooted = Rooted::open(&root).expect("the root opens");
@@ -400,6 +422,38 @@ mod tests {
                 "obj /usr/lib/libz.so.1.3.2 c80b8c1c189e1d042d2eb8fce52af5f0 1700000000",
                 "sym /usr/lib/libz.so -> libz.so.1.3.2 1700000000",
             ],
+        );
+    }
+
+    #[test]
+    fn a_named_pipe_is_recorded_as_a_fifo_and_never_opened() {
+        // A fifo reaches the merge because the extractor lays one down, where
+        // it skips the character and block devices that would need privilege.
+        // Recording it as an `obj` would mean digesting it, and opening a fifo
+        // for reading blocks until something opens the write end -- so this
+        // test would hang rather than fail, which is the argument for having
+        // it. Portage's own line type for one carries no digest and no
+        // timestamp.
+        let dir = merged_container(
+            "fifo",
+            1,
+            Built {
+                fifo: true,
+                ..Built::ordinary()
+            },
+        );
+        let contents = read(&dir, CONTENTS_FILE);
+        assert!(
+            contents
+                .lines()
+                .any(|line| line == "fif /usr/lib/zlib.pipe"),
+            "{contents}",
+        );
+        // And it is on disk as a fifo rather than as an empty file.
+        let laid = std::fs::metadata(dir.join("root/usr/lib/zlib.pipe")).expect("the fifo is laid");
+        assert!(
+            std::os::unix::fs::FileTypeExt::is_fifo(&laid.file_type()),
+            "{laid:?}",
         );
     }
 

@@ -531,8 +531,59 @@ fn is_name(text: &str) -> bool {
 }
 
 /// Whether `byte` may appear in a USE flag's name.
-fn is_flag_byte(byte: u8) -> bool {
+///
+/// Reachable from the rest of the layer because a flag's name is spelled in more
+/// than one place -- an atom's USE dependency and a caller's build preference —
+/// and the two must admit the same names: a preference naming a flag an atom
+/// could not name would silently never be met.
+pub(super) fn is_flag_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-' | b'@')
+}
+
+/// Whether the space-separated USE list `flags` holds `flag`.
+///
+/// Both sides of resolution spell their flags this way — an index record's
+/// `USE`, a database entry's — and both are asked only membership and a count,
+/// so the list stays the string its source published and the questions are asked
+/// over it.
+pub(super) fn holds(flags: &str, flag: &str) -> bool {
+    flags.split_ascii_whitespace().any(|held| held == flag)
+}
+
+/// Whether the space-separated `iuse` list declares `flag`, whether or not it is
+/// enabled.
+///
+/// The `+` and `-` prefixes an entry may carry state the ebuild's own default
+/// and are not part of the name, so they are stripped here.
+pub(super) fn declares(iuse: &str, flag: &str) -> bool {
+    iuse.split_ascii_whitespace()
+        .any(|held| held.trim_start_matches(['+', '-']) == flag)
+}
+
+/// What a candidate holding these two flag lists answers for `flag`: enabled,
+/// disabled, or unknown.
+///
+/// The one rule both sides of resolution answer by, and it has to be one: an
+/// atom is one grammar, and a root that answered a USE dependency differently
+/// from the archive would reinstall what it already has.
+///
+/// **Enabled beats known.** A build's `USE` carries flags its `IUSE` does not —
+/// `amd64`, `elibc_glibc` and `kernel_linux` are in every index record's `USE`
+/// and in no package's `IUSE` — so asking the declared list first would report
+/// an enabled flag as unknown and hand the answer to the atom's own
+/// `(+)`/`(-)` default.
+///
+/// `None` is the common case rather than an edge, and it is what those defaults
+/// exist to answer: a package's declared list names the flags it was written
+/// with, and an atom routinely asks about one another package defines.
+pub(super) fn use_flag(flags: &str, iuse: &str, flag: &str) -> Option<bool> {
+    if holds(flags, flag) {
+        Some(true)
+    } else if declares(iuse, flag) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Whether `byte` may appear in a slot or sub-slot name.
@@ -551,8 +602,10 @@ pub(super) enum Dependency {
     One(Atom),
     /// `|| ( a b c )`: any one of these satisfies it.
     ///
-    /// Nested groups are flattened away by the parser, since a group inside a
-    /// group means the same as its contents spliced in.
+    /// A group nested inside another of its own kind is flattened away by the
+    /// parser, since it means the same as its contents spliced in. One nested
+    /// inside a group of the other kind is refused rather than flattened; see
+    /// [`parse_group`].
     AnyOf(Vec<Atom>),
 }
 
@@ -571,12 +624,15 @@ pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
                 if tokens.next() != Some("(") {
                     return Err("an `||` is not followed by a group".to_string());
                 }
-                out.push(Dependency::AnyOf(parse_group(&mut tokens)?));
+                out.push(Dependency::AnyOf(parse_group(
+                    &mut tokens,
+                    Grouping::AnyOf,
+                )?));
             }
             // A bare group with no operator is an all-of group, which means
             // the same as its contents written out, so it is spliced in.
             "(" => {
-                for atom in parse_group(&mut tokens)? {
+                for atom in parse_group(&mut tokens, Grouping::AllOf)? {
                     out.push(Dependency::One(atom));
                 }
             }
@@ -587,25 +643,66 @@ pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
     Ok(out)
 }
 
+/// What a group's contents mean to the group holding them.
+///
+/// The two directions a flattening can be wrong in are not the same, so the
+/// parser has to know which group it is inside; see [`parse_group`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grouping {
+    /// `|| ( ... )`: any one of the contents satisfies it.
+    AnyOf,
+    /// `( ... )`: all of the contents are required.
+    AllOf,
+}
+
 /// Reads the atoms of a group up to its closing parenthesis.
 ///
-/// A nested group is spliced into the one holding it: `|| ( a ( b c ) )` offers
-/// three alternatives to a reader that cannot express "b and c together", and
-/// the index publishes none of that shape in the two classes this layer reads.
+/// A nested group is spliced into the one holding it, with one exception, and
+/// the exception is why this takes the kind of group it is reading.
+///
+/// - `( a ( b c ) )` — an all-of inside an all-of. Splicing is exact: both mean
+///   everything is required.
+/// - `|| ( a || ( b c ) )` — an any-of inside an any-of. Exact for the same
+///   reason.
+/// - `|| ( a ( b c ) )` — an all-of inside an any-of. Splicing *loosens* it,
+///   offering three alternatives where the archive asked for `a`, or for `b`
+///   and `c` together. What that costs is a closure larger than the archive
+///   asked for, and it is accepted.
+/// - `( a || ( b c ) )` — an any-of inside an all-of. Splicing would *tighten*
+///   it, making `b` and `c` both required where the archive asked for either,
+///   and that direction manufactures an unsatisfiable atom out of a satisfiable
+///   one. It is refused.
+///
+/// No shape here appears in practice: `RDEPEND` and `PDEPEND` were read across
+/// the whole index and carry no nested group at all, because the index is
+/// USE-evaluated and the conditionals that would produce one are gone by the
+/// time it is written. Refusing the one that would be wrong is what turns a
+/// future archive publishing it into a diagnostic instead of a silently
+/// different meaning.
 fn parse_group<'t>(
     tokens: &mut std::iter::Peekable<impl Iterator<Item = &'t str>>,
+    grouping: Grouping,
 ) -> Result<Vec<Atom>, String> {
     let mut atoms = Vec::new();
     loop {
         match tokens.next() {
             None => return Err("a group is opened that nothing closes".to_string()),
             Some(")") => return Ok(atoms),
-            Some("(") => atoms.extend(parse_group(tokens)?),
+            // A bare group nested in either kind is spliced. Inside an all-of
+            // that is exact; inside an any-of it is the loosening described
+            // above.
+            Some("(") => atoms.extend(parse_group(tokens, grouping)?),
             Some("||") => {
                 if tokens.next() != Some("(") {
                     return Err("an `||` is not followed by a group".to_string());
                 }
-                atoms.extend(parse_group(tokens)?);
+                if grouping == Grouping::AllOf {
+                    return Err(
+                        "an all-of group holds an `||` group, which cannot be flattened into it"
+                            .to_string(),
+                    );
+                }
+                atoms.extend(parse_group(tokens, Grouping::AnyOf)?);
             }
             Some(token) => atoms.push(parse(token)?),
         }
@@ -880,5 +977,41 @@ mod tests {
         assert!(parse_class("|| a-b/c").is_err());
         // An empty class is no dependencies rather than a failure.
         assert!(parse_class("").expect("an empty class").is_empty());
+    }
+
+    /// Asserts that `class` reads as one any-of group offering `count`
+    /// alternatives.
+    #[track_caller]
+    fn alternatives(class: &str, count: usize) {
+        match &parse_class(class).expect("a class")[0] {
+            Dependency::AnyOf(atoms) => assert_eq!(atoms.len(), count, "{class}"),
+            other => panic!("expected an any-of group from {class}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nested_group_is_flattened_where_that_is_exact_and_refused_where_it_is_not() {
+        // A group inside one of its own kind means its contents written out, so
+        // both directions of that are flattened and neither changes meaning.
+        let all_of = parse_class("( a-b/c ( d-e/f g-h/i ) )").expect("an all-of in an all-of");
+        assert_eq!(all_of.len(), 3);
+        assert!(all_of.iter().all(|dep| matches!(dep, Dependency::One(_))));
+        alternatives("|| ( a-b/c || ( d-e/f g-h/i ) )", 3);
+
+        // An all-of inside an any-of loosens: three alternatives where the
+        // archive asked for one, or for two together. Accepted, and it costs a
+        // closure larger than the archive asked for rather than a wrong answer.
+        alternatives("|| ( a-b/c ( d-e/f g-h/i ) )", 3);
+
+        // An any-of inside an all-of would tighten -- both required where the
+        // archive asked for either -- which manufactures an unsatisfiable atom
+        // out of a satisfiable one. Refused, so an archive that ever publishes
+        // the shape is a diagnostic rather than a different meaning.
+        let refused = parse_class("( a-b/c || ( d-e/f g-h/i ) )")
+            .expect_err("an `||` inside an all-of group is refused");
+        assert!(
+            refused.contains("all-of group holds an `||` group"),
+            "{refused}"
+        );
     }
 }

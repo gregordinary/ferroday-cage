@@ -954,10 +954,6 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack_host_loopback: false,
     };
 
-    let value_for = |name: &str, args: &mut dyn Iterator<Item = OsString>| {
-        args.next().ok_or(format!("{name} requires a value"))
-    };
-
     // Seccomp is assembled after the argument loop: the curated posture and the
     // allow/deny lists and rules are mutually constrained, so they are gathered
     // first and reconciled once, into `options.seccomp`.
@@ -1311,10 +1307,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
                     .map(str::to_string),
             );
         } else if arg == "--gentoo-plan" {
-            options.gentoo_plan =
-                Some(PathBuf::from(args.next().ok_or_else(|| {
-                    "--gentoo-plan requires a value".to_string()
-                })?));
+            options.gentoo_plan = Some(PathBuf::from(value_for("--gentoo-plan", &mut args)?));
         } else if let Some(value) = flag_value(&arg, b"--gentoo-plan=") {
             options.gentoo_plan = Some(PathBuf::from(value));
         } else if arg == "--gentoo-build-id" {
@@ -1334,10 +1327,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
                 .gentoo_mirror_fallback
                 .push(into_string("--gentoo-mirror-fallback", value)?);
         } else if arg == "--gentoo-cache" {
-            options.gentoo_cache =
-                Some(PathBuf::from(args.next().ok_or_else(|| {
-                    "--gentoo-cache requires a value".to_string()
-                })?));
+            options.gentoo_cache = Some(PathBuf::from(value_for("--gentoo-cache", &mut args)?));
         } else if let Some(value) = flag_value(&arg, b"--gentoo-cache=") {
             options.gentoo_cache = Some(PathBuf::from(value));
         } else if arg == "--gentoo-max-pointer-age" {
@@ -2001,10 +1991,7 @@ fn parse_gentoo_installed(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--gentoo-installed" {
-            root =
-                Some(PathBuf::from(args.next().ok_or_else(|| {
-                    "--gentoo-installed requires a value".to_string()
-                })?));
+            root = Some(PathBuf::from(value_for("--gentoo-installed", &mut args)?));
         } else if let Some(value) = flag_value(&arg, b"--gentoo-installed=") {
             root = Some(PathBuf::from(value));
         } else {
@@ -2625,6 +2612,16 @@ fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
     })
 }
 
+/// Consumes the next argument as the value a flag needs, or reports which flag
+/// needed one.
+///
+/// A free function rather than a closure inside the main parser, because the
+/// sub-parsers are functions of their own and a closure there is out of scope:
+/// three flags spelled this message by hand before it moved here.
+fn value_for(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<OsString, String> {
+    args.next().ok_or(format!("{name} requires a value"))
+}
+
 /// Consumes the next argument as a required UTF-8 string value.
 ///
 /// The library's examples carry helpers answering the same three questions —
@@ -2633,8 +2630,7 @@ fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
 /// argument-parsing functions would mean publishing a crate for them. Each side
 /// owns the wording of its own diagnostics.
 fn string_value(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<String, String> {
-    let value = args.next().ok_or(format!("{name} requires a value"))?;
-    into_string(name, value)
+    into_string(name, value_for(name, args)?)
 }
 
 /// Converts a flag value to a `String`, requiring UTF-8.

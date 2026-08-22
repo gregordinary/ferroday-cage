@@ -344,13 +344,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The relay does nothing process-global as a side effect and reads nothing from
 the environment, so four decisions belong to the program driving the session:
 
-- **Installing `Signals`**, early and on the main thread. Blocking the relayed
-  set is process-wide, so it is an explicit call rather than something `run`
-  does on the way past — and it must precede every thread the run may start,
-  because a thread inherits the mask of the thread that created it. The library
-  starts one thread of its own — the [native network
-  stack](userspace-networking.md)'s pump — so a program composing a relay with a
-  stack installs the signals before it attaches one.
+- **Installing `Signals`**, early and on the main thread, and keeping the
+  handle. Blocking the relayed set is process-wide, so it is an explicit call
+  rather than something `run` does on the way past — and it must precede every
+  thread the run may start, because a thread inherits the mask of the thread
+  that created it. The library starts one thread of its own — the [native
+  network stack](userspace-networking.md)'s pump — so a program composing a
+  relay with a stack installs the signals before it attaches one.
+
+  Nothing restores the mask, deliberately: a relay that unblocked on the way out
+  would leave a window in which the signals it exists to handle were fatal
+  again, and a program that relays one session usually relays another. What
+  follows from that is the handle's lifetime. Dropping it closes the descriptor
+  and unblocks nothing, so the eight signals stay blocked with nowhere to be
+  read from and the process then ignores `SIGINT`, `SIGTERM`, `SIGHUP` and
+  `SIGQUIT` entirely — a shell's `^C` and a supervisor's `SIGTERM` both do
+  nothing, and only `SIGKILL` is left. For `fcage` the handle lives to process
+  exit; a longer-lived program holds it for the program's life, which is also
+  the one-per-process shape the type asks for.
 - **Raw mode.** `Relay::raw` is off unless asked. Whether the caller's own
   standard input *is* a terminal is the program's reading to make; `fcage` asks
   `tcgetattr` and passes the answer.

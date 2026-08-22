@@ -1373,9 +1373,12 @@ impl Drop for PackageCache {
 /// Writes bytes to `dest` atomically, via a staging file in its directory and a
 /// rename onto the destination.
 ///
-/// This is how every userland layer publishes a cache entry — a fetched index,
-/// a downloaded package, a pool file — so that two processes provisioning at
-/// once cannot show each other a half-written file.
+/// This is how the Debian layer publishes a cache entry — a fetched index, a
+/// downloaded package, a pool file — so that two processes provisioning at once
+/// cannot show each other a half-written file. The Alpine and Gentoo layers
+/// stage and rename through [`staging_path`] at the point they stream a body to
+/// disk instead, because what they publish arrives as a stream rather than as
+/// bytes already in hand.
 ///
 /// The staging file is created exclusively, which establishes that the name is
 /// this call's alone and refuses a symlink pre-planted at it rather than writing
@@ -1388,7 +1391,7 @@ impl Drop for PackageCache {
 ///
 /// Errors name the staging file only when the failure is the staging file's
 /// own; the caller wraps them against the destination it asked for.
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(feature = "debian")]
 pub(crate) fn write_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
@@ -1568,7 +1571,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "debian", feature = "alpine"))]
+    #[cfg(feature = "debian")]
     #[test]
     fn concurrent_writes_of_one_cache_entry_all_succeed() {
         // The shared-cache race: several provisions download the same package
@@ -1597,7 +1600,7 @@ mod tests {
         assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
     }
 
-    #[cfg(any(feature = "debian", feature = "alpine"))]
+    #[cfg(feature = "debian")]
     #[test]
     fn a_failed_publish_leaves_nothing_staged() {
         // Staging names are unique per call, so a failure that left one behind

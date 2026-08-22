@@ -1069,6 +1069,14 @@ pub(crate) mod fixture {
     /// than from the key value directly, so what a test verifies against came
     /// through the same reader a vendored keyring does -- binary, which is the
     /// form both vendored keyrings ship in.
+    ///
+    /// The Gentoo layer's tests are its only callers: a Debian `Release` is
+    /// verified against a keyring a fixture builds through
+    /// [`Keyring::parse`] itself, where a gpkg container's `Manifest` is
+    /// verified through a `Keyring` the container fixture has to hand over. So
+    /// a build without that feature has no caller, where its sibling
+    /// [`clearsign`] has one in both layers.
+    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
     pub(crate) fn keyring(key: &SignedSecretKey) -> Keyring {
         let mut binary = Vec::new();
         pgp::ser::Serialize::to_writer(&key.to_public_key(), &mut binary)

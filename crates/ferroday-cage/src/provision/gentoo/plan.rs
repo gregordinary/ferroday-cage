@@ -290,12 +290,11 @@ impl Plan {
         let mut plan = Plan {
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             binhost: required(header.get("Binhost"), "Binhost", "the header")?,
-            index_timestamp: number(
+            index_timestamp: signed_number(
                 header.get("Index-Timestamp"),
                 "Index-Timestamp",
                 "the header",
-            )?
-            .map(|at| at as i64),
+            )?,
             packages: Vec::new(),
             carried: document::carried(header, HEADER_FIELDS),
         };
@@ -355,8 +354,31 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Gentoo
     document::required(value, field, at).map_err(plan_document)
 }
 
-/// Reads an optional numeric field, refusing one that is present and malformed.
+/// Reads an optional unsigned numeric field, refusing one that is present and
+/// malformed.
 fn number(value: Option<&str>, field: &str, at: &str) -> Result<Option<u64>, GentooError> {
+    parse_number(value, field, at)
+}
+
+/// Reads an optional signed numeric field, refusing one that is present and
+/// malformed.
+///
+/// Signed because the field it reads is: an index states its `TIMESTAMP` as an
+/// unsigned number and a mirror may state one above `i64::MAX`, which
+/// [`Preamble::generated`](super::index::Preamble::generated) carries as the
+/// negative it became. The field is provenance and nothing rests on it, so a
+/// plan that recorded such a timestamp must read back as itself rather than
+/// refusing the whole document over a line no decision consults.
+fn signed_number(value: Option<&str>, field: &str, at: &str) -> Result<Option<i64>, GentooError> {
+    parse_number(value, field, at)
+}
+
+/// The reading both share, so a number's refusal is worded once.
+fn parse_number<T: std::str::FromStr>(
+    value: Option<&str>,
+    field: &str,
+    at: &str,
+) -> Result<Option<T>, GentooError> {
     match value {
         None => Ok(None),
         Some(text) => text.parse().map(Some).map_err(|_| {
@@ -425,6 +447,36 @@ mod tests {
                 .expect("it renders again"),
             document,
         );
+    }
+
+    #[test]
+    fn an_index_timestamp_round_trips_whatever_the_index_stated() {
+        // The field is signed because what it carries is: an index states its
+        // `TIMESTAMP` as an unsigned number and a mirror may state one above
+        // `i64::MAX`, which the preamble carries as the negative it became.
+        // Nothing rests on the value -- it is provenance and the module says so
+        // -- which makes refusing the whole document over it exactly the wrong
+        // response.
+        for stated in [Some(0), Some(-1), Some(i64::MIN), Some(i64::MAX), None] {
+            let plan = Plan {
+                index_timestamp: stated,
+                ..plan()
+            };
+            let document = plan.to_document().expect("the plan renders");
+            assert_eq!(
+                Plan::parse_document(&document)
+                    .unwrap_or_else(|err| panic!("{stated:?}: {err}"))
+                    .index_timestamp,
+                stated,
+            );
+        }
+        // A value that is not a number at all is still refused, because a
+        // document stating one was not written by this library.
+        let document = plan()
+            .to_document()
+            .expect("the plan renders")
+            .replace("Index-Timestamp: 1787145736", "Index-Timestamp: whenever");
+        assert!(Plan::parse_document(&document).is_err());
     }
 
     #[test]

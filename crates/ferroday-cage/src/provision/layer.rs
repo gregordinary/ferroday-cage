@@ -66,6 +66,17 @@ impl<'a> Rooting<'a> {
 
     /// A cage builder rooted for the tree at `staging`, which is the whole root
     /// or the increment's upper according to which rooting this is.
+    ///
+    /// The type's own allowance covers its variants and not this: an inherent
+    /// method is not the enum. It is dead in the same builds and for the same
+    /// reason — a `gentoo`-only build roots no cage during a bootstrap.
+    #[cfg_attr(
+        not(any(feature = "debian", feature = "alpine")),
+        allow(
+            dead_code,
+            reason = "the Gentoo layer roots no cage during a bootstrap"
+        )
+    )]
     pub(crate) fn builder(self, staging: &Path) -> CageBuilder {
         match self {
             Rooting::Whole => Cage::builder().rootfs(staging),

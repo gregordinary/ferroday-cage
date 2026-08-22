@@ -130,6 +130,7 @@ use rustix::process::Signal;
 use rustix::termios::{self, SpecialCodeIndex};
 
 use crate::error::Error;
+use crate::mechanism::frame;
 use crate::poll;
 use crate::running::Running;
 use crate::status::ExitStatus;
@@ -493,21 +494,12 @@ fn flush_pending(pty: &Pty, pending: &mut Vec<u8>) -> Result<(), RelayError> {
 /// non-blocking fails the session with `EAGAIN` rather than being spun on: the
 /// relay states that this direction blocks, and a caller that arranged otherwise
 /// has arranged something the loop cannot honour.
-fn write_all(output: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), RelayError> {
-    while !bytes.is_empty() {
-        match rustix::io::write(output, bytes) {
-            Ok(0) => {
-                return Err(RelayError::io(
-                    "writing to the caller's terminal",
-                    io::Error::from(io::ErrorKind::WriteZero),
-                ));
-            }
-            Ok(written) => bytes = &bytes[written..],
-            Err(Errno::INTR) => {}
-            Err(errno) => return Err(RelayError::at("writing to the caller's terminal")(errno)),
-        }
-    }
-    Ok(())
+///
+/// The loop over short writes is [`frame::write_full`]'s, which is where this
+/// crate answers "write all of these bytes to a descriptor, retrying `EINTR`".
+/// All that is left here is the step this failure names.
+fn write_all(output: BorrowedFd<'_>, bytes: &[u8]) -> Result<(), RelayError> {
+    frame::write_full(output, bytes).map_err(RelayError::at("writing to the caller's terminal"))
 }
 
 /// The replica's current end-of-file character.

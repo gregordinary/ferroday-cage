@@ -40,13 +40,10 @@
 
 use std::path::Path;
 
-use super::GentooError;
-use super::atom::Candidate;
+use super::atom::{self, Candidate};
 use super::version;
+use super::{DB_DIR, GentooError};
 use crate::provision::rooted::Rooted;
-
-/// Where portage keeps its database inside a root.
-const DB_DIR: &str = "var/db/pkg";
 
 /// The file inside an entry naming its slot.
 const SLOT_FILE: &str = "SLOT";
@@ -140,32 +137,18 @@ impl Candidate for InstalledPackage {
     }
 
     fn use_flag(&self, flag: &str) -> Option<bool> {
-        // The same rule the index's records answer by, and it has to be: an
-        // atom is one grammar, and a root that answered a USE dependency
-        // differently from the archive would reinstall what it already has.
+        // The index's records answer through the same function, which is what
+        // keeps the two ends of resolution reading one grammar.
         //
-        // Reading `IUSE_EFFECTIVE` is what makes that work, and leaving it out
-        // is not a small loss. Every `dev-perl` package depends on
+        // What is this end's own is which file fills `iuse`. Reading
+        // `IUSE_EFFECTIVE` rather than `IUSE` is not a small difference: every
+        // `dev-perl` package depends on
         // `>=dev-lang/perl-5.38.2-r3[-perl_features_debug,...]` with no
         // `(+)`/`(-)` default, and a stage3's perl carries none of those flags
-        // in its `USE` and all of them in its `IUSE`. Without the second file
-        // the atom cannot be answered, and a root that already has perl
-        // installs it again.
-        if self
-            .use_flags
-            .split_ascii_whitespace()
-            .any(|held| held == flag)
-        {
-            Some(true)
-        } else if self
-            .iuse
-            .split_ascii_whitespace()
-            .any(|held| held.trim_start_matches(['+', '-']) == flag)
-        {
-            Some(false)
-        } else {
-            None
-        }
+        // in its `USE` and all of them in its `IUSE_EFFECTIVE`. Without the
+        // second file the atom cannot be answered, and a root that already has
+        // perl installs it again.
+        atom::use_flag(&self.use_flags, &self.iuse, flag)
     }
 }
 
@@ -205,14 +188,6 @@ impl Installed {
             .filter(move |package| package.name == name)
     }
 
-    /// Whether the root holds `name` in any slot or version.
-    ///
-    /// Asked when an atom cannot be satisfied, to tell a package the archive
-    /// does not publish from one it publishes in a shape the atom refuses.
-    pub(super) fn holds(&self, name: &str) -> bool {
-        self.packages.iter().any(|package| package.name == name)
-    }
-
     /// A set of packages spelled out, for a test that needs a root without a
     /// tree to read one from.
     ///
@@ -236,12 +211,24 @@ impl Installed {
     }
 
     /// Puts the entries in the order the type promises.
+    ///
+    /// The version is the last tiebreak and is compared as a version rather than
+    /// as text, through the layer's own comparator. Only determinism rests on
+    /// it — the type promises `category/name` and then slot, and two entries
+    /// reaching the third key differ only in version — but a root holding
+    /// `1.9` and `1.10` of one package in one slot is a root portage can
+    /// produce, and reporting them the wrong way round would be a listing a
+    /// reader has to distrust. A version the format does not define falls back
+    /// to text, which orders it stably rather than losing it.
     fn sorted(mut packages: Vec<InstalledPackage>) -> Installed {
         packages.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
                 .then_with(|| a.slot.cmp(&b.slot))
-                .then_with(|| a.version.cmp(&b.version))
+                .then_with(|| {
+                    version::compare(&a.version, &b.version)
+                        .unwrap_or_else(|| a.version.cmp(&b.version))
+                })
         });
         Installed { packages }
     }
@@ -577,8 +564,8 @@ mod tests {
             .map(InstalledPackage::slot)
             .collect();
         assert_eq!(util, ["0", "1"]);
-        assert!(merged.holds("dev-vcs/git"));
-        assert!(merged.holds("app-crypt/pinentry"));
+        assert!(merged.under("dev-vcs/git").next().is_some());
+        assert!(merged.under("app-crypt/pinentry").next().is_some());
     }
 
     #[test]

@@ -64,8 +64,17 @@ consumer upgrading can skip it.
 
 - `GentooError` gains `Index`, `Container`, `Database`, `PlanDocument` and
   `Resolve`, and `GentooEvent` gains `Index`, `Planned`, `Merging`,
-  `DependencyCycle`, `Unsatisfiable` and `Conflict`. Both are
+  `DependencyCycle`, `Unsatisfiable`, `Conflict` and `Occupied`. Both are
   `#[non_exhaustive]`, so this is additive.
+
+  `Occupied` is the refusal a closure earns by constraining one package from
+  two directions at once. Portage keeps one instance per `(package, slot)` and
+  reports a root holding two as a conflict, so a resolution that would produce
+  one is refused with both builds named rather than merged — which would lay
+  two images down with the second overwriting the first's shared paths, and
+  report success. Two *slots* of one package are not that: the archive
+  publishes `dev-lang/python` in several and Gentoo installs them side by side,
+  and the install order carries an edge to each.
 
 - `fcage` gains `--gentoo-binhost`, `--gentoo-install`, `--gentoo-prefer-use`
   and `--gentoo-plan` on a provisioning command line, and two listings that
@@ -73,7 +82,20 @@ consumer upgrading can skip it.
   publishes, and `--gentoo-installed` prints what a root already has.
 
 - A `gentoo-binhost` example provisions a stage3, installs prebuilt packages
-  into it, and runs a command against the result.
+  into it, and runs a command against the result. `--plan` writes the resolved
+  plan to standard output and `--plan-file` installs one written earlier, which
+  is the round trip the plan format exists for.
+
+- `md-5` is a new direct dependency of the `gentoo` feature. Portage records an
+  MD5 per installed file in a package's `CONTENTS`, so it can tell a file that
+  has been edited since it was merged from one that has not, and another in
+  `BINPKGMD5` naming the binary package an entry came from. It is bookkeeping
+  and never a trust decision: nothing in this crate compares an MD5 to decide
+  whether to accept bytes, and what holds a container to Gentoo is the
+  cleartext-signed `Manifest` inside it, over SHA-512. A `gentoo` build gains no
+  crate by taking it directly, since rPGP already pulled it in transitively —
+  the same standing `rsa`, `sha1`, `pkcs8` and `spki` have for the Alpine
+  layer.
 
 - `relay` drives the caller's side of an interactive terminal session:
   `relay::Relay` is the byte loop between the caller's terminal and the
@@ -100,6 +122,15 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- `Signals` documents what dropping the handle costs. Nothing restores the
+  process's signal mask — the type says why, and the reasoning is unchanged —
+  so a dropped handle leaves the eight relayed signals blocked with nowhere to
+  be read from, and the process then ignores `SIGINT`, `SIGTERM`, `SIGHUP` and
+  `SIGQUIT` entirely. For a program whose whole job is one session the handle
+  lives to process exit and the question does not arise; for a library consumer
+  relaying a session inside a longer-lived program, holding it for the
+  program's life is the shape to build.
+
 - `Fetch` and `FetchRequest::url` document that a URL's scheme compares
   case-insensitively (RFC 3986 §3.1). `HttpFetch` has compared it so since
   0.3.0, and a consumer's transport that routes on the scheme — TLS in front
@@ -108,6 +139,34 @@ consumer upgrading can skip it.
   TLS. The rule was stated only on the crate's internal scheme extractor.
 
 ### Internal
+
+- A binary package's download is bounded by this layer's own ceiling as well as
+  by the size the index published for it. The index's number is unsigned and
+  nothing signs the index, so it can be wrong in both directions and only one
+  of them fails closed: understated it stops the download short, overstated it
+  merely relaxes the bound. The stage3's pinned-build path has carried a
+  ceiling of its own for the same reason, and the binary-package path is
+  permanently in that position.
+
+- `GentooBuilder::build` refuses a plan whose architecture is not the builder's,
+  and one whose binhost the builder contradicts. The install wave composed the
+  builder's architecture with the plan's binhost, so a mismatch fetched a
+  directory neither of them names and reported a 404 against a mirror that was
+  spelled correctly.
+
+- A named pipe in a package's image is registered as portage's own `fif` line
+  rather than as a file with a digest. Digesting one means opening it, and
+  opening a fifo for reading blocks until something opens the write end, which
+  inside a provisioning run nothing does.
+
+- An atom for a package the binhost publishes in no version names what the root
+  has of it. That is the `app-crypt/pinentry` shape the layer's own
+  documentation builds its case on, and the refusal named nothing at all where
+  the root held the package.
+
+- A download that cannot stage, write or publish names what it was downloading.
+  The stage3 and every binary package share one download path, whose three
+  diagnostics named a stage3 whichever of the two had failed.
 
 - `fcage --terminal` drives the library's relay rather than a copy of its own.
   Its behaviour is unchanged, down to the exit codes and the restoration

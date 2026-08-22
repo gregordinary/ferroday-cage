@@ -183,6 +183,14 @@ impl Rooted {
     /// An absent directory is an empty listing rather than a failure: the
     /// question these callers ask is what is there, and nothing is a legitimate
     /// answer to it.
+    ///
+    /// Enumerating a tree is the Gentoo layer's alone — its package database is
+    /// a directory of directories, where Debian's and Alpine's are files whose
+    /// names the layer already knows — so a build without that feature has no
+    /// caller, and neither has [`open_read_dir`](Self::open_read_dir) below it.
+    /// The module's own blanket allowance does not cover the pair, since they
+    /// are dead under `debian` as well.
+    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
     pub(crate) fn directories(&self, relative: impl AsRef<Path>) -> io::Result<Vec<Vec<u8>>> {
         let components = components(relative.as_ref())?;
         let dir = match self.open_read_dir(&components) {
@@ -361,6 +369,10 @@ impl Rooted {
     /// `O_RDONLY` where [`open_dir`](Self::open_dir) takes `O_PATH`: an
     /// `O_PATH` descriptor anchors an `*at` call and cannot be handed to
     /// `getdents`.
+    ///
+    /// [`directories`](Self::directories) is its only caller, so it is dead in
+    /// the same builds and gated the same way.
+    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
     fn open_read_dir(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
         let path = if components.is_empty() {
             CString::new(&b"."[..])

@@ -151,10 +151,11 @@ pub(crate) fn required(value: Option<&str>, field: &str, at: &str) -> Result<Str
 
 /// Reads a space-separated list field, absent or empty giving no entries.
 ///
-/// The Gentoo layer's plan carries no list field: its stanzas name one package
-/// each, and a dependency closure is stanzas rather than a list. So a build of
-/// that layer alone has no caller.
-#[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+/// Only the Debian layer's plan carries a list field — an archive's components,
+/// and the keys that sign it. Alpine's names one repository per stanza and
+/// Gentoo's one package per stanza, and a dependency closure is stanzas rather
+/// than a list, so a build of either alone has no caller.
+#[cfg_attr(not(feature = "debian"), allow(dead_code))]
 pub(crate) fn list(value: Option<&str>) -> Vec<String> {
     value
         .unwrap_or_default()
@@ -213,10 +214,12 @@ impl Draft {
 
     /// Adds a field whose value may be empty, where empty is itself the answer.
     ///
-    /// The Gentoo layer's plan has no such field — every value it writes either
-    /// carries something or is absent — so a build of that layer alone has no
-    /// caller, and neither has [`put_list`](Self::put_list) below it.
-    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+    /// Only the Debian layer's plan has such a field: an unsigned repository's
+    /// `Signed-By` is empty and means it. The Alpine and Gentoo plans write
+    /// every value as something or as nothing at all, so a build without
+    /// `debian` has no caller, and neither has [`put_list`](Self::put_list)
+    /// below it.
+    #[cfg_attr(not(feature = "debian"), allow(dead_code))]
     pub(crate) fn put_allowing_empty(&mut self, name: &'static str, value: &str) {
         self.fields.push(Field {
             name: Name::Known(name),
@@ -234,7 +237,7 @@ impl Draft {
     }
 
     /// Adds a space-separated list field, which may be empty.
-    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+    #[cfg_attr(not(feature = "debian"), allow(dead_code))]
     pub(crate) fn put_list(&mut self, name: &'static str, values: &[String]) {
         self.put_allowing_empty(name, &values.join(" "));
     }

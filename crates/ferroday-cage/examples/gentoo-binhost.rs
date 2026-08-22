@@ -64,6 +64,23 @@
 //! it stands. With `--plan` it resolves against `--rootfs` and prints the plan
 //! document, fetching the index but downloading no package and merging nothing.
 //!
+//! # Resolve now, replay later
+//!
+//! `--plan` and `--plan-file` are the two halves of the plan format's whole
+//! argument, and this example has both so the round trip can be run:
+//!
+//! ```sh
+//! gentoo-binhost --rootfs ./gentoo --install dev-vcs/git --plan > binhost.plan
+//! gentoo-binhost --rootfs ./elsewhere --plan-file binhost.plan -- git --version
+//! ```
+//!
+//! A plan carries the build id, path, size and digest of every package and the
+//! order they merge in, so the replay fetches no index and makes no choice. The
+//! binhost keeps a published version far longer than the five weeks the stage3
+//! autobuilds tree keeps a build, so a plan replays for as long as the archive
+//! carries what it names. It supersedes `--install` and `--prefer-use`, which
+//! describe a resolution that no longer happens.
+//!
 //! ```text
 //! --rootfs DIR         Where the root filesystem lives (required)
 //! --arch ARCH          Architecture to provision (default: amd64)
@@ -74,6 +91,7 @@
 //!                      and without the ones written -flag; repeatable
 //! --cache DIR          Keep the stage3 and the packages here across runs
 //! --plan               Resolve against --rootfs, print the plan, and exit
+//! --plan-file FILE     Install exactly what this plan names, resolving nothing
 //! --help               Print this help and exit
 //! ```
 
@@ -81,7 +99,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent};
+use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent, Plan};
 use ferroday_cage::provision::{Provision, ProvisionEvent};
 use ferroday_cage::{Cage, Error};
 
@@ -130,6 +148,9 @@ struct Options {
     cache: Option<PathBuf>,
     /// Resolve and print, installing nothing.
     plan_only: bool,
+    /// A plan document to install, where one was named. Supersedes the atoms
+    /// and the preferences, which describe a resolution that no longer happens.
+    plan_file: Option<PathBuf>,
     /// The command to run in the finished sandbox, where one was given.
     command: Vec<OsString>,
 }
@@ -144,6 +165,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, String
     let mut prefer_use: Vec<String> = Vec::new();
     let mut cache: Option<PathBuf> = None;
     let mut plan_only = false;
+    let mut plan_file: Option<PathBuf> = None;
     let mut command: Vec<OsString> = Vec::new();
     let mut args = args.peekable();
 
@@ -192,6 +214,10 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, String
             cache = Some(PathBuf::from(value));
         } else if arg == "--plan" {
             plan_only = true;
+        } else if arg == "--plan-file" {
+            plan_file = Some(PathBuf::from(value_for("--plan-file", &mut args)?));
+        } else if let Some(value) = flag_value(&arg, b"--plan-file=") {
+            plan_file = Some(PathBuf::from(value));
         } else {
             return Err(format!("unknown option {}", arg.to_string_lossy()));
         }
@@ -200,6 +226,9 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, String
     let Some(rootfs) = rootfs else {
         return Err("--rootfs is required".to_string());
     };
+    if plan_only && plan_file.is_some() {
+        return Err("--plan resolves and --plan-file replays; name one or the other".to_string());
+    }
     Ok(Some(Options {
         rootfs,
         architecture,
@@ -209,6 +238,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, String
         prefer_use,
         cache,
         plan_only,
+        plan_file,
         command,
     }))
 }
@@ -220,6 +250,15 @@ fn run(options: Options) -> Result<ExitCode, String> {
         .binhost(&options.binhost)
         .install(&options.install)
         .prefer_use(&options.prefer_use);
+    if let Some(path) = &options.plan_file {
+        // The other half of `--plan`. A plan names every container and the
+        // order they merge in, so a run given one fetches no index and makes no
+        // choice -- and the builder's own architecture and binhost have to be
+        // the ones it was resolved for, which `build()` checks.
+        let document = std::fs::read_to_string(path)
+            .map_err(|err| format!("reading {}: {err}", path.display()))?;
+        builder = builder.plan(Plan::parse_document(&document).map_err(|err| err.to_string())?);
+    }
     if let Some(cache) = &options.cache {
         builder = builder.cache_dir(cache);
     }
@@ -330,6 +369,9 @@ Options:
                        unsatisfiable
   --cache DIR          Keep the stage3 and the packages here across runs
   --plan               Resolve against --rootfs, print the plan, and exit
+  --plan-file FILE     Install exactly what this plan names, resolving nothing.
+                       The other half of --plan: a plan replays for as long as
+                       the binhost carries what it names
   --help               Print this help and exit",
     );
 }
