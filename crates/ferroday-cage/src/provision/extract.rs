@@ -114,6 +114,9 @@ pub(crate) struct Extraction {
     /// Whether [`root_mode`](Self::root_mode) stated it, in which case a `./`
     /// entry does not replace it.
     root_mode_fixed: bool,
+    /// The directory inside the archive that stands for the extraction root,
+    /// where the archive wraps its tree in one.
+    under: Option<Vec<u8>>,
 }
 
 impl Extraction {
@@ -130,6 +133,7 @@ impl Extraction {
             dir_meta: HashMap::new(),
             root_meta: None,
             root_mode_fixed: false,
+            under: None,
         })
     }
 
@@ -154,6 +158,24 @@ impl Extraction {
         self
     }
 
+    /// Treats `prefix` inside the archive as the extraction root.
+    ///
+    /// An archive that wraps the tree it describes in a directory needs this: a
+    /// Gentoo binary package's image archive holds `image/usr/bin/git`, and
+    /// what belongs at the root is `usr/bin/git`. Entries outside the prefix
+    /// are not extracted, so the wrapper's own entry — and anything a container
+    /// put beside it — lands nowhere.
+    ///
+    /// The prefix is stripped before the path is validated, so what the
+    /// containment rules see is the path as it will be written, and an entry
+    /// that escapes the prefix is refused by the same check that refuses one
+    /// escaping the root.
+    #[cfg(feature = "gentoo")]
+    pub(crate) fn under(mut self, prefix: &[u8]) -> Extraction {
+        self.under = Some(prefix.to_vec());
+        self
+    }
+
     /// Extracts every entry of `archive` into the root.
     ///
     /// `on_entry` is called for each entry that is extracted, with its
@@ -172,7 +194,7 @@ impl Extraction {
         on_entry: &mut OnEntry<'_>,
     ) -> Result<(), ProvisionError> {
         let root = self.root_fd.as_fd();
-        while let Some(entry) = archive.next_entry()? {
+        while let Some(mut entry) = archive.next_entry()? {
             match entry.typeflag {
                 // Unextractable without privilege; the sandbox provides its
                 // own /dev. GNU volume labels are archive metadata.
@@ -187,7 +209,37 @@ impl Extraction {
                 _ => {}
             }
 
-            let components = validate_path(&entry.path, &entry.path, "path")?;
+            // A prefixed archive names the extraction root by a directory of
+            // its own, so what is validated and written is the path below it.
+            let path = match &self.under {
+                None => entry.path.as_slice(),
+                Some(prefix) => match strip_prefix(&entry.path, prefix) {
+                    Some(rest) => rest,
+                    // The wrapper's own entry, and anything outside it. The
+                    // archive is read past either, so what follows is
+                    // unaffected.
+                    None => continue,
+                },
+            };
+            let components = validate_path(path, &entry.path, "path")?;
+            // A hardlink names another entry of the same archive, so its target
+            // carries the wrapper too and has to lose it the same way. One that
+            // does not is naming something the archive is not laying down, and
+            // resolving it against the root would point it at whatever happens
+            // to be there.
+            if entry.typeflag == b'1'
+                && let Some(prefix) = &self.under
+            {
+                match strip_prefix(&entry.link_target, prefix) {
+                    Some(rest) => entry.link_target = rest.to_vec(),
+                    None => {
+                        return Err(entry_unsafe(
+                            &entry.path,
+                            "the hardlink target is outside the archive's own root directory",
+                        ));
+                    }
+                }
+            }
             if components.is_empty() {
                 // The `./` entry: metadata for the extraction root itself,
                 // unless the caller fixed the root's mode instead.
@@ -246,6 +298,22 @@ pub(crate) fn extract_archive<R: Read>(
     let mut extraction = Extraction::new(root)?;
     extraction.extract(archive, on_entry)?;
     extraction.finalize(root)
+}
+
+/// The part of `path` below `prefix`, or `None` where it is not under it.
+///
+/// The prefix names a directory, so a path that merely begins with those bytes
+/// is not under it: `image2/x` is not inside `image/`. The prefix's own entry
+/// — `image/`, or `image` — yields the empty path, which is the extraction root
+/// and is what the caller's own `./` handling answers.
+fn strip_prefix<'p>(path: &'p [u8], prefix: &[u8]) -> Option<&'p [u8]> {
+    let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
+    let rest = path.strip_prefix(prefix)?;
+    match rest.first() {
+        None => Some(rest),
+        Some(b'/') => Some(&rest[1..]),
+        Some(_) => None,
+    }
 }
 
 /// Splits and validates an entry path: relative, no `..`, no NUL.
@@ -1224,5 +1292,33 @@ mod tests {
             b"original\n",
             "the outside target was not written through",
         );
+    }
+}
+
+// The prefix strip serves the Gentoo layer's image archives, which wrap the
+// tree they describe in a directory. It sits apart from the overlay tests above
+// because those need the Debian feature and this needs none.
+#[cfg(test)]
+mod prefix_tests {
+    use super::strip_prefix;
+
+    #[test]
+    fn a_wrapper_prefix_is_stripped_only_from_paths_actually_under_it() {
+        // The prefix names a directory, so a path that merely begins with those
+        // bytes is not inside it. Reading `image2/x` as under `image/` would
+        // write one package's files into another's tree.
+        for prefix in [&b"image/"[..], b"image"] {
+            assert_eq!(
+                strip_prefix(b"image/usr/bin/git", prefix),
+                Some(&b"usr/bin/git"[..]),
+            );
+            // The wrapper's own entry, either way it is spelled, names the
+            // extraction root.
+            assert_eq!(strip_prefix(b"image/", prefix), Some(&b""[..]));
+            assert_eq!(strip_prefix(b"image", prefix), Some(&b""[..]));
+            for outside in [&b"image2/x"[..], b"images", b"other/x", b"", b"/image/x"] {
+                assert_eq!(strip_prefix(outside, prefix), None, "{outside:?}");
+            }
+        }
     }
 }

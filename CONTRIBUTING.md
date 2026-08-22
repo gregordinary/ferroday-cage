@@ -301,6 +301,9 @@ the question is not already here under different words.
 | What may one path component contain? | `path::is_ordinary_component` |
 | Open a directory the kernel keeps inside a tree | `provision::containment::open_dir` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
+| How do two Gentoo versions compare? | `provision::gentoo::version::compare` |
+| Does this build satisfy this dependency atom? | `provision::gentoo::atom::Atom::matches` |
+| What does a Gentoo root already have installed? | `provision::gentoo::installed` |
 | What may a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | What may a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |

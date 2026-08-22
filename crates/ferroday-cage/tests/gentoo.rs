@@ -33,6 +33,9 @@ const REQUIRE_GATE: &str = "FERRODAY_CAGE_REQUIRE_NETWORK_TEST";
 const ARCHITECTURE: &str = "amd64";
 const VARIANT: &str = "amd64-openrc";
 
+/// The binary-package tree that goes with them.
+const BINHOST: &str = "x86-64";
+
 /// Returns `false` and prints a skip note when the network tests are not
 /// enabled.
 fn network_enabled() -> bool {
@@ -173,4 +176,219 @@ fn a_bootstrap_produces_a_root_gentoo_recognizes() {
         Provisioned::Existing,
     );
     provision::remove(&root).expect("the root removes");
+}
+
+#[test]
+fn the_binhost_publishes_the_index_this_layer_reads() {
+    if !network_enabled() {
+        return;
+    }
+    let mut gentoo = Gentoo::builder(ARCHITECTURE)
+        .binhost(BINHOST)
+        .build()
+        .expect("the architecture and the binhost are usable coordinates");
+    let catalogue = gentoo
+        .packages()
+        .expect("the archive serves an index this layer can read");
+
+    // The shape rather than a number: the archive moves, and what would be
+    // worth noticing is it stopping being a package set at all.
+    assert!(
+        catalogue.len() > 5_000,
+        "the binhost publishes thousands of packages, not {}",
+        catalogue.len(),
+    );
+    // More builds than names, because a version is published more than once --
+    // which is the finding the whole selection rule rests on.
+    assert!(
+        catalogue.builds() > catalogue.len(),
+        "{} builds over {} names",
+        catalogue.builds(),
+        catalogue.len(),
+    );
+    assert!(
+        catalogue.contains("dev-vcs/git"),
+        "the binhost publishes git"
+    );
+    assert!(
+        catalogue.versions("dev-vcs/git").next().is_some(),
+        "git is published in some version",
+    );
+    // The coverage statement, held to: the binhost installs most things and
+    // not everything, and this is one of the ones it does not.
+    assert!(
+        !catalogue.contains("app-misc/jq"),
+        "the binhost has begun publishing app-misc/jq, so the guide's coverage \
+         example needs a different package",
+    );
+    // The preamble's own target triple, which is the one field of it that
+    // tracks the packages rather than the machine that generated the index.
+    assert_eq!(catalogue.chost(), Some("x86_64-pc-linux-gnu"));
+}
+
+#[test]
+fn an_install_wave_merges_packages_portage_reads_back() {
+    if !network_enabled() {
+        return;
+    }
+    let root = common::scratch_dir("gentoo-binhost").join("rootfs");
+    let mut gentoo = Gentoo::builder(ARCHITECTURE)
+        .variant(VARIANT)
+        .binhost(BINHOST)
+        // Small, and it exercises the shapes that matter: a closure of several
+        // packages, a file and a symbolic link in each image, and a dependency
+        // the stage3 already answers.
+        .install(["app-editors/vim"])
+        .cache_dir(common::download_cache("gentoo"))
+        .build()
+        .expect("the builder accepts an ordinary configuration");
+    assert_eq!(
+        provision::ensure(&root, &mut gentoo).expect("the stage3 and the packages install"),
+        Provisioned::Created,
+    );
+
+    // The files landed, with the image archive's own wrapper directory
+    // stripped rather than laid down.
+    assert!(root.join("usr/bin/vim").exists(), "vim is merged");
+    assert!(!root.join("image").exists(), "the wrapper is not a path");
+
+    // And the database describes them. Read back through this layer's own
+    // reader, which is the same one a later resolution against this root would
+    // use -- so what this asserts is that a second run would see the packages
+    // as installed rather than install them again.
+    let installed = ferroday_cage::provision::gentoo::installed(&root).expect("the database reads");
+    let vim = installed
+        .packages()
+        .find(|package| package.name() == "app-editors/vim")
+        .expect("vim is registered");
+    assert!(!vim.version().is_empty());
+    assert!(!vim.slot().is_empty());
+
+    // A stage3 arrives with 296 entries, so the merged set is larger than what
+    // was asked for and much larger than what was installed.
+    assert!(
+        installed.len() > 296,
+        "the stage3's own packages are still registered: {}",
+        installed.len(),
+    );
+
+    // The entry carries what portage computes at merge as well as what the
+    // container shipped, which is the whole of what makes it an entry.
+    let entry = root.join("var/db/pkg/app-editors").join(format!(
+        "{}-{}",
+        vim.name().rsplit('/').next().expect("a package name"),
+        vim.version(),
+    ));
+    for file in [
+        "CONTENTS",
+        "COUNTER",
+        "BINPKGMD5",
+        "SLOT",
+        "USE",
+        "CATEGORY",
+    ] {
+        assert!(entry.join(file).exists(), "the entry holds {file}");
+    }
+    // Every CONTENTS line names a path that is actually there, which is what
+    // portage's own `qcheck` walks the file to do.
+    let contents = std::fs::read_to_string(entry.join("CONTENTS")).expect("CONTENTS reads");
+    assert!(!contents.is_empty());
+    for line in contents.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(kind), Some(path)) = (fields.next(), fields.next()) else {
+            panic!("a CONTENTS line names no path: {line}");
+        };
+        assert!(
+            matches!(kind, "dir" | "obj" | "sym"),
+            "an unknown CONTENTS entry kind: {line}",
+        );
+        let path = root.join(path.trim_start_matches('/'));
+        assert!(
+            path.symlink_metadata().is_ok(),
+            "CONTENTS names {} and it is not there",
+            path.display(),
+        );
+    }
+    // The merge ordinal continued the stage3's own sequence rather than
+    // starting again, so no two entries share one.
+    let counter: u64 = std::fs::read_to_string(entry.join("COUNTER"))
+        .expect("COUNTER reads")
+        .trim()
+        .parse()
+        .expect("COUNTER is a number");
+    assert!(counter > 1, "the ordinal continues the stage3's: {counter}");
+
+    provision::remove(&root).expect("the root removes");
+}
+
+#[test]
+fn a_plan_replays_what_a_resolution_chose() {
+    if !network_enabled() {
+        return;
+    }
+    // A resolution needs a root to start from, so this reuses the bootstrap's
+    // shape: provision a stage3, then ask what installing into it would do.
+    let root = common::scratch_dir("gentoo-plan").join("rootfs");
+    let mut stage3 = Gentoo::builder(ARCHITECTURE)
+        .variant(VARIANT)
+        .cache_dir(common::download_cache("gentoo"))
+        .build()
+        .expect("the builder accepts an ordinary configuration");
+    provision::ensure(&root, &mut stage3).expect("the stage3 verifies and extracts");
+
+    let mut gentoo = Gentoo::builder(ARCHITECTURE)
+        .binhost(BINHOST)
+        .install(["dev-vcs/git"])
+        .build()
+        .expect("the builder accepts an ordinary configuration");
+    let plan = gentoo
+        .resolve_packages(&root)
+        .expect("the binhost can satisfy git against a stage3");
+    assert!(!plan.packages.is_empty());
+    assert_eq!(plan.binhost, BINHOST);
+
+    // The measured shape: a stage3 answers most of git's closure, so what is
+    // left is a dozen packages rather than a hundred.
+    assert!(
+        plan.packages.len() < 40,
+        "resolution starts from the root: {} packages",
+        plan.packages.len(),
+    );
+    // git merges last, because everything else is what it needs.
+    assert_eq!(plan.packages.last().expect("a package").name, "dev-vcs/git",);
+
+    // And the plan round-trips through its document, which is what makes it a
+    // pin worth committing.
+    let document = plan.to_document().expect("the plan renders");
+    let kept = ferroday_cage::provision::gentoo::Plan::parse_document(&document)
+        .expect("the document reads back");
+    assert_eq!(kept, plan);
+
+    provision::remove(&root).expect("the root removes");
+}
+
+#[test]
+fn an_atom_the_binhost_cannot_satisfy_says_which_wall_it_hit() {
+    if !network_enabled() {
+        return;
+    }
+    // Against an empty root rather than a stage3, which is a real answer as
+    // well as a cheap one: with nothing installed, git's closure reaches an
+    // `app-crypt/pinentry` the binhost publishes in no version, and that is the
+    // finding the whole root-first design rests on.
+    let root = common::scratch_dir("gentoo-unsatisfiable").join("empty");
+    std::fs::create_dir_all(&root).expect("the directory is created");
+    let mut gentoo = Gentoo::builder(ARCHITECTURE)
+        .binhost(BINHOST)
+        .install(["app-misc/jq"])
+        .build()
+        .expect("the builder accepts an ordinary configuration");
+    let error = gentoo
+        .resolve_packages(&root)
+        .expect_err("the binhost publishes no app-misc/jq");
+    let message = error.to_string();
+    assert!(
+        message.contains("app-misc/jq") && message.contains("published by this binhost"),
+        "the refusal names the atom and the wall: {message}",
+    );
 }

@@ -151,13 +151,34 @@ Provisioning the root filesystem:
                         archive keeps about five weeks of builds, so a pinned
                         id resolves against it for roughly a month and against
                         a populated --gentoo-cache indefinitely
+  --gentoo-binhost SUBARCH
+                        Install binary packages from the binhost tree for
+                        SUBARCH ('x86-64', 'x86-64-v3', 'x86-64_hardened',
+                        'x32'). There is no default: nothing signed enumerates
+                        the trees, so a wrong one is a 404 rather than a
+                        silently different userland
+  --gentoo-install ATOM Install ATOM and its runtime dependencies from the
+                        binhost, in Gentoo's own dependency grammar:
+                        'dev-vcs/git', '>=dev-lang/python-3.12',
+                        'dev-libs/openssl:0'. Repeatable. A USE dependency in
+                        an atom is a constraint -- 'dev-vcs/git[keyring]'
+                        refuses to install a build without the flag
+  --gentoo-prefer-use FLAGS
+                        Prefer builds carrying these space-separated USE flags,
+                        and builds without the ones written '-flag'. A
+                        preference, not a constraint: it reorders the candidate
+                        builds and cannot make an atom unsatisfiable. Repeatable
+  --gentoo-plan FILE    Install exactly the packages FILE names, resolving
+                        nothing. FILE is a plan document a previous run wrote;
+                        it supersedes --gentoo-install and --gentoo-prefer-use
   --gentoo-mirror URL   Archive mirror (default:
                         http://distfiles.gentoo.org)
   --gentoo-mirror-fallback URL
                         A further URL for the same archive, tried when the
                         primary mirror does not serve a resource (repeatable,
                         in order)
-  --gentoo-cache DIR    Cache the downloaded stage3 in DIR, reused across runs
+  --gentoo-cache DIR    Cache the downloaded stage3 and binary packages in DIR,
+                        reused across runs
   --gentoo-max-pointer-age DAYS
                         Refuse a signed pointer document regenerated more than
                         DAYS ago (default: 30), or 'none' to accept one of any
@@ -169,6 +190,15 @@ Provisioning the root filesystem:
                         Print the stage3 variants ARCH publishes, from the
                         signed enumeration, and exit. Takes --gentoo-mirror,
                         --gentoo-mirror-fallback and --gentoo-max-pointer-age
+  --gentoo-packages ARCH
+                        Print what the binhost publishes for ARCH: every
+                        package name and its versions, and exit. Takes
+                        --gentoo-binhost, --gentoo-mirror and
+                        --gentoo-mirror-fallback
+  --gentoo-installed ROOT
+                        Print what the Gentoo root at ROOT already has
+                        installed, from its own package database, and exit.
+                        Reaches no network
   --gentoo-keyring-horizon
                         Print the vendored Gentoo keyring: every certificate,
                         whether it can still sign, and when its authority
@@ -409,6 +439,19 @@ enum Invocation {
         fallbacks: Vec<String>,
         max_pointer_age: Option<Option<u64>>,
     },
+    /// Print what the binhost publishes for an architecture.
+    GentooPackages {
+        architecture: String,
+        /// The sub-architecture tree, which has no default: nothing signed
+        /// enumerates them.
+        binhost: Option<String>,
+        mirror: Option<String>,
+        fallbacks: Vec<String>,
+    },
+    /// Print what a Gentoo root already has installed, from its own database.
+    GentooInstalled {
+        root: PathBuf,
+    },
     /// Print what each certificate of the vendored Gentoo keyring can still be
     /// trusted to do, and until when.
     GentooKeyring,
@@ -467,6 +510,10 @@ struct Options {
     alpine_repositories: Vec<AlpineRepositorySpec>,
     provision_gentoo: Option<String>,
     gentoo_variant: Option<String>,
+    gentoo_binhost: Option<String>,
+    gentoo_install: Vec<String>,
+    gentoo_prefer_use: Vec<String>,
+    gentoo_plan: Option<PathBuf>,
     gentoo_build_id: Option<String>,
     gentoo_mirror: Option<String>,
     gentoo_mirror_fallback: Vec<String>,
@@ -749,6 +796,18 @@ fn main() -> ExitCode {
             &fallbacks,
             max_pointer_age,
         ),
+        Ok(Invocation::GentooPackages {
+            architecture,
+            binhost,
+            mirror,
+            fallbacks,
+        }) => gentoo_packages(
+            &architecture,
+            binhost.as_deref(),
+            mirror.as_deref(),
+            &fallbacks,
+        ),
+        Ok(Invocation::GentooInstalled { root }) => gentoo_installed(&root),
         Ok(Invocation::GentooKeyring) => gentoo_keyring_horizon(),
         Ok(Invocation::Export {
             source,
@@ -784,6 +843,12 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         .unwrap_or(args.len())];
     if configuring.iter().any(|arg| names_gentoo_variants(arg)) {
         return parse_gentoo_variants(args);
+    }
+    if configuring.iter().any(|arg| names_gentoo_packages(arg)) {
+        return parse_gentoo_packages(args);
+    }
+    if configuring.iter().any(|arg| names_gentoo_installed(arg)) {
+        return parse_gentoo_installed(args);
     }
     if configuring
         .iter()
@@ -835,6 +900,10 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         alpine_mirror_fallback: Vec::new(),
         provision_gentoo: None,
         gentoo_variant: None,
+        gentoo_binhost: None,
+        gentoo_install: Vec::new(),
+        gentoo_prefer_use: Vec::new(),
+        gentoo_plan: None,
         gentoo_build_id: None,
         gentoo_mirror: None,
         gentoo_mirror_fallback: Vec::new(),
@@ -1217,6 +1286,37 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             options.gentoo_variant = Some(string_value("--gentoo-variant", &mut args)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-variant=") {
             options.gentoo_variant = Some(into_string("--gentoo-variant", value)?);
+        } else if arg == "--gentoo-binhost" {
+            options.gentoo_binhost = Some(string_value("--gentoo-binhost", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-binhost=") {
+            options.gentoo_binhost = Some(into_string("--gentoo-binhost", value)?);
+        } else if arg == "--gentoo-install" {
+            options
+                .gentoo_install
+                .push(string_value("--gentoo-install", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-install=") {
+            options
+                .gentoo_install
+                .push(into_string("--gentoo-install", value)?);
+        } else if arg == "--gentoo-prefer-use" {
+            options.gentoo_prefer_use.extend(
+                string_value("--gentoo-prefer-use", &mut args)?
+                    .split_ascii_whitespace()
+                    .map(str::to_string),
+            );
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-prefer-use=") {
+            options.gentoo_prefer_use.extend(
+                into_string("--gentoo-prefer-use", value)?
+                    .split_ascii_whitespace()
+                    .map(str::to_string),
+            );
+        } else if arg == "--gentoo-plan" {
+            options.gentoo_plan =
+                Some(PathBuf::from(args.next().ok_or_else(|| {
+                    "--gentoo-plan requires a value".to_string()
+                })?));
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-plan=") {
+            options.gentoo_plan = Some(PathBuf::from(value));
         } else if arg == "--gentoo-build-id" {
             options.gentoo_build_id = Some(string_value("--gentoo-build-id", &mut args)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-build-id=") {
@@ -1822,6 +1922,105 @@ fn parse_gentoo_keyring(args: Vec<OsString>) -> Result<Invocation, String> {
     Ok(Invocation::GentooKeyring)
 }
 
+/// Whether `arg` names the binhost listing flag, in either form.
+fn names_gentoo_packages(arg: &OsStr) -> bool {
+    arg == "--gentoo-packages" || arg.as_bytes().starts_with(b"--gentoo-packages=")
+}
+
+/// Parses a `--gentoo-packages` command line, excluding the program name.
+///
+/// A listing reads the binhost index and prints it, so it takes the
+/// architecture, the sub-architecture tree, and where to read them from. As
+/// with the other listing modes, every other flag configures a launch that does
+/// not happen here.
+fn parse_gentoo_packages(args: Vec<OsString>) -> Result<Invocation, String> {
+    if let Some(answer) = help_or_version(&args) {
+        return Ok(answer);
+    }
+    let mut architecture: Option<String> = None;
+    let mut binhost: Option<String> = None;
+    let mut mirror: Option<String> = None;
+    let mut fallbacks: Vec<String> = Vec::new();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "--gentoo-packages" {
+            architecture = Some(string_value("--gentoo-packages", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-packages=") {
+            architecture = Some(into_string("--gentoo-packages", value)?);
+        } else if arg == "--gentoo-binhost" {
+            binhost = Some(string_value("--gentoo-binhost", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-binhost=") {
+            binhost = Some(into_string("--gentoo-binhost", value)?);
+        } else if arg == "--gentoo-mirror" {
+            mirror = Some(string_value("--gentoo-mirror", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror=") {
+            mirror = Some(into_string("--gentoo-mirror", value)?);
+        } else if arg == "--gentoo-mirror-fallback" {
+            fallbacks.push(string_value("--gentoo-mirror-fallback", &mut args)?);
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror-fallback=") {
+            fallbacks.push(into_string("--gentoo-mirror-fallback", value)?);
+        } else {
+            return Err(mode_conflict(
+                &arg,
+                "--gentoo-packages",
+                &[
+                    "--gentoo-packages",
+                    "--gentoo-binhost",
+                    "--gentoo-mirror",
+                    "--gentoo-mirror-fallback",
+                ],
+            ));
+        }
+    }
+    match architecture {
+        Some(architecture) => Ok(Invocation::GentooPackages {
+            architecture,
+            binhost,
+            mirror,
+            fallbacks,
+        }),
+        None => Err("--gentoo-packages requires a value".to_string()),
+    }
+}
+
+/// Whether `arg` names the installed-set listing flag, in either form.
+fn names_gentoo_installed(arg: &OsStr) -> bool {
+    arg == "--gentoo-installed" || arg.as_bytes().starts_with(b"--gentoo-installed=")
+}
+
+/// Parses a `--gentoo-installed` command line, excluding the program name.
+///
+/// It reads a root's own package database and reaches nothing else, so it takes
+/// a path and no other flag.
+fn parse_gentoo_installed(args: Vec<OsString>) -> Result<Invocation, String> {
+    if let Some(answer) = help_or_version(&args) {
+        return Ok(answer);
+    }
+    let mut root: Option<PathBuf> = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--gentoo-installed" {
+            root =
+                Some(PathBuf::from(args.next().ok_or_else(|| {
+                    "--gentoo-installed requires a value".to_string()
+                })?));
+        } else if let Some(value) = flag_value(&arg, b"--gentoo-installed=") {
+            root = Some(PathBuf::from(value));
+        } else {
+            return Err(mode_conflict(
+                &arg,
+                "--gentoo-installed",
+                &["--gentoo-installed"],
+            ));
+        }
+    }
+    match root {
+        Some(root) => Ok(Invocation::GentooInstalled { root }),
+        None => Err("--gentoo-installed requires a value".to_string()),
+    }
+}
+
 /// Whether `arg` names the export flag, in either the separated or the
 /// `=`-joined form.
 fn names_export(arg: &OsStr) -> bool {
@@ -1947,6 +2146,10 @@ fn has_alpine_modifiers(options: &Options) -> bool {
 /// Whether any `--gentoo-*` modifier flag was given.
 fn has_gentoo_modifiers(options: &Options) -> bool {
     options.gentoo_variant.is_some()
+        || options.gentoo_binhost.is_some()
+        || !options.gentoo_install.is_empty()
+        || !options.gentoo_prefer_use.is_empty()
+        || options.gentoo_plan.is_some()
         || options.gentoo_build_id.is_some()
         || options.gentoo_mirror.is_some()
         || !options.gentoo_mirror_fallback.is_empty()
@@ -3576,18 +3779,37 @@ fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(
 /// Bootstraps a Gentoo rootfs from a signed stage3, printing progress to
 /// stderr.
 ///
-/// The shortest of the three: Gentoo publishes no package resolution for a
-/// stage3, so there is nothing here for a `--debian-*` or `--alpine-*`
-/// counterpart of an include set, a priority floor, or a plan to configure. What
-/// it takes instead is which variant to install and how current the signed
-/// enumeration naming it must be.
+/// A run is two waves where the other two layers have one of a different shape:
+/// the stage3 is extracted, and then the binary packages `--gentoo-install`
+/// names are resolved against the root that produced and merged into it. A
+/// command line that names no package does exactly the first, which is what a
+/// stage3 bootstrap has always been.
 fn provision_gentoo(architecture: &str, options: &Options, rootfs: &Path) -> Result<(), ExitCode> {
     use ferroday_cage::provision::ProvisionEvent;
-    use ferroday_cage::provision::gentoo::Gentoo;
+    use ferroday_cage::provision::gentoo::{Gentoo, Plan};
 
     let mut builder = Gentoo::builder(architecture);
     if let Some(variant) = &options.gentoo_variant {
         builder = builder.variant(variant);
+    }
+    if let Some(binhost) = &options.gentoo_binhost {
+        builder = builder.binhost(binhost);
+    }
+    if !options.gentoo_install.is_empty() {
+        builder = builder.install(&options.gentoo_install);
+    }
+    if !options.gentoo_prefer_use.is_empty() {
+        builder = builder.prefer_use(&options.gentoo_prefer_use);
+    }
+    if let Some(path) = &options.gentoo_plan {
+        let document = std::fs::read_to_string(path).map_err(|error| {
+            eprintln!("fcage: reading {}: {error}", path.display());
+            ExitCode::from(125)
+        })?;
+        builder = builder.plan(Plan::parse_document(&document).map_err(|error| {
+            eprintln!("fcage: {}: {error}", path.display());
+            ExitCode::from(125)
+        })?);
     }
     if let Some(build_id) = &options.gentoo_build_id {
         builder = builder.build_id(build_id);
@@ -3647,6 +3869,51 @@ fn print_gentoo_event(event: &ferroday_cage::provision::gentoo::GentooEvent<'_>)
         GentooEvent::Extracting { path, .. } => {
             eprintln!("fcage: extracting {}", path.display());
         }
+        GentooEvent::Index {
+            builds,
+            skipped,
+            generated,
+            ..
+        } => eprintln!(
+            "fcage: the binhost index names {builds} builds{}{}",
+            match skipped {
+                0 => String::new(),
+                skipped => format!(", {skipped} of which this layer cannot act on"),
+            },
+            generated.map_or_else(String::new, |at| format!(", generated at {at}")),
+        ),
+        GentooEvent::Planned {
+            packages, bytes, ..
+        } => eprintln!("fcage: installing {packages} packages ({bytes} bytes)"),
+        GentooEvent::Merging {
+            package, version, ..
+        } => eprintln!("fcage: merging {package}-{version}"),
+        GentooEvent::DependencyCycle { packages, .. } => eprintln!(
+            "fcage: a runtime dependency cycle among {} was broken to order the merge",
+            packages.join(", "),
+        ),
+        // Reported before the run fails, so a caller fixing an install list
+        // sees every atom the binhost cannot answer rather than the first.
+        GentooEvent::Unsatisfiable {
+            atom,
+            wanted_by,
+            reason,
+            ..
+        } => eprintln!("fcage: {wanted_by} requires {atom}, and no build {reason}"),
+        GentooEvent::Conflict {
+            atom,
+            stated_by,
+            blocks,
+            installed,
+            ..
+        } => eprintln!(
+            "fcage: {stated_by} blocks {blocks} with {atom}, which {}",
+            if *installed {
+                "the root already has"
+            } else {
+                "this same resolution would install"
+            },
+        ),
         _ => {}
     }
 }
@@ -3695,6 +3962,73 @@ fn gentoo_variants(
         let build = available.build_id(variant).unwrap_or("");
         let size = available.size(variant).unwrap_or(0);
         println!("{variant}\t{build}\t{size}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints what the binhost publishes: every package name and its versions.
+fn gentoo_packages(
+    architecture: &str,
+    binhost: Option<&str>,
+    mirror: Option<&str>,
+    fallbacks: &[String],
+) -> ExitCode {
+    use ferroday_cage::provision::gentoo::Gentoo;
+
+    // Configured exactly as a provisioning run configures the same layer, so a
+    // command line that lists what a binhost offers and one that installs from
+    // it read the same archive.
+    let mut builder = Gentoo::builder(architecture);
+    if let Some(binhost) = binhost {
+        builder = builder.binhost(binhost);
+    }
+    if let Some(mirror) = mirror {
+        builder = builder.mirror(mirror);
+    }
+    for fallback in fallbacks {
+        builder = builder.mirror_fallback(fallback);
+    }
+    let mut gentoo = match builder.build() {
+        Ok(gentoo) => gentoo,
+        Err(error) => {
+            eprintln!("fcage: {error}");
+            return ExitCode::from(125);
+        }
+    };
+    let catalogue = match gentoo.packages() {
+        Ok(catalogue) => catalogue,
+        Err(error) => {
+            eprintln!("fcage: {error}");
+            return ExitCode::from(125);
+        }
+    };
+    // One line per package, its versions after it: a name is what a caller
+    // writes in an atom, and the versions are what tells them whether the one
+    // they meant is on offer.
+    for name in catalogue.names() {
+        let versions: Vec<&str> = catalogue.versions(name).collect();
+        println!("{name}\t{}", versions.join(" "));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints what the Gentoo root at `root` already has installed.
+fn gentoo_installed(root: &Path) -> ExitCode {
+    let installed = match ferroday_cage::provision::gentoo::installed(root) {
+        Ok(installed) => installed,
+        Err(error) => {
+            eprintln!("fcage: {error}");
+            return ExitCode::from(125);
+        }
+    };
+    for package in installed.packages() {
+        println!(
+            "{}-{}\t{}\t{}",
+            package.name(),
+            package.version(),
+            package.slot(),
+            package.use_flags().collect::<Vec<_>>().join(" "),
+        );
     }
     ExitCode::SUCCESS
 }
@@ -4145,6 +4479,71 @@ mod tests {
             error.contains("suite"),
             "an unknown field is named: {error}"
         );
+    }
+
+    #[test]
+    fn the_gentoo_binhost_options_reach_the_builder_they_mirror() {
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/gentoo",
+            "--provision-gentoo",
+            "amd64",
+            "--gentoo-variant",
+            "amd64-openrc",
+            "--gentoo-binhost",
+            "x86-64",
+            "--gentoo-install",
+            "dev-vcs/git[keyring]",
+            "--gentoo-install=app-editors/vim",
+            // Space-separated, because a caller states a taste as a list
+            // rather than one flag at a time.
+            "--gentoo-prefer-use",
+            "-X gtk",
+            "--gentoo-prefer-use=keyring",
+            "--gentoo-plan",
+            "/plans/binhost.plan",
+        ]);
+        assert_eq!(options.gentoo_binhost.as_deref(), Some("x86-64"));
+        assert_eq!(
+            options.gentoo_install,
+            ["dev-vcs/git[keyring]", "app-editors/vim"],
+        );
+        assert_eq!(options.gentoo_prefer_use, ["-X", "gtk", "keyring"]);
+        assert_eq!(
+            options.gentoo_plan.as_deref(),
+            Some(Path::new("/plans/binhost.plan")),
+        );
+    }
+
+    #[test]
+    fn the_gentoo_binhost_listings_are_modes_of_their_own() {
+        // Each reads and exits, so each parses on its own and refuses a flag
+        // that configures a launch it will not perform.
+        match parse_args(&["--gentoo-packages", "amd64", "--gentoo-binhost", "x86-64"])
+            .expect("the listing parses")
+        {
+            Invocation::GentooPackages {
+                architecture,
+                binhost,
+                ..
+            } => {
+                assert_eq!(architecture, "amd64");
+                assert_eq!(binhost.as_deref(), Some("x86-64"));
+            }
+            _ => panic!("expected a binhost listing"),
+        }
+        match parse_args(&["--gentoo-installed=/roots/gentoo"]).expect("the listing parses") {
+            Invocation::GentooInstalled { root } => assert_eq!(root, Path::new("/roots/gentoo")),
+            _ => panic!("expected an installed listing"),
+        }
+        // A flag belonging to a launch is a conflict rather than something the
+        // listing quietly ignores.
+        let error = parse_error(&["--gentoo-packages", "amd64", "--rootfs", "/roots/x"]);
+        assert!(error.contains("--gentoo-packages"), "{error}");
+        let error = parse_error(&["--gentoo-installed", "/roots/x", "--gentoo-mirror", "u"]);
+        assert!(error.contains("--gentoo-installed"), "{error}");
+        // And each requires its value.
+        assert!(parse_error(&["--gentoo-installed"]).contains("requires a value"));
     }
 
     #[test]

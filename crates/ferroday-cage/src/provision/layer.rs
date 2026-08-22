@@ -28,6 +28,19 @@ use crate::{Cage, CageBuilder, IdentityMap};
 /// increment's writable upper: the command reads the base's own interpreter, its
 /// accounts and its package database through the merged view, and everything it
 /// writes lands in the upper, so the base comes out of the build untouched.
+///
+/// Only a layer that runs something in a cage during a bootstrap needs this —
+/// Debian's `dpkg` waves and Alpine's install scripts. The Gentoo layer runs
+/// nothing: a stage3 is extracted, and a binary package is merged and
+/// registered without its phase functions, so a `gentoo`-only build reaches
+/// [`BuildLayer`] and no further.
+#[cfg_attr(
+    not(any(feature = "debian", feature = "alpine")),
+    allow(
+        dead_code,
+        reason = "the Gentoo layer roots no cage during a bootstrap"
+    )
+)]
 #[derive(Clone, Copy)]
 pub(crate) enum Rooting<'a> {
     /// The tree being built is the whole root.
@@ -70,18 +83,9 @@ impl<'a> Rooting<'a> {
 // Which provisioners return one depends on the userland features built, and a
 // link to a layer that is not compiled does not resolve. The sentence is
 // therefore written per feature combination, as is each link's definition below.
-#[cfg_attr(
-    all(feature = "debian", feature = "alpine"),
-    doc = "Returned by [`Debian::stage_layer`] and [`Alpine::stage_layer`]."
-)]
-#[cfg_attr(
-    all(feature = "debian", not(feature = "alpine")),
-    doc = "Returned by [`Debian::stage_layer`]."
-)]
-#[cfg_attr(
-    all(feature = "alpine", not(feature = "debian")),
-    doc = "Returned by [`Alpine::stage_layer`]."
-)]
+#[cfg_attr(feature = "debian", doc = "Returned by [`Debian::stage_layer`].")]
+#[cfg_attr(feature = "alpine", doc = "Returned by [`Alpine::stage_layer`].")]
+#[cfg_attr(feature = "gentoo", doc = "Returned by [`Gentoo::stage_layer`].")]
 ///
 /// The upper it owns is the writable layer of a build root — the caller roots a
 /// cage on
@@ -105,6 +109,10 @@ impl<'a> Rooting<'a> {
 #[cfg_attr(
     feature = "alpine",
     doc = "[`Alpine::stage_layer`]: crate::provision::alpine::Alpine::stage_layer"
+)]
+#[cfg_attr(
+    feature = "gentoo",
+    doc = "[`Gentoo::stage_layer`]: crate::provision::gentoo::Gentoo::stage_layer"
 )]
 #[derive(Debug)]
 pub struct BuildLayer {

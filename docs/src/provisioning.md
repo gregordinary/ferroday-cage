@@ -119,11 +119,12 @@ provisioner](gentoo.md) through `ProvisionEvent::Gentoo`, so a consumer
 reports any of the userlands by changing the type it matches on.
 
 Where the clean stopping points are is the provisioner's own question. A
-package boundary answers it for the two layers that have one; the Gentoo layer
-has none — a stage3 is a single file of several hundred megabytes — so it
-consults the check while the tarball is being written as well as at the step
-boundaries around it, and a cancelled download leaves nothing behind in the
-cache.
+package boundary answers it wherever there is one, and the Gentoo layer's
+stage3 wave has none — a stage3 is a single file of several hundred megabytes —
+so it consults the check while the tarball is being written as well as at the
+step boundaries around it, and a cancelled download leaves nothing behind in the
+cache. Its binary-package wave has package boundaries like the other two, and
+uses them.
 
 ## Removing a rootfs
 
@@ -564,9 +565,10 @@ the `debian` feature it bootstraps a Debian suite from the archive, and
 [Building a Debian package](building-a-debian-package.md) works it into a
 consumer that builds a `.deb` from source in a cage. The [Alpine
 userland](alpine.md) is the second, and provisions an Alpine or postmarketOS
-root the same way. The [Gentoo userland](gentoo.md) is the third, and is the
-one whose archive publishes no package resolution at all: it verifies a signed
-stage3 and extracts it.
+root the same way. The [Gentoo userland](gentoo.md) is the third: it verifies a
+signed stage3 and extracts it, then installs prebuilt packages into the result
+from the archive's binary-package host — resolving, uniquely among the three,
+against a root that already has 296 packages in it.
 
 ## The command line
 

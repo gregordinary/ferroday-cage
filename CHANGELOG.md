@@ -21,6 +21,60 @@ consumer upgrading can skip it.
 
 ### Added
 
+- The `gentoo` feature installs prebuilt packages from the archive's
+  binary-package host into the root it bootstraps. `GentooBuilder::binhost`
+  names the sub-architecture tree, `install` takes dependency atoms in Gentoo's
+  own grammar, and a run becomes two waves: the stage3 is extracted, and then
+  the packages are resolved against it, verified and merged. A builder that
+  names no package does exactly what it did before, byte for byte.
+
+  Resolution starts from the root rather than from the archive, which is the
+  shape neither the Debian nor the Alpine layer has: a stage3 unpacks with 296
+  packages already installed, so the resolver asks what is *missing*. That is
+  load-bearing rather than an efficiency — one of those 296 the binhost
+  publishes in no version at all, and it is in `dev-vcs/git`'s closure — so
+  `Gentoo::resolve_packages` takes the root it would install into rather than
+  defaulting it.
+
+  `Gentoo::packages` reports what a binhost publishes as a `Catalogue`, and
+  `gentoo::installed` reports what any Gentoo root already has as an
+  `Installed`, including a root this crate never built. `Gentoo::stage_layer`
+  and `GentooBuilder::base_layer` stage an install as a disposable overlay over
+  a root that already exists, which is the only way to add packages to one:
+  `provision::ensure` reports an existing directory as `Existing` and does not
+  touch it.
+
+- `gentoo::Plan` is the layer's plan document, `ferroday-cage-gentoo-plan 1`.
+  Unlike the stage3 half, which deliberately has none, a binary-package
+  resolution is worth serializing: the autobuilds tree keeps about five weeks of
+  stage3 builds while the binhost keeps a published version far longer, so a
+  plan replays for as long as the archive carries what it names.
+  `GentooBuilder::plan` installs one and resolves nothing. The stanza order is
+  the install order, which is where this format departs from the other two
+  layers' plans.
+
+- `GentooBuilder::prefer_use` states a preference among the builds of one
+  version. The archive publishes 2,774 versions more than once, differing only
+  in the USE flags they were compiled with and so in what they depend on, and
+  the rule that chooses between them decides whether resolution succeeds:
+  measured over four hundred package names, fewest-USE-flags resolves 361 where
+  newest-build-time resolves 262. A preference reorders those candidates and
+  removes none, so it provably cannot make an atom unsatisfiable — a USE
+  dependency written into the atom is the constraint that can, and says so.
+
+- `GentooError` gains `Index`, `Container`, `Database`, `PlanDocument` and
+  `Resolve`, and `GentooEvent` gains `Index`, `Planned`, `Merging`,
+  `DependencyCycle`, `Unsatisfiable` and `Conflict`. Both are
+  `#[non_exhaustive]`, so this is additive.
+
+- `fcage` gains `--gentoo-binhost`, `--gentoo-install`, `--gentoo-prefer-use`
+  and `--gentoo-plan` on a provisioning command line, and two listings that
+  answer without provisioning: `--gentoo-packages` prints what a binhost
+  publishes, and `--gentoo-installed` prints what a root already has.
+
+- A `gentoo-binhost` example provisions a stage3, installs prebuilt packages
+  into it, and runs a command against the result.
+
 - `relay` drives the caller's side of an interactive terminal session:
   `relay::Relay` is the byte loop between the caller's terminal and the
   sandbox's, `relay::Signals` blocks the eight signals such a session handles

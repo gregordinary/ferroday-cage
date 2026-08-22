@@ -142,6 +142,19 @@ impl Rooted {
     /// being followed, so a link planted where a file is expected cannot turn
     /// this into a read of something else.
     pub(crate) fn read(&self, relative: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+        let mut contents = Vec::new();
+        self.reader(relative)?.read_to_end(&mut contents)?;
+        Ok(contents)
+    }
+
+    /// Opens the file at `relative` for reading, contained as every path here
+    /// is.
+    ///
+    /// What [`read`](Self::read) is built on, and what a caller that must not
+    /// hold the whole file uses instead: a merged package's own database entry
+    /// records a digest per installed file, and a hundred-megabyte binary is
+    /// one of them.
+    pub(crate) fn reader(&self, relative: impl AsRef<Path>) -> io::Result<File> {
         let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Require)?;
         let fd = rustix::fs::openat(
             &parent,
@@ -149,9 +162,60 @@ impl Rooted {
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let mut contents = Vec::new();
-        File::from(fd).read_to_end(&mut contents)?;
-        Ok(contents)
+        Ok(File::from(fd))
+    }
+
+    /// The names of the subdirectories of `relative`, sorted.
+    ///
+    /// The tree is one untrusted code has run in, so this resolves as every
+    /// other operation here does and reads through the descriptor the kernel
+    /// returned rather than re-walking a host path. `.` and `..` are not
+    /// entries, and neither is anything that is not a directory: the callers
+    /// that ask this are walking a directory *of* directories — a package
+    /// database's categories, and the entries under each — and a stray file
+    /// beside them is not one of the things being enumerated.
+    ///
+    /// Sorted, so a walk over a tree is the same walk twice. Readdir order is
+    /// the filesystem's and differs between two roots holding the same entries,
+    /// which would make an install order, and anything derived from one,
+    /// unreproducible.
+    ///
+    /// An absent directory is an empty listing rather than a failure: the
+    /// question these callers ask is what is there, and nothing is a legitimate
+    /// answer to it.
+    pub(crate) fn directories(&self, relative: impl AsRef<Path>) -> io::Result<Vec<Vec<u8>>> {
+        let components = components(relative.as_ref())?;
+        let dir = match self.open_read_dir(&components) {
+            Ok(dir) => dir,
+            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(Vec::new()),
+            Err(errno) => return Err(errno.into()),
+        };
+        let mut names = Vec::new();
+        for entry in rustix::fs::Dir::read_from(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            // `DT_UNKNOWN` is what a filesystem answers when it does not carry
+            // the type in the directory entry, so the kind is confirmed with a
+            // `stat` against the same descriptor rather than assumed either way.
+            let is_dir = match entry.file_type() {
+                FileType::Directory => true,
+                FileType::Unknown => {
+                    rustix::fs::statat(&dir, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
+                        .is_ok_and(|stat| {
+                            FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+                        })
+                }
+                _ => false,
+            };
+            if is_dir {
+                names.push(name.to_vec());
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 
     /// Whether anything occupies `relative` — a file, a directory, or a
@@ -292,6 +356,26 @@ impl Rooted {
         containment::open_dir(self.fd.as_fd(), &path, OFlags::PATH, ResolveFlags::IN_ROOT)
     }
 
+    /// Resolves `components` inside the tree as a directory that will be read.
+    ///
+    /// `O_RDONLY` where [`open_dir`](Self::open_dir) takes `O_PATH`: an
+    /// `O_PATH` descriptor anchors an `*at` call and cannot be handed to
+    /// `getdents`.
+    fn open_read_dir(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
+        let path = if components.is_empty() {
+            CString::new(&b"."[..])
+        } else {
+            CString::new(components.join(&b'/'))
+        }
+        .map_err(|_| Errno::INVAL)?;
+        containment::open_dir(
+            self.fd.as_fd(),
+            &path,
+            OFlags::RDONLY,
+            ResolveFlags::IN_ROOT,
+        )
+    }
+
     /// Opens `components` as a directory, creating the missing links of the
     /// chain.
     ///
@@ -391,6 +475,51 @@ mod tests {
         for spelling in ["/", "", "."] {
             assert_eq!(tree.path(spelling), root, "{spelling:?}");
         }
+    }
+
+    #[test]
+    fn a_directory_listing_reports_the_subdirectories_sorted_and_nothing_else() {
+        let (scratch, tree) = tree("directories");
+        let root = scratch.join("tree");
+        for name in ["sys-libs", "app-crypt", "dev-vcs"] {
+            std::fs::create_dir_all(root.join("var/db/pkg").join(name)).unwrap();
+        }
+        // A file beside them is not one of the things being enumerated, and
+        // neither is a symbolic link to a directory: what these callers walk is
+        // a directory of directories.
+        std::fs::write(root.join("var/db/pkg/README"), b"").unwrap();
+        std::os::unix::fs::symlink("sys-libs", root.join("var/db/pkg/alias")).unwrap();
+
+        assert_eq!(
+            tree.directories("/var/db/pkg").unwrap(),
+            [
+                b"app-crypt".to_vec(),
+                b"dev-vcs".to_vec(),
+                b"sys-libs".to_vec()
+            ],
+        );
+        // Absent is an empty listing rather than a failure: the question is
+        // what is there, and nothing is an answer to it.
+        assert!(tree.directories("/var/db/nothing").unwrap().is_empty());
+        assert!(tree.directories("/var/db/pkg/README").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_directory_listing_stays_inside_the_tree() {
+        // The containment the whole module exists for, applied to the walk: an
+        // absolute link inside the tree names something inside the tree, which
+        // is what it means to the root filesystem the tree is.
+        let (scratch, tree) = tree("directories-contained");
+        let root = scratch.join("tree");
+        std::fs::create_dir_all(root.join("etc/portage")).unwrap();
+        std::fs::create_dir_all(scratch.join("outside/secret")).unwrap();
+        std::os::unix::fs::symlink("/etc", root.join("var")).unwrap();
+        std::os::unix::fs::symlink(scratch.join("outside"), root.join("escape")).unwrap();
+
+        // The in-tree absolute link resolves within the tree.
+        assert_eq!(tree.directories("/var").unwrap(), [b"portage".to_vec()]);
+        // The one pointing at the host resolves to nothing at all.
+        assert!(tree.directories("/escape").unwrap().is_empty());
     }
 
     #[test]

@@ -62,6 +62,14 @@ sha2 = { version = "0.11", optional = true }
 # reaches `Pkcs1v15Sign::new` for its DER prefix, not to hash.
 rsa = { version = "0.9.10", optional = true, default-features = false, features = ["std", "pem"] }
 sha1 = { version = "0.10", optional = true, features = ["oid"] }
+# The Gentoo binary-package add-on: the MD5 portage writes into its own package
+# database -- an installed package's `CONTENTS` records one per file so portage
+# can tell an edited file from a merged one, and its `BINPKGMD5` records the
+# binary package's own. Bookkeeping rather than trust: nothing in this crate
+# compares an MD5 to decide whether to accept bytes. It was already in the graph
+# transitively through rPGP, so a `gentoo` build gains no crate by taking it
+# directly -- the same argument `sha1` and `rsa` carry for the Alpine layer.
+md-5 = { version = "0.10", optional = true }
 # The hardening add-on: seccomp-BPF compilation, pure Rust (the syscall conduit
 # it installs through is the always-present `syscalls` above).
 seccompiler = { version = "0.5", optional = true }
@@ -97,7 +105,7 @@ alpine = ["tarball", "dep:rsa", "dep:sha1", "dep:sha2"]
 # tarball. It selects the same dependencies the Debian layer does, which is what
 # it costs to add: OpenPGP for the signed pointer and digest documents, and the
 # SHA-512 those record. Builds on the tarball extractor for the stage3 itself.
-gentoo = ["tarball", "dep:pgp", "dep:sha2"]
+gentoo = ["tarball", "dep:pgp", "dep:sha2", "dep:md-5"]
 # The hardening layer: opt-in Landlock filesystem rules, seccomp syscall
 # filters, and capability drops applied to the sandboxed command.
 hardening = ["dep:seccompiler"]
@@ -220,6 +228,14 @@ required-features = ["serde"]
 [[example]]
 name = "ebuild-sandbox"
 required-features = ["gentoo", "subid"]
+
+# A worked consumer: a Gentoo binary-package sandbox that provisions a stage3
+# and installs prebuilt packages into it from the archive's binhost, then runs a
+# command against the result. It provisions through the Gentoo provisioner, so
+# it builds only when the `gentoo` feature is enabled.
+[[example]]
+name = "gentoo-binhost"
+required-features = ["gentoo"]
 
 # A worked consumer: a Debian source-package build sandbox that bootstraps a
 # suite with build tooling and builds a .deb from source. It provisions the

@@ -724,6 +724,12 @@ pub mod ferroday_cage::provision::gentoo
 pub ferroday_cage::provision::gentoo::GentooError::Cancelled
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Config
 pub ferroday_cage::provision::gentoo::GentooError::Config::reason: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Container
+pub ferroday_cage::provision::gentoo::GentooError::Container::reason: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Container::subject: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Database
+pub ferroday_cage::provision::gentoo::GentooError::Database::reason: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Database::root: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Digest
 pub ferroday_cage::provision::gentoo::GentooError::Digest::actual: alloc::string::String
 pub ferroday_cage::provision::gentoo::GentooError::Digest::expected: alloc::string::String
@@ -732,10 +738,17 @@ pub ferroday_cage::provision::gentoo::GentooError::Digest::subject: alloc::strin
 pub ferroday_cage::provision::gentoo::GentooError::Document::reason: alloc::string::String
 pub ferroday_cage::provision::gentoo::GentooError::Document::subject: alloc::string::String
 pub ferroday_cage::provision::gentoo::GentooError::Fetch(ferroday_cage::provision::FetchError)
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Index
+pub ferroday_cage::provision::gentoo::GentooError::Index::reason: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Index::subject: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Io
 pub ferroday_cage::provision::gentoo::GentooError::Io::op: &'static str
 pub ferroday_cage::provision::gentoo::GentooError::Io::path: std::path::PathBuf
 pub ferroday_cage::provision::gentoo::GentooError::Io::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::PlanDocument
+pub ferroday_cage::provision::gentoo::GentooError::PlanDocument::reason: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Resolve
+pub ferroday_cage::provision::gentoo::GentooError::Resolve::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Signature
 pub ferroday_cage::provision::gentoo::GentooError::Signature::reason: alloc::string::String
 pub ferroday_cage::provision::gentoo::GentooError::Signature::subject: alloc::string::String
@@ -762,12 +775,33 @@ impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::GentooError
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::GentooError
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::GentooError
 #[non_exhaustive] pub enum ferroday_cage::provision::gentoo::GentooEvent<'a>
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Conflict
+pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::atom: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::blocks: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::installed: bool
+pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::stated_by: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::DependencyCycle
+pub ferroday_cage::provision::gentoo::GentooEvent::DependencyCycle::packages: &'a [alloc::string::String]
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Extracting
 pub ferroday_cage::provision::gentoo::GentooEvent::Extracting::path: &'a std::path::Path
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Fetching
 pub ferroday_cage::provision::gentoo::GentooEvent::Fetching::url: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Index
+pub ferroday_cage::provision::gentoo::GentooEvent::Index::builds: usize
+pub ferroday_cage::provision::gentoo::GentooEvent::Index::generated: core::option::Option<i64>
+pub ferroday_cage::provision::gentoo::GentooEvent::Index::skipped: usize
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Merging
+pub ferroday_cage::provision::gentoo::GentooEvent::Merging::package: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Merging::version: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Planned
+pub ferroday_cage::provision::gentoo::GentooEvent::Planned::bytes: u64
+pub ferroday_cage::provision::gentoo::GentooEvent::Planned::packages: usize
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Resolved
 pub ferroday_cage::provision::gentoo::GentooEvent::Resolved::stage3: &'a ferroday_cage::provision::gentoo::Stage3
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Unsatisfiable
+pub ferroday_cage::provision::gentoo::GentooEvent::Unsatisfiable::atom: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Unsatisfiable::reason: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Unsatisfiable::wanted_by: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Verifying
 pub ferroday_cage::provision::gentoo::GentooEvent::Verifying::path: &'a std::path::Path
 impl<'a> core::marker::Freeze for ferroday_cage::provision::gentoo::GentooEvent<'a>
@@ -793,6 +827,24 @@ impl core::marker::Unpin for ferroday_cage::provision::gentoo::Available
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Available
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Available
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Available
+pub struct ferroday_cage::provision::gentoo::Catalogue
+impl ferroday_cage::provision::gentoo::Catalogue
+pub fn ferroday_cage::provision::gentoo::Catalogue::builds(&self) -> usize
+pub fn ferroday_cage::provision::gentoo::Catalogue::chost(&self) -> core::option::Option<&str>
+pub fn ferroday_cage::provision::gentoo::Catalogue::contains(&self, &str) -> bool
+pub fn ferroday_cage::provision::gentoo::Catalogue::generated(&self) -> core::option::Option<i64>
+pub fn ferroday_cage::provision::gentoo::Catalogue::is_empty(&self) -> bool
+pub fn ferroday_cage::provision::gentoo::Catalogue::len(&self) -> usize
+pub fn ferroday_cage::provision::gentoo::Catalogue::names(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+pub fn ferroday_cage::provision::gentoo::Catalogue::ttl(&self) -> core::option::Option<i64>
+pub fn ferroday_cage::provision::gentoo::Catalogue::versions(&self, &str) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Catalogue
+impl core::marker::Send for ferroday_cage::provision::gentoo::Catalogue
+impl core::marker::Sync for ferroday_cage::provision::gentoo::Catalogue
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Catalogue
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Catalogue
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Catalogue
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Catalogue
 #[non_exhaustive] pub struct ferroday_cage::provision::gentoo::CertificateHorizon
 pub ferroday_cage::provision::gentoo::CertificateHorizon::expires: core::option::Option<i64>
 pub ferroday_cage::provision::gentoo::CertificateHorizon::fingerprint: alloc::string::String
@@ -811,7 +863,11 @@ pub fn ferroday_cage::provision::gentoo::Gentoo::architecture(&self) -> &str
 pub fn ferroday_cage::provision::gentoo::Gentoo::available(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Available, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Gentoo::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::Gentoo::keyring_horizon(&self) -> alloc::vec::Vec<ferroday_cage::provision::gentoo::CertificateHorizon>
+pub fn ferroday_cage::provision::gentoo::Gentoo::packages(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Catalogue, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Gentoo::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Stage3, ferroday_cage::provision::gentoo::GentooError>
+pub fn ferroday_cage::provision::gentoo::Gentoo::resolve_packages(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::gentoo::Plan, ferroday_cage::provision::gentoo::GentooError>
+impl ferroday_cage::provision::gentoo::Gentoo
+pub fn ferroday_cage::provision::gentoo::Gentoo::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
 impl core::fmt::Debug for ferroday_cage::provision::gentoo::Gentoo
 pub fn ferroday_cage::provision::gentoo::Gentoo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::gentoo::Gentoo
@@ -825,13 +881,18 @@ impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gent
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Gentoo
 pub struct ferroday_cage::provision::gentoo::GentooBuilder
 impl ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::base_layer(self, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::binhost(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::build(self) -> core::result::Result<ferroday_cage::provision::gentoo::Gentoo, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::build_id(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::cache_dir(self, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::fetcher(self, alloc::boxed::Box<dyn ferroday_cage::provision::Fetch>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::install<I, S>(self, I) -> ferroday_cage::provision::gentoo::GentooBuilder where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::max_pointer_age(self, impl core::convert::Into<core::option::Option<core::time::Duration>>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::mirror(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::plan(self, ferroday_cage::provision::gentoo::Plan) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::prefer_use<I, S>(self, I) -> ferroday_cage::provision::gentoo::GentooBuilder where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::stage3(self, ferroday_cage::provision::gentoo::Stage3) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::variant(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
 impl core::fmt::Debug for ferroday_cage::provision::gentoo::GentooBuilder
@@ -843,6 +904,60 @@ impl core::marker::Unpin for ferroday_cage::provision::gentoo::GentooBuilder
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::GentooBuilder
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::GentooBuilder
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::GentooBuilder
+pub struct ferroday_cage::provision::gentoo::Installed
+impl ferroday_cage::provision::gentoo::Installed
+pub fn ferroday_cage::provision::gentoo::Installed::is_empty(&self) -> bool
+pub fn ferroday_cage::provision::gentoo::Installed::len(&self) -> usize
+pub fn ferroday_cage::provision::gentoo::Installed::packages(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferroday_cage::provision::gentoo::InstalledPackage>
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Installed
+impl core::marker::Send for ferroday_cage::provision::gentoo::Installed
+impl core::marker::Sync for ferroday_cage::provision::gentoo::Installed
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Installed
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Installed
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Installed
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Installed
+pub struct ferroday_cage::provision::gentoo::InstalledPackage
+impl ferroday_cage::provision::gentoo::InstalledPackage
+pub fn ferroday_cage::provision::gentoo::InstalledPackage::name(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::InstalledPackage::slot(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::InstalledPackage::use_flags(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+pub fn ferroday_cage::provision::gentoo::InstalledPackage::version(&self) -> &str
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::InstalledPackage
+impl core::marker::Send for ferroday_cage::provision::gentoo::InstalledPackage
+impl core::marker::Sync for ferroday_cage::provision::gentoo::InstalledPackage
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::InstalledPackage
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::InstalledPackage
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::InstalledPackage
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::InstalledPackage
+#[non_exhaustive] pub struct ferroday_cage::provision::gentoo::Plan
+pub ferroday_cage::provision::gentoo::Plan::architecture: alloc::string::String
+pub ferroday_cage::provision::gentoo::Plan::binhost: alloc::string::String
+pub ferroday_cage::provision::gentoo::Plan::index_timestamp: core::option::Option<i64>
+pub ferroday_cage::provision::gentoo::Plan::packages: alloc::vec::Vec<ferroday_cage::provision::gentoo::PlannedPackage>
+impl ferroday_cage::provision::gentoo::Plan
+pub fn ferroday_cage::provision::gentoo::Plan::parse_document(&str) -> core::result::Result<ferroday_cage::provision::gentoo::Plan, ferroday_cage::provision::gentoo::GentooError>
+pub fn ferroday_cage::provision::gentoo::Plan::to_document(&self) -> core::result::Result<alloc::string::String, ferroday_cage::provision::gentoo::GentooError>
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Plan
+impl core::marker::Send for ferroday_cage::provision::gentoo::Plan
+impl core::marker::Sync for ferroday_cage::provision::gentoo::Plan
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Plan
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Plan
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Plan
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Plan
+#[non_exhaustive] pub struct ferroday_cage::provision::gentoo::PlannedPackage
+pub ferroday_cage::provision::gentoo::PlannedPackage::build_id: u64
+pub ferroday_cage::provision::gentoo::PlannedPackage::md5: alloc::string::String
+pub ferroday_cage::provision::gentoo::PlannedPackage::name: alloc::string::String
+pub ferroday_cage::provision::gentoo::PlannedPackage::path: alloc::string::String
+pub ferroday_cage::provision::gentoo::PlannedPackage::size: u64
+pub ferroday_cage::provision::gentoo::PlannedPackage::version: alloc::string::String
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::PlannedPackage
+impl core::marker::Send for ferroday_cage::provision::gentoo::PlannedPackage
+impl core::marker::Sync for ferroday_cage::provision::gentoo::PlannedPackage
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::PlannedPackage
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::PlannedPackage
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::PlannedPackage
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::PlannedPackage
 pub struct ferroday_cage::provision::gentoo::Stage3
 impl ferroday_cage::provision::gentoo::Stage3
 pub fn ferroday_cage::provision::gentoo::Stage3::build_id(&self) -> &str
@@ -858,6 +973,7 @@ impl core::marker::Unpin for ferroday_cage::provision::gentoo::Stage3
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Stage3
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Stage3
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Stage3
+pub fn ferroday_cage::provision::gentoo::installed(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::gentoo::Installed, ferroday_cage::provision::gentoo::GentooError>
 #[non_exhaustive] pub enum ferroday_cage::provision::FetchError
 #[non_exhaustive] pub ferroday_cage::provision::FetchError::Io
 pub ferroday_cage::provision::FetchError::Io::op: &'static str

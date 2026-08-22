@@ -694,6 +694,7 @@ dependencies = [
  "flate2",
  "libc",
  "lzma-rust2",
+ "md-5",
  "pgp",
  "rand",
  "rsa",

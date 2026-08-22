@@ -68,8 +68,10 @@ mod extract;
 // way.
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod digest;
-// The plan document's syntax, which every userland layer's plan is written in.
-#[cfg(any(feature = "debian", feature = "alpine"))]
+// The plan document's syntax, which every userland layer's plan is written in
+// -- and, for Gentoo, the syntax its archive publishes its binary-package index
+// in as well.
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod document;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod fetch;
@@ -78,7 +80,7 @@ mod http;
 mod identity;
 // The overlay upper a layered build installs into, which is a disposal handle
 // rather than anything one userland knows about.
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod layer;
 // Establishing that a cleartext-signed document is authentic against a keyring,
 // which is a question about the signature rather than about any archive that
@@ -99,7 +101,7 @@ pub use export::{Export, export_tar};
 pub use fetch::{Fetch, FetchError, FetchRequest};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub use http::{HttpFetch, file_url};
-#[cfg(any(feature = "debian", feature = "alpine"))]
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub use layer::BuildLayer;
 #[cfg(feature = "tarball")]
 pub use tarball::Tarball;

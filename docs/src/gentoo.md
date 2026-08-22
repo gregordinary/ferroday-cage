@@ -23,15 +23,14 @@ provision::ensure("/var/lib/machines/gentoo", &mut gentoo)?;
 publishes the result atomically: the destination directory either does not exist
 or holds a complete root.
 
-The surface is deliberately smaller than [the Debian](debian.md) and
-[Alpine](alpine.md) layers'. There is no plan document, no `resolve` over a
-dependency graph, no package cache to replay, and no install-script wave —
-because Gentoo publishes none of those things for a stage3. What it publishes is
-a signed pointer, a signed digest document, and a tarball, and this layer reads
-exactly that.
+It also installs prebuilt packages from the archive's binary-package host into
+the root it bootstrapped, which is [the second half of this
+chapter](#binary-packages). A run that asks for no package is exactly a stage3
+bootstrap, byte for byte.
 
-The `ebuild-sandbox` example works it into a consumer: it provisions a stage3,
-binds a portage tree into it read-only, and runs `emerge` in a cage.
+Two examples work it into consumers: `ebuild-sandbox` provisions a stage3, binds
+a portage tree into it read-only, and runs `emerge` in a cage; `gentoo-binhost`
+provisions one and installs prebuilt packages into it instead.
 
 ## How it works
 
@@ -144,9 +143,293 @@ weeks — a document outliving what it describes. A caller who wants to provisio
 the same root again records the build id and variant however they already record
 configuration.
 
+## Binary packages
+
+Gentoo publishes prebuilt packages beside the stage3 tarballs, under
+`releases/<arch>/binpackages/`, and this layer installs them. Name the
+sub-architecture tree and the atoms to install:
+
+```rust,no_run
+use ferroday_cage::provision::{self, gentoo::Gentoo};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut gentoo = Gentoo::builder("amd64")
+    .variant("amd64-openrc")
+    .binhost("x86-64")
+    .install(["dev-vcs/git", "app-editors/vim"])
+    .cache_dir("/var/cache/fcage/gentoo")
+    .build()?;
+provision::ensure("/var/lib/machines/gentoo", &mut gentoo)?;
+# Ok(())
+# }
+```
+
+A run is then two waves: the stage3 is fetched, verified and extracted, and then
+the packages are resolved against the root that produced, fetched, verified and
+merged into it. A builder that names no package does exactly the first, byte for
+byte.
+
+There is no default sub-architecture. amd64 publishes `x86-64`, `x86-64-v3`,
+`x86-64_hardened` and `x32` today, and the set moves — it published eight not
+long ago. The only thing that enumerates it is an unsigned directory listing,
+and reading that as discovery would put an unauthenticated document at the head
+of the trust chain, which is the reason the keyring is vendored. So the
+sub-architecture is yours to name, and a wrong one is a 404 rather than a
+silently different userland.
+
+### Resolution starts from the root
+
+This is the shape neither [the Debian](debian.md) nor [the Alpine](alpine.md)
+layer has. Both bootstrap from nothing, so their resolvers start with an empty
+root and ask what is *needed*. A Gentoo stage3 unpacks with 296 packages already
+installed and a database describing them, so resolution here starts from a
+populated root and asks what is *missing*.
+
+That is load-bearing rather than an efficiency. One of those 296 —
+`app-crypt/pinentry` — the binhost publishes in no version at all, and it is in
+`dev-vcs/git`'s runtime closure. Resolving git against an empty root does not
+merely produce a larger plan: it *fails*, on an atom the real root answers. The
+general case is the same one, less dramatically: the median closure over four
+hundred sampled packages is five, because everything else is already there.
+
+So `resolve_packages` takes the root it would install into:
+
+```rust,no_run
+use ferroday_cage::provision::gentoo::Gentoo;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut gentoo = Gentoo::builder("amd64")
+    .binhost("x86-64")
+    .install(["dev-vcs/git"])
+    .build()?;
+let plan = gentoo.resolve_packages("/var/lib/machines/gentoo")?;
+for package in &plan.packages {
+    println!("{}-{} build {}", package.name, package.version, package.build_id);
+}
+# Ok(())
+# }
+```
+
+`gentoo::installed` answers the same question on its own, for any Gentoo root
+including one this crate never built:
+
+```rust,no_run
+use ferroday_cage::provision::gentoo;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let installed = gentoo::installed("/var/lib/machines/gentoo")?;
+println!("{} packages", installed.len());
+# Ok(())
+# }
+```
+
+### Which build, and why the rule is that rule
+
+The archive publishes a version more than once. `binpkg-multi-instance` gives
+2,774 of the index's versions between two and twenty-four builds, differing only
+in the USE flags they were compiled with — and therefore in what they depend on.
+`dev-vcs/git` is the clean illustration: the build without `keyring` pulls
+twelve packages, and the build with it pulls seventy through the GTK stack.
+
+Choosing among them is therefore not a tie-break, it decides whether resolution
+succeeds at all. Measured over four hundred sampled package names against an
+`amd64-openrc` stage3:
+
+| Rule | Resolves cleanly | Unsatisfiable atoms | Conflicts | p90 closure |
+| --- | --- | --- | --- | --- |
+| newest build time | 262/400 | 884 | 129 | 173 |
+| fewest dependencies | 338/400 | 206 | 74 | 148 |
+| **fewest USE flags** | **361/400** | **26** | **50** | **126** |
+
+Fewest USE flags wins every column at once, which is the argument for it: it is
+not a trade. Portage makes the same choice from a profile's computed USE; this
+layer has no profile, so it needs a rule of its own, and this is the one the
+numbers chose. Each atom takes the highest version that satisfies it and then
+the fewest-flags build of that version.
+
+### A constraint fails loudly; a preference cannot
+
+Two ways to reach a build the default rule would not choose, and they differ in
+kind rather than in spelling.
+
+**A USE dependency in the atom is a constraint.** `dev-vcs/git[keyring]` removes
+every build without the flag from consideration, and if the archive publishes
+none the atom is unsatisfiable and the run says so. It costs no extra API: the
+atom grammar the resolver already speaks parses it.
+
+**`prefer_use` is a preference.** It reorders the candidates and removes none,
+so it *provably* cannot turn a resolvable request into an unresolvable one. Over
+the same four hundred seeds:
+
+| Preference | Resolves cleanly | Unsatisfiable atoms | Conflicts | p90 closure |
+| --- | --- | --- | --- | --- |
+| none | 361/400 | 26 | 50 | 126 |
+| `keyring` | 361/400 | 26 | 50 | 127 |
+| `-X` | 361/400 | 26 | 50 | 126 |
+| `X` | 354/400 | 26 | 60 | 164 |
+| `X`, `gtk`, `qt6`, `systemd` | 284/400 | 26 | 110 | 179 |
+
+The unsatisfiable count is 26 in every row: that is the guarantee stated as a
+number. What a *broad* preference does cost is a larger closure, and a larger
+closure meets more of the archive's own conflicts — the whole cost lands in that
+column. A narrow one costs nothing measurable.
+
+```rust,no_run
+use ferroday_cage::provision::gentoo::Gentoo;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut gentoo = Gentoo::builder("amd64")
+    .binhost("x86-64")
+    // A constraint: this build must have the flag, or the run fails.
+    .install(["dev-vcs/git[keyring]"])
+    // A taste: prefer builds without X, and never fail because of it.
+    .prefer_use(["-X"])
+    .build()?;
+# let _ = gentoo.resolve_packages("/var/lib/machines/gentoo")?;
+# Ok(())
+# }
+```
+
+State a flag the install must have in the atom; state a flag you would rather it
+had as a preference.
+
+### Conflicts are reported, not resolved around
+
+A blocker atom that matches something the root has or the resolution chose is a
+conflict, and the run fails naming both sides. There is no backtracking, and the
+evidence is why: an any-of policy that preferred a non-conflicting alternative
+changed nothing over the same four hundred seeds, and the conflicts that remain
+are ones portage refuses too. Almost all of them are a desktop stack asked for
+in a root built against the other init system — 27 of 50 are
+`!sys-apps/sysvinit` against the openrc stage3's own `sys-apps/sysvinit`.
+
+Every refusal is reported before the run fails, so a caller fixing an install
+list sees the whole list rather than its first entry, and each names which wall
+it hit: the package the binhost does not publish, the version, the slot, or the
+USE flag.
+
+### The plan is the reproducibility story
+
+Unlike the stage3 half, the binhost half has a plan document:
+
+```rust,no_run
+use ferroday_cage::provision::gentoo::{Gentoo, Plan};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let mut gentoo = Gentoo::builder("amd64").binhost("x86-64").build()?;
+// Resolve now, and keep what was resolved.
+let plan = gentoo.resolve_packages("/var/lib/machines/gentoo")?;
+std::fs::write("binhost.plan", plan.to_document()?)?;
+
+// Replay later: nothing is fetched but the packages themselves.
+let kept = Plan::parse_document(&std::fs::read_to_string("binhost.plan")?)?;
+let mut replay = Gentoo::builder("amd64").binhost("x86-64").plan(kept).build()?;
+# let _ = replay;
+# Ok(())
+# }
+```
+
+A plan names each package's build id, path, size and digest, and the order they
+merge in. It is worth serializing where a `Stage3` is not, and for the opposite
+reason: the autobuilds tree keeps about five weeks of stage3 builds, while the
+binhost keeps a published version far longer, so a plan replays for as long as
+the archive carries what it names.
+
+The stanza order *is* the install order, which is where this format departs from
+the other two layers' plans. That order is a resolution's own output — a
+topological sort over runtime dependencies — and a plan that lost it would have
+to derive it again from the index the plan exists to avoid needing.
+
+### What a merge writes, and what it does not run
+
+Each package's files are laid into the root and a `/var/db/pkg` entry is
+registered, because a stage3 arrives with a populated database and a root this
+layer installed into without registering would be a root whose database is a
+lie: portage would rebuild what is present, and `--depclean` would remove it.
+
+An entry is the container's own metadata directory plus the three files portage
+computes at merge — `CONTENTS`, `COUNTER` and `BINPKGMD5` — which is exactly
+what a stage3's own entries turn out to be. The merge ordinal continues the
+root's sequence rather than starting again.
+
+**Phase functions are not run.** Around 30% of packages define a `pkg_postinst`
+or a `pkg_preinst`, and they live in the container's `environment.bz2` as a
+serialized bash environment: running one means running portage's own `ebuild.sh`
+with the eclasses it was built against. So an `acct-user` or `acct-group`
+package ships a `sysusers.d` fragment and does not create the account,
+`ca-certificates` does not regenerate its bundle, and icon and font caches are
+not rebuilt.
+
+This is the same seam [the Debian layer](debian.md) has and the opposite
+decision. Debian's maintainer scripts are executables that layer can run inside
+the sandbox, so it runs them; Gentoo's are bash functions that need the guest's
+package manager. What this layer gives you instead is a root portage can act on,
+which is the strongest argument for registering the entry properly — run the
+phases with `emerge` inside the sandbox if you need them.
+
+**`CONFIG_PROTECT` is not honoured.** An existing file under `/etc` is
+overwritten rather than given portage's `._cfg0000_` treatment. The layer builds
+roots rather than upgrading live systems, and a root whose configuration depends
+on merge order is not reproducible.
+
+### Coverage is a property of the archive
+
+The binhost publishes 6,904 distinct package names across 15,773 builds. That is
+most of the tree and not all of it: `dev-build/cmake` is there, `app-misc/jq` is
+not, in any version. With around 90% of sampled packages resolving cleanly, the
+honest statement is that the binhost installs most things and cannot install
+everything, that the failures are the archive's shape rather than the resolver's,
+and that the layer says which atom it could not satisfy and why.
+
+`packages` lists what is on offer before you commit to a resolution:
+
+```rust,no_run
+use ferroday_cage::provision::gentoo::Gentoo;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut gentoo = Gentoo::builder("amd64").binhost("x86-64").build()?;
+let catalogue = gentoo.packages()?;
+println!("{} packages in {} builds", catalogue.len(), catalogue.builds());
+for version in catalogue.versions("dev-vcs/git") {
+    println!("{version}");
+}
+# Ok(())
+# }
+```
+
+### Adding packages to a root that already exists
+
+`provision::ensure` reports a directory that already exists as `Existing` and
+does not touch it, so the way to add packages to a root you already have is a
+layered build: the base stays pristine and the increment lives in an overlay
+upper that the returned handle removes when dropped.
+
+```rust,no_run
+use ferroday_cage::provision::gentoo::Gentoo;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut increment = Gentoo::builder("amd64")
+    .binhost("x86-64")
+    .install(["dev-vcs/git"])
+    .base_layer("/var/lib/machines/gentoo")
+    .build()?;
+let layer = increment.stage_layer("/var/tmp/build-upper")?;
+// Root a cage on overlay_rootfs(base, layer.path()) to build against the
+// merged view; drop the handle to revert the increment.
+# let _ = layer;
+# Ok(())
+# }
+```
+
+Resolution reads the *merged* view — the base's database and whatever the upper
+already holds — because that is what a package manager inside the finished
+sandbox sees. An increment resolving against its own empty upper would ask the
+archive for everything the base already has, and would fail on the packages the
+binhost does not publish.
+
 ## Trust
 
-The chain has three links, and the first is not fetched at all:
+The stage3 chain has three links, and the first is not fetched at all:
 
 ```text
 vendored service keyring
@@ -171,6 +454,49 @@ whichever line came first and hold the tarball to the sidecar's digest.
 **The `.sha256` sidecar is never read.** One sits beside every tarball, and it is
 a trap: nothing signs it, and it is not named in the signed digest document.
 Reading it would leave the chain resting on an unauthenticated file.
+
+### What a binary package's chain proves, and what it does not
+
+A binary package's chain is shorter and it is anchored to the same key:
+
+```text
+vendored service keyring
+  -> <package>.gpkg.tar/Manifest   (cleartext-signed)  each member's SHA-512
+  -> the members                   (bytes)             verified, then read
+```
+
+The subkey that signs a `Manifest` is the same one that signs
+`latest-stage3.txt` and the `.DIGESTS` documents, so the binary-package half
+adds no trust anchor, no keyring and no verification path — `Keyring::verify` is
+called on one more document.
+
+**The index is not signed, and nothing about that is fixable.** No
+`Packages.gpg`, `.asc`, `.sig`, `Manifest` or `.DIGESTS` is published beside it
+in any form, and its own per-package digests are MD5 and SHA-1. So a hostile
+mirror can decide *which* package a resolution asks for, even though it cannot
+forge the package it then serves.
+
+**And a Manifest proves authorship, not identity.** Its lines are `DATA <member>
+<size> SHA512 <hex> BLAKE2B <hex>` and there is no field naming the package.
+GLEP 78 is explicit that the container's directory prefix cannot supply the
+identity either — the name "should" match the file name, but "the implementation
+must be able to process an archive where the directory name is mismatched" — so
+a conforming reader cannot treat the prefix as a claim.
+
+Put together, that is a real substitution: a mirror answering a request for one
+package with a genuine, correctly signed *other* package passes every signature
+check there is. The layer closes it after verification, from the metadata inside
+the container — `CATEGORY`, `PF` and `BUILD_ID` compared against the record the
+resolution chose. A mismatch is a refusal, not a warning.
+
+The `Manifest` is the container's last member, so the digests arrive after the
+bytes they cover and a single forward pass cannot verify before extracting. The
+container is already in a cache, so this costs a second pass over a local file
+rather than a second fetch, and nothing is decompressed before its digest
+matches. The two detached `.sig` members go unread for the reason the stage3's
+`.asc` does — the cleartext-signed `Manifest` binds the same bytes — and they
+are digested by it like every other member, so they are verified *as data* even
+though they are not used as signatures.
 
 ### The keyring
 
@@ -374,18 +700,52 @@ earliest expiry among the certificates that can sign	1795718963
 have on a provisioning command line, so the archive a listing reads is the
 archive an install would; `--gentoo-keyring-horizon` reaches no network at all.
 
+Binary packages are installed by naming the tree and the atoms:
+
+```console
+$ fcage --provision-gentoo amd64 --gentoo-variant amd64-openrc \
+        --gentoo-binhost x86-64 \
+        --gentoo-install 'dev-vcs/git[keyring]' \
+        --gentoo-prefer-use '-X' \
+        --gentoo-cache ./gentoo-cache --rootfs ./gentoo \
+        /usr/bin/git --version
+fcage: the binhost index names 15773 builds, generated at 1787145736
+fcage: installing 74 packages (215048192 bytes)
+fcage: merging dev-lang/perl-5.42.2
+...
+git version 2.54.0
+```
+
+`--gentoo-install` is repeatable and `--gentoo-plan` installs a plan document
+instead of resolving. Two further listings answer without provisioning:
+
+```console
+$ fcage --gentoo-packages amd64 --gentoo-binhost x86-64
+acct-group/3proxy	0
+acct-group/adm	0-r3
+...
+
+$ fcage --gentoo-installed ./gentoo
+acct-group/audio-0-r3	0	abi_x86_64 amd64 elibc_glibc kernel_linux
+...
+```
+
+`--gentoo-packages` reads the binhost index; `--gentoo-installed` reads a root's
+own package database and reaches no network.
+
 ## Where this layer differs from the other two
 
 Every difference is one the archive itself makes.
 
 | | Debian and Alpine | Gentoo |
 | --- | --- | --- |
-| What is installed | a package closure this crate resolves | one prebuilt tarball |
+| What is installed | a package closure this crate resolves | a prebuilt tarball, and prebuilt packages over it |
 | The coordinate | a suite or release, plus an architecture | an architecture, plus a variant |
-| Replay | a plan document, versioned and portable | the build id and variant, recorded by the caller |
+| Where resolution starts | an empty root | a root with 296 packages already in it |
+| Replay | a plan document, versioned and portable | the build id and variant for the stage3, a plan document for the packages |
 | How long a pin lasts | as long as the archive or a snapshot service keeps the versions | about five weeks against the archive |
 | Freshness | `Valid-Until`, or an index refetched every run | the pointer's own signed regeneration timestamp |
-| What runs during a bootstrap | maintainer or install scripts, in a cage | nothing |
+| What runs during a bootstrap | maintainer or install scripts, in a cage | nothing; phase functions are not run |
 
 Building packages *inside* a provisioned stage3 is `emerge`'s job rather than
 this library's, and [the ebuild sandbox](ebuild-sandbox.md) is the worked example
@@ -393,14 +753,28 @@ of driving it.
 
 ## What is not here
 
-**The binary-package host.** Gentoo publishes prebuilt packages under
-`releases/<arch>/binpackages/`, and this layer does not read them. The index
-there is unsigned and its per-package digests are MD5 and SHA-1, so version
-selection on a hostile mirror is attacker-controlled even though the payloads are
-not — each `.gpkg.tar` carries a cleartext-signed `Manifest` of its own. A layer
-for it is a resolver's worth of work rather than a cryptographic one.
+**Building from source.** `emerge` inside a provisioned stage3 is what [the
+ebuild sandbox](ebuild-sandbox.md) shows, and it stays that example's job.
 
-**Detached signatures.** Gentoo publishes an `.asc` beside every tarball. It is
-an alternative path for someone verifying a download by hand, not the only one:
-the cleartext-signed digest document binds the same bytes, and that is what this
-layer reads.
+**Phase functions.** Named above, with what their absence costs.
+
+**The ebuild tree, and EAPI evaluation.** Neither is needed: the binhost index
+is USE-evaluated, so its dependency strings are the ones that survived the
+conditionals at build time and no `flag? ( ... )` group appears in any of them.
+That is the finding the whole binary-package half rests on.
+
+**Unmerging, upgrading and `--depclean`.** The layer installs into a root it is
+building. Removing and replacing packages in a root that exists is portage's job,
+and the database this layer writes is one portage can do it with.
+
+**Detached signatures.** Gentoo publishes an `.asc` beside every tarball and a
+`.sig` beside each container member. They are an alternative path for someone
+verifying a download by hand, not the only one: the cleartext-signed digest
+document and `Manifest` bind the same bytes, and that is what this layer reads.
+
+**BLAKE2B.** It sits beside SHA-512 on every `Manifest` line. A second algorithm
+agreeing with the first buys nothing the first does not already give.
+
+**A binhost of your own.** The mirror is configurable, so you can point this at
+one. What is not here is a second trust configuration for a keyring that is not
+Gentoo's.

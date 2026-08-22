@@ -1,25 +1,43 @@
-//! The Gentoo userland provisioner: bootstrap a rootfs from a signed stage3.
+//! The Gentoo userland provisioner: bootstrap a rootfs from a signed stage3,
+//! and install prebuilt packages into it.
 //!
-//! Gentoo publishes no package resolution to perform. There is no closure to
-//! compute, no dependency grammar to evaluate and no per-package container
-//! format; there is a signed pointer naming the current build of each variant,
-//! a signed digest document beside that build, and a tarball. So this layer is
-//! deliberately smaller than the Debian and Alpine ones — no plan, no
-//! resolution over a dependency graph, no install-script wave — while being
-//! driven exactly as they are, through [`Provisioner`] and
-//! [`provision::ensure`](super::ensure).
+//! A run is two waves, and a run that asks for no package is the first alone,
+//! byte for byte:
+//!
+//! 1. Resolve a stage3 variant to the build the archive currently publishes,
+//!    verify the signed documents that vouch for it, and extract the tarball.
+//! 2. Read the extracted root's own package database, resolve the caller's
+//!    atoms against it and the binary-package index, and fetch, verify and
+//!    merge what is missing.
+//!
+//! # Resolution starts from a populated root
+//!
+//! That is the shape neither of the other two userlands has, and it decides the
+//! resolver's inputs rather than being a detail of them. Debian and Alpine
+//! bootstrap from nothing, so their resolvers start with an empty root and the
+//! archive is the only source of truth. A stage3 arrives with 296 packages
+//! already installed and a database describing them, so resolution here asks
+//! what is *missing* — and it is measurably load-bearing, because one of those
+//! 296 has no binary package in the archive at all.
 //!
 //! # What binds the archive together
 //!
-//! One key, vouching for two cleartext-signed documents, the second of which
-//! vouches for the bytes:
+//! One key, vouching for cleartext-signed documents that vouch for the bytes:
 //!
 //! ```text
 //! vendored service keyring
 //!   -> latest-stage3.txt      (cleartext-signed)  the variants, their sizes
 //!   -> <tarball>.DIGESTS      (cleartext-signed)  the tarball's SHA-512
 //!   -> <tarball>              (bytes)             verified, then extracted
+//!
+//! vendored service keyring
+//!   -> <package>/Manifest     (cleartext-signed)  each member's SHA-512
+//!   -> the members            (bytes)             verified, then read
 //! ```
+//!
+//! The subkey that signs a package's `Manifest` is the one that signs the
+//! pointer and the digest documents, so the binary-package half adds no trust
+//! anchor: the crate's OpenPGP verification is called on one more document.
 //!
 //! That is the same shape Debian's release chain has, and it is verified with
 //! the same machinery: the crate's OpenPGP verification establishes each
@@ -27,24 +45,51 @@
 //! are held to. A `.sha256` sidecar sits beside every tarball and is never read
 //! — nothing signs it, and a chain resting on an unauthenticated file is not a
 //! chain.
+//!
+//! What no signature covers is the binary-package index, in any form, and the
+//! two consequences are answered in different places. That a mirror can decide
+//! *which* package a resolution asks for is closed after verification, by
+//! comparing the metadata inside a container against the record the resolution
+//! chose -- a `Manifest` carries no field naming the package, so a genuine,
+//! correctly signed *other* package would otherwise pass every check. That
+//! nothing vouches for the index's own freshness is not closed at all, and the
+//! rollback the stage3's signed timestamp shuts is open here — which is a fact
+//! about the archive rather than about this layer.
 
+mod atom;
 mod digests;
+mod gpkg;
+mod index;
+mod installed;
+mod plan;
 mod pointer;
+mod resolve;
+mod vdb;
+mod version;
 
 use std::fmt;
 use std::io;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use index::Catalogue;
+pub use installed::{Installed, InstalledPackage, installed};
+pub use plan::{Plan, PlannedPackage};
+
 use pointer::Pointer;
 
+use super::compress;
 use super::coordinate::{self, Nesting};
 use super::digest::{self, Algorithm};
+use super::layer::BuildLayer;
 use super::openpgp::{Keyring, OpenPgpError};
+use super::rooted::Rooted;
 use super::{
     Delegate, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter, PackageCache,
     ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball,
 };
+use crate::IdentityMap;
 
 /// The archive the layer reads unless the caller names another.
 const DEFAULT_MIRROR: &str = "http://distfiles.gentoo.org";
@@ -63,6 +108,34 @@ const MAX_POINTER_BYTES: u64 = 1024 * 1024;
 
 /// The ceiling on a digest document, which declares no size of its own.
 const MAX_DIGESTS_BYTES: u64 = 64 * 1024;
+
+/// The ceiling on a binary-package index, which declares no size of its own.
+///
+/// Sized against today's 19.1 MB with room for the archive to grow. It applies
+/// to the plain and the compressed form alike -- for the compressed one, to the
+/// decompressed stream, since that is what a decompression bomb inflates.
+const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The ceiling on a binary package's metadata archive, which the container
+/// declares no length for until its Manifest has been read.
+///
+/// The largest a real one runs to is a few tens of kilobytes; this is far above
+/// that and far below a bound that means nothing. It applies to the compressed
+/// member and again to what it inflates to, since a decompression bomb spends
+/// its bytes in the second.
+const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The most paths one binary package may ship.
+///
+/// Every one becomes a line of the database entry's `CONTENTS`, held in memory
+/// until the entry is written. The largest package Gentoo publishes ships tens
+/// of thousands; this is an order above that, and it bounds what a container
+/// whose length passed the index's `SIZE` can still make the merge spend.
+const MAX_CONTENTS_ENTRIES: usize = 1_000_000;
+
+/// The suffix of the cache binary packages are downloaded into when the caller
+/// named no directory of their own.
+const PACKAGE_CACHE: &str = ".fcage-binpkgs";
 
 /// The ceiling on a stage3 tarball where nothing declares its size.
 ///
@@ -152,6 +225,80 @@ pub enum GentooError {
         /// The bound it exceeded.
         limit: Duration,
     },
+    /// The binary-package index was fetched but does not say what the layer
+    /// needs.
+    ///
+    /// Nothing signs the index, so this is not a signature failure and never
+    /// can be: no `Packages.gpg`, `.asc`, `.sig`, `Manifest` or `.DIGESTS` is
+    /// published beside it in any form. What it reports is a document that
+    /// arrived and could not be read as one — an empty index, or one whose
+    /// stanzas this layer could not act on.
+    #[non_exhaustive]
+    Index {
+        /// The URL the index was served from, mirror included.
+        subject: String,
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// A plan document cannot be read, or cannot be written.
+    ///
+    /// Reading: the document is not one this library reads, or it states
+    /// something an index would never have published — a name that is not a
+    /// package, a version this format does not define, a path that would not
+    /// stay inside the archive. Writing: the plan holds a value the format
+    /// cannot carry back unchanged, which is refused rather than written as
+    /// something that reads back differently.
+    #[non_exhaustive]
+    PlanDocument {
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// The closure the binhost offers is not one that can be installed.
+    ///
+    /// An atom nothing published answers, or a blocker that matches something
+    /// the root has or the resolution chose. Both sides of every refusal are
+    /// named: which atom, who asked for it, and what stopped it.
+    #[non_exhaustive]
+    Resolve {
+        /// What could not be resolved, and what the binhost offers instead.
+        reason: String,
+    },
+    /// A binary package's container is not one this layer can read.
+    ///
+    /// Not a signature failure and not a digest one: those have variants of
+    /// their own. This is a container whose *shape* is wrong — no format
+    /// marker, a member its Manifest does not list or one it lists that is
+    /// absent, no image or metadata archive — or one whose metadata names a
+    /// different package than the index did.
+    ///
+    /// That last is the one worth naming. A Manifest carries no field saying
+    /// which package it is, and GLEP 78 forbids trusting the container's
+    /// directory prefix for it, so a hostile mirror answering a request for one
+    /// package with a genuine, correctly signed *other* package passes every
+    /// signature check there is. The identity check inside the container is
+    /// what closes that, and this is what it reports.
+    #[non_exhaustive]
+    Container {
+        /// The container concerned, in the cache.
+        subject: String,
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// A root's own package database holds something that is not a package
+    /// entry.
+    ///
+    /// The database is read to learn what a root already has, so an entry that
+    /// cannot be read is a gap in that answer rather than a detail to pass
+    /// over: resolving against a set that is missing a package asks the archive
+    /// for something the root already satisfies, or -- where the archive does
+    /// not publish it -- refuses an install that would have worked.
+    #[non_exhaustive]
+    Database {
+        /// The root whose database was being read.
+        root: PathBuf,
+        /// What was wrong with it.
+        reason: String,
+    },
     /// The tarball does not have the digest the signed document recorded for
     /// it.
     ///
@@ -216,6 +363,24 @@ impl GentooError {
         }
     }
 
+    /// A package database holding something that is not an entry, naming the
+    /// root and what was wrong.
+    pub(crate) fn database(root: impl Into<PathBuf>, reason: impl Into<String>) -> GentooError {
+        GentooError::Database {
+            root: root.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// An index that arrived and could not be read, naming where it came from
+    /// and what was wrong.
+    pub(crate) fn index(subject: impl Into<String>, reason: impl Into<String>) -> GentooError {
+        GentooError::Index {
+            subject: subject.into(),
+            reason: reason.into(),
+        }
+    }
+
     /// A host I/O failure, naming what the operation was doing and the path it
     /// concerned.
     ///
@@ -255,6 +420,23 @@ impl fmt::Display for GentooError {
             GentooError::Document { subject, reason } => {
                 write!(f, "{subject} verified but {reason}")
             }
+            GentooError::Index { subject, reason } => {
+                write!(f, "the index at {subject} {reason}")
+            }
+            GentooError::PlanDocument { reason } => {
+                write!(f, "the plan document cannot be used: {reason}")
+            }
+            GentooError::Resolve { reason } => {
+                write!(f, "the binhost cannot satisfy what was asked for: {reason}")
+            }
+            GentooError::Container { subject, reason } => {
+                write!(f, "the package at {subject} {reason}")
+            }
+            GentooError::Database { root, reason } => write!(
+                f,
+                "the package database of the root at {} cannot be read: {reason}",
+                root.display(),
+            ),
             GentooError::Stale {
                 published,
                 age,
@@ -539,6 +721,21 @@ pub struct Gentoo {
     architecture: String,
     /// The variant to resolve, where the caller named one.
     variant: Option<String>,
+    /// The binhost sub-architecture to install binary packages from, where the
+    /// caller named one.
+    binhost: Option<String>,
+    /// The atoms to install from the binhost, parsed at build time so a
+    /// misspelled one is refused before anything is fetched.
+    install: Vec<atom::Atom>,
+    /// The USE flags the caller would rather a build carried, in the order they
+    /// were named.
+    prefer_use: Vec<resolve::Preference>,
+    /// A resolution to install instead of performing one, where the caller
+    /// supplied a plan.
+    plan: Option<Plan>,
+    /// The root a layered build stages its increment over, where the caller
+    /// named one.
+    base_layer: Option<PathBuf>,
     /// The build directory to resolve within instead of the one the pointer
     /// currently names, where the caller pinned one.
     build_id: Option<String>,
@@ -567,6 +764,11 @@ impl fmt::Debug for Gentoo {
         f.debug_struct("Gentoo")
             .field("architecture", &self.architecture)
             .field("variant", &self.variant)
+            .field("binhost", &self.binhost)
+            .field("install", &self.install)
+            .field("prefer_use", &self.prefer_use)
+            .field("plan", &self.plan)
+            .field("base_layer", &self.base_layer)
             .field("build_id", &self.build_id)
             .field("stage3", &self.stage3)
             .field("max_pointer_age", &self.max_pointer_age)
@@ -584,6 +786,11 @@ impl Gentoo {
         GentooBuilder {
             architecture: architecture.into(),
             variant: None,
+            binhost: None,
+            install: Vec::new(),
+            prefer_use: Vec::new(),
+            plan: None,
+            base_layer: None,
             build_id: None,
             stage3: None,
             max_pointer_age: Some(DEFAULT_MAX_POINTER_AGE),
@@ -656,6 +863,230 @@ impl Gentoo {
             published: pointer.published(),
             entries: pointer.entries().to_vec(),
         })
+    }
+
+    /// What the configured binhost publishes.
+    ///
+    /// The read half of an install: it fetches the binary-package index,
+    /// parses it, and reports the names and versions it names. Nothing is
+    /// downloaded, so this serves an architecture the host could never run.
+    ///
+    /// Nothing signs the index, and no amount of asking would change that —
+    /// Gentoo publishes no signature over it in any form. Every package it
+    /// names carries a cleartext-signed `Manifest` of its own, which is what an
+    /// install verifies; the index decides which package is asked for, and a
+    /// hostile mirror can therefore decide that. What the identity check inside
+    /// each container closes is the substitution that would otherwise follow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GentooError::Config`] when no binhost sub-architecture was
+    /// named, [`GentooError::Fetch`] when no mirror serves the index, and
+    /// [`GentooError::Index`] when what one served could not be read as one.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use ferroday_cage::provision::gentoo::Gentoo;
+    ///
+    /// # fn main() -> Result<(), ferroday_cage::provision::gentoo::GentooError> {
+    /// let mut gentoo = Gentoo::builder("amd64").binhost("x86-64").build()?;
+    /// let catalogue = gentoo.packages()?;
+    /// println!("{} packages in {} builds", catalogue.len(), catalogue.builds());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn packages(&mut self) -> Result<Catalogue, GentooError> {
+        Ok(self.read_index(None)?.into_catalogue())
+    }
+
+    /// What installing the configured atoms into the root at `root` would
+    /// install.
+    ///
+    /// The read half of an install wave: it fetches the index, reads what
+    /// `root` already has, resolves the two against each other and reports the
+    /// [`Plan`]. Nothing is downloaded and nothing is merged.
+    ///
+    /// # Why this takes a root
+    ///
+    /// Because on this archive the answer has no meaning without one, and that
+    /// is the shape neither of the other userlands has. A stage3 arrives with
+    /// 296 packages already installed, and one of them — `app-crypt/pinentry` —
+    /// the binhost does not publish in any version. It is in `dev-vcs/git`'s
+    /// runtime closure, so resolving git against an empty root does not merely
+    /// produce a larger plan: it fails, on an atom the real root answers.
+    ///
+    /// So `root` is the root the packages would be installed into: the one a
+    /// bootstrap has already published, or the base of a layered build. A
+    /// resolution against a root that does not exist yet is a resolution
+    /// against nothing, which this archive does not support and which a
+    /// signature that defaulted the root would quietly produce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GentooError::Config`] when no binhost or no atom was named,
+    /// [`GentooError::Fetch`] or [`GentooError::Index`] for an index that
+    /// cannot be read, [`GentooError::Database`] for a root whose own database
+    /// cannot be, and [`GentooError::Resolve`] for a request the binhost cannot
+    /// satisfy — naming every atom it could not answer and every conflict it
+    /// met, rather than only the first.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use ferroday_cage::provision::gentoo::Gentoo;
+    ///
+    /// # fn main() -> Result<(), ferroday_cage::provision::gentoo::GentooError> {
+    /// let mut gentoo = Gentoo::builder("amd64")
+    ///     .binhost("x86-64")
+    ///     .install(["dev-vcs/git"])
+    ///     .build()?;
+    /// let plan = gentoo.resolve_packages("/var/lib/machines/gentoo")?;
+    /// for package in &plan.packages {
+    ///     println!("{}-{} build {}", package.name, package.version, package.build_id);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn resolve_packages(&mut self, root: impl AsRef<Path>) -> Result<Plan, GentooError> {
+        let installed = installed::installed(root)?;
+        self.resolve_install(&installed, None)
+    }
+
+    /// The resolution, with somewhere to report to.
+    ///
+    /// Shared by [`resolve_packages`](Self::resolve_packages) and the install
+    /// wave, so the answer a caller previews and the answer a run installs come
+    /// from one code path and cannot drift apart.
+    fn resolve_install(
+        &mut self,
+        installed: &Installed,
+        to: Reporting<'_, '_>,
+    ) -> Result<Plan, GentooError> {
+        // A plan is a caller saying what to install, so there is nothing to
+        // resolve and no index to fetch.
+        if let Some(plan) = &self.plan {
+            return Ok(plan.clone());
+        }
+        let Some(binhost) = self.binhost.clone() else {
+            return Err(GentooError::config(
+                "no binhost sub-architecture was named; call GentooBuilder::binhost with one of \
+                 the trees the architecture publishes, such as \"x86-64\"",
+            ));
+        };
+        if self.install.is_empty() {
+            return Err(GentooError::config(
+                "no package was asked for; call GentooBuilder::install with an atom such as \
+                 \"dev-vcs/git\"",
+            ));
+        }
+        let index = self.read_index(to)?;
+        report(
+            to,
+            GentooEvent::Index {
+                builds: index.records().len(),
+                skipped: index.skipped(),
+                generated: index.preamble().generated,
+            },
+        );
+        let (resolved, refusals) =
+            resolve::resolve(&index, installed, &self.install, &self.prefer_use);
+        for cycle in &resolved.cycles {
+            report(to, GentooEvent::DependencyCycle { packages: cycle });
+        }
+        if !refusals.is_empty() {
+            for unmet in &refusals.unsatisfied {
+                report(
+                    to,
+                    GentooEvent::Unsatisfiable {
+                        atom: &unmet.atom,
+                        wanted_by: &unmet.wanted_by,
+                        reason: &unmet.reason,
+                    },
+                );
+            }
+            for conflict in &refusals.conflicts {
+                report(
+                    to,
+                    GentooEvent::Conflict {
+                        atom: &conflict.atom,
+                        stated_by: &conflict.stated_by,
+                        blocks: &conflict.blocks,
+                        installed: conflict.installed,
+                    },
+                );
+            }
+            return Err(GentooError::Resolve {
+                reason: refusals.describe(),
+            });
+        }
+        Ok(Plan::project(
+            &self.architecture,
+            &binhost,
+            index.preamble().generated,
+            &resolved.packages,
+        ))
+    }
+
+    /// Fetches and parses the binary-package index.
+    fn read_index(&mut self, to: Reporting<'_, '_>) -> Result<index::Index, GentooError> {
+        let Some(binhost) = self.binhost.clone() else {
+            return Err(GentooError::config(
+                "no binhost sub-architecture was named; call GentooBuilder::binhost with one of \
+                 the trees the architecture publishes, such as \"x86-64\"",
+            ));
+        };
+        let directory = index::directory(&self.architecture, &binhost);
+        let mut unserved = None;
+        // The compressed form first and the plain one behind it, each walked
+        // across every mirror: a mirror that publishes only the plain form is a
+        // mirror to fall back to rather than one to give up on.
+        for name in index::NAMES {
+            let suffix = format!("{directory}/{name}");
+            match self.read_bytes(&suffix, MAX_INDEX_BYTES, to) {
+                Ok(served) => return read_index_body(&served),
+                Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(GentooError::Fetch(
+            unserved.unwrap_or_else(|| no_mirror(&directory)),
+        ))
+    }
+
+    /// Fetches one unsigned document, walking the mirrors as
+    /// [`read_signed`](Self::read_signed) does but stopping short of a
+    /// verification there is nothing to perform.
+    ///
+    /// Kept apart from that walk rather than folded into it, because the two
+    /// differ in what a failure means and not only in a step: a document that
+    /// does not verify is fatal there and there is no such outcome here, so a
+    /// shared body would carry a flag that decides whether the layer is
+    /// checking a signature. The index has none to check.
+    fn read_bytes(
+        &mut self,
+        suffix: &str,
+        limit: u64,
+        to: Reporting<'_, '_>,
+    ) -> Result<Fetched, GentooError> {
+        let mut unserved = None;
+        for mirror in &self.mirrors {
+            stop_if_cancelled(to)?;
+            let url = format!("{}/{suffix}", mirror.trim_end_matches('/'));
+            report(to, GentooEvent::Fetching { url: &url });
+            let mut bytes = Vec::new();
+            match self.fetcher.fetch(
+                &FetchRequest::new(&url).sized(limit),
+                &mut LimitedWriter::new(&mut bytes, limit),
+            ) {
+                Ok(()) => return Ok(Fetched { url, body: bytes }),
+                Err(err) if err.is_failover() => unserved = Some(err),
+                Err(err) => return Err(GentooError::Fetch(err)),
+            }
+        }
+        Err(GentooError::Fetch(
+            unserved.unwrap_or_else(|| no_mirror(suffix)),
+        ))
     }
 
     /// Resolves the configured variant to a build, and that build to the digest
@@ -836,6 +1267,65 @@ impl Gentoo {
     }
 }
 
+/// An unsigned document as it arrived, and the URL that served it.
+///
+/// The URL is the whole one, as [`Served`]'s is and for the same reason: a walk
+/// over several mirrors is exactly when a refusal has to name which one
+/// answered.
+struct Fetched {
+    /// The URL the document arrived from.
+    url: String,
+    /// The bytes, in whatever compression the archive served them.
+    body: Vec<u8>,
+}
+
+/// Reads a fetched index body into a parsed index.
+///
+/// The compression is selected from the bytes rather than from the file name,
+/// so the plain form and the compressed one go through one path — and a mirror
+/// serving one under the other's name is read for what it is rather than for
+/// what it is called.
+///
+/// The decompressed stream is bounded as well as the fetch: the fetch's ceiling
+/// bounds what arrived, and this one bounds what that inflates to, which is the
+/// only place a decompression bomb could spend anything.
+fn read_index_body(served: &Fetched) -> Result<index::Index, GentooError> {
+    let mut body = served.body.as_slice();
+    let head = compress::sniff_head(&mut body)
+        .map_err(|err| GentooError::index(&served.url, format!("could not be read: {err}")))?;
+    let mut reader = compress::decompress(&head, body)
+        .map_err(|err| GentooError::index(&served.url, format!("could not be read: {err}")))?;
+    let mut bytes = Vec::new();
+    io::copy(&mut reader.by_ref().take(MAX_INDEX_BYTES), &mut bytes)
+        .map_err(|err| GentooError::index(&served.url, format!("could not be read: {err}")))?;
+    // Lossy rather than strict: the index is fifteen thousand stanzas of which
+    // this layer reads a dozen fields, and one package's description holding a
+    // byte sequence that is not UTF-8 is not a reason to refuse the archive.
+    // Every field this layer acts on is held to its own grammar afterwards.
+    let parsed = index::Index::parse(&String::from_utf8_lossy(&bytes));
+    if parsed.records().is_empty() {
+        return Err(GentooError::index(
+            &served.url,
+            "names no package this layer can act on",
+        ));
+    }
+    // The index's own count against what arrived. Not a security property --
+    // the count is in the same unsigned document as the stanzas, so a mirror
+    // composing one composes both -- but a plain-text index cut short otherwise
+    // parses perfectly and resolves against a silently smaller archive, and
+    // this is the only thing that would notice.
+    let read = (parsed.records().len() + parsed.skipped()) as u64;
+    if let Some(declared) = parsed.preamble().declared
+        && read < declared
+    {
+        return Err(GentooError::index(
+            &served.url,
+            format!("states that it holds {declared} packages and carries {read}"),
+        ));
+    }
+    Ok(parsed)
+}
+
 /// A verified document, and the URL that served it.
 ///
 /// The URL is the whole one, mirror included, rather than the archive-relative
@@ -925,11 +1415,203 @@ impl Provisioner for Gentoo {
         // streamed through it as they arrive: an archive that turns out not to
         // be the one the signed document named would otherwise already have
         // written most of a root filesystem.
-        Tarball::new(&tarball).provision(request)
+        Tarball::new(&tarball).provision(request)?;
+
+        // The second wave. A run that asked for no package stops here and has
+        // done exactly what a stage3 bootstrap does, byte for byte.
+        if self.install.is_empty() && self.plan.is_none() {
+            return Ok(());
+        }
+        self.install_wave(request.staging(), None, Some(request))?;
+        Ok(())
     }
 }
 
 impl Gentoo {
+    /// Stages the configured install as a disposable overlay upper over the
+    /// [`base_layer`](GentooBuilder::base_layer).
+    ///
+    /// A layered build provisions one base and stages each increment over it:
+    /// the base is read-only, the increment lives in `upper`, and the
+    /// [`BuildLayer`] returned removes the upper when it is dropped. Root a
+    /// cage on
+    /// [`overlay_rootfs(base, layer.path())`](crate::CageBuilder::overlay_rootfs)
+    /// to build against the merged view.
+    ///
+    /// Resolution reads the merged view — the base's own database and whatever
+    /// the upper already holds — so an increment installs what the base is
+    /// missing and no more. The entries it writes land in the upper, and
+    /// portage reading the merged root sees the base's and the increment's
+    /// together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvisionError`] wrapping [`GentooError::Config`] when no base
+    /// layer is set, and the same failures an install wave reports otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use ferroday_cage::provision::gentoo::Gentoo;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut increment = Gentoo::builder("amd64")
+    ///     .binhost("x86-64")
+    ///     .install(["dev-vcs/git"])
+    ///     .base_layer("/var/lib/machines/gentoo")
+    ///     .build()?;
+    /// let layer = increment.stage_layer("/var/tmp/build-upper")?;
+    /// // Root a cage on the merged view; drop `layer` to revert the increment.
+    /// # let _ = layer;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
+        let upper = upper.as_ref();
+        let Some(base) = self.base_layer.clone() else {
+            return Err(GentooError::config(
+                "no base layer was named; call GentooBuilder::base_layer with the Gentoo root the \
+                 increment is staged over",
+            )
+            .into());
+        };
+        std::fs::create_dir_all(upper)
+            .map_err(|err| ProvisionError::io("creating the overlay upper", upper, err))?;
+        // The handle that owns the upper is taken as soon as the upper exists,
+        // not on the way out, so a failure below disposes of a partly-installed
+        // increment instead of orphaning it: there is no handle in an `Err` for
+        // the caller to drop.
+        let layer = BuildLayer::new(upper, IdentityMap::Single);
+        self.install_wave(upper, Some(&base), None)?;
+        Ok(layer)
+    }
+
+    /// Installs the configured atoms into `root`, merging each package and
+    /// registering its database entry.
+    ///
+    /// `over` is the base an increment is staged over, where this is a layered
+    /// build: resolution then describes the merged view rather than the upper
+    /// alone, because that is what a package manager inside the finished
+    /// sandbox sees.
+    ///
+    /// Cancellation is consulted between packages and while each one is being
+    /// downloaded. A wave installing a hundred packages is the longest thing
+    /// this layer does, and a check that ran only around it would answer a
+    /// caller who asked to stop once all of it had arrived.
+    fn install_wave(
+        &mut self,
+        root: &Path,
+        over: Option<&Path>,
+        to: Reporting<'_, '_>,
+    ) -> Result<(), ProvisionError> {
+        let installed = match over {
+            Some(base) => installed::merged(base, root)?,
+            None => installed::installed(root)?,
+        };
+        let plan = self.resolve_install(&installed, to)?;
+        report(
+            to,
+            GentooEvent::Planned {
+                packages: plan.packages.len(),
+                bytes: plan.packages.iter().map(|package| package.size).sum(),
+            },
+        );
+        // The resolution is one document and the downloads are not, so a caller
+        // who cancelled during it is not committed to them by having asked what
+        // would be installed.
+        stop_if_cancelled(to)?;
+        if plan.packages.is_empty() {
+            return Ok(());
+        }
+
+        let cache = PackageCache::beside(root, self.cache_dir.as_deref(), PACKAGE_CACHE);
+        let directory = index::directory(&self.architecture, &plan.binhost);
+        let rooted = Rooted::open(root).map_err(GentooError::at("opening the root", root))?;
+        // The merge ordinal continues the root's own sequence, and for a
+        // layered build that sequence is the base's: an increment that started
+        // again at one would give two packages the same ordinal, and the
+        // database could no longer say which was merged first.
+        let mut counter = vdb::counter_of(root, &rooted)?;
+        if let Some(base) = over {
+            let below = Rooted::open(base).map_err(GentooError::at("opening the base", base))?;
+            counter = counter.max(vdb::counter_of(base, &below)?);
+        }
+        for planned in &plan.packages {
+            stop_if_cancelled(to)?;
+            // The path came out of an index or a plan document and passed
+            // `coordinate::check` either way, so it names something under the
+            // cache and under the binhost directory and nothing else.
+            let cached = cache.path().join(&planned.path);
+            if let Some(parent) = cached.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(GentooError::at("creating the download cache", parent))?;
+            }
+            // A cached container is bytes on a disk this crate does not own, so
+            // it is verified on the read rather than trusted for having been
+            // verified once -- which makes the cache-hit path and the
+            // fresh-download path one code path.
+            if !cached.is_file() {
+                self.download_package(&directory, planned, &cached, to)?;
+            }
+            report(
+                to,
+                GentooEvent::Merging {
+                    package: &planned.name,
+                    version: &planned.version,
+                },
+            );
+            let package = match gpkg::Package::open(&cached, planned, &self.keyring) {
+                Ok(package) => package,
+                Err(err) => {
+                    // A container that is not what it should be is not the
+                    // archive's file whatever it is, and leaving it would make
+                    // every later run fail identically out of its own cache --
+                    // which reads as a permanent failure rather than as a
+                    // mirror that served the wrong bytes once. The same rule
+                    // the stage3's digest check applies.
+                    let _ = std::fs::remove_file(&cached);
+                    return Err(err.into());
+                }
+            };
+            counter += 1;
+            vdb::merge(root, &rooted, &cached, &package, planned, counter)?;
+        }
+        Ok(())
+    }
+
+    /// Downloads one binary package into the cache, atomically.
+    ///
+    /// Bounded by the exact length the index published for it. That number is
+    /// unsigned, which makes it a bound rather than a promise: it can only be
+    /// wrong in the direction of refusing a container larger than advertised,
+    /// and the fetch fails closed.
+    fn download_package(
+        &mut self,
+        directory: &str,
+        planned: &PlannedPackage,
+        dest: &Path,
+        to: Reporting<'_, '_>,
+    ) -> Result<(), GentooError> {
+        let mut unserved = None;
+        for mirror in &self.mirrors {
+            stop_if_cancelled(to)?;
+            let url = format!(
+                "{}/{directory}/{}",
+                mirror.trim_end_matches('/'),
+                planned.path,
+            );
+            report(to, GentooEvent::Fetching { url: &url });
+            match fetch_to(self.fetcher.as_mut(), &url, planned.size, dest, to) {
+                Ok(()) => return Ok(()),
+                Err(GentooError::Fetch(err)) if err.is_failover() => unserved = Some(err),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(GentooError::Fetch(
+            unserved.unwrap_or_else(|| no_mirror(&planned.path)),
+        ))
+    }
+
     /// Downloads a stage3 into the cache, atomically.
     ///
     /// The body is written to a staging file beside the destination and renamed
@@ -1134,6 +1816,79 @@ pub enum GentooEvent<'a> {
         /// The tarball, in the cache.
         path: &'a Path,
     },
+    /// The binary-package index has been read.
+    #[non_exhaustive]
+    Index {
+        /// How many published builds it names.
+        builds: usize,
+        /// How many stanzas were read and not kept: a record whose `CPV` this
+        /// layer could not split, whose path would not stay inside the archive,
+        /// or whose dependency classes it could not read. A live archive
+        /// reports zero.
+        skipped: usize,
+        /// The epoch the index states it was generated at, where it states one.
+        ///
+        /// Nothing signs the index, so this is a mirror's claim rather than a
+        /// verified fact.
+        generated: Option<i64>,
+    },
+    /// A runtime-dependency cycle was broken to produce an install order.
+    ///
+    /// Gentoo's runtime graph has them, and portage breaks them too. The rule
+    /// is stable — the first package still waiting, in name order — so a cycle
+    /// broken in one run is broken the same way in the next.
+    #[non_exhaustive]
+    DependencyCycle {
+        /// The packages still waiting on each other, as `category/name-version`.
+        packages: &'a [String],
+    },
+    /// An atom nothing published can satisfy.
+    ///
+    /// Reported for every such atom before the run fails, so a caller fixing an
+    /// install list sees the whole list rather than the first entry of it.
+    #[non_exhaustive]
+    Unsatisfiable {
+        /// The atom, as it was written.
+        atom: &'a str,
+        /// Who asked for it: the install list, or the package whose dependency
+        /// it is.
+        wanted_by: &'a str,
+        /// What the wall was, in the sentence "no build ...": the name, the
+        /// version, the slot, or a USE flag.
+        reason: &'a str,
+    },
+    /// The install set has been resolved, and the wave is about to download it.
+    #[non_exhaustive]
+    Planned {
+        /// How many packages it holds, which is what the root is missing rather
+        /// than what the request names: a stage3 already answers most of a
+        /// closure.
+        packages: usize,
+        /// What they weigh on the wire in total, from the sizes the index
+        /// published.
+        bytes: u64,
+    },
+    /// A verified package is being merged into the root and registered.
+    #[non_exhaustive]
+    Merging {
+        /// The package, as `category/name`.
+        package: &'a str,
+        /// The version being merged.
+        version: &'a str,
+    },
+    /// A blocker matched something the root has or the resolution chose.
+    #[non_exhaustive]
+    Conflict {
+        /// The blocker atom, as it was written.
+        atom: &'a str,
+        /// The package that states it.
+        stated_by: &'a str,
+        /// What it matched, as `category/name-version`.
+        blocks: &'a str,
+        /// Whether what it matched is already in the root, rather than
+        /// something this same resolution would install.
+        installed: bool,
+    },
 }
 
 /// Where a step reports to, when anything is listening.
@@ -1170,6 +1925,14 @@ fn stop_if_cancelled(to: Reporting<'_, '_>) -> Result<(), GentooError> {
 pub struct GentooBuilder {
     architecture: String,
     variant: Option<String>,
+    binhost: Option<String>,
+    /// The atoms as the caller wrote them, parsed at
+    /// [`build`](GentooBuilder::build) so a refusal names the whole
+    /// configuration rather than the call that added a line to it.
+    install: Vec<String>,
+    prefer_use: Vec<String>,
+    plan: Option<Plan>,
+    base_layer: Option<PathBuf>,
     build_id: Option<String>,
     stage3: Option<Stage3>,
     max_pointer_age: Option<Duration>,
@@ -1191,6 +1954,11 @@ impl fmt::Debug for GentooBuilder {
         f.debug_struct("GentooBuilder")
             .field("architecture", &self.architecture)
             .field("variant", &self.variant)
+            .field("binhost", &self.binhost)
+            .field("install", &self.install)
+            .field("prefer_use", &self.prefer_use)
+            .field("plan", &self.plan)
+            .field("base_layer", &self.base_layer)
             .field("build_id", &self.build_id)
             .field("stage3", &self.stage3)
             .field("max_pointer_age", &self.max_pointer_age)
@@ -1217,6 +1985,118 @@ impl GentooBuilder {
     /// naming what the architecture does offer. [`Gentoo::available`] lists them.
     pub fn variant(mut self, variant: impl Into<String>) -> GentooBuilder {
         self.variant = Some(variant.into());
+        self
+    }
+
+    /// Install binary packages from the binhost for this sub-architecture —
+    /// `x86-64`, `x86-64-v3`, `x86-64_hardened`, `x32`.
+    ///
+    /// The binhost publishes one tree per sub-architecture under the
+    /// architecture's own, and there is no default: the set moves — amd64
+    /// publishes four today where it published eight — and the only thing that
+    /// enumerates it is an unsigned directory listing. Reading that listing as
+    /// discovery would put an unauthenticated document at the head of the trust
+    /// chain, which is the reason the keyring is vendored, so the
+    /// sub-architecture is the caller's and a wrong one is a 404 rather than a
+    /// silently different userland.
+    ///
+    /// This selects the archive to read. What to install from it is
+    /// [`install`](Self::install), and a builder that names a binhost and asks
+    /// for no package bootstraps exactly as one that names neither.
+    pub fn binhost(mut self, sub_architecture: impl Into<String>) -> GentooBuilder {
+        self.binhost = Some(sub_architecture.into());
+        self
+    }
+
+    /// Install these atoms and their runtime dependencies from the binhost.
+    ///
+    /// An atom is the dependency grammar Gentoo itself writes:
+    /// `dev-vcs/git`, `>=dev-lang/python-3.12`, `dev-libs/openssl:0`,
+    /// `dev-vcs/git[keyring]`. Repeating this adds to the list.
+    ///
+    /// **A USE dependency in an atom is a constraint.** `dev-vcs/git[keyring]`
+    /// removes every build that was not compiled with the flag, and if the
+    /// binhost publishes none the atom is unsatisfiable and says so. That is
+    /// the difference from [`prefer_use`](Self::prefer_use), which reorders the
+    /// candidates and can never refuse: state a flag the install *must* have
+    /// here, and a flag you would rather it had there.
+    ///
+    /// A blocker — an atom written `!` or `!!` — is refused. It says what must
+    /// not be installed alongside a package rather than what to install, and
+    /// this layer installs into a root it is building rather than removing from
+    /// one.
+    ///
+    /// Resolution starts from what the root already has, so an atom the stage3
+    /// already satisfies costs nothing and pulls nothing.
+    pub fn install<I, S>(mut self, atoms: I) -> GentooBuilder
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.install.extend(atoms.into_iter().map(Into::into));
+        self
+    }
+
+    /// Prefer builds carrying these USE flags, and builds without the ones
+    /// written `-flag`.
+    ///
+    /// A preference, never a constraint. The archive publishes a version more
+    /// than once — up to twenty-four times — and the builds differ in the flags
+    /// they were compiled with; this reorders those candidates and removes
+    /// none, so it provably cannot turn a resolvable request into an
+    /// unresolvable one. Measured over four hundred package names, the count of
+    /// unsatisfiable atoms is the same under every preference as under none.
+    ///
+    /// What a broad preference does cost is a larger closure, and a larger
+    /// closure meets more of the archive's own conflicts: preferring `X`,
+    /// `gtk`, `qt6` and `systemd` together doubles them. A narrow one costs
+    /// nothing measurable.
+    ///
+    /// State a flag an install must have in the atom instead, where
+    /// [`install`](Self::install) explains why.
+    pub fn prefer_use<I, S>(mut self, flags: I) -> GentooBuilder
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.prefer_use.extend(flags.into_iter().map(Into::into));
+        self
+    }
+
+    /// Stage the install as an increment over the Gentoo root at `base`,
+    /// rather than into a root being bootstrapped.
+    ///
+    /// The base is never written to. [`Gentoo::stage_layer`] installs into an
+    /// overlay upper over it, and a cage rooted on the merged view sees the
+    /// base's own files and the increment's together.
+    ///
+    /// Resolution then describes that merged view rather than the upper alone,
+    /// which is not a detail: an increment resolving against an empty upper
+    /// would ask the archive for everything the base already has, and would
+    /// fail on the packages the binhost does not publish at all.
+    ///
+    /// This is the only way to add packages to a root a caller already has,
+    /// since [`provision::ensure`](super::ensure) reports a directory that
+    /// exists as `Existing` and does not touch it.
+    pub fn base_layer(mut self, base: impl AsRef<Path>) -> GentooBuilder {
+        self.base_layer = Some(base.as_ref().to_path_buf());
+        self
+    }
+
+    /// Install exactly what this plan names, resolving nothing.
+    ///
+    /// A [`Plan`] carries the build id, path, size and digest of every package
+    /// and the order they merge in, so a run given one fetches no index and
+    /// makes no choice. That is the reproducibility story for a root built from
+    /// binaries: the binhost keeps a published version far longer than the five
+    /// weeks the stage3 autobuilds tree keeps a build, so a plan replays for as
+    /// long as the archive carries what it names.
+    ///
+    /// It supersedes [`install`](Self::install) and
+    /// [`prefer_use`](Self::prefer_use), which describe a resolution that no
+    /// longer happens.
+    pub fn plan(mut self, plan: Plan) -> GentooBuilder {
+        self.plan = Some(plan);
         self
     }
 
@@ -1333,6 +2213,40 @@ impl GentooBuilder {
             coordinate::check("the archive's build id", build_id, Nesting::Single)
                 .map_err(GentooError::config)?;
         }
+        if let Some(binhost) = &self.binhost {
+            coordinate::check("the archive's binhost", binhost, Nesting::Single)
+                .map_err(GentooError::config)?;
+        }
+        // The install list and the preferences are parsed here rather than
+        // where they were set, so a misspelled atom is refused before anything
+        // is fetched and the refusal names the whole configuration rather than
+        // one call. It is also what makes an atom's USE dependency a real
+        // constraint: it is part of the grammar the resolver matches with, so
+        // parsing it is the only thing that has to happen for it to apply.
+        let install = self
+            .install
+            .iter()
+            .map(|text| atom::parse(text))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(GentooError::config)?;
+        if let Some(blocked) = install.iter().find(|atom| atom.blocker().is_some()) {
+            return Err(GentooError::config(format!(
+                "the install list holds the blocker {blocked}; a blocker says what must not be \
+                 installed alongside a package rather than what to install, and this layer \
+                 installs into a root it is building rather than removing from one",
+            )));
+        }
+        let prefer_use = self
+            .prefer_use
+            .iter()
+            .map(|text| resolve::Preference::parse(text))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(GentooError::config)?;
+        if let Some(plan) = &self.plan
+            && let Some(reason) = plan.unusable()
+        {
+            return Err(GentooError::config(reason));
+        }
         let keyring = Keyring::parse(EMBEDDED_KEYRING)
             .map_err(|err| GentooError::signature("the vendored Gentoo keyring", err))?;
         // The walk list is the primary followed by its backstops, composed
@@ -1343,6 +2257,11 @@ impl GentooBuilder {
         Ok(Gentoo {
             architecture: self.architecture,
             variant: self.variant,
+            binhost: self.binhost,
+            install,
+            prefer_use,
+            plan: self.plan,
+            base_layer: self.base_layer,
             build_id: self.build_id,
             stage3: self.stage3,
             max_pointer_age: self.max_pointer_age,
@@ -1515,6 +2434,11 @@ mod tests {
         Gentoo {
             architecture: ARCH.to_string(),
             variant: Some("amd64-openrc".to_string()),
+            binhost: None,
+            install: Vec::new(),
+            prefer_use: Vec::new(),
+            plan: None,
+            base_layer: None,
             build_id: None,
             stage3: None,
             max_pointer_age: Some(DEFAULT_MAX_POINTER_AGE),
@@ -1917,6 +2841,142 @@ mod tests {
         assert!(err.to_string().contains("Gentoo::available"), "{err}");
     }
 
+    /// The binhost sub-architecture every index test below reads.
+    const BINHOST: &str = "x86-64";
+
+    /// A two-record index document, enough to be a package set.
+    fn index_body() -> String {
+        format!(
+            "TIMESTAMP: 1787145736\nCHOST: x86_64-pc-linux-gnu\nPACKAGES: 1\n\n\
+             BUILD_ID: 1\nCPV: sys-libs/zlib-1.3.1-r1\n\
+             MD5: 3a61f698748c7323c87081584f383b3c\n\
+             PATH: sys-libs/zlib/zlib-1.3.1-r1-1.gpkg.tar\nSIZE: 204800\n\
+             SLOT: 0/1\nUSE: amd64 minizip\nREPO: gentoo\n\n\
+             BUILD_ID: 1\nCPV: dev-vcs/git-2.54.0\n\
+             MD5: 6a539af72c5577fdce267834d3dfd2f1\n\
+             PATH: dev-vcs/git/git-2.54.0-1.gpkg.tar\nSIZE: 8192000\n\
+             RDEPEND: >={arch}/zlib-1.3\nUSE: amd64 curl\nREPO: gentoo\n",
+            arch = "sys-libs",
+        )
+    }
+
+    /// `body` as a gzip member, which is how the archive publishes the index.
+    fn gzipped(body: &str) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body.as_bytes()).expect("gzip accepts it");
+        encoder.finish().expect("the member closes")
+    }
+
+    /// The mirror-relative URL of `name` in the binhost this test reads.
+    fn binhost_url(name: &str) -> String {
+        format!(
+            "{DEFAULT_MIRROR}/{}/{name}",
+            index::directory(ARCH, BINHOST),
+        )
+    }
+
+    /// A provisioner reading a binhost served by `fetcher`.
+    fn binhost_provisioner(fetcher: Box<dyn Fetch>) -> Gentoo {
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let mut gentoo = provisioner(&key, fetcher);
+        gentoo.binhost = Some(BINHOST.to_string());
+        gentoo
+    }
+
+    #[test]
+    fn the_index_is_read_from_the_compressed_copy_where_one_is_served() {
+        // A tenth of the bytes for identical content, and the decoder is
+        // selected by magic rather than by the name -- so the plain copy being
+        // present too changes nothing about which is read.
+        let served = HashMap::from([
+            (binhost_url("Packages.gz"), gzipped(&index_body())),
+            (binhost_url("Packages"), index_body().into_bytes()),
+        ]);
+        let mut gentoo = binhost_provisioner(Box::new(Canned::new(served)));
+        let catalogue = gentoo.packages().expect("the index is served");
+        assert_eq!(catalogue.len(), 2);
+        assert_eq!(catalogue.builds(), 2);
+        assert!(catalogue.contains("dev-vcs/git"));
+        assert_eq!(
+            catalogue.versions("sys-libs/zlib").collect::<Vec<_>>(),
+            ["1.3.1-r1"],
+        );
+        assert_eq!(catalogue.generated(), Some(1_787_145_736));
+        assert_eq!(catalogue.chost(), Some("x86_64-pc-linux-gnu"));
+    }
+
+    #[test]
+    fn a_mirror_serving_only_the_plain_copy_is_read_from_it() {
+        let served = HashMap::from([(binhost_url("Packages"), index_body().into_bytes())]);
+        let mut gentoo = binhost_provisioner(Box::new(Canned::new(served)));
+        assert_eq!(gentoo.packages().expect("the plain copy answers").len(), 2);
+    }
+
+    #[test]
+    fn an_index_cut_short_is_refused_against_its_own_count() {
+        // A truncated plain-text index parses perfectly and resolves against a
+        // silently smaller archive, and its own PACKAGES field is the only
+        // thing that would notice. Not a security property -- a mirror
+        // composing the stanzas composes the count too -- but the shape a
+        // half-written mirror actually has.
+        let body = index_body();
+        let short = body
+            .split_once("BUILD_ID: 1\nCPV: dev-vcs/git")
+            .expect("the fixture holds two records")
+            .0
+            .replace("PACKAGES: 1", "PACKAGES: 2");
+        let served = HashMap::from([(binhost_url("Packages.gz"), gzipped(&short))]);
+        let mut gentoo = binhost_provisioner(Box::new(Canned::new(served)));
+        let err = gentoo.packages().expect_err("a short index is refused");
+        assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
+        assert!(err.to_string().contains("holds 2 packages"), "{err}");
+
+        // An index that holds more than it declares is not short, so it is not
+        // this check's business. The fixture is one: its preamble says one
+        // package and it carries two, which is the shape the live archive has
+        // whenever a record is added between the count being written and the
+        // stanzas being emitted.
+        let served = HashMap::from([(binhost_url("Packages.gz"), gzipped(&body))]);
+        let mut gentoo = binhost_provisioner(Box::new(Canned::new(served)));
+        assert_eq!(gentoo.packages().expect("a long index reads").len(), 2);
+    }
+
+    #[test]
+    fn an_index_naming_nothing_this_layer_can_act_on_is_refused() {
+        // A preamble and nothing else is a document that arrived and is not an
+        // index. It is refused as one rather than reported as an empty archive,
+        // which a caller would read as "this binhost publishes nothing".
+        let served = HashMap::from([(
+            binhost_url("Packages.gz"),
+            gzipped("TIMESTAMP: 1787145736\n"),
+        )]);
+        let mut gentoo = binhost_provisioner(Box::new(Canned::new(served)));
+        let err = gentoo.packages().expect_err("an empty index is refused");
+        assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
+        // The refusal names the mirror that answered, which is the whole point
+        // of carrying the URL through the walk.
+        assert!(err.to_string().contains(DEFAULT_MIRROR), "{err}");
+    }
+
+    #[test]
+    fn a_binhost_that_was_never_named_is_a_configuration_failure() {
+        // Not a fetch failure: there is no URL to have failed. The refusal says
+        // what to call and gives a sub-architecture to call it with, since
+        // nothing signed enumerates them.
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let mut gentoo = provisioner(&key, Box::new(Canned::new(HashMap::new())));
+        let err = gentoo.packages().expect_err("no binhost was named");
+        assert!(matches!(err, GentooError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("binhost"), "{err}");
+    }
+
+    #[test]
+    fn a_mirror_that_serves_no_index_at_all_reports_the_fetch_failure() {
+        let mut gentoo = binhost_provisioner(Box::new(Canned::new(HashMap::new())));
+        let err = gentoo.packages().expect_err("nothing is served");
+        assert!(matches!(err, GentooError::Fetch(_)), "{err:?}");
+    }
+
     #[test]
     fn a_bootstrap_publishes_the_verified_tarball_into_a_root() {
         // The whole write half, driven exactly as every other provisioner is:
@@ -1964,6 +3024,9 @@ mod tests {
                         }
                         GentooEvent::Verifying { .. } => "verifying".to_string(),
                         GentooEvent::Extracting { .. } => "extracting".to_string(),
+                        // The install wave's own events, which a bootstrap
+                        // with no install list never reaches.
+                        other => format!("unexpected {other:?}"),
                     });
                 }
             })

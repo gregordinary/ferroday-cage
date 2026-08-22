@@ -178,6 +178,16 @@ mod gentoo {
     const _: () = assert_send_sync::<gentoo::GentooError>();
     const _: () = assert_send_sync::<gentoo::Stage3>();
     const _: () = assert_send_sync::<gentoo::Available>();
+    const _: () = assert_send_sync::<gentoo::Catalogue>();
+    const _: () = assert_send_sync::<gentoo::Installed>();
+    const _: () = assert_send_sync::<gentoo::InstalledPackage>();
+    const _: () = assert_send_sync::<gentoo::Plan>();
+    const _: () = assert_send_sync::<gentoo::PlannedPackage>();
+    // The Gentoo layer stages a build layer as the other two do, and its
+    // handle is the shared one -- but `Stream` is not shared with it, since
+    // nothing runs in a cage during a Gentoo bootstrap, so the assertion sits
+    // here rather than in the block above.
+    const _: () = assert_send_sync::<ferroday_cage::provision::BuildLayer>();
 
     // Send and not Sync, for the reason the Debian and Alpine provisioners
     // are: the provisioner owns its transport, and every operation that uses

@@ -14,6 +14,13 @@ use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256, Sha512};
 
+// `md-5` is on `digest 0.10` and `sha2` is on `digest 0.11`, so the two
+// `Digest` traits are distinct types and cannot be imported under one name. The
+// MD5 hasher therefore names its trait through this alias at each call rather
+// than through a bare `Digest` in scope.
+#[cfg(feature = "gentoo")]
+use md5::Digest as Md5Digest;
+
 /// The chunk size the streaming reads work in.
 #[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
 const CHUNK: usize = 64 * 1024;
@@ -35,6 +42,26 @@ pub(crate) enum Algorithm {
     /// documents record, SHA-256 not being on offer there at all.
     #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
     Sha512,
+    /// MD5, written as 32 hex characters. Portage's bookkeeping checksum, and
+    /// nothing this crate rests a trust decision on.
+    ///
+    /// It is here because portage's own package database is written in it: a
+    /// merged package's `CONTENTS` records an MD5 per file so portage can tell
+    /// whether a file has been edited since it was merged, and its `BINPKGMD5`
+    /// records the binary package's own. Both are notes a package manager
+    /// keeps about a root it owns.
+    ///
+    /// It is never compared to decide whether to trust bytes, and it must not
+    /// be: MD5 has been unusable for that for twenty years. Every trust
+    /// decision in this crate is SHA-256 or SHA-512, and a Gentoo binary
+    /// package's bytes are held to the SHA-512 of the cleartext-signed
+    /// `Manifest` inside it.
+    ///
+    /// The variant is gated rather than merely unused without the layer that
+    /// writes it: naming an algorithm a build cannot compute would leave a
+    /// hasher with a case it could only panic on.
+    #[cfg(feature = "gentoo")]
+    Md5,
 }
 
 impl Algorithm {
@@ -85,6 +112,8 @@ impl Algorithm {
         match self {
             Algorithm::Sha256 => 64,
             Algorithm::Sha512 => 128,
+            #[cfg(feature = "gentoo")]
+            Algorithm::Md5 => 32,
         }
     }
 }
@@ -98,6 +127,8 @@ impl Algorithm {
 enum Hasher {
     Sha256(Sha256),
     Sha512(Sha512),
+    #[cfg(feature = "gentoo")]
+    Md5(md5::Md5),
 }
 
 impl Hasher {
@@ -106,6 +137,8 @@ impl Hasher {
         match algorithm {
             Algorithm::Sha256 => Hasher::Sha256(Sha256::new()),
             Algorithm::Sha512 => Hasher::Sha512(Sha512::new()),
+            #[cfg(feature = "gentoo")]
+            Algorithm::Md5 => Hasher::Md5(Md5Digest::new()),
         }
     }
 
@@ -114,6 +147,8 @@ impl Hasher {
         match self {
             Hasher::Sha256(hasher) => hasher.update(bytes),
             Hasher::Sha512(hasher) => hasher.update(bytes),
+            #[cfg(feature = "gentoo")]
+            Hasher::Md5(hasher) => Md5Digest::update(hasher, bytes),
         }
     }
 
@@ -122,6 +157,8 @@ impl Hasher {
         match self {
             Hasher::Sha256(hasher) => hex(&hasher.finalize()),
             Hasher::Sha512(hasher) => hex(&hasher.finalize()),
+            #[cfg(feature = "gentoo")]
+            Hasher::Md5(hasher) => hex(&Md5Digest::finalize(hasher)),
         }
     }
 }
