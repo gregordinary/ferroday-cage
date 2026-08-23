@@ -196,6 +196,98 @@ pub trait Fetch: Send {
     /// each job holds an open sink for as long as the batch runs. Nothing here
     /// bounds that: how many is a question about the caller's file descriptors
     /// and memory, not about the transport.
+    ///
+    /// # Overriding it
+    ///
+    /// An override answers every job in the slice; Rust offers no way to call
+    /// this default body from an implementation that replaces it. A transport
+    /// that speaks for only some of the jobs therefore delivers the rest
+    /// itself, which is what [`FetchJob::parts`] is for.
+    ///
+    /// The rest need not go one at a time. [`FetchRequest`] is [`Copy`] and
+    /// [`FetchJob::new`] is public, so the halves `parts` hands back rebuild a
+    /// job at a shorter borrow: a subset of the slice becomes a batch of its
+    /// own, and the transport behind this one still overlaps it. Keep each
+    /// job's index while doing so, since the answers are read by position.
+    ///
+    /// # Example
+    ///
+    /// A transport that serves one scheme itself and passes the rest to
+    /// [`HttpFetch`](super::HttpFetch) as a batch:
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// use ferroday_cage::provision::{Fetch, FetchError, FetchJob, FetchRequest, HttpFetch};
+    ///
+    /// /// Serves `canned://` itself; every other scheme is the bundled client's.
+    /// struct Routed(HttpFetch);
+    ///
+    /// fn is_canned(request: &FetchRequest<'_>) -> bool {
+    ///     // `eq_ignore_ascii_case`, because a scheme is case-insensitive.
+    ///     request
+    ///         .scheme()
+    ///         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("canned"))
+    /// }
+    ///
+    /// impl Fetch for Routed {
+    ///     fn fetch(
+    ///         &mut self,
+    ///         request: &FetchRequest<'_>,
+    ///         sink: &mut dyn Write,
+    ///     ) -> Result<(), FetchError> {
+    ///         if is_canned(request) {
+    ///             sink.write_all(b"canned")
+    ///                 .map_err(|err| FetchError::io("writing the body", request.url(), err))
+    ///         } else {
+    ///             self.0.fetch(request, sink)
+    ///         }
+    ///     }
+    ///
+    ///     fn fetch_all(&mut self, jobs: &mut [FetchJob<'_>]) -> Vec<Result<(), FetchError>> {
+    ///         let mut outcomes: Vec<Option<Result<(), FetchError>>> =
+    ///             jobs.iter().map(|_| None).collect();
+    ///         let mut passed_on: Vec<(usize, FetchJob<'_>)> = Vec::new();
+    ///
+    ///         for (index, job) in jobs.iter_mut().enumerate() {
+    ///             let (request, sink) = job.parts();
+    ///             if is_canned(request) {
+    ///                 let written = sink.write_all(b"canned").map_err(|err| {
+    ///                     FetchError::io("writing the body", request.url(), err)
+    ///                 });
+    ///                 outcomes[index] = Some(written);
+    ///             } else {
+    ///                 // Rebuilt, so what is passed on is one batch rather than
+    ///                 // one request at a time.
+    ///                 passed_on.push((index, FetchJob::new(*request, sink)));
+    ///             }
+    ///         }
+    ///
+    ///         let (indices, mut batch): (Vec<usize>, Vec<FetchJob<'_>>) =
+    ///             passed_on.into_iter().unzip();
+    ///         for (index, outcome) in indices.into_iter().zip(self.0.fetch_all(&mut batch)) {
+    ///             outcomes[index] = Some(outcome);
+    ///         }
+    ///
+    ///         outcomes
+    ///             .into_iter()
+    ///             .map(|outcome| outcome.expect("every job was served or passed on"))
+    ///             .collect()
+    ///     }
+    /// }
+    ///
+    /// let (mut served, mut absent) = (Vec::new(), Vec::new());
+    /// let mut jobs = vec![
+    ///     FetchJob::new(FetchRequest::new("canned://body"), &mut served),
+    ///     FetchJob::new(FetchRequest::new("file:///nonexistent/body"), &mut absent),
+    /// ];
+    /// let outcomes = Routed(HttpFetch::new()).fetch_all(&mut jobs);
+    /// drop(jobs);
+    ///
+    /// assert!(outcomes[0].is_ok(), "the scheme this transport speaks");
+    /// assert!(outcomes[1].is_err(), "passed on, and answered at its own index");
+    /// assert_eq!(served, b"canned".as_slice());
+    /// ```
     fn fetch_all(&mut self, jobs: &mut [FetchJob<'_>]) -> Vec<Result<(), FetchError>> {
         jobs.iter_mut()
             .map(|job| {
@@ -231,11 +323,21 @@ impl<'a> FetchJob<'a> {
 
     /// What to fetch and where it goes, borrowed apart.
     ///
-    /// One method rather than two, because a transport needs both at once and
-    /// the request is behind the same borrow as the sink. `pub(crate)`: a batch
-    /// is driven by the transport, and handing a caller a second way to write
-    /// into someone else's sink answers no question a consumer has.
-    pub(crate) fn parts(&mut self) -> (&FetchRequest<'a>, &mut (dyn Write + Send)) {
+    /// This is how a transport delivers a job it took from
+    /// [`Fetch::fetch_all`]: [`request`](Self::request) alone says what was
+    /// asked for, and this says where the body goes. One method rather than
+    /// two, because a transport needs both at once and the request is behind
+    /// the same borrow as the sink.
+    ///
+    /// It hands back the two halves that share one borrow, not an exhaustive
+    /// view of the job. Anything a job comes to carry later arrives as an
+    /// accessor of its own, or as one on [`FetchRequest`], rather than as a
+    /// third element here.
+    ///
+    /// The sink is reborrowed from `self`, so it cannot outlive the job it came
+    /// from, and the job cannot be handed to a second transport while it is
+    /// out.
+    pub fn parts(&mut self) -> (&FetchRequest<'a>, &mut (dyn Write + Send)) {
         (&self.request, self.sink)
     }
 }

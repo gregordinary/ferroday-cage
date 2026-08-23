@@ -150,6 +150,12 @@ one `fetch` per job, in order — so it is not a requirement on an implementatio
 and a transport that can overlap requests says so by overriding it. Every method
 added to this trait in a later release will carry one, for the same reason.
 
+An override is written against the surface the bundled client is written
+against: `FetchJob::parts` hands a job's request and its sink back together, and
+`FetchJob::new` rebuilds a job from them, so a transport that speaks for only
+part of a batch passes the rest on as a batch of its own rather than one request
+at a time. Nothing about this seam is reserved to the crate.
+
 The consequence for a consumer: `Debian` and `DebianBuilder` are `Send`, so a
 provisioner can be built on one thread and run on another. `Running`, `Pending`,
 and `Debian::observe`'s `Observed` are neither, because each borrows an

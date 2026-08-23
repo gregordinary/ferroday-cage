@@ -1205,6 +1205,7 @@ impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Exp
 pub struct ferroday_cage::provision::FetchJob<'a>
 impl<'a> ferroday_cage::provision::FetchJob<'a>
 pub fn ferroday_cage::provision::FetchJob<'a>::new(ferroday_cage::provision::FetchRequest<'a>, &'a mut (dyn std::io::Write + core::marker::Send)) -> ferroday_cage::provision::FetchJob<'a>
+pub fn ferroday_cage::provision::FetchJob<'a>::parts(&mut self) -> (&ferroday_cage::provision::FetchRequest<'a>, &mut (dyn std::io::Write + core::marker::Send))
 pub fn ferroday_cage::provision::FetchJob<'a>::request(&self) -> &ferroday_cage::provision::FetchRequest<'a>
 impl core::fmt::Debug for ferroday_cage::provision::FetchJob<'_>
 pub fn ferroday_cage::provision::FetchJob<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

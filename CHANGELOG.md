@@ -25,6 +25,13 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Added
+
+- `FetchJob::parts` is public, so a `Fetch` implementation outside the crate can
+  override `Fetch::fetch_all`. A job's sink was reachable only from inside, which
+  left the batching seam documented as an extension point that nothing but the
+  bundled client could extend.
+
 ## [0.4.0] - 2026-08-22
 
 ### Added

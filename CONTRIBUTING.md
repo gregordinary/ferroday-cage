@@ -356,6 +356,7 @@ type yet; when it grows one, it is this row it extends.
 | Which standard stream did a provisioner's in-cage output come from? | `provision::Stream` |
 | Take the first mirror that serves a resource, past those that do not | `provision::walk_mirrors` |
 | Fetch several resources at once, where the transport can | `provision::Fetch::fetch_all` |
+| Deliver one job of a batch: what it asked for, and where its body goes | `provision::FetchJob::parts` |
 | Join a mirror-relative path onto a mirror | `provision::mirror_url` |
 | Is this failure one to ask the next mirror about? | `provision::Failover` |
 | Name a local path as a `file://` URL | `provision::file_url` |
