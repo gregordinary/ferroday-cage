@@ -25,6 +25,8 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-22
+
 ### Added
 
 - `FetchJob::parts` is public, so a `Fetch` implementation outside the crate can
@@ -888,7 +890,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.1.4...v0.2.0
