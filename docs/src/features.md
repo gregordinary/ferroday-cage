@@ -71,11 +71,14 @@ What it spells, surface by surface:
 | The native network stack | Every setting, as `--netstack-*`. |
 | The provisioners' bootstrap surface | Every setting, plan and pin documents included, so a reproducible install is expressible at a prompt. A custom transport is code and has none. |
 | Layered provisioning | Nothing. A provisioner given a base layer produces an increment in a disposable overlay upper rather than a published rootfs, and `fcage` publishes rootfs directories. |
+| Exporting a rootfs | The identity map and the modification-time clamp, as `--identity-map` and `--clamp-mtime`, writing where `--export-to` names. The two settings that take code have none: an identity-map delegate, and the entry filter that says what the archive holds. |
 | Read-only archive inspection | Gentoo's, which prints stage3 variants, binhost packages, an installed set, and the vendored keyring's horizon. Debian and Alpine have no equivalent mode. |
 
-The record behind that table is `tools/parity.toml`, which names every public
-builder setting against the flag that reaches it or the reason it has none; a
-check in CI holds it to both surfaces.
+The record behind the first three rows is `tools/parity.toml`, which names every
+setting of the launch, restriction, network-stack and provisioner builders
+against the flag that reaches it or the reason it has none; a check in CI holds
+it to both surfaces. The rows below them describe surfaces built from something
+other than one of those builders.
 
 ## Documentation
 

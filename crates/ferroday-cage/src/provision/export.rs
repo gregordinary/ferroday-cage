@@ -15,8 +15,11 @@
 //! which runs in ordinary `std` context. Here the frames are reassembled into
 //! paths, hardlinks are coalesced by `(device, inode)`, and the pax/ustar
 //! archive is encoded — all the heap-bearing work the post-fork child cannot
-//! do. The encoder is hand-rolled, symmetric with the [reader](super::tar),
-//! and adds no tar dependency.
+//! do. A caller's [`Export::filter`] is consulted here for the same reason:
+//! the child holds no path to offer one and could not call a caller's code
+//! post-fork, so an excluded subtree is walked and dropped on this side. The
+//! encoder is hand-rolled, symmetric with the [reader](super::tar), and adds no
+//! tar dependency.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
@@ -52,6 +55,11 @@ use crate::{IdMapper, IdentityMap};
 /// unprivileged extraction restore. Character and block devices, FIFOs, and
 /// sockets are skipped, as a deployed image's runtime provides its own.
 ///
+/// [`filter`](Self::filter) narrows that to a subset the caller names, so a
+/// tree that holds more than the artifact should — a build cache, a mount
+/// point a runtime fills in for itself — is exported without being edited
+/// first.
+///
 /// Entries are emitted in sorted order — directory children by name, extended
 /// attributes by name — so the output does not depend on the order the source
 /// filesystem stores entries in. With [`clamp_mtime`](Self::clamp_mtime) set,
@@ -83,11 +91,21 @@ pub struct Export<'a> {
     map: IdentityMap,
     mapper: Option<&'a dyn IdMapper>,
     clamp_mtime: Option<i64>,
+    filter: Option<Box<EntryPredicate<'a>>>,
 }
 
+/// The predicate an [`Export::filter`] holds: owned by the builder, borrowed by
+/// the encoder.
+///
+/// `Send + Sync` because [`Export`] is: a configured export can be moved to
+/// another thread or shared, and a caller's predicate is the only part of it
+/// that could withdraw either.
+type EntryPredicate<'a> = dyn Fn(&ExportEntry<'_>) -> bool + Send + Sync + 'a;
+
 impl fmt::Debug for Export<'_> {
-    /// Renders every setting, and the mapper by its presence rather than its
-    /// contents: it is a caller's trait object, with nothing useful to show.
+    /// Renders every setting, and the mapper and the filter by their presence
+    /// rather than their contents: both are a caller's code, with nothing
+    /// useful to show.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Export")
             .field("rootfs", &self.rootfs)
@@ -97,6 +115,7 @@ impl fmt::Debug for Export<'_> {
                 &self.mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
             )
             .field("clamp_mtime", &self.clamp_mtime)
+            .field("filter", &self.filter.as_ref().map(|_| Delegate("dyn Fn")))
             .finish()
     }
 }
@@ -113,6 +132,7 @@ impl<'a> Export<'a> {
             map: IdentityMap::Single,
             mapper: None,
             clamp_mtime: None,
+            filter: None,
         }
     }
 
@@ -158,6 +178,70 @@ impl<'a> Export<'a> {
         self
     }
 
+    /// Writes only the entries `keep` answers `true` for.
+    ///
+    /// The predicate is consulted once per entry, in the order the archive is
+    /// written, and is the export's own statement of what the tree holds that
+    /// the artifact should not — a build cache, a resolver's package lists, the
+    /// contents of a directory a runtime fills in for itself. Without one every
+    /// entry the walk reaches is written.
+    ///
+    /// **Excluding a directory excludes everything under it.** Its descendants
+    /// are dropped without the predicate being consulted about them, so a rule
+    /// naming the top of a subtree does not have to be restated for its
+    /// contents. The tree's own root is an entry like any other and is offered
+    /// too, as `/`; excluding it produces an empty archive.
+    ///
+    /// A hardlink is offered as [`ExportKind::File`]. Which of an inode's names
+    /// carries the data is the encoder's choice rather than a property of the
+    /// entry, so excluding the first name seen does not lose the file: the next
+    /// kept name is written in full, and later ones link onto it.
+    ///
+    /// The archive stays byte-reproducible as long as the predicate is a pure
+    /// function of the entry it is given — every input it has is already
+    /// determined by the tree.
+    ///
+    /// The predicate runs on this side of the export rather than in the walking
+    /// child, which is a post-fork reader that can neither call a caller's code
+    /// nor assemble a path to offer it. An excluded subtree is therefore read
+    /// from the tree and dropped here, not left unvisited: the archive is what
+    /// the filter says, and the walk is not made cheaper by it.
+    ///
+    /// A closure rather than a named seam, which is the second answer to a
+    /// question [`IdMapper`] answers with a trait. Its `Debug` supertrait is
+    /// what a trait buys, and it buys nothing here: a filter renders by its
+    /// presence either way, exactly as the identity-map delegate beside it
+    /// does. That leaves a trait costing a type definition per rule for a
+    /// predicate whose body is usually one comparison. `Send + Sync` is not
+    /// optional, though — it is what keeps [`Export`] itself both.
+    ///
+    /// # Example
+    ///
+    /// A rootfs's `/dev` is a mount point the deployed runtime fills, so the
+    /// archive carries the directory and nothing under it:
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), ferroday_cage::provision::ProvisionError> {
+    /// use std::path::Path;
+    /// use ferroday_cage::IdentityMap;
+    /// use ferroday_cage::provision::Export;
+    ///
+    /// let dev = Path::new("/dev");
+    /// Export::new("/var/lib/myapp/rootfs")
+    ///     .map(IdentityMap::Subordinate)
+    ///     .filter(move |entry| entry.path() == dev || !entry.path().starts_with(dev))
+    ///     .write_to_path("/var/lib/myapp/rootfs.tar")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn filter(
+        mut self,
+        keep: impl Fn(&ExportEntry<'_>) -> bool + Send + Sync + 'a,
+    ) -> Export<'a> {
+        self.filter = Some(Box::new(keep));
+        self
+    }
+
     /// Writes the archive to `writer`.
     ///
     /// # Errors
@@ -172,6 +256,7 @@ impl<'a> Export<'a> {
             &self.map,
             self.mapper,
             self.clamp_mtime,
+            self.filter.as_deref(),
         )
     }
 
@@ -257,6 +342,7 @@ impl<'a> Export<'a> {
             &self.map,
             self.mapper,
             self.clamp_mtime,
+            self.filter.as_deref(),
         )
         .and_then(|()| {
             file.sync_all()
@@ -314,8 +400,8 @@ fn refuse_dest_inside(rootfs: &Path, dest: &Path, parent: &Path) -> Result<(), P
 /// identity `map` that produced it.
 ///
 /// The shorthand for [`Export`], carrying only the inputs every export needs.
-/// Reach for the builder to clamp modification times, or to name a
-/// caller-supplied identity-map delegate.
+/// Reach for the builder to clamp modification times, to filter what the
+/// archive holds, or to name a caller-supplied identity-map delegate.
 ///
 /// # Errors
 ///
@@ -336,6 +422,7 @@ fn export_inner<W: Write>(
     map: &IdentityMap,
     mapper: Option<&dyn IdMapper>,
     clamp_mtime: Option<i64>,
+    filter: Option<&EntryPredicate<'_>>,
 ) -> Result<(), ProvisionError> {
     let rootfs_c = CString::new(rootfs.as_os_str().as_bytes()).map_err(|_| {
         ProvisionError::io(
@@ -369,7 +456,7 @@ fn export_inner<W: Write>(
         }
     };
 
-    let result = drive(child.stream(), writer, rootfs, clamp_mtime);
+    let result = drive(child.stream(), writer, rootfs, clamp_mtime, filter);
 
     // Reap the child regardless. A walk failure already surfaced as a frame; a
     // failure to reap is not worth masking the export's own outcome.
@@ -386,13 +473,14 @@ fn drive<W: Write>(
     writer: W,
     rootfs: &Path,
     clamp_mtime: Option<i64>,
+    filter: Option<&EntryPredicate<'_>>,
 ) -> Result<(), ProvisionError> {
     // The stream is duplicated so it can be owned by a buffered reader while the
     // child retains its own descriptor for reaping.
     let dup = rustix::io::dup(stream)
         .map_err(|errno| ProvisionError::io("exporting", rootfs, errno.into()))?;
     let mut reader = BufReader::new(std::fs::File::from(dup));
-    let mut tar = TarWriter::new(BufWriter::new(writer), clamp_mtime);
+    let mut tar = TarWriter::new(BufWriter::new(writer), clamp_mtime, filter);
 
     let read_err = |e: io::Error| ProvisionError::io("reading the exported tree", rootfs, e);
     let write_err = |e: io::Error| ProvisionError::io("writing the archive", rootfs, e);
@@ -460,6 +548,95 @@ fn classify(
     }
 }
 
+/// What one entry offered to an [`Export::filter`] is.
+///
+/// Only the three kinds an export writes. Character and block devices, FIFOs,
+/// and sockets are never offered: the export skips them before any filter is
+/// consulted, since a deployed image's runtime provides its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExportKind {
+    /// A directory. Excluding one excludes everything under it.
+    Directory,
+    /// A regular file, or a second name for one — see
+    /// [`Export::filter`] for why a hardlink is not a kind of its own.
+    File,
+    /// A symbolic link.
+    Symlink,
+}
+
+/// One entry an [`Export`] is about to write, as its
+/// [`filter`](Export::filter) sees it.
+///
+/// The path is where the entry sits *inside the tree*, spelled absolutely —
+/// `/etc/hostname`, and `/` for the tree itself — which is how a mount target
+/// and a Landlock grant name a location inside a tree too. Because it is a
+/// [`Path`], [`starts_with`](Path::starts_with) compares whole components, so
+/// `/dev` does not match `/devices`.
+///
+/// It is deliberately not the member name the archive carries. That name is
+/// `./`-prefixed and gives a directory a trailing slash, and a leading `./` is
+/// the one relative component [`Path::components`] does not normalize away — so
+/// a rule written the way a rootfs is otherwise spoken about, `/dev`, would
+/// silently match nothing.
+///
+/// The ownership is what the *rootfs* intends rather than what the host stores,
+/// which is the whole point of exporting through the identity map: a file a
+/// subordinate-mapped bootstrap chowned to uid 42 is offered as uid 42.
+///
+/// The modification time is the entry's own, before
+/// [`clamp_mtime`](Export::clamp_mtime) applies — filtering decides what the
+/// archive holds, and clamping decides how what it holds is recorded.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportEntry<'a> {
+    path: &'a Path,
+    kind: ExportKind,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime: i64,
+}
+
+impl ExportEntry<'_> {
+    /// Where the entry sits inside the tree, spelled absolutely.
+    pub fn path(&self) -> &Path {
+        self.path
+    }
+
+    /// What the entry is.
+    pub fn kind(&self) -> ExportKind {
+        self.kind
+    }
+
+    /// The permission and set-id bits, without the type bits
+    /// [`kind`](Self::kind) already answers for.
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    /// The owning user id, as the rootfs intends it.
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// The owning group id, as the rootfs intends it.
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    /// The file's length in bytes; zero for a directory or a symbolic link.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The modification time in Unix seconds, before any
+    /// [`clamp_mtime`](Export::clamp_mtime).
+    pub fn mtime(&self) -> i64 {
+        self.mtime
+    }
+}
+
 /// One entry's metadata, decoded from a frame.
 struct Meta {
     name: Vec<u8>,
@@ -477,26 +654,69 @@ struct Meta {
 
 /// Encodes the frame stream into a tar, maintaining the path stack and the
 /// hardlink table the post-fork child could not.
-struct TarWriter<W: Write> {
+struct TarWriter<'f, W: Write> {
     out: W,
     /// Directory name components from the root to the current directory.
+    ///
+    /// A pruned directory is not pushed, so the stack always describes a path
+    /// that is being written and `child_path` is only ever asked for one.
     stack: Vec<Vec<u8>>,
     /// The recorded path of the first link seen for each `(device, inode)` with
     /// more than one link, so a later link coalesces onto it.
+    ///
+    /// A filtered-out link is not recorded, so the first *kept* name of an
+    /// inode is the one that carries the data.
     hardlinks: HashMap<(u64, u64), Vec<u8>>,
     /// A `SOURCE_DATE_EPOCH` ceiling in Unix seconds. An entry's modification
     /// time is recorded as `min(mtime, epoch)`; `None` records the real time.
     epoch: Option<i64>,
+    /// The caller's entry filter, consulted once per entry; `None` keeps every
+    /// entry the walk reaches.
+    filter: Option<&'f EntryPredicate<'f>>,
+    /// How many directory levels of an excluded subtree the walk is inside.
+    ///
+    /// The child walks the whole tree whatever the filter says — it is a
+    /// post-fork reader with no channel back — so exclusion is a state this end
+    /// holds: nonzero means every frame until the matching `FRAME_LEAVE`s is
+    /// dropped, and a file's data is read off the stream and discarded so the
+    /// next frame starts where it should.
+    pruned: u32,
 }
 
-impl<W: Write> TarWriter<W> {
-    fn new(out: W, epoch: Option<i64>) -> TarWriter<W> {
+impl<'f, W: Write> TarWriter<'f, W> {
+    fn new(out: W, epoch: Option<i64>, filter: Option<&'f EntryPredicate<'f>>) -> TarWriter<'f, W> {
         TarWriter {
             out,
             stack: Vec::new(),
             hardlinks: HashMap::new(),
             epoch,
+            filter,
+            pruned: 0,
         }
+    }
+
+    /// Whether the caller's filter keeps the entry named `name` in the current
+    /// directory.
+    ///
+    /// `true` with no filter configured, so an unfiltered export pays one
+    /// branch and builds neither the path nor the entry.
+    fn keeps(&self, name: &[u8], kind: ExportKind, meta: &Meta) -> bool {
+        let Some(filter) = self.filter else {
+            return true;
+        };
+        let path = self.child_tree_path(name);
+        filter(&ExportEntry {
+            path: Path::new(OsStr::from_bytes(&path)),
+            kind,
+            // The type bits are what `kind` already answers for, and leaving
+            // them in would make a mode comparison at the call site wrong in a
+            // way that reads right.
+            mode: meta.mode & 0o7777,
+            uid: meta.uid,
+            gid: meta.gid,
+            size: meta.size,
+            mtime: meta.mtime,
+        })
     }
 
     /// Clamps a modification time to the configured epoch: the
@@ -509,7 +729,8 @@ impl<W: Write> TarWriter<W> {
         }
     }
 
-    /// The path of a child named `name` in the current directory.
+    /// The archive member name of a child named `name` in the current
+    /// directory.
     fn child_path(&self, name: &[u8]) -> Vec<u8> {
         if self.stack.is_empty() {
             return name.to_vec();
@@ -520,18 +741,57 @@ impl<W: Write> TarWriter<W> {
         path
     }
 
+    /// Where a child named `name` in the current directory sits inside the
+    /// tree, spelled absolutely: what an [`Export::filter`] is offered.
+    ///
+    /// The walk's root frame is named `.` and no entry the walk reaches can be,
+    /// so dropping that component is what turns the archive's `./etc/hostname`
+    /// into the `/etc/hostname` a caller's rule is written against, and the
+    /// tree's own root into `/`.
+    fn child_tree_path(&self, name: &[u8]) -> Vec<u8> {
+        let mut path = Vec::new();
+        for component in self.stack.iter().map(Vec::as_slice).chain([name]) {
+            if component == b"." {
+                continue;
+            }
+            path.push(b'/');
+            path.extend_from_slice(component);
+        }
+        if path.is_empty() {
+            path.push(b'/');
+        }
+        path
+    }
+
     /// Emits a directory entry and descends: later frames name its children
     /// until the matching [`leave_dir`](Self::leave_dir).
+    ///
+    /// A directory the filter excludes takes its whole subtree with it, which
+    /// is what makes one rule enough to drop a build cache or a mount point's
+    /// contents.
     fn enter_dir(&mut self, meta: &Meta) -> io::Result<()> {
+        if self.pruned > 0 {
+            self.pruned += 1;
+            return Ok(());
+        }
+        if !self.keeps(&meta.name, ExportKind::Directory, meta) {
+            self.pruned = 1;
+            return Ok(());
+        }
         let mut path = self.child_path(&meta.name);
         self.stack.push(meta.name.clone());
         path.push(b'/');
         self.write_entry(&path, b'5', meta, 0, &[], &meta.xattrs)
     }
 
-    /// Ascends out of the current directory.
+    /// Ascends out of the current directory, or out of one level of an excluded
+    /// subtree — the stack holds only directories that were written.
     fn leave_dir(&mut self) {
-        self.stack.pop();
+        if self.pruned > 0 {
+            self.pruned -= 1;
+        } else {
+            self.stack.pop();
+        }
     }
 
     /// Emits a file entry: a full regular file the first time its inode is
@@ -540,6 +800,9 @@ impl<W: Write> TarWriter<W> {
     /// discarded for a coalesced hardlink, so the stream stays in step either
     /// way.
     fn file(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<(), CopyError> {
+        if self.pruned > 0 || !self.keeps(&meta.name, ExportKind::File, meta) {
+            return discard(reader, meta.size);
+        }
         let path = self.child_path(&meta.name);
         if meta.nlink > 1 {
             if let Some(first) = self.hardlinks.get(&(meta.dev, meta.ino)) {
@@ -559,6 +822,9 @@ impl<W: Write> TarWriter<W> {
 
     /// Emits a symlink entry.
     fn symlink(&mut self, meta: &Meta) -> io::Result<()> {
+        if self.pruned > 0 || !self.keeps(&meta.name, ExportKind::Symlink, meta) {
+            return Ok(());
+        }
         let path = self.child_path(&meta.name);
         self.write_entry(&path, b'2', meta, 0, &meta.link_target, &meta.xattrs)
     }
@@ -905,7 +1171,7 @@ mod tests {
     fn ownership_and_mode_round_trip() {
         let mut buf = Vec::new();
         {
-            let mut tar = TarWriter::new(&mut buf, None);
+            let mut tar = TarWriter::new(&mut buf, None, None);
             let m = meta("etc", 0o755, 0, 0);
             tar.enter_dir(&m).unwrap();
             let mut f = meta("shadow", 0o640, 0, 42);
@@ -932,7 +1198,7 @@ mod tests {
     fn a_symlink_round_trips_its_target() {
         let mut buf = Vec::new();
         {
-            let mut tar = TarWriter::new(&mut buf, None);
+            let mut tar = TarWriter::new(&mut buf, None, None);
             let mut m = meta("sh", 0o777, 0, 0);
             m.link_target = b"bin/busybox".to_vec();
             tar.symlink(&m).unwrap();
@@ -949,7 +1215,7 @@ mod tests {
     fn a_second_link_becomes_a_hardlink() {
         let mut buf = Vec::new();
         {
-            let mut tar = TarWriter::new(&mut buf, None);
+            let mut tar = TarWriter::new(&mut buf, None, None);
             let mut a = meta("a", 0o644, 0, 0);
             a.size = 3;
             a.dev = 7;
@@ -979,7 +1245,7 @@ mod tests {
         let long = format!("{}/leaf", "d".repeat(200));
         let mut buf = Vec::new();
         {
-            let mut tar = TarWriter::new(&mut buf, None);
+            let mut tar = TarWriter::new(&mut buf, None, None);
             let mut f = meta("leaf", 0o644, 0, 0);
             // Bypass the stack to force a path longer than the ustar fields.
             f.name = long.as_bytes().to_vec();
@@ -1032,7 +1298,7 @@ mod tests {
         fn exported_mtime(entry_mtime: i64, epoch: Option<i64>) -> i64 {
             let mut buf = Vec::new();
             {
-                let mut tar = TarWriter::new(&mut buf, epoch);
+                let mut tar = TarWriter::new(&mut buf, epoch, None);
                 let mut f = meta("f", 0o644, 0, 0);
                 f.mtime = entry_mtime;
                 f.nlink = 1;
@@ -1059,7 +1325,7 @@ mod tests {
         fn exported_mtime(entry_mtime: i64) -> i64 {
             let mut buf = Vec::new();
             {
-                let mut tar = TarWriter::new(&mut buf, None);
+                let mut tar = TarWriter::new(&mut buf, None, None);
                 let mut f = meta("f", 0o644, 0, 0);
                 f.mtime = entry_mtime;
                 f.nlink = 1;
@@ -1094,5 +1360,260 @@ mod tests {
         let xattrs = read_xattrs(&mut &frame[..]).unwrap();
         let names: Vec<&[u8]> = xattrs.iter().map(|(n, _)| n.as_slice()).collect();
         assert_eq!(names, [&b"user.aaa"[..], &b"user.zzz"[..]]);
+    }
+
+    #[test]
+    fn a_filter_drops_the_entries_it_refuses() {
+        // The dropped file carries data, so this also pins that the frame
+        // stream stays in step: the entry after it decodes correctly.
+        let keep = |entry: &ExportEntry<'_>| entry.path() != Path::new("/etc/secret");
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, None, Some(&keep));
+            tar.enter_dir(&meta("etc", 0o755, 0, 0)).unwrap();
+            let mut secret = meta("secret", 0o600, 0, 0);
+            secret.size = 6;
+            secret.nlink = 1;
+            tar.file(&secret, &mut &b"hunter"[..]).unwrap();
+            let mut kept = meta("hostname", 0o644, 0, 0);
+            kept.size = 3;
+            kept.nlink = 1;
+            tar.file(&kept, &mut &b"box"[..]).unwrap();
+            tar.leave_dir();
+            tar.finish().unwrap();
+        }
+        let mut reader = TarReader::new(&buf[..]);
+        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/");
+        let file = reader.next_entry().unwrap().unwrap();
+        assert_eq!(file.path, b"etc/hostname");
+        assert_eq!(file.size, 3);
+        assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn excluding_a_directory_excludes_its_subtree_unasked() {
+        // The whole point of the prune: one rule names the top of a subtree and
+        // nothing under it is offered, so the rule does not have to be restated
+        // for every descendant.
+        let seen = std::sync::Mutex::new(Vec::new());
+        let keep = |entry: &ExportEntry<'_>| {
+            seen.lock()
+                .unwrap()
+                .push(entry.path().display().to_string());
+            entry.path() != Path::new("/var/cache")
+        };
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, None, Some(&keep));
+            tar.enter_dir(&meta("var", 0o755, 0, 0)).unwrap();
+            tar.enter_dir(&meta("cache", 0o755, 0, 0)).unwrap();
+            tar.enter_dir(&meta("apt", 0o755, 0, 0)).unwrap();
+            let mut deb = meta("a.deb", 0o644, 0, 0);
+            deb.size = 4;
+            deb.nlink = 1;
+            tar.file(&deb, &mut &b"data"[..]).unwrap();
+            tar.leave_dir();
+            let mut link = meta("latest", 0o777, 0, 0);
+            link.link_target = b"apt"[..].to_vec();
+            tar.symlink(&link).unwrap();
+            tar.leave_dir();
+            tar.enter_dir(&meta("lib", 0o755, 0, 0)).unwrap();
+            tar.leave_dir();
+            tar.leave_dir();
+            tar.finish().unwrap();
+        }
+        // Consulted about the two directories it reached and the one it kept
+        // descending into -- never about anything under the excluded one.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["/var", "/var/cache", "/var/lib"],
+            "descendants of an excluded directory must not be offered"
+        );
+        let mut reader = TarReader::new(&buf[..]);
+        let paths: Vec<Vec<u8>> = std::iter::from_fn(|| reader.next_entry().unwrap())
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(paths, [b"var/".to_vec(), b"var/lib/".to_vec()]);
+    }
+
+    #[test]
+    fn a_filtered_first_link_leaves_the_next_carrying_the_data() {
+        // A hardlink is offered as a file, and the encoder's choice of which
+        // name carries the bytes follows the filter: dropping the first name
+        // must not leave the second pointing at a member that is not there.
+        let keep = |entry: &ExportEntry<'_>| entry.path() != Path::new("/a");
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, None, Some(&keep));
+            for name in ["a", "b", "c"] {
+                let mut m = meta(name, 0o644, 0, 0);
+                m.size = 3;
+                m.dev = 7;
+                m.ino = 99;
+                m.nlink = 3;
+                tar.file(&m, &mut &b"abc"[..]).unwrap();
+            }
+            tar.finish().unwrap();
+        }
+        let mut reader = TarReader::new(&buf[..]);
+        let first = reader.next_entry().unwrap().unwrap();
+        assert_eq!(first.path, b"b");
+        assert_eq!(first.typeflag, b'0', "the first kept name carries the data");
+        let second = reader.next_entry().unwrap().unwrap();
+        assert_eq!(second.path, b"c");
+        assert_eq!(second.typeflag, b'1');
+        assert_eq!(second.link_target, b"b");
+        assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_filter_sees_the_entry_the_rootfs_intends() {
+        // The ownership is the in-map one, the mode carries no type bits (which
+        // `kind` answers for), and the time is the entry's own rather than the
+        // clamped one -- filtering decides what the archive holds, clamping
+        // decides how it is recorded.
+        let seen = std::sync::Mutex::new(Vec::new());
+        let keep = |entry: &ExportEntry<'_>| {
+            seen.lock().unwrap().push((
+                entry.path().display().to_string(),
+                entry.kind(),
+                entry.mode(),
+                entry.uid(),
+                entry.gid(),
+                entry.size(),
+                entry.mtime(),
+            ));
+            true
+        };
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, Some(1_600_000_000), Some(&keep));
+            let mut dir = meta("etc", 0o755, 0, 0);
+            dir.mode |= 0o040_000;
+            tar.enter_dir(&dir).unwrap();
+            let mut file = meta("shadow", 0o640, 0, 42);
+            file.mode |= 0o100_000;
+            file.size = 5;
+            file.nlink = 1;
+            tar.file(&file, &mut &b"1234\n"[..]).unwrap();
+            let mut link = meta("sh", 0o777, 0, 0);
+            link.mode |= 0o120_000;
+            link.link_target = b"bin/busybox"[..].to_vec();
+            tar.symlink(&link).unwrap();
+            tar.leave_dir();
+            tar.finish().unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (
+                    "/etc".to_string(),
+                    ExportKind::Directory,
+                    0o755,
+                    0,
+                    0,
+                    0,
+                    1_700_000_000
+                ),
+                (
+                    "/etc/shadow".to_string(),
+                    ExportKind::File,
+                    0o640,
+                    0,
+                    42,
+                    5,
+                    1_700_000_000
+                ),
+                (
+                    "/etc/sh".to_string(),
+                    ExportKind::Symlink,
+                    0o777,
+                    0,
+                    0,
+                    0,
+                    1_700_000_000
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unfiltered_export_writes_what_it_always_did() {
+        // The default must be untouched: the filter is an addition, and an
+        // export that names none pays nothing.
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, None, None);
+            tar.enter_dir(&meta("etc", 0o755, 0, 0)).unwrap();
+            let mut f = meta("hostname", 0o644, 0, 0);
+            f.size = 3;
+            f.nlink = 1;
+            tar.file(&f, &mut &b"box"[..]).unwrap();
+            tar.leave_dir();
+            tar.finish().unwrap();
+        }
+        let mut reader = TarReader::new(&buf[..]);
+        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/");
+        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/hostname");
+        assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_tree_is_spelled_absolutely_and_the_archive_is_not() {
+        // The walk opens with a directory frame named `.` for the rootfs root,
+        // which the archive carries as `./`. The filter is offered the same
+        // entries spelled as locations inside the tree, so a rule reads the way
+        // a mount target does and never has to know how tar spells a member.
+        let seen = std::sync::Mutex::new(Vec::new());
+        let keep = |entry: &ExportEntry<'_>| {
+            seen.lock()
+                .unwrap()
+                .push(entry.path().display().to_string());
+            true
+        };
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, None, Some(&keep));
+            tar.enter_dir(&meta(".", 0o755, 0, 0)).unwrap();
+            tar.enter_dir(&meta("etc", 0o755, 0, 0)).unwrap();
+            tar.leave_dir();
+            tar.leave_dir();
+            tar.finish().unwrap();
+        }
+        assert_eq!(*seen.lock().unwrap(), ["/", "/etc"]);
+        let mut reader = TarReader::new(&buf[..]);
+        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"./");
+        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"./etc/");
+    }
+
+    #[test]
+    fn an_excluded_root_produces_an_empty_archive() {
+        // Documented rather than special-cased: the root is an entry like any
+        // other, so a filter that refuses everything refuses it too.
+        let keep = |_: &ExportEntry<'_>| false;
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, None, Some(&keep));
+            tar.enter_dir(&meta(".", 0o755, 0, 0)).unwrap();
+            tar.enter_dir(&meta("etc", 0o755, 0, 0)).unwrap();
+            let mut f = meta("hostname", 0o644, 0, 0);
+            f.size = 3;
+            f.nlink = 1;
+            tar.file(&f, &mut &b"box"[..]).unwrap();
+            tar.leave_dir();
+            tar.leave_dir();
+            tar.finish().unwrap();
+        }
+        assert!(TarReader::new(&buf[..]).next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_filter_renders_in_the_debug_by_its_presence() {
+        // A caller's closure has nothing to show, so it is rendered the way the
+        // identity-map delegate beside it is: present or absent.
+        let plain = format!("{:?}", Export::new("/tmp/rootfs"));
+        assert!(plain.contains("filter: None"), "{plain}");
+        let filtered = format!("{:?}", Export::new("/tmp/rootfs").filter(|_| true));
+        assert!(filtered.contains("filter: Some(<dyn Fn>)"), "{filtered}");
     }
 }

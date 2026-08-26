@@ -93,7 +93,7 @@ mod tarball;
 
 pub use copyin::{CopyIn, CopyReport, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
-pub use export::{Export, export_tar};
+pub use export::{Export, ExportEntry, ExportKind, export_tar};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub(crate) use fetch::{Failover, mirror_url, walk_mirrors};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]

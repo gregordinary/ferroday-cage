@@ -234,6 +234,59 @@ Export::new("/var/lib/myapp/rootfs")
 `provision::export_tar(rootfs, writer, map)` is the shorthand, carrying only
 what every export needs.
 
+### Choosing what the archive holds
+
+`Export::filter` takes a predicate and writes only the entries it answers
+`true` for. It is how a tree that holds more than the artifact should — a build
+cache, a resolver's package lists, the contents of a mount point the deployed
+runtime fills in for itself — is exported without being edited first, which
+matters when the tree is one a later build will reuse.
+
+**Excluding a directory excludes everything under it**, without the predicate
+being consulted about the descendants, so a rule names the top of a subtree
+once. This keeps `/dev` as a mount point and drops the package cache outright:
+
+```rust,no_run
+use std::path::Path;
+use ferroday_cage::IdentityMap;
+use ferroday_cage::provision::Export;
+
+let dev = Path::new("/dev");
+let cache = Path::new("/var/cache/apt/archives");
+
+Export::new("/var/lib/myapp/rootfs")
+    .map(IdentityMap::Subordinate)
+    .filter(move |entry| {
+        !entry.path().starts_with(cache)
+            && (entry.path() == dev || !entry.path().starts_with(dev))
+    })
+    .write_to_path("rootfs.tar")?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The entry is offered with its path spelled as a location *inside the tree* —
+`/etc/hostname`, and `/` for the tree itself — the way a mount target or a
+Landlock grant names one, rather than as the `./`-prefixed member name the
+archive carries. It is a `Path`, so `starts_with` compares whole components and
+`/dev` does not match `/devices`. Beside the path it carries the entry's kind,
+its permission bits, the ownership the rootfs intends, the file's size, and its
+unclamped modification time. Refusing the tree's root is allowed and produces an
+empty archive; it is an entry like any other.
+
+A hardlink is offered as `ExportKind::File`, and dropping one name of an inode
+does not lose the file: the next kept name carries the data and later ones link
+onto it. Character and block devices, FIFOs, and sockets are never offered at
+all — the export skips them before any filter runs.
+
+The filter runs on the parent side of the export, where the paths are
+assembled: the walking child is a post-fork reader that cannot call a caller's
+code, so an excluded subtree is read from the tree and discarded rather than
+never visited. The archive is what the filter says; the walk is not made
+cheaper by it.
+
+The archive stays byte-reproducible as long as the predicate is a pure function
+of the entry, which every input it is given already is.
+
 ### Where the archive goes
 
 `write_to_path` names a file, and that file appears complete or not at all. The

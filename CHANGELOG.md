@@ -25,6 +25,16 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Added
+
+- `provision::Export::filter` takes a predicate and writes only the entries it
+  answers `true` for, with `provision::ExportEntry` and `provision::ExportKind`
+  as what it is offered: where the entry sits inside the tree spelled
+  absolutely, the kind, the permission bits, the ownership the rootfs intends,
+  the size, and the unclamped modification time. Excluding a directory excludes
+  everything under it. An export that names no filter writes what it always
+  did.
+
 ## [0.4.2] - 2026-08-25
 
 `fcage` 0.4.1. The two crates version independently and this is the first

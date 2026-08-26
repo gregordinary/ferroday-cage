@@ -1011,6 +1011,17 @@ impl<F: core::ops::function::FnMut(ferroday_cage::provision::gentoo::GentooEvent
 pub fn F::cancelled(&mut self) -> bool
 pub fn F::progress(&mut self, ferroday_cage::provision::gentoo::GentooEvent<'_>)
 pub fn ferroday_cage::provision::gentoo::installed(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::gentoo::Installed, ferroday_cage::provision::gentoo::GentooError>
+#[non_exhaustive] pub enum ferroday_cage::provision::ExportKind
+pub ferroday_cage::provision::ExportKind::Directory
+pub ferroday_cage::provision::ExportKind::File
+pub ferroday_cage::provision::ExportKind::Symlink
+impl core::marker::Freeze for ferroday_cage::provision::ExportKind
+impl core::marker::Send for ferroday_cage::provision::ExportKind
+impl core::marker::Sync for ferroday_cage::provision::ExportKind
+impl core::marker::Unpin for ferroday_cage::provision::ExportKind
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::ExportKind
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ExportKind
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ExportKind
 #[non_exhaustive] pub enum ferroday_cage::provision::FetchError
 #[non_exhaustive] pub ferroday_cage::provision::FetchError::Io
 pub ferroday_cage::provision::FetchError::Io::op: &'static str
@@ -1193,6 +1204,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::CopyRepo
 pub struct ferroday_cage::provision::Export<'a>
 impl<'a> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::clamp_mtime(self, i64) -> ferroday_cage::provision::Export<'a>
+pub fn ferroday_cage::provision::Export<'a>::filter(self, impl core::ops::function::Fn(&ferroday_cage::provision::ExportEntry<'_>) -> bool + core::marker::Send + core::marker::Sync + 'a) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::mapper(self, &'a dyn ferroday_cage::IdMapper) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Export<'a>
@@ -1207,6 +1219,22 @@ impl<'a> core::marker::Unpin for ferroday_cage::provision::Export<'a>
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::Export<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Export<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Export<'a>
+pub struct ferroday_cage::provision::ExportEntry<'a>
+impl ferroday_cage::provision::ExportEntry<'_>
+pub fn ferroday_cage::provision::ExportEntry<'_>::gid(&self) -> u32
+pub fn ferroday_cage::provision::ExportEntry<'_>::kind(&self) -> ferroday_cage::provision::ExportKind
+pub fn ferroday_cage::provision::ExportEntry<'_>::mode(&self) -> u32
+pub fn ferroday_cage::provision::ExportEntry<'_>::mtime(&self) -> i64
+pub fn ferroday_cage::provision::ExportEntry<'_>::path(&self) -> &std::path::Path
+pub fn ferroday_cage::provision::ExportEntry<'_>::size(&self) -> u64
+pub fn ferroday_cage::provision::ExportEntry<'_>::uid(&self) -> u32
+impl<'a> core::marker::Freeze for ferroday_cage::provision::ExportEntry<'a>
+impl<'a> core::marker::Send for ferroday_cage::provision::ExportEntry<'a>
+impl<'a> core::marker::Sync for ferroday_cage::provision::ExportEntry<'a>
+impl<'a> core::marker::Unpin for ferroday_cage::provision::ExportEntry<'a>
+impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::ExportEntry<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ExportEntry<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ExportEntry<'a>
 pub struct ferroday_cage::provision::FetchJob<'a>
 impl<'a> ferroday_cage::provision::FetchJob<'a>
 pub fn ferroday_cage::provision::FetchJob<'a>::new(ferroday_cage::provision::FetchRequest<'a>, &'a mut (dyn std::io::Write + core::marker::Send)) -> ferroday_cage::provision::FetchJob<'a>

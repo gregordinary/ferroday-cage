@@ -87,6 +87,14 @@ const _: () = assert_send_sync::<ferroday_cage::provision::ProvisionError>();
 const _: () = assert_send_sync::<ferroday_cage::provision::Remove<'_>>();
 #[cfg(feature = "tarball")]
 const _: () = assert_send_sync::<ferroday_cage::provision::Export<'_>>();
+// The entry an export's filter is offered, and what it says the entry is. Both
+// are plain data over a borrowed path, and `Export` above stays `Send + Sync`
+// only because the predicate it holds is required to be, so these are the pair
+// that would have to move for that bound to become questionable.
+#[cfg(feature = "tarball")]
+const _: () = assert_send_sync::<ferroday_cage::provision::ExportEntry<'_>>();
+#[cfg(feature = "tarball")]
+const _: () = assert_send_sync::<ferroday_cage::provision::ExportKind>();
 
 // `Tarball::from_reader` stores its source, so the stored seam carries the
 // `Send` bound the crate's rule asks of a stored seam. It is not `Sync`: a

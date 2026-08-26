@@ -297,6 +297,81 @@ fn exports_a_single_mapped_tree() {
 }
 
 #[test]
+fn a_filter_narrows_what_the_archive_holds() {
+    // The filter runs on this side of the frame stream, so this is the test
+    // that the exclusion survives the real walk: the child reads and streams
+    // everything, and what reaches the archive is what the predicate kept.
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("filter");
+    let root = dir.join("root");
+    std::fs::create_dir_all(root.join("dev/pts")).unwrap();
+    std::fs::create_dir_all(root.join("etc")).unwrap();
+    std::fs::create_dir_all(root.join("var/cache/apt")).unwrap();
+    std::fs::write(root.join("etc/hostname"), b"host\n").unwrap();
+    std::fs::write(root.join("dev/null-ish"), b"placeholder\n").unwrap();
+    std::os::unix::fs::symlink("/proc/self/fd", root.join("dev/fd")).unwrap();
+    // Large enough that the encoder has to discard several buffers of data
+    // rather than a single short read.
+    std::fs::write(root.join("var/cache/apt/big.deb"), vec![b'x'; 512 * 1024]).unwrap();
+
+    let dev = Path::new("/dev");
+    let cache = Path::new("/var/cache");
+    let mut out = Vec::new();
+    provision::Export::new(&root)
+        .filter(move |entry| {
+            // Keep the /dev mount point and nothing under it, and drop the
+            // package cache outright.
+            !entry.path().starts_with(cache)
+                && (entry.path() == dev || !entry.path().starts_with(dev))
+        })
+        .write_to(&mut out)
+        .expect("export should succeed");
+    let entries = parse_tar(&out);
+    let index = by_path(&entries);
+
+    // The mount point itself is kept, so the deployed runtime has somewhere to
+    // mount over.
+    assert_eq!(index[&b"./dev/"[..]].typeflag, b'5');
+    assert!(index.contains_key(&b"./etc/hostname"[..]));
+    assert!(index.contains_key(&b"./var/"[..]));
+
+    for gone in [
+        &b"./dev/pts/"[..],
+        b"./dev/null-ish",
+        b"./dev/fd",
+        b"./var/cache/",
+        b"./var/cache/apt/",
+        b"./var/cache/apt/big.deb",
+    ] {
+        assert!(
+            !index.contains_key(gone),
+            "{:?} should have been filtered out",
+            bstr(gone)
+        );
+    }
+
+    // The discarded half-megabyte did not desynchronize the frame stream: the
+    // members are exactly the kept ones, in the walk's sorted order, so nothing
+    // after the drop was misread as a header.
+    let paths: Vec<Vec<u8>> = entries.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        [
+            &b"./"[..],
+            b"./dev/",
+            b"./etc/",
+            b"./etc/hostname",
+            b"./var/",
+        ]
+        .map(<[u8]>::to_vec)
+    );
+
+    let _ = provision::remove(&dir);
+}
+
+#[test]
 fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
     if !userns_available() {
         return;
