@@ -531,6 +531,22 @@ pub enum ProvisionError {
         /// Why no delegate could establish the identity map.
         reason: String,
     },
+    /// An export's destination file lies inside the tree being exported.
+    ///
+    /// The archive would be a member of its own source: the walk reaches the
+    /// file it is being written to, and what lands in the archive depends on
+    /// how far the encoder had got when the walk arrived there. Reported by
+    /// [`Export::write_to_path`], which names the destination and so can see
+    /// it; [`Export::write_to`] takes a sink it cannot locate, and a caller
+    /// that opens a file inside the tree itself gets the archive it asked for.
+    #[cfg(feature = "tarball")]
+    #[non_exhaustive]
+    ExportDestInside {
+        /// The destination as it was given.
+        path: PathBuf,
+        /// The tree it lies inside.
+        rootfs: PathBuf,
+    },
     /// A copy into a rootfs owned through a range map could not establish that
     /// map.
     ///
@@ -674,6 +690,14 @@ impl fmt::Display for ProvisionError {
                  and no delegate can establish the map to read them ({reason})",
                 path.display(),
             ),
+            #[cfg(feature = "tarball")]
+            ProvisionError::ExportDestInside { path, rootfs } => write!(
+                f,
+                "cannot write the archive to {}: it lies inside {}, the tree being exported, \
+                 so the archive would be a member of itself",
+                path.display(),
+                rootfs.display(),
+            ),
         }
     }
 }
@@ -816,12 +840,14 @@ pub struct Remove<'a> {
     dest: PathBuf,
     map: crate::IdentityMap,
     mapper: Option<&'a dyn crate::idmap::IdMapper>,
+    remove_lock: bool,
 }
 
 impl fmt::Debug for Remove<'_> {
-    /// Renders the tree, the map it was written under, and whether a
-    /// caller-supplied mapper was given. The mapper renders by its presence
-    /// rather than its contents.
+    /// Renders the tree, the map it was written under, whether a
+    /// caller-supplied mapper was given, and whether the publication lock is
+    /// removed with the tree. The mapper renders by its presence rather than
+    /// its contents.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Remove")
             .field("dest", &self.dest)
@@ -830,6 +856,7 @@ impl fmt::Debug for Remove<'_> {
                 "mapper",
                 &self.mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
             )
+            .field("remove_lock", &self.remove_lock)
             .finish()
     }
 }
@@ -840,11 +867,16 @@ impl<'a> Remove<'a> {
     /// The identity map defaults to
     /// [`IdentityMap::Subordinate`](crate::IdentityMap::Subordinate), which is
     /// what a tree written by a bundled-delegate sandbox needs.
+    ///
+    /// The publication lock beside `dest` is removed with the tree, matching
+    /// [`remove`]; [`remove_lock(false)`](Self::remove_lock) is how a caller
+    /// whose `dest` is not itself a published rootfs declines that.
     pub fn new(dest: impl AsRef<Path>) -> Remove<'a> {
         Remove {
             dest: dest.as_ref().to_path_buf(),
             map: crate::IdentityMap::Subordinate,
             mapper: None,
+            remove_lock: true,
         }
     }
 
@@ -867,13 +899,35 @@ impl<'a> Remove<'a> {
         self
     }
 
+    /// Sets whether the `<dest>.lock` sibling goes with the tree.
+    ///
+    /// Defaults to `true`, because [`ensure`] wrote that file and a published
+    /// rootfs and its lock round-trip together. Pass `false` for a `dest` that
+    /// merely *contains* published rootfs trees rather than being one — a
+    /// scratch directory, a cache, a work area holding several. There
+    /// `<dest>.lock` is an unrelated path that the caller never named as a
+    /// target, and removing it is a deletion outside the tree the caller asked
+    /// about.
+    ///
+    /// The distinction is the caller's to make, because only the caller knows
+    /// which of the two its `dest` is: both are directories, and a containing
+    /// directory that happens to have no `.lock` sibling today is
+    /// indistinguishable from a published one whose lock was already cleared.
+    ///
+    /// The tree itself is removed identically either way; this governs the
+    /// sibling file only.
+    pub fn remove_lock(mut self, remove: bool) -> Remove<'a> {
+        self.remove_lock = remove;
+        self
+    }
+
     /// Removes the tree.
     ///
     /// # Errors
     ///
     /// As [`remove`].
     pub fn run(self) -> Result<(), ProvisionError> {
-        remove_dest(&self.dest, &self.map, self.mapper)
+        remove_dest(&self.dest, &self.map, self.mapper, self.remove_lock)
     }
 }
 
@@ -1064,7 +1118,10 @@ fn ensure_inner(
 /// it, so create and destroy round-trip and nothing is left behind. A
 /// destination that was never published through `ensure` has no lock to
 /// remove, and a removal of a destination whose provision failed clears the
-/// lock that was left beside no rootfs.
+/// lock that was left beside no rootfs. A caller whose destination *contains*
+/// published trees rather than being one wants
+/// [`Remove::remove_lock(false)`](Remove::remove_lock) instead, so the sibling
+/// of a path it never published stays where it is.
 ///
 /// # Errors
 ///
@@ -1079,16 +1136,20 @@ fn ensure_inner(
 /// bundled-delegate [`IdentityMap::Ranges`](crate::IdentityMap::Ranges). For a
 /// tree built under a caller-supplied delegate, use [`Remove::mapper`].
 pub fn remove(dest: impl AsRef<Path>) -> Result<(), ProvisionError> {
-    remove_dest(dest.as_ref(), &crate::IdentityMap::Subordinate, None)
+    remove_dest(dest.as_ref(), &crate::IdentityMap::Subordinate, None, true)
 }
 
 /// The shared body of [`remove`] and [`Remove::run`]: dispatch a non-directory
 /// or missing path, then remove a directory tree with the given resolution,
 /// and finally the publication lock [`ensure`] left beside it.
+///
+/// `lock` says whether that last step runs. [`Remove::remove_lock`] clears it,
+/// for a `dest` that holds published trees rather than being one.
 fn remove_dest(
     dest: &Path,
     map: &crate::IdentityMap,
     mapper: Option<&dyn crate::idmap::IdMapper>,
+    lock: bool,
 ) -> Result<(), ProvisionError> {
     match fs::symlink_metadata(dest) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -1098,7 +1159,7 @@ fn remove_dest(
         }
         Ok(_) => remove_tree(dest, map, mapper)?,
     }
-    remove_lock(dest)
+    if lock { remove_lock(dest) } else { Ok(()) }
 }
 
 /// Removes the `<name>.lock` file [`ensure`] leaves beside a published rootfs,
@@ -1106,7 +1167,10 @@ fn remove_dest(
 ///
 /// Removed after the tree, so a failure to delete the rootfs leaves the lock
 /// guarding it. A destination that was never published through [`ensure`] has
-/// no lock, which is not an error.
+/// no lock, which is not an error — but neither is that a way to tell a
+/// published destination from a containing one, which is why
+/// [`Remove::remove_lock`] is a caller-supplied flag rather than this probing
+/// for it.
 ///
 /// Removing the lock is safe only because a removal and a concurrent
 /// publication of the same destination are already mutually exclusive: a caller
@@ -1486,6 +1550,39 @@ mod tests {
         remove(&dest).expect("the published rootfs is removed");
         assert!(!dest.exists());
         assert!(!lock.exists(), "the lock goes with the rootfs");
+    }
+
+    #[test]
+    fn declining_the_lock_removes_the_tree_and_leaves_the_sibling() {
+        // A caller whose `dest` holds published trees rather than being one:
+        // the `.lock` beside it belongs to whoever wrote it, and was never a
+        // target of this removal.
+        let dir = Scratch::for_test("provision", "keep-lock");
+        let dest = dir.join("work");
+        let sibling = dir.join("work.lock");
+        assert_eq!(ensure(&dest, &mut Touch).unwrap(), Provisioned::Created);
+        assert!(sibling.is_file());
+        Remove::new(&dest)
+            .remove_lock(false)
+            .run()
+            .expect("the tree is removed");
+        assert!(!dest.exists(), "the tree itself goes either way");
+        assert!(
+            sibling.is_file(),
+            "the sibling is not this removal's to take"
+        );
+    }
+
+    #[test]
+    fn a_removal_takes_the_lock_unless_asked_not_to() {
+        // The builder defaults to `remove`'s behaviour, so reaching for
+        // `Remove` to name a map does not silently change what is deleted.
+        let dir = Scratch::for_test("provision", "builder-lock");
+        let dest = dir.join("rootfs");
+        let lock = dir.join("rootfs.lock");
+        assert_eq!(ensure(&dest, &mut Touch).unwrap(), Provisioned::Created);
+        Remove::new(&dest).run().expect("the rootfs is removed");
+        assert!(!lock.exists(), "the default is the round-trip");
     }
 
     #[test]

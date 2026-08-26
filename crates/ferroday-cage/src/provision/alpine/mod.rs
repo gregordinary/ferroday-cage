@@ -277,8 +277,10 @@ impl Alpine {
     ///
     /// # Errors
     ///
-    /// Returns [`AlpineError::Config`] when nothing was included,
-    /// [`AlpineError::Fetch`], [`AlpineError::Container`],
+    /// Returns [`AlpineError::Config`] when nothing was included or when a
+    /// [`base_layer`](AlpineBuilder::base_layer) is set — such a provisioner
+    /// stages an increment, and [`resolve_layer`](Self::resolve_layer) is its
+    /// read half — [`AlpineError::Fetch`], [`AlpineError::Container`],
     /// [`AlpineError::Signature`] or [`AlpineError::Index`] for a repository
     /// that cannot be read or verified, and [`AlpineError::Resolve`] for a
     /// closure the repositories cannot supply.
@@ -1308,9 +1310,10 @@ pub enum AlpineEvent<'a> {
     Downloading {
         /// The package name.
         package: &'a str,
-        /// Its position in the download, from 1.
+        /// Its position among the packages being downloaded, from 1.
         index: usize,
-        /// The total number of packages.
+        /// How many packages are being downloaded, which is the plan's total
+        /// less whatever the cache already held.
         total: usize,
     },
     /// A package's files are being laid down.
@@ -1388,6 +1391,18 @@ impl fmt::Debug for Observed<'_> {
 impl Observed<'_> {
     /// [`Alpine::resolve`], reporting to the attached sink.
     pub fn resolve(&mut self) -> Result<Plan, AlpineError> {
+        // A provisioner with a base layer stages an increment, which
+        // `provision::ensure` refuses outright for the same value. Reporting the
+        // whole-root closure here would answer a question this provisioner never
+        // asks -- hundreds of packages the base already carries — and read as
+        // the plan it would install. `resolve_layer` is its read half.
+        if self.alpine.base_layer.is_some() {
+            return Err(AlpineError::Config {
+                reason: "a provisioner with a base layer resolves an increment, and is read \
+                         through Alpine::resolve_layer rather than through Alpine::resolve"
+                    .to_string(),
+            });
+        }
         self.alpine.resolve_over(None, self.sink)
     }
 
@@ -1566,6 +1581,43 @@ fn install(
     };
     observer.progress(AlpineEvent::Resolved { plan: &plan });
 
+    // The state the finished root carries, composed before anything is
+    // downloaded so that an increment with nothing in it still writes it. The
+    // base's own is carried forward rather than replaced: these files shadow
+    // the base's copies through the overlay, so each has to describe the merged
+    // root.
+    //
+    // A plan names every package rather than the seeds a resolution closed over,
+    // and `plan()` forbids `include()` — so the configured world is empty and
+    // the plan's own names are what the root wants. Written as world, they pin
+    // the closure for a later `apk`: an empty file says nothing is wanted, which
+    // is what `apk fix` acts on.
+    let wanted: Vec<String> = match &alpine.plan {
+        Some(plan) => plan.packages.iter().map(|p| p.name.clone()).collect(),
+        None => alpine.world.clone(),
+    };
+    let world = joined(base.map_or(&[], layer::Base::world), wanted);
+    let sources = joined(
+        base.map_or(&[], layer::Base::repositories),
+        alpine
+            .repositories
+            .iter()
+            .flat_map(super::alpine::Repository::sources),
+    );
+    let beneath = base
+        .map(|base| {
+            Rooted::open(base.path()).map_err(AlpineError::at("opening the base", base.path()))
+        })
+        .transpose()
+        .map_err(wrap)?;
+    let state = bootstrap::State {
+        world: &world,
+        architecture: &alpine.architecture,
+        sources: &sources,
+        repositories: &alpine.repositories,
+        beneath: beneath.as_ref(),
+    };
+
     if let Some(base) = base {
         // The resolver reports this as the upgrade it is, with the dependency
         // that forced it; a plan reaches here without having been resolved
@@ -1587,10 +1639,14 @@ fn install(
                 ),
             }));
         }
-        // An increment with nothing in it needs no download and no script; the
-        // build root is the base as it stands.
+        // An increment with nothing in it needs no download and no script — but
+        // it still writes its state, so what a caller reads back from the
+        // merged view does not depend on whether the delta happened to be
+        // empty. Registration is a file format rather than a program's output,
+        // so writing it runs nothing.
         if plan.packages.is_empty() {
-            return Ok(());
+            let database = installed::Database::carrying(base.carried());
+            return bootstrap::register(into, &database, &state).map_err(wrap);
         }
     }
 
@@ -1615,34 +1671,6 @@ fn install(
     if let Some(overlay) = &alpine.overlay {
         super::extract::overlay_tree(into, overlay)?;
     }
-
-    // The base's own state is carried forward rather than replaced: the files
-    // written here shadow the base's copies through the overlay, so each has to
-    // describe the merged root.
-    let world = joined(
-        base.map_or(&[], layer::Base::world),
-        alpine.world.iter().cloned(),
-    );
-    let sources = joined(
-        base.map_or(&[], layer::Base::repositories),
-        alpine
-            .repositories
-            .iter()
-            .flat_map(super::alpine::Repository::sources),
-    );
-    let beneath = base
-        .map(|base| {
-            Rooted::open(base.path()).map_err(AlpineError::at("opening the base", base.path()))
-        })
-        .transpose()
-        .map_err(wrap)?;
-    let state = bootstrap::State {
-        world: &world,
-        architecture: &alpine.architecture,
-        sources: &sources,
-        repositories: &alpine.repositories,
-        beneath: beneath.as_ref(),
-    };
 
     if alpine.extract_only {
         // Registration is a file format here rather than a program's output, so
@@ -1716,7 +1744,7 @@ fn acquire(
     // caller is told it is downloading is what the batch and the walk between
     // them go on to fetch, in the order the plan names them.
     let mut missing: Vec<Missing<'_>> = Vec::new();
-    for (position, planned) in plan.packages.iter().enumerate() {
+    for planned in &plan.packages {
         if observer.cancelled() {
             return Err(ProvisionError::Cancelled);
         }
@@ -1749,11 +1777,6 @@ fn acquire(
         // A cached entry that does not read back as this package is not an
         // error; it is a download waiting to happen.
         if read_acquired(&path, planned, architecture).is_err() {
-            observer.progress(AlpineEvent::Downloading {
-                package: &planned.name,
-                index: position + 1,
-                total: plan.packages.len(),
-            });
             missing.push(Missing {
                 planned,
                 index,
@@ -1761,6 +1784,20 @@ fn acquire(
                 path,
             });
         }
+    }
+
+    // Announced over what is actually being fetched, once the cache has been
+    // asked about every package: a position among the plan's packages counts
+    // the ones already cached, so an observer reporting `index` of `total` would
+    // show a fetch of three packages as reaching nine of ten. The announcement
+    // precedes the batch because the batch fetches several at once, which is
+    // the shape a fetch event has throughout this crate.
+    for (position, entry) in missing.iter().enumerate() {
+        observer.progress(AlpineEvent::Downloading {
+            package: &entry.planned.name,
+            index: position + 1,
+            total: missing.len(),
+        });
     }
 
     prefetch(fetcher, &missing, architecture, observer)?;
@@ -3831,12 +3868,96 @@ mod tests {
     }
 
     #[test]
-    fn an_increment_the_base_already_satisfies_stages_nothing() {
+    fn a_download_is_announced_over_what_is_being_downloaded() {
+        // The event is emitted for a cache miss and only for one, so counting
+        // the plan's packages reports a fetch of one package as reaching two of
+        // two. What `index` of `total` means has to be the downloads.
+        let scratch = Scratch::new("alpine-download-count");
+        let mirror = published(
+            &scratch,
+            &[
+                ("musl-1.2.5-r23.apk", fixtures::MUSL),
+                ("alpine-keys-2.6-r0.apk", fixtures::ALPINE_KEYS),
+            ],
+        );
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(&cache).expect("the cache is creatable");
+        // One of the two already in the cache, which is the everyday state of a
+        // second run.
+        std::fs::write(cache.join("musl-1.2.5-r23.apk"), fixtures::MUSL)
+            .expect("the cached package is writable");
+
+        #[derive(Default)]
+        struct Counting(Vec<(String, usize, usize)>);
+        impl AlpineObserver for Counting {
+            fn progress(&mut self, event: AlpineEvent<'_>) {
+                if let AlpineEvent::Downloading {
+                    package,
+                    index,
+                    total,
+                } = event
+                {
+                    self.0.push((package.to_string(), index, total));
+                }
+            }
+        }
+
+        let mut counting = Counting::default();
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .include(["musl", "alpine-keys"])
+            .cache_dir(&cache)
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures");
+        crate::provision::ensure(scratch.join("root"), &mut alpine.observe(&mut counting))
+            .expect("the bootstrap runs");
+
+        assert_eq!(
+            counting.0,
+            vec![("alpine-keys".to_string(), 1, 1)],
+            "one package is downloaded, and it is the first of one",
+        );
+    }
+
+    #[test]
+    fn a_layered_provisioner_is_read_through_resolve_layer() {
+        // `provision::ensure` refuses a provisioner with a base layer, and the
+        // read half has to agree: reporting the whole-root closure answers a
+        // question this provisioner never asks, and reads as the plan it would
+        // install.
+        let scratch = Scratch::new("alpine-layered-resolve");
+        let mirror = published(&scratch, &[("musl-1.2.5-r23.apk", fixtures::MUSL)]);
+        let base = provisioned_base(&mirror, &scratch.join("base"), &["musl"]);
+        let err = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .base_layer(&base)
+            .include(["musl"])
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect_err("a layered provisioner is not read this way");
+        assert!(
+            matches!(&err, AlpineError::Config { reason } if reason.contains("resolve_layer")),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn an_increment_the_base_already_satisfies_still_says_what_it_wants() {
         // Every requested package is in the base, so there is nothing to
-        // download and nothing to run; the build root is the base as it stands.
+        // download and no script to run -- but the increment's own state is
+        // still written. What a caller reads back from the merged view cannot
+        // depend on whether the delta happened to be empty, and a base holding
+        // a package says nothing about whether its world names one: every
+        // package a resolution pulled in as a dependency is installed and
+        // unwanted.
         let scratch = Scratch::new("alpine-empty-increment");
         let mirror = published(&scratch, &[("musl-1.2.5-r23.apk", fixtures::MUSL)]);
         let base = provisioned_base(&mirror, &scratch.join("base"), &["musl"]);
+        std::fs::write(base.join("etc/apk/world"), b"").expect("the base's world is writable");
         let upper = scratch.join("upper");
 
         let layer = Alpine::builder("v3.23")
@@ -3849,13 +3970,15 @@ mod tests {
             .expect("the bootstrap configures")
             .stage_layer(&upper)
             .expect("the increment stages");
-        assert!(layer.path().is_dir(), "the upper exists and is empty");
+        assert!(layer.path().is_dir());
         assert_eq!(
-            std::fs::read_dir(&upper)
-                .expect("the upper is readable")
-                .count(),
-            0,
+            std::fs::read_to_string(upper.join("etc/apk/world")).expect("the world is written"),
+            "musl\n",
+            "the increment's request reaches the merged view",
         );
+        // Nothing was downloaded and nothing ran, which is still true.
+        assert!(!upper.join("lib/apk/exec").exists());
+        assert!(!upper.join("lib/ld-musl-x86_64.so.1").exists());
     }
 
     #[test]
@@ -4105,6 +4228,47 @@ mod tests {
             .expect("the bootstrap configures");
         crate::provision::ensure(&root, &mut alpine).expect("the backstop serves the package");
         assert!(root.join("lib/ld-musl-x86_64.so.1").is_file());
+    }
+
+    #[test]
+    fn a_plan_pins_the_closure_it_installed() {
+        // `plan()` forbids `include()`, so the configured world is empty and an
+        // empty `/etc/apk/world` is what a plan-based root carried: apk reads
+        // that as nothing being wanted, and acts on it. A plan names every
+        // package rather than the seeds a resolution closed over, so its names
+        // are what the root wants.
+        let scratch = Scratch::for_test("alpine", "plan-world");
+        let mirror = published(&scratch, &[("musl-1.2.5-r23.apk", fixtures::MUSL)]);
+        let plan = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .include(["musl"])
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect("musl resolves");
+        let mut names: Vec<String> = plan
+            .packages
+            .iter()
+            .map(|package| package.name.clone())
+            .collect();
+        assert!(names.iter().any(|name| name == "musl"), "{names:?}");
+        names.sort();
+
+        let root = scratch.join("planned");
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .plan(plan)
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures");
+        crate::provision::ensure(&root, &mut alpine).expect("the plan installs");
+        let world =
+            std::fs::read_to_string(root.join("etc/apk/world")).expect("a world is written");
+        let mut wanted: Vec<String> = world.lines().map(str::to_string).collect();
+        wanted.sort();
+        assert_eq!(wanted, names, "the plan's packages are what the root wants");
     }
 
     #[test]

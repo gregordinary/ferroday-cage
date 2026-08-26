@@ -544,6 +544,11 @@ impl RestrictionBuilder {
     /// [`ConfigError::RestrictionEmpty`].
     pub fn build(self) -> Result<Restriction, Error> {
         let command = self.command.ok_or(ConfigError::CommandMissing)?;
+        // The absence of a command written down, reported as that rather than
+        // as a path that is not absolute; a cage reads it the same way.
+        if command.as_os_str().is_empty() {
+            return Err(ConfigError::CommandMissing.into());
+        }
         if !command.is_absolute() {
             return Err(ConfigError::CommandNotAbsolute { command }.into());
         }
@@ -783,6 +788,21 @@ mod tests {
             .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/")
             .build()
             .expect("a grant on the root covers the whole filesystem");
+    }
+
+    #[test]
+    fn build_rejects_an_empty_command() {
+        // The absence of a command written down, reported as that rather than
+        // as a path that is not absolute -- which is how a cage reads it too.
+        let err = Restriction::builder()
+            .command("")
+            .seccomp(SeccompPolicy::Curated)
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::CommandMissing)),
+            "{err}",
+        );
     }
 
     #[test]

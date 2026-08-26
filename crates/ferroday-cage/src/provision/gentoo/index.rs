@@ -40,6 +40,7 @@ use std::collections::HashMap;
 use super::atom::{self, Dependency};
 use super::version;
 use crate::provision::coordinate::{self, Nesting};
+use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
 
 /// The binary-package generation the archive publishes under.
@@ -321,6 +322,16 @@ fn read_record(stanza: &Stanza) -> Option<Record> {
     if !atom::is_package(&name) {
         return None;
     }
+    // The digest every package is verified against, and the `MD5` a plan
+    // document carries. Held to the algorithm's own alphabet here, where the
+    // record is built, because both readers downstream assume it: no digest
+    // check can pass on a value outside it, and `Plan::parse_document` refuses
+    // one — so a plan projected from such a record is a document this crate
+    // emits and will not read back.
+    let md5 = stanza.get("MD5")?;
+    if !Algorithm::Md5.is_hex(md5) {
+        return None;
+    }
     Some(Record {
         name,
         version: version.to_string(),
@@ -339,7 +350,7 @@ fn read_record(stanza: &Stanza) -> Option<Record> {
         pdepend: atom::parse_class(stanza.get("PDEPEND").unwrap_or_default()).ok()?,
         path: stanza.get("PATH")?.to_string(),
         size: stanza.get("SIZE")?.parse().ok()?,
-        md5: stanza.get("MD5")?.to_string(),
+        md5: md5.to_string(),
     })
 }
 
@@ -645,6 +656,12 @@ SIZE: 1
 
 BUILD_ID: 1
 CPV: sys-libs/zlib-1.3.1
+MD5: not a digest
+PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar
+SIZE: 1
+
+BUILD_ID: 1
+CPV: sys-libs/zlib-1.3.1
 MD5: d41d8cd98f00b204e9800998ecf8427e
 PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar
 SIZE: 1
@@ -652,8 +669,11 @@ SIZE: 1
         let index = Index::parse(refused);
         // The traversal is the one that matters: nothing signs the index, so
         // its PATH is a mirror's string and it becomes a URL and a cache entry.
+        // The digest matters for a second reason: a record carrying something
+        // that is not one can pass no verification, and projects a plan
+        // document this crate emits and refuses to read back.
         assert_eq!(index.records().len(), 1);
-        assert_eq!(index.skipped(), 3);
+        assert_eq!(index.skipped(), 4);
         assert!(index.publishes("sys-libs/zlib"));
     }
 

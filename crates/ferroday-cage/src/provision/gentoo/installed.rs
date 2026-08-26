@@ -369,14 +369,31 @@ fn read_entry(
 /// The upper wins where both describe one package in one slot, which is what an
 /// overlay does with two entries of a name. Two *slots* of one package are two
 /// installed packages, so an increment that added a second slot has not
-/// replaced the first.
+/// replaced the first — but a sub-slot is not a slot, so a package rebuilt
+/// against a new one replaces what the base had rather than joining it. Matched
+/// through [`slot_of`] for that reason.
 pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooError> {
     let mut packages = installed(lower)?.packages;
     for above in installed(upper)?.packages {
-        packages.retain(|below| !(below.name == above.name && below.slot == above.slot));
+        packages.retain(|below| {
+            !(below.name == above.name && slot_of(&below.slot) == slot_of(&above.slot))
+        });
         packages.push(above);
     }
     Ok(Installed::sorted(packages))
+}
+
+/// The slot proper of a `slot` or `slot/subslot` spelling.
+///
+/// The sub-slot records what a dependent must be rebuilt against and is not part
+/// of what a slot *is*: portage installs one instance per `(package, slot)`, and
+/// two builds differing only in their sub-slot are two versions of one instance
+/// rather than two. Every question about which instance a package *is* asks
+/// through this — the merged view above, and the resolver's one-instance-per-slot
+/// guard — where a question about what a dependent was built against reads the
+/// value whole.
+pub(super) fn slot_of(slot: &str) -> &str {
+    slot.split_once('/').map_or(slot, |(slot, _)| slot)
 }
 
 #[cfg(test)]
@@ -544,8 +561,11 @@ mod tests {
         let lower = stage3("merged-lower");
         let upper = Scratch::for_test("gentoo-installed", "merged-upper");
         entry(&upper, "dev-vcs", "git-2.54.0", Some("0"), "amd64 curl");
-        // The upper wins where both describe one package in one slot.
-        entry(&upper, "sys-libs", "zlib-1.3.2", Some("0/1"), "amd64");
+        // The upper wins where both describe one package in one slot -- and a
+        // sub-slot bump is one slot, not two: a package rebuilt against a new
+        // sub-slot replaces what the base had rather than joining it, or the
+        // merged view would describe a root holding two instances of one slot.
+        entry(&upper, "sys-libs", "zlib-1.3.2", Some("0/2"), "amd64");
         // A second slot of a package the lower has is a second package rather
         // than a replacement.
         entry(&upper, "sys-apps", "util-linux-2.42", Some("1"), "amd64");
@@ -558,6 +578,14 @@ mod tests {
                 .map(InstalledPackage::version)
                 .collect::<Vec<_>>(),
             ["1.3.2"],
+        );
+        assert_eq!(
+            merged
+                .under("sys-libs/zlib")
+                .map(InstalledPackage::slot)
+                .collect::<Vec<_>>(),
+            ["0/2"],
+            "the sub-slot the upper states is what the merged view carries",
         );
         let util: Vec<&str> = merged
             .under("sys-apps/util-linux")

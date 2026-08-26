@@ -377,6 +377,12 @@ it:
 - `--bind`, `--ro-bind`, and `--setenv` extend the profile's lists.
 - A command on the command line replaces the profile's `command` and
   `args` as a unit.
+- `stop-with-caller` is the one key `fcage` defaults differently from the
+  library: `fcage` waits for the command and exits with it, so a sandbox that
+  outlived the process is never what a shell or a supervisor meant, and the tie
+  is on unless something says otherwise. A profile stating the key is that
+  something, so `stop-with-caller = false` holds — the flag still overrides
+  either way.
 - Hardening flags compose with a profile's `[hardening]` table:
   `--landlock-ro`, `--landlock-rw`, `--landlock-bind`, and `--landlock-connect`
   add grants to it, while the seccomp flags, `--drop-caps`, and `--keep-caps`

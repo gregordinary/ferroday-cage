@@ -135,7 +135,31 @@ impl Signals {
     /// already-blocked set and opens a second descriptor, and two descriptors in
     /// one process race for a process-directed signal — whichever reads first
     /// consumes it. One per process is the shape to build.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::Io`] where the mask cannot be set, or where the descriptor
+    /// cannot be opened — descriptor exhaustion, or a seccomp policy that
+    /// refuses `signalfd4`. A failed call leaves the caller's signal mask
+    /// exactly as it found it: the permanent block described above is what a
+    /// *successful* install establishes, and holding it with no descriptor to
+    /// drain it would leave the process unable to answer `SIGINT` or `SIGTERM`
+    /// at all.
     pub fn install() -> Result<Signals, RelayError> {
+        Signals::install_with(open_signalfd)
+    }
+
+    /// The body of [`install`](Self::install), with the descriptor opened by
+    /// `open`.
+    ///
+    /// Split so the failure path is reachable from a test. `signalfd4` fails on
+    /// descriptor exhaustion or a seccomp refusal, and a test can arrange
+    /// neither without perturbing the whole test binary; what the failure path
+    /// has to get right — the mask this call leaves behind — is independent of
+    /// which of them it was.
+    fn install_with(
+        open: impl FnOnce(&KernelSigSet) -> Result<OwnedFd, Errno>,
+    ) -> Result<Signals, RelayError> {
         let mut blocked = KernelSigSet::empty();
         for signal in RELAYED {
             blocked.insert(signal);
@@ -144,32 +168,27 @@ impl Signals {
         // Blocking the relayed set interferes with nothing in the process: the
         // standard library installs handlers only for SIGPIPE and the
         // stack-overflow SIGSEGV, neither of which is in it.
-        unsafe { rustix::runtime::kernel_sigprocmask(How::BLOCK, Some(&blocked)) }
+        let previous = unsafe { rustix::runtime::kernel_sigprocmask(How::BLOCK, Some(&blocked)) }
             .map_err(RelayError::at("blocking the relayed signals"))?;
 
-        // SAFETY: `blocked` is a live local, and `KernelSigSet` is a transparent
-        // wrapper over the kernel's own `sigset_t` -- so the pointer is one to
-        // that type and the size passed alongside it is that type's, which is
-        // what `signalfd4` compares against. The first argument, -1, asks for a
-        // new descriptor rather than modifying an existing one, and the call
-        // returns an owned file descriptor on success.
-        let fd = unsafe {
-            syscalls::syscall!(
-                Sysno::signalfd4,
-                -1i32,
-                std::ptr::from_ref(&blocked),
-                size_of::<KernelSigSet>(),
-                SFD_CLOEXEC | SFD_NONBLOCK
-            )
-        }
-        .map_err(|err| {
-            RelayError::io(
-                "opening the signal descriptor",
-                io::Error::from_raw_os_error(err.into_raw()),
-            )
+        let fd = open(&blocked).map_err(|errno| {
+            // No descriptor came back, so nothing will drain what was just
+            // blocked. Left blocked, SIGINT and SIGTERM would do nothing to a
+            // caller that logged this failure and carried on -- a service made
+            // resistant to ordinary shutdown by the very call that reported it
+            // could not relay. The permanent block is a property of a
+            // *successful* install, where a descriptor exists to answer on it.
+            //
+            // Restoring the exact prior mask, rather than unblocking the
+            // relayed set, is what keeps a signal the caller had blocked for its
+            // own reasons blocked.
+            //
+            // SAFETY: `previous` is a live local of exactly the type the call
+            // takes, and is the mask this same thread was running under a few
+            // instructions ago.
+            let _ = unsafe { rustix::runtime::kernel_sigprocmask(How::SETMASK, Some(&previous)) };
+            RelayError::io("opening the signal descriptor", io::Error::from(errno))
         })?;
-        // SAFETY: the syscall returned a fresh, owned file descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
         Ok(Signals { fd })
     }
 
@@ -215,6 +234,32 @@ impl Signals {
     }
 }
 
+/// Opens a `signalfd` reading `blocked`, non-blocking and close-on-exec.
+///
+/// The one call [`Signals::install`] makes that the kernel can refuse for a
+/// reason outside this crate: descriptor exhaustion, or a seccomp policy that
+/// does not permit `signalfd4`.
+fn open_signalfd(blocked: &KernelSigSet) -> Result<OwnedFd, Errno> {
+    // SAFETY: `blocked` is a live reference, and `KernelSigSet` is a transparent
+    // wrapper over the kernel's own `sigset_t` -- so the pointer is one to that
+    // type and the size passed alongside it is that type's, which is what
+    // `signalfd4` compares against. The first argument, -1, asks for a new
+    // descriptor rather than modifying an existing one, and the call returns an
+    // owned file descriptor on success.
+    let fd = unsafe {
+        syscalls::syscall!(
+            Sysno::signalfd4,
+            -1i32,
+            std::ptr::from_ref(blocked),
+            size_of::<KernelSigSet>(),
+            SFD_CLOEXEC | SFD_NONBLOCK
+        )
+    }
+    .map_err(|err| Errno::from_raw_os_error(err.into_raw()))?;
+    // SAFETY: the syscall returned a fresh, owned file descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +300,58 @@ mod tests {
             None,
             "one record was queued and one was read",
         );
+    }
+
+    /// This thread's current signal mask, read without changing it.
+    fn mask_here() -> KernelSigSet {
+        // SAFETY: `None` asks only for the current mask; `how` is then ignored
+        // and nothing is set.
+        unsafe { rustix::runtime::kernel_sigprocmask(How::BLOCK, None) }
+            .expect("reading a thread's own mask cannot fail")
+    }
+
+    /// Applies `how` with `set` to this thread's mask.
+    fn set_mask_here(how: How, set: &KernelSigSet) {
+        // SAFETY: `set` is a live reference of exactly the type the call takes.
+        unsafe { rustix::runtime::kernel_sigprocmask(how, Some(set)) }
+            .expect("setting a thread's own mask cannot fail");
+    }
+
+    #[test]
+    fn a_failed_install_leaves_the_mask_exactly_as_it_found_it() {
+        // Without the rollback, a caller that logs this failure and carries on
+        // runs with SIGINT and SIGTERM blocked and no descriptor draining them:
+        // the process stops answering ^C and an ordinary shutdown request,
+        // having just reported that it could not relay. Restoring the prior mask
+        // rather than unblocking the relayed set is what this pins -- a signal
+        // the caller had blocked for its own reasons stays blocked.
+        let mut mine = KernelSigSet::empty();
+        mine.insert(Signal::INT);
+        set_mask_here(How::BLOCK, &mine);
+        assert!(!mask_here().contains(Signal::TERM), "the test's premise");
+
+        let err = Signals::install_with(|_| Err(Errno::MFILE))
+            .expect_err("the descriptor cannot be opened");
+        assert!(
+            err.to_string().contains("signal descriptor"),
+            "{err}, expected the descriptor's own failure",
+        );
+
+        let after = mask_here();
+        assert!(
+            after.contains(Signal::INT),
+            "a signal the caller had blocked was unblocked by a failed install",
+        );
+        for signal in RELAYED {
+            if signal != Signal::INT {
+                assert!(
+                    !after.contains(signal),
+                    "{signal:?} was left blocked with no descriptor to drain it",
+                );
+            }
+        }
+
+        set_mask_here(How::UNBLOCK, &mine);
     }
 
     #[test]

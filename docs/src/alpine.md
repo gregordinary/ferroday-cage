@@ -56,7 +56,9 @@ A bootstrap runs in stages:
 The finished root carries `/lib/apk/db/installed`, `/etc/apk/world`,
 `/etc/apk/repositories`, `/etc/apk/arch` and the repositories' trusted keys, so
 an `apk` inside it reads back the state this bootstrap wrote and can go on
-installing.
+installing. `world` is what `include` named, which is what a later `apk` treats
+as wanted; a bootstrap installing a `plan` writes every package the plan names,
+since a plan is the whole closure and records no seeds.
 
 ## Selecting packages
 

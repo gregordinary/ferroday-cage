@@ -633,6 +633,16 @@ impl Database {
             .collect();
         order.sort_by(|a, b| a.name.cmp(&b.name));
         let mut out = self.carried.triggers.clone();
+        // The seam the carried bytes make with this layer's lines, guarded as
+        // `installed` guards its own: `apk` reads this file line by line, and a
+        // base whose copy did not end in a newline would have its last line
+        // glued to the first written here — two packages' watches read as one
+        // package's. Neither this layer nor `apk` writes such a file; what makes
+        // the check worth its line is that the base is a directory a caller
+        // named.
+        if !out.is_empty() && !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
         for record in order {
             out.extend_from_slice(record.control_identity.as_bytes());
             out.push(b' ');
@@ -753,6 +763,54 @@ mod tests {
             "Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
             "X1".to_string() + &"0".repeat(40),
         )
+    }
+
+    #[test]
+    fn a_carried_triggers_file_is_terminated_before_this_layers_lines() {
+        // apk reads the file line by line, so a base whose copy did not end in
+        // a newline would have its last line glued to the first written here --
+        // two packages' watched paths read as one package's. The record
+        // rendering beside this guards its own seam for the same reason.
+        let info = info("busybox", "1.37.0-r30", "triggers = /bin /usr/bin\n");
+        let mut database = Database::carrying(Carried {
+            triggers: b"Q1BASE= /etc/init.d".to_vec(),
+            ..Carried::default()
+        });
+        database.add(record(&info));
+        let triggers = String::from_utf8(database.triggers()).expect("the file is text");
+        assert_eq!(
+            triggers.lines().count(),
+            2,
+            "the base's line and this layer's are two lines: {triggers:?}",
+        );
+        assert!(
+            triggers.starts_with("Q1BASE= /etc/init.d\n"),
+            "{triggers:?}"
+        );
+
+        // A base whose file is terminated already gains no second newline, and
+        // an absent one contributes nothing at all.
+        let mut database = Database::carrying(Carried {
+            triggers: b"Q1BASE= /etc/init.d\n".to_vec(),
+            ..Carried::default()
+        });
+        database.add(record(&info));
+        assert_eq!(
+            String::from_utf8(database.triggers())
+                .expect("the file is text")
+                .lines()
+                .count(),
+            2,
+        );
+        let mut database = Database::default();
+        database.add(record(&info));
+        assert_eq!(
+            String::from_utf8(database.triggers())
+                .expect("the file is text")
+                .lines()
+                .count(),
+            1,
+        );
     }
 
     #[test]

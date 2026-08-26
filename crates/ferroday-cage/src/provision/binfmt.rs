@@ -28,14 +28,28 @@ pub(crate) enum Missing {
 /// Whether the `qemu-<interpreter>` handler can run a foreign binary from a
 /// cage.
 pub(crate) fn ready(interpreter: &str) -> Result<(), Missing> {
-    let registration = read(interpreter).ok_or(Missing::Unregistered)?;
+    let registration = read(interpreter)
+        .map_err(|_| Missing::Unusable("its registration could not be read"))?
+        .ok_or(Missing::Unregistered)?;
     check(&parse(&registration)).map_err(Missing::Unusable)
 }
 
-/// The kernel's registration for the `qemu-<name>` handler, or `None` when none
-/// is registered.
-pub(crate) fn read(name: &str) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/sys/fs/binfmt_misc/qemu-{name}")).ok()
+/// The kernel's registration for the `qemu-<name>` handler, or `Ok(None)` when
+/// none is registered.
+///
+/// A read that fails for any other reason is not "none is registered", and is
+/// reported rather than folded into it: `binfmt_misc` can be mounted with a
+/// registration present and unreadable — a restrictive mount, an LSM — and
+/// answering `None` there advises a caller to register a handler the kernel
+/// already holds.
+pub(crate) fn read(name: &str) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(format!("/proc/sys/fs/binfmt_misc/qemu-{name}")) {
+        Ok(registration) => Ok(Some(registration)),
+        // Both the registration and the directory it would live in: neither
+        // present is the same answer, since the filesystem is not mounted.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// What a `binfmt_misc` registration file says, as fields.
@@ -132,6 +146,15 @@ mod tests {
         assert_eq!(
             ready("an-architecture-no-kernel-has"),
             Err(Missing::Unregistered),
+        );
+        // A name the read cannot even attempt is not "no handler is
+        // registered": the preflight would advise registering one, and what is
+        // true is that nothing here could look. A NUL makes the read fail for a
+        // reason that is not absence, whatever the host has mounted.
+        assert!(read("a\0name").is_err());
+        assert_eq!(
+            ready("a\0name"),
+            Err(Missing::Unusable("its registration could not be read")),
         );
     }
 }

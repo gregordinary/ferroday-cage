@@ -364,17 +364,7 @@ impl TcpFlow {
             return true;
         }
 
-        // A hung-up host side with no room left in the guest's transmit buffer
-        // can move nothing until the guest reads. That is ordinary mid-transfer
-        // and resolves itself; a guest that never reads at all does not, and
-        // keep-alive will not reclaim it because it answers the probes. Time
-        // the stall from the moment it starts and clear it the moment the flow
-        // can move again; `enforce_deadline` reclaims what stays stuck.
-        if !self.host_eof && self.host_hangup && !socket.can_send() {
-            self.stalled_since.get_or_insert(now);
-        } else {
-            self.stalled_since = None;
-        }
+        self.note_stall(socket.can_send(), progress, now);
 
         // Both directions have half-closed: the host socket is done both ways,
         // so release its descriptor now rather than hold it while the guest
@@ -453,6 +443,30 @@ impl TcpFlow {
         if expired {
             socket.abort();
             self.dead = true;
+        }
+    }
+
+    /// Records whether the pass that just ran left the flow stalled, which is
+    /// what [`enforce_deadline`](Self::enforce_deadline) reclaims a flow on.
+    ///
+    /// A hung-up host side with no room left in the guest's transmit buffer can
+    /// move nothing until the guest reads. That is ordinary mid-transfer and
+    /// resolves itself; a guest that never reads at all does not, and keep-alive
+    /// will not reclaim it because it answers the probes.
+    ///
+    /// The clock runs from the last pass that moved the flow rather than from
+    /// the moment the buffer first filled, which is what [`HANGUP_DEADLINE`]
+    /// states and what `moved` is here for. A guest reading steadily but slower
+    /// than the host queued would otherwise never clear it: the check runs after
+    /// both copy directions, and a pass that drains a little and refills the
+    /// buffer completely ends with no room and bytes having moved. Timing that
+    /// as a stall reclaims a flow that is draining, which is the one thing this
+    /// deadline exists not to do.
+    fn note_stall(&mut self, can_send: bool, moved: bool, now: Instant) {
+        if !self.host_eof && self.host_hangup && !can_send && !moved {
+            self.stalled_since.get_or_insert(now);
+        } else {
+            self.stalled_since = None;
         }
     }
 
@@ -756,6 +770,36 @@ mod tests {
 
         assert!(flow.service(socket, Instant::now()));
         assert!(flow.dead, "a failed host side is not worth draining");
+    }
+
+    #[test]
+    fn the_stall_clock_runs_from_the_last_pass_that_moved_the_flow() {
+        // A guest draining slower than the host queued ends every pass with a
+        // full transmit buffer and bytes having moved into it. Timing that from
+        // the moment the buffer first filled reclaims the flow at the deadline
+        // while it is still draining, which is what the deadline is written not
+        // to do.
+        let (_sockets, handle) = guest_socket();
+        let (mut flow, _peer) = connected_flow(handle);
+        flow.host_hangup = true;
+        let started = Instant::now();
+        let later = started + Duration::from_secs(1);
+
+        // No room and nothing moved: the flow is stuck, and the clock starts.
+        flow.note_stall(false, false, started);
+        assert_eq!(flow.stalled_since, Some(started));
+        // Still no room, but the pass moved bytes: the flow is draining.
+        flow.note_stall(false, true, later);
+        assert_eq!(flow.stalled_since, None, "a draining flow is not stalled");
+        // Room again clears it too, whether or not this pass moved anything.
+        flow.note_stall(false, false, started);
+        flow.note_stall(true, false, later);
+        assert_eq!(flow.stalled_since, None);
+        // A clock already running is not restarted by a later stalled pass, or
+        // a flow that never moves would never reach the deadline.
+        flow.note_stall(false, false, started);
+        flow.note_stall(false, false, later);
+        assert_eq!(flow.stalled_since, Some(started));
     }
 
     #[test]

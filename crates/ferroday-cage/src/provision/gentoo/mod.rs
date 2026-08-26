@@ -1043,6 +1043,7 @@ impl Gentoo {
                     slot: &taken.slot,
                     held: &taken.held,
                     second: &taken.second,
+                    installed: taken.installed,
                     atom: &taken.atom,
                     wanted_by: &taken.wanted_by,
                 });
@@ -1586,7 +1587,7 @@ impl Gentoo {
         let plan = self.resolve_install(&installed, to)?;
         to.progress(GentooEvent::Planned {
             packages: plan.packages.len(),
-            bytes: plan.packages.iter().map(|package| package.size).sum(),
+            bytes: planned_bytes(&plan.packages),
         });
         // The resolution is one document and the downloads are not, so a caller
         // who cancelled during it is not committed to them by having asked what
@@ -2051,7 +2052,8 @@ pub enum GentooEvent<'a> {
         /// closure.
         packages: usize,
         /// What they weigh on the wire in total, from the sizes the index
-        /// published.
+        /// published. Saturating: the figures are a mirror's, and nothing
+        /// bounds their sum.
         bytes: u64,
     },
     /// A verified package is being merged into the root and registered.
@@ -2075,29 +2077,51 @@ pub enum GentooEvent<'a> {
         /// something this same resolution would install.
         installed: bool,
     },
-    /// Two builds the resolution would have chosen occupy one slot of one
-    /// package.
+    /// A build the resolution would have chosen occupies a slot of a package
+    /// something already holds.
     ///
     /// Portage keeps one instance per `(package, slot)` and reports a root
     /// holding two as a conflict, so this is refused rather than merged. It is
     /// reached whenever the closure constrains one package from two directions
     /// at once — an atom holding it below a version and another holding it at or
-    /// above one.
+    /// above one — and whenever an atom is answered only by a version later
+    /// than the one the root already has in that slot, since merging installs
+    /// beside what is there rather than replacing it.
     #[non_exhaustive]
     Occupied {
         /// The package, as `category/name`.
         package: &'a str,
         /// The slot both would occupy, without a sub-slot.
         slot: &'a str,
-        /// The build already chosen, as `category/name-version build N`.
+        /// What holds the slot, as `category/name-version` — and `build N` as
+        /// well, where it is a build this same resolution chose.
         held: &'a str,
-        /// The build that would have joined it, spelled the same way.
+        /// The build that would have joined it, as `category/name-version
+        /// build N`.
         second: &'a str,
+        /// Whether what holds the slot is already in the root or would be
+        /// installed by this same resolution.
+        installed: bool,
         /// The atom that asked for the second, as it was written.
         atom: &'a str,
         /// Who asked for it: the caller, or the package whose dependency it is.
         wanted_by: &'a str,
     },
+}
+
+/// What a plan's packages weigh on the wire in total.
+///
+/// Saturating, because the figures are a mirror's own: `SIZE` is read as a
+/// `u64` and nothing bounds a sum of them, so an index publishing two packages
+/// at the largest one overflows the total — a panic in a debug build and a
+/// wrapped figure in a release one, from a number that only ever reaches a
+/// progress event. Reported as the largest total there is, which says exactly
+/// as much as the arithmetic could.
+fn planned_bytes(packages: &[PlannedPackage]) -> u64 {
+    packages
+        .iter()
+        .map(|package| package.size)
+        .fold(0, u64::saturating_add)
 }
 
 /// Receives progress from a Gentoo resolution or bootstrap, and decides whether
@@ -2654,6 +2678,33 @@ impl GentooBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    /// A planned package weighing `size`, otherwise minimal.
+    fn weighing(size: u64) -> PlannedPackage {
+        let stanza = format!(
+            "BUILD_ID: 1\nCPV: sys-libs/zlib-1.3.1\n\
+             MD5: d41d8cd98f00b204e9800998ecf8427e\n\
+             PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar\nSIZE: {size}\n"
+        );
+        let index = index::Index::parse(&format!("TIMESTAMP: 1\n\n{stanza}"));
+        Plan::project("amd64", "amd64", None, index.records())
+            .packages
+            .pop()
+            .expect("the fixture publishes one build")
+    }
+
+    #[test]
+    fn a_planned_total_saturates_rather_than_overflowing() {
+        // `SIZE` is a mirror's own number, read as a u64 and bounded by nothing
+        // else. Two packages at the largest one overflow the sum, which panics
+        // a debug build over a figure that only ever reaches a progress event.
+        assert_eq!(planned_bytes(&[weighing(2), weighing(3)]), 5);
+        assert_eq!(
+            planned_bytes(&[weighing(u64::MAX), weighing(u64::MAX)]),
+            u64::MAX,
+        );
+        assert_eq!(planned_bytes(&[]), 0);
+    }
     use std::collections::HashMap;
     use std::io::Write;
 

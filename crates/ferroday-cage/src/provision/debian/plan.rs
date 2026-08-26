@@ -801,10 +801,17 @@ Source: local-suite
         // into a provenance record, or to normalize a file it commits -- would
         // otherwise silently discard whatever the newer writer had added, which
         // is the one thing a plan kept for reproducibility must not do.
+        // One of them folded, which a deb822 writer does for a list and which
+        // the reader accepts: a carried field refused on the way out is a
+        // document this crate reads and cannot re-emit, which is the failure
+        // carrying one exists to prevent.
         let document = sample()
             .to_document()
             .unwrap()
-            .replace("Suite: trixie\n", "Suite: trixie\nFuture-Header: h\n")
+            .replace(
+                "Suite: trixie\n",
+                "Suite: trixie\nFuture-Header: h\nFuture-List:\n first\n second\n",
+            )
             .replace(
                 "Mirror: http://deb.debian.org/debian\n",
                 "Mirror: http://deb.debian.org/debian\nFuture-Archive: a\n",
@@ -816,7 +823,12 @@ Source: local-suite
 
         let plan = Plan::parse_document(&document).expect("a newer document reads");
         let rewritten = plan.to_document().expect("and writes back");
-        for carried in ["Future-Header: h", "Future-Archive: a", "Future-Package: p"] {
+        for carried in [
+            "Future-Header: h",
+            "Future-List:\n first\n second\n",
+            "Future-Archive: a",
+            "Future-Package: p",
+        ] {
             assert!(
                 rewritten.contains(carried),
                 "{carried} was dropped:\n{rewritten}"

@@ -214,10 +214,16 @@ impl Extraction {
             let path = match &self.under {
                 None => entry.path.as_slice(),
                 Some(prefix) => match strip_prefix(&entry.path, prefix) {
+                    // The wrapper's own entry. It strips to the empty path,
+                    // which the `./` arm below reads as the extraction root --
+                    // and the root is the caller's, not something the wrapper
+                    // describes, so applying its mode and modification time
+                    // there would rewrite the root every archive is unpacked
+                    // into. `under` says the wrapper lands nowhere.
+                    Some([]) => continue,
                     Some(rest) => rest,
-                    // The wrapper's own entry, and anything outside it. The
-                    // archive is read past either, so what follows is
-                    // unaffected.
+                    // Anything outside the wrapper. The archive is read past
+                    // it, so what follows is unaffected.
                     None => continue,
                 },
             };
@@ -304,8 +310,9 @@ pub(crate) fn extract_archive<R: Read>(
 ///
 /// The prefix names a directory, so a path that merely begins with those bytes
 /// is not under it: `image2/x` is not inside `image/`. The prefix's own entry
-/// — `image/`, or `image` — yields the empty path, which is the extraction root
-/// and is what the caller's own `./` handling answers.
+/// — `image/`, or `image` — yields the empty path, which the caller tells from
+/// a path below the prefix and skips: the wrapper describes the extraction root
+/// it was unpacked into, and that root is the caller's.
 fn strip_prefix<'p>(path: &'p [u8], prefix: &[u8]) -> Option<&'p [u8]> {
     let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
     let rest = path.strip_prefix(prefix)?;
@@ -1301,6 +1308,50 @@ mod tests {
 #[cfg(test)]
 mod prefix_tests {
     use super::strip_prefix;
+    #[cfg(feature = "gentoo")]
+    use super::{Extraction, Placement, TarReader};
+    #[cfg(feature = "gentoo")]
+    use crate::scratch::Scratch;
+    #[cfg(feature = "gentoo")]
+    use std::fs;
+    #[cfg(feature = "gentoo")]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(feature = "gentoo")]
+    #[test]
+    fn a_wrapper_directory_does_not_become_the_extraction_roots_metadata() {
+        // The wrapper describes the directory the archive was built in, not the
+        // root it is unpacked into -- and the root belongs to the caller, who
+        // may be merging a hundred containers into it. Reading the wrapper as
+        // the `./` entry rewrote that root's mode and modification time once
+        // per container.
+        let root = Scratch::for_test("extract", "wrapper-root-mode");
+        fs::set_permissions(&*root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut tar = ferroday_cage_testkit::tar::Tar::new();
+        tar.dir("image/", 0o700)
+            .file("image/usr/bin/git", 0o755, b"binary\n");
+        let archive = tar.finish();
+
+        let mut extraction = Extraction::new(&root)
+            .expect("the root opens")
+            .under(b"image");
+        extraction
+            .extract(&mut TarReader::new(&archive[..]), &mut |_, _| {
+                Ok(Placement::Write)
+            })
+            .expect("the image extracts");
+        extraction
+            .finalize(&root)
+            .expect("the extraction finalizes");
+
+        assert_eq!(
+            fs::symlink_metadata(&*root).unwrap().permissions().mode() & 0o7777,
+            0o755,
+            "the wrapper's own mode must not reach the extraction root",
+        );
+        assert!(root.join("usr/bin/git").exists(), "the image still lands");
+    }
 
     #[test]
     fn a_wrapper_prefix_is_stripped_only_from_paths_actually_under_it() {

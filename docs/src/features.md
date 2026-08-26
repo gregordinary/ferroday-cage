@@ -60,9 +60,22 @@ featureless build and is tried first regardless.
 ## In the command-line tool
 
 `fcage` is built with every feature enabled, so any profile the library accepts
-loads there and every builder capability has a flag. It is the quickest way to
-try a configuration before committing to a feature set in a consumer's
-`Cargo.toml`.
+loads there. It is the quickest way to try a configuration before committing to
+a feature set in a consumer's `Cargo.toml`.
+
+What it spells, surface by surface:
+
+| Surface | In `fcage` |
+| --- | --- |
+| The launch builder, and the restriction fallback behind `--restrict` | Every setting, but the two no argument can carry: a command's standard input as an open descriptor, and an identity-map delegate supplied as code. The output pair has no flag either, a shell already spelling both of its dispositions. |
+| The native network stack | Every setting, as `--netstack-*`. |
+| The provisioners' bootstrap surface | Every setting, plan and pin documents included, so a reproducible install is expressible at a prompt. A custom transport is code and has none. |
+| Layered provisioning | Nothing. A provisioner given a base layer produces an increment in a disposable overlay upper rather than a published rootfs, and `fcage` publishes rootfs directories. |
+| Read-only archive inspection | Gentoo's, which prints stage3 variants, binhost packages, an installed set, and the vendored keyring's horizon. Debian and Alpine have no equivalent mode. |
+
+The record behind that table is `tools/parity.toml`, which names every public
+builder setting against the flag that reaches it or the reason it has none; a
+check in CI holds it to both surfaces.
 
 ## Documentation
 

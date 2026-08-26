@@ -59,7 +59,7 @@ use std::collections::HashMap;
 
 use super::atom::{self, Atom, Dependency, Unmet};
 use super::index::{Index, Record};
-use super::installed::{Installed, InstalledPackage};
+use super::installed::{Installed, InstalledPackage, slot_of};
 use super::version;
 
 /// A USE flag the caller would rather a build carried, or rather it did not.
@@ -133,20 +133,30 @@ pub(super) struct Conflict {
     pub installed: bool,
 }
 
-/// Two builds one resolution chose that would occupy one slot of one package.
+/// A build a resolution chose that would occupy a slot of a package something
+/// already holds.
 ///
 /// Portage keeps one instance per `(package, slot)` and refuses to create a
 /// second, so a root holding two is a root `emerge` reports as a conflict. A
 /// resolution that produced one and merged it anyway would lay both images down
 /// with the second overwriting the first's shared paths, and report success.
+///
+/// The holder is another build this resolution chose, or a package the root
+/// already has: a merge registers a database entry beside whatever is there and
+/// unmerges nothing, so a same-slot upgrade over the root produces exactly the
+/// state two chosen builds would.
 pub(super) struct Occupied {
     /// The package, as `category/name`.
     pub name: String,
     /// The slot both would occupy, without a sub-slot.
     pub slot: String,
-    /// The build already chosen, as `category/name-version`, and which build of
-    /// it.
+    /// What already holds the slot, as `category/name-version` — and which
+    /// build of it, where it is one this resolution chose. An installed package
+    /// has no build to name.
     pub held: String,
+    /// Whether what holds the slot is already in the root or would be installed
+    /// by this same resolution.
+    pub installed: bool,
     /// The build the second atom would have chosen, spelled the same way.
     pub second: String,
     /// The atom that asked for the second, as it was written.
@@ -194,9 +204,18 @@ impl Refusals {
         }
         for taken in &self.occupied {
             parts.push(format!(
-                "{} requires {}, and {} would occupy slot {} of {}, which {} already takes in this \
-                 same resolution",
-                taken.wanted_by, taken.atom, taken.second, taken.slot, taken.name, taken.held,
+                "{} requires {}, and {} would occupy slot {} of {}, which {} already takes {}",
+                taken.wanted_by,
+                taken.atom,
+                taken.second,
+                taken.slot,
+                taken.name,
+                taken.held,
+                if taken.installed {
+                    "in the root"
+                } else {
+                    "in this same resolution"
+                },
             ));
         }
         parts.join("; ")
@@ -279,23 +298,38 @@ pub(super) fn resolve(
             continue;
         };
         // One instance per slot, which is the invariant portage's own database
-        // keeps: the atom is not answered by what is already chosen -- that was
-        // asked two steps above -- so a chosen build sharing its slot is a
-        // second version of one package in one slot. Merging both would lay two
-        // images down with the second overwriting the first's shared paths, and
-        // leave a `/var/db/pkg` portage reads as a conflict.
+        // keeps: the atom is answered neither by what is already chosen nor by
+        // the root -- that was asked two steps above -- so anything sharing the
+        // picked build's slot is a second version of one package in one slot.
+        // Merging both would lay two images down with the second overwriting
+        // the first's shared paths, and leave a `/var/db/pkg` portage reads as
+        // a conflict.
+        //
+        // The root holds a slot as firmly as the resolution does. A merge
+        // registers its entry beside what is already there and unmerges
+        // nothing, so a same-slot upgrade over a stage3 is the same defect
+        // reached from the other side: the caller's answer is a root whose
+        // version the atom admits, not a second copy of the package.
         //
         // Reported rather than resolved around, which is the module's stance on
         // a conflict generally: nothing here backtracks, and the caller's atoms
         // are what would have to change.
-        if let Some(taken) = chosen
+        let taken = chosen
             .iter()
             .find(|held| held.name == record.name && slot_of(&held.slot) == slot_of(&record.slot))
-        {
+            .map(|held| (describe_build(held), false))
+            .or_else(|| {
+                installed
+                    .under(&record.name)
+                    .find(|held| slot_of(held.slot()) == slot_of(&record.slot))
+                    .map(|held| (format!("{}-{}", held.name(), held.version()), true))
+            });
+        if let Some((held, installed)) = taken {
             refusals.occupied.push(Occupied {
                 name: record.name.clone(),
                 slot: slot_of(&record.slot).to_string(),
-                held: describe_build(taken),
+                held,
+                installed,
                 second: describe_build(&record),
                 atom: alternatives
                     .iter()
@@ -341,16 +375,6 @@ pub(super) fn resolve(
 
     let (packages, cycles) = order(chosen);
     (Resolved { packages, cycles }, refusals)
-}
-
-/// The slot proper of a `slot` or `slot/subslot` spelling.
-///
-/// The sub-slot records what a dependent must be rebuilt against and is not part
-/// of what a slot *is*: portage installs one instance per `(package, slot)`, and
-/// two builds differing only in their sub-slot are two versions of one instance
-/// rather than two.
-fn slot_of(slot: &str) -> &str {
-    slot.split_once('/').map_or(slot, |(slot, _)| slot)
 }
 
 /// How a refusal names one build: its `CPV` and which build of it.
@@ -958,6 +982,7 @@ USE: amd64
         assert_eq!(taken.slot, "0");
         assert_eq!(taken.held, "sys-libs/zlib-1.3.1 build 1");
         assert_eq!(taken.second, "sys-libs/zlib-1.3.2 build 1");
+        assert!(!taken.installed, "both are builds this resolution chose");
         assert!(
             refusals
                 .describe()
@@ -970,6 +995,59 @@ USE: amd64
         // The first of the two is still chosen, so the refusal names one pair
         // rather than reporting the same collision from both sides.
         assert_eq!(installing(&resolved), ["sys-libs/zlib-1.3.1"]);
+    }
+
+    #[test]
+    fn a_same_slot_upgrade_over_the_root_is_refused() {
+        // A merge registers its database entry beside what the root already has
+        // and unmerges nothing, so installing a second version into an occupied
+        // slot leaves two entries with overlapping CONTENTS -- the state the
+        // refusal above exists to stop, reached from the root rather than from
+        // a second chosen build. The atom is one no installed version answers,
+        // which is what makes the collision reachable at all.
+        let (resolved, refusals) = run(
+            &root(&["sys-libs/zlib-1.3.1"]),
+            &[">=sys-libs/zlib-1.3.2"],
+            &[],
+        );
+        assert_eq!(refusals.occupied.len(), 1, "{}", refusals.describe());
+        let taken = &refusals.occupied[0];
+        assert_eq!(taken.name, "sys-libs/zlib");
+        assert_eq!(taken.slot, "0");
+        // No build to name: the root records what is installed, not which build
+        // of it was published.
+        assert_eq!(taken.held, "sys-libs/zlib-1.3.1");
+        assert_eq!(taken.second, "sys-libs/zlib-1.3.2 build 1");
+        assert!(taken.installed, "the root holds the slot");
+        assert!(
+            refusals.describe().contains("already takes in the root"),
+            "{}",
+            refusals.describe(),
+        );
+        // Nothing is installed: the refusal is the outcome.
+        assert!(
+            installing(&resolved).is_empty(),
+            "{:?}",
+            installing(&resolved)
+        );
+    }
+
+    #[test]
+    fn a_version_the_root_already_answers_is_no_collision() {
+        // The guard fires only where the atom is genuinely unanswered. An atom
+        // the root's own version satisfies is done two steps earlier, so a root
+        // holding a package is not by itself a refusal to install alongside.
+        let (resolved, refusals) = run(
+            &root(&["sys-libs/zlib-1.3.2"]),
+            &[">=sys-libs/zlib-1.3.1"],
+            &[],
+        );
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert!(
+            installing(&resolved).is_empty(),
+            "{:?}",
+            installing(&resolved)
+        );
     }
 
     #[test]

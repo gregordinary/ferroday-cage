@@ -37,11 +37,37 @@ use std::fmt;
 /// Total: see this module's documentation for why this format has no
 /// unorderable version and the other two do.
 pub(super) fn compare(a: &str, b: &str) -> Ordering {
-    let (ea, ua, ra) = split(a);
-    let (eb, ub, rb) = split(b);
+    let (ea, ua, ra) = split(as_dpkg_reads(a));
+    let (eb, ub, rb) = split(as_dpkg_reads(b));
     ea.cmp(&eb)
         .then_with(|| verrevcmp(ua, ub))
         .then_with(|| verrevcmp(ra, rb))
+}
+
+/// The part of a version string dpkg itself reads.
+///
+/// dpkg holds a version as a NUL-terminated `char *`, so a string carrying an
+/// interior NUL is to every part of dpkg the shorter string that ends there —
+/// including the parser that reads a `Version:` field back out of a
+/// `dpkg/status` this crate wrote. Reading the same prefix is what keeps this
+/// comparison agreeing with the tool that will read the same bytes, and it is
+/// what keeps it total: [`verrevcmp`] weights a byte past the end as that
+/// terminator, so an interior NUL reaching it matches the weight of the end of
+/// the *other* string in every branch, and neither cursor advances.
+///
+/// This scans for a NUL where [`path::is_ordinary_component`] is the
+/// workspace's answer for refusing one, because the question is not the same:
+/// that answer refuses a path whose bytes were not understood, where this one
+/// reproduces how another program reads bytes that are not this crate's to
+/// refuse. A version reaches here from a caller's plan document and from a base
+/// layer's own database, and neither is a place this comparison may fail.
+///
+/// [`path::is_ordinary_component`]: crate::path::is_ordinary_component
+fn as_dpkg_reads(version: &str) -> &str {
+    match version.find('\0') {
+        Some(nul) => &version[..nul],
+        None => version,
+    }
 }
 
 /// Splits a version into `(epoch, upstream, revision)`.
@@ -393,6 +419,22 @@ mod tests {
         lt("a", "b");
         // Letters sort before non-letter punctuation like `.` and `+`.
         lt("1.0a", "1.0.");
+    }
+
+    #[test]
+    fn a_version_is_compared_as_far_as_dpkg_would_read_it() {
+        // An interior NUL ends the string dpkg holds, so everything past one is
+        // not part of the version being compared. Reading further here would
+        // not terminate: the field comparison weights a byte past the end as
+        // dpkg's terminator, which an interior NUL matches without advancing
+        // either cursor.
+        eq("1.0\0-evil", "1.0");
+        eq("1.0\0", "1.0");
+        lt("1.0\0zzz", "1.1");
+        // The epoch and revision boundaries are found in that same prefix, so a
+        // hyphen or a colon past the NUL is not a boundary at all.
+        eq("1:2.0\0:9", "1:2.0");
+        eq("2.0-1\0-9", "2.0-1");
     }
 
     #[test]

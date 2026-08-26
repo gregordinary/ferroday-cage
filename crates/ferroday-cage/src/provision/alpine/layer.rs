@@ -213,7 +213,16 @@ impl Base {
             return Ok(Vec::new());
         }
 
-        let archived = apk::members(&self.path.display().to_string(), &self.scripts)?;
+        // A base that carries neither `scripts.tar` nor `scripts.tar.gz` reads
+        // as no bytes at all, which is not the same as an archive holding no
+        // members: no stream arrived to be one. A trigger whose script such a
+        // base has nowhere to keep is refused below, by the name that is
+        // missing, rather than here as an unreadable archive.
+        let archived = if self.scripts.is_empty() {
+            Vec::new()
+        } else {
+            apk::members(&self.path.display().to_string(), &self.scripts)?
+        };
         let mut subjects = Vec::new();
         for line in watched.lines().filter(|line| !line.trim().is_empty()) {
             // A line is the package's control identity, then the paths it

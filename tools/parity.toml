@@ -1,0 +1,519 @@
+# What each public builder setting is spelled as on the command line.
+#
+# `fcage` is a consumer of the library and nothing else, and its help, its
+# README, and the guide all say what it covers. A test that reads the CLI's own
+# `FLAGS` table cannot check that: a library method absent from the table is
+# absent from both sides of the comparison. This file is the other side --
+# every configuration method the committed public API records, against the flag
+# that reaches it or the reason no flag does.
+#
+# `tools/check-parity.py` compares it against `crates/ferroday-cage/public-api.txt`
+# and the CLI's flag table, and fails on any difference. A new builder method
+# therefore arrives with a flag, or with a recorded reason it has none, in a diff
+# a reviewer can see.
+#
+# `kind` says why a setting has no flag:
+#
+#   code       The setting takes executable behavior -- a trait object, an open
+#              descriptor. An argument cannot carry one.
+#   positional The setting is spelled somewhere other than a flag: the command
+#              line after `--`, or a shell facility.
+#   library    A capability `fcage` does not offer at all. The reason says what
+#              the tool would have to grow first.
+#
+# Accessors (`get_*`), `build`, and the trait impls are not settings and are not
+# recorded; the checker skips them.
+
+# The launch builder. This is the surface the documentation's parity claim is
+# about, and every setting on it is spelled here.
+[[builder]]
+name = "CageBuilder"
+path = "ferroday_cage::CageBuilder"
+
+[[builder.setting]]
+name = "rootfs"
+flags = ["--rootfs"]
+
+[[builder.setting]]
+name = "overlay"
+flags = ["--overlay-lower", "--overlay-upper", "--overlay-work"]
+
+[[builder.setting]]
+name = "overlay_rootfs"
+flags = ["--rootfs", "--overlay-upper", "--overlay-work"]
+why = "The shorthand for an overlay over one lower directory, which the trio spells by naming --rootfs as that directory."
+
+[[builder.setting]]
+name = "bind"
+flags = ["--bind"]
+
+[[builder.setting]]
+name = "bind_ro"
+flags = ["--ro-bind"]
+
+[[builder.setting]]
+name = "raw_mount"
+flags = ["--raw-mount"]
+
+[[builder.setting]]
+name = "managed_mounts"
+flags = ["--managed-mounts", "--no-managed-mounts"]
+
+[[builder.setting]]
+name = "mount_proc"
+flags = ["--proc", "--no-proc"]
+
+[[builder.setting]]
+name = "mount_dev"
+flags = ["--dev", "--no-dev"]
+
+[[builder.setting]]
+name = "mount_tmp"
+flags = ["--tmp", "--no-tmp"]
+
+[[builder.setting]]
+name = "resolv_conf"
+flags = ["--resolv-conf", "--no-resolv-conf"]
+
+[[builder.setting]]
+name = "command"
+kind = "positional"
+why = "The command line after `--`, which is where a shell already writes one."
+
+[[builder.setting]]
+name = "arg"
+kind = "positional"
+why = "The command line after `--`."
+
+[[builder.setting]]
+name = "args"
+kind = "positional"
+why = "The command line after `--`."
+
+[[builder.setting]]
+name = "clear_args"
+kind = "positional"
+why = "A command line given alongside a profile replaces the profile's command and its arguments together, which is this call."
+
+[[builder.setting]]
+name = "current_dir"
+flags = ["--chdir"]
+
+[[builder.setting]]
+name = "env"
+flags = ["--setenv"]
+
+[[builder.setting]]
+name = "envs"
+flags = ["--setenv"]
+
+[[builder.setting]]
+name = "base_env"
+flags = ["--base-env", "--no-base-env"]
+
+[[builder.setting]]
+name = "path_lookup"
+flags = ["--path-lookup", "--no-path-lookup"]
+
+[[builder.setting]]
+name = "hostname"
+flags = ["--hostname"]
+
+[[builder.setting]]
+name = "network"
+flags = ["--share-net", "--isolate-net", "--deny-net"]
+
+[[builder.setting]]
+name = "pid_namespace"
+flags = ["--pid-ns", "--share-pid"]
+
+[[builder.setting]]
+name = "identity_map"
+flags = ["--identity-map"]
+
+[[builder.setting]]
+name = "id_mapper"
+kind = "code"
+why = "An identity-map delegate is a trait object. `--identity-map` names the delegates the library bundles."
+
+[[builder.setting]]
+name = "run_as"
+flags = ["--run-as"]
+
+[[builder.setting]]
+name = "rlimit"
+flags = ["--rlimit"]
+
+[[builder.setting]]
+name = "seccomp"
+flags = [
+    "--seccomp",
+    "--seccomp-allow",
+    "--seccomp-deny",
+    "--seccomp-allow-rule",
+    "--seccomp-deny-rule",
+]
+
+[[builder.setting]]
+name = "landlock_fs"
+flags = ["--landlock-ro", "--landlock-rw"]
+
+[[builder.setting]]
+name = "landlock_net"
+flags = ["--landlock-bind", "--landlock-connect"]
+
+[[builder.setting]]
+name = "drop_all_capabilities"
+flags = ["--drop-caps"]
+
+[[builder.setting]]
+name = "keep_capabilities"
+flags = ["--keep-caps"]
+
+[[builder.setting]]
+name = "stdin"
+flags = ["--stdin"]
+why = "The unit dispositions only. `Stdio::Fd` hands the command an open descriptor, which no argument carries."
+
+[[builder.setting]]
+name = "stdout"
+kind = "positional"
+why = "A shell already spells both dispositions, and a profile carries `stdout` where a run wants it recorded."
+
+[[builder.setting]]
+name = "stderr"
+kind = "positional"
+why = "As `stdout`."
+
+[[builder.setting]]
+name = "stop_with_caller"
+flags = ["--stop-with-caller", "--no-stop-with-caller"]
+
+# The restriction fallback: Landlock and seccomp over a plain process, for a
+# host with no unprivileged user namespaces. Its settings are the launch
+# builder's minus everything that needs a namespace, and `--restrict` selects
+# it, so they share the flags rather than gaining a parallel set.
+[[builder]]
+name = "RestrictionBuilder"
+path = "ferroday_cage::RestrictionBuilder"
+
+[[builder.setting]]
+name = "command"
+kind = "positional"
+why = "The command line after `--`."
+
+[[builder.setting]]
+name = "arg"
+kind = "positional"
+why = "The command line after `--`."
+
+[[builder.setting]]
+name = "args"
+kind = "positional"
+why = "The command line after `--`."
+
+[[builder.setting]]
+name = "current_dir"
+flags = ["--chdir"]
+
+[[builder.setting]]
+name = "env"
+flags = ["--setenv"]
+
+[[builder.setting]]
+name = "envs"
+flags = ["--setenv"]
+
+[[builder.setting]]
+name = "base_env"
+flags = ["--base-env", "--no-base-env"]
+
+[[builder.setting]]
+name = "rlimit"
+flags = ["--rlimit"]
+
+[[builder.setting]]
+name = "seccomp"
+flags = [
+    "--seccomp",
+    "--seccomp-allow",
+    "--seccomp-deny",
+    "--seccomp-allow-rule",
+    "--seccomp-deny-rule",
+]
+
+[[builder.setting]]
+name = "landlock_fs"
+flags = ["--landlock-ro", "--landlock-rw"]
+
+[[builder.setting]]
+name = "landlock_net"
+flags = ["--landlock-bind", "--landlock-connect"]
+
+[[builder.setting]]
+name = "stdin"
+flags = ["--stdin"]
+why = "As the launch builder's."
+
+[[builder.setting]]
+name = "stdout"
+kind = "positional"
+why = "As the launch builder's."
+
+[[builder.setting]]
+name = "stderr"
+kind = "positional"
+why = "As the launch builder's."
+
+[[builder.setting]]
+name = "stop_with_caller"
+flags = ["--stop-with-caller", "--no-stop-with-caller"]
+
+# The native network stack. Every setting has a flag; the builder's separate
+# serde document has no `--profile` of its own, because the flags say
+# everything it can.
+[[builder]]
+name = "NetStackBuilder"
+path = "ferroday_cage::NetStackBuilder"
+
+[[builder.setting]]
+name = "ipv4"
+flags = ["--netstack-no-ipv4"]
+
+[[builder.setting]]
+name = "ipv6"
+flags = ["--netstack-no-ipv6"]
+
+[[builder.setting]]
+name = "ipv4_cidr"
+flags = ["--netstack-cidr"]
+
+[[builder.setting]]
+name = "ipv6_cidr"
+flags = ["--netstack-cidr6"]
+
+[[builder.setting]]
+name = "mtu"
+flags = ["--netstack-mtu"]
+
+[[builder.setting]]
+name = "interface"
+flags = ["--netstack-interface"]
+
+[[builder.setting]]
+name = "host_loopback"
+flags = ["--netstack-host-loopback"]
+
+# The Debian bootstrap.
+[[builder]]
+name = "DebianBuilder"
+path = "ferroday_cage::provision::debian::DebianBuilder"
+
+[[builder.setting]]
+name = "architecture"
+flags = ["--debian-arch"]
+
+[[builder.setting]]
+name = "mirror"
+flags = ["--debian-mirror"]
+
+[[builder.setting]]
+name = "mirror_fallback"
+flags = ["--debian-mirror-fallback"]
+
+[[builder.setting]]
+name = "components"
+flags = ["--debian-components"]
+
+[[builder.setting]]
+name = "repository"
+flags = ["--debian-repository"]
+
+[[builder.setting]]
+name = "include"
+flags = ["--debian-include"]
+
+[[builder.setting]]
+name = "exclude"
+flags = ["--debian-exclude"]
+
+[[builder.setting]]
+name = "base_priority"
+flags = ["--debian-base-priority"]
+
+[[builder.setting]]
+name = "plan"
+flags = ["--debian-plan"]
+
+[[builder.setting]]
+name = "pin"
+flags = ["--debian-pin"]
+
+[[builder.setting]]
+name = "extract_only"
+flags = ["--debian-extract-only"]
+
+[[builder.setting]]
+name = "pre_configure_overlay"
+flags = ["--debian-pre-configure-overlay"]
+
+[[builder.setting]]
+name = "cache_dir"
+flags = ["--debian-cache"]
+
+[[builder.setting]]
+name = "keyring"
+flags = ["--debian-keyring"]
+
+[[builder.setting]]
+name = "trust_unsigned"
+flags = ["--debian-trust-unsigned"]
+
+[[builder.setting]]
+name = "allow_stale_release"
+flags = ["--debian-allow-stale-release"]
+
+[[builder.setting]]
+name = "identity_map"
+flags = ["--debian-identity-map"]
+
+[[builder.setting]]
+name = "fetcher"
+kind = "code"
+why = "A transport is a trait object."
+
+[[builder.setting]]
+name = "base_layer"
+kind = "library"
+why = "A provisioner given a base layer is used through `stage_layer` and `resolve_layer`, which produce an increment in an overlay upper rather than a published rootfs, and `fcage` publishes rootfs directories. The tool would have to grow a layered-build mode first."
+
+# The Alpine and postmarketOS bootstrap.
+[[builder]]
+name = "AlpineBuilder"
+path = "ferroday_cage::provision::alpine::AlpineBuilder"
+
+[[builder.setting]]
+name = "architecture"
+flags = ["--alpine-arch"]
+
+[[builder.setting]]
+name = "mirror"
+flags = ["--alpine-mirror"]
+
+[[builder.setting]]
+name = "mirror_fallback"
+flags = ["--alpine-mirror-fallback"]
+
+[[builder.setting]]
+name = "components"
+flags = ["--alpine-components"]
+
+[[builder.setting]]
+name = "repository"
+flags = ["--alpine-repository"]
+
+[[builder.setting]]
+name = "include"
+flags = ["--alpine-include"]
+
+[[builder.setting]]
+name = "exclude"
+flags = ["--alpine-exclude"]
+
+[[builder.setting]]
+name = "plan"
+flags = ["--alpine-plan"]
+
+[[builder.setting]]
+name = "pin"
+flags = ["--alpine-pin"]
+
+[[builder.setting]]
+name = "extract_only"
+flags = ["--alpine-extract-only"]
+
+[[builder.setting]]
+name = "pre_configure_overlay"
+flags = ["--alpine-pre-configure-overlay"]
+
+[[builder.setting]]
+name = "cache_dir"
+flags = ["--alpine-cache"]
+
+[[builder.setting]]
+name = "keys"
+flags = ["--alpine-keys"]
+
+[[builder.setting]]
+name = "identity_map"
+flags = ["--alpine-identity-map"]
+
+[[builder.setting]]
+name = "fetcher"
+kind = "code"
+why = "A transport is a trait object."
+
+[[builder.setting]]
+name = "base_layer"
+kind = "library"
+why = "As the Debian builder's."
+
+# The Gentoo stage3 bootstrap and binary-package install.
+[[builder]]
+name = "GentooBuilder"
+path = "ferroday_cage::provision::gentoo::GentooBuilder"
+
+[[builder.setting]]
+name = "variant"
+flags = ["--gentoo-variant"]
+
+[[builder.setting]]
+name = "build_id"
+flags = ["--gentoo-build-id"]
+
+[[builder.setting]]
+name = "mirror"
+flags = ["--gentoo-mirror"]
+
+[[builder.setting]]
+name = "mirror_fallback"
+flags = ["--gentoo-mirror-fallback"]
+
+[[builder.setting]]
+name = "binhost"
+flags = ["--gentoo-binhost"]
+
+[[builder.setting]]
+name = "install"
+flags = ["--gentoo-install"]
+
+[[builder.setting]]
+name = "prefer_use"
+flags = ["--gentoo-prefer-use"]
+
+[[builder.setting]]
+name = "plan"
+flags = ["--gentoo-plan"]
+
+[[builder.setting]]
+name = "cache_dir"
+flags = ["--gentoo-cache"]
+
+[[builder.setting]]
+name = "max_pointer_age"
+flags = ["--gentoo-max-pointer-age"]
+
+[[builder.setting]]
+name = "stage3"
+kind = "library"
+why = "A `Stage3` is the answer `Gentoo::resolve` returns, held in memory and provisioned from without fetching the pointer again. `--gentoo-build-id` is what a command line records instead, and it names the same build to the archive."
+
+[[builder.setting]]
+name = "fetcher"
+kind = "code"
+why = "A transport is a trait object."
+
+[[builder.setting]]
+name = "base_layer"
+kind = "library"
+why = "As the Debian builder's."

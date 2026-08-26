@@ -32,13 +32,22 @@ const AR_HEADER: usize = 60;
 /// The chunk size the streaming reads work in.
 const CHUNK: usize = 64 * 1024;
 
-/// The largest `control.tar` member [`read_control_from`] will hold in memory.
+/// The largest `control.tar` member [`read_control_from`] will read, compressed
+/// and decompressed alike.
 ///
 /// A control member carries the control stanza, the maintainer scripts, and
 /// `md5sums`, which together run to a few megabytes even for the largest
 /// packages in the archive. The cap is what makes the bound unconditional: it
 /// stops a `.deb` that declares an implausible member size from being read into
 /// memory just because its header said so.
+///
+/// Both sides matter, and for the reason the Alpine layer bounds its own control
+/// segment both ways: the member is a compression format, so one comfortably
+/// inside the wire bound decompresses to as much `./control` as its author
+/// chose. It is also read before anything about the package has been
+/// authenticated. Applied to the decompressed stream the bound covers the time
+/// as well as the memory — an entry the reader skips past is decompressed too —
+/// and a member over it is refused as a control archive that ends early.
 const CONTROL_MEMBER_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Extracts a `.deb`'s `data.tar` member into an ongoing extraction.
@@ -204,7 +213,7 @@ fn control_from_tar(member: &[u8]) -> Result<String, ProvisionError> {
         )
     })?;
     let decoded = compress::decompress(&head, cursor)?;
-    let mut archive = TarReader::new(decoded);
+    let mut archive = TarReader::new(decoded.take(CONTROL_MEMBER_LIMIT));
     while let Some(entry) = archive.next_entry()? {
         // The control file is `./control` in a conforming `.deb`; tolerate a
         // bare `control` as well.
@@ -425,6 +434,37 @@ mod tests {
         let err = read_control_from(&mut Cursor::new(&archive))
             .expect_err("a .deb with no control member is rejected");
         assert!(err.to_string().contains("no control.tar member"), "{err}");
+    }
+
+    #[test]
+    fn a_control_member_that_decompresses_past_the_ceiling_is_refused() {
+        // The wire bound holds the compressed member, and the member is a
+        // compression format: one comfortably inside it decompresses to as much
+        // `./control` as its author chose. Read before anything about the
+        // package is authenticated, so it is refused rather than accumulated.
+        use std::io::Write as _;
+        let compressed = {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder
+                .write_all(&control_tar(&vec![b'x'; CONTROL_MEMBER_LIMIT as usize + 1]))
+                .expect("the bomb compresses");
+            encoder.finish().expect("the encoder finishes")
+        };
+        assert!(
+            (compressed.len() as u64) < CONTROL_MEMBER_LIMIT,
+            "the fixture must be inside the wire bound to test the other one",
+        );
+
+        let mut archive = AR_MAGIC.to_vec();
+        ar_member(&mut archive, "debian-binary", b"2.0\n");
+        ar_member(&mut archive, "control.tar.gz", &compressed);
+        let err = read_control_from(&mut Cursor::new(&archive))
+            .expect_err("a control member past the decompressed ceiling is refused");
+        assert!(
+            err.to_string().contains("ends inside an entry's data"),
+            "{err}",
+        );
     }
 
     #[test]

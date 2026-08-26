@@ -203,6 +203,12 @@ fn exports_a_single_mapped_tree() {
     std::fs::write(root.join("etc/hostname"), b"host\n").unwrap();
     write_mode(&root.join("usr/bin/tool"), b"bin\n", 0o755);
     std::os::unix::fs::symlink("../usr/share/zoneinfo/UTC", root.join("etc/localtime")).unwrap();
+    // The longest target Linux will store: `PATH_MAX - 1`, one byte short of
+    // the mechanism's link buffer. `readlinkat` reports a truncated target as a
+    // success, so the export refuses a target that fills that buffer — and this
+    // is the boundary that must still be exported whole.
+    let longest = "l".repeat(4095);
+    std::os::unix::fs::symlink(&longest, root.join("etc/longest")).unwrap();
     std::fs::write(root.join("data/a"), b"shared").unwrap();
     std::fs::hard_link(root.join("data/a"), root.join("data/b")).unwrap();
 
@@ -253,6 +259,12 @@ fn exports_a_single_mapped_tree() {
     assert_eq!(link.typeflag, b'2');
     assert_eq!(link.linkname, b"../usr/share/zoneinfo/UTC");
 
+    // The longest legal target survives whole, through a pax `linkpath` record
+    // the ustar header cannot hold.
+    let longest_link = index[&b"./etc/longest"[..]];
+    assert_eq!(longest_link.typeflag, b'2');
+    assert_eq!(longest_link.linkname, longest.as_bytes());
+
     // Exactly one of the hardlinked pair is a full file, the other a link onto
     // it.
     let a = index[&b"./data/a"[..]];
@@ -280,6 +292,91 @@ fn exports_a_single_mapped_tree() {
             .map(|(_, v)| v.clone());
         assert_eq!(found.as_deref(), Some(&b"present"[..]), "user xattr lost");
     }
+
+    let _ = provision::remove(&dir);
+}
+
+#[test]
+fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("atomic");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file"), b"contents\n").unwrap();
+
+    let archive = dir.join("rootfs.tar");
+    provision::Export::new(&root)
+        .map(IdentityMap::Single)
+        .write_to_path(&archive)
+        .expect("the first export succeeds");
+    let published = std::fs::read(&archive).unwrap();
+    assert!(!published.is_empty());
+
+    // A source that is not there is the ordinary typo, and it fails only after
+    // the destination has been opened. Opening the destination directly would
+    // have truncated the archive above to write nothing into it, and removing
+    // the truncated result does not bring the previous archive back.
+    let err = provision::Export::new(dir.join("absent"))
+        .map(IdentityMap::Single)
+        .write_to_path(&archive)
+        .expect_err("a missing source cannot be exported");
+    assert!(matches!(err, provision::ProvisionError::Io { .. }), "{err}");
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        published,
+        "the previous archive must survive a failed export",
+    );
+
+    // And nothing of the failed run is left beside it.
+    let leftovers: Vec<_> = std::fs::read_dir(&*dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".partial"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging files left behind: {leftovers:?}"
+    );
+
+    let _ = provision::remove(&dir);
+}
+
+#[test]
+fn an_archive_written_inside_the_tree_it_exports_is_refused() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("dest-inside");
+    let root = dir.join("root");
+    std::fs::create_dir_all(root.join("var")).unwrap();
+    std::fs::write(root.join("file"), b"contents\n").unwrap();
+
+    // The walk would reach the archive it is being written into, so what lands
+    // in it depends on how far the encoder had got. Refusing is the contract;
+    // the staging file the export would otherwise have created inside the tree
+    // is refused with it.
+    for dest in [root.join("rootfs.tar"), root.join("var/rootfs.tar")] {
+        let err = provision::Export::new(&root)
+            .map(IdentityMap::Single)
+            .write_to_path(&dest)
+            .expect_err("a destination inside the tree is refused");
+        assert!(
+            matches!(err, provision::ProvisionError::ExportDestInside { .. }),
+            "{err}",
+        );
+        assert!(!dest.exists(), "nothing was written at {}", dest.display());
+    }
+
+    // The sibling case the refusal must not take with it: a name that shares a
+    // prefix with the rootfs is not inside it.
+    let sibling = dir.join("rootfs.tar");
+    provision::Export::new(&root)
+        .map(IdentityMap::Single)
+        .write_to_path(&sibling)
+        .expect("a destination beside the tree is fine");
+    assert!(sibling.exists());
 
     let _ = provision::remove(&dir);
 }

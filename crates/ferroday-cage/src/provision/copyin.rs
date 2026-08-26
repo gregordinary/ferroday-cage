@@ -13,14 +13,14 @@
 //! missing something says so.
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
-use std::fs;
 use std::io::{self, Read};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{self, AtFlags, OFlags};
 
 use super::identity::compose_child_map;
 use super::{Delegate, ProvisionError};
@@ -336,7 +336,11 @@ fn walk(
         prefix: Vec::new(),
         report: CopyReport::default(),
     };
-    walk.dir(stream, source, 0)?;
+    // The whole walk is relative to a descriptor: every step below resolves a
+    // name against the directory this opened rather than against a path, so
+    // what was typed is what is read. See `Walk::dir`.
+    let root = open_dir(source, source)?;
+    walk.dir(stream, root.as_fd(), source, 0)?;
     put(stream, &[COPY_END], source)?;
     Ok(walk.report)
 }
@@ -364,6 +368,19 @@ struct Walk<'a> {
 impl Walk<'_> {
     /// Emits every entry of `dir`, descending into subdirectories.
     ///
+    /// `dir` is a descriptor, and every step resolves its name against that
+    /// descriptor rather than against a path: the entry that is typed is the
+    /// entry that is then read, opened, or descended into. A path-based walk
+    /// resolves each name afresh at every step, so an entry swapped for a
+    /// symbolic link between being typed and being acted on is followed — a
+    /// directory descended out of the source, or worse, a file streamed from
+    /// wherever the link points. `path` is carried alongside for diagnostics
+    /// and for the report, and names nothing this resolves.
+    ///
+    /// A symbolic link is therefore copied as a symbolic link and never
+    /// traversed, whatever it points at, and the child opens each destination
+    /// directory with `O_NOFOLLOW` for the same reason on its side.
+    ///
     /// Entries are sorted by name, so a copy of one tree is one sequence of
     /// frames whatever order the filesystem hands them back — the same reason
     /// the export sorts its own walk. Sorting also fixes which name of a
@@ -372,99 +389,97 @@ impl Walk<'_> {
     fn dir(
         &mut self,
         stream: BorrowedFd<'_>,
-        dir: &Path,
+        dir: BorrowedFd<'_>,
+        path: &Path,
         depth: usize,
     ) -> Result<(), ProvisionError> {
         if depth >= MAX_DEPTH {
             return Err(ProvisionError::EntryRefused {
-                path: dir.to_path_buf(),
+                path: path.to_path_buf(),
                 reason: format!("the source tree is deeper than {MAX_DEPTH} levels"),
             });
         }
-        let mut entries: Vec<PathBuf> = fs::read_dir(dir)
-            .map_err(|err| ProvisionError::io("reading", dir, err))?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<_, _>>()
-            .map_err(|err| ProvisionError::io("reading", dir, err))?;
+        let mut entries = read_names(dir, path)?;
         entries.sort();
 
-        for path in entries {
-            let name = path
-                .file_name()
-                .ok_or_else(|| ProvisionError::EntryRefused {
-                    path: path.clone(),
-                    reason: "the entry has no final component".to_string(),
-                })?
-                .as_bytes()
-                .to_vec();
+        for name in entries {
+            let entry = path.join(OsStr::from_bytes(&name));
             // The child refuses anything that is not a single ordinary
-            // component, by the same rule, but refusing here too means the
-            // caller gets a path in the message rather than an errno from a
-            // forked process.
+            // component, and refusing here names the host path that carries it
+            // rather than leaving the child to report a name with no context.
             if !path::is_ordinary_component(&name) {
                 return Err(ProvisionError::EntryRefused {
-                    path: path.clone(),
+                    path: entry,
                     reason: "the entry name is not a single path component".to_string(),
                 });
             }
             if name.len() > u16::from(u8::MAX) as usize {
                 return Err(ProvisionError::EntryRefused {
-                    path: path.clone(),
+                    path: entry,
                     reason: "the entry name is longer than NAME_MAX".to_string(),
                 });
             }
+            let leaf = leaf_cstring(&name, &entry)?;
 
-            // `symlink_metadata`, so a symlink is copied as a symlink rather
-            // than followed. A symlink pointing out of the source is therefore
-            // recreated as a symlink inside the destination, and never
-            // traversed: the walk does not descend through one, and the child
-            // opens each directory with `O_NOFOLLOW`.
-            let meta = fs::symlink_metadata(&path)
-                .map_err(|err| ProvisionError::io("reading", &path, err))?;
-            let kind = meta.file_type();
-            if kind.is_dir() {
-                self.emit_named(stream, COPY_DIR, &name, &meta, &path)?;
+            // `AT_SYMLINK_NOFOLLOW`, so a symlink is typed as a symlink rather
+            // than as whatever it points at.
+            let meta = fs::statat(dir, &leaf, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|errno| ProvisionError::io("reading", &entry, errno.into()))?;
+            let kind = fs::FileType::from_raw_mode(meta.st_mode);
+            if kind == fs::FileType::Directory {
+                self.emit_named(stream, COPY_DIR, &name, &meta, &entry)?;
                 let restore = self.prefix.len();
                 self.prefix.extend_from_slice(&name);
                 self.prefix.push(b'/');
-                self.dir(stream, &path, depth + 1)?;
+                // `O_NOFOLLOW` as well as `O_DIRECTORY`: an entry that became a
+                // symlink between the stat above and this open is refused here
+                // rather than descended through.
+                let child = openat_nofollow(dir, &leaf, OFlags::DIRECTORY, &entry)?;
+                self.dir(stream, child.as_fd(), &entry, depth + 1)?;
                 self.prefix.truncate(restore);
-                put(stream, &[COPY_LEAVE], &path)?;
-            } else if kind.is_file() {
-                if self.emit_link(stream, &name, &meta, &path)? {
+                put(stream, &[COPY_LEAVE], &entry)?;
+            } else if kind == fs::FileType::RegularFile {
+                if self.emit_link(stream, &name, &meta, &entry)? {
                     continue;
                 }
-                self.emit_named(stream, COPY_FILE, &name, &meta, &path)?;
-                put(stream, &meta.len().to_le_bytes(), &path)?;
-                stream_file(stream, &path, meta.len())?;
-            } else if kind.is_symlink() {
-                let target = fs::read_link(&path)
-                    .map_err(|err| ProvisionError::io("reading", &path, err))?;
-                let target = target.as_os_str().as_bytes();
-                if target.len() > u16::MAX as usize {
+                // Opened before the length is announced, so the descriptor the
+                // bytes come from is the file that was typed.
+                let file = openat_nofollow(dir, &leaf, OFlags::empty(), &entry)?;
+                let size = meta.st_size as u64;
+                self.emit_named(stream, COPY_FILE, &name, &meta, &entry)?;
+                put(stream, &size.to_le_bytes(), &entry)?;
+                stream_file(stream, file, &entry, size)?;
+            } else if kind == fs::FileType::Symlink {
+                let mut buffer = [0u8; LINK_BUF];
+                let read = fs::readlinkat_raw(dir, &leaf, &mut buffer[..])
+                    .map_err(|errno| ProvisionError::io("reading", &entry, errno.into()))?;
+                // `readlinkat` truncates a target too long for the buffer and
+                // reports the truncated length as a success, so a full buffer is
+                // the only signal there is: a target that fills it is refused
+                // rather than copied as a link pointing somewhere else.
+                if read == buffer.len() {
                     return Err(ProvisionError::EntryRefused {
-                        path: path.clone(),
+                        path: entry,
                         reason: "the symlink target is longer than a frame can carry".to_string(),
                     });
                 }
-                self.emit_named(stream, COPY_SYMLINK, &name, &meta, &path)?;
-                put(stream, &(target.len() as u16).to_le_bytes(), &path)?;
-                put(stream, target, &path)?;
-            } else if kind.is_fifo() {
+                let target = &buffer[..read];
+                self.emit_named(stream, COPY_SYMLINK, &name, &meta, &entry)?;
+                put(stream, &(target.len() as u16).to_le_bytes(), &entry)?;
+                put(stream, target, &entry)?;
+            } else if kind == fs::FileType::Fifo {
                 // A named pipe is an ordinary unprivileged creation, so the
                 // copy makes one rather than dropping it: a tree that ships a
                 // FIFO meant to ship it.
-                self.emit_named(stream, COPY_FIFO, &name, &meta, &path)?;
+                self.emit_named(stream, COPY_FIFO, &name, &meta, &entry)?;
             } else {
-                let skipped = if kind.is_char_device() {
-                    SkippedKind::CharacterDevice
-                } else if kind.is_block_device() {
-                    SkippedKind::BlockDevice
-                } else {
-                    SkippedKind::Socket
+                let skipped = match kind {
+                    fs::FileType::CharacterDevice => SkippedKind::CharacterDevice,
+                    fs::FileType::BlockDevice => SkippedKind::BlockDevice,
+                    _ => SkippedKind::Socket,
                 };
                 self.report.skipped.push(SkippedEntry {
-                    path: path.clone(),
+                    path: entry,
                     kind: skipped,
                 });
             }
@@ -477,17 +492,21 @@ impl Walk<'_> {
     ///
     /// A file with one link is never recorded: the table would then hold every
     /// regular file in the tree to answer a question that can only be no.
+    ///
+    /// The device and inode widths are the architecture's; see
+    /// [`emit_named`](Self::emit_named).
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
     fn emit_link(
         &mut self,
         stream: BorrowedFd<'_>,
         name: &[u8],
-        meta: &fs::Metadata,
+        meta: &fs::Stat,
         path: &Path,
     ) -> Result<bool, ProvisionError> {
-        if meta.nlink() <= 1 {
+        if meta.st_nlink <= 1 {
             return Ok(false);
         }
-        let key = (meta.dev(), meta.ino());
+        let key = (meta.st_dev as u64, meta.st_ino as u64);
         if let Some(anchor) = self.links.get(&key) {
             put(stream, &[COPY_LINK], path)?;
             put(stream, &(name.len() as u16).to_le_bytes(), path)?;
@@ -513,21 +532,38 @@ impl Walk<'_> {
     }
 
     /// Emits a frame's tag, name, and metadata block.
+    ///
+    /// A `stat`'s field widths are the architecture's own — `st_nlink` is 32
+    /// bits on some and 64 on others, and the time fields likewise — so the
+    /// conversions to the frame's fixed widths are the identity on one target
+    /// and a widening on another. `allow` rather than `expect`, for the reason
+    /// the export's link count carries: an expectation of either lint is
+    /// fulfilled on some targets and not others, and an unfulfilled one fails
+    /// the clippy job there.
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
     fn emit_named(
         &self,
         stream: BorrowedFd<'_>,
         tag: u8,
         name: &[u8],
-        meta: &fs::Metadata,
+        meta: &fs::Stat,
         path: &Path,
     ) -> Result<(), ProvisionError> {
         put(stream, &[tag], path)?;
         put(stream, &(name.len() as u16).to_le_bytes(), path)?;
         put(stream, name, path)?;
-        put(stream, &meta.mode().to_le_bytes(), path)?;
-        put(stream, &self.ids.uid(meta.uid(), path)?.to_le_bytes(), path)?;
-        put(stream, &self.ids.gid(meta.gid(), path)?.to_le_bytes(), path)?;
-        put(stream, &meta.mtime().to_le_bytes(), path)
+        put(stream, &(meta.st_mode as u32).to_le_bytes(), path)?;
+        put(
+            stream,
+            &self.ids.uid(meta.st_uid, path)?.to_le_bytes(),
+            path,
+        )?;
+        put(
+            stream,
+            &self.ids.gid(meta.st_gid, path)?.to_le_bytes(),
+            path,
+        )?;
+        put(stream, &(meta.st_mtime as i64).to_le_bytes(), path)
     }
 }
 
@@ -630,6 +666,73 @@ fn inside(extents: &[IdRange], host: u32, which: &str, path: &Path) -> Result<u3
     ))
 }
 
+/// Opens `path` as a directory, without following a symbolic link at it.
+///
+/// The root of a walk: every directory below it is opened relative to its
+/// parent's descriptor instead. `subject` names the tree in a failure.
+fn open_dir(path: &Path, subject: &Path) -> Result<OwnedFd, ProvisionError> {
+    fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        fs::Mode::empty(),
+    )
+    .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))
+}
+
+/// Opens `name` under `dir`, following no symbolic link at it.
+///
+/// `extra` carries `O_DIRECTORY` where a directory is what was typed, so an
+/// entry that has since become something else is refused by the kernel rather
+/// than read as whatever it now is.
+fn openat_nofollow(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    extra: OFlags,
+    subject: &Path,
+) -> Result<OwnedFd, ProvisionError> {
+    fs::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | extra,
+        fs::Mode::empty(),
+    )
+    .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))
+}
+
+/// Every entry name `dir` holds, `.` and `..` left out.
+///
+/// Read from a descriptor rather than from a path, so the directory listed is
+/// the directory the walk holds open. `subject` names it in a failure.
+fn read_names(dir: BorrowedFd<'_>, subject: &Path) -> Result<Vec<Vec<u8>>, ProvisionError> {
+    // A `Dir` takes a descriptor of its own and consumes its offset, so this
+    // opens `.` relative to the walk's: the caller goes on resolving every
+    // entry against the descriptor it already holds.
+    let handle = openat_nofollow(dir, c".", OFlags::DIRECTORY, subject)?;
+    let mut names = Vec::new();
+    for entry in fs::Dir::read_from(&handle)
+        .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))?
+    {
+        let entry = entry.map_err(|errno| ProvisionError::io("reading", subject, errno.into()))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        names.push(name.to_vec());
+    }
+    Ok(names)
+}
+
+/// An entry's name as a `CStr`, for the `*at` calls that resolve it.
+///
+/// The component check above has already refused a name carrying a NUL, so this
+/// is the boundary the bytes cross rather than the rule they are held to.
+fn leaf_cstring(name: &[u8], subject: &Path) -> Result<CString, ProvisionError> {
+    CString::new(name).map_err(|_| ProvisionError::EntryRefused {
+        path: subject.to_path_buf(),
+        reason: "the entry name carries a NUL".to_string(),
+    })
+}
+
 /// Streams exactly `size` bytes of `path` to the child, and refuses to call a
 /// file that changed underneath it copied.
 ///
@@ -644,8 +747,13 @@ fn inside(extents: &[IdRange], host: u32, which: &str, path: &Path) -> Result<u3
 /// different questions. Keeping the stream in step is what lets the failure be
 /// reported at all rather than as a desynchronized child; it is not a reason to
 /// hand back a rootfs holding a zero-padded binary and call it a copy.
-fn stream_file(stream: BorrowedFd<'_>, path: &Path, size: u64) -> Result<(), ProvisionError> {
-    let mut file = fs::File::open(path).map_err(|err| ProvisionError::io("reading", path, err))?;
+fn stream_file(
+    stream: BorrowedFd<'_>,
+    file: OwnedFd,
+    path: &Path,
+    size: u64,
+) -> Result<(), ProvisionError> {
+    let mut file = std::fs::File::from(file);
     let mut buf = [0u8; DATA_BUF];
     let mut left = size;
     let mut changed = false;
@@ -708,12 +816,64 @@ mod tests {
     /// The sizes stay well under a pipe's capacity, so nothing has to drain the
     /// read end.
     fn stream_at(path: &Path, size: u64) -> Result<(), ProvisionError> {
-        use std::os::fd::AsFd;
-
         let (read, write) = rustix::pipe::pipe().expect("a pipe is creatable");
-        let outcome = stream_file(write.as_fd(), path, size);
+        // Opened as the walk opens one: the descriptor is what the data comes
+        // from, so the file streamed is the file that was typed.
+        let file = std::fs::File::open(path).expect("the fixture opens");
+        let outcome = stream_file(write.as_fd(), OwnedFd::from(file), path, size);
         drop((read, write));
         outcome
+    }
+
+    #[test]
+    fn an_entry_is_resolved_against_its_directory_and_never_through_a_symlink() {
+        // The walk types an entry and then reads, opens, or descends into it.
+        // Resolving the name afresh at each step follows whatever is at the
+        // path by then, so an entry swapped for a symlink between the two is
+        // traversed -- a directory descended out of the source, or a file
+        // streamed from wherever the link points. Every step resolves against
+        // the descriptor of the directory holding the name instead, and refuses
+        // a symlink at it.
+        let dir = Scratch::new("copyin-nofollow");
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::write(dir.join("outside/secret"), b"not the source's").unwrap();
+        std::fs::create_dir_all(dir.join("source")).unwrap();
+        std::fs::write(dir.join("source/own"), b"the source's own").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join("source/as-dir")).unwrap();
+        std::os::unix::fs::symlink(dir.join("outside/secret"), dir.join("source/as-file")).unwrap();
+
+        let source = open_dir(&dir.join("source"), &dir).expect("the source opens");
+        for (name, extra) in [
+            (c"as-dir", OFlags::DIRECTORY),
+            (c"as-file", OFlags::empty()),
+        ] {
+            assert!(
+                openat_nofollow(source.as_fd(), name, extra, &dir).is_err(),
+                "{name:?} was opened through a symlink",
+            );
+        }
+        // What is not a symlink still opens, so the refusal is the link's doing.
+        openat_nofollow(source.as_fd(), c"own", OFlags::empty(), &dir)
+            .expect("an ordinary file opens");
+
+        // And the listing comes from the descriptor: a source directory
+        // replaced by a symlink after it was opened is not what gets listed.
+        let mut names = read_names(source.as_fd(), &dir).expect("the source lists");
+        names.sort();
+        assert_eq!(
+            names,
+            [b"as-dir".to_vec(), b"as-file".to_vec(), b"own".to_vec()]
+        );
+        std::fs::remove_file(dir.join("source/own")).unwrap();
+        std::fs::remove_file(dir.join("source/as-dir")).unwrap();
+        std::fs::remove_file(dir.join("source/as-file")).unwrap();
+        std::fs::remove_dir(dir.join("source")).unwrap();
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join("source")).unwrap();
+        assert_eq!(
+            read_names(source.as_fd(), &dir).expect("the held directory still lists"),
+            Vec::<Vec<u8>>::new(),
+            "the descriptor lists the directory it opened, not the path's new target",
+        );
     }
 
     #[test]

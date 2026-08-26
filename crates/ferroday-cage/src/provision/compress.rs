@@ -15,11 +15,11 @@
 //! a header far smaller than the allocation it asks for. A zstd frame declares
 //! the window the decoder buffers, and an xz block declares the dictionary the
 //! decoder allocates and zeroes; both are bounded here, at
-//! [`MAX_ZSTD_WINDOW`] and [`MAX_XZ_DICTIONARY`], and both are checked from the
-//! header before anything is allocated. The bounds are enforced differently
-//! because the decoders differ: `ruzstd` takes the cap as a constructor
-//! argument, while `lzma-rust2` offers none, so [`XzDictionaryGuard`] walks the
-//! xz container ahead of the decoder to apply it.
+//! [`MAX_ZSTD_WINDOW`] and [`MAX_XZ_DICTIONARY`], and each decoder is told its
+//! bound and checks it against the header before allocating anything. `ruzstd`
+//! takes the cap as a constructor argument; `lzma-rust2` takes it on the
+//! sans-I/O decoder alone, which is why [`XzReader`] drives that one rather
+//! than the crate's own `Read` wrapper.
 
 use std::io::{self, Read};
 
@@ -53,12 +53,12 @@ const MAX_ZSTD_WINDOW: u64 = 128 * 1024 * 1024;
 /// in a single header byte that can ask for anything from 4 KiB to 4 GiB. The
 /// decoder allocates it when it starts the block and zeroes the whole
 /// allocation, so the cost is resident memory rather than an address-space
-/// reservation. `lzma-rust2` reserves it fallibly, which means a host that
-/// refuses the allocation gets a clean error rather than an abort — but a host
-/// with the memory free simply hands it over. Measured: a 69-byte input whose
-/// one block declares 2 GiB takes 2 GiB of resident memory, and a valid
-/// multi-block file whose *second* block declares it decodes successfully,
-/// reporting nothing, having taken the same 2 GiB on the way.
+/// reservation. Unbounded, a 69-byte input whose one block declares 2 GiB takes
+/// 2 GiB of it — and so does a valid multi-block archive whose *hundred and
+/// seventy-third* block declares it, which then decodes successfully and reports
+/// nothing, the cost having been paid on the way. Every block is therefore
+/// bounded, not the first: the decoder is given [`MAX_XZ_MEMORY_KB`] and checks
+/// each block header against it as it parses one.
 ///
 /// 128 MiB is twice the largest dictionary observed in the archives this crate
 /// reads. Measured 2026-08-22 over the Debian trixie amd64 pool — including its
@@ -114,15 +114,12 @@ pub(crate) fn decompress<'r, R: Read + 'r>(
         // read there provisions an incomplete rootfs without an error.
         Box::new(flate2::read::MultiGzDecoder::new(stream))
     } else if head.starts_with(&XZ_MAGIC) {
-        // Multiple concatenated xz streams are legal in one file and some
-        // producers emit them. Every block of every stream declares its own
-        // dictionary and every one is allocated, so the guard walks the
-        // container ahead of the decoder and refuses one over the cap before
-        // the decoder reads the header that would allocate it.
-        Box::new(lzma_rust2::XzReader::new(
-            XzDictionaryGuard::new(stream),
-            true,
-        ))
+        // Every block of every stream declares its own dictionary and every one
+        // is allocated, so the decode runs under a memory budget the decoder
+        // checks against each block header before it allocates. Multiple
+        // concatenated xz streams are legal in one file and some producers emit
+        // them; the reader decodes them as one.
+        Box::new(XzReader::new(stream))
     } else if is_zstd_start(head) {
         // zstd is framed, and a producer such as `pzstd` emits several frames
         // (often behind a leading skippable frame). Decode every frame, each
@@ -325,454 +322,143 @@ fn discard_exact<R: Read>(reader: &mut R, mut count: usize) -> io::Result<()> {
 /// The six-byte signature every xz stream begins with.
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 
-/// An xz stream header: the magic, two stream flags, and a CRC32 over them.
-const XZ_STREAM_HEADER: usize = 12;
+/// The memory budget an xz decode runs under, in kibibytes.
+///
+/// `lzma-rust2` checks a *memory* figure against this -- the block's dictionary
+/// rounded up, plus a constant for the decoder's own tables -- as it parses each
+/// block header, before allocating anything. The budget is therefore the
+/// dictionary cap plus slack for those tables: sized at the cap alone it would
+/// refuse a dictionary of exactly [`MAX_XZ_DICTIONARY`], which the tables push
+/// over.
+///
+/// One mebibyte of slack admits nothing a tighter figure would not. Dictionary
+/// sizes step in halvings and doublings, so the next one up from 128 MiB is
+/// 192 MiB, and the slack would have to be sixty-four times this to reach it.
+/// Stating it as slack rather than as the decoder's exact constant also means
+/// an upstream change to that constant moves nothing here.
+const MAX_XZ_MEMORY_KB: u32 = (MAX_XZ_DICTIONARY / 1024) as u32 + 1024;
 
-/// An xz stream footer: a CRC32, the index's backward size, the stream flags
-/// again, and the two-byte `YZ` signature.
-const XZ_STREAM_FOOTER: u64 = 12;
+/// The bytes of compressed input handed to the decoder at a time.
+const XZ_CHUNK: usize = 64 * 1024;
 
-/// The LZMA2 filter's id in a block header's filter chain.
-const LZMA2_FILTER_ID: u64 = 0x21;
-
-/// The dictionary size an LZMA2 property byte declares.
+/// An xz decoder bounded by [`MAX_XZ_DICTIONARY`].
 ///
-/// The encoding is one byte: `40` means `0xFFFFFFFF`, and every smaller value
-/// means `(2 | (byte & 1)) << (byte / 2 + 11)` — so `0` is 4 KiB, `22` is 8 MiB,
-/// `30` is 64 MiB, and `39` is 3 GiB. Values above `40` are not dictionary
-/// sizes at all, and the caller refuses them before asking.
-fn lzma2_dictionary(property: u8) -> u64 {
-    if property == 40 {
-        u64::from(u32::MAX)
-    } else {
-        u64::from(2 | (property & 1)) << (property / 2 + 11)
-    }
-}
-
-/// The size of the check that follows every block, from the stream flags.
+/// `lzma-rust2` offers the bound on its sans-I/O decoder and not on its
+/// `Read` one, so this drives the sans-I/O decoder and is the `Read` half:
+/// compressed bytes in from `source` a chunk at a time, decoded bytes out to
+/// the caller's buffer, and the memory limit set once at construction. The
+/// decoder checks it against each block header as it parses one, which is both
+/// before the allocation and inside the parser that decides what to allocate --
+/// the two properties a bound applied from outside could not have.
 ///
-/// The format assigns sizes in threes: id 0 is no check, 1 to 3 are four bytes
-/// (CRC32 and two reserved), 4 to 6 are eight (CRC64 and two reserved), and so
-/// on to 64. The reserved ids are sized here as well as the defined ones,
-/// because the walk needs to know where the next block header starts even for a
-/// stream the decoder will go on to reject.
-fn xz_check_size(flags: u8) -> u64 {
-    match flags & 0x0F {
-        0 => 0,
-        id => 4 << ((id - 1) / 3),
-    }
-}
-
-/// Reads one variable-length integer from `bytes` at `at`, advancing it.
+/// Concatenated streams are decoded as one, which several producers emit and
+/// the format permits.
 ///
-/// The format's integers are little-endian seven bits at a time, the high bit
-/// marking that another byte follows, and at most nine bytes long. `None` for
-/// an integer that is truncated or runs past that.
-fn read_vli(bytes: &[u8], at: &mut usize) -> Option<u64> {
-    let mut value = 0u64;
-    for shift in (0..9).map(|index| index * 7) {
-        let byte = *bytes.get(*at)?;
-        *at += 1;
-        value |= u64::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-    }
-    None
-}
-
-/// What one xz block header declares that the walk needs.
-struct XzBlock {
-    /// The dictionary its LZMA2 filter asks the decoder to allocate.
-    dictionary: u64,
-    /// The compressed size it declares, where it declares one. Without it the
-    /// walk cannot find the next block header: the decoder locates that by
-    /// decoding to the LZMA2 end marker, which is not something to reproduce
-    /// here.
-    compressed: Option<u64>,
-}
-
-/// Reads what the walk needs out of a complete block header — the size byte,
-/// the flags, the optional sizes, the filter chain, the padding and the CRC32.
+/// # What this does not decode
 ///
-/// `None` for anything this walk cannot follow: a reserved flag bit, a
-/// malformed integer, a chain with no LZMA2 filter, a dictionary property that
-/// is not one. The caller reads `None` as "stop checking", never as "refuse" —
-/// the decoder is the authority on whether a stream is valid, and a guard that
-/// refused what the decoder would have accepted would break real archives to
-/// bound a hypothetical one.
-fn parse_xz_block(header: &[u8]) -> Option<XzBlock> {
-    // Everything between the size byte and the trailing CRC32.
-    let body = header.get(1..header.len().checked_sub(4)?)?;
-    let flags = *body.first()?;
-    if flags & 0x3C != 0 {
-        return None; // A reserved bit is set; the layout is not this one.
-    }
-    let filters = usize::from(flags & 0x03) + 1;
-    let mut at = 1;
-    let compressed = if flags & 0x40 != 0 {
-        Some(read_vli(body, &mut at)?)
-    } else {
-        None
-    };
-    if flags & 0x80 != 0 {
-        // The uncompressed size, which the walk does not need but must step over.
-        read_vli(body, &mut at)?;
-    }
-    // A chain of up to four filters, of which the last must be LZMA2 — so a BCJ
-    // or Delta filter can precede the one that declares the dictionary.
-    let mut dictionary = None;
-    for _ in 0..filters {
-        let id = read_vli(body, &mut at)?;
-        let properties = usize::try_from(read_vli(body, &mut at)?).ok()?;
-        let declared = body.get(at..at.checked_add(properties)?)?;
-        at += properties;
-        if id == LZMA2_FILTER_ID {
-            match declared {
-                [property] if *property <= 40 => dictionary = Some(lzma2_dictionary(*property)),
-                _ => return None,
-            }
-        }
-    }
-    Some(XzBlock {
-        dictionary: dictionary?,
-        compressed,
-    })
-}
-
-/// Where in the xz container [`XzDictionaryGuard`] is.
-enum XzStage {
-    /// Before a stream's header, at the start of the file.
-    StreamHeader,
-    /// Before the byte that says whether a block header or the index follows.
-    BlockBoundary,
-    /// Inside the index, before the integer giving its record count.
-    IndexCount,
-    /// Inside the index's records, with this many variable-length integers left
-    /// to step over: two per record.
-    IndexIntegers(u64),
-    /// After a stream's footer, where zero padding, another stream, or the end
-    /// of the file may follow.
-    StreamBoundary,
-    /// Not tracking any more. Whatever the source yields is forwarded as it is,
-    /// and no further block is checked.
-    PassThrough,
-}
-
-/// A reader that refuses an xz stream declaring a dictionary over
-/// [`MAX_XZ_DICTIONARY`], before the decoder reads the header that would
-/// allocate it.
-///
-/// It sits between the source and `lzma_rust2::XzReader` and yields exactly the
-/// bytes it was given. What it adds is a walk of the container structure — the
-/// stream header, each block header, the index, the footer — carried out as the
-/// bytes go past rather than over the whole file first, so a 500 MB stage3
-/// arriving from a mirror still streams and the guard's own memory stays at one
-/// block header, at most 1024 bytes.
-///
-/// # What it covers
-///
-/// Every block header the walk can reach, in every stream. That is every block
-/// of every archive this crate has been measured against, the 75-block Gentoo
-/// stage3 included. Checking only the first block would not be worth having:
-/// each block declares its own dictionary and each is allocated, so a file
-/// whose first block declares 8 MiB and whose second declares 2 GiB costs the
-/// 2 GiB and then decodes successfully, reporting nothing.
-///
-/// The walk stops, and everything after it goes unchecked, at a block header
-/// that declares no compressed size. Such a header leaves the next one findable
-/// only by decoding this block to its LZMA2 end marker, which is the decoder's
-/// job and not worth reproducing. `xz -T1 --block-size=...` writes exactly that
-/// shape, so this is a real limit and not a theoretical one; single-block
-/// producers that omit the size, `xz` reading a pipe among them, are fully
-/// covered because there is nothing after the block that was checked.
-///
-/// This bounds an archive that is hostile by accident and one that is hostile
-/// without trying hard. It is not a guarantee against an attacker who knows it
-/// is here, who need only omit a compressed size to stop the walk. The sound
-/// fix is a memory limit inside the decoder, where the allocation is;
-/// `lzma-rust2` 0.18 offers none, and `XzReader::new` is its only constructor.
-///
-/// # What it refuses
-///
-/// Only an LZMA2 filter declaring more than the cap. Anything the walk cannot
-/// make sense of — a reserved flag, an unfamiliar filter chain, a short read —
-/// stops the tracking rather than failing the archive. The decoder decides what
-/// is valid; a guard that refused what the decoder would have accepted would
-/// break real archives in order to bound a hypothetical one.
-///
-/// # It is a second xz parser, and the two are not held to each other
-///
-/// A reader meeting this module cold finds two parsers of the same container in
-/// one process: `lzma-rust2`'s, which decodes, and this one, which polices.
-/// Nothing holds them to reading a container the same way, and nothing could
-/// without reimplementing the decoder — so where they disagree, the disagreement
-/// is a hole in the bound rather than a decode error, which is the fail-open
-/// posture the section above describes from the other side.
-///
-/// That is the cost of the arrangement, and it is worth paying only for as long
-/// as the decoder offers no bound of its own. The durable fix is upstream: a
-/// maximum dictionary size on `lzma-rust2`'s decoder, applied where the
-/// allocation happens, after which everything here but [`MAX_XZ_DICTIONARY`]
-/// deletes.
-struct XzDictionaryGuard<R> {
+/// A block whose filter chain holds more than one filter before LZMA2. The xz
+/// format allows up to four, and the sans-I/O decoder supports one; `xz` itself
+/// writes at most one (a BCJ or a delta), and no archive this crate reads
+/// carries two. Such a block is refused rather than mis-decoded, and the
+/// refusal names the decoder's own reason.
+struct XzReader<R> {
     source: R,
-    stage: XzStage,
-    /// Bytes read to inspect and not yet handed downstream.
-    pending: Vec<u8>,
-    /// How much of `pending` has been handed downstream already.
-    handed: usize,
-    /// Bytes still to forward without inspecting: a block's compressed data,
-    /// its padding and its check, or a footer.
-    forward: u64,
-    /// The size of this stream's check, needed to find the next block header.
-    check: u64,
-    /// How many bytes of the current index have gone past, for its padding.
-    index_bytes: u64,
+    stream: lzma_rust2::XzStream,
+    /// The buffer compressed bytes are read into.
+    input: Vec<u8>,
+    /// How much of `input` holds bytes read from `source`.
+    filled: usize,
+    /// How much of that the decoder has taken.
+    taken: usize,
+    /// Set once `source` has reported end of input.
+    drained: bool,
+    /// Set once the decoder has reported the end of the last stream.
+    finished: bool,
 }
 
-impl<R: Read> XzDictionaryGuard<R> {
+impl<R: Read> XzReader<R> {
     /// Wraps `source`, positioned at the start of the first stream header.
-    fn new(source: R) -> XzDictionaryGuard<R> {
-        XzDictionaryGuard {
+    fn new(source: R) -> XzReader<R> {
+        XzReader {
             source,
-            stage: XzStage::StreamHeader,
-            pending: Vec::new(),
-            handed: 0,
-            forward: 0,
-            check: 0,
-            index_bytes: 0,
+            // `true`: several concatenated xz streams are one legal file.
+            stream: lzma_rust2::XzStream::new_mem_limit(true, MAX_XZ_MEMORY_KB),
+            input: vec![0; XZ_CHUNK],
+            filled: 0,
+            taken: 0,
+            drained: false,
+            finished: false,
         }
-    }
-
-    /// Reads `want` bytes onto the end of `pending`, returning how many
-    /// arrived. Fewer than asked for only at end of input.
-    fn buffer(&mut self, want: usize) -> io::Result<usize> {
-        let from = self.pending.len();
-        self.pending.resize(from + want, 0);
-        let mut filled = 0;
-        while filled < want {
-            let got = self.source.read(&mut self.pending[from + filled..])?;
-            if got == 0 {
-                break;
-            }
-            filled += got;
-        }
-        self.pending.truncate(from + filled);
-        Ok(filled)
-    }
-
-    /// Reads and inspects one structural element, leaving its bytes in
-    /// `pending` for the caller to hand downstream and setting what comes next.
-    fn inspect(&mut self) -> io::Result<()> {
-        match self.stage {
-            XzStage::StreamHeader | XzStage::StreamBoundary => self.inspect_stream_start(),
-            XzStage::BlockBoundary => self.inspect_block(),
-            XzStage::IndexCount => self.inspect_index_count(),
-            XzStage::IndexIntegers(remaining) => self.inspect_index(remaining),
-            XzStage::PassThrough => Ok(()),
-        }
-    }
-
-    /// Reads a stream header, or decides there is not one here.
-    ///
-    /// At [`XzStage::StreamBoundary`] the four bytes may be stream padding —
-    /// zeroes in multiples of four — rather than the start of a header, so they
-    /// are read first and only then told apart. The end of the file is the
-    /// ordinary way for this to finish.
-    fn inspect_stream_start(&mut self) -> io::Result<()> {
-        let at_boundary = matches!(self.stage, XzStage::StreamBoundary);
-        if at_boundary {
-            if self.buffer(4)? < 4 {
-                // The file ends here, cleanly or short; either way there is no
-                // further header to read.
-                self.stage = XzStage::PassThrough;
-                return Ok(());
-            }
-            let group = &self.pending[self.pending.len() - 4..];
-            if group.iter().all(|byte| *byte == 0) {
-                return Ok(()); // Stream padding; stay at the boundary.
-            }
-            if group != &XZ_MAGIC[..4] {
-                self.stage = XzStage::PassThrough;
-                return Ok(());
-            }
-        }
-        let want = if at_boundary {
-            XZ_STREAM_HEADER - 4
-        } else {
-            XZ_STREAM_HEADER
-        };
-        if self.buffer(want)? < want {
-            self.stage = XzStage::PassThrough;
-            return Ok(());
-        }
-        let header = &self.pending[self.pending.len() - XZ_STREAM_HEADER..];
-        // The second flag byte carries the check id; the first is reserved and
-        // must be zero, and a stream where it is not is one the decoder refuses
-        // anyway.
-        if header[..6] != XZ_MAGIC || header[6] != 0 {
-            self.stage = XzStage::PassThrough;
-            return Ok(());
-        }
-        self.check = xz_check_size(header[7]);
-        self.stage = XzStage::BlockBoundary;
-        Ok(())
-    }
-
-    /// Reads either the next block header or the index indicator that ends the
-    /// stream's blocks.
-    fn inspect_block(&mut self) -> io::Result<()> {
-        if self.buffer(1)? < 1 {
-            self.stage = XzStage::PassThrough;
-            return Ok(());
-        }
-        let size_byte = self.pending[self.pending.len() - 1];
-        if size_byte == 0 {
-            // The index indicator, not a block header. One integer for the
-            // record count follows, and then two per record.
-            self.index_bytes = 1;
-            self.stage = XzStage::IndexCount;
-            return Ok(());
-        }
-        let header_size = (usize::from(size_byte) + 1) * 4;
-        if self.buffer(header_size - 1)? < header_size - 1 {
-            self.stage = XzStage::PassThrough;
-            return Ok(());
-        }
-        let header = &self.pending[self.pending.len() - header_size..];
-        let Some(block) = parse_xz_block(header) else {
-            // Not a shape this walk follows. The decoder decides whether it is
-            // valid; the guard stops checking rather than refusing.
-            self.stage = XzStage::PassThrough;
-            return Ok(());
-        };
-        if block.dictionary > MAX_XZ_DICTIONARY {
-            return Err(io::Error::other(archive_error(format!(
-                "the xz stream declares a {} MiB LZMA2 dictionary, over the {} MiB this \
-                 provisioner decodes; the decoder would allocate and zero all of it before \
-                 reading any of the block",
-                block.dictionary / (1024 * 1024),
-                MAX_XZ_DICTIONARY / (1024 * 1024),
-            ))));
-        }
-        match block.compressed {
-            // Compressed data, then padding to a four-byte multiple of it, then
-            // the check: past all three is the next block header.
-            Some(compressed) => {
-                self.forward = compressed + (4 - compressed % 4) % 4 + self.check;
-                self.stage = XzStage::BlockBoundary;
-            }
-            // Without a declared size the next header is findable only by
-            // decoding this block, so tracking ends here.
-            None => self.stage = XzStage::PassThrough,
-        }
-        Ok(())
-    }
-
-    /// Steps over the index's record count, which says how many integers
-    /// follow it: two per record.
-    fn inspect_index_count(&mut self) -> io::Result<()> {
-        let Some(length) = self.step_over_index_integer()? else {
-            return Ok(());
-        };
-        // A count large enough to overflow the doubling is not a count.
-        let count = decode_vli(&self.pending[self.pending.len() - length..]);
-        self.stage = match count.and_then(|count| count.checked_mul(2)) {
-            Some(integers) => XzStage::IndexIntegers(integers),
-            None => XzStage::PassThrough,
-        };
-        Ok(())
-    }
-
-    /// Steps over one of the index's record integers, and over the index's
-    /// padding, CRC32 and stream footer once they are all gone.
-    fn inspect_index(&mut self, remaining: u64) -> io::Result<()> {
-        if remaining == 0 {
-            // Padding to a four-byte multiple, the index's own CRC32, and the
-            // stream footer; past all three is where another stream may begin.
-            self.forward = (4 - self.index_bytes % 4) % 4 + 4 + XZ_STREAM_FOOTER;
-            self.stage = XzStage::StreamBoundary;
-            return Ok(());
-        }
-        if self.step_over_index_integer()?.is_some() {
-            self.stage = XzStage::IndexIntegers(remaining - 1);
-        }
-        Ok(())
-    }
-
-    /// Buffers one of the index's variable-length integers, returning how many
-    /// bytes long it was, or `None` having stopped the walk.
-    ///
-    /// A byte at a time: the high bit clear ends the integer, and nine bytes is
-    /// the format's longest.
-    fn step_over_index_integer(&mut self) -> io::Result<Option<usize>> {
-        for length in 1..=9 {
-            if self.buffer(1)? < 1 {
-                self.stage = XzStage::PassThrough;
-                return Ok(None);
-            }
-            self.index_bytes += 1;
-            if self.pending[self.pending.len() - 1] & 0x80 == 0 {
-                return Ok(Some(length));
-            }
-        }
-        self.stage = XzStage::PassThrough;
-        Ok(None)
     }
 }
 
-/// Decodes a variable-length integer that is exactly `bytes` long.
-fn decode_vli(bytes: &[u8]) -> Option<u64> {
-    let mut at = 0;
-    let value = read_vli(bytes, &mut at)?;
-    (at == bytes.len()).then_some(value)
-}
-
-impl<R: Read> Read for XzDictionaryGuard<R> {
+impl<R: Read> Read for XzReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
+        if buf.is_empty() || self.finished {
             return Ok(0);
         }
         loop {
-            // Anything inspected and waiting goes downstream first, unchanged.
-            if self.handed < self.pending.len() {
-                let taken = (self.pending.len() - self.handed).min(buf.len());
-                buf[..taken].copy_from_slice(&self.pending[self.handed..self.handed + taken]);
-                self.handed += taken;
-                return Ok(taken);
+            // Both start at zero, so the first pass reads before it decodes.
+            if self.taken == self.filled && !self.drained {
+                self.filled = self.source.read(&mut self.input)?;
+                self.taken = 0;
+                self.drained = self.filled == 0;
             }
-            self.pending.clear();
-            self.handed = 0;
-            // A block's payload is forwarded without being looked at.
-            if self.forward > 0 {
-                let want = usize::try_from(self.forward)
-                    .unwrap_or(usize::MAX)
-                    .min(buf.len());
-                let got = self.source.read(&mut buf[..want])?;
-                if got == 0 {
-                    // The payload ends short. The decoder reports that; the
-                    // guard has nothing left to find.
-                    self.stage = XzStage::PassThrough;
-                    self.forward = 0;
-                    return Ok(0);
-                }
-                self.forward -= got as u64;
-                return Ok(got);
+            let action = if self.drained {
+                lzma_rust2::Action::Finish
+            } else {
+                lzma_rust2::Action::Run
+            };
+            let result = self
+                .stream
+                .process(&self.input[self.taken..self.filled], buf, action)
+                .map_err(refused_memory)?;
+            self.taken += result.bytes_consumed;
+            if result.bytes_produced > 0 {
+                return Ok(result.bytes_produced);
             }
-            if matches!(self.stage, XzStage::PassThrough) {
-                return self.source.read(buf);
+            if result.status == lzma_rust2::Status::StreamEnd {
+                self.finished = true;
+                return Ok(0);
             }
-            let before = self.pending.len();
-            self.inspect()?;
-            if self.pending.len() == before && self.forward == 0 {
-                // Nothing was read and nothing was queued: the walk has run out
-                // of container to follow, so the rest is the source's.
-                debug_assert!(matches!(self.stage, XzStage::PassThrough));
-                return self.source.read(buf);
+            // Neither output nor an ending, so the decoder wants more input. If
+            // the source has none left and the decoder took nothing either, no
+            // further call can make progress: return rather than spin. Reached
+            // only if the decoder stops short of both an ending and an error on
+            // a truncated stream, which it is not documented to do -- but a loop
+            // whose termination rests on a dependency's documentation is one
+            // this crate would rather not have.
+            if self.drained && result.bytes_consumed == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the xz stream ends mid-decode",
+                ));
             }
         }
     }
+}
+
+/// Rewrites the decoder's memory refusal to name the bound in force.
+///
+/// `lzma-rust2` reports both a block over the budget and a host that would not
+/// give it an allocation within the budget as [`io::ErrorKind::OutOfMemory`],
+/// and its own words for the first -- "needed memory too big for mem_limit_kb"
+/// -- name a parameter the caller never set and cannot see. The rewrite states
+/// the cap as the bound in force rather than as the cause, which is true of
+/// both, and keeps the decoder's reason after it for whoever needs to tell them
+/// apart. Every other failure passes through as it arrives.
+fn refused_memory(err: io::Error) -> io::Error {
+    if err.kind() != io::ErrorKind::OutOfMemory {
+        return err;
+    }
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "an xz decode is capped at {} MiB of memory here and this stream's could not be \
+             satisfied: {err}",
+            MAX_XZ_DICTIONARY / (1024 * 1024),
+        ),
+    )
 }
 
 /// A tar/archive error at offset zero, for the compression layer's failures.
@@ -869,19 +555,40 @@ mod tests {
         assert_eq!(decoded, expected, "both members decoded");
     }
 
+    #[test]
+    fn a_fixture_declares_the_dictionary_it_names() {
+        // The tests below name a dictionary in mebibytes and assert what the
+        // decoder does about it, which is only meaningful if the byte written
+        // into the header declares that dictionary and not a neighbouring one.
+        // Each step of the encoding is half a doubling, so a byte one out
+        // declares half or twice what was meant, and the refusal tests would
+        // still pass while covering a different number.
+        //
+        // The format's own table: property `p` under 40 declares
+        // `(2 | (p & 1)) << (p / 2 + 11)`, and 40 declares `0xFFFFFFFF`.
+        for (bytes, property) in [
+            (4 * 1024_u64, 0_u8),
+            (8 * 1024 * 1024, 22),
+            (64 * 1024 * 1024, 28),
+            (128 * 1024 * 1024, 30),
+            (2048 * 1024 * 1024, 38),
+        ] {
+            assert_eq!(dictionary_property(bytes), property, "{bytes} bytes");
+        }
+    }
+
     /// The LZMA2 dictionary property byte that declares `bytes`.
     ///
-    /// The inverse of [`lzma2_dictionary`] over the even properties, which are
-    /// the powers of two: property `p` declares `2^(p / 2 + 12)`.
+    /// Only the even properties, which are the powers of two: property `p`
+    /// declares `2^(p / 2 + 12)`, so `p` is `(log2(bytes) - 12) * 2`. The odd
+    /// ones are the halfway steps, which no fixture here needs.
     fn dictionary_property(bytes: u64) -> u8 {
-        let property = (bytes.trailing_zeros() as u8 - 12) * 2;
-        assert_eq!(
-            lzma2_dictionary(property),
-            bytes,
-            "{bytes} is a power of two"
-        );
-        property
+        assert!(bytes.is_power_of_two(), "{bytes} is a power of two");
+        (bytes.trailing_zeros() as u8 - 12) * 2
     }
+
+    /// The LZMA2 filter's id in a block header's filter chain.
+    const LZMA2_FILTER_ID: u64 = 0x21;
 
     /// A CRC32 over `bytes`, which every xz header carries one of.
     fn crc32(bytes: &[u8]) -> [u8; 4] {
@@ -945,11 +652,9 @@ mod tests {
     /// how long its block is.
     ///
     /// The check is a parameter because it is what separates one block from the
-    /// next. A walk that sized it wrongly would step into the middle of the
-    /// following header, fail to recognise it, and quietly stop checking --
-    /// which no fixture written without one could catch, and which would mean
-    /// the guard covered nothing at all in production. The archives this crate
-    /// reads use CRC32 and CRC64.
+    /// next, and a fixture written with only one of the format's check sizes
+    /// could not catch a reader that placed the following header wrongly. The
+    /// archives this crate reads use CRC32 and CRC64.
     fn xz_stream(check: Check, blocks: &[Block<'_>]) -> Vec<u8> {
         let flags = [0x00u8, check.id()];
         let mut out = XZ_MAGIC.to_vec();
@@ -1030,9 +735,14 @@ mod tests {
             }
         }
 
-        /// How many bytes follow each block, which is what the walk must know.
+        /// How many bytes follow each block, which is what places the next
+        /// block header. The format sizes checks in threes: id 0 is none, 1 to
+        /// 3 are four bytes, 4 to 6 are eight, and so on.
         fn size(self) -> u64 {
-            xz_check_size(self.id())
+            match self.id() {
+                0 => 0,
+                id => 4 << ((u64::from(id) - 1) / 3),
+            }
         }
 
         /// The check itself, over what the block decodes to.
@@ -1044,54 +754,28 @@ mod tests {
         }
     }
 
-    /// Reads `bytes` through [`XzDictionaryGuard`] alone, decoding nothing.
-    ///
-    /// The guard is what these tests are about, and driving it directly keeps
-    /// them from allocating the dictionaries they name: a fixture declaring the
-    /// cap would otherwise cost 128 MiB of zeroed memory to admit.
-    fn guard_all(bytes: &[u8]) -> io::Result<Vec<u8>> {
-        let mut guard = XzDictionaryGuard::new(bytes);
-        let mut out = Vec::new();
-        // A small buffer on purpose: it splits headers across reads, which is
-        // the case a guard that buffers is most likely to get wrong.
-        let mut chunk = [0u8; 7];
-        loop {
-            match guard.read(&mut chunk)? {
-                0 => return Ok(out),
-                got => out.extend_from_slice(&chunk[..got]),
-            }
-        }
-    }
-
     const MIB: u64 = 1024 * 1024;
 
-    #[test]
-    fn the_guard_hands_back_exactly_what_it_was_given() {
-        // The property everything else rests on: the guard is transparent. Two
-        // streams, four blocks between them, read seven bytes at a time so
-        // every header is split across reads.
-        let mut bytes = xz_stream(
-            Check::Crc32,
-            &[
-                Block::new(8 * MIB, b"first block"),
-                Block::new(8 * MIB, b"second block"),
-            ],
-        );
-        bytes.extend_from_slice(&xz_stream(
-            Check::Crc32,
-            &[
-                Block::new(4096, b"third block"),
-                Block::new(64 * MIB, b"fourth block"),
-            ],
-        ));
-        assert_eq!(guard_all(&bytes).expect("the walk completes"), bytes);
+    /// The message an over-budget decode is refused with, or a panic naming
+    /// what happened instead.
+    ///
+    /// Driven through [`decompress`], so what is asserted is the path a
+    /// provisioning run takes rather than a component of it. A refused block is
+    /// refused as its header is parsed, before anything it declared is
+    /// allocated, so a fixture may name any dictionary it likes.
+    fn refusal(bytes: &[u8]) -> String {
+        match decode_all(bytes) {
+            Err(err) if err.kind() == io::ErrorKind::OutOfMemory => err.to_string(),
+            Err(err) => panic!("expected a memory refusal, got {err}"),
+            Ok(decoded) => panic!("expected a memory refusal, decoded {} bytes", decoded.len()),
+        }
     }
 
     #[test]
     fn a_fixture_stream_is_one_a_real_decoder_decodes() {
         // The fixtures are hand-built, so this is what keeps the tests below
-        // honest: what `xz_stream` writes is a stream `lzma-rust2` accepts, and
-        // a guard bug therefore cannot hide behind a bad fixture.
+        // honest: what `xz_stream` writes is a stream the decoder accepts, and a
+        // bound that refused everything could not hide behind a bad fixture.
         let bytes = xz_stream(
             Check::Crc32,
             &[
@@ -1107,22 +791,27 @@ mod tests {
     }
 
     #[test]
-    fn an_over_cap_dictionary_is_refused() {
+    fn an_over_budget_dictionary_is_refused() {
         // The whole point, on the simplest shape: one block asking for more
-        // than the cap, refused from its header.
+        // than the budget, refused as its header is parsed.
         let bytes = xz_stream(Check::Crc32, &[Block::new(256 * MIB, b"payload")]);
-        let err = guard_all(&bytes).expect_err("an over-cap dictionary is refused");
-        assert!(err.to_string().contains("dictionary"), "{err}");
-        assert!(err.to_string().contains("256 MiB"), "{err}");
+        let err = refusal(&bytes);
+        assert!(
+            err.contains("128 MiB"),
+            "the bound in force is named: {err}"
+        );
+        assert!(
+            err.contains("mem_limit_kb"),
+            "the decoder's own reason survives: {err}",
+        );
     }
 
     #[test]
     fn a_later_blocks_dictionary_is_also_capped() {
-        // The reason the guard walks rather than checking the front of the
-        // file. Every block declares its own dictionary and every one is
-        // allocated, so a file whose first block is ordinary and whose second
-        // asks for 4 GiB costs the 4 GiB -- and then decodes successfully,
-        // reporting nothing. A first-block check admits exactly this file.
+        // Every block declares its own dictionary and every one is allocated,
+        // so a file whose first block is ordinary and whose second asks for 2
+        // GiB costs the 2 GiB -- and then decodes successfully, reporting
+        // nothing. A check of the front of the file admits exactly this file.
         let bytes = xz_stream(
             Check::Crc32,
             &[
@@ -1130,37 +819,28 @@ mod tests {
                 Block::new(2048 * MIB, b"and a hostile second one"),
             ],
         );
-        let err = guard_all(&bytes).expect_err("the second block is refused too");
-        assert!(err.to_string().contains("2048 MiB"), "{err}");
+        refusal(&bytes);
     }
 
     #[test]
     fn the_last_of_many_blocks_is_still_checked() {
         // A real archive is not two blocks. A Gentoo stage3 is one stream of
         // seventy-five, each declaring 8 MiB, and every one of them is
-        // allocated in turn -- so the walk has to still be tracking at the end
-        // of a long stream, not only just after the front of it.
+        // allocated in turn -- so the bound has to still apply at the end of a
+        // long stream, not only just after the front of it.
         let mut blocks: Vec<Block<'_>> =
             (0..75).map(|_| Block::new(8 * MIB, b"ordinary")).collect();
-        let ordinary = xz_stream(Check::Crc32, &blocks);
-        assert_eq!(
-            guard_all(&ordinary).expect("seventy-five walk clean"),
-            ordinary
-        );
+        decode_all(&xz_stream(Check::Crc32, &blocks)).expect("seventy-five decode clean");
 
         blocks.push(Block::new(512 * MIB, b"hostile"));
-        let err = guard_all(&xz_stream(Check::Crc32, &blocks))
-            .expect_err("the seventy-sixth block is checked too");
-        assert!(err.to_string().contains("512 MiB"), "{err}");
+        refusal(&xz_stream(Check::Crc32, &blocks));
     }
 
     #[test]
-    fn a_stream_carrying_no_check_is_walked_too() {
-        // The check's size is what separates one block from the next, and zero
-        // is one of the sizes the format allows. Getting it wrong would not
-        // fail anything -- the walk would step into the next header, not
-        // recognise it, and quietly stop -- so it is asserted rather than
-        // assumed.
+    fn a_stream_carrying_no_check_is_bounded_too() {
+        // Zero is one of the check sizes the format allows, and the check is
+        // what separates one block from the next. A reader that sized it wrongly
+        // would look for the second header in the wrong place.
         let bytes = xz_stream(
             Check::None,
             &[
@@ -1168,60 +848,44 @@ mod tests {
                 Block::new(512 * MIB, b"and a hostile second one"),
             ],
         );
-        let err = guard_all(&bytes).expect_err("the second block is checked here too");
-        assert!(err.to_string().contains("512 MiB"), "{err}");
+        refusal(&bytes);
     }
 
     #[test]
     fn a_dictionary_in_a_second_stream_is_also_capped() {
         // Concatenated streams are legal and the decoder is told to read them
-        // all, so the walk steps over an index and a footer to keep checking.
+        // all, so the bound has to survive an index and a footer.
         let mut bytes = xz_stream(Check::Crc32, &[Block::new(8 * MIB, b"an ordinary stream")]);
         bytes.extend_from_slice(&xz_stream(
             Check::Crc32,
             &[Block::new(512 * MIB, b"a hostile one")],
         ));
-        let err = guard_all(&bytes).expect_err("the second stream is checked too");
-        assert!(err.to_string().contains("512 MiB"), "{err}");
+        refusal(&bytes);
     }
 
     #[test]
-    fn stream_padding_between_streams_does_not_lose_the_walk() {
+    fn stream_padding_between_streams_does_not_lose_the_bound() {
         // Four zero bytes may sit between two streams. Mistaking them for the
-        // start of a header, or for the end of the file, would stop the walk
-        // one stream early and silently.
+        // start of a header, or for the end of the file, would stop one stream
+        // early and silently.
         let mut bytes = xz_stream(Check::Crc32, &[Block::new(8 * MIB, b"an ordinary stream")]);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         bytes.extend_from_slice(&xz_stream(
             Check::Crc32,
             &[Block::new(512 * MIB, b"a hostile one")],
         ));
-        let err = guard_all(&bytes).expect_err("the padded second stream is checked too");
-        assert!(err.to_string().contains("512 MiB"), "{err}");
+        refusal(&bytes);
     }
 
     #[test]
-    fn a_dictionary_of_exactly_the_cap_is_admitted() {
-        // The boundary is inclusive, and 64 MiB -- what `xz -9` writes, and the
-        // largest observed in the archives this crate reads -- is well inside
-        // it. Neither is decoded: admitting the cap would otherwise cost 128
-        // MiB of zeroed memory to prove a comparison.
-        for dictionary in [64 * MIB, MAX_XZ_DICTIONARY] {
-            let bytes = xz_stream(Check::Crc32, &[Block::new(dictionary, b"payload")]);
-            assert_eq!(
-                guard_all(&bytes).expect("a dictionary at or under the cap is admitted"),
-                bytes,
-            );
-        }
-    }
-
-    #[test]
-    fn a_block_declaring_no_compressed_size_stops_the_walk_rather_than_failing_it() {
+    fn a_block_declaring_no_compressed_size_is_bounded_too() {
         // `xz -T1 --block-size=...` writes headers without a compressed size,
         // and the next header is then findable only by decoding this block to
-        // its LZMA2 end marker. The walk stops there. What it must not do is
-        // refuse: the file is legal, and the decoder reads it.
-        let bytes = xz_stream(
+        // its LZMA2 end marker. A bound applied by walking the container from
+        // outside stops at such a header, having no way to find what follows;
+        // the decoder is already inside and does not have to look. The legal
+        // stream still decodes, and the hostile one is still refused.
+        let ordinary = xz_stream(
             Check::Crc32,
             &[Block {
                 dictionary: 8 * MIB,
@@ -1230,31 +894,56 @@ mod tests {
             }],
         );
         assert_eq!(
-            guard_all(&bytes).expect("a legal stream is not refused"),
-            bytes
+            decode_all(&ordinary).expect("a legal stream decodes"),
+            b"payload"
         );
+
+        let hostile = xz_stream(
+            Check::Crc32,
+            &[
+                Block {
+                    dictionary: 8 * MIB,
+                    data: b"payload",
+                    declare_size: false,
+                },
+                Block {
+                    dictionary: 512 * MIB,
+                    data: b"hostile",
+                    declare_size: false,
+                },
+            ],
+        );
+        refusal(&hostile);
     }
 
     #[test]
-    fn the_walk_stops_at_a_shape_it_cannot_follow_rather_than_refusing() {
-        // The same rule for a header the walk does not understand. A reserved
-        // flag bit is the stand-in: the decoder is the authority on whether a
-        // stream is valid, and refusing here would break real archives to bound
-        // a hypothetical one.
-        let mut bytes = xz_stream(Check::Crc32, &[Block::new(8 * MIB, b"payload")]);
-        bytes[XZ_STREAM_HEADER + 1] |= 0x04;
-        assert_eq!(
-            guard_all(&bytes).expect("an odd shape is not refused"),
-            bytes
-        );
+    fn a_dictionary_of_exactly_the_cap_is_admitted() {
+        // The boundary is inclusive, which is what the budget's slack over
+        // [`MAX_XZ_DICTIONARY`] buys: the decoder counts its own tables against
+        // the budget as well as the dictionary, so a budget of the cap exactly
+        // would refuse a block declaring the cap exactly. 64 MiB -- what `xz -9`
+        // writes, and the largest observed in the archives this crate reads --
+        // is well inside it.
+        //
+        // Decoding the second of these really does allocate 128 MiB for as long
+        // as the block lasts. That is the cost of proving the boundary through
+        // the decoder rather than against a comparison of this crate's own.
+        for dictionary in [64 * MIB, MAX_XZ_DICTIONARY] {
+            let bytes = xz_stream(Check::Crc32, &[Block::new(dictionary, b"payload")]);
+            assert_eq!(
+                decode_all(&bytes).expect("a dictionary at or under the cap is admitted"),
+                b"payload",
+                "dictionary {dictionary}",
+            );
+        }
     }
 
     #[test]
-    fn a_truncated_stream_is_handed_back_rather_than_refused() {
-        // Every prefix of a real stream: the walk runs out of container at some
-        // point in each, and must hand back what it read and stop. Reporting
-        // the truncation is the decoder's, and a guard that lost bytes here
-        // would corrupt an archive rather than bound one.
+    fn a_truncated_stream_ends_rather_than_spinning() {
+        // Every prefix of a real stream. Each is a decode that runs out of
+        // input, and what matters is that each *returns*: a decoder still asking
+        // for input a drained source cannot give would otherwise be called
+        // forever. What each prefix answers is the decoder's to decide.
         let bytes = xz_stream(
             Check::Crc32,
             &[
@@ -1263,11 +952,13 @@ mod tests {
             ],
         );
         for cut in 0..bytes.len() {
-            assert_eq!(
-                guard_all(&bytes[..cut]).unwrap_or_else(|err| panic!("cut at {cut}: {err}")),
-                bytes[..cut],
-                "cut at {cut}",
-            );
+            if let Err(err) = decode_all(&bytes[..cut]) {
+                assert_ne!(
+                    err.kind(),
+                    io::ErrorKind::OutOfMemory,
+                    "cut at {cut}: a truncation is not a memory refusal",
+                );
+            }
         }
     }
 

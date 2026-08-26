@@ -11,8 +11,11 @@ fcage --rootfs /srv/rootfs/alpine -- /bin/sh -c 'echo hello from the cage'
 
 `fcage` is a thin consumer of the [`ferroday-cage`](https://crates.io/crates/ferroday-cage)
 library, built with every feature enabled. Any profile the library accepts loads here, and
-every builder capability has a flag — which makes it the quickest way to try a
-configuration before committing to a feature set in a consumer's `Cargo.toml`.
+every capability of the launch builder and the network stack has a flag — which makes it
+the quickest way to try a configuration before committing to a feature set in a consumer's
+`Cargo.toml`. The provisioners' bootstrap surface has flags too, plans and pins included;
+layered builds, which produce an increment rather than a published rootfs, stay in the
+library.
 
 ## Producing the root filesystem
 

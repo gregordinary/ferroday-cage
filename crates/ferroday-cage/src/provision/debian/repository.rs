@@ -19,6 +19,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::DebianError;
+use super::bootstrap::{self, TRUST_ANCHOR_STEM};
 use super::check_coordinate;
 use crate::provision::coordinate::Nesting;
 
@@ -453,8 +454,8 @@ fn validate_name(name: &str) -> Result<(), DebianError> {
     }
 }
 
-/// Rejects a repository set whose additional repositories would write over
-/// each other in the finished rootfs.
+/// Rejects a repository set whose repositories would write over each other in
+/// the finished rootfs.
 ///
 /// Each additional repository writes `sources.list.d/<stem>.list` and its own
 /// `<stem>.gpg` keyring, so two sharing a stem leave only the last one's source
@@ -462,15 +463,25 @@ fn validate_name(name: &str) -> Result<(), DebianError> {
 /// from the installed system's apt configuration even though its packages were
 /// installed. Collisions arise between two caller-supplied names, and between a
 /// caller-supplied name and another repository's generated stem.
+///
+/// The primary repository takes no stem of its own — it owns `sources.list`
+/// rather than an entry under `sources.list.d` — but its trust anchor lands in
+/// the same keyrings directory under [`TRUST_ANCHOR_STEM`], so that name is in
+/// the set from the start. It is the one collision that matters most: the
+/// primary's `sources.list` still names the anchor by path, so an additional
+/// repository claiming the name would leave the finished rootfs verifying the
+/// primary archive against a third party's key.
 pub(crate) fn validate_distinct_entries(repositories: &[Repository]) -> Result<(), DebianError> {
     let mut seen: Vec<String> = Vec::with_capacity(repositories.len());
+    seen.push(TRUST_ANCHOR_STEM.to_string());
     for (index, repository) in repositories.iter().enumerate().skip(1) {
         let stem = repository.entry_stem(index);
         if seen.contains(&stem) {
             return Err(DebianError::Config {
                 reason: format!(
-                    "two additional repositories would both write the apt source {stem:?}: \
-                     give each repository a distinct name"
+                    "two repositories would both write the keyring {:?}: \
+                     give each repository a distinct name",
+                    bootstrap::keyring_path(&stem)
                 ),
             });
         }
@@ -513,6 +524,20 @@ mod tests {
             validate_distinct_entries(&set),
             Err(DebianError::Config { .. })
         ));
+    }
+
+    #[test]
+    fn a_name_colliding_with_the_primarys_trust_anchor_is_refused() {
+        // The primary writes its keyring under this stem and its sources.list
+        // names that path, so an additional repository claiming the name would
+        // leave the finished rootfs verifying the primary archive against this
+        // repository's key.
+        let set = [named(None), named(Some(TRUST_ANCHOR_STEM))];
+        let err = validate_distinct_entries(&set).unwrap_err();
+        assert!(
+            matches!(&err, DebianError::Config { reason } if reason.contains(TRUST_ANCHOR_STEM)),
+            "{err}"
+        );
     }
 
     #[test]

@@ -40,6 +40,12 @@
 //! a newer writer had added. [`carried`] collects those fields and
 //! [`Draft::put_carried`] re-emits them, so a round trip preserves every field.
 //!
+//! A folded field is carried the same way: the reader joins its continuation
+//! lines with newlines and the writer folds them back, so a document holding a
+//! multi-line field a later version added reads and writes without loss. A
+//! field *this* version knows is one it composed rather than read, and none of
+//! them is multi-line, so a newline in one is refused rather than encoded.
+//!
 //! It does not promise byte identity across versions: a future writer may
 //! interleave its own fields with these rather than append them, and this
 //! version cannot know where they belong. What it does mean is that a field
@@ -262,11 +268,11 @@ impl Draft {
     ///
     /// # Errors
     ///
-    /// Returns the reason where a name or a value cannot be written as a single
-    /// field line and read back as itself: a name holding a colon or
-    /// whitespace, a value spanning more than one line, a value carrying
-    /// whitespace a reader would strip, or an empty value where empty is not an
-    /// answer.
+    /// Returns the reason where a name or a value cannot be written and read
+    /// back as itself: a name holding a colon or whitespace, a value carrying a
+    /// carriage return or one of the whitespace runs a reader would strip, a
+    /// folded value with a blank continuation, or an empty value where empty is
+    /// not an answer.
     pub(crate) fn render(&self, out: &mut String) -> Result<(), String> {
         for field in &self.fields {
             let name = &field.name;
@@ -284,24 +290,52 @@ impl Draft {
                      back as a field name",
                 ));
             }
-            if field.value.contains(['\n', '\r']) {
+            if field.value.contains('\r') {
+                return Err(format!(
+                    "the {name} value carries a carriage return, which a document cannot carry",
+                ));
+            }
+            // A field this version knows is one it composed, and none of them is
+            // multi-line: a newline in one is a value the layer should have
+            // refused, and writing it folded would encode it rather than report
+            // it. A carried field's value came off a document instead, where a
+            // folded one is ordinary — the reader accepts it, so refusing to
+            // write it back would read a document this crate cannot re-emit,
+            // which is the one thing carrying an unknown field is for.
+            if matches!(name, Name::Known(_)) && field.value.contains('\n') {
                 return Err(format!(
                     "the {name} value spans more than one line, which a document cannot carry",
                 ));
             }
-            // A reader strips the whitespace around a value, so a value
-            // carrying any of its own would not survive being written and read
-            // back. A leading one is worse still: the continuation marker is a
-            // leading space, so such a value would be folded into the field
-            // above it.
-            if field.value.trim() != field.value {
+            // A carried value the reader folded holds its continuation lines
+            // joined with newlines, and is written back folded.
+            let mut lines = field.value.split('\n');
+            let first = lines.next().unwrap_or_default();
+            // A reader strips the whitespace around a field's own line, so a
+            // value carrying any of its own would not survive being written and
+            // read back. A leading one is worse still: the continuation marker
+            // is a leading space, so such a value would be folded into the
+            // field above it.
+            if first.trim() != first {
                 return Err(format!(
                     "the {name} value begins or ends with whitespace, which a reader strips, so \
                      the document would not read back as what wrote it",
                 ));
             }
-            if field.value.is_empty() && !field.may_be_empty {
+            if first.is_empty() && !field.may_be_empty {
                 return Err(format!("the {name} value is empty"));
+            }
+            let continuations: Vec<&str> = lines.collect();
+            // A blank continuation cannot be written: a line of whitespace ends
+            // the stanza, so the rest of the value would read as a stanza of its
+            // own. Nothing this crate reads produces one — a blank line ends the
+            // stanza there too — so this is about a value assembled rather than
+            // read.
+            if continuations.iter().any(|line| line.trim().is_empty()) {
+                return Err(format!(
+                    "the {name} value folds onto a blank line, which ends a stanza rather than \
+                     continuing a field",
+                ));
             }
             // An empty value is written as a bare `Name:`, with no space after
             // the colon. `Name: ` would be the only line the format can produce
@@ -309,10 +343,14 @@ impl Draft {
             // repository is trusted unsigned — so a committed plan would stop
             // matching its own digest the first time an editor or a pre-commit
             // hook stripped the line, without the plan changing.
-            if field.value.is_empty() {
+            if first.is_empty() {
                 let _ = writeln!(out, "{name}:");
             } else {
-                let _ = writeln!(out, "{name}: {}", field.value);
+                let _ = writeln!(out, "{name}: {first}");
+            }
+            // The single space the reader strips from a continuation, put back.
+            for line in continuations {
+                let _ = writeln!(out, " {line}");
             }
         }
         out.push('\n');

@@ -169,13 +169,37 @@ escalation looks redundant and is not: root of the mapped namespace holds the
 capabilities that clear a directory whose own mode denies the write the
 deletion needs — a read-only directory an archive carried in, for one.
 
-At a shell prompt, `fcage --remove-rootfs DIR` is the same removal. It takes
-`--identity-map` for the map the tree was provisioned under, defaulting to the
-subordinate one, and is a mode of its own that accepts no other option:
+At a shell prompt, `fcage --remove-rootfs DIR` removes the tree and its lock
+together, which is the default above and the only behaviour it offers: the mode
+names a published rootfs, which is the case the round-trip is right for. A
+destination that holds published trees rather than being one is a library call
+rather than a flag. `fcage` takes `--identity-map` for the map the tree was
+provisioned under, defaulting to the subordinate one, and is a mode of its own
+that accepts no other option:
 
 ```sh
 fcage --remove-rootfs /var/lib/myapp/rootfs
 ```
+
+### The lock beside the tree
+
+A removal takes the `<dest>.lock` `ensure` wrote beside the destination, so a
+published rootfs and its lock round-trip together. A caller whose `dest`
+*contains* published trees rather than being one — a scratch directory, a
+cache, a work area holding several — passes `false` to `Remove::remove_lock`:
+
+```rust,no_run
+use ferroday_cage::provision::Remove;
+
+Remove::new("/var/cache/myapp/work").remove_lock(false).run()?;
+# Ok::<(), ferroday_cage::provision::ProvisionError>(())
+```
+
+Only the caller can tell the two apart. Both are directories, and a containing
+directory with no `.lock` sibling today looks exactly like a published one
+whose lock was already cleared, so the library cannot probe for the answer. The
+tree itself is removed identically either way; the flag governs the sibling
+file alone.
 
 ## Exporting a rootfs
 
@@ -195,25 +219,47 @@ single-identity map — the default — the export records every entry as root, 
 identity the sandbox runs everything as.
 
 ```rust,no_run
-use std::fs::File;
 use ferroday_cage::IdentityMap;
 use ferroday_cage::provision::Export;
 
-let mut archive = File::create("rootfs.tar")?;
 Export::new("/var/lib/myapp/rootfs")
     .map(IdentityMap::Subordinate)
     // A fixed SOURCE_DATE_EPOCH makes the archive byte-reproducible; without
     // it, real modification times are recorded.
     .clamp_mtime(1_700_000_000)
-    .write_to(&mut archive)?;
+    .write_to_path("rootfs.tar")?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `provision::export_tar(rootfs, writer, map)` is the shorthand, carrying only
 what every export needs.
 
-The archive is written to any `Write` sink, so it can stream directly into a
-compressor or an archive reader with no intermediate file. Regular files,
+### Where the archive goes
+
+`write_to_path` names a file, and that file appears complete or not at all. The
+bytes go to a staging file beside it, which is synced and then renamed over the
+destination, so an export that fails part-way — an unreadable source entry, an
+identity map no delegate can establish, a filesystem that filled up — leaves
+whatever archive was already there. Opening the destination directly would
+instead destroy a previous archive to make a partial one, before the export had
+established that it could produce anything at all. The staging file is created
+afresh, so the destination's inode is replaced rather than rewritten: a hard
+link to the previous archive keeps it, a symlink at the destination is replaced
+rather than followed, and the new file's permissions are `0o666` less the
+process umask, as an ordinary shell redirection produces.
+
+A destination *inside* the tree being exported is refused with
+`ProvisionError::ExportDestInside`. The walk would reach the file it is being
+written to, so what landed in the archive would depend on how far the encoder
+had got when the walk arrived there.
+
+`write_to` takes any `Write` sink instead, so an export can stream directly into
+a compressor or an archive reader with no intermediate file. It writes what it
+is given and cannot stage onto anything, which is the right shape for a pipe, a
+socket, or a buffer in memory, and the wrong one for a file a previous archive
+already occupies.
+
+Regular files,
 directories, symlinks, and hardlinks are emitted with their mode, ownership,
 and modification time. Extended attributes come with everything but symlinks —
 ACLs and file capabilities included — since the kernel confines a symlink's
@@ -257,9 +303,10 @@ fcage --export-rootfs /var/lib/myapp/rootfs --clamp-mtime 1700000000 \
     | zstd -o rootfs.tar.zst
 ```
 
-`--export-to FILE` writes to a file instead. Writing an archive to a terminal
-is refused rather than filling the screen, which is the only case where the
-default would surprise anyone.
+`--export-to FILE` writes to a file instead, with the staging and rename above,
+so a failed run leaves an existing archive at that path untouched. Writing an
+archive to a terminal is refused rather than filling the screen, which is the
+only case where the default would surprise anyone.
 
 ### What a launch leaves in the tree
 
@@ -417,10 +464,13 @@ Two of the three compressions let the archive name its own memory cost, in a
 header far smaller than the allocation it asks for: a zstd frame declares the
 window the decoder buffers, and an xz block declares the dictionary the decoder
 allocates and zeroes. Both are capped at 128 MiB, which is twice the largest
-either uses in the archives this library reads, and both are refused from the
-header rather than partway through the payload. An archive over the cap fails
-the provisioning run; nothing published by Debian, Alpine, postmarketOS, or
-Gentoo comes close to it.
+either uses in the archives this library reads. Each decoder is given its cap
+and checks the header against it before allocating, so an archive over the cap
+fails the provisioning run rather than being paid for and then reported — and
+the check is per block and per frame, not on the first alone, since a hostile
+declaration in the last block of an otherwise ordinary archive costs exactly as
+much as one in the first. Nothing published by Debian, Alpine, postmarketOS, or
+Gentoo comes close to the cap.
 
 The archive comes from a path or from any reader:
 
@@ -445,6 +495,15 @@ intermediate file on either side. A stream can be read only once, so the reader
 is consumed by the first run and a second run against the same `Tarball` says
 so rather than publishing an empty rootfs; `new` is the form that provisions
 repeatedly.
+
+A stream that ends before its first header block holds no archive, and is
+refused with `ProvisionError::FormatUnrecognized` — an empty file, a download
+that produced nothing, and a compression stream whose decoded payload is empty
+all arrive that way. The reader does tolerate an archive whose final two-block
+terminator never arrived, as GNU `tar` does, but only once at least one entry
+has been read: a publication is durable, so a stream taken for a complete
+archive of nothing publishes an empty tree that every later `ensure` then
+returns as `Provisioned::Existing` without consulting the source again.
 
 Extraction is unprivileged and designed for archives that describe a root
 filesystem:

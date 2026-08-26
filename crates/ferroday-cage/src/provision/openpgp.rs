@@ -427,6 +427,14 @@ const WEAK_SIGNING_KEY: &str =
 /// [`governing_binding`].
 const UNBOUND_SUBKEY: &str =
     "the subkey that made the signature carries no valid binding from its certificate";
+/// Refused because the governing binding rests on a hash this crate does not
+/// trust. See [`hash_is_acceptable`].
+const WEAK_BINDING: &str =
+    "the binding of the subkey that made the signature rests on a hash that is no longer trusted";
+/// Refused because the governing binding carries a critical subpacket that
+/// cannot be interpreted. See [`has_unknown_critical_subpacket`].
+const UNREADABLE_BINDING: &str = "the binding of the subkey that made the signature carries a \
+     critical subpacket that cannot be interpreted";
 /// Refused because the governing binding grants no signing capability.
 const NON_SIGNING_SUBKEY: &str = "the subkey that made the signature is not certified for signing";
 /// Refused because the governing binding carries no usable back signature, so
@@ -715,6 +723,12 @@ fn subkey_verdict(
     subkey: &SignedPublicSubKey,
 ) -> Result<Option<i64>, &'static str> {
     let binding = governing_binding(cert, subkey).ok_or(UNBOUND_SUBKEY)?;
+    if !hash_is_acceptable(binding) {
+        return Err(WEAK_BINDING);
+    }
+    if has_unknown_critical_subpacket(binding) {
+        return Err(UNREADABLE_BINDING);
+    }
     if !binding.key_flags().sign() {
         return Err(NON_SIGNING_SUBKEY);
     }
@@ -737,17 +751,24 @@ fn subkey_verdict(
 /// A subkey may have been re-bound over time; the newest binding (by creation)
 /// carries the current capability flags and expiration, exactly as
 /// [`key_expiry_epoch`] takes the newest self-signature over each object the
-/// primary signs. The remaining conditions on a binding are applied to whichever
-/// one governs rather than used to choose it, so that a defective newest binding
-/// refuses the subkey instead of handing authority back to a superseded one.
+/// primary signs.
+///
+/// Being issued by the primary is the whole of what makes a candidate here.
+/// Every other condition a binding must meet — the hash it rests on, the
+/// critical subpackets it carries, the flags it grants, the back signature it
+/// embeds — is applied by [`subkey_verdict`] to whichever binding governs,
+/// rather than used to choose it. Selecting on them would let a defective
+/// newest binding hand authority back to a superseded one: a re-binding that
+/// withdraws the signing flag but rests on a weak hash would be passed over,
+/// and the broader grant it was published to replace would govern instead.
+/// A signature that does not verify as the primary's is not a binding at all,
+/// so it is the one condition that belongs here.
 fn governing_binding<'a>(
     cert: &SignedPublicKey,
     subkey: &'a SignedPublicSubKey,
 ) -> Option<&'a Signature> {
     governing_signature(subkey.signatures.iter().filter(|signature| {
         signature.typ() == Some(SignatureType::SubkeyBinding)
-            && hash_is_acceptable(signature)
-            && !has_unknown_critical_subpacket(signature)
             && signature
                 .verify_subkey_binding(&cert.primary_key, &subkey.key)
                 .is_ok()
@@ -1255,15 +1276,20 @@ mod tests {
     }
 
     /// Signs a subkey binding or revocation of `subkey` with `primary`'s primary
-    /// key, carrying the given creation time, key flags, and optional
-    /// key-expiration. The high-level builder emits only a plain, non-expiring
-    /// binding, so tests that need a revocation or an expiration craft the
+    /// key, carrying the given creation time, key flags, optional
+    /// key-expiration, and any further hashed subpackets. The high-level builder
+    /// emits only a plain, non-expiring binding, so tests that need a
+    /// revocation, an expiration, or a subpacket of their own craft the
     /// signature packet here.
     ///
     /// For a binding, `backsig` decides whether the subkey counter-signs the
     /// primary as RFC 9580 requires. A revocation carries no back signature and
     /// passes [`BackSignature::Omit`].
+    ///
+    /// Every argument is one field of the packet being crafted, so the count is
+    /// the packet's rather than a shape a smaller helper could take.
     #[cfg(test)]
+    #[expect(clippy::too_many_arguments)]
     fn craft_subkey_signature(
         primary: &pgp::composed::SignedSecretKey,
         subkey: &pgp::composed::SignedSecretSubKey,
@@ -1272,6 +1298,7 @@ mod tests {
         key_flags: pgp::packet::KeyFlags,
         key_expiration: Option<pgp::types::Duration>,
         backsig: BackSignature,
+        extra: &[pgp::packet::Subpacket],
     ) -> Signature {
         use pgp::packet::{SignatureConfig, Subpacket, SubpacketData};
         use pgp::types::Password;
@@ -1290,6 +1317,7 @@ mod tests {
                     .expect("key-expiration subpacket"),
             );
         }
+        hashed.extend_from_slice(extra);
         // The subkey's own signature over the primary, which is what makes the
         // binding two-sided. The stamps are set here rather than left to the
         // signature config, which starts with an empty hashed area.
@@ -1530,6 +1558,7 @@ mod tests {
             signing_key_flags(),
             None,
             BackSignature::Omit,
+            &[],
         );
         revoked.public_subkeys[0].signatures.push(revocation);
         let revoked_keyring = Keyring {
@@ -1568,6 +1597,7 @@ mod tests {
             signing_key_flags(),
             Some(Duration::from_secs(86_400)),
             BackSignature::Embed,
+            &[],
         );
         public.public_subkeys[0].signatures = vec![expiring_binding];
 
@@ -1937,6 +1967,7 @@ mod tests {
             signing_key_flags(),
             None,
             BackSignature::Embed,
+            &[],
         )];
 
         // The fixture is the shape under test: a live subkey on a dead primary.
@@ -2054,6 +2085,68 @@ mod tests {
     }
 
     #[test]
+    fn a_defective_newest_binding_refuses_rather_than_reviving_a_superseded_one() {
+        // A binding this crate cannot read is still the primary's latest word on
+        // the subkey. Passing over it to reach an older one would let a
+        // certificate that has narrowed a subkey's authority go on granting the
+        // authority it withdrew, so the newest verified binding governs and its
+        // own defects refuse the subkey. The defect here is a critical
+        // subpacket with no interpretation; a hash below the floor is the same
+        // rule through the other predicate.
+        let created = Timestamp::from_secs(KEY_CREATED);
+        let archive = dated_key_with_signing_subkey("archive <archive@test.invalid>", created);
+        let subkey_secret = archive.secret_subkeys.first().expect("a signing subkey");
+        let signed = clearsign_with(&**subkey_secret, SIGNED_BODY);
+        let mut public = archive.to_public_key();
+
+        let broad = craft_subkey_signature(
+            &archive,
+            subkey_secret,
+            SignatureType::SubkeyBinding,
+            created,
+            signing_key_flags(),
+            None,
+            BackSignature::Embed,
+            &[],
+        );
+        // Published later, granting nothing, and carrying a critical notation
+        // this crate implements no semantics for.
+        let withdrawal = craft_subkey_signature(
+            &archive,
+            subkey_secret,
+            SignatureType::SubkeyBinding,
+            Timestamp::from_secs(KEY_CREATED + 86_400),
+            pgp::packet::KeyFlags::default(),
+            None,
+            BackSignature::Embed,
+            &[
+                pgp::packet::Subpacket::critical(SubpacketData::Notation(pgp::packet::Notation {
+                    readable: true,
+                    name: "policy@test.invalid".to_string().into(),
+                    value: b"withdrawn".to_vec().into(),
+                }))
+                .expect("notation subpacket"),
+            ],
+        );
+        public.public_subkeys[0].signatures = vec![broad, withdrawal];
+
+        assert_eq!(
+            subkey_candidates(&public)[0].verdict,
+            Err(UNREADABLE_BINDING),
+            "the newest binding governs, and its own defect is the refusal",
+        );
+
+        let keyring = Keyring { keys: vec![public] };
+        let err = keyring
+            .verify(signed.as_bytes(), false)
+            .expect_err("a subkey whose newest binding cannot be read must not verify");
+        let OpenPgpError::Signature(reason) = &err else {
+            panic!("an unusable signing key is a Signature error, got {err:?}");
+        };
+        assert_eq!(reason, UNREADABLE_BINDING);
+    }
+
+    #[test]
     fn a_signing_subkey_without_a_back_signature_is_refused() {
         // The binding alone is only the primary's claim over the subkey, and
         // any primary can make that claim about any public key it has seen. The
@@ -2087,6 +2180,7 @@ mod tests {
             signing_key_flags(),
             None,
             BackSignature::Omit,
+            &[],
         )];
         assert_eq!(
             subkey_candidates(&public)[0].verdict,
@@ -2233,6 +2327,7 @@ mod tests {
                 signing_key_flags(),
                 None,
                 backsig,
+                &[],
             )];
             subkey_candidates(&cert)[0].verdict
         };
@@ -2273,6 +2368,7 @@ mod tests {
             signing_key_flags(),
             None,
             BackSignature::ExpiringAfter(Duration::from_secs(86_400)),
+            &[],
         )];
         assert_eq!(
             subkey_candidates(&public)[0].verdict,

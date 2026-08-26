@@ -56,12 +56,26 @@ const OWNERSHIP_TOOLS: [&str; 2] = ["chown", "chgrp"];
 /// wrote, so the restore can delete a stub it has no real tool to put back.
 const OWNERSHIP_STUB: &str = "#!/bin/sh\nexit 0\n";
 
-/// Where the primary repository's trust anchor is written in the finished
-/// rootfs, and the `signed-by` its [`sources.list`](write_repository_sources)
-/// references. A binary OpenPGP keyring here lets an in-rootfs `apt-get update`
-/// verify the release without the `debian-archive-keyring` package, which the
-/// base closure does not pull in.
-pub(crate) const TRUST_ANCHOR: &str = "/usr/share/keyrings/debian-archive-keyring.gpg";
+/// The file-name stem the primary repository's trust anchor takes in the
+/// finished rootfs, and so the one name an additional repository may not claim:
+/// [`repository::validate_distinct_entries`] refuses a set that would write a
+/// second keyring here.
+///
+/// [`repository::validate_distinct_entries`]: super::repository::validate_distinct_entries
+pub(crate) const TRUST_ANCHOR_STEM: &str = "debian-archive-keyring";
+
+/// Where a repository's trust anchor is written in the finished rootfs, and the
+/// `signed-by` its [sources file](write_repository_sources) references. A binary
+/// OpenPGP keyring here lets an in-rootfs `apt-get update` verify the release
+/// without the `debian-archive-keyring` package, which the base closure does not
+/// pull in.
+///
+/// The primary's stem is [`TRUST_ANCHOR_STEM`] and an additional repository's is
+/// its [`entry_stem`](Repository::entry_stem); both land in this one directory,
+/// which is why they share one collision set rather than two.
+pub(crate) fn keyring_path(stem: &str) -> String {
+    format!("/usr/share/keyrings/{stem}.gpg")
+}
 
 /// The dpkg statoverride: one record per path whose ownership or mode differs
 /// from what its package shipped.
@@ -441,9 +455,24 @@ fn install_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
 
 /// Removes the ownership-tool stubs from the upper, revealing the base's real
 /// tools through the overlay again.
+///
+/// Conditional on the file still holding the stub body, for the reason
+/// [`restore_ownership_stubs`]'s deletion is: the increment's own unpack wave
+/// runs after the stubs are written, so a package it installs — or the caller's
+/// pre-configure overlay — may have laid a real tool over one. Removing that
+/// would delete a file the merged database says the increment installed, and
+/// reveal the base's older copy in its place. Anything the read refuses to
+/// follow, a symbolic link at the path among them, survives for the same
+/// reason.
 fn restore_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        remove_if_present(upper, &format!("usr/bin/{tool}"))?;
+        let path = format!("usr/bin/{tool}");
+        if upper
+            .read(&path)
+            .is_ok_and(|body| body == OWNERSHIP_STUB.as_bytes())
+        {
+            remove_if_present(upper, &path)?;
+        }
     }
     Ok(())
 }
@@ -726,7 +755,7 @@ fn write_dselect_method(tree: &Rooted) -> Result<(), DebianError> {
 /// Writes every repository's apt source into the finished rootfs.
 ///
 /// The primary repository (index zero) owns `/etc/apt/sources.list` and, when
-/// signed, the canonical [`TRUST_ANCHOR`] keyring path. Each additional
+/// signed, the [`TRUST_ANCHOR_STEM`] keyring path. Each additional
 /// repository writes `/etc/apt/sources.list.d/<name>.list` and, when signed,
 /// its own `/usr/share/keyrings/<name>.gpg`, referenced by a `signed-by` so an
 /// in-rootfs `apt-get update` verifies it against that keyring without the
@@ -737,22 +766,26 @@ fn write_dselect_method(tree: &Rooted) -> Result<(), DebianError> {
 /// is not written into the installed system.
 fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Result<(), DebianError> {
     for (index, repository) in repositories.iter().enumerate() {
-        let (list_path, keyring_path) = if index == 0 {
-            ("etc/apt/sources.list".to_string(), TRUST_ANCHOR.to_string())
+        let (list_path, anchor_path) = if index == 0 {
+            (
+                "etc/apt/sources.list".to_string(),
+                keyring_path(TRUST_ANCHOR_STEM),
+            )
         } else {
-            // Distinct across the set: the configuration refuses two additional
-            // repositories that would write the same pair of files.
+            // Distinct across the set, the primary's anchor included: the
+            // configuration refuses two repositories that would write the same
+            // keyring or the same sources file.
             let stem = repository.entry_stem(index);
             (
                 format!("etc/apt/sources.list.d/{stem}.list"),
-                format!("/usr/share/keyrings/{stem}.gpg"),
+                keyring_path(&stem),
             )
         };
 
         let options = match &repository.trust {
             Trust::Signed(keyring) => {
-                write_keyring(tree, &keyring_path, keyring)?;
-                format!("[signed-by={keyring_path}]")
+                write_keyring(tree, &anchor_path, keyring)?;
+                format!("[signed-by={anchor_path}]")
             }
             Trust::Unsigned => "[trusted=yes]".to_string(),
         };
@@ -879,6 +912,31 @@ mod tests {
     }
 
     #[test]
+    fn a_delta_restores_only_the_stubs_it_wrote() {
+        // The increment's unpack wave runs after the stubs are written, so a
+        // package it installs can lay a real tool over one. Removing that would
+        // delete a file the merged database says is installed and reveal the
+        // base's older copy through the overlay in its place.
+        let (upper, tree) = rooted_tree("delta-ownership-stubs");
+        install_delta_ownership_stubs(&tree).expect("the stubs are written");
+        // What an unpack of a real coreutils leaves behind.
+        let real = b"\x7fELF real chown\n";
+        tree.write("usr/bin/chown", real)
+            .expect("the real tool lands");
+
+        restore_delta_ownership_stubs(&tree).expect("the stubs are restored");
+
+        assert_eq!(
+            fs::read(upper.join("usr/bin/chown")).expect("the real tool survives"),
+            real,
+        );
+        assert!(
+            !upper.join("usr/bin/chgrp").exists(),
+            "an untouched stub is still removed, revealing the base's tool",
+        );
+    }
+
+    #[test]
     fn the_primary_sources_list_is_signed_by_the_trust_anchor() {
         // The primary owns sources.list and the canonical keyring path; the deb
         // line must carry a signed-by naming it, or apt would reject the release
@@ -894,7 +952,7 @@ mod tests {
         write_repository_sources(&tree, &[primary]).expect("the sources are written");
 
         // The keyring lands at the canonical anchor path.
-        let anchor = staging.join(TRUST_ANCHOR.trim_start_matches('/'));
+        let anchor = staging.join(keyring_path(TRUST_ANCHOR_STEM).trim_start_matches('/'));
         assert_eq!(
             fs::read(&anchor).expect("the anchor exists"),
             b"keyring-bytes",
@@ -904,7 +962,8 @@ mod tests {
         assert_eq!(
             sources,
             format!(
-                "deb [signed-by={TRUST_ANCHOR}] http://deb.debian.org/debian trixie main contrib\n"
+                "deb [signed-by={}] http://deb.debian.org/debian trixie main contrib\n",
+                keyring_path(TRUST_ANCHOR_STEM)
             ),
         );
     }
@@ -1028,7 +1087,10 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&sources).unwrap(),
-            format!("deb [signed-by={TRUST_ANCHOR}] file:///srv/pool trixie main\n"),
+            format!(
+                "deb [signed-by={}] file:///srv/pool trixie main\n",
+                keyring_path(TRUST_ANCHOR_STEM)
+            ),
         );
         assert_eq!(
             fs::read_link(staging.join("usr/bin/awk")).unwrap(),

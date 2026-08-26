@@ -253,8 +253,12 @@ The [`fcage`](quick-start.md) tool exposes the native stack with `--netstack`:
 fcage --rootfs ./alpine --netstack /usr/bin/wget -qO- http://example.org
 ```
 
-`--netstack-cidr` and `--netstack-mtu` configure the interface, and
-`--netstack-host-loopback` maps the gateway address onto host `127.0.0.1`.
+Every builder setting has a flag. `--netstack-cidr` and `--netstack-cidr6` set
+the two networks, `--netstack-mtu` and `--netstack-interface` the tap itself,
+and `--netstack-host-loopback` maps the gateway address onto host `127.0.0.1`.
+`--netstack-no-ipv4` and `--netstack-no-ipv6` run one protocol alone, for a host
+or a workload where the other is unwanted; turning both off is refused, there
+being no stack left to attach.
 `--netstack` composes the sandbox's `resolv.conf` from the host's routable
 nameservers. A host offering only loopback resolvers composes nothing and warns:
 the sandbox keeps whatever `resolv.conf` its rootfs ships, which may name a
@@ -262,7 +266,10 @@ routable resolver and work perfectly well, so the warning reports what was not
 composed rather than predicting the run's DNS. `--no-resolv-conf` opts out of
 the composition, and so does `--no-managed-mounts`, whose promise is that the
 sandbox carries exactly the binds the command line names; a profile setting
-either toggle governs it the same way. A rootfs that ships no
+either toggle governs it the same way. A mount of the caller's own onto
+`/etc/resolv.conf` — `--bind`, `--ro-bind` or `--raw-mount` — replaces the
+composed one rather than sitting under it, so a run that supplies its own
+resolver configuration need not also decline this one. A rootfs that ships no
 `/etc/resolv.conf` gets one created to mount onto and taken away again
 afterwards, as every file bind target does. The flag conflicts with
 `--share-net` and with `--restrict`.

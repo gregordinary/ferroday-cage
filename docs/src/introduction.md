@@ -11,10 +11,12 @@ The library is the product. A program links it, configures a sandbox with a
 typed builder, launches a command, and consumes a typed result. A companion
 command-line tool, `fcage`, is a thin consumer of the same public API and
 offers the same sandbox at a shell prompt: it is built with every feature
-enabled, so any profile the library accepts loads there and every builder
-capability has a flag. Two seams stay in the library alone, being the ones no
-argument could carry — handing the command an open descriptor as its standard
-input, and supplying an identity-map delegate as code.
+enabled, so any profile the library accepts loads there and every capability of
+the launch builder has a flag. Two seams stay in the library alone, being the
+ones no argument could carry — handing the command an open descriptor as its
+standard input, and supplying an identity-map delegate as code. The
+[feature guide](features.md#in-the-command-line-tool) states what the tool
+covers of the other builders.
 
 A bare dependency gives the sandbox itself. Provisioning, hardening, profiles,
 and the network stack are opt-in, each named by the chapter that covers it and

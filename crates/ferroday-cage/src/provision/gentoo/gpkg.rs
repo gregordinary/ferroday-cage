@@ -133,6 +133,16 @@ pub(super) struct Package {
     /// The member holding the image archive, with its prefix, so the second
     /// pass can find it again.
     image: Vec<u8>,
+    /// The container itself, held open from the pass that verified it.
+    ///
+    /// The second pass rewinds this rather than opening the path again. The
+    /// cache directory is a caller's, and a caller may point two builds at one:
+    /// a cache entry is published by renaming a staging file over its name, so
+    /// re-opening reads whatever that name now binds and need not be the bytes
+    /// the Manifest was checked against. Holding the descriptor keeps the file
+    /// that was verified the file that is extracted, which is the answer the
+    /// Alpine layer's `Acquired` gives by carrying its own.
+    container: std::fs::File,
 }
 
 impl Package {
@@ -157,7 +167,8 @@ impl Package {
         planned: &PlannedPackage,
         keyring: &Keyring,
     ) -> Result<Package, GentooError> {
-        let scan = scan(path)?;
+        let mut container = std::fs::File::open(path).map_err(GentooError::at("opening", path))?;
+        let scan = scan(path, &mut container)?;
         let manifest = Manifest::verify(path, &scan, keyring)?;
         manifest.hold(path, &scan)?;
         let metadata = read_metadata(path, &scan)?;
@@ -165,6 +176,7 @@ impl Package {
         Ok(Package {
             metadata,
             image: scan.image.clone(),
+            container,
         })
     }
 
@@ -177,11 +189,16 @@ impl Package {
 
     /// Opens the image archive for reading, decompressed.
     ///
-    /// The second pass. Everything it yields was covered by the verified
-    /// Manifest, so this is where a caller may act on the container's contents
-    /// and the first place it may.
-    pub(super) fn image(&self, path: &Path) -> Result<TarReader<Box<dyn Read>>, GentooError> {
-        let file = std::fs::File::open(path).map_err(GentooError::at("opening", path))?;
+    /// The second pass, over the descriptor the first one verified: `path` names
+    /// the container in a failure and is not opened again. See
+    /// [`container`](Self::container) for why.
+    ///
+    /// Everything this yields was covered by the verified Manifest, so it is
+    /// where a caller may act on the container's contents and the first place it
+    /// may.
+    pub(super) fn image(&self, path: &Path) -> Result<TarReader<Box<dyn Read + '_>>, GentooError> {
+        let mut file = &self.container;
+        io::Seek::rewind(&mut file).map_err(GentooError::at("rewinding the container", path))?;
         let mut archive = TarReader::new(io::BufReader::new(file));
         while let Some(entry) = archive
             .next_entry()
@@ -245,8 +262,7 @@ struct Seen {
 /// The prefix is read to find the members and is never trusted as a name: GLEP
 /// 78 says a conforming writer may mismatch it, so what it is used for is
 /// stripping, and what a member *is* comes from its own name below the prefix.
-fn scan(path: &Path) -> Result<Scan, GentooError> {
-    let file = std::fs::File::open(path).map_err(GentooError::at("opening", path))?;
+fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
     let mut archive = TarReader::new(io::BufReader::new(file));
     let mut scan = Scan {
         members: Vec::new(),
@@ -310,15 +326,21 @@ fn scan(path: &Path) -> Result<Scan, GentooError> {
             left: entry.size,
         };
         let (sha512, size) = match held {
-            Some(limit) => {
-                let taken = io::copy(&mut (&mut member).take(limit), &mut buffered)
+            // Refused on the length the entry declares, before a byte of it is
+            // held. `Member` reads no further than that length, so it was
+            // already the bound a `take` restated -- and a take stops at the
+            // ceiling whether the member ends there or runs past it, so the
+            // count it returns cannot tell the two apart and refused a member
+            // that fits with a reason that is not true of it.
+            Some(limit) if entry.size > limit => {
+                return Err(container(
+                    path,
+                    format!("holds a {name} of more than {limit} bytes"),
+                ));
+            }
+            Some(_) => {
+                let taken = io::copy(&mut member, &mut buffered)
                     .map_err(GentooError::at("reading a container member", path))?;
-                if taken == limit {
-                    return Err(container(
-                        path,
-                        format!("holds a {name} of more than {limit} bytes"),
-                    ));
-                }
                 (Algorithm::Sha512.hex_of(&buffered), taken)
             }
             None => digest::stream(Algorithm::Sha512, &mut member)
@@ -885,6 +907,63 @@ mod tests {
                 .map(|(_, bytes)| String::from_utf8_lossy(bytes)),
             Some("sys-libs\n".into()),
         );
+    }
+
+    #[test]
+    fn the_second_pass_reads_the_container_the_first_one_verified() {
+        // The cache directory is a caller's and a caller may point two builds
+        // at one, so a container replaced between the two passes is a real
+        // race. Re-opening the path reads whatever is there now; holding the
+        // descriptor reads the bytes the Manifest was checked against.
+        let dir = Scratch::for_test("gentoo-gpkg", "verified-bytes");
+        let path = dir.join("zlib.gpkg.tar");
+        let key = fixture::signing_key("gentoo <infra@test.invalid>");
+        Built::ordinary().write(&path, &key);
+        let keyring = fixture::keyring(&key);
+        let package =
+            Package::open(&path, &planned(CPV, 1), &keyring).expect("the container verifies");
+
+        // What another build publishing its own container at the same path
+        // does: a staging file renamed over it, which is how every one of the
+        // three layers writes a cache entry. The rename rebinds the name and
+        // leaves this descriptor on the bytes that were verified.
+        let staged = dir.join("zlib.gpkg.tar.staged");
+        let mut swapped = Built::ordinary();
+        swapped.prefix = "somethingelse-9.9-1".to_string();
+        swapped.write(&staged, &key);
+        std::fs::rename(&staged, &path).expect("the other build publishes its container");
+
+        let mut image = package.image(&path).expect("the image archive still opens");
+        assert!(
+            image
+                .next_entry()
+                .expect("the verified image reads")
+                .is_some(),
+            "the second pass reads the container the first one verified",
+        );
+    }
+
+    #[test]
+    fn a_member_of_exactly_the_ceiling_is_not_over_it() {
+        // The copy stops at the ceiling whether the member ends there or runs
+        // past it, so reading the count taken refuses one that fits with a
+        // reason that is not true of it. What the member still holds is what
+        // tells the two apart.
+        let mut built = Built::ordinary();
+        built.metadata = vec![b'm'; MAX_METADATA_BYTES as usize];
+        let err = open("gpkg-ceiling", built, &planned(CPV, 1))
+            .expect_err("the fixture's metadata is not a metadata archive");
+        assert!(
+            !err.to_string().contains("more than"),
+            "a member that fits was refused for its size: {err}",
+        );
+
+        // One byte more is over it, and says so.
+        let mut built = Built::ordinary();
+        built.metadata = vec![b'm'; MAX_METADATA_BYTES as usize + 1];
+        let err = open("gpkg-over-ceiling", built, &planned(CPV, 1))
+            .expect_err("a member past the ceiling is refused");
+        assert!(err.to_string().contains("more than"), "{err}");
     }
 
     #[test]

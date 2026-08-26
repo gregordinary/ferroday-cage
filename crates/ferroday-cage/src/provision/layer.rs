@@ -177,8 +177,21 @@ impl Drop for BuildLayer {
             crate::host::force_remove_dir_all(&self.upper);
             crate::host::force_remove_dir_all(&self.work);
         } else {
-            let _ = crate::provision::remove(&self.upper);
-            let _ = crate::provision::remove(&self.work);
+            // The map the increment was staged under, rather than the
+            // subordinate default: an explicit range map allocates ids the
+            // bundled chain would not, and the removal has to re-enter the map
+            // the tree's ownership was written in.
+            //
+            // And no lock: an upper is a directory a caller named as a build
+            // layer, not a published rootfs, so `<upper>.lock` is a path this
+            // never created and may not delete. The work directory is the
+            // layer's own and has no lock either.
+            for tree in [&self.upper, &self.work] {
+                let _ = crate::provision::Remove::new(tree)
+                    .map(self.identity_map.clone())
+                    .remove_lock(false)
+                    .run();
+            }
         }
     }
 }
@@ -216,5 +229,32 @@ mod tests {
             !work.exists(),
             "the work directory is removed despite mode-0"
         );
+    }
+
+    #[test]
+    fn a_layer_drop_leaves_a_lock_sibling_it_never_created() {
+        // An upper is a directory a caller named as a build layer, not a
+        // published rootfs -- `ensure` wrote no lock beside it, so `<upper>.lock`
+        // is an unrelated path, and deleting it is a removal outside the tree
+        // the layer owns. A build root and its layers routinely sit beside the
+        // published trees a cache holds.
+        let dir = Scratch::for_test("layer", "dispose-lock");
+        let upper = dir.join("upper");
+        std::fs::create_dir_all(&upper).unwrap();
+        let sibling = dir.join("upper.lock");
+        std::fs::write(&sibling, b"someone else's").unwrap();
+
+        // Asserted for the single-identity map, whose removal never touched the
+        // sibling, and for the escalating one, which did.
+        for map in [IdentityMap::Single, IdentityMap::Subordinate] {
+            std::fs::create_dir_all(&upper).unwrap();
+            drop(BuildLayer::new(&upper, map));
+            assert!(!upper.exists(), "the upper is removed");
+            assert!(
+                sibling.exists(),
+                "a lock the layer never created went with it",
+            );
+        }
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"someone else's");
     }
 }

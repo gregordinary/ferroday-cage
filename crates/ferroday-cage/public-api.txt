@@ -800,6 +800,7 @@ pub ferroday_cage::provision::gentoo::GentooEvent::Merging::version: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Occupied
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::atom: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::held: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::installed: bool
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::package: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::second: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::slot: &'a str
@@ -1065,6 +1066,9 @@ pub ferroday_cage::provision::ProvisionError::EntryUnsafe::reason: alloc::string
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::EntryUnsupported
 pub ferroday_cage::provision::ProvisionError::EntryUnsupported::kind: u8
 pub ferroday_cage::provision::ProvisionError::EntryUnsupported::path: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::provision::ProvisionError::ExportDestInside
+pub ferroday_cage::provision::ProvisionError::ExportDestInside::path: std::path::PathBuf
+pub ferroday_cage::provision::ProvisionError::ExportDestInside::rootfs: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::ExportUnprivileged
 pub ferroday_cage::provision::ProvisionError::ExportUnprivileged::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::ExportUnprivileged::reason: alloc::string::String
@@ -1193,6 +1197,7 @@ pub fn ferroday_cage::provision::Export<'a>::map(self, ferroday_cage::IdentityMa
 pub fn ferroday_cage::provision::Export<'a>::mapper(self, &'a dyn ferroday_cage::IdMapper) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::write_to<W: std::io::Write>(self, W) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+pub fn ferroday_cage::provision::Export<'a>::write_to_path(self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl core::fmt::Debug for ferroday_cage::provision::Export<'_>
 pub fn ferroday_cage::provision::Export<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a> core::marker::Freeze for ferroday_cage::provision::Export<'a>
@@ -1285,6 +1290,7 @@ impl<'a> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::mapper(self, &'a dyn ferroday_cage::IdMapper) -> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Remove<'a>
+pub fn ferroday_cage::provision::Remove<'a>::remove_lock(self, bool) -> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::run(self) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl core::fmt::Debug for ferroday_cage::provision::Remove<'_>
 pub fn ferroday_cage::provision::Remove<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

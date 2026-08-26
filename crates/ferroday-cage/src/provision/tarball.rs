@@ -37,6 +37,14 @@ enum Source {
 /// first — the mirror image of [`export_tar`](super::export_tar), which writes
 /// to any `Write`.
 ///
+/// A stream that ends before its first header block holds no archive, and is
+/// refused with [`ProvisionError::FormatUnrecognized`]: an empty file, a
+/// truncated download, and a compression stream whose decoded payload is empty
+/// all arrive that way, and taking one as a complete archive of nothing would
+/// publish an empty tree that every later run then trusted. A *missing final
+/// terminator* is tolerated, as GNU tar tolerates it, but only once at least
+/// one entry has been read.
+///
 /// # Progress and cancellation
 ///
 /// Extraction reports an [`Entry`](ProvisionEvent::Entry) per extracted entry

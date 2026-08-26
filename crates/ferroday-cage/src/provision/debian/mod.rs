@@ -544,10 +544,20 @@ impl<'a> Debian<'a> {
                     .to_string(),
             });
         };
+        // Reading the base's set is what refuses a base that is not a
+        // configured bootstrap, so it runs whether or not a plan makes the
+        // resolution below unnecessary.
         let assume_installed = layer::read_installed_set(&base)?;
 
         let suite = self.suite.clone();
         let (config, fetcher) = self.split();
+        // As for a whole root: a plan is the increment, and staging installs it
+        // verbatim.
+        if let Some(plan) = config.plan {
+            let plan = plan.clone();
+            observer.progress(DebianEvent::Resolved { plan: &plan });
+            return Ok(plan);
+        }
         let architecture = config.architecture.to_string();
         let (packages, archives) = resolve_delta(&config, &assume_installed, fetcher, observer)?;
         Ok(Plan::project(&suite, &architecture, &packages, &archives))
@@ -663,16 +673,28 @@ impl<'a> Debian<'a> {
         // A staging run installs the increment rather than reporting it, so
         // the archive state goes to the `Resolved` event and no further.
         let (config, fetcher) = self.split();
-        let (packages, _archives) =
-            resolve_delta(&config, &assume_installed, fetcher, observer).map_err(wrap)?;
-        // An empty increment — every requested package already in the base —
-        // needs no download or configuration; the build root is the base as it
-        // stands. Skipping here also keeps dpkg from being handed an empty
-        // unpack wave, which it refuses.
-        if packages.is_empty() {
+        let wanted: Vec<Wanted> = match config.plan {
+            // A plan is the resolution here as it is for a whole root: the
+            // release and the index are never fetched, and what it names is
+            // installed over the base. Reported as the resolved manifest so an
+            // observer sees the same event either way.
+            Some(plan) => {
+                observer.progress(DebianEvent::Resolved { plan });
+                plan.packages.iter().map(Wanted::from_planned).collect()
+            }
+            None => {
+                let (packages, _archives) =
+                    resolve_delta(&config, &assume_installed, fetcher, observer).map_err(wrap)?;
+                packages.iter().map(Wanted::from_package).collect()
+            }
+        };
+        // An empty increment — every requested package already in the base, or a
+        // plan that names none — needs no download or configuration; the build
+        // root is the base as it stands. Skipping here also keeps dpkg from
+        // being handed an empty unpack wave, which it refuses.
+        if wanted.is_empty() {
             return Ok(layer);
         }
-        let wanted: Vec<Wanted> = packages.iter().map(Wanted::from_package).collect();
         let installables = acquire_debs(
             fetcher,
             config.repositories,
@@ -908,6 +930,13 @@ impl<'a> DebianBuilder<'a> {
     /// and the fetcher. A package is fetched from the repository its
     /// [`PlannedPackage::archive`] names, so a reproduce run may point the same
     /// plan at a snapshot mirror.
+    ///
+    /// [`base_layer`](Self::base_layer) applies too, and a plan set alongside
+    /// one is the increment rather than the whole root: it is what
+    /// [`Debian::stage_layer`] installs over the base and what
+    /// [`Debian::resolve_layer`] reports, exactly as a plan without a base layer
+    /// is what a whole bootstrap installs. The plan to keep for that is the one
+    /// [`Debian::resolve_layer`] produced.
     pub fn plan(mut self, plan: Plan) -> Self {
         self.plan = Some(plan);
         self
@@ -1363,6 +1392,17 @@ impl Observed<'_, '_> {
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
         let suite = self.debian.suite.clone();
         let (config, fetcher) = self.debian.split();
+        // A plan set with `plan()` *is* the resolution: a bootstrap installs it
+        // verbatim and fetches no index. Resolving afresh here would answer with
+        // a different closure from the one the same value installs, which is the
+        // one thing this is documented not to do -- and the plan is recommended
+        // as a build-cache key, where a key that does not describe what is built
+        // is worse than none.
+        if let Some(plan) = config.plan {
+            let plan = plan.clone();
+            self.sink.progress(DebianEvent::Resolved { plan: &plan });
+            return Ok(plan);
+        }
         let architecture = config.architecture.to_string();
         let (packages, archives) = resolve_packages(&config, fetcher, self.sink)?;
         Ok(Plan::project(&suite, &architecture, &packages, &archives))

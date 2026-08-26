@@ -492,9 +492,16 @@ impl Walker<'_> {
             put(stream, &(stat.st_size as u64).to_le_bytes())?;
             put(stream, &stat.st_dev.to_le_bytes())?;
             put(stream, &stat.st_ino.to_le_bytes())?;
-            // `st_nlink` is u32 or u64 depending on rustix's `Stat` backing;
+            // `st_nlink` is u32 or u64 depending on the architecture's `stat`;
             // normalize to the 8-byte field the parent decodes.
-            #[expect(clippy::useless_conversion)]
+            //
+            // `allow` rather than `expect`, and a conversion rather than a
+            // cast, because either lint fires on some targets and not others:
+            // the conversion is the identity where the field is already 64 bits
+            // and a widening where it is 32, so an expectation of one is
+            // unfulfilled on the targets the other applies to — which fails the
+            // clippy job there. `allow` is the attribute that holds either way.
+            #[allow(clippy::useless_conversion)]
             let nlink = u64::from(stat.st_nlink);
             put(stream, &nlink.to_le_bytes())?;
         }
@@ -564,14 +571,18 @@ impl Walker<'_> {
         stat: &fs::Stat,
     ) -> Result<(), (ExportStep, Errno)> {
         let mut target = [0u8; LINK_BUF];
-        let len = fs::readlinkat_raw(dir, name, &mut target[..]).map_err(|e| {
-            let e = if e == Errno::RANGE {
-                Errno::NAMETOOLONG
-            } else {
-                e
-            };
-            (ExportStep::ReadLink, e)
-        })?;
+        let len = fs::readlinkat_raw(dir, name, &mut target[..])
+            .map_err(|e| (ExportStep::ReadLink, e))?;
+        // `readlinkat` truncates a target too long for the buffer and reports
+        // the truncated length as success, so a full buffer is the only signal
+        // there is and one that exactly fills it cannot be told from one that
+        // did not fit. Refused rather than exported, because a truncated target
+        // extracts as a link pointing somewhere else entirely. Linux caps a
+        // symlink's target at `PATH_MAX - 1`, one byte short of this buffer, so
+        // what this guards is a filesystem that answers for a longer one.
+        if len == target.len() {
+            return Err((ExportStep::ReadLink, Errno::NAMETOOLONG));
+        }
         let stream = self.stream;
         put(stream, &[FRAME_SYMLINK])?;
         put_bytes_u16(stream, name.to_bytes())?;

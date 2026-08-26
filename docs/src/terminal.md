@@ -309,7 +309,9 @@ use ferroday_cage::{Cage, Terminal};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // First of all: blocking the relayed signals is process-wide, and a thread
-    // inherits the signal mask of the thread that created it.
+    // inherits the signal mask of the thread that created it. A failed install
+    // leaves the mask as it found it, so a program that reports this and carries
+    // on still answers a SIGINT.
     let signals = Signals::install()?;
     // Restores the terminal before a backtrace prints, which a guard cannot.
     install_panic_restore();
@@ -362,6 +364,14 @@ the environment, so four decisions belong to the program driving the session:
   nothing, and only `SIGKILL` is left. For `fcage` the handle lives to process
   exit; a longer-lived program holds it for the program's life, which is also
   the one-per-process shape the type asks for.
+
+  That permanence belongs to a *successful* install. A call that blocks the set
+  and then cannot open the descriptor — descriptor exhaustion, a seccomp policy
+  refusing `signalfd4` — restores the exact mask it found before it reports the
+  failure, so a program that logs it and carries on is not left unable to answer
+  `SIGINT` by the call that told it the relay was unavailable. The prior mask is
+  restored rather than the relayed set unblocked, so a signal the program had
+  blocked for its own reasons stays blocked.
 - **Raw mode.** `Relay::raw` is off unless asked. Whether the caller's own
   standard input *is* a terminal is the program's reading to make; `fcage` asks
   `tcgetattr` and passes the answer.

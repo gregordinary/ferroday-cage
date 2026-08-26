@@ -205,16 +205,19 @@ can be disabled:
 - **`/tmp`** is a fresh tmpfs.
 
 The caller's own mounts apply after the managed profile, in configuration
-order, with one exception: the `resolv.conf` bind is applied last of all, so
-it lands over whatever the caller's own mounts established. Binds and raw
-mounts (see [Profiles](profiles.md) for the escape hatch) share one sequence
-rather than being applied kind by kind, so a mount that
+order, with one exception: the `resolv.conf` bind is applied last of all.
+Binds and raw mounts (see [Profiles](profiles.md) for the escape hatch) share
+one sequence rather than being applied kind by kind, so a mount that
 covers a path an earlier one established can be ordered deliberately: a raw
 tmpfs followed by the binds that populate it yields a directory the sandbox
 owns outright, which is how the managed `/dev` is itself assembled.
 
 Last, the host's `resolv.conf` — resolved to its real file — is bound
-read-only onto `/etc/resolv.conf` when the host network is shared.
+read-only onto `/etc/resolv.conf` when the host network is shared. Unless the
+caller mounted that target themselves: a mount of their own there replaces this
+one rather than sitting under it, so applying it last does not take back the
+rule that among the caller's mounts the order is theirs. Every kind of mount
+counts, a raw mount as much as a bind.
 
 ### A read-only bind is a boundary
 

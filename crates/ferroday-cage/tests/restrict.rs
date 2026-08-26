@@ -447,6 +447,26 @@ fn the_working_directory_applies() {
 }
 
 #[test]
+fn the_working_directory_defaults_to_the_root() {
+    if !seccomp_supported() {
+        return;
+    }
+    // The default is `/`, not whatever directory the caller happened to be in:
+    // a restriction that inherited one would run the same command differently
+    // depending on where it was launched from, and a relative path the command
+    // resolves would name a different file each time.
+    let output = Restriction::builder()
+        .command("/bin/pwd")
+        .seccomp(SeccompPolicy::Curated)
+        .build()
+        .expect("a valid restriction configuration")
+        .output()
+        .expect("the restriction launches");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"/\n");
+}
+
+#[test]
 fn the_handle_kills_a_running_command() {
     if !seccomp_supported() {
         return;

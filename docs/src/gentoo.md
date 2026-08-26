@@ -336,6 +336,13 @@ Since nothing backtracks, the resolution keeps the build it chose first and
 reports what could not join it. The order is a resolution's own and is stable,
 so the same install list is refused the same way every time.
 
+The root holds a slot as firmly as the resolution does. Merging registers a
+database entry beside what is already installed and unmerges nothing, so an atom
+answered only by a version later than the one the root has in that slot is
+refused the same way — naming the installed version rather than a second build.
+Bootstrap a root whose version the atom admits, or constrain the atom to the
+version the root already has.
+
 Two *slots* of one package are a different thing and are not a conflict. The
 archive publishes `dev-lang/python` in `3.11` and `3.12`, `llvm`, `gcc`, `ruby`,
 `postgresql` and `qt` in several each, and Gentoo installs them side by side.

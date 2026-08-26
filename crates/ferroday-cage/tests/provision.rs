@@ -715,6 +715,56 @@ fn garbage_is_reported_as_unrecognized() {
 }
 
 #[test]
+fn an_empty_stream_is_unrecognized_rather_than_published_as_an_empty_rootfs() {
+    use std::io::Write;
+
+    // A tar reader tolerates a missing terminator, which is what lets an
+    // archive whose last two blocks never arrived still extract. Applied to a
+    // stream that ended before its *first* header, the same tolerance reports a
+    // complete archive of nothing: `ensure` then publishes the empty staging
+    // tree, and every later call answers `Provisioned::Existing` without
+    // consulting the source again. A failed producer, an empty download, and a
+    // truncated cache entry all arrive as such a stream.
+    let err = provision_err("extract-empty-plain", b"");
+    assert!(
+        matches!(err, ProvisionError::FormatUnrecognized { .. }),
+        "{err}"
+    );
+
+    // The same holds one layer down: a well-formed compression stream whose
+    // decoded payload is empty is not an archive either, and the emptiness is
+    // only visible after the decoder has run.
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(b"").unwrap();
+    let gz = gz.finish().unwrap();
+
+    let xz = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1))
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let zst =
+        ruzstd::encoding::compress_to_vec(&b""[..], ruzstd::encoding::CompressionLevel::Fastest);
+
+    for (name, bytes) in [("gz", gz), ("xz", xz), ("zst", zst)] {
+        let err = provision_err(&format!("extract-empty-{name}"), &bytes);
+        assert!(
+            matches!(err, ProvisionError::FormatUnrecognized { .. }),
+            "format {name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_terminated_empty_archive_publishes_an_empty_rootfs() {
+    // The counterpart the rejection above must not take with it: two zero
+    // blocks are what `tar cf empty.tar --files-from /dev/null` writes, and an
+    // archive that says it holds nothing is an archive.
+    let rootfs = provision("extract-empty-terminated", &[0u8; 1024]);
+    assert_eq!(fs::read_dir(&rootfs).unwrap().count(), 0);
+}
+
+#[test]
 fn truncation_is_reported_as_malformed() {
     let mut tar = TarBuilder::new();
     tar.file("f", 0o644, b"some content");

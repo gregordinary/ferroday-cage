@@ -2076,7 +2076,23 @@ pub(crate) mod serde_request {
         /// Raises a [`SeccompRules`] into its table form, partitioning the
         /// listed syscalls into bare names and argument-conditioned entries.
         /// Rejects a policy with a custom action, which a profile cannot name.
+        ///
+        /// A rule set listing no syscall at all is rejected here for the same
+        /// reason. The table tells its allow side from its deny side by which
+        /// of them is non-empty, so a policy with neither has no table that
+        /// says which it was — it renders as a bare `[hardening.seccomp]` that
+        /// [`into_rules`](SeccompLists::into_rules) then refuses. Reporting it
+        /// on the way out is what keeps the promise that a policy a profile
+        /// cannot express is a serialization error rather than a document that
+        /// will not read back.
         fn from_rules(rules: &SeccompRules) -> Result<SeccompLists, String> {
+            if rules.rules.is_empty() {
+                return Err(
+                    "a seccomp policy listing no syscall cannot be represented in a \
+                            profile: the table names its side by listing one"
+                        .to_string(),
+                );
+            }
             let mut bare: Vec<String> = Vec::new();
             let mut rule_profiles: Vec<RuleProfile> = Vec::new();
             for rule in &rules.rules {

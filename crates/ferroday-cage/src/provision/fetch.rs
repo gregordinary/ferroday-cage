@@ -470,7 +470,8 @@ impl FetchError {
     /// names: an answer over the size the resource may weigh, or a redirect
     /// chain that never arrives at one, is what a mirror did rather than how the
     /// caller spelled it, and each is carried as a transport failure so that a
-    /// walk treats it as one.
+    /// walk treats it as one — as is a redirect refused for leaving the host,
+    /// since where a mirror sends a request is that mirror's arrangement.
     ///
     /// This asks only about the transport. A digest or signature failure is not
     /// a `FetchError` at all — it is the layer's own, raised over bytes that did

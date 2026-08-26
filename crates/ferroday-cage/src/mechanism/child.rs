@@ -465,11 +465,21 @@ fn stage_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
 /// The restriction setup: no namespaces to configure and no root to swap —
 /// only the working directory changes, resolved against the host filesystem,
 /// before the hardening and the exec.
+///
+/// The root is the working directory a plan carrying none means, exactly as it
+/// is for a cage: `validate_workdir` collapses `/` to no workdir at all, so an
+/// absent one and an explicit `/` are the same request. A cage arrives there by
+/// the unconditional `chdir` its pivot ends with, and a restriction pivots
+/// nothing, so it says so here. Without it the command would inherit the
+/// caller's own directory, which is a different command each time it is
+/// launched from somewhere else.
 #[cfg(feature = "hardening")]
 fn setup_restriction(context: &Context<'_>) -> Result<(), Failure> {
-    if let Some(workdir) = &context.plan.workdir {
-        process::chdir(workdir.as_c_str()).map_err(|errno| (SetupStep::ChdirWorkdir, errno, 0))?;
-    }
+    let workdir = match &context.plan.workdir {
+        Some(workdir) => workdir.as_c_str(),
+        None => c"/",
+    };
+    process::chdir(workdir).map_err(|errno| (SetupStep::ChdirWorkdir, errno, 0))?;
     Ok(())
 }
 

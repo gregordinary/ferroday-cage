@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256, Sha512};
 // `md-5` is on `digest 0.10` and `sha2` is on `digest 0.11`, so the two
 // `Digest` traits are distinct types and cannot be imported under one name. The
 // MD5 hasher therefore names its trait through this alias at each call rather
-// than through a bare `Digest` in scope.
+// than through a bare `Digest` in scope. `md-5` moves to `digest 0.11` when
+// `pgp` does, which is what holds the 0.10 generation in the tree.
 #[cfg(feature = "gentoo")]
 use md5::Digest as Md5Digest;
 

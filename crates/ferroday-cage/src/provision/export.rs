@@ -19,8 +19,9 @@
 //! and adds no tar dependency.
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
+use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
@@ -56,7 +57,11 @@ use crate::{IdMapper, IdentityMap};
 /// filesystem stores entries in. With [`clamp_mtime`](Self::clamp_mtime) set,
 /// the archive is byte-reproducible given the tree.
 ///
-/// [`export_tar`] is the shorthand for the common case.
+/// [`write_to_path`](Self::write_to_path) names a file, which the archive is
+/// staged beside and renamed over, so the destination appears complete or not
+/// at all; [`write_to`](Self::write_to) takes any `Write` sink, for a pipe, a
+/// compressor, or a buffer in memory. [`export_tar`] is the shorthand for the
+/// common case.
 ///
 /// # Example
 ///
@@ -169,6 +174,139 @@ impl<'a> Export<'a> {
             self.clamp_mtime,
         )
     }
+
+    /// Writes the archive to the file at `path`, which appears complete or not
+    /// at all.
+    ///
+    /// The bytes go to a staging file beside `path`, which is synced and then
+    /// renamed over it. A failure — an unreadable source entry, an identity map
+    /// no delegate can establish, a full filesystem — removes the staging file
+    /// and leaves whatever was already at `path` untouched, and a crash
+    /// mid-write cannot leave a truncated archive behind a completed rename.
+    /// Writing to the destination directly would instead destroy a previous
+    /// archive to make a partial one, before the export had established that it
+    /// could produce anything at all.
+    ///
+    /// The staging file is created afresh, so `path`'s own inode is replaced
+    /// rather than rewritten: a hard link to the previous archive keeps it, and
+    /// a symlink at `path` is replaced by the archive rather than followed. Its
+    /// permissions are the ones an ordinary shell redirection produces, `0o666`
+    /// less the process umask, and `path`'s previous mode does not carry over.
+    ///
+    /// [`write_to`](Self::write_to) remains the call for a sink that is not a
+    /// file — a pipe, a socket, a buffer in memory, a compressor.
+    ///
+    /// # Errors
+    ///
+    /// As [`write_to`](Self::write_to), plus
+    /// [`ProvisionError::ExportDestInside`] where `path` lies inside the tree
+    /// being exported, which would make the archive a member of itself, and
+    /// [`ProvisionError::Io`] for a failure of the staging file, the sync, or
+    /// the rename.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), ferroday_cage::provision::ProvisionError> {
+    /// use ferroday_cage::IdentityMap;
+    /// use ferroday_cage::provision::Export;
+    ///
+    /// Export::new("/var/lib/myapp/rootfs")
+    ///     .map(IdentityMap::Subordinate)
+    ///     .write_to_path("/var/lib/myapp/rootfs.tar")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_to_path(self, path: impl AsRef<Path>) -> Result<(), ProvisionError> {
+        let path = path.as_ref();
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        refuse_dest_inside(&self.rootfs, path, parent)?;
+
+        // Named for this process, so two exports to one destination stage
+        // separately and the later rename wins -- which is what two shell
+        // redirections to one path do. Composed as an `OsString` rather than
+        // formatted, so a destination whose name is not UTF-8 stages beside
+        // itself rather than under a lossy rendering of itself, which is how
+        // `ensure` names its own staging path.
+        let mut staging_name = OsString::from(".");
+        staging_name.push(path.file_name().unwrap_or_else(|| OsStr::new("export")));
+        staging_name.push(format!(".{}.partial", std::process::id()));
+        let staging = parent.join(staging_name);
+        // A leftover can only be a crashed prior run's, since the pid is this
+        // process's own and no live writer in it shares the name. Creating with
+        // `O_EXCL` afterwards is what makes that the only reading available: a
+        // staging path that reappears between the two is not this run's to
+        // overwrite.
+        match fs::remove_file(&staging) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(ProvisionError::io("removing", &staging, err)),
+        }
+        let file = fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .map_err(|err| ProvisionError::io("creating", &staging, err))?;
+
+        let written = export_inner(
+            &self.rootfs,
+            &file,
+            &self.map,
+            self.mapper,
+            self.clamp_mtime,
+        )
+        .and_then(|()| {
+            file.sync_all()
+                .map_err(|err| ProvisionError::io("syncing", &staging, err))
+        });
+        if let Err(err) = written {
+            let _ = fs::remove_file(&staging);
+            return Err(err);
+        }
+        drop(file);
+
+        fs::rename(&staging, path).map_err(|err| {
+            let _ = fs::remove_file(&staging);
+            ProvisionError::io("publishing", path, err)
+        })?;
+        // The rename is durable only once the directory entry is, which is what
+        // keeps a crash from resurrecting the destination the rename replaced.
+        let parent_dir =
+            fs::File::open(parent).map_err(|err| ProvisionError::io("opening", parent, err))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| ProvisionError::io("syncing", parent, err))
+    }
+}
+
+/// Refuses a destination that lies inside the tree being exported.
+///
+/// The comparison is between the tree and the *directory the archive would be
+/// written into*, both canonicalized, so it is about where the kernel would
+/// resolve to rather than about how the two paths were spelled: a symlinked
+/// directory, a relative source, and a `..` in either all reduce to the same
+/// answer. The destination file itself is not canonicalized, since it need not
+/// exist yet; the directory holding it must, because the staging file goes
+/// there.
+///
+/// Where either side cannot be canonicalized the check abstains -- a missing
+/// rootfs or a missing parent directory is a failure the export itself reports
+/// a moment later, with the operation that met it named.
+fn refuse_dest_inside(rootfs: &Path, dest: &Path, parent: &Path) -> Result<(), ProvisionError> {
+    let (Ok(rootfs_real), Ok(parent_real)) = (fs::canonicalize(rootfs), fs::canonicalize(parent))
+    else {
+        return Ok(());
+    };
+    if parent_real.starts_with(&rootfs_real) {
+        return Err(ProvisionError::ExportDestInside {
+            path: dest.to_path_buf(),
+            rootfs: rootfs.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Writes the finished rootfs at `rootfs` to `writer` as a POSIX/pax tar whose

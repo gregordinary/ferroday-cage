@@ -40,18 +40,31 @@ use crate::provision::binfmt;
 /// [`Pool::architecture`]: super::Pool::architecture
 pub fn host_architecture() -> String {
     let uname = rustix::system::uname();
-    let machine = uname.machine().to_string_lossy();
-    match machine.as_ref() {
+    debian_architecture(&uname.machine().to_string_lossy()).to_string()
+}
+
+/// The Debian architecture a `uname` machine name names.
+///
+/// Separate from [`host_architecture`] so the mapping can be stated for a
+/// machine this one is not: what a name maps to is a fact about the port rather
+/// than about the host reading it.
+fn debian_architecture(machine: &str) -> &str {
+    match machine {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
-        "armv7l" | "armv6l" => "armhf",
+        // armhf's baseline is ARMv7-A with VFPv3-D16, so an ARMv6 machine does
+        // not run it: reported as armhf, its own binaries are foreign to it and
+        // the bootstrap that would have asked for a qemu handler runs them
+        // natively into a SIGILL. armel is the port an ARMv6 machine executes,
+        // its ARMv5TE baseline being a subset of ARMv6.
+        "armv7l" => "armhf",
+        "armv6l" => "armel",
         "i686" | "i586" | "i386" => "i386",
         "ppc64le" => "ppc64el",
         "s390x" => "s390x",
         "riscv64" => "riscv64",
         other => other,
     }
-    .to_string()
 }
 
 /// The merged-usr top-level directories for `architecture`: `bin`, `sbin`,
@@ -80,7 +93,7 @@ fn qemu_interpreter(architecture: &str) -> Option<&'static str> {
     Some(match architecture {
         "amd64" => "x86_64",
         "arm64" => "aarch64",
-        "armhf" => "arm",
+        "armhf" | "armel" => "arm",
         "i386" => "i386",
         "ppc64el" => "ppc64le",
         "s390x" => "s390x",
@@ -196,7 +209,10 @@ pub fn foreign_interpreter(architecture: &str) -> Option<Interpreter> {
         return None;
     }
     let name = qemu_interpreter(architecture)?;
-    let registration = binfmt::parse(&binfmt::read(name)?);
+    // A registration that cannot be read is not one to describe: an
+    // `Interpreter` reporting its absent fields would say the handler names no
+    // interpreter, where what is true is that nothing here could look.
+    let registration = binfmt::parse(&binfmt::read(name).ok().flatten()?);
     let path = registration.interpreter?;
     Some(Interpreter {
         name: name.to_string(),
@@ -284,6 +300,20 @@ mod tests {
         // and an unrelated pair stays foreign.
         assert!(!runs_natively("i386", "amd64"));
         assert!(!runs_natively("arm64", "armhf"));
+    }
+
+    #[test]
+    fn an_armv6_machine_is_armel_rather_than_armhf() {
+        // armhf's baseline is ARMv7-A with VFPv3-D16, so an ARMv6 machine runs
+        // none of it. Reported as armhf, a bootstrap for it would be taken for
+        // native -- the preflight that exists to demand a qemu handler passing
+        // silently -- and the target's own dpkg would SIGILL. armel is what
+        // such a machine executes.
+        assert_eq!(debian_architecture("armv6l"), "armel");
+        assert_eq!(debian_architecture("armv7l"), "armhf");
+        // And armel is a target qemu covers, through the same interpreter
+        // armhf uses, so a cross bootstrap for it is possible at all.
+        assert_eq!(qemu_interpreter("armel"), Some("arm"));
     }
 
     #[test]

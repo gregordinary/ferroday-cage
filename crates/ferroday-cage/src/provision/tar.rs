@@ -3,7 +3,8 @@
 //!
 //! The parser yields entry metadata and streams entry data; it interprets
 //! GNU long-name (`L`)/long-link (`K`) entries and pax extended headers
-//! (`x` per-entry, `g` global) internally, so a consumer only ever sees
+//! (`x` per-entry, and `g` global, whose per-file keywords are read past)
+//! internally, so a consumer only ever sees
 //! concrete file entries with their effective path, link target, size, and
 //! times. Header checksums are verified.
 //!
@@ -99,8 +100,9 @@ struct PaxRecords {
 }
 
 impl PaxRecords {
-    /// Overlays `other` on top of `self`, `other` winning where both are
-    /// set (per-entry records override globals).
+    /// Overlays `other` on top of `self`, `other` winning where both are set:
+    /// a pax header may be split across several `x` entries, and the later one
+    /// states the attribute.
     fn overlaid(&self, other: &PaxRecords) -> PaxRecords {
         PaxRecords {
             path: other.path.clone().or_else(|| self.path.clone()),
@@ -141,14 +143,16 @@ impl HeaderFlaw {
 /// A streaming tar reader over any byte source.
 pub(crate) struct TarReader<R: Read> {
     inner: R,
+    /// Whether a read of `inner` itself failed, as against the bytes it
+    /// produced not being a tar archive. Read by
+    /// [`rejected_at_start`](Self::rejected_at_start).
+    read_failed: bool,
     /// Bytes consumed from the (uncompressed) stream, for error offsets.
     offset: u64,
     /// Unread data bytes of the current entry.
     data_remaining: u64,
     /// Block-padding bytes following the current entry's data.
     padding: u64,
-    /// Global pax records (`g` headers), applying to all later entries.
-    globals: PaxRecords,
     /// Set once the archive terminator or EOF was seen.
     finished: bool,
 }
@@ -157,21 +161,29 @@ impl<R: Read> TarReader<R> {
     pub fn new(inner: R) -> Self {
         TarReader {
             inner,
+            read_failed: false,
             offset: 0,
             data_remaining: 0,
             padding: 0,
-            globals: PaxRecords::default(),
             finished: false,
         }
     }
 
-    /// Whether parsing failed on the very first block.
+    /// Whether the failure was that this is not a tar archive at all.
     ///
     /// Meaningful only after [`next_entry`](Self::next_entry) returned an
-    /// error; used to report "not a tar archive" rather than "corrupt
-    /// archive".
+    /// error; a caller reports "not a tar archive" rather than "corrupt
+    /// archive" on it. True where nothing past the first header block was read
+    /// and what did arrive is not one — a file of some other format, or one too
+    /// short to hold a header.
+    ///
+    /// A read that *failed* is not that, however early it failed. The reader
+    /// underneath is a decompressor, and its refusal — a dictionary over the
+    /// bound, a truncated stream, a frame it will not decode — is a diagnostic
+    /// with a reason in it, which this would replace with a guess about the
+    /// format. The reason is the whole value of such a refusal.
     pub fn rejected_at_start(&self) -> bool {
-        self.offset <= BLOCK
+        !self.read_failed && self.offset <= BLOCK
     }
 
     /// Advances to the next file entry, returning `None` at the end of the
@@ -195,7 +207,16 @@ impl<R: Read> TarReader<R> {
             let header_offset = self.offset;
             let mut block = [0u8; BLOCK as usize];
             if !self.read_block(&mut block)? {
-                // EOF at a header boundary. GNU tar tolerates a missing
+                // EOF before the first header block: there is no archive here.
+                // The tolerance below is for an archive that ran out of
+                // terminator, which presupposes an archive; a stream that
+                // ended before its first header is a file of some other
+                // format, or an empty one, and calling it a complete archive
+                // of nothing publishes an empty rootfs as a finished tree.
+                if header_offset == 0 {
+                    return Err(malformed(0, "the stream holds no archive"));
+                }
+                // EOF at a later header boundary. GNU tar tolerates a missing
                 // two-block terminator, and so do we — unless metadata was
                 // left dangling.
                 if gnu_longname.is_some() || gnu_longlink.is_some() || pax_entry.is_some() {
@@ -239,18 +260,28 @@ impl<R: Read> TarReader<R> {
                     });
                 }
                 b'g' => {
+                    // A global extended header states attributes for every
+                    // entry after it, and every keyword this reader
+                    // understands is a per-file one: a path, a size, an
+                    // owner, a digest. Taking them from here would let one
+                    // record at the head of an archive rename every member —
+                    // or, with a `size` the entry's own header contradicts,
+                    // split one member into two, since the bytes past the
+                    // declared size are read as the next header. That is a
+                    // member set no other reader agrees with, which is the
+                    // shape a tar parser differential takes. GNU tar decodes
+                    // no per-file keyword from a global header either.
+                    //
+                    // The records are still parsed, so a malformed global
+                    // header is a malformed archive rather than a block read
+                    // past without looking.
                     let data = self.read_metadata(header_offset)?;
-                    let records =
-                        parse_pax(&data).map_err(|reason| malformed(header_offset, reason))?;
-                    self.globals = self.globals.overlaid(&records);
+                    parse_pax(&data).map_err(|reason| malformed(header_offset, reason))?;
                 }
                 _ => {
                     // A concrete file entry: fold in the accumulated
                     // metadata, per-entry pax beating GNU long names.
-                    let pax = match pax_entry {
-                        Some(records) => self.globals.overlaid(&records),
-                        None => self.globals.clone(),
-                    };
+                    let pax = pax_entry.unwrap_or_default();
                     if let Some(path) = pax.path {
                         entry.path = path;
                     } else if let Some(longname) = gnu_longname {
@@ -325,10 +356,16 @@ impl<R: Read> TarReader<R> {
         let want = buf
             .len()
             .min(usize::try_from(self.data_remaining).unwrap_or(usize::MAX));
-        let got = self
-            .inner
-            .read(&mut buf[..want])
-            .map_err(|err| malformed(self.offset, &format!("cannot read entry data: {err}")))?;
+        let got = match self.inner.read(&mut buf[..want]) {
+            Ok(got) => got,
+            Err(err) => {
+                self.read_failed = true;
+                return Err(malformed(
+                    self.offset,
+                    &format!("cannot read entry data: {err}"),
+                ));
+            }
+        };
         if got == 0 {
             return Err(malformed(
                 self.offset,
@@ -365,9 +402,16 @@ impl<R: Read> TarReader<R> {
             let want = scratch
                 .len()
                 .min(usize::try_from(skip).unwrap_or(usize::MAX));
-            let got = self.inner.read(&mut scratch[..want]).map_err(|err| {
-                malformed(self.offset, &format!("cannot read the archive: {err}"))
-            })?;
+            let got = match self.inner.read(&mut scratch[..want]) {
+                Ok(got) => got,
+                Err(err) => {
+                    self.read_failed = true;
+                    return Err(malformed(
+                        self.offset,
+                        &format!("cannot read the archive: {err}"),
+                    ));
+                }
+            };
             if got == 0 {
                 return Err(malformed(self.offset, "the archive ends inside an entry"));
             }
@@ -382,9 +426,16 @@ impl<R: Read> TarReader<R> {
     fn read_block(&mut self, block: &mut [u8; BLOCK as usize]) -> Result<bool, ProvisionError> {
         let mut filled = 0;
         while filled < block.len() {
-            let got = self.inner.read(&mut block[filled..]).map_err(|err| {
-                malformed(self.offset, &format!("cannot read the archive: {err}"))
-            })?;
+            let got = match self.inner.read(&mut block[filled..]) {
+                Ok(got) => got,
+                Err(err) => {
+                    self.read_failed = true;
+                    return Err(malformed(
+                        self.offset,
+                        &format!("cannot read the archive: {err}"),
+                    ));
+                }
+            };
             if got == 0 {
                 if filled == 0 {
                     return Ok(false);
@@ -1171,6 +1222,91 @@ mod tests {
         assert_eq!(entry.path, &b"file.txt"[..]);
     }
 
+    /// A pax metadata entry — `x` per-entry or `g` global — carrying `records`,
+    /// followed by the blocks its data occupies.
+    fn pax_block(typeflag: u8, records: &[u8]) -> Vec<u8> {
+        let mut out = sized_header(b"PaxHeaders/entry", records.len() as u64, typeflag).to_vec();
+        let mut data = records.to_vec();
+        data.resize(data.len().next_multiple_of(BLOCK as usize), 0);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn a_reader_that_fails_is_not_a_file_of_another_format() {
+        // The reader under the parser is a decompressor, and its refusals carry
+        // reasons -- a dictionary over the bound, a frame it will not decode.
+        // Reported as "not a tar archive" those reasons are gone, replaced by a
+        // guess about the format, and the guard that produced them exists for
+        // nothing.
+        struct Refusing;
+        impl Read for Refusing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the dictionary is larger than the bound",
+                ))
+            }
+        }
+        let mut reader = TarReader::new(Refusing);
+        let err = reader.next_entry().expect_err("the reader refuses");
+        assert!(
+            err.to_string().contains("larger than the bound"),
+            "{err}, expected the reader's own reason",
+        );
+        assert!(
+            !reader.rejected_at_start(),
+            "a reader that failed said nothing about the format",
+        );
+
+        // What the classification is for: bytes that arrived and are not a tar
+        // header, however few of them there were.
+        let mut reader = TarReader::new(&b"not a tar archive at all"[..]);
+        assert!(reader.next_entry().is_err());
+        assert!(reader.rejected_at_start());
+        let mut reader = TarReader::new(&[b'X'; BLOCK as usize][..]);
+        assert!(reader.next_entry().is_err());
+        assert!(reader.rejected_at_start());
+    }
+
+    #[test]
+    fn a_global_header_states_nothing_about_a_later_entry() {
+        // A `g` header applies to every entry after it, and every keyword this
+        // reader understands is a per-file one. Taking a `size` from one splits
+        // a member in two: the bytes past the declared size are read as the
+        // next header, so this reader's member set differs from that of every
+        // reader that ignores it -- a tar parser differential of exactly the
+        // kind the rest of this module refuses. A `path` from one renames every
+        // member of the archive at once.
+        let payload = b"0123456789abcdef";
+        let mut archive = pax_block(b'g', b"9 size=0\n16 path=renamed\n");
+        archive.extend_from_slice(&sized_header(b"real.txt", payload.len() as u64, b'0'));
+        let mut data = [0u8; BLOCK as usize];
+        data[..payload.len()].copy_from_slice(payload);
+        archive.extend_from_slice(&data);
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+
+        let mut reader = TarReader::new(&archive[..]);
+        let entry = reader.next_entry().unwrap().expect("the file entry");
+        assert_eq!(
+            entry.path,
+            &b"real.txt"[..],
+            "the global path is not the entry's",
+        );
+        assert_eq!(
+            entry.size,
+            payload.len() as u64,
+            "the global size is not the entry's",
+        );
+        let mut body = vec![0u8; payload.len()];
+        let got = reader.read_data(&mut body).expect("the body reads");
+        assert_eq!(&body[..got], payload);
+        assert!(
+            reader.next_entry().unwrap().is_none(),
+            "the archive holds one member, not two",
+        );
+    }
+
     #[test]
     fn a_v7_name_ending_in_a_separator_is_a_directory() {
         // The convention the oldest writers used in place of a typeflag. GNU
@@ -1205,5 +1341,44 @@ mod tests {
         let mut block = ustar_header(b"file.txt", b"");
         block[0] = b'X';
         assert_eq!(parse_header(&block).unwrap_err(), HeaderFlaw::Checksum);
+    }
+
+    #[test]
+    fn a_stream_that_ends_before_its_first_header_holds_no_archive() {
+        // The missing-terminator tolerance below presupposes an archive. A
+        // stream that ended before its first header is a file of some other
+        // format or an empty one, and answering `None` here would report a
+        // complete archive of nothing -- which a publication then publishes as
+        // a finished, empty rootfs that every later run trusts without
+        // reconsulting the source.
+        let mut reader = TarReader::new(&b""[..]);
+        let err = reader
+            .next_entry()
+            .expect_err("an empty stream is no archive");
+        assert!(
+            reader.rejected_at_start(),
+            "{err}, expected a format classification",
+        );
+    }
+
+    #[test]
+    fn a_terminated_empty_archive_holds_no_entries_and_is_not_an_error() {
+        // Two zero blocks are what `tar cf empty.tar --files-from /dev/null`
+        // writes, and it is a valid archive of nothing -- the case the rejection
+        // above must not take with it.
+        let archive = [0u8; 2 * BLOCK as usize];
+        let mut reader = TarReader::new(&archive[..]);
+        assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn an_archive_missing_only_its_terminator_still_reads() {
+        // GNU tar tolerates a truncated two-block terminator and so does this
+        // reader, once at least one header has been consumed.
+        let archive = v7_header(b"file.txt").to_vec();
+        let mut reader = TarReader::new(&archive[..]);
+        let entry = reader.next_entry().unwrap().expect("the file");
+        assert_eq!(entry.path, b"file.txt");
+        assert!(reader.next_entry().unwrap().is_none());
     }
 }

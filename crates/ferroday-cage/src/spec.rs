@@ -56,6 +56,32 @@ const DEV_DEVICES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tt
 /// process umask. This is the conventional directory mode, and what a
 /// distribution ships `/dev` and `/proc` as.
 const DIR_MODE: RawMode = 0o755;
+
+/// The sandbox path the host's resolver configuration is bound onto, and the
+/// one a caller's own mount there replaces.
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// Whether one of the caller's own mounts targets the sandbox's
+/// [`RESOLV_CONF`].
+///
+/// Every kind of mount counts, not only a bind. What the managed mount yields
+/// to is the caller having claimed the target, and a [`Mount::Raw`] carries a
+/// source and the kernel's own flags -- so a bind spelled through the escape
+/// hatch is the more deliberate spelling of the claim, not a weaker one.
+///
+/// The target is compared by its components, which is what a mount target is:
+/// [`path::absolute_components`] is what every mount's target is read through,
+/// so `/etc//resolv.conf` and `/etc/./resolv.conf` are the same target here as
+/// they will be there.
+///
+/// `fcage` asks the same question of the bind a `--netstack` run composes, which
+/// is one this crate never makes and so cannot answer.
+fn mounts_resolv_conf(mounts: &[Mount]) -> bool {
+    let wanted = path::absolute_components(Path::new(RESOLV_CONF)).ok();
+    mounts
+        .iter()
+        .any(|mount| path::absolute_components(mount.get_target()).ok() == wanted)
+}
 /// The mode of a mount point standing in for a world-writable sticky
 /// directory: `/tmp` and `/dev/shm`, which the profile covers with a
 /// `mode=1777` tmpfs.
@@ -1652,6 +1678,11 @@ impl CageBuilder {
     /// Controls whether the host's `resolv.conf` is bound into the sandbox
     /// (default `true`).
     ///
+    /// A [`bind`](Self::bind) of the caller's own onto `/etc/resolv.conf`
+    /// replaces the managed bind rather than sitting under it, so a caller who
+    /// composes their own resolver configuration need not also decline this
+    /// one.
+    ///
     /// The bind only happens with [`Network::Host`], where host DNS
     /// configuration is meaningful: the host's `/etc/resolv.conf` is
     /// resolved to its real file and bound read-only onto
@@ -1944,6 +1975,16 @@ impl CageBuilder {
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
         let command = self.command.ok_or(ConfigError::CommandMissing)?;
+        // An empty path is the absence of a command written down, and every
+        // check below reads it as something else: it carries no slash, so a
+        // path lookup takes it for a bare name to search, and joining it onto a
+        // `PATH` entry yields that entry — leaving a candidate list of
+        // directories that `SearchPathUnusable` has no reason to refuse. What
+        // survives is an `execve` of a directory at launch, reported as a
+        // failure of the sandbox rather than of the configuration.
+        if command.as_os_str().is_empty() {
+            return Err(ConfigError::CommandMissing.into());
+        }
 
         // A command with no slash is resolved against PATH only when path
         // lookup is opted into; otherwise, and for any command that contains a
@@ -2079,7 +2120,14 @@ impl CageBuilder {
                 Mount::Raw(raw) => lowering.push_raw(raw)?,
             }
         }
-        if resolv_conf && matches!(self.network, Network::Host) {
+        // The managed `resolv.conf` bind, unless the caller mounted something of
+        // their own at that target. Theirs was pushed by the loop above and this
+        // would land on top of it, which takes back the "among the caller's
+        // own, the order is theirs" rule for the one mount they were most
+        // deliberate about. A caller who mounts it has replaced the managed one
+        // as surely as `resolv_conf(false)` declines it.
+        if resolv_conf && matches!(self.network, Network::Host) && !mounts_resolv_conf(&self.mounts)
+        {
             lowering.push_resolv_conf()?;
         }
 
@@ -3323,7 +3371,7 @@ impl Lowering {
     /// with every other target the launch creates, and the caller side removes
     /// it once the sandbox is gone.
     fn push_resolv_conf(&mut self) -> Result<(), Error> {
-        let Ok(source) = std::fs::canonicalize("/etc/resolv.conf") else {
+        let Ok(source) = std::fs::canonicalize(RESOLV_CONF) else {
             return Ok(());
         };
         if !source.is_file() {
@@ -3339,7 +3387,7 @@ impl Lowering {
                     read_only: true,
                 },
             },
-            "/etc/resolv.conf".to_string(),
+            RESOLV_CONF.to_string(),
         );
         Ok(())
     }
@@ -3880,6 +3928,27 @@ mod tests {
                 assert_eq!(path, OsStr::new("relative:"));
             }
             other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_command_names_no_command_at_all() {
+        // Every check below reads an empty path as something else: it carries
+        // no slash, so a path lookup takes it for a bare name, and joining it
+        // onto a `PATH` entry yields that entry -- so the search finds a list of
+        // directories and refuses nothing, deferring an `execve` of a directory
+        // to launch. It is the absence of a command, and is reported as one.
+        for builder in [
+            sh_in("/tmp").command("").path_lookup(true),
+            sh_in("/tmp").command(""),
+        ] {
+            assert!(
+                matches!(
+                    builder.build().unwrap_err(),
+                    Error::Config(ConfigError::CommandMissing),
+                ),
+                "an empty command must not build",
+            );
         }
     }
 
@@ -4814,6 +4883,76 @@ mod tests {
             .unwrap();
         assert!(!binds_resolv_conf(&cage));
         assert!(cage.plan.managed_placeholders.is_empty());
+    }
+
+    #[test]
+    fn a_callers_own_resolv_conf_mount_replaces_the_managed_one() {
+        // The caller's mounts go last so their order is theirs, and a managed
+        // mount pushed after them takes that back for the one target they were
+        // most deliberate about: the sandbox's DNS would be the host's however
+        // explicitly they said otherwise.
+        if !host_has_resolv_conf() {
+            return;
+        }
+        let dir = Scratch::new("resolv-replaced");
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::fs::write(dir.join("etc/hosts"), b"127.0.0.1 localhost\n").unwrap();
+        let rootfs = dir.to_str().unwrap();
+
+        let cage = sh_in(rootfs)
+            .network(Network::Host)
+            .bind_ro(dir.join("etc/hosts"), "/etc/resolv.conf")
+            .build()
+            .unwrap();
+        let binds: Vec<&String> = cage
+            .plan
+            .op_labels
+            .iter()
+            .filter(|label| label.contains("/etc/resolv.conf"))
+            .collect();
+        assert_eq!(binds.len(), 1, "one bind at the target, not two: {binds:?}");
+        assert!(
+            binds[0].contains("etc/hosts"),
+            "the caller's own bind is the one in force: {binds:?}",
+        );
+        // Written a way the mount target reader normalizes, and the same
+        // target, so the managed bind is still replaced.
+        let cage = sh_in(rootfs)
+            .network(Network::Host)
+            .bind_ro(dir.join("etc/hosts"), "/etc/./resolv.conf")
+            .build()
+            .unwrap();
+        assert_eq!(
+            cage.plan
+                .op_labels
+                .iter()
+                .filter(|label| label.contains("resolv.conf"))
+                .count(),
+            1,
+        );
+
+        // The same claim spelled through the raw escape hatch. `RawMount`
+        // carries a source and the kernel's own flags, so a bind is expressible
+        // there too -- and a caller who reaches for it has been more explicit
+        // about the target than one who called `bind_ro`, not less.
+        let cage = sh_in(rootfs)
+            .network(Network::Host)
+            .raw_mount(
+                RawMount::new("/etc/resolv.conf")
+                    .source(dir.join("etc/hosts"))
+                    .flags(0x1000), // MS_BIND
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            cage.plan
+                .op_labels
+                .iter()
+                .filter(|label| label.contains("resolv.conf"))
+                .count(),
+            1,
+            "a raw mount at the target replaces the managed bind as a bind does",
+        );
     }
 
     #[test]
@@ -6232,6 +6371,27 @@ port = 8080
                 }]));
         let err = toml::to_string(&builder).unwrap_err();
         assert!(err.to_string().contains("precompiled"), "{err}");
+    }
+
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_seccomp_policy_listing_no_syscall_cannot_be_serialized() {
+        use crate::{SeccompPolicy, SeccompRules};
+        // The table names its side by listing one, so a policy with neither
+        // side populated renders as a bare `[hardening.seccomp]` -- a document
+        // the reader then refuses. Reported on the way out instead, which is
+        // what "a serialization error, never a silent omission" means.
+        for policy in [
+            SeccompPolicy::Rules(SeccompRules::allowing([])),
+            SeccompPolicy::Rules(SeccompRules::denying([])),
+        ] {
+            let builder = Cage::builder()
+                .rootfs("/tmp")
+                .command("/bin/sh")
+                .seccomp(policy);
+            let err = toml::to_string(&builder).expect_err("an empty rule set is refused");
+            assert!(err.to_string().contains("listing no syscall"), "{err}");
+        }
     }
 
     #[cfg(feature = "hardening")]

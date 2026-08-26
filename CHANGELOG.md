@@ -25,6 +25,269 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-25
+
+`fcage` 0.4.1. The two crates version independently and this is the first
+release where their numbers differ within one section, so the `fcage` entries
+below are that version's rather than this heading's.
+
+### Internal
+
+- Dependencies refreshed. `smoltcp` moves to 0.14, whose TCP work is the part
+  that reaches this crate: out-of-window receive handling and MSS selection are
+  more RFC-compliant, Reno and CUBIC were corrected, and fast retransmit
+  improved. `lzma-rust2` moves to 0.20, which fixes an out-of-bounds panic when
+  encoding more than about 2 GiB through one stream and decodes LZMA2 chunks as
+  they arrive rather than buffering each. Everything else moved within its
+  existing range.
+
+  `sha1`, `md-5` and `rand` stay a generation behind on purpose: `pgp` holds the
+  RustCrypto 0.10 line and the `rand` 0.8 line, and a crate this one shares with
+  `pgp` is better shared than duplicated. They move when `pgp` does.
+
+- The xz dictionary bound is the decoder's own. `lzma-rust2` 0.20 accepts a
+  memory limit and checks it against each block header as it parses one, so the
+  container walk that applied the bound from outside — a second parser of the
+  same format, which could only ever be as accurate as its agreement with the
+  first — is gone. The cap and what an archive over it does are unchanged.
+
+### Fixed
+
+- A copy into a rootfs resolves every source entry against the descriptor of
+  the directory holding it. The walk typed each entry without following a
+  symbolic link and then read, opened, or descended into it by path, resolving
+  the name afresh — so an entry replaced by a symbolic link between the two was
+  followed: a directory descended out of the source, or a file streamed from
+  wherever the link pointed.
+- Dropping a `BuildLayer` leaves any `<upper>.lock` sibling alone and removes
+  the increment under the identity map it was staged with. An upper is a
+  directory a caller named as a build layer rather than a published rootfs, so
+  the lock is a path the layer never created — and an explicit range map
+  allocates ids the subordinate default's delegate chain would not.
+- **`fcage`.** An `--alpine-repository keys=` naming nothing is a usage error
+  rather than a directory path. Read as one it named the working directory, and
+  the run ended at an io failure about a directory the caller never typed.
+- **`fcage`.** A bare `--` draws no flag suggestion. It is every flag's prefix,
+  so the abbreviation rule answered it with whichever one sorted first.
+- A `binfmt_misc` registration that is present but unreadable is reported as a
+  handler that cannot be used, not as one that is not registered. The preflight
+  advised installing a handler the kernel already held.
+- A plan document carrying a folded field a newer writer added is written back
+  folded, rather than refused. The reader accepts one, so refusing to write it
+  meant a document this library reads and cannot re-emit — the one thing
+  carrying an unknown field exists to prevent.
+- `AlpineEvent::Downloading` counts the packages being downloaded rather than
+  the plan's. The event fires only for a cache miss, so a fetch of one package
+  out of a ten-package plan was reported as reaching nine of ten.
+- A layered Alpine build terminates a base's carried `triggers` file before
+  appending its own lines, as it already did for the carried package records.
+- `Alpine::resolve` refuses a provisioner configured with a `base_layer`, as
+  `provision::ensure` already did for the same value. It reported the whole-root
+  closure — hundreds of packages the base already carries — where
+  `resolve_layer` is the read half of what such a provisioner does.
+- An Alpine increment with nothing to install still writes its state, so what a
+  caller reads back from the merged view does not depend on whether the delta
+  happened to be empty. A request the base already satisfied reached
+  `/etc/apk/world` only when something else was installed alongside it.
+- An Alpine bootstrap installing a `plan` writes the plan's packages into
+  `/etc/apk/world`. `plan()` forbids `include()`, so the world came out empty
+  and nothing in the finished root said what it wanted — which is what a later
+  `apk fix` acts on.
+- `debian::host_architecture` reports `armel` on an ARMv6 machine, not `armhf`.
+  armhf's baseline is ARMv7-A, so a bootstrap for it on such a host was taken
+  for native — the preflight that demands a qemu handler passing silently — and
+  the target's own binaries met a `SIGILL`.
+- A Gentoo binary package is extracted from the container its Manifest was
+  verified against. The second pass re-opened the path, so two builds sharing a
+  cache directory could have one extract bytes the other published between the
+  passes.
+- A Gentoo container member of exactly the size ceiling is accepted rather than
+  refused for holding "more than" it. The refusal now reads the length the
+  entry declares, which is the bound the read already had.
+- A Gentoo `|| ( )` group asks for nothing rather than for something no
+  candidate can answer. Kept as a dependency it refused the whole resolution,
+  naming an atom with no name.
+- `GentooEvent::Planned` reports a saturating total rather than overflowing on
+  the sizes an index published, which are a mirror's own numbers and bounded by
+  nothing. A debug build panicked on them.
+- A Gentoo index record carrying an `MD5` that is not one is left out of the
+  index, as a record with any other unusable field already was. Such a record
+  could pass no digest check and projected a plan document this crate emits and
+  refuses to read back.
+- A decompressor's refusal survives to the caller instead of being reported as
+  an unrecognized format. A failure before the first tar header — the xz
+  dictionary bound's refusal among them — was reclassified as "not a tar
+  archive", discarding the reason the guard exists to produce.
+- **`fcage`.** A listing whose reader stops early — `fcage --gentoo-packages
+  amd64 | head` — exits 141 in silence, as an export already did, rather than
+  panicking with exit 101. Rust ignores `SIGPIPE`, so the write returns `EPIPE`
+  and `println!` had nowhere to report it.
+- **`fcage`.** A profile's `stop-with-caller = false` holds. `fcage` defaults the
+  tie on, and that default was applied as though it were a setting, so it
+  overrode the profile's answer and left the key unreachable through `fcage`.
+- A mount of the caller's own onto `/etc/resolv.conf` replaces the managed one
+  rather than being superseded by it — the library's for a host-network
+  sandbox, and the one `fcage --netstack` composes. Both were applied after the
+  caller's mounts, so the sandbox's DNS was the host's however explicitly the
+  caller said otherwise. Every kind of mount counts: a `Mount::Raw` carries a
+  source and the kernel's own flags, so a bind spelled through it claims the
+  target as much as `bind_ro` does.
+- An empty command path is refused at `build` as `ConfigError::CommandMissing`,
+  by a cage and by a restriction alike. Under `path_lookup` a cage read it as a
+  bare name, found every `PATH` entry a candidate, and deferred an `execve` of a
+  directory to launch.
+- A userspace-networking flow whose host side has hung up is reclaimed only
+  after the hangup deadline passes with *nothing moving*. The clock ran from the
+  moment the guest's transmit buffer filled and consulted nothing after that, so
+  a guest draining more slowly than the host queued was reset while it was still
+  reading.
+- A Gentoo package rebuilt against a new sub-slot replaces the base's copy in a
+  layered build's merged view rather than joining it. The merge matched on the
+  whole `slot/subslot`, where a slot is the part before the slash, so the view
+  described a root holding two instances of one slot.
+- A Gentoo `~` atom admits every spelling of the version it names. Two versions
+  the format's ordering calls equal were compared as text, so
+  `~cat/pkg-1.0_alpha` refused a published `1.0_alpha0` that `=cat/pkg-1.0_alpha`
+  accepts.
+- A `.deb`'s control member is bounded decompressed as well as compressed, as
+  Alpine's control segment already was. The member is a compression format, so
+  one comfortably inside the wire bound could decompress to an unbounded
+  `./control` and be accumulated in memory.
+- A plan set alongside a `base_layer` is the increment a layered build installs.
+  The layered path read no plan at all, and `plan()` forbids `include()`, so the
+  seed was empty: `stage_layer` returned a build layer over an empty upper
+  having installed nothing, and `resolve_layer` reported that same empty
+  closure.
+- `Debian::resolve` answers with the plan the provisioner was configured with,
+  rather than resolving a fresh closure the same value would not install. The
+  documentation states the two cannot drift and recommends the plan as a
+  build-cache key.
+- A pax global extended header no longer states a path, size, owner or digest
+  for the entries after it. A global `size` split one archive member into two,
+  since the bytes past the declared size were read as the next header, which is
+  a member set no other reader agrees with.
+- Merging a Gentoo binary package leaves the root's own mode and modification
+  time alone. The wrapper directory an image archive is built under stripped to
+  the empty path and was read as the archive's root entry, so every merge
+  applied that directory's metadata to the rootfs root.
+- Serializing a seccomp policy that lists no syscall is a serialization error
+  rather than a profile that cannot be read back. `SeccompRules::allowing([])`
+  rendered as a bare `[hardening.seccomp]` table, which the reader then refused
+  for naming neither side.
+- A restriction starts its command in `/` where none is configured, which is
+  what `RestrictionBuilder::current_dir` documents as the default. The command
+  inherited the caller's own working directory instead, so the same restriction
+  ran differently depending on where it was launched from. Note that a
+  restriction that resolved a relative path against the inherited directory
+  resolves it against `/` now, and does so without an error: this is the one
+  fix in the release that relocates a working command rather than turning a
+  wrong result into a right one or into a failure. Such a caller sets
+  `current_dir` to the directory it was inheriting.
+- A `Location: //host/path` redirect resolves to that host, as RFC 3986 defines
+  a network-path reference, rather than to a doubled-slash path on the mirror's
+  own host. The same-host policy then refuses it unless cross-host redirects are
+  enabled.
+- An interim `1xx` response is read past rather than reported as the answer. A
+  server sending `103 Early Hints` before the response, which RFC 9110 permits
+  whether or not the client asked for hints, failed the fetch with a status
+  error.
+- A redirect's own page is not held to the cap on the resource being fetched. A
+  mirror answering a request for a small signed index with an ordinary HTML
+  redirect page failed the fetch before the redirect was followed.
+- `HttpFetch::request_timeout` bounds the walk over the addresses a host
+  resolves to, not only the reads once a connection is open. A host with eight
+  addresses and no route to some of them waited the connect timeout for each,
+  which multiplies past the ceiling the caller set on the fetch.
+- A redirect refused for leaving the mirror's host is a failure a mirror walk
+  advances past, as a redirect chain that never arrives already was. One
+  CDN-redirecting mirror in a list aborted the whole walk.
+- **Security. `fcage`.** `--debian-repository trust-unsigned=false` disabled
+  archive signature verification. The field's presence is the whole of its
+  meaning and its value was discarded, so a value written to turn it off turned
+  it on. A value on `trust-unsigned` or `allow-stale-release` is now a usage
+  error; the setting is left out to have it off.
+- **`fcage`.** A flag written where a separated value belongs is a usage error
+  rather than the value. `fcage --remove-rootfs --identity-map=subordinate`
+  took the map's spelling as the tree to delete and reported success having
+  removed a path of that name in the working directory instead. A value that is
+  genuinely spelled like a flag is written joined, `--remove-rootfs=--odd`, and
+  a value that merely begins with a dash is unaffected.
+- A rootfs export refuses a symbolic link whose target fills the mechanism's
+  link buffer rather than exporting the truncated target as a whole one.
+  `readlinkat` truncates and reports success, so the `ERANGE` the export tested
+  for is one the kernel never returns.
+- The rootfs export builds on every architecture. A lint expectation on the
+  link-count field held only where `st_nlink` is already 64 bits, so a clippy
+  run on any other architecture failed on the unfulfilled expectation.
+- A layered Debian build removes an ownership-tool stub only where the file
+  still holds the stub, as the full bootstrap already did. The increment's
+  unpack wave runs after the stubs are written, so a real `chown` or `chgrp` the
+  increment installed was deleted and the base's copy revealed in its place.
+- A Gentoo resolution refuses a build that would occupy a slot the root already
+  holds, as it already refused one occupying a slot another chosen build holds.
+  Merging registers a database entry beside what is installed and unmerges
+  nothing, so a same-slot upgrade over a stage3 laid a second image down over
+  the first's paths and left a `/var/db/pkg` portage reads as a conflict.
+  `GentooEvent::Occupied` gains `installed`, which says which of the two the
+  slot's holder is.
+- A subkey re-bound over time is judged on the newest binding its certificate
+  issued. The hash floor and the critical-subpacket rule were applied when
+  choosing which binding governs rather than to the one that does, so a newer
+  binding that narrowed a subkey's authority but rested on a weak hash was
+  passed over and the superseded, broader grant governed instead.
+- A Debian repository set is refused when an additional repository would write
+  the keyring the primary's `sources.list` names, rather than accepted and
+  written in the order that leaves the primary archive verified against the
+  additional repository's key.
+- Debian version comparison reads a version only as far as dpkg would. A
+  version carrying an interior NUL made the comparison of two version fields
+  spin without either cursor advancing, which a caller's plan document or a
+  base layer's own `dpkg/status` could reach.
+- A stream that ends before its first tar header is refused as
+  `ProvisionError::FormatUnrecognized` rather than read as a complete archive
+  holding nothing. An empty file, a download that produced nothing, and a
+  compression stream decoding to an empty payload were each published as a
+  finished, empty rootfs, which every later `provision::ensure` then returned as
+  `Provisioned::Existing` without consulting the source again. An archive
+  missing only its final terminator is still tolerated.
+- `relay::Signals::install` restores the caller's signal mask when it blocks the
+  relayed set and then cannot open the descriptor. The blocked set survived a
+  failed call with nothing draining it, so a program that reported the failure
+  and carried on no longer answered `SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGQUIT`
+  at all.
+- **`fcage`.** A failed `--export-rootfs ... --export-to FILE` leaves an
+  existing archive at `FILE` as it found it. The destination was opened, and so
+  truncated, before the export had established it could produce anything, and
+  removing the partial result does not bring the previous archive back.
+
+### Added
+
+- `Remove::remove_lock` sets whether the `<dest>.lock` sibling goes with the
+  tree. It defaults to `true`, which is what `provision::remove` does — right
+  for a published rootfs, wrong for a destination that merely holds published
+  trees, where the sibling is an unrelated path the caller never named as a
+  target.
+- `Export::write_to_path` writes the archive to a named file, which then appears
+  complete or not at all: the bytes go to a staging file beside it, which is
+  synced and renamed over the destination. A destination inside the tree being
+  exported is refused with the new `ProvisionError::ExportDestInside`.
+- **`fcage`.** `--netstack-cidr6`, `--netstack-no-ipv4`, `--netstack-no-ipv6`,
+  and `--netstack-interface`, which complete the native network stack's
+  command-line surface. A stack running one protocol alone, on a host or for a
+  workload where the other is unwanted, was expressible only from a program.
+- **`fcage`.** `--debian-plan`, `--debian-pin`, `--alpine-plan`, and
+  `--alpine-pin` take the plan documents a previous resolution wrote, as
+  `--gentoo-plan` already did, so a reproducible install is expressible at a
+  shell prompt for each of the three userlands.
+
+### Internal
+
+- `tools/parity.toml` records every public builder setting against the flag that
+  reaches it or the reason it has none, and `tools/check-parity.py` holds the
+  record to the API snapshot and to the CLI's flag table. The CLI's own tests
+  read that table, so a library setting absent from it was absent from both
+  sides of every comparison they could make.
+
 ## [0.4.1] - 2026-08-22
 
 ### Added
@@ -890,7 +1153,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.2.0...v0.3.0

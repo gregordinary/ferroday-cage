@@ -1104,6 +1104,102 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
 }
 
 #[test]
+fn hermetic_a_plan_is_the_increment_a_layered_build_installs() {
+    // A plan set alongside a base layer describes the increment. The layered
+    // path read no plan at all and `plan()` forbids `include()`, so the seed was
+    // empty: `stage_layer` returned a build layer over an empty upper having
+    // installed nothing, and `resolve_layer` reported that same empty closure.
+    let dir = common::scratch_dir("debian-layer-plan");
+    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&dir) {
+        eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
+        return;
+    }
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload("base"), ""),
+            Pkg::ordinary("extra", payload("extra")),
+        ],
+    );
+
+    // A configured base carrying only `base`.
+    let base_dir = dir.join("base");
+    let dpkg = base_dir.join("var/lib/dpkg");
+    std::fs::create_dir_all(&dpkg).unwrap();
+    std::fs::write(
+        dpkg.join("status"),
+        "Package: base\nStatus: install ok installed\nVersion: 1.0\n",
+    )
+    .unwrap();
+
+    let layered = |plan: Option<Plan>| {
+        let mut builder = Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(mirror.clone())
+            .trust_unsigned(true)
+            .cache_dir(dir.join("cache"))
+            .base_layer(&base_dir);
+        builder = match plan {
+            Some(plan) => builder.plan(plan),
+            None => builder.include(["extra"]),
+        };
+        builder.build().expect("the builder validates")
+    };
+
+    let plan = layered(None)
+        .resolve_layer()
+        .expect("the increment resolves");
+    assert_eq!(
+        plan.packages
+            .iter()
+            .map(|package| package.name.clone())
+            .collect::<Vec<_>>(),
+        ["extra"],
+        "the base already carries `base`, so the increment is `extra` alone",
+    );
+
+    // The plan is what the layered resolve answers with, rather than a closure
+    // resolved from an empty seed.
+    let answered = layered(Some(plan.clone()))
+        .resolve_layer()
+        .expect("a configured plan needs no archive to answer");
+    assert_eq!(
+        answered
+            .packages
+            .iter()
+            .map(|package| package.name.clone())
+            .collect::<Vec<_>>(),
+        ["extra"],
+    );
+
+    // And it is what staging installs. The configure wave needs a real dpkg in
+    // the base, which this fixture has none of, so the call fails there -- what
+    // this asserts is that the increment's package was fetched, which an empty
+    // layer would not have done.
+    let watcher = Watching::default();
+    let asked = std::sync::Arc::clone(&watcher.asked);
+    let mut staging = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .base_layer(&base_dir)
+        .plan(plan)
+        .fetcher(Box::new(watcher))
+        .build()
+        .expect("the builder validates");
+    let _ = staging.stage_layer(dir.join("upper"));
+    let urls = asked.lock().unwrap().clone();
+    assert!(
+        urls.iter()
+            .any(|url| url.contains("/pool/") && url.contains("extra")),
+        "the plan's package was never fetched: {urls:?}",
+    );
+}
+
+#[test]
 fn hermetic_a_failed_stage_layer_disposes_of_the_upper_it_created() {
     // stage_layer creates the upper before it resolves, and a failure hands the
     // caller no BuildLayer to drop — so the upper it created has to go with the
@@ -2573,6 +2669,43 @@ fn the_guides_sample_document_is_what_the_library_emits() {
         "the guide's sample is not what the library emits",
     );
     assert!(rendered.ends_with("\n\n"), "{rendered:?}");
+}
+
+#[test]
+fn a_configured_plan_is_what_resolve_answers_with() {
+    // `resolve` and `ensure` are documented as one code path, and the plan is
+    // recommended as a build-cache key. Resolving afresh on a provisioner that
+    // already carries a plan answered with a whole fresh closure while `ensure`
+    // on the same value installed the plan's, so the key described a rootfs
+    // nothing built.
+    let (dir, mirror, plan) = resolved_fixture("debian-plan-resolve-agrees");
+    let mut trimmed = plan.clone();
+    trimmed.packages.truncate(1);
+
+    let answered = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .cache_dir(dir.join("cache"))
+        .extract_only(true)
+        .plan(trimmed.clone())
+        .build()
+        .expect("the builder validates")
+        .resolve()
+        .expect("a configured plan needs no archive to answer");
+    assert_eq!(
+        answered
+            .packages
+            .iter()
+            .map(|package| package.name.clone())
+            .collect::<Vec<_>>(),
+        trimmed
+            .packages
+            .iter()
+            .map(|package| package.name.clone())
+            .collect::<Vec<_>>(),
+        "resolve answered with a closure the same value would not install",
+    );
 }
 
 #[test]

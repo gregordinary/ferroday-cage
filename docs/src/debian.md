@@ -1083,6 +1083,12 @@ present in `base + toolchain`, that delta is small — which is the point.
 [`resolve_layer`] previews it without staging, the layered counterpart of
 [`resolve`], so a build-root cache can be keyed on the increment inline.
 
+A plan reproduces a layer exactly as it reproduces a whole root. Keep the one
+[`resolve_layer`] returned, hand it back through [`plan`] alongside the same
+[`base_layer`], and `stage_layer` installs those packages at those versions
+without fetching a release or an index — the increment's counterpart of the
+pinned install below.
+
 `stage_layer` installs the delta into the overlay upper and returns a
 [`BuildLayer`]. Root a cage on [`overlay_rootfs`] with the base as the read-only
 lower and the layer's `path()` as the writable upper, and the build sees the
@@ -1172,7 +1178,11 @@ a retired key cannot vouch for a release. Debian's archive keys sign with a
 dedicated signing subkey rather than the primary, and a subkey is admitted only
 on the terms OpenPGP sets for one: the primary must have bound it with the
 signing capability, the subkey must have counter-signed that binding, and the
-binding must not be revoked. A subkey's authority is delegated from its primary,
+binding must not be revoked. Where a subkey has been re-bound over time, the
+newest binding the primary issued is the one judged: it is the certificate's
+latest word on that subkey, so a defect in it refuses the subkey rather than
+returning authority to the superseded, possibly broader grant it replaced. A
+subkey's authority is delegated from its primary,
 so it lapses when the primary's does — the expiry that governs is whichever of
 the certificate's, the binding's and the counter-signature's comes first. A
 keyring holding several keys is searched in full, and every signature a key made

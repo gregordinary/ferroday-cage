@@ -184,6 +184,13 @@ Two further gates matter when the public API moves:
   neither. Losing an auto trait is a breaking change; if a change withdraws
   one, the assertion and its recorded reason both need updating.
 
+- **Command-line parity.** `tools/check-parity.py` records every public builder
+  setting against the flag that reaches it, or the reason it has none, and
+  fails on any difference. `fcage`'s own tests read its `FLAGS` table, so a
+  library setting the table never learned is absent from both sides of every
+  comparison they can make; `tools/parity.toml` is the other side. It reads the
+  API snapshot above, so regenerate that first when the public surface moves.
+
 - **The provisioning seam.** `tools/check-seam.py` records what each userland
   reaches for outside `provision`, and fails on any difference. The three
   layers sit on a seam they could one day be crates of their own on, and this
@@ -346,6 +353,7 @@ type yet; when it grows one, it is this row it extends.
 | Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `alpine::version::Constraint::satisfied_by`, `debian::version::Constraint::satisfied_by` |
 | What version does a `Provides`-style entry supply a name at? | `provision::alpine::version::Constraint::exact_version`, `debian::version::Constraint::exact_version` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
+| Which slot does a `slot/subslot` value name? | `provision::gentoo::installed::slot_of` |
 | What did one resolution refuse, and how does it read? | `provision::gentoo::resolve::Refusals`, `debian::resolve::Refusals` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What may a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |

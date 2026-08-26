@@ -224,7 +224,14 @@ pub enum ConfigError {
     },
     /// The rootfs resolves to the host root directory.
     RootfsIsHostRoot,
-    /// No command was provided.
+    /// No command was provided, or the path given names nothing.
+    ///
+    /// An empty path is the second: it is not a command that could not be
+    /// found, it is the absence of one written down. Every later check reads it
+    /// as something else — it carries no slash, so a path lookup takes it for a
+    /// bare name and joining it onto a `PATH` entry yields that entry — so it is
+    /// refused where the command is read rather than deferred to an `execve` of
+    /// a directory.
     CommandMissing,
     /// The command path is not absolute.
     ///

@@ -69,7 +69,7 @@ const RANK_P: usize = SUFFIXES.len() - 1;
 /// The fields are in comparison order and [`Ord`] compares them in that order:
 /// the numeric components, then the letter, then the suffixes, then the
 /// revision. That order is the format's rather than a choice.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct Version<'a> {
     /// The dotted components, as written, at least one.
     numbers: Vec<&'a str>,
@@ -107,6 +107,22 @@ impl PartialOrd for Version<'_> {
         Some(self.cmp(other))
     }
 }
+
+/// Equality is the ordering's, which is what stops the two from disagreeing.
+///
+/// A derived equality would compare the text each field borrows, and this format
+/// spells one version several ways: `1.0_alpha` and `1.0_alpha0` carry the same
+/// suffix, `1.01` and `1.010` the same fractional component, `1.0` and `1.0-r0`
+/// the same revision. Comparing them as written makes two versions the ordering
+/// calls equal unequal, so `~cat/pkg-1.0_alpha` would refuse a published
+/// `1.0_alpha0` that `=cat/pkg-1.0_alpha` accepts.
+impl PartialEq for Version<'_> {
+    fn eq(&self, other: &Version<'_>) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Version<'_> {}
 
 impl<'a> Version<'a> {
     /// The version with its revision removed, which is what `~` matches over.
@@ -301,7 +317,9 @@ pub(super) fn compare(a: &str, b: &str) -> Option<Ordering> {
 ///
 /// Both are parsed rather than compared as text: `1.0-r0`, `1.0` and `1.0.0`
 /// are two versions and three spellings, and the operator is about the first
-/// distinction rather than the second.
+/// distinction rather than the second. The comparison that answers it is
+/// [`Version`]'s own, which is the ordering rather than the text — see the
+/// [`PartialEq`] impl for the spellings that would otherwise differ.
 pub(super) fn same_but_revision(candidate: &str, wanted: &str) -> bool {
     match (parse(candidate), parse(wanted)) {
         (Some(candidate), Some(wanted)) => {
@@ -432,6 +450,15 @@ mod tests {
         assert!(!same_but_revision("1.0.0", "1.0"));
         assert!(!same_but_revision("1.1", "1.0"));
         assert!(!same_but_revision("1.0_p1", "1.0"));
+        // Two spellings of one version, which the ordering calls equal and a
+        // text comparison would not: `~cat/pkg-1.0_alpha` has to admit a
+        // published `1.0_alpha0` exactly as `=cat/pkg-1.0_alpha` does.
+        assert_eq!(compare("1.0_alpha", "1.0_alpha0"), Some(Ordering::Equal));
+        assert!(same_but_revision("1.0_alpha0", "1.0_alpha"));
+        assert!(same_but_revision("1.0_alpha-r2", "1.0_alpha0"));
+        // The same for a fractional component with a trailing zero.
+        assert_eq!(compare("1.01", "1.010"), Some(Ordering::Equal));
+        assert!(same_but_revision("1.010", "1.01"));
     }
 
     #[test]

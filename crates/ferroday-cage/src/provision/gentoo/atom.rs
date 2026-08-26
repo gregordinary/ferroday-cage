@@ -602,6 +602,10 @@ pub(super) enum Dependency {
     One(Atom),
     /// `|| ( a b c )`: any one of these satisfies it.
     ///
+    /// Never empty: an any-of group with no alternatives asks for nothing and is
+    /// dropped where it is parsed, so a resolver reading one of these has an
+    /// alternative to consider.
+    ///
     /// A group nested inside another of its own kind is flattened away by the
     /// parser, since it means the same as its contents spliced in. One nested
     /// inside a group of the other kind is refused rather than flattened; see
@@ -624,10 +628,18 @@ pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
                 if tokens.next() != Some("(") {
                     return Err("an `||` is not followed by a group".to_string());
                 }
-                out.push(Dependency::AnyOf(parse_group(
-                    &mut tokens,
-                    Grouping::AnyOf,
-                )?));
+                let alternatives = parse_group(&mut tokens, Grouping::AnyOf)?;
+                // A group with nothing in it asks for nothing, exactly as the
+                // empty all-of group below does: that arm splices its contents,
+                // and an empty one contributes none. Kept, this would reach the
+                // resolver as a dependency with no alternative to try, refusing
+                // the whole run over an atom with no name in the message.
+                //
+                // The index is USE-evaluated, so a group whose every
+                // alternative was conditioned out is how an empty one arrives.
+                if !alternatives.is_empty() {
+                    out.push(Dependency::AnyOf(alternatives));
+                }
             }
             // A bare group with no operator is an all-of group, which means
             // the same as its contents written out, so it is spliced in.
@@ -977,6 +989,20 @@ mod tests {
         assert!(parse_class("|| a-b/c").is_err());
         // An empty class is no dependencies rather than a failure.
         assert!(parse_class("").expect("an empty class").is_empty());
+        // So is a group with nothing in it, of either kind: it asks for
+        // nothing. An empty any-of kept as a dependency has no alternative for
+        // the resolver to try, so it refuses the whole run over an atom with no
+        // name -- and the index is USE-evaluated, so a group whose every
+        // alternative was conditioned out is how one arrives.
+        assert!(parse_class("|| ( )").expect("an empty any-of").is_empty());
+        assert!(parse_class("( )").expect("an empty all-of").is_empty());
+        let with_empty = parse_class("a-b/c || ( ) d-e/f").expect("a class holding an empty group");
+        assert_eq!(with_empty.len(), 2);
+        assert!(
+            with_empty
+                .iter()
+                .all(|dep| matches!(dep, Dependency::One(_)))
+        );
     }
 
     /// Asserts that `class` reads as one any-of group offering `count`

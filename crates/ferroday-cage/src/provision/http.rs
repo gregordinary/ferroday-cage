@@ -30,6 +30,17 @@ use super::fetch::{Fetch, FetchError, FetchJob, FetchRequest};
 /// A consumer that must fetch something larger supplies their own [`Fetch`].
 const MAX_BODY: u64 = 2 * 1024 * 1024 * 1024;
 
+/// How many interim (`1xx`) responses are read past before the peer is treated
+/// as never intending to send a final one. A server sends at most a handful,
+/// and each costs a round trip's worth of parsing.
+const MAX_INTERIM_RESPONSES: u32 = 8;
+
+/// How much of a redirect's own body is read off so the connection can serve
+/// the next request. Nothing here reads it, so the only question the number
+/// answers is how large a page is worth keeping a connection for; a redirect
+/// page is a few hundred bytes of HTML and this is far above any of them.
+const MAX_REDIRECT_BODY: u64 = 64 * 1024;
+
 /// The ceiling on a single framing line — the status line, a header line, or a
 /// chunk-size line. Real ones are a few hundred bytes at most; a larger one is
 /// a hostile or broken mirror, not a legitimate response. Bounding each line
@@ -135,9 +146,12 @@ impl HttpFetch {
     /// take, or `None` to remove the bound. The default is one hour per file;
     /// raise it only to fetch an unusually large artifact over a slow link.
     ///
-    /// One fetch means one call, whatever it takes to answer: a redirect chain
-    /// and the retry a connection reused from an earlier fetch is allowed both
-    /// come out of this budget rather than starting a fresh one.
+    /// One fetch means one call, whatever it takes to answer: a redirect chain,
+    /// the retry a connection reused from an earlier fetch is allowed, and the
+    /// walk over the addresses a host resolves to all come out of this budget
+    /// rather than starting a fresh one. The one step it cannot bound is the
+    /// address resolution itself, which the platform's resolver answers on a
+    /// timeout of its own.
     ///
     /// A timeout beyond what the clock can express removes the bound as well:
     /// there is no faithful deadline for one, and asking to wait that long is
@@ -397,11 +411,24 @@ impl HttpFetch {
                 kept.reader
             }
             None => {
+                // The deadline bounds the whole fetch, so it is checked before
+                // the work rather than only once bytes are moving. Address
+                // resolution is the one step inside it that cannot be bounded
+                // here: `to_socket_addrs` uses the platform's resolver, which
+                // takes no deadline of its own and answers on its own timeout.
+                if expired(deadline) {
+                    return Err(Exchange::BeforeBody(deadline_elapsed(
+                        "resolving the address",
+                        url,
+                    )));
+                }
                 let addrs = (parsed.host.as_str(), parsed.port)
                     .to_socket_addrs()
                     .map_err(io("resolving the address"))
                     .map_err(Exchange::BeforeBody)?;
-                let stream = self.connect(url, addrs).map_err(Exchange::BeforeBody)?;
+                let stream = self
+                    .connect(url, addrs, deadline)
+                    .map_err(Exchange::BeforeBody)?;
                 BufReader::new(DeadlineReader {
                     inner: stream,
                     deadline,
@@ -438,12 +465,44 @@ impl HttpFetch {
             .map_err(io("sending the request"))
             .map_err(Exchange::BeforeBody)?;
 
-        let status = read_status(&mut reader)
+        let mut status = read_status(&mut reader)
             .map_err(io("reading the response"))
             .map_err(Exchange::BeforeBody)?;
-        let headers = read_headers(&mut reader)
+        let mut headers = read_headers(&mut reader)
             .map_err(io("reading the response"))
             .map_err(Exchange::BeforeBody)?;
+
+        // An interim response is not the answer to the request. RFC 9110
+        // section 15.2 requires a client to read past one it never asked for,
+        // which a server may send at any time — `103 Early Hints` is the one in
+        // use — and a client that took the first status line for the final one
+        // reports the hint as a status failure. An interim response ends at its
+        // own blank line and carries no body, so reading the next status and
+        // headers is the whole of skipping it.
+        //
+        // `101` is not interim in that sense: it says the connection has left
+        // HTTP/1.1 for a protocol nothing here asked for, so it falls through
+        // to the unexpected statuses below rather than being read past.
+        let mut interim = 0;
+        while (100..=199).contains(&status.code) && status.code != 101 {
+            interim += 1;
+            if interim > MAX_INTERIM_RESPONSES {
+                return Err(Exchange::BeforeBody(FetchError::io(
+                    "reading the response",
+                    url,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("more than {MAX_INTERIM_RESPONSES} interim responses"),
+                    ),
+                )));
+            }
+            status = read_status(&mut reader)
+                .map_err(io("reading the response"))
+                .map_err(Exchange::BeforeBody)?;
+            headers = read_headers(&mut reader)
+                .map_err(io("reading the response"))
+                .map_err(Exchange::BeforeBody)?;
+        }
 
         // Whether the connection can serve another request. A response with no
         // definite framing ends at end of stream, so there is nothing after it
@@ -474,13 +533,18 @@ impl HttpFetch {
                     .map_err(Exchange::AfterBody)?;
                 // A redirect carries a body of its own, framed like any other,
                 // and the connection is only reusable once it has been read
-                // off. It is bounded by the same cap and thrown away.
+                // off. It is not the resource, so it is neither delivered nor
+                // held to the resource's cap: a request for a signed index of a
+                // few hundred bytes would otherwise be failed by the mirror's
+                // own redirect page. A page past even the generous cap here
+                // costs the connection and nothing more, since a reader left
+                // part way through a body cannot serve the next request —
+                // the redirect is still followed, on a connection of its own.
                 if framed {
                     let mut discard = io::sink();
-                    read_body(&mut reader, &headers, &mut discard, cap)
-                        .map_err(io("reading the body"))
-                        .map_err(Exchange::AfterBody)?;
-                    keep(reader);
+                    if read_body(&mut reader, &headers, &mut discard, MAX_REDIRECT_BODY).is_ok() {
+                        keep(reader);
+                    }
                 }
                 let next = resolve_redirect(url, &location);
                 self.check_redirect_host(url, &next)
@@ -515,14 +579,27 @@ impl HttpFetch {
     /// instead of making it depend on the order the resolver returned. The
     /// connect timeout applies to each attempt, as it does for every client
     /// that walks a resolved address list.
+    ///
+    /// The walk is held to the fetch's deadline as well, and that is what stops
+    /// the two bounds from multiplying: eight black-holed addresses at the
+    /// default connect timeout would otherwise wait eight times it, whatever
+    /// ceiling the caller set on the fetch as a whole. Each attempt gets
+    /// whichever of the two is nearer, and a deadline already reached ends the
+    /// walk rather than starting an attempt that cannot finish inside it.
     fn connect(
         &self,
         url: &str,
         addrs: impl Iterator<Item = SocketAddr>,
+        deadline: Option<Instant>,
     ) -> Result<TcpStream, FetchError> {
         let mut last = None;
         for addr in addrs {
-            match TcpStream::connect_timeout(&addr, self.connect_timeout) {
+            let timeout = match remaining(deadline) {
+                Some(Duration::ZERO) => return Err(deadline_elapsed("connecting", url)),
+                Some(left) => self.connect_timeout.min(left),
+                None => self.connect_timeout,
+            };
+            match TcpStream::connect_timeout(&addr, timeout) {
                 Ok(stream) => return Ok(stream),
                 Err(source) => last = Some(source),
             }
@@ -539,6 +616,12 @@ impl HttpFetch {
     /// next request, which refuses it. Closes the blind, GET-only SSRF an
     /// unconstrained redirect target would otherwise allow — including the port
     /// scan a same-host, different-port redirect amounts to.
+    ///
+    /// The refusal is carried as a transport failure, for the reason a redirect
+    /// chain that never arrives is: where a mirror sends a request is that
+    /// mirror's own arrangement rather than a URL the caller spelled wrong, so a
+    /// walk over interchangeable mirrors asks the next one. One CDN-fronting
+    /// mirror in a list would otherwise abort the whole walk.
     fn check_redirect_host(&self, from: &str, to: &str) -> Result<(), FetchError> {
         if self.cross_host_redirects {
             return Ok(());
@@ -549,12 +632,16 @@ impl HttpFetch {
         if from_url.host.eq_ignore_ascii_case(&to_url.host) && from_url.port == to_url.port {
             Ok(())
         } else {
-            Err(FetchError::url(
+            Err(FetchError::io(
+                "following a redirect",
                 to,
-                format!(
-                    "redirect to a different host ({}:{}) than {}:{}; \
-                     enable cross-host redirects to follow it",
-                    to_url.host, to_url.port, from_url.host, from_url.port
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "redirect to a different host ({}:{}) than {}:{}; \
+                         enable cross-host redirects to follow it",
+                        to_url.host, to_url.port, from_url.host, from_url.port
+                    ),
                 ),
             ))
         }
@@ -667,17 +754,25 @@ fn is_absolute_url(s: &str) -> bool {
 /// Resolves a redirect `location` against the `base` URL it was returned for.
 ///
 /// An absolute URL is returned unchanged — a non-`http` scheme is then refused
-/// by [`parse_http_url`], so a redirect cannot escape to `file://`. A path
-/// reference resolves against the base's `http://host[:port]` origin: an
-/// absolute path (`/x`) replaces the base path, a relative one (`x`) resolves
-/// against the base path's directory. This resolves the target only; the
-/// same-host redirect policy is applied separately by
-/// [`HttpFetch::check_redirect_host`], and a redirected response is still
-/// checked against the signed digest, so a redirect can never substitute
-/// content.
+/// by [`parse_http_url`], so a redirect cannot escape to `file://`. A
+/// network-path reference (`//host/x`, RFC 3986 section 4.2) carries an
+/// authority of its own and inherits only the scheme. Any other path reference
+/// resolves against the base's `http://host[:port]` origin: an absolute path
+/// (`/x`) replaces the base path, a relative one (`x`) resolves against the base
+/// path's directory. This resolves the target only; the same-host redirect
+/// policy is applied separately by [`HttpFetch::check_redirect_host`], and a
+/// redirected response is still checked against the signed digest, so a redirect
+/// can never substitute content.
 fn resolve_redirect(base: &str, location: &str) -> String {
     if is_absolute_url(location) {
         return location.to_string();
+    }
+    // Before the absolute-path arm below, which would otherwise read the
+    // authority as the first two segments of a path and compose
+    // `http://base-host//cdn.example/x` — a request to the wrong resource on
+    // the base's host, which the same-host policy then has no reason to refuse.
+    if let Some(authority_and_path) = location.strip_prefix("//") {
+        return format!("http://{authority_and_path}");
     }
     let Ok(parsed) = parse_http_url(base) else {
         return location.to_string();
@@ -1070,16 +1165,40 @@ struct DeadlineReader<R> {
 
 impl<R: Read> Read for DeadlineReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(deadline) = self.deadline
-            && Instant::now() >= deadline
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the overall fetch deadline elapsed",
-            ));
+        if expired(self.deadline) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED));
         }
         self.inner.read(buf)
     }
+}
+
+/// What a fetch reports when its whole-request deadline has passed. One wording
+/// for every step it bounds, so a caller reads the same sentence whether the
+/// deadline was reached before the connection or part way through the body.
+const DEADLINE_ELAPSED: &str = "the overall fetch deadline elapsed";
+
+/// How much of `deadline` is left, or `None` where there is no deadline at all.
+/// A deadline already reached leaves [`Duration::ZERO`].
+fn remaining(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+}
+
+/// Whether `deadline` is set and has passed.
+fn expired(deadline: Option<Instant>) -> bool {
+    remaining(deadline) == Some(Duration::ZERO)
+}
+
+/// The deadline failure, named for the step that could not be started.
+///
+/// A transport failure rather than a `Url` one, because a deadline reached is
+/// what this exchange did rather than how the caller spelled it, and a walk over
+/// interchangeable mirrors is right to ask the next.
+fn deadline_elapsed(op: &'static str, url: &str) -> FetchError {
+    FetchError::io(
+        op,
+        url,
+        io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED),
+    )
 }
 
 #[cfg(test)]
@@ -1659,6 +1778,130 @@ mod tests {
     }
 
     #[test]
+    fn a_connect_walk_is_held_to_the_fetch_deadline() {
+        // A host resolving to several addresses tried at the connect timeout
+        // each waits that timeout per address, which multiplies past whatever
+        // ceiling the caller put on the fetch. With the deadline already
+        // reached, no attempt is started at all.
+        let fetch = HttpFetch::new();
+        let addrs = [
+            SocketAddr::from(([192, 0, 2, 1], 80)),
+            SocketAddr::from(([192, 0, 2, 2], 80)),
+        ];
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a monotonic clock a second past its start");
+        let err = fetch
+            .connect("http://mirror.example/x", addrs.into_iter(), Some(past))
+            .expect_err("the deadline ends the walk");
+        assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
+        assert!(err.to_string().contains(DEADLINE_ELAPSED), "{err}");
+        // The mirror walk is right to ask the next mirror about it.
+        assert!(err.is_failover(), "{err}");
+    }
+
+    #[test]
+    fn an_interim_response_is_read_past_rather_than_reported() {
+        // A server may send `103 Early Hints` before the response it was asked
+        // for, whether or not the client asked for hints. Reading the first
+        // status line as the final one turned the hint into a status failure.
+        let body = b"Suite: trixie\n";
+        let mut response =
+            b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n".to_vec();
+        response.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+        response.extend_from_slice(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        response.extend_from_slice(body);
+        let (url, served) = serving(1, response);
+
+        let mut out = Vec::new();
+        HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut out)
+            .expect("the final response is the one delivered");
+        assert_eq!(out, body);
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
+    fn a_peer_that_only_ever_sends_interim_responses_is_refused() {
+        // A final response has to arrive. Reading past interim ones forever
+        // would let a mirror hold a fetch open for the whole deadline.
+        let mut response = Vec::new();
+        for _ in 0..MAX_INTERIM_RESPONSES + 2 {
+            response.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n\r\n");
+        }
+        let (url, served) = serving(1, response);
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut Vec::new())
+            .expect_err("a peer that never answers is refused");
+        assert!(
+            err.to_string().contains("interim responses"),
+            "{err}, expected the interim-response refusal"
+        );
+        assert!(err.is_failover(), "{err}");
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
+    fn an_unrequested_protocol_switch_is_not_read_past() {
+        // A 101 says the connection has left HTTP/1.1 for something nothing
+        // here asked for, so it is a status failure rather than an interim
+        // response to skip.
+        let (url, served) = serving(
+            1,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_vec(),
+        );
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut Vec::new())
+            .expect_err("an unrequested protocol switch is refused");
+        assert!(
+            matches!(err, FetchError::Status { code: 101, .. }),
+            "{err:?}"
+        );
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
+    fn a_redirects_own_page_is_not_held_to_the_resources_cap() {
+        // A request for a signed index states its size, and the body cap is
+        // that size. A mirror answering with an HTML redirect page larger than
+        // the index it points at is ordinary, and reading the page against the
+        // index's cap failed the fetch before the redirect was followed.
+        let page = "<html>redirecting</html>".repeat(64);
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: /moved\r\nContent-Length: {}\r\n\r\n{page}",
+            page.len(),
+        );
+        let body = b"Suite: trixie\n";
+        let (url, accepted, served) = serving_one_connection(vec![
+            redirect.into_bytes(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes()
+            .into_iter()
+            .chain(body.iter().copied())
+            .collect(),
+        ]);
+
+        let mut out = Vec::new();
+        HttpFetch::new()
+            .fetch(&FetchRequest::new(&url).sized(body.len() as u64), &mut out)
+            .expect("the redirect is followed and the resource delivered");
+        assert_eq!(out, body);
+        // The page was read off, so the redirect was followed on the same
+        // connection rather than a new one.
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        served.join().expect("the server thread ends");
+    }
+
+    #[test]
     fn a_redirect_chain_with_no_end_is_the_mirrors_state_too() {
         // The same question one step earlier: a mirror that answers every
         // request with another redirect has not served the resource, and the
@@ -1760,6 +2003,29 @@ mod tests {
             parse_http_url(&injected),
             Err(FetchError::Url { .. }),
         ));
+    }
+
+    #[test]
+    fn a_network_path_redirect_carries_its_own_authority() {
+        // `//host/path` names a host of its own and inherits only the scheme,
+        // where an absolute path names a path on the base's host. Reading the
+        // first as the second composed a doubled-slash path on the base host,
+        // which the same-host policy admits because the host never changed.
+        let base = "http://mirror.example/debian/dists/trixie/Release";
+        assert_eq!(
+            resolve_redirect(base, "//cdn.example/x"),
+            "http://cdn.example/x",
+        );
+        assert_eq!(
+            resolve_redirect(base, "//cdn.example:8080/x"),
+            "http://cdn.example:8080/x",
+        );
+        // And it is then a cross-host redirect, which the default policy
+        // refuses rather than following.
+        let refused = HttpFetch::new()
+            .check_redirect_host(base, &resolve_redirect(base, "//cdn.example/x"))
+            .expect_err("a network-path redirect leaves the host");
+        assert!(refused.is_failover(), "{refused}");
     }
 
     #[test]
@@ -2127,16 +2393,20 @@ mod tests {
                 .is_ok()
         );
         // A redirect to another host is refused: it is the blind SSRF vector.
-        assert!(matches!(
-            fetch.check_redirect_host(from, "http://169.254.169.254/latest/meta-data"),
-            Err(FetchError::Url { .. })
-        ));
+        // Carried as a transport failure, so a walk asks the next mirror rather
+        // than aborting the list over where this one sends its requests.
+        let refused = fetch
+            .check_redirect_host(from, "http://169.254.169.254/latest/meta-data")
+            .expect_err("a cross-host redirect is refused");
+        assert!(matches!(refused, FetchError::Io { .. }), "{refused:?}");
+        assert!(refused.is_failover(), "{refused}");
         // So is another port on the same host, which is the same vector aimed
         // at whatever else that host is running.
-        assert!(matches!(
-            fetch.check_redirect_host(from, "http://mirror.example:9000/pool/y.deb"),
-            Err(FetchError::Url { .. })
-        ));
+        let refused = fetch
+            .check_redirect_host(from, "http://mirror.example:9000/pool/y.deb")
+            .expect_err("a cross-port redirect is refused");
+        assert!(matches!(refused, FetchError::Io { .. }), "{refused:?}");
+        assert!(refused.is_failover(), "{refused}");
         // Opting in allows the cross-host CDN redirect.
         let permissive = HttpFetch::new().cross_host_redirects(true);
         assert!(

@@ -53,6 +53,14 @@ jobs:
         # tools/seam.toml records every name that does not, with what it would
         # cost, and this fails on any difference.
         run: python3 tools/check-seam.py
+      - name: Command-line parity
+        # `fcage` claims to spell the launch builder's whole surface, and the
+        # CLI's own tests cannot check that: they read its flag table, so a
+        # library method absent from the table is absent from both sides.
+        # tools/parity.toml records every public builder setting against the
+        # flag that reaches it or the reason it has none, and this fails on any
+        # difference.
+        run: python3 tools/check-parity.py
       - name: Check (default features)
         run: cargo check --workspace --all-targets
       - name: Enable the sandbox facilities
@@ -242,7 +250,13 @@ jobs:
       - name: Check against the last published release
         # Compares the working tree's public API against the newest version on
         # crates.io and fails on an undeclared breaking change.
-        run: cargo semver-checks check-release -p ferroday-cage
+        #
+        # `--all-features`, as the API snapshot above takes it and for the same
+        # reason: the crate declares no `default` feature, so without it the
+        # compared surface is the featureless one and every item a feature gates
+        # -- the provisioners, the hardening layer, the network stack -- is
+        # outside the gate entirely.
+        run: cargo semver-checks check-release -p ferroday-cage --all-features
 
   deny:
     name: License and advisory policy

@@ -169,6 +169,17 @@ fn an_absent_delegate_renders_as_absent_and_a_present_one_as_present() {
     );
 }
 
+#[test]
+fn a_removal_shows_whether_the_publication_lock_goes_with_the_tree() {
+    // The flag decides whether a file beside the tree is deleted, so which way
+    // it was set is the part of a removal a log is asked about after the fact.
+    let bare = format!("{:?}", Remove::new("/srv/rootfs"));
+    assert!(bare.contains("remove_lock: true"), "{bare}");
+
+    let kept = format!("{:?}", Remove::new("/srv/rootfs").remove_lock(false));
+    assert!(kept.contains("remove_lock: false"), "{kept}");
+}
+
 #[cfg(feature = "tarball")]
 #[test]
 fn an_export_shows_whether_it_has_a_mapper() {
