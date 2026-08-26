@@ -25,6 +25,10 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-08-26
+
+`fcage` 0.4.1, unchanged: the entry filter is code, and no argument carries one.
+
 ### Added
 
 - `provision::Export::filter` takes a predicate and writes only the entries it
@@ -1163,7 +1167,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.3.0...v0.4.0
