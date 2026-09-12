@@ -149,7 +149,7 @@ and the next build starts from where the last one left off — convenient for
 iterating on one ebuild, but not a fresh root each time.
 
 For a pristine root per build, root the cage on an
-[overlay](provisioning.md#keeping-a-provisioned-rootfs-pristine) of the stage3
+[overlay](provisioning.md#keeping-a-provisioned-root-pristine) of the stage3
 instead of on the stage3 itself: the provisioned root becomes a read-only lower
 layer, every write lands in a disposable upper, and discarding the upper is the
 whole of the cleanup. One provisioned stage3 then serves any number of clean

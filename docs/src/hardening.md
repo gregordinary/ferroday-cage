@@ -332,7 +332,7 @@ reasonably assume are covered, and are not:
 - **The rootfs itself.** The command is root inside the sandbox and the rootfs
   is mounted read-write, so it can modify anything in the provisioned tree that
   the calling user could modify on the host. A Landlock grant narrows this; so
-  does [`overlay_rootfs`](provisioning.md#keeping-a-provisioned-rootfs-pristine),
+  does [`overlay_rootfs`](provisioning.md#keeping-a-provisioned-root-pristine),
   which leaves the base untouched and sends every write to a disposable upper.
   The root is mounted `nosuid`, so what the command writes into the tree cannot
   be executed back with elevated ids — but the tree's contents are still the

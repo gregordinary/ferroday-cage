@@ -25,10 +25,10 @@ let status = ferroday_cage::Cage::builder()
 ## Atomic publication
 
 `ensure` guarantees that the destination directory either does not exist or
-holds a complete rootfs — never a partial one:
+holds a complete root filesystem, never a partial one:
 
 - If the destination already exists, it is reused and the provisioner does
-  not run. The first launch pays for provisioning; the rest are free.
+  not run. The first launch pays for provisioning, and the rest are free.
   Any existing directory counts, including an empty one the caller just
   made, so a destination created ahead of time is never provisioned into.
 - Otherwise the provisioner fills a staging directory beside the
@@ -46,9 +46,9 @@ The return value says which happened: `Provisioned::Created` or
 
 The lock file persists after the call, so a later publication of the same
 destination serializes on the same inode. `provision::remove` deletes it along
-with the rootfs, so create and destroy round-trip cleanly — and, because
-removal is idempotent, `remove` also clears the lock a *failed* provision left
-beside no rootfs at all.
+with the root filesystem, so create and destroy round-trip cleanly. Removal is
+idempotent, so `remove` also clears the lock a *failed* provision left beside no
+tree at all.
 
 ## Progress and cancellation
 
@@ -102,52 +102,54 @@ let outcome = Provision::new("/var/cache/myapp/trixie")
 # }
 ```
 
-The check is consulted where stopping is clean — an archive entry boundary, a
-package boundary — and a cancelled run fails with `ProvisionError::Cancelled`.
-`ensure` then removes the staging tree exactly as it does for any other
-failure, so the destination is left absent rather than half-built. Setting the
-flag from a signal handler or a watchdog thread is the usual way to drive it;
-`Arc<AtomicBool>` is the shape that fits both.
+The check is consulted where stopping is clean, meaning an archive entry
+boundary or a package boundary. A run stopped there fails with
+`ProvisionError::Cancelled`. `ensure` then removes the staging tree exactly as
+it does for any other failure, so the destination is left absent rather than
+half-built. Setting the flag from a signal handler or a watchdog thread is the
+usual way to drive it. `Arc<AtomicBool>` is the shape that fits both.
 
 Every provisioner reports through this one channel, so a consumer wiring
-provisioning into a logging system writes one adapter. The `Tarball`
-provisioner reports each entry and its progress through the archive; the
-[Debian provisioner](debian.md) reports its own richer events —
-fetches, resolution, downloads, and dpkg's output — through the
-`ProvisionEvent::Debian` variant, and honours the same cancellation check
-between packages. The [Alpine provisioner](alpine.md) reports the same
-progress through `ProvisionEvent::Alpine`, and the [Gentoo
-provisioner](gentoo.md) through `ProvisionEvent::Gentoo`, so a consumer
-reports any of the userlands by changing the type it matches on.
+provisioning into a logging system writes one adapter. The `Tarball` provisioner
+reports each entry and its progress through the archive. The [Debian
+provisioner](debian.md) reports its own richer events through the
+`ProvisionEvent::Debian` variant: fetches, resolution, downloads, and dpkg's
+output. It honors the same cancellation check between packages. The [Alpine
+provisioner](alpine.md) reports the same progress through
+`ProvisionEvent::Alpine`, and the [Gentoo provisioner](gentoo.md) through
+`ProvisionEvent::Gentoo`. A consumer reports any of the userlands by changing
+the type it matches on.
 
-Where the clean stopping points are is the provisioner's own question. A
-package boundary answers it wherever there is one, and the Gentoo layer's
-stage3 wave has none — a stage3 is a single file of several hundred megabytes —
-so it consults the check while the tarball is being written as well as at the
-step boundaries around it, and a cancelled download leaves nothing behind in the
-cache. Its binary-package wave has package boundaries like the other two, and
-uses them.
+Where the clean stopping points are is the provisioner's own question. A package
+boundary answers it wherever there is one. The Gentoo layer's stage3 wave has
+none, because a stage3 is a single file of several hundred megabytes. That layer
+therefore consults the check while the tarball is being written, as well as at
+the step boundaries around it. A download stopped there leaves nothing behind in
+the cache. Its binary-package wave has package boundaries like the other two,
+and uses them.
 
 ## Removing a rootfs
 
-`provision::remove` is `ensure`'s counterpart: it deletes a rootfs
+`provision::remove` is `ensure`'s counterpart. It deletes a root filesystem
 directory, including one a sandbox under a [range identity
-map](identity-maps.md) has written. Such a tree can hold directories owned
-by subordinate ids, whose contents the plain caller cannot unlink; `remove`
-starts plain and, when refused, re-enters the same map — a forked process
-unshares a user namespace, the bundled delegates establish the subordinate
-map for it, and the tree is deleted from inside, where the ids are the
-caller's own. It is the rootless container runtimes' `unshare rm` pattern as
-a library call, and `ensure` uses the same escalation for its own staging
-cleanup, so a crashed range-mapped provisioning run cannot wedge the
-destination. Removing a path that does not exist is not an error.
+map](identity-maps.md) has written. Such a tree can hold directories owned by
+subordinate ids, whose contents the plain caller cannot unlink. So `remove`
+starts plain and, when refused, re-enters the same map. A forked process
+unshares a user namespace and the bundled delegates establish the subordinate
+map for it. The tree is then deleted from inside, where the ids are the caller's
+own.
+
+It is the rootless container runtimes' `unshare rm` pattern as a library call.
+`ensure` uses the same escalation for its own staging cleanup, so a crashed
+range-mapped provisioning run cannot wedge the destination. Removing a path that
+does not exist is not an error.
 
 `remove` escalates through the bundled delegate chain, which covers a tree
-written under the subordinate map or a bundled-delegate range map. A tree whose
-ownership a site-specific delegate established — one supplied through
-`CageBuilder::id_mapper` that allocates ids the bundled delegates would not —
-is removed through the `Remove` builder, whose `mapper` re-enters the map using
-that same delegate:
+written under the subordinate map or a bundled-delegate range map. Some trees
+need more. Where a site-specific delegate established the ownership, the tree is
+removed through the `Remove` builder instead. Such a delegate is supplied
+through `CageBuilder::id_mapper` and allocates ids the bundled delegates would
+not. `Remove::mapper` re-enters the map using that same delegate:
 
 ```rust,no_run
 use ferroday_cage::IdentityMap;
@@ -167,16 +169,16 @@ chain, and nothing to configure.
 A tree written under the single-identity map escalates too, named with
 `Remove::map(IdentityMap::Single)`, and there the child writes the map itself
 with no delegate involved. Its ids are the caller's own either way, so the
-escalation looks redundant and is not: root of the mapped namespace holds the
-capabilities that clear a directory whose own mode denies the write the
-deletion needs — a read-only directory an archive carried in, for one.
+escalation looks redundant and is not. Root of the mapped namespace holds the
+capabilities that clear a directory whose own mode denies the write. A read-only
+directory an archive carried in is the everyday case.
 
 At a shell prompt, `fcage --remove-rootfs DIR` removes the tree and its lock
-together, which is the default above: the mode names a published rootfs, which
-is the case the round-trip is right for. `--keep-lock` spells the other case,
-where `DIR` merely holds such trees. `fcage` takes `--identity-map` for the map
-the tree was provisioned under, defaulting to the subordinate one, and is a mode
-of its own that accepts no other option:
+together, which is the default above. The mode names a published root
+filesystem, which is the case the round-trip is right for. `--keep-lock` spells
+the other case, where `DIR` merely holds such trees. `fcage` takes
+`--identity-map` for the map the tree was provisioned under, defaulting to the
+subordinate one. It is a mode of its own that accepts no other option:
 
 ```sh
 fcage --remove-rootfs /var/lib/myapp/rootfs
@@ -186,9 +188,10 @@ fcage --remove-rootfs /var/cache/myapp/work --keep-lock
 ### The lock beside the tree
 
 A removal takes the `<dest>.lock` `ensure` wrote beside the destination, so a
-published rootfs and its lock round-trip together. A caller whose `dest`
-*contains* published trees rather than being one — a scratch directory, a
-cache, a work area holding several — passes `false` to `Remove::remove_lock`:
+published root filesystem and its lock round-trip together. Some callers mean
+the other thing. Where `dest` *contains* published trees rather than being one,
+such as a scratch directory or a cache holding several, pass `false` to
+`Remove::remove_lock`:
 
 ```rust,no_run
 use ferroday_cage::provision::Remove;
@@ -198,27 +201,30 @@ Remove::new("/var/cache/myapp/work").remove_lock(false).run()?;
 ```
 
 Only the caller can tell the two apart. Both are directories, and a containing
-directory with no `.lock` sibling today looks exactly like a published one
-whose lock was already cleared, so the library cannot probe for the answer. The
-tree itself is removed identically either way; the flag governs the sibling
-file alone.
+directory with no `.lock` sibling today looks exactly like a published one whose
+lock was already cleared. The library cannot probe for the answer. The tree
+itself is removed identically either way, and the flag governs the sibling file
+alone.
 
 ## Exporting a rootfs
 
 With the `tarball` cargo feature, `provision::export_tar` writes a provisioned
-rootfs to a POSIX/pax tar. It is the range-map counterpart of taring the
-directory: under a [range identity map](identity-maps.md) the finished tree
-carries real system ownership stored on the host at an offset — a file the
-rootfs means as uid 42 is owned `100000 + 42` — so a host-side `tar` would
-record the offset id, and could not read the `security.*` extended attributes a
-setcap'd binary carries at all. `export_tar` re-enters the map the tree was
-built under, exactly as `remove` does: a forked child reads every entry as root
-of the mapped namespace, where the intended ids and attributes are its own.
+root filesystem to a POSIX/pax tar. It is the range-map counterpart of taring
+the directory. Under a [range identity map](identity-maps.md) the finished tree
+carries real system ownership stored on the host at an offset. A file the tree
+means as uid 42 is owned `100000 + 42`.
 
-The map is named explicitly and must be the one the tree was built under, so
-the host offset ids round-trip to the ids the tree intends. Under the
-single-identity map — the default — the export records every entry as root, the
-identity the sandbox runs everything as.
+A host-side `tar` would record the offset id, and could not read the `security.*`
+extended attributes a setcap'd binary carries at all. `export_tar` re-enters the
+map the tree was built under, exactly as `remove` does. A forked child then
+reads every entry as root of the mapped namespace, where the intended ids and
+attributes are its own.
+
+The map is named explicitly and must be the one the tree was built under. The
+host offset ids then round-trip to the ids the tree intends.
+
+Under the single-identity map, which is the default, the export records every
+entry as root, the identity the sandbox runs everything as.
 
 ```rust,no_run
 use ferroday_cage::IdentityMap;
@@ -239,10 +245,11 @@ what every export needs.
 ### Choosing what the archive holds
 
 `Export::filter` takes a predicate and writes only the entries it answers
-`true` for. It is how a tree that holds more than the artifact should — a build
-cache, a resolver's package lists, the contents of a mount point the deployed
-runtime fills in for itself — is exported without being edited first, which
-matters when the tree is one a later build will reuse.
+`true` for. Some trees hold more than the artifact is meant to carry. A build
+cache, a resolver's package lists, and the contents of a mount point the
+deployed runtime fills in for itself are the usual three. The filter exports
+such a tree without editing it first, which matters when a later build will
+reuse it.
 
 **Excluding a directory excludes everything under it**, without the predicate
 being consulted about the descendants, so a rule names the top of a subtree
@@ -266,25 +273,25 @@ Export::new("/var/lib/myapp/rootfs")
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The entry is offered with its path spelled as a location *inside the tree* —
-`/etc/hostname`, and `/` for the tree itself — the way a mount target or a
-Landlock grant names one, rather than as the `./`-prefixed member name the
+The entry is offered with its path spelled as a location *inside the tree*,
+meaning `/etc/hostname`, and `/` for the tree itself. That is how a mount target
+or a Landlock grant names one, rather than the `./`-prefixed member name the
 archive carries. It is a `Path`, so `starts_with` compares whole components and
 `/dev` does not match `/devices`. Beside the path it carries the entry's kind,
-its permission bits, the ownership the rootfs intends, the file's size, and its
+its permission bits, the ownership the tree intends, the file's size, and its
 unclamped modification time. Refusing the tree's root is allowed and produces an
-empty archive; it is an entry like any other.
+empty archive, since the root is an entry like any other.
 
 A hardlink is offered as `ExportKind::File`, and dropping one name of an inode
-does not lose the file: the next kept name carries the data and later ones link
+does not lose the file. The next kept name carries the data and later ones link
 onto it. Character and block devices, FIFOs, and sockets are never offered at
-all — the export skips them before any filter runs.
+all, because the export skips them before any filter runs.
 
-The filter runs on the parent side of the export, where the paths are
-assembled: the walking child is a post-fork reader that cannot call a caller's
-code, so an excluded subtree is read from the tree and discarded rather than
-never visited. The archive is what the filter says; the walk is not made
-cheaper by it.
+The filter runs on the parent side of the export, where the paths are assembled.
+The walking child is a post-fork reader that cannot call a caller's code. An
+excluded subtree is therefore read from the tree and discarded rather than never
+visited.
+The archive is what the filter says, and the walk is not made cheaper by it.
 
 The archive stays byte-reproducible as long as the predicate is a pure function
 of the entry, which every input it is given already is.
@@ -293,60 +300,62 @@ of the entry, which every input it is given already is.
 
 `write_to_path` names a file, and that file appears complete or not at all. The
 bytes go to a staging file beside it, which is synced and then renamed over the
-destination, so an export that fails part-way — an unreadable source entry, an
-identity map no delegate can establish, a filesystem that filled up — leaves
-whatever archive was already there. Opening the destination directly would
-instead destroy a previous archive to make a partial one, before the export had
-established that it could produce anything at all. The staging file is created
-afresh, so the destination's inode is replaced rather than rewritten: a hard
-link to the previous archive keeps it, a symlink at the destination is replaced
-rather than followed, and the new file's permissions are `0o666` less the
-process umask, as an ordinary shell redirection produces.
+destination. An export that fails part-way therefore leaves whatever archive was
+already there. The cause might be an unreadable source entry, an identity map no
+delegate can establish, or a filesystem that filled up. Opening the destination
+directly would instead destroy a previous archive to make a partial one, before
+the export had established that it could produce anything.
+
+The staging file is created afresh, so the destination's inode is replaced
+rather than rewritten. A hard link to the previous archive keeps it, and a
+symlink at the destination is replaced rather than followed. The new file's
+permissions are `0o666` less the process umask, as an ordinary shell redirection
+produces.
 
 A destination *inside* the tree being exported is refused with
 `ProvisionError::ExportDestInside`. The walk would reach the file it is being
-written to, so what landed in the archive would depend on how far the encoder
-had got when the walk arrived there.
+written to. What landed in the archive would then depend on how far the encoder
+had got when the walk arrived.
 
 `write_to` takes any `Write` sink instead, so an export can stream directly into
 a compressor or an archive reader with no intermediate file. It writes what it
-is given and cannot stage onto anything, which is the right shape for a pipe, a
-socket, or a buffer in memory, and the wrong one for a file a previous archive
+is given and cannot stage onto anything. That is the right shape for a pipe, a
+socket, or a buffer in memory. It is the wrong one for a file a previous archive
 already occupies.
 
-Regular files,
-directories, symlinks, and hardlinks are emitted with their mode, ownership,
-and modification time. Extended attributes come with everything but symlinks —
-ACLs and file capabilities included — since the kernel confines a symlink's
-attributes to the `security` and `trusted` namespaces, which an unprivileged
-export can neither read in full nor an unprivileged extraction restore.
+Regular files, directories, symlinks, and hardlinks are emitted with their mode,
+ownership, and modification time. Extended attributes come with everything but
+symlinks, ACLs and file capabilities included. The kernel confines a symlink's
+attributes to the `security` and `trusted` namespaces. An unprivileged export
+cannot read those in full, and an unprivileged extraction cannot restore
+them.
 Character and block devices, FIFOs, and sockets are skipped, as a deployed
-image's runtime provides its own. When no delegate can establish a
-range map the export fails with `ProvisionError::ExportUnprivileged`, naming
-what the host is missing.
+image's runtime provides its own. When no delegate can establish a range map the
+export fails with `ProvisionError::ExportUnprivileged`, naming what the host is
+missing.
 
-Member names match `tar -C rootfs .`: the archive leads with a `./` directory
+Member names match `tar -C rootfs .`. The archive leads with a `./` directory
 entry for the root and every other member is `./`-prefixed (`./etc/`,
 `./etc/hostname`). A consumer that selects a member by path or strips leading
-components sees the same layout GNU `tar` produces, so the export is a drop-in
-for it.
+components sees the same layout GNU `tar` produces. The export is a drop-in for
+it.
 
-The archive is byte-reproducible given the tree and a `clamp_mtime`.
-Entries are emitted in sorted order — directory children by name, extended
-attributes by name — so the output does not depend on the order the filesystem
-stores entries in. `clamp_mtime(epoch)` records each entry's modification time
-as `min(mtime, epoch)`, capping the wall-clock stamps a bootstrap writes while
-preserving any earlier time a package sets; unset, the real time is recorded. A
-build that pins its inputs and clamps to a fixed epoch produces a byte-identical
-archive on any host.
+The archive is byte-reproducible given the tree and a `clamp_mtime`. Entries are
+emitted in sorted order, directory children by name and extended attributes by
+name. The output therefore does not depend on the order the filesystem stores
+entries in. `clamp_mtime(epoch)` records each entry's modification time as `min(mtime,
+epoch)`. That caps the wall-clock stamps a bootstrap writes while preserving any
+earlier time a package sets, and unset, the real time is recorded. A build that
+pins its inputs and clamps to a fixed epoch produces a byte-identical archive on
+any host.
 
 As with removal, a tree built under a `CageBuilder::id_mapper` delegate is
-exported through `Export::mapper`, which re-enters the map using that same
+exported through `Export::mapper`. That re-enters the map using the same
 delegate rather than the bundled chain.
 
 At a shell prompt, `fcage --export-rootfs DIR` is the same export. It takes
 `--identity-map` for the map the tree was provisioned under, defaulting to the
-subordinate one, and `--clamp-mtime` for the epoch that makes the archive
+subordinate one. `--clamp-mtime` names the epoch that makes the archive
 byte-reproducible. Like the removal, it is a mode of its own that accepts no
 other option.
 
@@ -366,8 +375,8 @@ only case where the default would surprise anyone.
 ### What a launch leaves in the tree
 
 An export records the tree as it is, so what a provisioning sandbox contributed
-to the tree is what the archive carries. A launch over a plain rootfs leaves its
-mount points behind and nothing else:
+to the tree is what the archive carries. A launch over a plain root filesystem
+leaves its mount points behind and nothing else:
 
 | Path | What is left | Mode |
 | --- | --- | --- |
@@ -375,31 +384,33 @@ mount points behind and nothing else:
 | `/dev` | the mount point, empty | `0755` |
 | `/tmp` | the mount point, empty | `1777` |
 
-A mount point is created only when the rootfs does not already have the path,
-and a path the rootfs ships keeps the mode it shipped with — the tree owns what
-it ships, the sandbox owns what it creates. The mode is the directory's own,
+A mount point is created only when the tree does not already have the path. A
+path the tree ships keeps the mode it shipped with. The tree owns what it ships,
+and the sandbox owns what it creates. The mode is the directory's own,
 independent of the launching process's umask, so the same tree exports the same
 way from any host.
 
-Nothing survives *inside* those directories. The `/dev` the sandbox assembles —
-the six device nodes, the five symlinks, the `devpts` on `/dev/pts` and the
-tmpfs on `/dev/shm` — is built inside the tmpfs that covers the mount point, so
-it goes with the mount namespace. An exported tree holds `./dev/` and nothing
-under it.
+Nothing survives *inside* those directories. The `/dev` the sandbox assembles is
+built inside the tmpfs that covers the mount point, so it goes with the mount
+namespace. That is the six device nodes, the five symlinks, the `devpts` on
+`/dev/pts` and the tmpfs on `/dev/shm`. An exported tree holds `./dev/` and
+nothing under it.
 
 A mount that contributes a *file* rather than a directory takes it back. A bind
 needs its target to exist, so the `/etc/resolv.conf` bind that host networking
-performs creates an empty file when the rootfs ships none — and removes it once
-the sandbox is gone, leaving the tree without the resolver configuration it never
-had. A caller's own file bind is treated the same way: the empty `0644` target it
-needs is present for the mount to cover and for nothing else, and its mode is
-exact, independent of the launching process's umask. A rootfs that does ship an
-entry at that path keeps it untouched, whether it is a file or a symbolic link:
-the bind covers it for the sandbox's life and reveals it again afterwards.
+performs creates an empty file when the tree ships none. It removes that file
+once the sandbox is gone, leaving the tree without the resolver configuration it
+never had.
+
+A caller's own file bind is treated the same way. The empty `0644` target it
+needs is present for the mount to cover and for nothing else. Its mode is exact,
+independent of the launching process's umask. A tree that does ship an
+entry at that path keeps it untouched, whether it is a file or a symbolic link.
+The bind covers it for the sandbox's life and reveals it again afterwards.
 
 A caller's own `bind` or `raw_mount` is the case where a *directory* target is
 created and stays, as `0755`. That is worth knowing when the tree being written
-into is the one being shipped — a bind declared for the duration of a build
+into is the one being shipped. A bind declared for the duration of a build
 leaves its mount point in the artifact.
 
 Where a launch must leave the tree untouched entirely, root it on an overlay.
@@ -423,8 +434,8 @@ afterwards gives an archive of a tree no sandbox has written to.
 
 ## Copying a tree into a rootfs
 
-`CopyIn` lays a host directory tree into a rootfs with each entry created under
-the identity map the rootfs is owned through:
+`CopyIn` lays a host directory tree into a root filesystem, with each entry
+created under the identity map that tree is owned through:
 
 ```rust,no_run
 use ferroday_cage::IdentityMap;
@@ -443,89 +454,101 @@ for entry in &report.skipped {
 ```
 
 It is the mirror image of the export. An export forks a child into the map to
-*read* a tree at the ownership it intends; this forks one to *write* one. That
-is what `cp` structurally cannot do: `cp` runs as the calling user, which can
-create a file owned by nobody else, so a tree laid in by hand arrives owned by
-the caller whatever the source intended.
+*read* a tree at the ownership it intends, and this forks one to *write* one.
+That is what `cp` structurally cannot do. `cp` runs as the calling user, which
+can create a file owned by nobody else. A tree laid in by hand therefore arrives
+owned by the caller, whatever the source intended.
 
 Ownership is read through the map, which is what makes the two exact mirrors. A
-file the host stores at `100000 + 42` is uid 42 as the rootfs means it, and the
-copy stores it back at the host id the map puts it at — so a tree an earlier
-mapped sandbox produced copies into a rootfs owned through the same map with its
-ownership intact. Under `IdentityMap::Single` the same rule lands everything as
-root, that map having only the one inside id, which is what such a sandbox sees
-and what it could have written itself. A source id no extent covers is refused,
-naming the path that carries it: the rootfs has no id for it.
+file the host stores at `100000 + 42` is uid 42 as the tree means it. The copy
+stores it back at the host id the map puts it at. A tree an earlier mapped
+sandbox produced therefore copies into a root filesystem owned through the same
+map with its ownership intact.
 
-The destination must already exist, and entries are added to it — a directory
-the rootfs already carries is kept and descended into, a file, symlink, or named
+Under `IdentityMap::Single` the same rule lands everything as root, that map
+having only the one inside id. That is what such a sandbox sees, and what it
+could have written itself. A source id no extent covers is refused, naming the
+path that carries it: the tree has no id for it.
+
+The destination must already exist, and entries are added to it. A directory the
+tree already carries is kept and descended into, while a file, symlink, or named
 pipe is replaced.
 
 Directories, regular files, symbolic links, and named pipes are copied, with
 their modes and modification times. A symbolic link's modification time is its
-own rather than its target's; its mode is the one thing not carried, the kernel
-fixing every symbolic link's at `0777`. Several names for one file are copied as
-hard links onto the first name, so a tree keeps the sharing it was written with
-and its data is streamed once; that is what lets a tree exported by `Export`,
-which coalesces hard links of its own, come back through `CopyIn` unchanged.
+own rather than its target's. Its mode is the one thing not carried, the kernel
+fixing every symbolic link's at `0777`.
 
-Character and block devices and sockets cannot be copied: a device node needs a
-privilege the copy does not hold whatever map it is under, and a socket's inode
-is created by the process that binds it and is meaningless without it. Rather
+Several names for one file are copied as hard links onto the first name. A tree
+therefore keeps the sharing it was written with, and its data is streamed once.
+That is what lets a tree exported by `Export`, which coalesces hard links of its
+own, come back through `CopyIn` unchanged.
+
+Character and block devices and sockets cannot be copied. A device node needs a
+privilege the copy does not hold whatever map it is under. A socket's inode is
+created by the process that binds it, and is meaningless without it. Rather
 than dropping those in silence, the run returns a `CopyReport` naming every
-entry it left out and what each one was, so a rootfs that ends up missing
-something says so.
+entry it left out and what each one was. A tree that ends up missing something
+therefore says so.
 
 A source file that changes size while it is being read fails the run with
-`ProvisionError::SourceChanged`. The frame's length is committed before the
-data is read, so such a file is written padded or truncated; the copy finishes
-the frame to keep the stream in step and then refuses, rather than reporting
-success for a file it did not reproduce.
+`ProvisionError::SourceChanged`. The frame's length is committed before the data
+is read, so such a file is written padded or truncated. The copy finishes the
+frame to keep the stream in step and then refuses, rather than reporting success
+for a file it did not reproduce.
 
 Containment is structural rather than checked. Every frame the parent sends
-names its entry as a single path component, never a path, and the child creates
-each entry relative to the directory it currently holds open — so there is no
-path for a `..` or a leading `/` to appear in. The one exception is a hard
-link's anchor, which is a path because the two names may sit in different
-directories. Containment there rests on three things together: the child refuses
-an absolute anchor and any `.`, `..`, or empty component in one; the link is
-made without following the final component; and every directory along the
-anchor's path was created and opened `O_NOFOLLOW` by that same walk, which is
-what keeps `linkat`'s resolution of the *intermediate* components inside the
-tree. The residual is a concurrent writer inside the destination, which the
-whole copy shares. A symlink in
-the source is recreated as a symlink and never traversed: the walk does not
-descend through one, and the child opens each directory with `O_NOFOLLOW`, so a
-link pointing out of the tree lands inside the destination as a link and nothing
-is written through it.
+names its entry as a single path component, never a path. The child creates each
+entry relative to the directory it currently holds open. There is then no path
+for a `..` or a leading `/` to appear in.
+
+The one exception is a hard link's anchor, which is a path because the two names
+can sit in different directories. Containment there rests on three things
+together:
+
+- The child refuses an absolute anchor, and any `.`, `..`, or empty component in
+  one.
+- The link is made without following the final component.
+- Every directory along the anchor's path was created and opened `O_NOFOLLOW` by
+  that same walk. That is what keeps `linkat`'s resolution of the *intermediate*
+  components inside the tree.
+
+The residual is a concurrent writer inside the destination, which the whole copy
+shares. A symlink in the source is recreated as a symlink and never traversed.
+The walk does not descend through one, and the child opens each directory with
+`O_NOFOLLOW`. A link pointing out of the tree therefore lands inside the
+destination as a link, and nothing is written through it.
 
 ## The tarball provisioner
 
-With the `tarball` cargo feature, `Tarball` provisions from a tar archive.
-The archive may be uncompressed or compressed with gzip, xz, or zstd —
-detected from the content, never the file name — and may use the POSIX
-ustar, GNU, or pax dialect, or the pre-POSIX v7 one that predates all three.
-Decoding is pure Rust throughout.
+With the `tarball` cargo feature, `Tarball` provisions from a tar archive. The
+archive is either uncompressed or compressed with gzip, xz, or zstd, detected
+from the content and never the file name. It uses the POSIX ustar, GNU, or pax
+dialect, or the pre-POSIX v7 one that predates all three. Decoding is pure Rust
+throughout.
 
 v7 is worth naming because it still turns up. It carries no magic, no
-`uname`/`gname`, no device numbers, and no `prefix` field, so a v7 path fits the
-100-byte name field or does not exist; a directory is marked by a `5` typeflag,
-a trailing `/` on the name, or both. Contemporary tooling does not write it, but
-an upstream release tarball was written by whoever released the software, on
-whatever machine, in whatever year, and a sample of Debian trixie's
-`.orig.tar.*` files finds roughly one in twelve is v7.
+`uname`/`gname`, no device numbers, and no `prefix` field. A v7 path therefore
+fits the 100-byte name field or does not exist. A directory is marked by a `5`
+typeflag, a trailing `/` on the name, or both.
+
+Contemporary tooling does not write it. But an upstream release tarball was
+written by whoever released the software, on whatever machine, in whatever year.
+A sample of Debian trixie's `.orig.tar.*` files finds roughly one in twelve is
+v7.
 
 Two of the three compressions let the archive name its own memory cost, in a
-header far smaller than the allocation it asks for: a zstd frame declares the
+header far smaller than the allocation it asks for. A zstd frame declares the
 window the decoder buffers, and an xz block declares the dictionary the decoder
 allocates and zeroes. Both are capped at 128 MiB, which is twice the largest
-either uses in the archives this library reads. Each decoder is given its cap
-and checks the header against it before allocating, so an archive over the cap
-fails the provisioning run rather than being paid for and then reported — and
-the check is per block and per frame, not on the first alone, since a hostile
-declaration in the last block of an otherwise ordinary archive costs exactly as
-much as one in the first. Nothing published by Debian, Alpine, postmarketOS, or
-Gentoo comes close to the cap.
+either uses in the archives this library reads.
+
+Each decoder is given its cap and checks the header against it before
+allocating. An archive over the cap therefore fails the provisioning run rather
+than being paid for and then reported. The check is per block and per frame,
+not on the first alone. A hostile declaration in the last block of an otherwise
+ordinary archive costs exactly as much as one in the first. Nothing
+published by Debian, Alpine, postmarketOS, or Gentoo comes close to the cap.
 
 The archive comes from a path or from any reader:
 
@@ -544,40 +567,42 @@ provision::ensure("/var/cache/alpine-net", &mut Tarball::from_reader(body))?;
 # }
 ```
 
-`from_reader` is the mirror image of `export_tar`, which writes to any `Write`:
-a rootfs fetched over the network is provisioned as it arrives, with no
+`from_reader` is the mirror image of `export_tar`, which writes to any `Write`.
+A root filesystem fetched over the network is provisioned as it arrives, with no
 intermediate file on either side. A stream can be read only once, so the reader
-is consumed by the first run and a second run against the same `Tarball` says
-so rather than publishing an empty rootfs; `new` is the form that provisions
+is consumed by the first run. A second run against the same `Tarball` says so
+rather than publishing an empty tree, and `new` is the form that provisions
 repeatedly.
 
 A stream that ends before its first header block holds no archive, and is
-refused with `ProvisionError::FormatUnrecognized` — an empty file, a download
+refused with `ProvisionError::FormatUnrecognized`. An empty file, a download
 that produced nothing, and a compression stream whose decoded payload is empty
-all arrive that way. The reader does tolerate an archive whose final two-block
-terminator never arrived, as GNU `tar` does, but only once at least one entry
-has been read: a publication is durable, so a stream taken for a complete
-archive of nothing publishes an empty tree that every later `ensure` then
-returns as `Provisioned::Existing` without consulting the source again.
+all arrive that way.
+
+The reader does tolerate an archive whose final two-block terminator never
+arrived, as GNU `tar` does. But it tolerates that only once at least one entry
+has been read, because a publication is durable. A stream taken for a complete
+archive of nothing would publish an empty tree. Every later `ensure` then
+returns that as `Provisioned::Existing` without consulting the source again.
 
 Extraction is unprivileged and designed for archives that describe a root
 filesystem:
 
 - **Containment is kernel-enforced.** Entry paths and hardlink targets
   resolve through `openat2` strictly beneath the destination. In-tree
-  relative symlinks resolve normally — a merged-usr archive whose `bin`
-  is a symlink to `usr/bin` extracts correctly — while an entry that
-  reaches outside through `..`, an absolute path, or a symlink chain fails
-  with `ProvisionError::EntryUnsafe` before anything is written. That error
-  means an escape and nothing else; an entry refused for another reason — a
-  path component that is not a directory, a symbolic link with no target —
-  is a `ProvisionError::EntryRefused`.
+  relative symlinks resolve normally, so a merged-usr archive whose `bin`
+  is a symlink to `usr/bin` extracts correctly. An entry that reaches
+  outside through `..`, an absolute path, or a symlink chain fails with
+  `ProvisionError::EntryUnsafe` before anything is written. That error
+  means an escape and nothing else. An entry refused for another reason is a
+  `ProvisionError::EntryRefused`: a path component that is not a directory,
+  or a symbolic link with no target.
 - **Ownership maps to the calling user.** Every extracted entry belongs to the
   calling user, whom the sandbox's identity map presents as root, so
   extracted files appear root-owned inside the sandbox. Ownership recorded
   in the archive is ignored.
 - **Permission bits apply verbatim**, setuid, setgid, and sticky bits
-  included. Modification times are applied from the archive; directory
+  included. Modification times are applied from the archive, and directory
   times are applied after their contents, so they survive extraction.
 - **Device nodes and sockets are skipped.** They cannot be created without
   privilege, and the sandbox assembles its own minimal `/dev` at launch.
@@ -586,35 +611,36 @@ filesystem:
   behavior. Sparse and multi-volume members are not supported and fail
   with a typed error.
 
-Extraction imposes no size or entry-count quota; when the archive comes
-from an untrusted source, bound disk usage externally.
+Extraction imposes no size or entry-count quota. Where the archive comes from an
+untrusted source, bound disk usage externally.
 
-A setuid bit applying verbatim is what a root filesystem needs — `/usr/bin/sudo`
-without it is not `sudo` — and it grants nothing inside the sandbox, where the
-extracting user is already root. On the host it is a live bit: the extracted file
-is setuid **to the calling user**, so another local user who can reach the
-destination directory, on a filesystem not mounted `nosuid`, can run it as the
-calling user. Extract an untrusted archive into a directory only the calling user
-can reach, or onto a `nosuid` filesystem.
+A setuid bit applying verbatim is what a root filesystem needs, since
+`/usr/bin/sudo` without it is not `sudo`. It grants nothing inside the sandbox,
+where the extracting user is already root. On the host it is a live bit. The
+extracted file is setuid **to the calling user**. Another local user who can
+reach the destination directory, on a filesystem not mounted `nosuid`, can
+therefore run it as the calling user. Extract an untrusted archive into a
+directory only the calling user can reach, or onto a `nosuid` filesystem.
 
 [An ebuild development sandbox](ebuild-sandbox.md) works this into a consumer:
 it provisions a Gentoo stage3 through `Tarball`, then runs a package build in
 the provisioned root.
 
-## Keeping a provisioned rootfs pristine
+## Keeping a provisioned root pristine
 
-A provisioned rootfs is a durable cache: the first run pays for it and every
-later run finds it published. But a sandbox writes into the root it is given,
-and a bind mount creates its target inside the rootfs when the target does not
-exist — a `bind("/host/data", "/work")` makes `/work` in the rootfs, and the
-directory stays there on the host after the sandbox exits. Over many runs with
-different binds, a shared root accretes empty mount-point directories. This
-project's own test fixture shows it: an Alpine root the tests treat as
-read-only has picked up `/candidates`, `/raw`, and `/work` from bind targets.
+A provisioned root filesystem is a durable cache: the first run pays for it and
+every later run finds it published. But a sandbox writes into the root it is
+given. A bind mount creates its target inside the tree when the target does not
+exist. A `bind("/host/data", "/work")` therefore makes `/work` there, and the
+directory stays on the host after the sandbox exits. Over many runs with
+different binds,
+a shared root accretes empty mount-point directories. This project's own test
+fixture shows it: an Alpine root the tests treat as read-only has picked up
+`/candidates`, `/raw`, and `/work` from bind targets.
 
-Nothing is broken by this — the directories are empty, and the next run reuses
-them — but a root meant to be pristine no longer is, and it drifts from what
-provisioning produced.
+Nothing is broken by this, since the directories are empty and the next run
+reuses them. But a root meant to be pristine no longer is, and it drifts from
+what provisioning produced.
 
 `overlay_rootfs` is the answer. It roots the sandbox on an overlay whose lower
 layer is the provisioned tree and whose upper takes every write:
@@ -635,30 +661,31 @@ let status = Cage::builder()
 ```
 
 The mount points, the command's writes, and anything a build leaves behind all
-land in `/var/cache/myapp/run-42`; the provisioned root is untouched and byte-identical
-to what `ensure` published. Discarding the upper reverts the run, which is also
-what makes the pattern a clean-root-per-build — see [the ebuild
-sandbox](ebuild-sandbox.md#a-note-on-clean-builds). Keeping the upper instead
-gives an incremental root layered over a shared base.
+land in `/var/cache/myapp/run-42`. The provisioned root is untouched and
+byte-identical to what `ensure` published. Discarding the upper reverts the run,
+which is also what makes the pattern a clean-root-per-build, covered in [the
+ebuild sandbox](ebuild-sandbox.md#a-note-on-clean-builds). Keeping the upper
+instead gives an incremental root layered over a shared base.
 
-An unprivileged overlay needs Linux 5.11 or later and an upper on a filesystem
-that records `user.*` extended attributes, which an on-disk filesystem (ext4,
-xfs, btrfs) does; a tmpfs upper needs Linux 6.6. A host that cannot establish
-one is refused at build time, naming what is missing, rather than silently
-falling back to writing into the base. The kernel creates a directory in the
-overlay's work area with mode `0`, so discard the upper with
-`provision::remove`, which restores traversable permissions as it descends,
-rather than a plain `rm -rf`.
+An unprivileged overlay needs Linux 5.11 or later, and an upper on a filesystem
+that records `user.*` extended attributes. An on-disk filesystem (ext4, xfs,
+btrfs) does, and a tmpfs upper needs Linux 6.6. A host that cannot establish one
+is refused at build time, naming what is missing, rather than silently falling
+back to writing into the base. The kernel creates a directory in the overlay's
+work area with mode `0`. Discard the upper with `provision::remove`, which
+restores traversable permissions as it descends, rather than a plain `rm -rf`.
 
 Put the upper under a directory the calling user controls, not a world-writable
-one such as `/var/tmp` — the same requirement `rootfs` carries, and for a
-sharper reason: the upper is where the sandbox's writes land and where the
-caller reads its result back afterwards. The library creates the upper and its
-work directory with `mkdirat` against their parent and adopts an existing entry
-only when it is a directory the calling user owns, so a symbolic link another
-local user planted at the path is refused rather than followed. That closes the
-create; it does not make a shared parent safe, because the mount options name
-the layers as paths and the kernel resolves them again at mount time.
+one such as `/var/tmp`. That is the same requirement `rootfs` carries, for a
+sharper reason. The upper is where the sandbox's writes land, and where the
+caller reads its result back afterwards.
+
+The library creates the upper and its work directory with `mkdirat` against
+their parent. It adopts an existing entry only when it is a directory the
+calling user owns. A symbolic link another local user planted at the path is
+therefore refused rather than followed. That closes the create. It does not make
+a shared parent safe: the mount options name the layers as paths, and the kernel
+resolves them again at mount time.
 
 On the command line, `--overlay-lower` and `--overlay-upper` stand in for
 `--rootfs`.
@@ -674,24 +701,25 @@ pub trait Provisioner {
 ```
 
 An implementation fills `request.staging()` and must not assume that directory
-is the rootfs's final location — `ensure` moves it into place afterward. A
+is the tree's final location, since `ensure` moves it into place afterward. A
 provisioner outside this crate wraps its own failures with
 `ProvisionError::other`.
 
-The inputs arrive as a `ProvisionRequest` rather than as loose parameters so
-that context a provisioner comes to need can be added as accessors without
-changing the method's signature; see [Stability and
-versioning](stability.md#extension-traits).
+The inputs arrive as a `ProvisionRequest` rather than as loose parameters. That
+way, context a provisioner comes to need can be added as accessors without
+changing the method's signature. [Stability and
+versioning](stability.md#extension-traits) covers the rule.
 
-The [Debian userland](debian.md) add-on is a provisioner of this kind: with
-the `debian` feature it bootstraps a Debian suite from the archive, and
-[Building a Debian package](building-a-debian-package.md) works it into a
-consumer that builds a `.deb` from source in a cage. The [Alpine
-userland](alpine.md) is the second, and provisions an Alpine or postmarketOS
-root the same way. The [Gentoo userland](gentoo.md) is the third: it verifies a
-signed stage3 and extracts it, then installs prebuilt packages into the result
-from the archive's binary-package host — resolving, uniquely among the three,
-against a root that already has 296 packages in it.
+The [Debian userland](debian.md) add-on is a provisioner of this kind. With the
+`debian` feature it bootstraps a Debian suite from the archive. [Building a
+Debian package](building-a-debian-package.md) works it into a consumer that
+builds a `.deb` from source in a sandbox. The [Alpine userland](alpine.md) is
+the second, and provisions an Alpine or postmarketOS root the same way.
+
+The [Gentoo userland](gentoo.md) is the third. It verifies a signed stage3 and
+extracts it, then installs prebuilt packages into the result from the archive's
+binary-package host. Uniquely among the three, it resolves against a root that
+already has 296 packages in it.
 
 ## The command line
 

@@ -71,6 +71,17 @@ consumer upgrading can skip it.
 - `fcage`: a profile error is one diagnostic again. The `toml` crate's `Display`
   ends with a newline of its own, so the three sites that wrapped one left a
   blank line behind.
+- The guide's quick start shows the `id` output a sandbox actually produces.
+  Under the single-identity map the command keeps its inherited supplementary
+  groups, each presenting as the overflow gid, where the example had shown the
+  list cleared.
+- `docs/src/quick-start.md`, `provisioning.md`, `debian.md` and `gentoo.md` are
+  rewritten for readability: long sentences split, one term per concept, and
+  the repository's own spellings throughout. Two claims were wrong rather than
+  merely long and are corrected with them, namely that `--remove-rootfs` offers
+  no control over the lock sibling, and the Gentoo keyring reduction above.
+- `docs/src/debian.md` points at `examples/deb-layer-pipeline.rs`, the one
+  example no chapter named.
 - The single-identity map's ownership coverage is documented where it stops.
   Substituting `chown` and `chgrp` covers a maintainer script that runs one of
   those commands; a compiled helper calling `fchownat()`, and any POSIX ACL

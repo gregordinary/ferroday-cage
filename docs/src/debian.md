@@ -1,11 +1,12 @@
 # A Debian userland
 
-The `debian` feature provisions a Debian root filesystem: it bootstraps a
-suite and architecture from the archive and installs packages into it, so a
-sandbox can build or run Debian software from a userland the library assembles
-for it. It speaks to the archive directly — a pure-Rust replacement for
-`debootstrap` and `mmdebstrap` — and configures packages by running dpkg
-inside a cage of its own.
+The `debian` feature provisions a Debian root filesystem. It bootstraps a suite
+and architecture from the archive and installs packages into it. A sandbox can
+then build or run Debian software from a userland the library assembles for
+it.
+It speaks to the archive directly, a pure-Rust replacement for `debootstrap` and
+`mmdebstrap`, and configures packages by running dpkg inside a sandbox of its
+own.
 
 ```rust,no_run
 use ferroday_cage::provision::{self, debian::Debian};
@@ -22,50 +23,54 @@ provision::ensure("/var/lib/machines/trixie", &mut debian)?;
 
 `Debian` implements [`Provisioner`](provisioning.md), so `provision::ensure`
 publishes the result atomically: the destination directory either does not
-exist or holds a complete, configured rootfs.
+exist or holds a complete, configured tree.
 
 [Building a Debian package](building-a-debian-package.md) works this into a
-consumer: it bootstraps a suite with build tooling and builds a `.deb` from
-source inside a cage, with the host untouched.
+consumer. It bootstraps a suite with build tooling and builds a `.deb` from
+source inside a sandbox, with the host untouched.
 
 ## How it works
 
 A bootstrap runs in stages:
 
-1. **The signed release.** It fetches `InRelease`, verifies the OpenPGP
-   signature against the archive keyring, confirms the release identifies as
-   the requested suite and has not expired, and reads the release, which
+1. **The signed release.** It fetches `InRelease` and verifies the OpenPGP
+   signature against the archive keyring. It confirms the release identifies as
+   the requested suite and has not expired, then reads the release, which
    carries the digest of every package index.
-2. **The package set.** It fetches each component's `Packages` index, verifies
-   it against the release digest, and resolves the install set: the base system
-   (every essential and required package, plus `apt`) together with the
-   packages named by `include`, closed over their dependencies.
+2. **The package set.** It fetches each component's `Packages` index and
+   verifies it against the release digest. It then resolves the install set:
+   the base system (every essential and required package, plus `apt`) together
+   with the packages named by `include`, closed over their dependencies.
 3. **Download and extract.** It downloads each package, verifies its digest,
    and extracts its files into a staging tree with the same kernel-enforced
    containment the tarball provisioner uses. The merged-usr symlink layout is
    created first, so packages that ship `/usr`-native paths resolve correctly.
-   The staging tree's own directory is mode `0755`, the mode `base-files` gives
-   `/`: every `.deb` describes the root it is unpacked into as well as its
-   contents, so taking the root's mode from one of them would make it a property
-   of whichever package happened to be extracted last.
-4. **Configuration.** It configures the packages by running dpkg inside a cage
-   rooted at the staging tree, in waves modeled on a second-stage bootstrap.
-   Because configuration runs in the sandbox, it needs no privilege on the
-   host. It writes the rootfs's `sources.list` and installs the archive keyring
-   as its `signed-by` trust anchor, so the finished rootfs is apt-usable: an
-   in-cage `apt-get update` verifies the release against that keyring without
-   the `debian-archive-keyring` package, which the base install set does not
-   pull in. Under the single-identity map it also configures apt to run its
-   download methods as root, since the `_apt` user apt would otherwise drop to
-   is not represented in that map; a range map keeps apt's default sandbox.
-   When every package reaches the installed state, the rootfs is published.
+   The staging tree's own directory is mode `0755`, the mode `base-files`
+   gives `/`. Every `.deb` describes the root it is unpacked into as well as
+   its contents. Taking the root's mode from one of them would make it a
+   property of whichever package happened to be extracted last.
+4. **Configuration.** It configures the packages by running dpkg inside a
+   sandbox rooted at the staging tree, in waves modeled on a second-stage
+   bootstrap. Because configuration runs in the sandbox, it needs no privilege
+   on the host.
 
-A bootstrapped rootfs carries no `/etc/resolv.conf`, because the provisioner
-writes none: a resolver configuration belongs to wherever the tree is deployed,
-not to the archive it was built from. An in-cage `apt-get update` still resolves
-names, because host networking binds the host's `resolv.conf` in — creating the
-file to mount onto, and removing it once the sandbox is gone, so the tree keeps
-carrying none:
+   It writes the tree's `sources.list` and installs the archive keyring as its
+   `signed-by` trust anchor, so the finished tree is apt-usable. An in-sandbox
+   `apt-get update` verifies the release against that keyring without the
+   `debian-archive-keyring` package, which the base install set does not pull
+   in.
+
+   Under the single-identity map it also configures apt to run its download
+   methods as root. The `_apt` user apt would otherwise drop to is not
+   represented in that map. A range map keeps apt's default sandbox. When every
+   package reaches the installed state, the tree is published.
+
+A bootstrapped tree carries no `/etc/resolv.conf`, because the provisioner
+writes none. A resolver configuration belongs to wherever the tree is deployed,
+not to the archive it was built from. An in-sandbox `apt-get update` still
+resolves names, because host networking binds the host's `resolv.conf` in. That
+bind creates the file to mount onto and removes it once the sandbox is gone, so
+the tree keeps carrying none:
 
 ```rust,no_run
 # use ferroday_cage::{Cage, Network};
@@ -87,42 +92,42 @@ for a tree that goes on to be exported.
 
 ## The package cache
 
-`cache_dir` sets a directory downloaded packages are kept in, so a later
-bootstrap that resolves the same version reuses the file instead of fetching it
+`cache_dir` sets a directory downloaded packages are kept in. A later bootstrap
+that resolves the same version then reuses the file instead of fetching it
 again. Entries are content-addressed by digest, and every reuse verifies the
-file against that digest, so a truncated or altered entry is downloaded again
-rather than trusted. A cache directory is the caller's: it is created if absent
-and never removed, which is what makes it a cache.
+file against that digest. A truncated or altered entry is therefore downloaded
+again rather than trusted. A cache directory is the caller's: it is created if
+absent and never removed, which is what makes it a cache.
 
 Without one, packages are downloaded into a directory beside the tree being
-built and discarded when the run ends — whether the run succeeded or failed, so
-a bootstrap that fails partway leaves nothing beside the rootfs it did not
-publish.
+built and discarded when the run ends. That holds whether the run succeeded or
+failed, so a bootstrap that fails partway leaves nothing beside the tree it did
+not publish.
 
 A package is never held in memory. The bytes are written to a staging file as
-they arrive and digested on the way through, and the file is renamed into the
-cache only once the digest matches the one the archive recorded; installing
+they arrive and digested on the way through. The file is renamed into the cache
+only once the digest matches the one the archive recorded. Installing
 reads it back the same way, streaming the `data.tar` through the decompressor
 into the extractor. So a 90 MB kernel package costs what a shell script costs,
 and nothing unverified is ever visible at a cache path.
 
 One cache directory serves any number of concurrent bootstraps, in one process
 or several, whether or not their package sets overlap. Each entry is staged
-under a name unique to the writer and published with a rename, so two
-bootstraps downloading the same package at once both succeed and both end up
-naming the one file. A builder that provisions several rootfs trees in parallel
-can therefore point them all at a single cache.
+under a name unique to the writer and published with a rename. Two bootstraps
+downloading the same package at once therefore both succeed, and both end up
+naming the one file. A builder that provisions several trees in parallel can
+point them all at a single cache.
 
 ## Selecting packages
 
 The install set is the base system, plus the packages `include` names, closed
 over their dependencies, minus the packages `exclude` removes.
 
-The base system is chosen by priority, not by an enumerated list. `base_priority`
-sets the least essential `Priority` band it seeds from: the base is every
-essential package plus every package at least as essential as the floor. The
-default, `Priority::Required`, is `debootstrap`'s minbase — essential and
-required packages only. A less essential floor seeds more:
+The base system is chosen by priority, not by an enumerated list.
+`base_priority` sets the least essential `Priority` band it seeds from. The base
+is then every essential package, plus every package at least as essential as the
+floor. The default, `Priority::Required`, is `debootstrap`'s minbase: essential
+and required packages only. A less essential floor seeds more:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::{Debian, Priority};
@@ -136,19 +141,20 @@ let debian = Debian::builder("trixie")
 # }
 ```
 
-`Priority::Important` additionally seeds that band — `cron`, `logrotate`, and
-the like — so a package the archive marks at that priority is present without
-being named in `include`, matching the corresponding bootstrap variant.
+`Priority::Important` additionally seeds that band, meaning `cron`, `logrotate`,
+and the like. A package the archive marks at that priority is then present
+without being named in `include`, matching the corresponding bootstrap variant.
 Choosing the base by priority rather than by listing packages keeps the set in
-step with the archive: a package the archive promotes into the band appears
+step with the archive. A package the archive promotes into the band appears
 without the selection being revised. Floors below `Priority::Standard` seed the
 bulk of the archive and are not meaningful for a base system.
 
 `exclude` removes a package from the resolved closure. An excluded package is
-dropped from the base seed and skipped as a dependency alternative, so a group
-such as `network-manager | isc-dhcp-client` resolves to the surviving
-alternative rather than pulling the excluded one — apt's `pkgname-` deselection,
-a way to keep out a package a broader selection would otherwise draw in:
+dropped from the base seed and skipped as a dependency alternative. A group such
+as `network-manager | isc-dhcp-client` therefore resolves to the surviving
+alternative rather than pulling the excluded one. It is apt's `pkgname-`
+deselection, a way to keep out a package a broader selection would otherwise
+draw in:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Debian;
@@ -163,29 +169,34 @@ let debian = Debian::builder("trixie")
 # }
 ```
 
-Exclusion is a resolver decision, so the resolved plan and the finished rootfs
-agree — unlike a post-install purge, which would install a package only to
-remove it. A hard dependency that only an excluded package can satisfy fails the
-bootstrap rather than producing a broken closure, as does excluding a package
-that is also an `include`.
+Exclusion is a resolver decision, so the resolved plan and the finished tree
+agree. A post-install purge would instead install a package only to remove it. A
+hard dependency that only an excluded package can satisfy fails the bootstrap
+rather than producing a broken closure. So does excluding a package that is also
+an `include`.
 
 ### What a resolution refuses
 
-A dependency nothing can satisfy fails the resolution: a name no configured
-archive carries, a name carried only at a version the declared constraint rules
-out, or one an exclusion removed that a hard dependency needed. Installing
-anyway would succeed — dpkg configures with `--force-depends` — and leave a root
-whose packages cannot work, so the resolution refuses instead.
+A dependency nothing can satisfy fails the resolution. Three cases reach it:
+
+- A name no configured archive carries.
+- A name carried only at a version the declared constraint rules out.
+- One an exclusion removed that a hard dependency needed.
+ Installing anyway would succeed, since dpkg configures with
+`--force-depends`, and leave a root whose packages cannot work. The resolution
+refuses instead.
 
 Every refusal is reported before the run fails, and the failure names all of
 them. A resolution reports each one as a `DebianEvent::Unsatisfiable` carrying
-what could not be supplied, who asked for it, and what the wall was, so an
-install list with four mistakes in it is corrected in one pass rather than in
-four bootstraps. The resolution keeps walking past a refusal to find the next:
-a group nothing satisfies contributes nothing to the selection, so the rest of
-the closure is unaffected by it. Two packages needing one absent name produce
-two refusals rather than one, which is the fact rather than noise — both have
-to change.
+what could not be supplied, who asked for it, and what the wall was. An install
+list with four mistakes in it is therefore corrected in one pass rather than in
+four bootstraps.
+
+The resolution keeps walking past a refusal to find the next. A group nothing
+satisfies contributes nothing to the selection, so the rest of the closure is
+unaffected by it. Two packages needing one absent name produce two refusals
+rather than one. That is the fact rather than noise, since both have to
+change.
 
 ## Repositories
 
@@ -198,14 +209,14 @@ caller reaches for both fall out of that one type.
 
 Every mirror URL is fetched through the configured transport, and the built-in
 one speaks `http://` and `file://` only. An `https://` mirror therefore needs a
-transport of the caller's own, supplied through [`fetcher`]; see
+transport of the caller's own, supplied through [`fetcher`] and covered under
 [Trust](#trust). It is the archive signature, not the transport, that
 authenticates a package.
 
 **Distinct sources in one resolution.** A local trusted pool of a build's own
-`.deb`s and one or more signed feature repositories are separate repositories,
-each with its own trust anchor, contributing packages to a single dependency
-closure:
+`.deb`s and one or more signed feature repositories are separate repositories.
+Each has its own trust anchor, and each contributes packages to a single
+dependency closure:
 
 ```rust,no_run
 use ferroday_cage::provision::{self, debian::{Debian, Repository}};
@@ -226,28 +237,33 @@ provision::ensure("/var/lib/machines/trixie", &mut debian)?;
 # }
 ```
 
-Resolution is highest-version-wins across every repository, so a package a
-feature repository ships at a higher version supersedes the mirror's, and a
-package only the local pool ships is pulled from it while its dependencies close
-against the mirror; an exact-version tie resolves to the earlier repository, the
-primary first. The local pool is a `dists/`-structured repository — the layout
-apt reads, the same one the provisioner fetches from a mirror — trusted without
-a signature, which is apt's `[trusted=yes]` and the shape a build produces when
-it regenerates a pool of its own `.deb`s each run. Each additional repository
-writes its own `/etc/apt/sources.list.d/<name>.list` into the finished rootfs,
-signed by its own `/usr/share/keyrings/<name>.gpg` when it carries a keyring.
-Those file names have to be distinct, so a set in which two additional
-repositories would write the same pair is refused at build time; a repository
-with no [`name`] takes a generated one from its position, which a caller-supplied
-name must not collide with either.
+Resolution is highest-version-wins across every repository. A package a feature
+repository ships at a higher version therefore supersedes the mirror's. A
+package only the local pool ships is pulled from it, while its dependencies
+close against the mirror. An exact-version tie resolves to the earlier
+repository, the primary first.
+
+The local pool is a `dists/`-structured repository, the layout apt reads and the
+same one the provisioner fetches from a mirror. It is trusted without a
+signature, which is apt's `[trusted=yes]`. That is the shape a build produces
+when it regenerates a pool of its own `.deb`s each run.
+
+Each additional repository writes its own
+`/etc/apt/sources.list.d/<name>.list` into the finished tree, signed by its own
+`/usr/share/keyrings/<name>.gpg` when it carries a keyring. Those file names
+have to be distinct, so a set in which two additional repositories would write
+the same pair is refused at build time. A repository with no [`name`] takes a
+generated one from its position, which a caller-supplied name must not collide
+with either.
 
 **Interchangeable URLs for one source.** A live mirror with a
 `snapshot.debian.org` backstop is one source reached two ways.
-[`mirror_fallback`] adds a backstop URL to the primary — and
+[`mirror_fallback`] adds a backstop URL to the primary, and
 [`Repository::builder`](https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Repository.html#method.builder)
 [`mirror_fallback`](https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.RepositoryBuilder.html#method.mirror_fallback)
-to any repository — tried in order when the live mirror reports a resource
-missing, for a version that has rotated off the live pool:
+does the same for any repository. Backstops are tried in order when the live
+mirror reports a resource missing. That is what happens to a version that has
+rotated off the live pool:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Debian;
@@ -264,21 +280,22 @@ let _debian = Debian::builder("trixie")
 
 The freshness posture is repository-wide, so a repository with a snapshot
 backstop sets [`allow_stale_release`], the snapshot's release being expired by
-design; the signature is still verified. The backstop is a fetch-time concern
-only — the finished rootfs's `sources.list` names the live mirror, not the
+design. The signature is still verified. The backstop is a fetch-time concern
+only: the finished tree's `sources.list` names the live mirror, not the
 snapshot.
 
-Multiplying repositories does not dilute trust. Every authenticity check — the
-signature against the repository's keyring, the release bound to its suite, the
-transport `trust_unsigned` requires — simply runs once per repository.
-The `deb-multirepo` example provisions a root from the archive mirror plus a
-local trusted pool, auditing the repository builder end to end.
+Multiplying repositories does not dilute trust. Every authenticity check simply
+runs once per repository: the signature against that repository's keyring, the
+release bound to its suite, and the transport `trust_unsigned` requires. The
+`deb-multirepo` example provisions a root from the archive mirror plus a local
+trusted pool, auditing the repository builder end to end.
 
 ## Publishing a local pool
 
-[`Pool`] produces the local trusted pool the previous section consumes: it
-writes or updates a `dists/`-structured repository from a set of `.deb`s, so a
-pipeline that builds packages can feed each one into the resolution of the next.
+[`Pool`] produces the local trusted pool the previous section consumes. It
+writes or updates a `dists/`-structured repository from a set of `.deb`s. A
+pipeline that builds packages can then feed each one into the resolution of the
+next.
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Pool;
@@ -292,32 +309,32 @@ Pool::at("/srv/my-debs")
 ```
 
 The component defaults to `main` and the architecture to the host's. Both have
-setters, and both select what the call writes rather than what the suite offers;
-the next section covers a suite that holds more than one of either. `publish`
-takes anything that iterates paths, and may be called repeatedly on the same
-`Pool` — each call merges into what the pool already indexes.
+setters, and both select what the call writes rather than what the suite offers.
+The next section covers a suite that holds more than one of either. `publish`
+takes anything that iterates paths, and it can be called repeatedly on the same
+`Pool`, each call merging into what the pool already indexes.
 
 The call reads each `.deb`'s control stanza, copies it into the pool under
 `pool/`, and regenerates the component's `Packages` index (with its `.gz`) and
-the suite's `Release`. It is idempotent and incremental: the pool directory is
-updated in place, and the index keeps the highest version of each package name —
-the same rule resolution applies — so republishing over a superset of a prior
-run is well-defined.
+the suite's `Release`. It is idempotent and incremental. The pool directory is
+updated in place, and the index keeps the highest version of each package name,
+which is the same rule resolution applies. Republishing over a superset of a
+prior run is therefore well-defined.
 
-Publishing an empty set writes a valid, empty repository: the `Release` still
+Publishing an empty set writes a valid, empty repository. The `Release` still
 declares the architecture and component, so the pool can be created before the
-first `.deb` exists and referenced from the start, resolving against an empty
-package set rather than a missing repository. The pool is trusted, not signed —
-a `file://` repository under the caller's control, apt's `[trusted=yes]` — so no
-OpenPGP signature is written and none is expected.
+first `.deb` exists and referenced from the start. It then resolves against an
+empty package set rather than a missing repository. The pool is trusted, not
+signed: a `file://` repository under the caller's control, apt's
+`[trusted=yes]`. No OpenPGP signature is written and none is expected.
 
 ### A suite accumulates
 
 A suite holds as many components and architectures as are published into it, and
-its `Release` describes all of them. Each publish rescans `dists/<suite>` for the
-indexes it holds and rewrites the release from what it finds, so publishing a
-second architecture leaves the first reachable, and a component published beside
-another does not retire it.
+its `Release` describes all of them. Each publish rescans `dists/<suite>` for
+the indexes it holds and rewrites the release from what it finds. Publishing a
+second architecture therefore leaves the first reachable, and a component
+published beside another does not retire it.
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Pool;
@@ -345,36 +362,39 @@ Components: main
 
 This matters more than it looks. A reader consults the release before it knows
 which digests to ask for, and verifies every index it fetches against a digest
-the release records, so a section the release does not name cannot be resolved
-however intact it is on disk — and the `by-hash` copies are no way around that,
-for the same reason. A release describing only the publish that wrote it would
-make each publish retire the last.
+the release records. A section the release does not name therefore cannot be
+resolved however intact it is on disk. The `by-hash` copies are no way around
+that, for the same reason. A release describing only the publish that wrote it
+would make each publish retire the last.
 
 The scan costs the digest of every index in the suite rather than only the one
 just written. Indexes are small beside the packages they describe, and the scan
-runs under the publish lock along with the rest of the call, so a pipeline
-publishing components in parallel serializes on it exactly as it already does.
+runs under the publish lock along with the rest of the call. A pipeline
+publishing components in parallel therefore serializes on it exactly as it
+already does.
 
-A component may be laid out as a subtree, which is how `main/debian-installer`
+A component can be laid out as a subtree, which is how `main/debian-installer`
 sits in the archive. It records in `Components` under its full path, since that
 is the name a reader has to ask for to reach it.
 
-The suite is a path too — Debian's security archive published `buster/updates`
-for years — so both accept an interior slash. What they refuse is a value that
-would resolve somewhere other than where it says: a leading `/`, a `..` segment,
-an empty or `.` segment. An architecture is always a single directory name and
-takes no slash at all. All three also refuse whitespace and control characters,
-which a release field has no way to name: `Architectures` and `Components` are
-whitespace-delimited lists, so a component with a space in it would read back as
-two components, neither of them the one published. Each refusal is a
-configuration error naming the field and the value.
+The suite is a path too, since Debian's security archive published
+`buster/updates` for years, so both accept an interior slash. What they refuse
+is a value that would resolve somewhere other than where it says. That means a
+leading `/`, a `..` segment, or an empty or `.` segment. An architecture is
+always a single directory name and takes no slash at all.
+
+All three also refuse whitespace and control characters, which a release field
+has no way to name. `Architectures` and `Components` are whitespace-delimited
+lists. A component with a space in it would therefore read back as two
+components, neither of them the one published. Each refusal is a configuration
+error naming the field and the value.
 
 The same rule holds on the reading side. A [`Repository`]'s suite and components
 and a bootstrap's architecture become path segments of every URL the archive is
-fetched through and words of the `deb` line written into the finished rootfs, so
-each is checked when the repository or the builder is built: a `..` segment
-would climb out of the mirror root, which for a `file://` mirror is a local
-read, and a control character would split the request line the value is
+fetched through. They are also words of the `deb` line written into the finished
+tree. Each is therefore checked when the repository or the builder is built. A
+`..` segment would climb out of the mirror root, which for a `file://` mirror is
+a local read. A control character would split the request line the value is
 interpolated into.
 
 ### What a published `.deb` must declare
@@ -382,27 +402,29 @@ interpolated into.
 `publish` derives the path a package is stored at, and the `Filename` the index
 records, from the package's own control stanza. Two things follow.
 
-`Package` and `Version` are held to the alphabet Debian policy gives them — a
-name of lowercase letters, digits, `+`, `-`, and `.`, at least two characters and
-starting with a letter or a digit; a version of alphanumerics and `.`, `+`, `-`,
-`:`, `~`. Neither alphabet contains a separator, so the derived path stays where
-the pool put it: without the check a package naming itself `../../..` would
-create directories and write a file outside the pool root, as the publishing
-user.
+`Package` and `Version` are held to the alphabet Debian policy gives them. A
+name is lowercase letters, digits, `+`, `-`, and `.`, at least two characters
+and starting with a letter or a digit. A version is alphanumerics and `.`, `+`,
+`-`, `:`, `~`. Neither alphabet contains a separator, so the derived path stays
+where the pool put it. Without the check, a package naming itself `../../..`
+would create directories and write a file outside the pool root, as the
+publishing user.
 
 The control file must be one paragraph and must not itself carry `Filename`,
 `Size`, or `SHA256`. A pool entry is the control file verbatim with those three
-appended, and a deb822 reader resolves a field by its first occurrence, so a
-package carrying one would shadow the archive's value — a digest it chose rather
-than one taken from the bytes on disk, or a `Filename` naming another package's
-file. A second paragraph does the same by another route: the appended fields
-land on the last paragraph, which is then the one that reads back as the entry,
-under whatever name and version it declares. A pool is consumed as
-`[trusted=yes]` and resolution is highest-version-wins across repositories, so an
-entry a package wrote for itself would supersede the primary archive's.
+appended, and a deb822 reader resolves a field by its first occurrence. A
+package carrying one would therefore shadow the archive's value. That is a
+digest it chose rather than one taken from the bytes on disk, or a `Filename`
+naming another package's file.
+
+A second paragraph does the same by another route. The appended fields land on
+the last paragraph, which is then the one that reads back as the entry. It reads
+back under whatever name and version it declares. A pool is consumed as `[trusted=yes]` and
+resolution is highest-version-wins across repositories, so an entry a package
+wrote for itself would supersede the primary archive's.
 
 Both are `DebianError::Deb`, naming the file and what is wrong with it. No
-conforming `.deb` is affected: `dpkg-deb` builds a one-paragraph control file,
+conforming `.deb` is affected. `dpkg-deb` builds a one-paragraph control file,
 and the three appended names are archive fields that a control file has no
 reason to carry.
 
@@ -410,10 +432,10 @@ reason to carry.
 
 A pool reports the paths it owns, so nothing outside it needs to know how an
 archive is laid out. [`Pool::mirror_url`] is the `file://` URL that declares the
-pool as a [`Repository`]; [`Pool::release_path`] and [`Pool::dists_dir`] are the
+pool as a [`Repository`]. [`Pool::release_path`] and [`Pool::dists_dir`] are the
 suite's `Release` and the directory it sits in. A relative pool root is made
-absolute for the URL, and none of the three requires the pool to exist, so a
-pipeline can wire itself together before its first publish.
+absolute for the URL, and none of the three requires the pool to exist. A
+pipeline can therefore wire itself together before its first publish.
 
 ```rust,no_run
 use ferroday_cage::provision::debian::{Pool, Repository};
@@ -435,18 +457,18 @@ let repository = Repository::builder("trixie")
 ### Dating a release
 
 The `Release` carries `Date`, the required field naming when the pool was
-published. A client reads it to tell how old a snapshot is and to check its own
-clock against the archive's; one that finds no `Date` reports the release as
+published. A client reads it to tell how old a snapshot is, and to check its own
+clock against the archive's. One that finds no `Date` reports the release as
 malformed rather than as merely undated.
 
 The release carries no `Valid-Until`, the separate and optional field, so it
 never expires. A pool stays usable for as long as its packages are wanted,
 however long after the build that wrote it that is. Dating a release does not
-bound its freshness — expiry is enforced on `Valid-Until` alone.
+bound its freshness, since expiry is enforced on `Valid-Until` alone.
 
-By default the field names the time of the publish, which is what makes the
+By default the field names the time of the publish. That is what makes the
 release the one part of a pool that varies between two publishes of the same
-packages: the indexes are a function of the package set, and the release is a
+packages. The indexes are a function of the package set, and the release is a
 function of the indexes and the date. [`Pool::date`] pins it, making a publish
 byte-reproducible.
 
@@ -464,15 +486,15 @@ Pool::at("build/pool")
 ```
 
 The pinned value is a plain Unix timestamp rather than something read from the
-environment, so a pipeline that already pins a build date pins the pool's with
-the same number it gives [`Export::clamp_mtime`].
+environment. A pipeline that already pins a build date therefore pins the pool's
+with the same number it gives [`Export::clamp_mtime`].
 
 ### Naming a pool
 
-A release may carry `Origin`, `Label`, and `Description`, which name who
+A release can carry `Origin`, `Label`, and `Description`, which name who
 produced the archive, what it is, and what it holds. None has a default and each
-is emitted only when set, so a pool that names none of them is a valid archive —
-inventing an origin would put a name in an archive its owner did not choose.
+is emitted only when set, so a pool that names none of them is a valid archive.
+Inventing an origin would put a name in an archive its owner did not choose.
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Pool;
@@ -488,53 +510,53 @@ Pool::at("build/pool")
 # }
 ```
 
-They are informational: nothing resolves against them. What they buy is how a
-client presents the archive — `apt policy` renders a repository under its origin
-and label, and `Pin: release o=Example` is the pinning form apt's own
+They are informational, and nothing resolves against them. What they buy is how
+a client presents the archive. `apt policy` renders a repository under its
+origin and label, and `Pin: release o=Example` is the pinning form apt's own
 documentation leads with. Without them, a pool is still pinned by suite or
 codename.
 
 The three are free text and take spaces and punctuation. What they cannot carry
-is a control character: a release field ends at a newline, so a value holding one
-would continue into the release as further fields. A value that is empty is
-refused as well, the way to have no `Origin` being not to set one.
+is a control character. A release field ends at a newline, so a value holding
+one would continue into the release as further fields. An empty value is refused
+as well, the way to have no `Origin` being not to set one.
 
 ### Signing a pool
 
-A pool that leaves the machine that built it is signed by its owner:
-`release_path` names the document to sign and `dists_dir` the directory the
+A pool that leaves the machine that built it is signed by its owner.
+`release_path` names the document to sign, and `dists_dir` the directory the
 signature belongs in. The signature must be an inline cleartext-signed
-`InRelease` — the form the provisioner reads for a repository with a
-[`keyring`] — since a detached `Release.gpg` is not fetched. A signed pool needs
-no `Valid-Until`; a release that carries none is simply unbounded, as Debian
+`InRelease`, which is the form the provisioner reads for a repository with a
+[`keyring`]. A detached `Release.gpg` is not fetched. A signed pool needs no
+`Valid-Until`, and a release that carries none is simply unbounded, as Debian
 stable's is.
 
 Publishing removes any signature the pool already carries, both spellings, so a
 signature made over a superseded `Release` can never outlive it. That matters
-more than it looks: the by-hash index copies are immutable and never removed, so
-a stale-but-valid signature would not fail a reader — it would quietly resolve
+more than it looks. The by-hash index copies are immutable and never removed, so
+a stale-but-valid signature would not fail a reader. It would quietly resolve
 the older package set. Leaving the pool unsigned between a publish and its
-signature fails closed instead, and it means a pool is signed after every
+signature fails closed instead. It also means a pool is signed after every
 publish rather than once.
 
 ### What publishing costs
 
 Publishing never holds a package in memory. A `.deb`'s control stanza is read by
-seeking to the control member of its `ar` container, its digest is taken in
-chunks, and its payload is copied without being buffered, so publishing a 90 MB
-kernel package costs what publishing a shell script costs.
+seeking to the control member of its `ar` container. Its digest is taken in
+chunks, and its payload is copied without being buffered. Publishing a 90 MB
+kernel package therefore costs what publishing a shell script costs.
 
-Where the build tree and the pool sit on one filesystem that can share extents —
-btrfs, XFS formatted with reflink, bcachefs — the payload is cloned rather than
-copied. The clone is a metadata operation: no time proportional to the package,
-and no additional disk. Everywhere else, including ext4 and any pool on a
-different filesystem from the build tree, the bytes are streamed through
+The payload is cloned rather than copied where the build tree and the pool sit
+on one filesystem that can share extents. That means btrfs, XFS formatted with
+reflink, or bcachefs. The clone is a metadata operation, costing no time
+proportional to the package and no additional disk. Everywhere else, including ext4 and any pool on
+a different filesystem from the build tree, the bytes are streamed through
 instead. The two produce the same pool.
 
 The copy is a clone and never a hard link, and the difference is what a reader
-sees. A hard link would alias the caller's file, so rebuilding a package in place
-would rewrite the pool's copy along with it, and a reader partway through
-resolving that package would fail its digest check against a `Release` that
+sees. A hard link would alias the caller's file, so rebuilding a package in
+place would rewrite the pool's copy along with it. A reader partway through
+resolving that package would then fail its digest check against a `Release` that
 described the older bytes. A clone shares storage and nothing else, so a
 published file is fixed once published.
 
@@ -547,26 +569,29 @@ untouched.
 ### Publishing in parallel
 
 A pipeline that builds components in parallel can publish each one the moment it
-finishes, and resolve against the pool while other components are still
+finishes. It can resolve against the pool while other components are still
 publishing into it. Neither needs coordination of its own.
 
 Publishes exclude each other with a lock on `.lock` in the pool root, held for
 the whole call. The index is rebuilt by merging into what the pool already
-holds, so without that lock two publishes would each start from the same prior
-index and the later would drop the earlier's packages.
+holds. Without that lock, two publishes would each start from the same prior
+index, and the later would drop the earlier's packages.
 
-Readers take no lock, and cannot: a reader reaches the pool through the fetch
-transport as an ordinary repository and does not know a pool is what it is
-reading. Instead a publish becomes visible all at once. Every file is written
-atomically; the indexes are additionally written under `by-hash/SHA256/<digest>`,
-where they are immutable and are never rewritten or removed; and the `Release`
-that names those digests is written last. A bootstrap that has read a `Release`
-therefore keeps resolving the indexes that `Release` described, however many
-publishes land while it works.
+Readers take no lock, and cannot. A reader reaches the pool through the fetch
+transport as an ordinary repository, and does not know a pool is what it is
+reading. Instead a publish becomes visible all at once, in three parts:
+
+- Every file is written atomically.
+- The indexes are additionally written under `by-hash/SHA256/<digest>`, where
+  they are immutable and are never rewritten or removed.
+- The `Release` that names those digests is written last.
+
+A bootstrap that has read a `Release` therefore keeps resolving the indexes that
+`Release` described, however many publishes land while it works.
 
 One case falls outside this. Republishing a package at a version the pool
 already holds, with *different* bytes, writes to the path the older bytes
-occupy, because the archive layout stores both there. A reader partway through
+occupy. The archive layout stores both there. A reader partway through
 resolving the older bytes fails its digest check. In a build pipeline that means
 two components produced the same package version. Republishing *identical* bytes
 is the ordinary incremental case and rewrites nothing.
@@ -574,9 +599,10 @@ is the ordinary incremental case and rewrites nothing.
 ## The resolved plan
 
 [`resolve`] reports what a bootstrap would install without installing it. It
-runs the read half of the pipeline — the signed release and the package index,
-then dependency resolution — and returns the exact package set, each with its
-version, architecture, and archive-verified SHA-256, downloading nothing:
+runs the read half of the pipeline, meaning the signed release, the package
+index, and then dependency resolution. It returns the exact package set, each
+with its version, architecture, and archive-verified SHA-256, and downloads
+nothing:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Debian;
@@ -591,15 +617,15 @@ for package in &plan.packages {
 # }
 ```
 
-The plan is the same closure a full bootstrap installs — both resolve through
-one code path — so it is a faithful preview and a stable key for a
+The plan is the same closure a full bootstrap installs, since both resolve
+through one code path. It is therefore a faithful preview and a stable key for a
 content-addressed build cache. Every digest chains back to the release
 signature, so the key is anchored to the archive rather than to a mirror's word.
 Because it runs nothing, `resolve` needs neither a `qemu-user` binfmt handler
 nor an establishable identity map, and so serves an architecture the host cannot
 execute.
 
-A full bootstrap reports the same plan inline: it emits `DebianEvent::Resolved`
+A full bootstrap reports the same plan inline. It emits `DebianEvent::Resolved`
 once the closure is resolved and before the first download, carrying the plan it
 is about to install. A [progress sink](streaming.md) can read it there, keying a
 build cache on what the running bootstrap actually resolved without a separate
@@ -640,34 +666,35 @@ Three details are worth stating.
 
 The **mirror** recorded is the URL that answered, not the configured list. A
 repository with a [`mirror_fallback`] snapshot backstop resolves against
-whichever URL served, and recording the list would describe a choice rather than
-the choice made.
+whichever URL served. Recording the list would describe a choice rather than the
+choice made.
 
-The **release digest** is of the body that was verified — for a signed
-repository, the cleartext the signature covers, not the `InRelease` armor around
-it and not a re-fetch. So it identifies the exact archive state the signature
-vouched for.
+The **release digest** is of the body that was verified. For a signed
+repository, that is the cleartext the signature covers, not the `InRelease` armor
+around it and not a re-fetch. It therefore identifies the exact archive state
+the signature vouched for.
 
 Two fingerprints record **who vouched for it**, both in the uppercase hex the
-OpenPGP tools print, and both empty for a repository configured as
-[`trust_unsigned`] — where nothing was verified, which is a fact worth recording
-rather than an omission. `signed_by` is the certificate's primary-key
-fingerprint: the identity a keyring entry is named by, and the one to pin a
-repository against. `signing_key` is the component key that actually made the
-signature. Debian's archive keys sign with a dedicated signing subkey, so the
-two normally differ, and only `signed_by` stays put when an archive rotates that
-subkey.
+OpenPGP tools print. Both are empty for a repository configured as
+[`trust_unsigned`], where nothing was verified, which is a fact worth recording
+rather than an omission.
+
+`signed_by` is the certificate's primary-key fingerprint: the identity a keyring
+entry is named by, and the one to pin a repository against. `signing_key` is the
+component key that actually made the signature. Debian's archive keys sign with
+a dedicated signing subkey, so the two normally differ. Only `signed_by` stays
+put when an archive rotates that subkey.
 
 `package.archive` indexes into `plan.archives`. Resolution is
-highest-version-wins across the merged repositories, so with more than one
-configured this is the only thing that says where a package will actually come
+highest-version-wins across the merged repositories. With more than one
+configured, this is the only thing that says where a package will actually come
 from.
 
 ## Installing a plan without resolving again
 
-[`plan`] hands a previously resolved `Plan` back to the bootstrap, which then
-fetches exactly the packages it records, by the digests it records, and never
-touches a release or a package index:
+[`plan`] hands a previously resolved `Plan` back to the bootstrap. The bootstrap
+then fetches exactly the packages it records, by the digests it records, and
+never touches a release or a package index:
 
 ```rust,no_run
 use ferroday_cage::provision::{self, debian::Debian};
@@ -684,56 +711,56 @@ provision::ensure("/srv/images/replay", &mut debian)?;
 # }
 ```
 
-Ordinarily `resolve` and a bootstrap each run a full resolution, so a pipeline
-that resolves once to key its cache and then provisions resolves twice — and has
-to reconcile the two when the archive publishes in between. Pinning removes both
-the second resolution and the divergence, along with the roughly 9 MB index
+Ordinarily `resolve` and a bootstrap each run a full resolution. A pipeline that
+resolves once to key its cache and then provisions therefore resolves twice. It
+has to reconcile the two when the archive publishes in between. Pinning removes
+both the second resolution and the divergence, along with the roughly 9 MB index
 download that dominates it.
 
 ### The trust model changes
 
-Skipping the release and the index is the win, and it means the package digests
-no longer chain to an archive signature at install time. **The plan becomes the
+Skipping the release and the index is the win. It means the package digests no
+longer chain to an archive signature at install time. **The plan becomes the
 trust anchor.** It was archive-verified when it was produced, and installing
 from it asserts that whoever kept it kept it intact. Each `.deb` is still
 verified against the digest the plan records, so a tampered mirror is still
-caught; what is no longer checked is that the plan still describes what the
+caught. What is no longer checked is that the plan still describes what the
 archive says.
 
-That is exactly what a reproduce mode wants and exactly what an ordinary build
-should not take, so pinning is opt-in by construction: a builder that sets no
-plan resolves as it always has, chaining every digest to a repository signature
-at install time. Nothing about an ordinary bootstrap changes.
+That is exactly what a reproduce mode wants, and exactly what an ordinary build
+must not take. So pinning is opt-in by construction. A builder that sets no plan
+resolves as it always has, chaining every digest to a repository signature at
+install time. Nothing about an ordinary bootstrap changes.
 
 ### What a plan pins, and what it does not
 
-A plan describes a resolution that already happened, so anything that would
-shape a resolution contradicts it and is refused at `build` with
-`DebianError::Config` rather than given a silent precedence: `include`,
-`exclude`, and `base_priority`. A plan whose suite or architecture disagrees
-with the builder's is refused the same way, as is one naming more archives than
-there are repositories to fetch them from. Where the builder names no
+A plan describes a resolution that already happened. Anything that would shape a
+resolution therefore contradicts it. `include`, `exclude`, and `base_priority`
+are refused at `build` with `DebianError::Config` rather than given a silent
+precedence. A plan whose suite or architecture disagrees with the builder's is
+refused the same way. So is one naming more archives than there are repositories
+to fetch them from. Where the builder names no
 architecture the plan's is adopted, since a plan states which architecture it is
 for.
 
 Everything that shapes *how* rather than *what* still applies: `cache_dir`,
 `identity_map`, `pre_configure_overlay`, the repositories, and the fetcher. A
-package is fetched from the repository its `archive` index names, so the same
-plan can be replayed against a snapshot mirror by configuring one.
+package is fetched from the repository its `archive` index names, so configuring
+a snapshot mirror is enough to replay the same plan against one.
 
 A pinned install against an archive that has moved on installs the pinned
-versions, which is the point. If a `.deb` the plan names is no longer on the
-mirror, the failure names the package and its digest rather than reporting a
-resolution that found nothing — the plan is intact, and the archive no longer
+versions, which is the point. Where a `.deb` the plan names is no longer on the
+mirror, the failure names the package and its digest. It does not report a
+resolution that found nothing: the plan is intact, and the archive no longer
 holds what it names.
 
 ### Keeping a plan
 
-Handing a `Plan` straight back to `plan` covers one process: resolve once,
-install once, no second resolution and no divergence if the archive publishes in
-between. A reproduce mode resolves on Monday and replays in a month, and for
-that the plan has to leave the process. `to_document` and `parse_document` are
-that form:
+Handing a `Plan` straight back to `plan` covers one process. Resolve once,
+install once, with no second resolution and no divergence when the archive
+publishes in between. A reproduce mode instead resolves on Monday and replays in a
+month, and for that the plan has to leave the process. `to_document` and
+`parse_document` are that form:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::{Debian, Plan};
@@ -754,9 +781,9 @@ let mut debian = Debian::builder("trixie")
 # }
 ```
 
-The document is deb822 — the archive's own control format, the one a `Release`
-and a `Packages` index are written in — so it reads in a terminal and diffs in a
-review:
+The document is deb822, the archive's own control format and the one a `Release`
+and a `Packages` index are written in. It therefore reads in a terminal and
+diffs in a review:
 
 ```text
 Format: ferroday-cage-plan 2
@@ -802,106 +829,113 @@ Source: local-suite
 Archive 0 names both the archive certificate and the signing subkey that made
 the signature. Archive 1 is a locally published
 [pool](#publishing-a-local-pool) configured with `trust_unsigned`, so nothing
-verified its release and both fields are empty — written bare, with nothing
-after the colon, because a line ending in whitespace would not survive the
-editors and hooks that strip it. It carries no
-`Valid-Until` either, an absent optional field being absent rather than empty.
-`local-tool` names `Archive: 1`, which is what says it will be fetched from the
-pool rather than from the Debian mirror.
+verified its release and both fields are empty. They are written bare, with
+nothing after the colon, because a line ending in whitespace would not survive
+the editors and hooks that strip it. Archive 1 carries no `Valid-Until` either,
+an absent optional field being absent rather than empty. `local-tool` names
+`Archive: 1`, which is what says it will be fetched from the pool rather than
+from the Debian mirror.
 
 `Installed-Size` and `Source` are optional, and each stanza above carries one of
-them to show it. `Installed-Size` is the archive's own figure, in the kibibytes
-[Debian Policy
+them to show it.
+
+`Installed-Size` is the archive's own figure, in the kibibytes [Debian Policy
 5.6.20](https://www.debian.org/doc/debian-policy/ch-controlfields.html#installed-size)
-defines it in rather than normalized to bytes, so it can be compared against a
-mirror's value directly. It is an estimate: the package's build produces it from
+defines it in rather than normalized to bytes. It can therefore be compared
+against a mirror's value directly. It is an estimate. The package's build produces it from
 its staged tree, so it neither measures an installed filesystem nor accounts for
-the target's block size, and a total over a plan is best presented as the
-archive's accounting rather than as what an image will weigh. `Source` names the
-source package a binary package was built from, with any parenthesized source
-version dropped, and is absent for the common case of a source that shares the
-binary package's name — which is how the archive itself says it. Reading it that
-way is what lets several binary packages be attributed to the one source that
-produced them.
+the target's block size. A total over a plan is best presented as the archive's
+accounting rather than as what an image will weigh.
+
+`Source` names the source package a binary package was built from, with any
+parenthesized source version dropped. It is absent for the common case of a
+source that shares the binary package's name, which is how the archive itself
+says it. Reading it that way is what lets several binary packages be attributed
+to the one source that produced them.
 
 A plan the library resolved never states a `Source` equal to the package's own
-name. A plan read back from a document states whatever the document does: the
-reader takes the field verbatim, so a hand-written stanza naming a source that
-matches reads that way and is written back unchanged. Attributing a plan by
-source is therefore a question of the source name where there is one and the
-package's own name where there is not, not of whether the field is present.
+name. A plan read back from a document states whatever the document does,
+because the reader takes the field verbatim. A hand-written stanza naming a
+source that matches therefore reads that way and is written back unchanged.
+Attributing a plan by source is a question of the source name where there is
+one, and the package's own name where there is not. It is not a question of
+whether the field is present.
 
 Both of a plan's lists are already ordered, so two renderings of one plan are
-byte-identical and a plan that changes shows the change as a diff rather than as
-a different blob.
+byte-identical. A plan that changes shows the change as a diff rather than as a
+different blob.
 
-A field a reader does not know is carried rather than refused, so a document
-written by a later version of the library still reads here as long as the
-`Format` version is unchanged — that version is bumped only for a change an
-older reader would misread. Adding a field is not one.
+A field a reader does not know is carried rather than refused. A document
+written by a later version of the library therefore still reads here as long as
+the `Format` version is unchanged. That version is bumped only for a change an
+older reader would misread, and adding a field is not one.
 
 A field that keeps its name and changes its meaning is, and version 2 is what
 one of them required. In version 1, `Signed-By` named the key that made the
-release signature; in version 2 it names the verifying certificate, and the
-signing key has a field of its own. A version 1 document is therefore refused
-rather than read: the fingerprint under `Signed-By` answers a different
-question, and a consumer comparing it against a recorded one would read the
-difference as the archive having rotated its key. Re-resolving against the same
-archive writes a version 2 document.
+release signature. In version 2 it names the verifying certificate, and the
+signing key has a field of its own.
+
+A version 1 document is therefore refused rather than read. The fingerprint
+under `Signed-By` answers a different question. A consumer comparing it against
+a recorded one would read the difference as the archive having rotated its key.
+Re-resolving against the same archive writes a version 2 document.
 
 Carried on the way in does not mean dropped on the way out. A field this version
-does not know is carried with its stanza and re-emitted after the ones it does,
-so reading a plan and writing it back preserves every field. That matters
-because re-emitting a plan is a thing a consumer does — into a provenance
-record, or to normalize a file it commits — and a round trip that quietly
+does not know is carried with its stanza and re-emitted after the ones it does.
+Reading a plan and writing it back therefore preserves every field.
+
+That matters because re-emitting a plan is a thing a consumer does, into a
+provenance record or to normalize a file it commits. A round trip that quietly
 discarded whatever a newer writer had added would corrupt exactly the record it
 was kept for.
 
 Within one version a round trip is byte-identical, carried fields included, so
 re-emitting does not churn a committed file. Between two versions of this
 library that share a `Format` version it is byte-identical too, in both
-directions: a document the newer writes reads and re-writes unchanged through
-the older, because a field added to the format is written after every field the
-older readers knew — which is exactly where those readers put a field they do
-not know back. `Installed-Size` and `Source` sit after `Archive` for that reason
+directions. A document the newer writes reads and re-writes unchanged through
+the older. A field added to the format is written after every field the older
+readers knew. That is exactly where those readers put a field they do not know
+back. `Installed-Size` and `Source` sit after `Archive` for that reason
 rather than beside the fields they describe.
 
-What no round trip can promise is byte identity across *writers*: another
-implementation of this format may interleave its fields with the known ones
-rather than append them, and a reader cannot know where they belong. If you need
-bytes that are stable against anything, digest the document you were given
+What no round trip can promise is byte identity across *writers*. Another
+implementation of this format might interleave its fields with the known ones
+rather than append them, and a reader cannot know where they belong. Where you
+need bytes that are stable against anything, digest the document you were given
 rather than a re-render of it.
 
 No line the format emits ends in whitespace, so a plan survives the editors and
-pre-commit hooks that strip it. An empty field — `Signed-By` for a repository
-trusted unsigned, `Components` for none — is written bare, as `Signed-By:` with
-nothing after the colon.
+pre-commit hooks that strip it. An empty field is written bare, as `Signed-By:`
+with nothing after the colon. That covers `Signed-By` for a repository trusted
+unsigned, and `Components` for none.
 
-What is refused is anything that would read back as a *different* plan: a
-package naming an archive the document does not carry, archive stanzas numbered
-out of order, a missing required field, and, on the writing side, a value the
-format cannot carry on one line or one whose own leading or trailing whitespace
-a reader would strip.
+What is refused is anything that would read back as a *different* plan. That
+means a package naming an archive the document does not carry, archive stanzas
+numbered out of order, or a missing required field. On the writing side it also
+means a value the format cannot carry on one line. So is one whose own leading
+or trailing whitespace a reader would strip.
 
 Two fields are also held to their shape, because they are what a plan install
 composes rather than merely reports. A package's `Filename` is interpolated
 verbatim into the URL its `.deb` is fetched from, so it is held to the same rule
-an archive index's is: a relative path, no `..` component, printable ASCII only,
-as written and as a server that percent-decodes it would read it. And its
-`SHA256` must be 64 lowercase hex characters, since that is the value the fetched
-bytes are compared against. A document is a trust anchor, so neither is a
-defense against the plan itself — it is what keeps a plan that was edited by hand
-into something unfetchable from being reported as a mirror that served the wrong
-bytes. Both are checked again at `build`, since a `Plan` taken from `resolve`
-and modified in memory reaches the bootstrap without passing a reader.
+an archive index's. That rule is a relative path, no `..` component, and
+printable ASCII only. It holds both as written and as a server that
+percent-decodes it would read it. Its `SHA256` must be 64 lowercase hex
+characters, since that is the value the fetched bytes are compared against.
+
+A document is a trust anchor, so neither check is a defense against the plan
+itself. What they keep out is a plan hand-edited into something unfetchable
+being reported as a mirror that served the wrong bytes. Both are checked again
+at `build`, since a `Plan` taken from `resolve` and modified in memory reaches
+the bootstrap without passing a reader.
 
 ## Holding a resolution to a plan's versions
 
 [`pin`] takes the same `Plan` and does something else with it. Where [`plan`]
-*replaces* a resolution, `pin` *constrains* one: the bootstrap fetches and
-verifies every release and index as it always does and computes the closure over
-what the archives offer now, and each package the pin names is selected at the
-pinned version rather than at the highest offered.
+*replaces* a resolution, `pin` *constrains* one. The bootstrap fetches and
+verifies every release and index as it always does, and computes the closure
+over what the archives offer now. Each package the pin names is then selected at
+the pinned version rather than at the highest offered.
 
 ```rust,no_run
 use ferroday_cage::provision::debian::{Debian, Plan, Repository};
@@ -926,26 +960,28 @@ let mut debian = Debian::builder("trixie")
 ### When this is the one that fits
 
 A build whose inputs are not all archives. Where some of the packages are
-compiled by the build itself and published to a local [pool](#publishing-a-local-pool),
-`plan` requires those compiles to be byte-reproducible: it installs every
-package by a recorded digest, and a compile that differs by a timestamp no
-longer matches its own plan. Where the compile is not reproducible, replaying
-becomes unavailable for exactly the builds that most want it, for a reason that
-has nothing to do with the archive.
+compiled by the build itself and published to a local
+[pool](#publishing-a-local-pool), `plan` requires those compiles to be
+byte-reproducible. It installs every package by a recorded digest, and a compile
+that differs by a timestamp no longer matches its own plan. Where the compile is
+not reproducible, replaying becomes unavailable for exactly the builds that most
+want it. The reason has nothing to do with the archive.
 
 Pinning only the archive-sourced packages splits the two apart. The document
-fixes the half a mirror controls — the versions it served, which is what a plan
-exists to record and what a source-level lock cannot pin — and the locally built
-half resolves at whatever the pool now holds, its digest read from the pool's own
+fixes the half a mirror controls, meaning the versions it served. That is what a
+plan exists to record, and what a source-level lock cannot pin. The locally
+built half
+resolves at whatever the pool now holds, its digest read from the pool's own
 index as any other package's is.
 
 ### The trust model does not change
 
 Nothing here leaves the archive signature chain. Every digest installed is still
-read from an index whose own digest a verified release records, so a pinned
-bootstrap has the trust properties of an ordinary one — which is the difference
+read from an index whose own digest a verified release records. A pinned
+bootstrap therefore has the trust properties of an ordinary one. That is the
+difference
 from `plan`, where the plan becomes the anchor. The pin narrows which version is
-selected; it never becomes the authority for what the bytes are.
+selected, and never becomes the authority for what the bytes are.
 
 A pin whose recorded digest disagrees with the archive's for the same version is
 refused rather than preferred. That is one version published twice over
@@ -954,29 +990,30 @@ different bytes, which is the event a recorded digest exists to catch.
 ### What composes, and what is refused
 
 `include`, `exclude`, and `base_priority` all compose with a pin, where a plan
-refuses them. That is the whole of what separates the two: a plan names every
-package to install, so a selection has nothing to add to it, while a pin names
-the versions a selection resolves to and says nothing about what is selected.
-The repository list is free to differ from the one the pin was resolved against,
-and the pin's own archive records are not read — a pin constrains packages.
+refuses them. That is the whole of what separates the two. A plan names every
+package to install, so a selection has nothing to add to it. A pin names the
+versions a selection resolves to, and says nothing about what is selected. The
+repository list is free to differ from the one the pin was resolved against, and
+the pin's own archive records are not read. A pin constrains packages.
 
-A pin alongside a `plan` is refused at `build` with `DebianError::Config`: a
+A pin alongside a `plan` is refused at `build` with `DebianError::Config`. A
 plan resolves nothing, so there is no resolution left to constrain. So is a pin
-whose suite or architecture disagrees with the builder's, and one naming the
-same package twice, which states two versions to hold it at. So is one whose
-entries fail the shape a plan document's do — a digest that is not 64 lowercase
-hex characters is refused as the malformed entry it is, rather than compared and
-reported as an archive that had published past the pin. Where the builder names
-no architecture the pin's is adopted, as a plan's is.
+whose suite or architecture disagrees with the builder's. So is one naming the
+same package twice, which states two versions to hold it at.
+
+So is one whose entries fail the shape a plan document's do. A digest that is
+not 64 lowercase hex characters is refused as the malformed entry it is. It is
+not compared and reported as an archive that had published past the pin. Where
+the builder names no architecture the pin's is adopted, as a plan's is.
 
 ### When the archives have moved past it
 
 A pin the archives cannot supply fails the resolve or the bootstrap with
 `DebianError::Pin`, before the closure is computed and before anything is
 downloaded. It names every package that could not be held at once, in name
-order, since one archive publish moves many together — and for each of them
-which of the three happened: the archives offer another version, offer no
-version of it at all, or record different bytes for the one pinned.
+order, since one archive publish moves many together. For each it says which of
+three things happened. The archives offer another version, offer no version of
+it at all, or record different bytes for the one pinned.
 
 A live mirror serving a single version per suite will move past a pin as soon as
 it publishes. A [snapshot mirror](#installing-a-plan-without-resolving-again) is
@@ -984,10 +1021,10 @@ what holds one open, and it is the same configuration a replayed plan uses.
 
 ## Asking what an archive carries
 
-[`available`] answers a different question: not what a bootstrap would install,
-but which names the configured archives offer at all. It runs the same read half
-— each repository's signed release and index, merged — and returns the name set
-rather than a closure:
+[`available`] answers a different question. Not what a bootstrap would install,
+but which names the configured archives offer at all. It runs the same read
+half, each repository's signed release and index, merged, and returns the name
+set rather than a closure:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Debian;
@@ -1007,40 +1044,42 @@ for provider in available.providers("awk") {
 # }
 ```
 
-`resolve` cannot stand in for this, and neither of its behaviours is a defect.
-A resolve *fails* where a name cannot be satisfied — a top-level `include` that
-names nothing, or a transitive dependency nothing supplies — rather than
-answering a question about it. It does name every one of them rather than the
-first, so a failed resolve is a usable list of what to correct; but it is still
-a failure, and it is a failure about a whole closure. A name that is perfectly
-available can appear in one because something else in its dependency tree is
-not. Nor is the cost the same: one `available` pass answers any number of names,
-where a resolve per name re-fetches and re-parses the index every time — a
-`Packages.xz` for trixie amd64 is around 9 MB, and `cache_dir` caches `.deb`
-files, not indexes.
+`resolve` cannot stand in for this, and neither of its behaviors is a defect. A
+resolve *fails* where a name cannot be satisfied, rather than answering a
+question about it. That covers a top-level `include` that names nothing, and a
+transitive dependency nothing supplies. It does name every one of them rather
+than the first, so a failed resolve is a usable list of what to correct.
 
-Availability is answered at the level of the name: `contains` reports that the
-archives offer a name, not that they offer a version satisfying some
-constraint. The resolver does enforce a dependency's version constraint — it
-has to, since a layered resolve closes over a base provisioned at some earlier
-archive state — but that is a question about a particular closure, and this
-query computes none. Answering it here would mean resolving, which is the cost
-`available` exists to avoid.
+But it is still a failure, and it is a failure about a whole closure. A name
+that is perfectly available can appear in one because something else in its
+dependency tree is not. Nor is the cost the same. One `available` pass answers
+any number of names, where a resolve per name re-fetches and re-parses the index
+every time. A `Packages.xz` for trixie amd64 is around 9 MB, and `cache_dir`
+caches `.deb` files, not indexes.
+
+Availability is answered at the level of the name. `contains` reports that the
+archives offer a name, not that they offer a version satisfying some constraint.
+The resolver does enforce a dependency's version constraint, since a layered
+resolve closes over a base provisioned at some earlier archive state. But that
+is a question about a particular closure, and this query computes none.
+Answering it here would mean resolving, which is the cost `available` exists to
+avoid.
 
 The builder's `include`, `exclude`, and `base_priority` shape a resolution and
-so do not apply; the suite, the architecture, the repositories, and the fetcher
-are what the query reads. `Available` is a snapshot: an archive can publish at
-any time, so a name it reports is a name that was there when the index was read.
+so do not apply. The suite, the architecture, the repositories, and the fetcher
+are what the query reads. `Available` is a snapshot. An archive can publish at
+any time, so a name it reports is a name that was there when the index was
+read.
 
 ## Layered build roots
 
-A pipeline that builds many packages against one shared base — a build root of
-`base + toolchain + this component's build-dependencies`, rebuilt per component —
-need not re-provision the shared part each time. Provision the base once, then
-stage each component's increment over it as a disposable overlay layer:
-[`base_layer`] marks the pristine base, and [`stage_layer`] resolves and installs
-only the packages the base does not already carry into an overlay upper, leaving
-the base untouched.
+A pipeline that builds many packages against one shared base need not
+re-provision the shared part each time. Such a build root is `base + toolchain +
+this component's build-dependencies`, rebuilt per component. Provision the base
+once, then stage each component's increment over it as a disposable overlay
+layer. [`base_layer`] marks the pristine base. [`stage_layer`] resolves and
+installs only the packages the base does not already carry into an overlay
+upper, leaving the base untouched.
 
 ```rust,no_run
 use ferroday_cage::Cage;
@@ -1075,48 +1114,56 @@ drop(layer);
 # }
 ```
 
+The example lives at `crates/ferroday-cage/examples/deb-layer-pipeline.rs`. It
+carries the shape above through a whole pipeline: one shared base, and a
+disposable layer per component. A local pool lets each component build against
+the packages the ones before it produced.
+
 The increment resolves against the base's *already-installed set*, read from the
-base's own dpkg status database: every package the base configured, and the
+base's own dpkg status database. Every package the base configured, and the
 virtual packages they provide, is treated as satisfied, so the resolution closes
-over only the delta. Because most components share build-dependencies already
-present in `base + toolchain`, that delta is small — which is the point.
+over only the delta. Most components share build-dependencies already present in
+`base + toolchain`, so that delta is small, which is the point.
 [`resolve_layer`] previews it without staging, the layered counterpart of
 [`resolve`], so a build-root cache can be keyed on the increment inline.
 
 A plan reproduces a layer exactly as it reproduces a whole root. Keep the one
-[`resolve_layer`] returned, hand it back through [`plan`] alongside the same
-[`base_layer`], and `stage_layer` installs those packages at those versions
-without fetching a release or an index — the increment's counterpart of the
-pinned install below.
+[`resolve_layer`] returned and hand it back through [`plan`] alongside the same
+[`base_layer`]. `stage_layer` then installs those packages at those versions
+without fetching a release or an index, which is the increment's counterpart of
+the pinned install below.
 
 `stage_layer` installs the delta into the overlay upper and returns a
-[`BuildLayer`]. Root a cage on [`overlay_rootfs`] with the base as the read-only
-lower and the layer's `path()` as the writable upper, and the build sees the
-merged view; every write lands in the upper, and the base is never mutated.
-Dropping the `BuildLayer` removes the upper — and the overlay work directory
-beside it — reverting the increment and leaving the base ready for the next
-component. A `stage_layer` that fails disposes of them itself, since it hands the
-caller no handle to drop, so a failed staging leaves nothing behind either.
+[`BuildLayer`]. Root a sandbox on [`overlay_rootfs`] with the base as the
+read-only lower and the layer's `path()` as the writable upper. The build then
+sees the merged view, every write lands in the upper, and the base is never
+mutated.
+
+Dropping the `BuildLayer` removes the upper, and the overlay work directory
+beside it, reverting the increment and leaving the base ready for the next
+component. A `stage_layer` that fails disposes of them itself, since it hands
+the caller no handle to drop, so a failed staging leaves nothing behind either.
 
 The base must be a full, configured bootstrap, not an
-[`extract_only`](#extract-only-and-foreign-architectures) tree: the overlay's
+[`extract_only`](#extract-only-and-foreign-architectures) tree. The overlay's
 lower supplies the dpkg database the increment's configuration reads. A base and
 its layers must share a suite, an architecture, and an [identity
-map](identity-maps.md) — a base configured under one map carries ownership a
-layer under another would not agree with. The increment's configuration runs the
-target's binaries, so a foreign architecture needs the same `qemu-user` binfmt
-handler a full bootstrap does. Staging roots a cage on an unprivileged overlay,
-which the host must support; see [overlay-rooted
-cages](host-requirements.md#overlay-rooted-cages), reported by
-[`host::overlay_blocker`]. `stage_layer` refuses a host that cannot establish one
-before downloading anything.
+map](identity-maps.md). A base configured under one map carries ownership a
+layer under another would not agree with.
+
+The increment's configuration runs the target's binaries, so a foreign
+architecture needs the same `qemu-user` binfmt handler a full bootstrap does.
+Staging roots a sandbox on an unprivileged overlay, which the host must support.
+[Overlay-rooted sandboxes](host-requirements.md#overlay-rooted-cages) covers it,
+and [`host::overlay_blocker`] reports it. `stage_layer` refuses a host that
+cannot establish one before downloading anything.
 
 ## The pre-configure overlay
 
-[`pre_configure_overlay`] lays a directory of configuration into the rootfs
-after the packages are unpacked and before their maintainer scripts run, so a
-script observes the injected values — a debconf pre-seed, a locale selection, a
-hardware-probe guard:
+[`pre_configure_overlay`] lays a directory of configuration into the tree after
+the packages are unpacked and before their maintainer scripts run. A script
+therefore observes the injected values, whether those are a debconf pre-seed, a
+locale selection, or a hardware-probe guard:
 
 ```rust,no_run
 use ferroday_cage::provision::{self, debian::Debian};
@@ -1130,16 +1177,16 @@ provision::ensure("/var/lib/machines/trixie", &mut debian)?;
 # }
 ```
 
-The source is a rootfs-shaped tree: `./rootfs-config/etc/locale.gen` becomes
-`/etc/locale.gen`. File modes and symlinks are preserved, and a file replaces
-the package's own copy of the same path, which is how a shipped conffile is
+The source is a root-shaped tree, so `./rootfs-config/etc/locale.gen` becomes
+`/etc/locale.gen`. File modes and symlinks are preserved. A file replaces the
+package's own copy of the same path, which is how a shipped conffile is
 overridden. The tree is laid with the same kernel-enforced containment as
-package extraction, so nothing in it can be written outside the rootfs. The
-overlay applies only to a full bootstrap; because the base system is configured
+package extraction, so nothing in it can be written outside the destination. The
+overlay applies only to a full bootstrap. Because the base system is configured
 first, it governs the configuration of the non-essential packages.
 
 Entries land owned by the calling user, which the identity map presents as root
-inside. A tree that has to ship a file owned by some other in-rootfs id wants
+inside. A tree that has to ship a file owned by some other in-tree id wants
 [`CopyIn`](provisioning.md#copying-a-tree-into-a-rootfs) instead, which lays one
 in through the map.
 
@@ -1147,123 +1194,136 @@ in through the map.
 
 Authenticity comes from the archive's OpenPGP signature, not the transport, so
 packages are fetched over plain HTTP by default. The `InRelease` signature is
-verified against an embedded copy of the Debian archive keyring; every index
-and every package is then checked against a SHA-256 digest that chains back to
-that signature. A different keyring is supplied with
-[`keyring`], and
-[`trust_unsigned`] accepts an unsigned `Release`
-for a local mirror under the caller's control — the equivalent of apt's
-`trusted=yes`. It removes the only authenticity check, leaving the transport to
-supply one, so `build` requires a transport that does: every mirror of an
-unsigned repository must be `file://` or `https://`. Any other scheme is
-refused, `http://` among them. The rule is an allow-list rather than a refusal
-of `http://` because a refusal names only the plaintext scheme it was written
-for, and a caller-supplied transport can speak any of them; schemes are
-compared case-insensitively, as [RFC 3986 §3.1] defines them. A transport
-routing on the scheme itself reads it from [`FetchRequest::scheme`], which
-applies the same rule, so the two layers cannot disagree about which URLs name
-which transport.
+verified against an embedded copy of the Debian archive keyring. Every index and
+every package is then checked against a SHA-256 digest that chains back to that
+signature.
 
-The signature alone does not say which suite was delivered — a single archive
-key signs every suite — so the release is also bound to the request: its
-`Suite` or `Codename` must equal the requested suite, which stops a mirror
-from answering a request for one suite with a genuine, validly-signed release
-for another.
+A different keyring is supplied with [`keyring`]. [`trust_unsigned`] accepts an
+unsigned `Release` for a local mirror under the caller's control, the equivalent
+of apt's `trusted=yes`. It removes the only authenticity check, leaving the
+transport to supply one. So `build` requires a transport that does: every mirror
+of an unsigned repository must be `file://` or `https://`. Any other scheme is
+refused, `http://` among them.
+
+The rule is an allow-list rather than a refusal of `http://`. A refusal names
+only the plaintext scheme it was written for, and a caller-supplied transport
+can speak any of them. Schemes are compared case-insensitively, as [RFC 3986
+§3.1] defines them. A transport routing on the scheme itself reads it from
+[`FetchRequest::scheme`], which applies the same rule. The two layers therefore
+cannot disagree about which URLs name which transport.
+
+The signature alone does not say which suite was delivered, because a single
+archive key signs every suite. So the release is also bound to the request. Its
+`Suite` or `Codename` must equal the requested suite. That stops a mirror from
+answering a request for one suite with a genuine, validly-signed release for
+another.
 
 Key validity is enforced beyond the cryptographic check, which on its own
 accepts a signature from any key whose material fits. A revoked archive key is
-dropped from the keyring, and a signature made outside its signing key's
-validity window — before the key existed, or after it expired — is rejected, so
-a retired key cannot vouch for a release. Debian's archive keys sign with a
-dedicated signing subkey rather than the primary, and a subkey is admitted only
-on the terms OpenPGP sets for one: the primary must have bound it with the
+dropped from the keyring. A signature made outside its signing key's validity
+window is rejected, whether before the key existed or after it expired. A
+retired key therefore cannot vouch for a release.
+
+Debian's archive keys sign with a dedicated signing subkey rather than the
+primary. A subkey is admitted only on the terms OpenPGP sets for one. The primary must have bound it with the
 signing capability, the subkey must have counter-signed that binding, and the
-binding must not be revoked. Where a subkey has been re-bound over time, the
-newest binding the primary issued is the one judged: it is the certificate's
-latest word on that subkey, so a defect in it refuses the subkey rather than
-returning authority to the superseded, possibly broader grant it replaced. A
-subkey's authority is delegated from its primary,
-so it lapses when the primary's does — the expiry that governs is whichever of
-the certificate's, the binding's and the counter-signature's comes first. A
-keyring holding several keys is searched in full, and every signature a key made
-is judged, so a release is accepted whenever any of its signatures is
-acceptable.
+binding must not be revoked.
+
+Where a subkey has been re-bound over time, the newest binding the primary
+issued is the one judged. It is the certificate's latest word on that subkey. A
+defect in it therefore refuses the subkey, rather than returning authority to
+the superseded and possibly broader grant it replaced. A subkey's authority is
+delegated from its primary, so it lapses when the primary's does. The expiry
+that governs is whichever of the certificate's, the binding's and the
+counter-signature's comes first.
+
+A keyring holding several keys is searched in full, and every signature a key
+made is judged. A release is therefore accepted whenever any of its signatures
+is acceptable.
 
 Beyond the key, the signature itself has to be worth resting a decision on. It
 carries a creation time, every check being relative to it. Its digest is not
-MD5, SHA-1 or RIPEMD-160, whose collisions are within reach, and neither the
-signing key nor the certificate behind it is DSA or an RSA key narrower than
-2048 bits: a signature is worth no more than the weaker of the digest it covers
-and the key material that binds it. And it carries no critical subpacket that
-cannot be interpreted, which RFC 9580 requires a verifier meeting one to treat
-as invalidating. Only the signed part of a signature is searched for such a
-subpacket, so a relay cannot append one in transit and fail every fetch.
+MD5, SHA-1 or RIPEMD-160, whose collisions are within reach. Neither the signing
+key nor the certificate behind it is DSA or an RSA key narrower than 2048 bits.
+A signature is worth no more than the weaker of the digest it covers and the key
+material that binds it.
+
+It also carries no critical subpacket that cannot be interpreted, which RFC 9580
+requires a verifier meeting one to treat as invalidating. Only the signed part
+of a signature is searched for such a subpacket, so a relay cannot append one in
+transit and fail every fetch.
 
 The release must also be fresh. A `Valid-Until` the release carries must be
 parseable and in the future, and the archive signature must not itself have
-expired; this refuses a stale but validly-signed release, which a mirror or an
+expired. That refuses a stale but validly-signed release, which a mirror or an
 on-path attacker could otherwise replay to deliver superseded, potentially
-vulnerable packages. A release that omits `Valid-Until` — as the Debian stable
-suite does, so its release does not expire between point releases — carries no
-freshness bound and is accepted, as apt accepts it.
-[`allow_stale_release`] relaxes the freshness
-check entirely — the signature is still verified — for the legitimate case of
-pinning a historical archive state, such as a `snapshot.debian.org` suite. A
-`trust_unsigned` mirror is never freshness-checked.
+vulnerable packages.
 
-The transport is a trait. The built-in fetcher speaks plain HTTP and
-`file://`, addressing a mirror by DNS name, IPv4 literal, or bracketed IPv6
-literal (`http://[::1]:8080/debian`); a consumer that needs HTTPS, a proxy, or a
-private mirror protocol supplies their own through
-[`fetcher`]. A `file://` URL names a path on the machine it is read on, in either
-of RFC 8089's spellings for that — `file:///srv/pool` and
-`file://localhost/srv/pool`. One naming any other host is refused rather than
-read as a path relative to the current directory. [`file_url`] builds the URL
-for a local path, and is what [`Pool::mirror_url`] answers with: it makes a
-relative path absolute, since such a URL carries a path from a root and has no
-way to spell one that is not. A transport is `Send`, because the provisioner owns it and is
-itself `Send` — see [thread bounds](stability.md#thread-bounds).
+A release that omits `Valid-Until` carries no freshness bound and is accepted,
+as apt accepts it. The Debian stable suite does exactly that, so its release
+does not expire between point releases. [`allow_stale_release`] relaxes the
+freshness check entirely, the signature still being verified. It is for the
+legitimate case of pinning a historical archive state, such as a
+`snapshot.debian.org` suite. A `trust_unsigned` mirror is never
+freshness-checked.
+
+The transport is a trait. The built-in fetcher speaks plain HTTP and `file://`,
+addressing a mirror by DNS name, IPv4 literal, or bracketed IPv6 literal
+(`http://[::1]:8080/debian`). A consumer that needs HTTPS, a proxy, or a private
+mirror protocol supplies their own through [`fetcher`].
+
+A `file://` URL names a path on the machine it is read on, in either of RFC
+8089's spellings for that: `file:///srv/pool` and `file://localhost/srv/pool`.
+One naming any other host is refused rather than read as a path relative to the
+current directory. [`file_url`] builds the URL for a local path, and is what
+[`Pool::mirror_url`] answers with. It makes a relative path absolute. Such a URL
+carries a path from a root and has no way to spell one that is not.
+
+A transport is `Send`, because the provisioner owns it and is itself `Send`.
+[Thread bounds](stability.md#thread-bounds) covers the rule.
 
 The bundled fetcher holds its connection open between requests, as HTTP/1.1 does
-by default, so a bootstrap installing a few hundred packages from one host pays
-one handshake rather than a few hundred.
+by default. A bootstrap installing a few hundred packages from one host
+therefore pays one handshake rather than a few hundred.
 
-A bootstrap is nearly all network on a cold cache, so the packages it is about to
-install are asked for in batches through `Fetch::fetch_all` before the
-package-by-package wave runs. That method has a default body — one `fetch` per
-job, in order — so a transport that overrides nothing behaves exactly as it did
-before it existed. `HttpFetch` overrides it and runs four at once, each on a
-connection of its own; `HttpFetch::concurrency` changes how many. The ceiling is
-deliberately low: an archive mirror is usually somebody else's bandwidth, and the
-win is in overlapping latency rather than in saturating a link.
+A bootstrap is nearly all network on a cold cache. The packages it is about to
+install are therefore asked for in batches through `Fetch::fetch_all`, before
+the package-by-package wave runs. That method has a default body, one `fetch`
+per job in order. A transport that overrides nothing therefore behaves exactly
+as it did before it existed.
+
+`HttpFetch` overrides it and runs four at once, each on a connection of its own.
+`HttpFetch::concurrency` changes how many. The ceiling is deliberately low. An
+archive mirror is usually somebody else's bandwidth, and the win is in
+overlapping latency rather than in saturating a link.
 
 The batch decides nothing. A job it does not deliver simply leaves the cache
-without that package, and the wave behind it downloads that package with every
+without that package. The wave behind it then downloads that package with every
 mirror available to it, exactly as though the batch had not run. Whether a
 package is present is still the rename, and the rename happens only over bytes
 that verified.
 
 A transport therefore sees calls from more than one thread only when it says so,
-by overriding `fetch_all`; the default body, and every `fetch`, run on the thread
-that called into the provisioner.
+by overriding `fetch_all`. The default body, and every `fetch`, run on the
+thread that called into the provisioner.
 
 ## Ownership
 
 The bootstrap's [identity map](identity-maps.md) decides the ownership the
-finished rootfs carries, and the right map follows from what the rootfs is
-for.
+finished tree carries, and the right map follows from what the tree is for.
 
-The default is the single-identity map: the sandbox maps the calling user to
-root and nothing else, so every file in the bootstrapped rootfs is owned by
-root. Debian expects some files to belong to other system users and groups;
-those ownerships cannot be represented under this map, and the bootstrap
-reconciles the difference — recording the intended overrides in dpkg's
-database and neutralizing the ownership changes that would otherwise fail —
-so configuration completes and the rootfs is internally consistent. The
-result is a working userland whose files are uniformly root-owned: exactly
-right for a build or run environment consumed back inside single-identity
-cages, which cannot observe the flattening, and whose caller-owned output
-needs no extra host support to copy or delete.
+The default is the single-identity map. The sandbox maps the calling user to
+root and nothing else, so every file in the bootstrapped tree is owned by root.
+Debian expects some files to belong to other system users and groups, and those
+ownerships cannot be represented under this map. The bootstrap reconciles the
+difference by recording the intended overrides in dpkg's database, and
+neutralizing the ownership changes that would otherwise fail. Configuration then
+completes, and the tree is internally consistent.
+
+The result is a working userland whose files are uniformly root-owned. That is
+exactly right for a build or run environment consumed back inside
+single-identity sandboxes, which cannot observe the flattening. Its caller-owned
+output also needs no extra host support to copy or delete.
 
 Neutralizing substitutes the `chown` and `chgrp` **commands**, so it covers a
 maintainer script that shells out to one and nothing further. A script that
@@ -1280,15 +1340,17 @@ increment runs under the map of the base it increments. The fix is to give such
 a tree a range map, where the ids are real and nothing is substituted.
 
 The overrides are recorded one per path. dpkg treats two records for one path as
-an unrecoverable fatal error, and an install set reaches that honestly: two
+an unrecoverable fatal error, and an install set reaches that honestly. Two
 selected packages can ship one path, since the resolver reads `Depends` and
-`Provides` and never `Conflicts`. Where that happens the last record wins, which
-is the extraction's own rule — a later entry supersedes an earlier one — so the
-record describes the file that survived. A layered build lays the increment's
-records over the base's the same way.
+`Provides` and never `Conflicts`.
 
-A rootfs that is itself the product — deployed, exported, or run under a
-range map — wants real ownership, and
+Where that happens the last record wins, which is the extraction's own rule: a
+later entry supersedes an earlier one. The record therefore describes the file
+that survived. A layered build lays the increment's records over the base's the
+same way.
+
+A tree that is itself the product, whether deployed, exported, or run under a
+range map, wants real ownership, and
 [`identity_map`](https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.identity_map)
 selects it:
 
@@ -1308,29 +1370,30 @@ provision::ensure("/srv/images/trixie", &mut debian)?;
 # fn main() {}
 ```
 
-Under the subordinate map the system ids genuinely exist, every `chown` a
+Under the subordinate map the system ids genuinely exist. Every `chown` a
 maintainer script or compiled tool performs happens for real, and no stub or
-override is involved: the tree is a correct Debian system as `dpkg` and
-`base-passwd` define one. The map requires the `subid` feature and a host
-that can establish it, and a bootstrap that cannot fails before any download
-rather than falling back to the flattened form. Because the ownership is
-real, it reaches the host: a directory the system chowns to a non-root id
-refuses the plain caller's removal, and
-[`provision::remove`](provisioning.md#removing-a-rootfs) deletes the
-produced rootfs either way, re-entering the map where ownership requires it.
+override is involved. The tree is a correct Debian system as `dpkg` and
+`base-passwd` define one.
+
+The map requires the `subid` feature and a host that can establish it. A
+bootstrap that cannot fails before any download, rather than falling back to the
+flattened form. Because the ownership is real, it reaches the host. A directory
+the system chowns to a non-root id refuses the plain caller's removal.
+[`provision::remove`](provisioning.md#removing-a-rootfs) deletes the produced
+tree either way, re-entering the map where ownership requires it.
 
 ## Extract-only and foreign architectures
 
-The bootstrap targets the host architecture by default; another is selected
-with [`architecture`]. A full bootstrap for a
-foreign architecture runs that architecture's dpkg and maintainer scripts, and
-so requires a registered `qemu-user` binfmt handler (see
-[Host requirements](host-requirements.md)); the bootstrap checks for one and
-reports an actionable error when it is absent.
+The bootstrap targets the host architecture by default, and another is selected
+with [`architecture`]. A full bootstrap for a foreign architecture runs that
+architecture's dpkg and maintainer scripts. It therefore requires a registered
+`qemu-user` binfmt handler, covered in [Host
+requirements](host-requirements.md). The bootstrap checks for one and reports an
+actionable error when it is absent.
 
 Where the foreign binaries cannot run, `extract_only` lays out the packages'
-files without configuring them. An extract-only rootfs has run no maintainer
-scripts and has no configured dpkg database; it is the raw file tree, suitable
+files without configuring them. An extract-only tree has run no maintainer
+scripts and has no configured dpkg database. It is the raw file tree, suitable
 for completing the configuration elsewhere.
 
 ### Recording which interpreter ran
@@ -1355,24 +1418,25 @@ match foreign_interpreter("arm64") {
 ```
 
 The registration is the right source, and a `PATH` lookup is not. The kernel
-reaches the interpreter through the registration, so the two can disagree — and
-a build under a harness that strips `PATH` records no interpreter at all while
+reaches the interpreter through the registration, so the two can disagree. A
+build under a harness that strips `PATH` records no interpreter at all, while
 one is executing every target binary.
 
-`None` is returned in three cases, each the honest answer rather than a failure:
-the host runs the architecture natively, the architecture is not one a
+`None` is returned in three cases, each the honest answer rather than a failure.
+The host runs the architecture natively, the architecture is not one a
 `qemu-user` handler covers, or no handler is registered. A registered handler
 that is switched off reports as present and not enabled, which is the difference
 between "turn it on" and "install it".
 
 Two paths are reported because they are two facts. `path` is what the kernel
-recorded; `resolved` is what it canonicalizes to. On the common Debian layout
-the registration names a wrapper — `/usr/libexec/qemu-binfmt/aarch64-binfmt-P` —
-that is a symlink to the real binary, and repointing that symlink changes the
-interpreter without changing the registration.
+recorded, and `resolved` is what it canonicalizes to. On the common Debian
+layout the registration names a wrapper,
+`/usr/libexec/qemu-binfmt/aarch64-binfmt-P`, that is a symlink to the real
+binary. Repointing that symlink changes the interpreter without changing the
+registration.
 
-**Hash the path; do not probe the binary.** qemu refuses to run under its binfmt
-wrapper name:
+**Hash the path rather than probing the binary.** qemu refuses to run under its
+binfmt wrapper name:
 
 ```console
 $ /usr/libexec/qemu-binfmt/aarch64-binfmt-P --version
@@ -1381,21 +1445,21 @@ binfmt-misc subsystem
 ```
 
 So the registered path is good for identity and not for interrogation. Hashing
-it works unchanged — `open` follows the symlink, so no canonicalization is
-needed — and is the better answer anyway: a version string is a claim the binary
+it works unchanged, since `open` follows the symlink and no canonicalization is
+needed. It is the better answer anyway: a version string is a claim the binary
 makes about itself, and a digest is what it is. Only executing the interpreter
 needs `resolved`.
 
 The digest is the caller's to take. The `F` flag means the kernel opened and
-holds the interpreter at *registration* time, so the file at that path may have
-been replaced since and a digest taken now may be of something that never ran.
+holds the interpreter at *registration* time. The file at that path might have
+been replaced since, so a digest taken now can be of something that never ran.
 The library reports the path and states the caveat rather than handing back a
 digest that can be quietly wrong.
 
 ## The command line
 
 `fcage --provision-debian SUITE` bootstraps the `--rootfs` directory before
-launching. Given without a command, it provisions and exits; the
+launching. Given without a command, it provisions and exits. The
 already-provisioned case is fast, so the flag can stay in an invocation
 permanently.
 
@@ -1408,7 +1472,7 @@ $ fcage --rootfs ./trixie /usr/bin/dpkg --list
 The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 `--debian-include`, `--debian-extract-only`, `--debian-cache`, and
 `--debian-keyring` options map onto the builder. `--debian-include` and
-`--debian-components` take comma-separated lists and may be repeated.
+`--debian-components` take comma-separated lists, and each can be repeated.
 
 [`keyring`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.keyring
 [`trust_unsigned`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.trust_unsigned

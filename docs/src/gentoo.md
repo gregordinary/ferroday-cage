@@ -1,6 +1,6 @@
 # A Gentoo userland
 
-The `gentoo` feature provisions a Gentoo root filesystem from a stage3: it
+The `gentoo` feature provisions a Gentoo root filesystem from a stage3. It
 resolves which build the archive currently publishes for a variant, verifies the
 signed documents that vouch for it, and extracts the tarball. It speaks to the
 archive directly, and verifies what it fetches against a keyring the crate
@@ -28,30 +28,32 @@ the root it bootstrapped, which is [the second half of this
 chapter](#binary-packages). A run that asks for no package is exactly a stage3
 bootstrap, byte for byte.
 
-Two examples work it into consumers: `ebuild-sandbox` provisions a stage3, binds
-a portage tree into it read-only, and runs `emerge` in a cage; `gentoo-binhost`
-provisions one and installs prebuilt packages into it instead.
+Two examples work it into consumers. `ebuild-sandbox` provisions a stage3, binds
+a portage tree into it read-only, and runs `emerge` in a sandbox.
+`gentoo-binhost` provisions one and installs prebuilt packages into it
+instead.
 
 ## How it works
 
 A bootstrap runs in three steps:
 
 1. **The signed enumeration.** It fetches
-   `releases/<arch>/autobuilds/latest-stage3.txt`, a cleartext-signed document
-   listing every stage3 that architecture currently offers with the build each
-   points at and the exact size of its tarball, and verifies it against the
-   vendored keyring.
+   `releases/<arch>/autobuilds/latest-stage3.txt` and verifies it against the
+   vendored keyring. That document is cleartext-signed. It lists every stage3
+   the architecture currently offers, with the build each points at and the
+   exact size of its tarball.
 2. **The signed digest.** It matches the configured variant against that list,
-   then fetches the `.DIGESTS` document beside the chosen build — cleartext-
-   signed by the same key — and reads the SHA-512 it records for the tarball.
+   then fetches the `.DIGESTS` document beside the chosen build, cleartext-
+   signed by the same key. From it the layer reads the SHA-512 recorded for the
+   tarball.
 3. **Download and verify.** It downloads the tarball into a cache, bounded by the
    size the enumeration recorded, checks it against that SHA-512, and only then
-   extracts it. The bytes are never streamed into the extractor unverified: an
+   extracts it. The bytes are never streamed into the extractor unverified. An
    archive that turned out not to be the one the document named would otherwise
    already have written most of a root filesystem.
 
-The finished root is the stage3 as Gentoo built it — portage, its configuration,
-a toolchain and a base system — ready for a cage to run `emerge` in.
+The finished root is the stage3 as Gentoo built it: portage, its configuration,
+a toolchain and a base system. It is ready for a sandbox to run `emerge` in.
 
 ## Naming a variant
 
@@ -76,16 +78,16 @@ for variant in gentoo.available()?.variants() {
 # }
 ```
 
-`x32-openrc` appears in amd64's own document, as a sibling of `amd64-openrc`:
-what sits between `stage3-` and the build id is a sub-architecture and variant
+`x32-openrc` appears in amd64's own document, as a sibling of `amd64-openrc`.
+What sits between `stage3-` and the build id is a sub-architecture and variant
 compound rather than a variant of a fixed architecture. A name relative to the
 architecture could not reach the `x32` entries at all.
 
 The match is exact rather than by prefix, because `amd64-openrc-splitusr` sits
 beside `amd64-openrc` in that same document. A variant the architecture does not
 publish is refused before anything is downloaded, and the refusal names what is
-on offer — checked against what Gentoo publishes now rather than against a list
-compiled into this crate.
+on offer. That list is what Gentoo publishes now rather than one compiled into
+this crate.
 
 Each entry keeps its own build id: a sub-architecture is built on its own
 cadence, so one document routinely points different variants at different builds.
@@ -108,17 +110,17 @@ let mut gentoo = Gentoo::builder("amd64")
 # }
 ```
 
-A pin skips the enumeration entirely — it is the caller saying which build they
-want, and asking the archive which is current would not change the answer — so
-the digest document beside that build is what vouches for the tarball.
+A pin skips the enumeration entirely. It is the caller saying which build they
+want, and asking the archive which is current would not change the answer. The
+digest document beside that build is what vouches for the tarball.
 
 **A pin is not indefinite.** The autobuilds tree holds about five weeks of
-builds and Gentoo publishes no equivalent of `snapshot.debian.org`, so a build id
-resolves against the archive for roughly a month and against a populated cache
-for as long as the cache lives. Past that the archive answers 404. That is a
-difference from the Debian and Alpine layers, whose plan documents replay against
-a snapshot service or a repository that keeps old versions, and it is a property
-of the archive rather than of this layer.
+builds and Gentoo publishes no equivalent of `snapshot.debian.org`. A build id
+therefore resolves against the archive for roughly a month, and against a
+populated cache for as long as the cache lives. Past that the archive answers
+a 404 instead. The Debian and Alpine layers differ here, because their plan documents
+replay against a snapshot service or a repository that keeps old versions. That
+is a property of the archive rather than of this layer.
 
 Within one process, a resolution carries over whole:
 
@@ -138,9 +140,9 @@ provision::ensure("/var/lib/machines/gentoo-2", &mut again)?;
 ```
 
 There is no plan document to write. A single tarball does not need a versioned
-serialization, and one would name a build the archive deletes in about five
-weeks — a document outliving what it describes. A caller who wants to provision
-the same root again records the build id and variant however they already record
+serialization. One would name a build the archive deletes in about five weeks,
+outliving what it describes. A caller who wants to provision the same
+root again records the build id and variant however they already record
 configuration.
 
 ## Binary packages
@@ -164,16 +166,16 @@ provision::ensure("/var/lib/machines/gentoo", &mut gentoo)?;
 # }
 ```
 
-A run is then two waves: the stage3 is fetched, verified and extracted, and then
-the packages are resolved against the root that produced, fetched, verified and
+A run is then two waves. The stage3 is fetched, verified and extracted. The
+packages are then resolved against the root that produced, fetched, verified and
 merged into it. A builder that names no package does exactly the first, byte for
 byte.
 
 There is no default sub-architecture. amd64 publishes `x86-64`, `x86-64-v3`,
-`x86-64_hardened` and `x32` today, and the set moves — it published eight not
-long ago. The only thing that enumerates it is an unsigned directory listing,
-and reading that as discovery would put an unauthenticated document at the head
-of the trust chain, which is the reason the keyring is vendored. So the
+`x86-64_hardened` and `x32` today, and the set moves: it published eight not
+long ago. The only thing that enumerates it is an unsigned directory listing.
+Reading that as discovery would put an unauthenticated document at the head of
+the trust chain, which is the reason the keyring is vendored. So the
 sub-architecture is yours to name, and a wrong one is a 404 rather than a
 silently different userland.
 
@@ -182,13 +184,13 @@ silently different userland.
 This is the shape neither [the Debian](debian.md) nor [the Alpine](alpine.md)
 layer has. Both bootstrap from nothing, so their resolvers start with an empty
 root and ask what is *needed*. A Gentoo stage3 unpacks with 296 packages already
-installed and a database describing them, so resolution here starts from a
-populated root and asks what is *missing*.
+installed and a database describing them. Resolution here therefore starts from
+a populated root and asks what is *missing*.
 
-That is load-bearing rather than an efficiency. One of those 296 —
-`app-crypt/pinentry` — the binhost publishes in no version at all, and it is in
+That is load-bearing rather than an efficiency. The binhost publishes one of
+those 296, `app-crypt/pinentry`, in no version at all, and it sits in
 `dev-vcs/git`'s runtime closure. Resolving git against an empty root does not
-merely produce a larger plan: it *fails*, on an atom the real root answers. The
+merely produce a larger plan. It *fails*, on an atom the real root answers. The
 general case is the same one, less dramatically: the median closure over four
 hundred sampled packages is five, because everything else is already there.
 
@@ -226,10 +228,11 @@ println!("{} packages", installed.len());
 ### Which build, and why the rule is that rule
 
 The archive publishes a version more than once. `binpkg-multi-instance` gives
-2,774 of the index's versions between two and twenty-four builds, differing only
-in the USE flags they were compiled with — and therefore in what they depend on.
-`dev-vcs/git` is the clean illustration: the build without `keyring` pulls
-twelve packages, and the build with it pulls seventy through the GTK stack.
+2,774 of the index's versions between two and twenty-four builds. Those builds
+differ only in the USE flags they were compiled with, and therefore in what they
+depend on. `dev-vcs/git` is the clean illustration: the build without `keyring`
+pulls twelve packages, and the build with it pulls seventy through the GTK
+stack.
 
 Choosing among them is therefore not a tie-break, it decides whether resolution
 succeeds at all. Measured over four hundred sampled package names against an
@@ -242,7 +245,7 @@ succeeds at all. Measured over four hundred sampled package names against an
 | **fewest USE flags** | **361/400** | **26** | **50** | **126** |
 
 Fewest USE flags wins every column at once, which is the argument for it: it is
-not a trade. Portage makes the same choice from a profile's computed USE; this
+not a trade. Portage makes the same choice from a profile's computed USE. This
 layer has no profile, so it needs a rule of its own, and this is the one the
 numbers chose. Each atom takes the highest version that satisfies it and then
 the fewest-flags build of that version.
@@ -271,7 +274,7 @@ the same four hundred seeds:
 
 The unsatisfiable count is 26 in every row: that is the guarantee stated as a
 number. What a *broad* preference does cost is a larger closure, and a larger
-closure meets more of the archive's own conflicts — the whole cost lands in that
+closure meets more of the archive's own conflicts. The whole cost lands in that
 column. A narrow one costs nothing measurable.
 
 ```rust,no_run
@@ -290,31 +293,32 @@ let mut gentoo = Gentoo::builder("amd64")
 # }
 ```
 
-State a flag the install must have in the atom; state a flag you would rather it
+State a flag the install must have in the atom. State a flag you would rather it
 had as a preference.
 
 ### Conflicts are reported, not resolved around
 
 A blocker atom that matches something the root has or the resolution chose is a
 conflict, and the run fails naming both sides. There is no backtracking, and the
-evidence is why: an any-of policy that preferred a non-conflicting alternative
-changed nothing over the same four hundred seeds, and the conflicts that remain
-are ones portage refuses too. Almost all of them are a desktop stack asked for
-in a root built against the other init system — 27 of 50 are
-`!sys-apps/sysvinit` against the openrc stage3's own `sys-apps/sysvinit`.
+evidence is why. An any-of policy that preferred a non-conflicting alternative
+changed nothing over the same four hundred seeds. The conflicts that remain are
+ones portage refuses too. Almost all are a desktop stack asked for in a root
+built against the other init system. The commonest single case, 27 of the 50, is
+`!sys-apps/sysvinit` meeting the openrc stage3's own `sys-apps/sysvinit`.
 
 Every refusal is reported before the run fails, so a caller fixing an install
-list sees the whole list rather than its first entry, and each names which wall
-it hit: the package the binhost does not publish, the version, the slot, or the
-USE flag. Where the binhost publishes the package in no version and the root has
-it anyway — the `app-crypt/pinentry` shape again — the refusal names the version
-the root has, which is the half a caller can act on.
+list sees the whole list rather than its first entry. Each names which wall it
+hit: the package the binhost does not publish, the version, the slot, or the USE
+flag. Where the binhost publishes the package in no version and the root has it
+anyway, the refusal names the version the root has. That is the
+`app-crypt/pinentry` shape again, and the version is the half a caller can act
+on.
 
 ### One instance per slot
 
 Portage keeps one instance of each `(package, slot)` and reports a root holding
 two as a conflict. A resolution that would produce one is therefore refused with
-both builds named, rather than merged: merging both would lay two images down
+both builds named, rather than merged. Merging both would lay two images down
 with the second overwriting the first's shared paths, and report success.
 
 It is reached by an ordinary install list rather than by a contrived one. Two
@@ -324,22 +328,22 @@ atoms constraining one package from opposite directions both select:
 --gentoo-install '<dev-libs/foo-2' --gentoo-install '>=dev-libs/foo-2'
 ```
 
-and so does a closure holding one package constrained upward and another
-constrained downward on the same dependency, with no caller writing the pair by
-hand. The likelier trigger is a USE constraint: ask for `dev-vcs/git` and for
-something that needs `dev-vcs/git[keyring]`, and the first takes the build
-without the flag while the second needs the build with it. Both are `git` in
-slot `0`, so the second is refused naming both builds — constrain the first atom
-the same way, or state the flag as a `prefer_use` and let one build answer both.
+A closure does the same where one package is constrained upward and another
+downward on the same dependency. No caller writes that pair by hand. The
+likelier trigger is a USE constraint. Ask for `dev-vcs/git` and for something
+that needs `dev-vcs/git[keyring]`: the first takes the build without the flag,
+and the second needs the build with it. Both are `git` in slot `0`, so the
+second is refused naming both builds. Constrain the first atom the same way, or
+state the flag as a `prefer_use` and let one build answer both.
 
 Since nothing backtracks, the resolution keeps the build it chose first and
 reports what could not join it. The order is a resolution's own and is stable,
 so the same install list is refused the same way every time.
 
 The root holds a slot as firmly as the resolution does. Merging registers a
-database entry beside what is already installed and unmerges nothing, so an atom
-answered only by a version later than the one the root has in that slot is
-refused the same way — naming the installed version rather than a second build.
+database entry beside what is already installed and unmerges nothing. So an atom
+answered only by a version later than the root's own in that slot is refused the
+same way. The refusal names the installed version rather than a second build.
 Bootstrap a root whose version the atom admits, or constrain the atom to the
 version the root already has.
 
@@ -372,59 +376,67 @@ let mut replay = Gentoo::builder("amd64").binhost("x86-64").plan(kept).build()?;
 
 A plan names each package's build id, path, size and digest, and the order they
 merge in. It is worth serializing where a `Stage3` is not, and for the opposite
-reason: the autobuilds tree keeps about five weeks of stage3 builds, while the
-binhost keeps a published version far longer, so a plan replays for as long as
-the archive carries what it names.
+reason. The autobuilds tree keeps about five weeks of stage3 builds, while the
+binhost keeps a published version far longer. A plan therefore replays for as
+long as the archive carries what it names.
 
 A plan also names the architecture and the binhost it was resolved for, and
 `build()` refuses one that does not agree with the builder. The builder above
-names both and they match; a builder that named a different architecture would
-otherwise compose its own with the plan's binhost, fetch a directory neither of
-them names, and report a 404 against a mirror that was spelled correctly. A
-builder that names no binhost takes the plan's, which is what it resolved
-against.
+names both and they match. Without that refusal, a builder naming a different
+architecture would compose its own with the plan's binhost. It would fetch a
+directory neither of them names, and report a 404 against a correctly spelled
+mirror. A builder that names no binhost takes the plan's, which is what it
+resolved against.
 
 The stanza order *is* the install order, which is where this format departs from
-the other two layers' plans. That order is a resolution's own output — a
-topological sort over runtime dependencies — and a plan that lost it would have
-to derive it again from the index the plan exists to avoid needing.
+the other two layers' plans. That order is a resolution's own output, a
+topological sort over runtime dependencies. A plan that lost it would have to
+derive it again from the index the plan exists to avoid needing.
 
 ### What a merge writes, and what it does not run
 
 Each package's files are laid into the root and a `/var/db/pkg` entry is
-registered, because a stage3 arrives with a populated database and a root this
-layer installed into without registering would be a root whose database is a
-lie: portage would rebuild what is present, and `--depclean` would remove it.
+registered. A stage3 arrives with a populated database, so a root this layer
+installed into without registering would have a database that lies about it.
+Portage would rebuild what is present, and `--depclean` would remove it.
 
 An entry is the container's own metadata directory plus the three files portage
-computes at merge — `CONTENTS`, `COUNTER` and `BINPKGMD5` — which is exactly
-what a stage3's own entries turn out to be. The merge ordinal continues the
-root's sequence rather than starting again.
+computes at merge, `CONTENTS`, `COUNTER` and `BINPKGMD5`. That is exactly what a
+stage3's own entries turn out to be. The merge ordinal continues the root's
+sequence rather than starting again.
 
-`CONTENTS` uses portage's own line types: `dir` for a directory, `obj` with a
-digest and an mtime for a file, `sym` with its target for a symbolic link, and
-`fif` for a named pipe. A fifo has no contents to digest and is recorded without
-one — opening it to look for some would block until something opened the write
-end, which inside a provisioning run nothing does. Character and block devices
+`CONTENTS` uses portage's own line types:
+
+| Line type | What it records |
+| --- | --- |
+| `dir` | A directory |
+| `obj` | A file, with a digest and an mtime |
+| `sym` | A symbolic link, with its target |
+| `fif` | A named pipe |
+
+A fifo has no contents to digest and is recorded without one. Opening it to look for some would block until something opened the write
+end, and inside a provisioning run nothing does. Character and block devices
 never appear: laying one down needs privilege the layer does not have, and the
 sandbox provides its own `/dev`.
 
 **Phase functions are not run.** Around 30% of packages define a `pkg_postinst`
-or a `pkg_preinst`, and they live in the container's `environment.bz2` as a
-serialized bash environment: running one means running portage's own `ebuild.sh`
-with the eclasses it was built against. So an `acct-user` or `acct-group`
-package ships a `sysusers.d` fragment and does not create the account,
-`ca-certificates` does not regenerate its bundle, and icon and font caches are
-not rebuilt.
+or a `pkg_preinst`. They live in the container's `environment.bz2` as a
+serialized bash environment. Running one therefore means running portage's own
+`ebuild.sh` with the eclasses it was built against.
+
+Three consequences are the ones callers meet. An `acct-user` or `acct-group`
+package ships a `sysusers.d` fragment and does not create the account.
+`ca-certificates` does not regenerate its bundle. Icon and font caches are not
+rebuilt.
 
 This is the same seam [the Debian layer](debian.md) has and the opposite
 decision. Debian's maintainer scripts are executables that layer can run inside
-the sandbox, so it runs them; Gentoo's are bash functions that need the guest's
+the sandbox, so it runs them. Gentoo's are bash functions that need the guest's
 package manager. What this layer gives you instead is a root portage can act on,
-which is the strongest argument for registering the entry properly — run the
+which is the strongest argument for registering the entry properly. Run the
 phases with `emerge` inside the sandbox if you need them.
 
-**`CONFIG_PROTECT` is not honoured.** An existing file under `/etc` is
+**`CONFIG_PROTECT` is not honored.** An existing file under `/etc` is
 overwritten rather than given portage's `._cfg0000_` treatment. The layer builds
 roots rather than upgrading live systems, and a root whose configuration depends
 on merge order is not reproducible.
@@ -433,10 +445,10 @@ on merge order is not reproducible.
 
 The binhost publishes 6,904 distinct package names across 15,773 builds. That is
 most of the tree and not all of it: `dev-build/cmake` is there, `app-misc/jq` is
-not, in any version. With around 90% of sampled packages resolving cleanly, the
-honest statement is that the binhost installs most things and cannot install
-everything, that the failures are the archive's shape rather than the resolver's,
-and that the layer says which atom it could not satisfy and why.
+not, in any version. Around 90% of sampled packages resolve cleanly. So the
+binhost installs most things and cannot install everything. The failures are the
+archive's shape rather than the resolver's, and the layer says which atom it
+could not satisfy and why.
 
 `packages` lists what is on offer before you commit to a resolution:
 
@@ -457,8 +469,8 @@ for version in catalogue.versions("dev-vcs/git") {
 ### Adding packages to a root that already exists
 
 `provision::ensure` reports a directory that already exists as `Existing` and
-does not touch it, so the way to add packages to a root you already have is a
-layered build: the base stays pristine and the increment lives in an overlay
+does not touch it. So the way to add packages to a root you already have is a
+layered build. The base stays pristine, and the increment lives in an overlay
 upper that the returned handle removes when dropped.
 
 ```rust,no_run
@@ -478,11 +490,11 @@ let layer = increment.stage_layer("/var/tmp/build-upper")?;
 # }
 ```
 
-Resolution reads the *merged* view — the base's database and whatever the upper
-already holds — because that is what a package manager inside the finished
-sandbox sees. An increment resolving against its own empty upper would ask the
-archive for everything the base already has, and would fail on the packages the
-binhost does not publish.
+Resolution reads the *merged* view: the base's database and whatever the upper
+already holds. That is what a package manager inside the finished sandbox sees.
+An increment resolving against its own empty upper would ask the archive for
+everything the base already has. It would then fail on the packages the binhost
+does not publish.
 
 ## Trust
 
@@ -496,17 +508,21 @@ vendored service keyring
 ```
 
 Both documents are cleartext-signed OpenPGP messages, verified by the same
-machinery the [Debian layer](debian.md#trust) uses for an `InRelease`: the
-signature must verify against a certificate in the keyring, the key must have
-been within its validity window when it signed, and the algorithms involved must
-be ones this crate rests a trust decision on. Gentoo signs with a dedicated
-signing subkey of its Automated Weekly Release Key, so the subkey's binding is
-verified back to the primary before the signature it made counts.
+machinery the [Debian layer](debian.md#trust) uses for an `InRelease`. Three
+things must hold:
+
+- The signature verifies against a certificate in the keyring.
+- The key was within its validity window when it signed.
+- The algorithms involved are ones this crate rests a trust decision on.
+
+Gentoo signs with a dedicated signing subkey of its Automated Weekly Release
+Key. The subkey's binding is verified back to the primary before the signature
+it made counts.
 
 The digest document records SHA-512 and BLAKE2B for the tarball *and* for its
-`.CONTENTS.gz` sidecar. The layer reads the SHA-512 for the tarball, keyed on the
-algorithm and the file name together: keying on the algorithm alone would take
-whichever line came first and hold the tarball to the sidecar's digest.
+`.CONTENTS.gz` sidecar. The layer reads the SHA-512 for the tarball, keyed on
+the algorithm and the file name together. Keying on the algorithm alone would
+take whichever line came first and hold the tarball to the sidecar's digest.
 
 **The `.sha256` sidecar is never read.** One sits beside every tarball, and it is
 a trap: nothing signs it, and it is not named in the signed digest document.
@@ -523,9 +539,9 @@ vendored service keyring
 ```
 
 The subkey that signs a `Manifest` is the same one that signs
-`latest-stage3.txt` and the `.DIGESTS` documents, so the binary-package half
-adds no trust anchor, no keyring and no verification path — `Keyring::verify` is
-called on one more document.
+`latest-stage3.txt` and the `.DIGESTS` documents. The binary-package half
+therefore adds no trust anchor, no keyring and no verification path.
+`Keyring::verify` is called on one more document.
 
 **The index is not signed, and nothing about that is fixable.** No
 `Packages.gpg`, `.asc`, `.sig`, `Manifest` or `.DIGESTS` is published beside it
@@ -535,50 +551,52 @@ forge the package it then serves.
 
 It also decides each download's declared size, which is why the layer keeps a
 ceiling of its own beside it. The index's `SIZE` bounds a fetch, and an
-understated one fails closed — the download stops short and the container fails
+understated one fails closed: the download stops short and the container fails
 its digest. An overstated one only relaxes the bound, since a transport caps at
-the smaller of the declared size and its own ceiling, so a hundred packages each
-declaring `SIZE: 18446744073709551615` would buy that ceiling a hundred times
-over before anything was verified. The layer's own bound is 1 GiB per package —
-above the 796 MB a whole stage3 weighs, and below the bundled client's own
-2 GiB, so it binds where the transport does not. The smaller of the two wins, as
-a ceiling should.
+the smaller of the declared size and its own ceiling. A hundred packages each
+declaring `SIZE: 18446744073709551615` would therefore buy that ceiling a
+hundred times over before anything was verified.
+
+The layer's own bound is 1 GiB per package. That is above the 796 MB a whole
+stage3 weighs and below the bundled client's own 2 GiB, so it binds where the
+transport does not. The smaller of the two always wins.
 
 **And a Manifest proves authorship, not identity.** Its lines are `DATA <member>
 <size> SHA512 <hex> BLAKE2B <hex>` and there is no field naming the package.
 GLEP 78 is explicit that the container's directory prefix cannot supply the
-identity either — the name "should" match the file name, but "the implementation
-must be able to process an archive where the directory name is mismatched" — so
-a conforming reader cannot treat the prefix as a claim.
+identity either. Matching the file name is only a recommendation there, while
+"the implementation must be able to process an archive where the directory name
+is mismatched". A conforming reader therefore cannot treat the prefix as a
+claim.
 
-Put together, that is a real substitution: a mirror answering a request for one
+Put together, that is a real substitution. A mirror answering a request for one
 package with a genuine, correctly signed *other* package passes every signature
 check there is. The layer closes it after verification, from the metadata inside
-the container — `CATEGORY`, `PF` and `BUILD_ID` compared against the record the
+the container: `CATEGORY`, `PF` and `BUILD_ID` compared against the record the
 resolution chose. A mismatch is a refusal, not a warning.
 
 The `Manifest` is the container's last member, so the digests arrive after the
 bytes they cover and a single forward pass cannot verify before extracting. The
 container is already in a cache, so this costs a second pass over a local file
-rather than a second fetch, and nothing is decompressed before its digest
-matches. The two detached `.sig` members go unread for the reason the stage3's
-`.asc` does — the cleartext-signed `Manifest` binds the same bytes — and they
-are digested by it like every other member, so they are verified *as data* even
-though they are not used as signatures.
+rather than a second fetch. Nothing is decompressed before its digest matches.
+
+The two detached `.sig` members go unread for the reason the stage3's `.asc`
+does: the cleartext-signed `Manifest` binds the same bytes. They are digested by
+it like every other member, so they are verified *as data* even though they are
+not used as signatures.
 
 ### The keyring
 
 The crate vendors Gentoo's service keys — the same
 `qa-reports.gentoo.org/output/service-keys.gpg` the distribution publishes,
 mirrored whole. Vendoring is the security property rather than a saved round
-trip: a trust anchor fetched over the same plain-HTTP channel as the artifact it
-authenticates authenticates nothing, because whoever can serve a forged stage3
-can serve the key that signs it.
+trip. An anchor fetched over the same channel as the artifact authenticates
+nothing: whoever can serve a forged stage3 can serve the key that signs it.
 
 It is mirrored mechanically, certificates this layer never meets included. An
-unusable key in an anchor weakens nothing — nothing rests on a key until it
-produces a signature that passes the gates — and a curated subset would be a
-judgement a later reader has to reconstruct rather than a rule they can check.
+unusable key in an anchor weakens nothing, since nothing rests on a key until it
+produces a signature that passes the gates. A curated subset would be a judgment
+a later reader has to reconstruct rather than a rule they can check.
 
 A vendored anchor has a shelf life, and Gentoo's certificates do not share one
 expiry:
@@ -623,19 +641,19 @@ Release Engineering automated weekly key, which runs to 2028-07-01. That is an
 observation about the archive rather than a rule. Gentoo can sign with another
 anchor without telling anyone, and the keyring will still verify it.
 
-Nothing refreshes the keyring at run time, and nothing should: fetching a trust
-anchor at provisioning time would hand the network the power to replace the very
-thing vendoring exists to protect. A newer keyring arrives in a release of this
-crate.
+Nothing refreshes the keyring at run time, and nothing is meant to. Fetching a
+trust anchor at provisioning time would hand the network the power to replace
+the very thing vendoring exists to protect. A newer keyring arrives in a release
+of this crate.
 
 ### Staleness, and what bounds it
 
 Gentoo publishes no deadline of any kind. There is no `Valid-Until` above the
 documents and no expiration on the signatures themselves, which leaves a gap the
-first two layers do not have: a mirror serving a genuinely signed but months-old
-pointer, and its matching digest document, passes every other check there is. The
-signature verifies, the key was valid when it signed, and the digest matches the
-bytes. That is a rollback, and it is the standard attack on a chain with no
+first two layers do not have. A mirror serving a genuinely signed but months-old
+pointer, with its matching digest document, passes every other check there is.
+The signature verifies, the key was valid when it signed, and the digest matches
+the bytes. That is a rollback, and it is the standard attack on a chain with no
 deadline.
 
 The pointer closes it itself. Inside its signed body, above the entries:
@@ -646,15 +664,16 @@ The pointer closes it itself. Inside its signed body, above the entries:
 ```
 
 Every architecture carries the line, and the documents are regenerated on a
-common schedule whether or not new builds landed in them — amd64's `x32` entries
-can be two months old while the document's own timestamp is minutes old — so the
-value measures the pointer's currency rather than the age of what it points at.
+common schedule whether or not new builds landed in them. So amd64's `x32`
+entries can be two months old while the document's own timestamp is minutes old.
+The value measures the pointer's currency rather than the age of what it points
+at.
 
 A pointer older than thirty days is refused. That is about four regeneration
 cycles, so a live archive never approaches it. A pointer stating no timestamp is
-refused on the same terms: it is the only bound there is, and reading its absence
-as permission would let whoever serves the document disable the check by deleting
-a line.
+refused on the same terms. It is the only bound there is. Reading its absence as
+permission would let whoever serves the document disable the check by deleting a
+line.
 
 ```rust,no_run
 use ferroday_cage::provision::gentoo::Gentoo;
@@ -671,50 +690,51 @@ let gentoo = Gentoo::builder("amd64")
 # }
 ```
 
-Clearing the bound gives up the only defence against a replayed pointer, and it
-accepts an undated one too. It is the right answer for an archived mirror and the
-wrong one for a live network.
+Clearing the bound gives up the only defense against a replayed pointer, and it
+accepts an undated one too. It is the right answer for an archived mirror and
+the wrong one for a live network.
 
 ## The cache
 
 `cache_dir` names a directory the downloaded tarball is kept in across runs. A
-stage3 is hundreds of megabytes, so a caller provisioning more than one root from
-the same build wants one. Without it the tarball is downloaded beside the tree
-being built and removed with it.
+stage3 is hundreds of megabytes, so a caller provisioning more than one root
+from the same build wants one. Without it the tarball is downloaded beside the
+tree being built and removed with it.
 
 A cached tarball is verified on the read, not trusted for having been verified
-once: what sits at a cache path is bytes on a disk this crate does not own, so a
-cache hit and a fresh download go through the same check. A tarball that does not
-match is removed rather than left behind — it is not the archive's file whatever
-it is, and keeping it would make every later run of that build fail identically
-out of its own cache. Binary packages are cached the same way and on the same
-terms.
+once. What sits at a cache path is bytes on a disk this crate does not own. A
+cache hit and a fresh download therefore go through the same check.
+
+A tarball that does not match is removed rather than left behind. It is not the
+archive's file whatever it is. Keeping it would make every later run of that
+build fail out of its own cache. Binary packages are cached the same way and on
+the same terms.
 
 **The cache directory is inside the trust boundary.** A container is verified in
-one pass and extracted in a second, both over the file on disk, so anything able
-to write the directory between the two substitutes content nothing verified into
-the merge. In normal use nobody else can: the cache is `cache_dir`, or a sibling
-of the tree being built where you name none. Pointing `cache_dir` at a shared or
+one pass and extracted in a second, both over the file on disk. Anything able to
+write the directory between the two therefore substitutes unverified content
+into the merge. In normal use nobody else can: the cache is `cache_dir`, or a
+sibling of the tree being built where you name none. Pointing `cache_dir` at a shared or
 world-writable location extends the boundary to whoever can write there.
 
 ## Mirrors
 
 `mirror` replaces the default `http://distfiles.gentoo.org`, and
 `mirror_fallback` adds URLs tried after it. The two are separate settings, as
-they are on the [Debian](debian.md) and [Alpine](alpine.md) builders: the walk
+they are on the [Debian](debian.md) and [Alpine](alpine.md) builders. The walk
 list is the primary followed by its backstops whichever order the calls are
-written in, repeating `mirror` takes the last value, and a backstop on its own
+written in. Repeating `mirror` takes the last value, and a backstop on its own
 backs the default archive rather than replacing it.
 
 The list is walked in order, advancing past a mirror that could not serve a
 document. A mirror that serves one that does not *verify* is fatal rather than a
-reason to try the next: what it served was answered for by the URL that was asked
-for, and the answer to a refused signature is never to ask somewhere else.
+reason to try the next. What it served was answered for by the URL that was
+asked for. The answer to a refused signature is never to ask somewhere else.
 
 The archive serves plain HTTP with no redirect to HTTPS, and the bundled client
-speaks it. Every byte it brings back is verified against the vendored keyring, so
-the transport is not what the trust rests on; a caller who wants TLS, a proxy, or
-a private mirror protocol supplies their own `Fetch`.
+speaks it. Every byte it brings back is verified against the vendored keyring,
+so the transport is not what the trust rests on. A caller who wants TLS, a
+proxy, or a private mirror protocol supplies their own `Fetch`.
 
 ## Progress
 
@@ -772,19 +792,19 @@ println!("{} packages", plan.packages.len());
 ```
 
 `Conflict`, `DependencyCycle` and `Occupied` describe how a resolution reached
-its answer, which is the half a preview is for: `resolve_packages` returns the
+its answer, which is the half a preview is for. `resolve_packages` returns the
 plan, and the sink says which atom blocked which, whether the blocker is already
 installed, and which packages form a cycle. An observed call reports the same
 events a bootstrap does, because both go through one code path.
 
 The same observer stops the run. `ProvisionObserver::cancelled` is consulted at
-each step boundary — before a document is fetched, once the resolution is in
-hand, before the download, and before the digest pass — and, unlike the other
-userlands, while the tarball is arriving: this layer has no package boundary to
-break the work up, and a check that ran only around the download would answer a
-caller who asked to stop once all of it had been fetched. A cancelled run fails
-with `ProvisionError::Cancelled`, leaves no root behind, and leaves no partial
-tarball in the cache.
+each step boundary: before a document is fetched, once the resolution is in
+hand, and before the digest pass. Unlike the other userlands, it is also
+consulted while the tarball is arriving. This layer has no
+package boundary to break the work up. A check that ran only around the download
+would answer a caller who asked to stop once all of it had been fetched. A run
+stopped this way fails with `ProvisionError::Cancelled`, leaves no root behind,
+and leaves no partial tarball in the cache.
 
 ## The command line
 
@@ -800,7 +820,7 @@ Gentoo Base System release 2.18
 The architecture is the coordinate rather than a release, since Gentoo publishes
 one autobuilds tree per architecture and no suite. `--gentoo-build-id`,
 `--gentoo-mirror`, `--gentoo-mirror-fallback` and `--gentoo-max-pointer-age`
-mirror the builder setters above; the last takes a count of days or `none`.
+mirror the builder setters above. The last takes a count of days or `none`.
 
 Two listings answer without provisioning anything:
 
@@ -817,10 +837,11 @@ $ fcage --gentoo-keyring-horizon
 11 certificates, 10 can sign	expiring between 1795718963 and 1846022400
 ```
 
-`--gentoo-variants` reads the signed enumeration, taking `--gentoo-mirror`,
+`--gentoo-variants` reads the signed enumeration. It takes `--gentoo-mirror`,
 `--gentoo-mirror-fallback` and `--gentoo-max-pointer-age` with the meanings they
-have on a provisioning command line, so the archive a listing reads is the
-archive an install would; `--gentoo-keyring-horizon` reaches no network at all.
+have on a provisioning command line. The archive a listing reads is therefore
+the archive an install would. `--gentoo-keyring-horizon` reaches no network at
+all.
 
 Binary packages are installed by naming the tree and the atoms:
 
@@ -852,7 +873,7 @@ acct-group/audio-0-r3	0	abi_x86_64 amd64 elibc_glibc kernel_linux
 ...
 ```
 
-`--gentoo-packages` reads the binhost index; `--gentoo-installed` reads a root's
+`--gentoo-packages` reads the binhost index. `--gentoo-installed` reads a root's
 own package database and reaches no network.
 
 ## Where this layer differs from the other two
@@ -867,7 +888,7 @@ Every difference is one the archive itself makes.
 | Replay | a plan document, versioned and portable | the build id and variant for the stage3, a plan document for the packages |
 | How long a pin lasts | as long as the archive or a snapshot service keeps the versions | about five weeks against the archive |
 | Freshness | `Valid-Until`, or an index refetched every run | the pointer's own signed regeneration timestamp |
-| What runs during a bootstrap | maintainer or install scripts, in a cage | nothing; phase functions are not run |
+| What runs during a bootstrap | maintainer or install scripts, in a sandbox | nothing, since phase functions are not run |
 
 Building packages *inside* a provisioned stage3 is `emerge`'s job rather than
 this library's, and [the ebuild sandbox](ebuild-sandbox.md) is the worked example
@@ -880,9 +901,9 @@ ebuild sandbox](ebuild-sandbox.md) shows, and it stays that example's job.
 
 **Phase functions.** Named above, with what their absence costs.
 
-**The ebuild tree, and EAPI evaluation.** Neither is needed: the binhost index
-is USE-evaluated, so its dependency strings are the ones that survived the
-conditionals at build time and no `flag? ( ... )` group appears in any of them.
+**The ebuild tree, and EAPI evaluation.** Neither is needed, because the binhost
+index is USE-evaluated. Its dependency strings are the ones that survived the
+conditionals at build time, and no `flag? ( ... )` group appears in any of them.
 That is the finding the whole binary-package half rests on.
 
 **Unmerging, upgrading and `--depclean`.** The layer installs into a root it is
@@ -891,8 +912,9 @@ and the database this layer writes is one portage can do it with.
 
 **Detached signatures.** Gentoo publishes an `.asc` beside every tarball and a
 `.sig` beside each container member. They are an alternative path for someone
-verifying a download by hand, not the only one: the cleartext-signed digest
-document and `Manifest` bind the same bytes, and that is what this layer reads.
+verifying a download by hand, not the only one. The cleartext-signed digest
+document and `Manifest` bind the same bytes, and that is what this layer
+reads.
 
 **BLAKE2B.** It sits beside SHA-512 on every `Manifest` line. A second algorithm
 agreeing with the first buys nothing the first does not already give.
