@@ -388,6 +388,7 @@ pub mod ferroday_cage::provision::debian
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Config
 pub ferroday_cage::provision::debian::DebianError::Config::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Configure
+pub ferroday_cage::provision::debian::DebianError::Configure::packages: alloc::vec::Vec<alloc::string::String>
 pub ferroday_cage::provision::debian::DebianError::Configure::status: ferroday_cage::ExitStatus
 pub ferroday_cage::provision::debian::DebianError::Configure::wave: &'static str
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Deb

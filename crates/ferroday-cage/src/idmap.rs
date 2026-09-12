@@ -68,6 +68,14 @@ pub enum IdentityMap {
     /// Reads of host ids outside the map present the overflow id (`nobody`),
     /// and changing a file's ownership to any other id fails with `EINVAL`,
     /// because the namespace cannot represent the id at all.
+    ///
+    /// A provisioner may substitute the `chown` and `chgrp` commands so that a
+    /// packaging script shelling out to one succeeds here. Nothing covers a
+    /// compiled helper calling `fchownat()` directly, or a POSIX ACL naming an
+    /// unmapped id: both reach the kernel and fail. A userland holding packages
+    /// that do either — `systemd`, whose `postinst` runs `systemd-tmpfiles`, is
+    /// the common one — needs [`Subordinate`](IdentityMap::Subordinate) or
+    /// [`Ranges`](IdentityMap::Ranges) instead.
     #[default]
     Single,
     /// Explicit ranges, written verbatim.

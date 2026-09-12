@@ -2825,6 +2825,21 @@ pub enum DebianError {
         wave: &'static str,
         /// dpkg's exit status.
         status: ExitStatus,
+        /// The packages dpkg named under `Errors were encountered while
+        /// processing`, in the order it listed them.
+        ///
+        /// Empty when dpkg failed without naming any: it exits non-zero for
+        /// reasons no package owns, and an empty list says only that the wave's
+        /// output held no such list. Why each package failed is not here — dpkg
+        /// writes that alongside the list, and it reaches a
+        /// [`DebianObserver`] as
+        /// [`DebianEvent::CommandOutput`].
+        ///
+        /// The names are on the error, rather than in the observer's stream
+        /// alone, because the observer is optional: a caller that takes no
+        /// progress events, or renders them only under a verbosity flag, still
+        /// has to be told which package failed.
+        packages: Vec<String>,
     },
     /// Packages were not left in the installed state after configuration.
     #[non_exhaustive]
@@ -2908,8 +2923,16 @@ impl fmt::Display for DebianError {
                 f,
                 "{path} did not match its recorded digest (expected {expected}, got {actual})",
             ),
-            DebianError::Configure { wave, status } => {
-                write!(f, "the dpkg {wave} step exited with {status}")
+            DebianError::Configure {
+                wave,
+                status,
+                packages,
+            } => {
+                write!(f, "the dpkg {wave} step exited with {status}")?;
+                if !packages.is_empty() {
+                    write!(f, ", processing {}", packages.join(", "))?;
+                }
+                Ok(())
             }
             DebianError::NotConfigured { packages } => write!(
                 f,
@@ -2988,6 +3011,30 @@ impl From<crate::Error> for DebianError {
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+
+    #[test]
+    fn a_failed_wave_reads_as_the_step_and_the_packages() {
+        // The names are the whole point of carrying them, so the rendering is
+        // asserted rather than left to the Display arm's own care.
+        let named = DebianError::Configure {
+            wave: "configure",
+            status: ExitStatus::exited(1),
+            packages: vec!["systemd".to_string(), "udev".to_string()],
+        };
+        assert_eq!(
+            named.to_string(),
+            "the dpkg configure step exited with exit code 1, processing systemd, udev",
+        );
+        let unnamed = DebianError::Configure {
+            wave: "unpack",
+            status: ExitStatus::exited(2),
+            packages: Vec::new(),
+        };
+        assert_eq!(
+            unnamed.to_string(),
+            "the dpkg unpack step exited with exit code 2",
+        );
+    }
 
     /// A transport that refuses the first mirror with a fixed error and serves
     /// a body from any other, recording every URL it was asked for.

@@ -25,6 +25,25 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Added
+
+- `provision::debian::DebianError::Configure` carries `packages`: the packages
+  dpkg named under `Errors were encountered while processing`, in the order it
+  listed them, appended to the error's `Display` as `, processing systemd,
+  udev`. The variant is `#[non_exhaustive]`, so the field is additive for a
+  caller that matches on it. Empty when dpkg failed without naming any package.
+  Why each one failed is unchanged: dpkg writes it beside the list, and it
+  reaches a `DebianObserver` as `DebianEvent::CommandOutput`.
+
+### Changed
+
+- The single-identity map's ownership coverage is documented where it stops.
+  Substituting `chown` and `chgrp` covers a maintainer script that runs one of
+  those commands; a compiled helper calling `fchownat()`, and any POSIX ACL
+  naming an unmapped id, reach the kernel and fail. `IdentityMap::Single` and
+  the guide's Debian chapter say so, and name `systemd` as the package most
+  installations meet that needs a range map. No behavior changes.
+
 ## [0.4.3] - 2026-08-26
 
 `fcage` 0.4.1, unchanged: the entry filter is code, and no argument carries one.

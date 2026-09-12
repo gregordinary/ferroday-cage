@@ -49,6 +49,16 @@ const CORE_ORDER: [&str; 5] = ["base-passwd", "base-files", "dpkg", "libc6", "pe
 /// fails. They are replaced with a stub that succeeds while packages
 /// configure, and restored afterward. A range map leaves the real tools in
 /// place, because the chowns genuinely work there.
+///
+/// Substituting a command covers only a script that runs one. A compiled helper
+/// calls `fchownat()` itself and is unreachable from here — see
+/// [`precreate_shadow`], which exists because `pwconv` is one — as is a POSIX
+/// ACL, which goes through `acl_set_file()` and has no dpkg record besides.
+/// `setfacl` is deliberately not on this list: the stub is only honest because
+/// [`StatOverride`] keeps the ownership the rootfs intends, and there is no
+/// such record for an ACL to keep, so stubbing it would discard the intent
+/// instead of deferring it. The coverage is documented for callers on
+/// [`IdentityMap::Single`].
 const OWNERSHIP_TOOLS: [&str; 2] = ["chown", "chgrp"];
 
 /// The body of an ownership-tool stub: a shell script that succeeds and does
@@ -223,6 +233,13 @@ pub(crate) struct Configure<'a> {
 /// trust anchor so the sources verify. `identity_map` is the map the cages run
 /// under, deciding whether the single-identity ownership reconciliation happens
 /// at all. `progress` receives dpkg's output.
+///
+/// Under the single-identity map the reconciliation neutralizes the
+/// [`chown`/`chgrp` commands](OWNERSHIP_TOOLS), so a maintainer script that
+/// shells out to one to assign an id the map cannot represent succeeds. That is
+/// the whole of the coverage: a script reaching `fchownat()` through a compiled
+/// helper, or setting a POSIX ACL, fails with `EINVAL`, and a package that does
+/// so cannot be configured under this map at all.
 pub(crate) fn configure(
     staging: &Path,
     wave: &Configure<'_>,
@@ -346,11 +363,16 @@ pub(crate) fn configure(
 /// base-system priming (base-passwd first, the awk shim, shadow pre-creation),
 /// since the base already supplies all of it. Under the single-identity map it
 /// still neutralizes `chown`/`chgrp` and seeds a merged statoverride, so a
-/// maintainer script that assigns an id the map cannot represent succeeds; those
-/// shims shadow the base's real tools through the overlay and are removed
-/// afterward. `overlay_source` is the caller's pre-configure overlay, laid over
-/// the upper between the unpack and configure waves exactly as for a full
-/// bootstrap.
+/// maintainer script that shells out to one of those commands to assign an id
+/// the map cannot represent succeeds; those shims shadow the base's real tools
+/// through the overlay and are removed afterward. The coverage stops exactly
+/// where [`configure`]'s does — a compiled helper or a POSIX ACL still fails —
+/// and the overlay is not the variable: an increment runs under the map of the
+/// base it increments, so a package needing real ids fails here for the same
+/// reason it fails in a full bootstrap.
+///
+/// `overlay_source` is the caller's pre-configure overlay, laid over the upper
+/// between the unpack and configure waves exactly as for a full bootstrap.
 pub(crate) fn configure_delta(
     lower: &Path,
     upper: &Path,
@@ -515,9 +537,49 @@ fn write_delta_statoverride(
         .map_err(at("writing", upper, STATOVERRIDE))
 }
 
-/// Forwards a wave's dpkg output to the bootstrap's observer.
+/// Forwards a wave's dpkg output to the bootstrap's observer, keeping enough of
+/// stderr that a failing wave can name the packages dpkg reported.
 struct DpkgOutput<'a> {
     emit: &'a mut dyn DebianObserver,
+    /// The tail of dpkg's stderr, bounded at [`DPKG_STDERR_KEPT`] and discarded
+    /// from the front: the list [`failed_packages`] reads is the last thing
+    /// dpkg writes, so what a bound drops is the unpack output ahead of it.
+    stderr_tail: Vec<u8>,
+}
+
+/// How much of a wave's stderr is kept to read its failure list out of. The
+/// whole of it is unbounded — a line per package acted on, plus whatever the
+/// maintainer scripts write — while the list sits at its end.
+const DPKG_STDERR_KEPT: usize = 64 * 1024;
+
+/// The line dpkg prints before listing the packages a wave failed on. Each name
+/// follows on its own line, indented by one space.
+///
+/// dpkg translates this message, so reading it is sound only because the wave's
+/// locale is this library's to set rather than a caller's: [`maintainer_env`]
+/// pins `LC_ALL=C.UTF-8` and is internal, so no caller can put dpkg into a
+/// locale that renders the line otherwise.
+///
+/// [`maintainer_env`]: super::maintainer_env
+const DPKG_ERROR_LIST: &str = "Errors were encountered while processing:";
+
+/// The packages dpkg named under [`DPKG_ERROR_LIST`], in the order it listed
+/// them.
+///
+/// Empty when the output holds no such list, which is every wave that failed
+/// for a reason no package owns. The last list wins: a maintainer script is
+/// free to run dpkg itself, and that dpkg writes to the stderr it inherited —
+/// so its summary can precede the one the wave itself ends with.
+fn failed_packages(stderr: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let Some((_, list)) = text.rsplit_once(DPKG_ERROR_LIST) else {
+        return Vec::new();
+    };
+    list.lines()
+        .skip(1)
+        .take_while(|line| line.starts_with(' ') && !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .collect()
 }
 
 impl Observer for DpkgOutput<'_> {
@@ -532,6 +594,11 @@ impl Observer for DpkgOutput<'_> {
             stream: Stream::Stderr,
             bytes: chunk,
         });
+        self.stderr_tail.extend_from_slice(chunk);
+        if self.stderr_tail.len() > DPKG_STDERR_KEPT {
+            let excess = self.stderr_tail.len() - DPKG_STDERR_KEPT;
+            self.stderr_tail.drain(..excess);
+        }
     }
 }
 
@@ -637,12 +704,19 @@ fn run_dpkg(
         )
         .build()
         .map_err(DebianError::Launch)?;
-    let mut output = DpkgOutput { emit: observer };
+    let mut output = DpkgOutput {
+        emit: observer,
+        stderr_tail: Vec::new(),
+    };
     let status = cage.run_with(&mut output).map_err(DebianError::Launch)?;
     if status.success() {
         Ok(())
     } else {
-        Err(DebianError::Configure { wave: name, status })
+        Err(DebianError::Configure {
+            wave: name,
+            status,
+            packages: failed_packages(&output.stderr_tail),
+        })
     }
 }
 
@@ -1172,6 +1246,40 @@ mod tests {
              root root 4755 /usr/bin/shared\n\
              games games 2755 /usr/games/keep\n",
         );
+    }
+
+    #[test]
+    fn a_failing_wave_names_the_packages_dpkg_listed() {
+        // The shape dpkg writes to stderr when a wave fails: the per-package
+        // error, then the summary list the name comes out of.
+        let stderr = "dpkg: error processing package systemd (--configure):\n \
+             installed systemd package post-installation script subprocess \
+             returned error exit status 73\n\
+             Errors were encountered while processing:\n \
+             systemd\n udev\n initramfs-tools-core\n";
+        assert_eq!(
+            failed_packages(stderr.as_bytes()),
+            ["systemd", "udev", "initramfs-tools-core"],
+        );
+    }
+
+    #[test]
+    fn a_wave_that_named_no_package_reports_none() {
+        // dpkg exits non-zero for reasons no package owns, and an empty list is
+        // the honest answer rather than a guess at one.
+        assert!(failed_packages(b"dpkg: error: cannot access archives\n").is_empty());
+        assert!(failed_packages(b"").is_empty());
+    }
+
+    #[test]
+    fn the_last_list_wins_over_one_a_nested_dpkg_left() {
+        // A maintainer script may run dpkg itself, on the stderr it inherited,
+        // so a summary can precede the one the wave ends with. The wave's own
+        // is the later one.
+        let stderr = "Errors were encountered while processing:\n nested\n\
+             Setting up udev ...\n\
+             Errors were encountered while processing:\n udev\n";
+        assert_eq!(failed_packages(stderr.as_bytes()), ["udev"]);
     }
 
     #[test]

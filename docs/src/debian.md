@@ -1265,6 +1265,20 @@ right for a build or run environment consumed back inside single-identity
 cages, which cannot observe the flattening, and whose caller-owned output
 needs no extra host support to copy or delete.
 
+Neutralizing substitutes the `chown` and `chgrp` **commands**, so it covers a
+maintainer script that shells out to one and nothing further. A script that
+changes ownership through a compiled helper reaches the kernel directly and
+fails with `EINVAL`. So does any POSIX ACL naming an id the map does not hold.
+`setfacl` is not substituted at all: dpkg's database has no record for an ACL,
+and a stub would discard the intent rather than defer it.
+
+Packages that do either cannot configure under the single-identity map. The one
+most installations meet is `systemd`, whose `postinst` runs `systemd-tmpfiles
+--create`. That calls `fchownat()` and `acl_set_file()` itself, reports `Invalid
+argument`, and fails the wave. A layered build is no way around it, since an
+increment runs under the map of the base it increments. The fix is to give such
+a tree a range map, where the ids are real and nothing is substituted.
+
 The overrides are recorded one per path. dpkg treats two records for one path as
 an unrecoverable fatal error, and an install set reaches that honestly: two
 selected packages can ship one path, since the resolver reads `Depends` and
