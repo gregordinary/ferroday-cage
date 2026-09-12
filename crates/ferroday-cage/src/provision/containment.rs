@@ -49,6 +49,16 @@ use rustix::io::Errno;
 /// forever.
 const REPLACE_ATTEMPTS: u32 = 3;
 
+/// How many times a resolution is retried when a rename raced it.
+///
+/// Each attempt re-resolves from the anchor, so a genuine race is lost once and
+/// won next; consecutive losses are what a tree being rewritten underneath the
+/// walk produces, and sixteen of them is far past anything an ordinary one
+/// reaches. The bound exists for the same reason [`REPLACE_ATTEMPTS`] does:
+/// neither half of provisioning walks a tree this crate trusts, and a
+/// pathological state must not be able to loop forever.
+const RESOLVE_ATTEMPTS: u32 = 16;
+
 /// Opens `path` as a directory, resolved against `anchor` under `containment`.
 ///
 /// `access` is what the descriptor is for: `O_PATH` where it is only ever the
@@ -65,17 +75,23 @@ const REPLACE_ATTEMPTS: u32 = 3;
 /// reason — a `/proc/*/fd/*` entry re-opens whatever it names, from anywhere on
 /// the host, and no path in a tree being provisioned has a use for one.
 ///
-/// `EAGAIN` is retried rather than returned. The kernel answers with it when a
-/// rename raced the walk, meaning "ask again", and a caller that took it for a
-/// failure would report a rootfs as unwritable because something moved
-/// underneath it.
+/// `EAGAIN` is retried rather than returned, up to [`RESOLVE_ATTEMPTS`] times.
+/// The kernel answers with it when a rename raced the walk, meaning "ask
+/// again", and a caller that took it for a failure would report a rootfs as
+/// unwritable because something moved underneath it. The bound is the same
+/// reasoning [`replacing`] applies to its own retry: a tree being provisioned
+/// is not one this crate trusts, and something renaming components in a loop
+/// must not be able to spin the walk forever. An exhausted retry returns the
+/// `EAGAIN` it kept receiving, which is the accurate answer — the resolution
+/// really was raced every time — and the caller reports it against whatever it
+/// was opening.
 pub(super) fn open_dir(
     anchor: BorrowedFd<'_>,
     path: &CStr,
     access: OFlags,
     containment: ResolveFlags,
 ) -> Result<OwnedFd, Errno> {
-    loop {
+    for _ in 0..RESOLVE_ATTEMPTS {
         // The call `clippy.toml` sends every other site here for: this is that
         // answer.
         #[expect(clippy::disallowed_methods)]
@@ -91,6 +107,7 @@ pub(super) fn open_dir(
             result => return result,
         }
     }
+    Err(Errno::AGAIN)
 }
 
 /// Runs `create`, unlinking whatever occupies `leaf` in `parent` and trying

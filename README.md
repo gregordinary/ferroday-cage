@@ -11,9 +11,9 @@ deadline, terminate, or kill. A companion command-line tool, `fcage`, offers the
 sandbox at a shell prompt.
 
 The library issues the sandbox's syscalls itself, so a default build is
-self-contained: pure Rust throughout, resting on the kernel alone. `unsafe` is
-confined to the small kernel-facing core — namespaces, id maps, mounts, `pivot_root`,
-`exec` — and nothing in the public API requires a caller to write it.
+self-contained: pure Rust throughout, resting on the kernel alone. Nothing in the
+public API requires a caller to write `unsafe`, and [CONTRIBUTING.md](CONTRIBUTING.md)
+names the three modules that use it.
 
 The sandbox rests on the same kernel primitives as bubblewrap — user and mount
 namespaces, `pivot_root`, seccomp — and presents them as a library with a typed builder

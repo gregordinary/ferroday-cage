@@ -44,6 +44,24 @@ consumer upgrading can skip it.
   the guide's Debian chapter say so, and name `systemd` as the package most
   installations meet that needs a range map. No behavior changes.
 
+### Fixed
+
+- `provision::containment`'s directory open bounds its `EAGAIN` retry, which was
+  unbounded where the module's own replacement retry is deliberately bounded.
+  `openat2` answers `EAGAIN` when a rename races the walk, so something renaming
+  components in a loop could spin a walk over a tree the crate does not trust.
+
+### Internal
+
+- The crate and `mechanism` module documentation named two homes of `unsafe`
+  where there are three; `CONTRIBUTING.md` had it right. `mechanism` no longer
+  states a count or names the complement, which is what made it go stale.
+- `the_command_runs_one_user_namespace_deeper_than_the_sandbox` compares the
+  `ns/user` link's content rather than `readlink`'s exit status. Linux 7.1
+  withholds the identifier by returning success with an empty result where
+  older kernels answer `EACCES`, so the status test read the newer kernel's
+  refusal as permission granted and failed.
+
 ## [0.4.3] - 2026-08-26
 
 `fcage` 0.4.1, unchanged: the entry filter is code, and no argument carries one.

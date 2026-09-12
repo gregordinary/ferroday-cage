@@ -539,18 +539,30 @@ fn the_command_runs_one_user_namespace_deeper_than_the_sandbox() {
     // inside to the calling user outside and never reads `0 0 1`, while the
     // nested map — the reflection of that inside id onto itself — always does.
     //
-    // The second check is the kernel's own account of the same fact. Reading
-    // another process's `ns/user` link needs either the same user namespace or
-    // `CAP_SYS_PTRACE` over that process's namespace, and a child namespace
-    // holds no capability over its parent's; the init, which never nests, is
-    // therefore out of reach in a way it was not before.
+    // The second and third checks are the kernel's own account of the same
+    // fact. Reading another process's `ns/user` link needs either the same user
+    // namespace or `CAP_SYS_PTRACE` over that process's namespace, and a child
+    // namespace holds no capability over its parent's; the init, which never
+    // nests, is therefore out of reach in a way it was not before.
+    //
+    // They compare the link's *content* rather than `readlink`'s exit status,
+    // because the two kernel generations refuse differently and only the
+    // content is stable across them. An older kernel answers `EACCES`; Linux
+    // 7.1 returns success with an empty result, withholding the identifier
+    // without reporting a denial. A status test therefore reads the newer
+    // kernel's refusal as permission granted. What holds on both is that the
+    // command can see its own namespace and cannot see the init's, so a
+    // non-empty own identifier that the init's does not match is the property,
+    // and an unreadable link yields the empty string under either refusal.
     //
     // The rest asserts what does *not* change: the command is still root
     // inside, and the root filesystem is still its own.
     let script = "\
         set -- $(cat /proc/self/uid_map); [ \"$1 $2 $3\" = \"0 0 1\" ] || exit 1; \
-        /bin/busybox readlink /proc/self/ns/user >/dev/null || exit 2; \
-        /bin/busybox readlink /proc/1/ns/user >/dev/null 2>&1 && exit 3; \
+        own=$(/bin/busybox readlink /proc/self/ns/user 2>/dev/null); \
+        [ -n \"$own\" ] || exit 2; \
+        init=$(/bin/busybox readlink /proc/1/ns/user 2>/dev/null); \
+        [ \"$init\" = \"$own\" ] && exit 3; \
         [ \"$(/bin/busybox id -u)\" = 0 ] || exit 4; \
         [ -O / ] || exit 5";
     let status = run_sh(rootfs, script);

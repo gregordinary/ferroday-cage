@@ -11,9 +11,9 @@
 //! beyond it — `subid` delegates uid/gid range maps to the shadow suite's
 //! privileged `newuidmap`/`newgidmap` helpers, the standard subordinate-id
 //! mechanism every rootless container runtime uses. `unsafe` is confined to
-//! the kernel-facing core — the launch mechanism, and the tap-device layer
-//! of the optional native network stack — and every consumer of the crate
-//! is safe Rust.
+//! the kernel-facing core — the launch mechanism, the tap-device layer of the
+//! optional native network stack, and the signal handling of the terminal
+//! relay — and every consumer of the crate is safe Rust.
 //!
 //! # Example
 //!

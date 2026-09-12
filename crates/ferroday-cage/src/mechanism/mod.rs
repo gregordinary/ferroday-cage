@@ -1,8 +1,7 @@
 //! The sandbox launch mechanism: fork, the launch-stage pipes, and the
 //! supervisor plumbing.
 //!
-//! This module is one of the crate's two homes of `unsafe` (the other is
-//! the network stack's tap layer, `crate::netstack::tap`). The unsafe
+//! This module is one of the crate's homes of `unsafe`. The unsafe
 //! surface here is the process-creation and exec boundary — `kernel_fork`,
 //! `unshare_unsafe`, `execve`, the signal-state calls, and the descriptor
 //! sweep — each with its invariant documented at the call site, and
