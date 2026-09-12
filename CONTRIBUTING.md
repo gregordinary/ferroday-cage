@@ -1,7 +1,7 @@
 # Contributing
 
 Thank you for your interest. ferroday-cage is a personal project maintained in
-spare time, so this document sets out what is welcome and how it is handled,
+spare time. This document sets out what is welcome and how it is handled,
 alongside what you need to build and test the code.
 
 ## Reporting a security issue
@@ -14,24 +14,24 @@ Please do not open a public issue for one.
 ## Reporting a bug
 
 Open an issue. The bug template asks for the configuration, the kernel, and
-the host probes' output, which is usually enough to tell a defect from a host
+the host probes' output. That is usually enough to tell a defect from a host
 that lacks a facility. The build and test instructions below are also what you
 need to reproduce a problem locally.
 
 ## Proposing a capability
 
 Open an issue describing what you are trying to do and where the library stops
-you. The shape is discussable; a sketch is enough to start from.
+you. The shape is discussable, and a sketch is enough to start from.
 
 ## Proposing a change
 
 Open an issue before writing code, so the design can be agreed before anyone
-spends time on it. The library's public surface is a compatibility commitment
-guarded by a committed API snapshot and `cargo-semver-checks`, and a change to
-it is a decision about what the project promises for the rest of the 0.x
-series — better settled in discussion than in review.
+spends time on it. The library's public surface is a compatibility commitment,
+guarded by a committed API snapshot and `cargo-semver-checks`. A change to it
+decides what the project promises for the rest of the 0.x series. That is
+better settled in discussion than in review.
 
-An unsolicited pull request may therefore sit for some time, or be declined on
+An unsolicited pull request therefore sits for some time, or is declined on
 scope or design grounds after the work is done. Agreeing the shape first
 spares you that. Once a change is agreed, the sections below are what it needs
 to pass.
@@ -47,8 +47,8 @@ cargo test  --workspace --all-features
 ```
 
 The crate targets Linux only, and the launch mechanism requires rustix's
-`linux_raw` backend; a configuration that would select the libc backend fails
-the build with an explanatory `compile_error!` rather than silently
+`linux_raw` backend. A configuration that would select the libc backend fails
+the build with an explanatory `compile_error!`, rather than silently
 compromising the post-fork discipline.
 
 ## Running the tests
@@ -67,17 +67,19 @@ CI asserts the security-property suites actually ran:
 | `FERRODAY_CAGE_REQUIRE_SECCOMP` | The kernel offers no seccomp |
 | `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` | A network suite was not opted into |
 
-To exercise the full suite locally you need unprivileged user namespaces
-enabled (on Ubuntu 23.10 and later, `sysctl -w
-kernel.apparmor_restrict_unprivileged_userns=0`), the `tun` module loaded, and
-a subordinate id allocation for your user (`usermod --add-subuids
---add-subgids`).
+To exercise the full suite locally you need three things:
+
+- Unprivileged user namespaces enabled. On Ubuntu 23.10 and later, that is
+  `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+- The `tun` module loaded.
+- A subordinate id allocation for your user, from `usermod --add-subuids
+  --add-subgids`.
 
 ### The network suites
 
 Three integration suites bootstrap from a live archive, and all are **off by
-default**, so `cargo test --workspace --all-features` — CI included — resolves
-against no archive unless it is asked to. Each is opted into with its own
+default**. `cargo test --workspace --all-features` therefore resolves against no
+archive unless it is asked to, CI included. Each is opted into with its own
 variable:
 
 | Variable | Runs |
@@ -87,78 +89,84 @@ variable:
 | `FERRODAY_CAGE_GENTOO_NETWORK_TEST` | `tests/gentoo.rs`'s live resolution and stage3 bootstrap, against the Gentoo archive |
 
 These are the proofs that a produced root is one the distribution's own files
-and tools agree with — `apt` and `dpkg` on the Debian side, `apk audit` and
-`busybox` on the Alpine one, and on the Gentoo side the release files and
-portage's own tooling in the extracted stage3 — so run them before a release and
-after any change to a provisioner. They are happy-path suites by design; the failure paths are covered
-by the hermetic unit tests beside the code, which run always.
+and tools agree with:
 
-`FERRODAY_CAGE_REQUIRE_NETWORK_TEST` turns *not* opting in into a failure, which
-is what keeps a release check that meant to exercise them from coming back green
-having run nothing. Both suites also skip when the host cannot build a sandbox at
-all — a missing user namespace is not a repository failure — and that skip is
+- Debian: `apt` and `dpkg`.
+- Alpine: `apk audit` and `busybox`.
+- Gentoo: the release files, and portage's own tooling in the extracted stage3.
+
+Run them before a release, and after any change to a provisioner. They are
+happy-path suites by design, and the failure paths are covered by the hermetic
+unit tests beside the code, which run always.
+
+`FERRODAY_CAGE_REQUIRE_NETWORK_TEST` turns *not* opting in into a failure. That
+keeps a release check that meant to exercise them from coming back green having
+run nothing. Every suite also skips when the host cannot build a sandbox at all,
+because a missing user namespace is not a repository failure. That skip is
 `FERRODAY_CAGE_REQUIRE_USERNS`'s to assert on, as it is everywhere else.
 
 That is narrower than "reaches no network", and deliberately so. Every suite that
-builds a sandbox needs a root filesystem to build it in, and that is a pinned
-Alpine minirootfs the first run fetches from a mirror and caches under `target/`.
-A cold cache therefore reaches the network whatever is opted into; a warm one
+builds a sandbox needs a root filesystem to build it in. That is a pinned Alpine
+minirootfs, which the first run fetches from a mirror and caches under `target/`.
+A cold cache therefore reaches the network whatever is opted into, and a warm one
 reaches nothing. `FERRODAY_CAGE_FIXTURE_DIR` points the cache somewhere already
 populated, for a build with no network at all.
 
 ### Scratch directories
 
 A test that needs a real filesystem tree takes it from a guard that removes the
-tree when it drops, rather than composing a path under the system temporary
+tree when it drops. It does not compose a path under the system temporary
 directory by hand. A directory that only clears itself on the *next* run leaves
 one tree per run behind forever, which a long-lived machine notices.
+
+Three shapes cover every test here:
 
 - **A unit test** inside `crates/ferroday-cage/src` uses
   `crate::scratch::Scratch`, which dereferences to its `Path`.
 - **An integration test** uses `common::scratch_dir`, which places its trees
   under `target` so `cargo clean` clears them. Two tests name a tree of their
-  own instead — `tests/export.rs` and the removal test in `tests/identity.rs` —
-  because both fill it with subordinate-owned entries, which have to be removed
-  through `provision::remove` rather than by the calling user. `scratch_dir`
+  own instead: `tests/export.rs` and the removal test in `tests/identity.rs`.
+  Both fill it with subordinate-owned entries, which have to be removed through
+  `provision::remove` rather than by the calling user. `scratch_dir`
   clears the previous run's tree as the calling user, which is exactly what such
   a tree resists.
 - **A network suite's downloads** are not a scratch tree at all: they are kept
   on purpose, so that a second run does not fetch half a gigabyte again.
   `common::download_cache` names one directory per suite, under
   `FERRODAY_CAGE_FIXTURE_DIR` where it is set and the system temporary directory
-  otherwise — the one place here that deliberately sits outside `target`, since
-  a `cargo clean` costing that much to undo is a reason not to run the network
+  otherwise. That is the one place here that deliberately sits outside `target`.
+  A `cargo clean` costing that much to undo is a reason not to run the network
   suites.
 
 Both crates' `tests/common/mod.rs` are re-exports of `ferroday-cage-testkit`, a
-workspace member that is never published. It holds the rootfs fixture, the
-scratch directories, and the builders for `.deb`, `ar`, and tar fixtures, so the
+workspace member that is never published. It holds the root filesystem fixture,
+the scratch directories, and the builders for `.deb`, `ar`, and tar fixtures. The
 two suites share them rather than keeping a copy each. Every part of it that
-needs a library feature sits behind one of its own that forwards, and a dependent
-enables only what it uses — which is what keeps the `features` job's featureless
+needs a library feature sits behind one of its own that forwards. A dependent
+enables only what it uses, which is what keeps the `features` job's featureless
 and powerset checks meaning what they say.
 
 ### Feature-gating a test
 
-Every command above selects all features, so none of them can catch a test that
-uses an API the feature selection it runs under does not provide. A new
-integration test declares what it needs, one of two ways:
+Every command above selects all features. None of them catches a test that uses
+an API the feature selection it runs under does not provide. A new integration
+test declares what it needs, one of two ways:
 
 - **A whole binary needing a feature** gets a `[[test]]` entry in
   `crates/ferroday-cage/Cargo.toml` with `required-features`. Cargo then skips
   the target where the features are absent.
 - **A binary that is only partly feature-dependent** stays out of that list and
   carries `#[cfg(feature = "...")]` on the imports, helpers, and tests that
-  need one. `tests/debug_rendering.rs` is the worked example: what it asserts
+  need one. `tests/debug_rendering.rs` is the worked example. What it asserts
   about a publication and a removal is part of a featureless build's public
-  API, and gating the whole binary would stop covering it.
+  API. Gating the whole binary would stop covering it.
 
 The `features` job checks both, so a leak surfaces there rather than in a
 consumer's build.
 
 ## Before opening a pull request
 
-CI runs all of these; running them locally first is faster than a round trip.
+CI runs all of these, and running them locally first is faster than a round trip.
 
 ```sh
 cargo fmt --all --check
@@ -172,74 +180,75 @@ Two further gates matter when the public API moves:
 - **The API snapshot.** `crates/ferroday-cage/public-api.txt` is committed, so
   any change to the public surface arrives as a reviewable diff. Regenerate it
   with the command in the `api` job of `.github/workflows/ci.yml`, including
-  the nightly that job pins, and commit the result. The pin matters: the
+  the nightly that job pins, and commit the result. The pin matters. The
   snapshot is rustdoc's JSON rendering, which differs between nightlies, so an
-  unpinned regeneration produces a diff that is not an API change. That command
-  needs `cargo-public-api`, whose own build links libcurl and so wants
-  `libssl-dev` and `pkg-config` on the machine installing it. The library
-  itself needs neither, and nothing in its dependency graph links a C
-  library.
+  unpinned regeneration produces a diff that is not an API change.
+
+  That command needs `cargo-public-api`, whose own build links libcurl and so
+  wants `libssl-dev` and `pkg-config` on the machine installing it. The library
+  itself needs neither, and nothing in its dependency graph links a C library.
 - **Auto traits.** `crates/ferroday-cage/tests/auto_traits.rs` pins `Send` and
   `Sync` for every public type, including the ones that deliberately have
-  neither. Losing an auto trait is a breaking change; if a change withdraws
+  neither. Losing an auto trait is a breaking change. Where a change withdraws
   one, the assertion and its recorded reason both need updating.
 
 - **Command-line parity.** `tools/check-parity.py` records every public builder
   setting against the flag that reaches it, or the reason it has none, and
   fails on any difference. `fcage`'s own tests read its `FLAGS` table, so a
-  library setting the table never learned is absent from both sides of every
-  comparison they can make; `tools/parity.toml` is the other side. It reads the
+  library setting the table never learned is absent from both sides of any
+  comparison they make. `tools/parity.toml` is the other side. It reads the
   API snapshot above, so regenerate that first when the public surface moves.
 
 - **The provisioning seam.** `tools/check-seam.py` records what each userland
   reaches for outside `provision`, and fails on any difference. The three
   layers sit on a seam they could one day be crates of their own on, and this
-  keeps that decision cheap: a new reach past the seam is recorded in
+  keeps that decision cheap. A new reach past the seam is recorded in
   `tools/seam.toml` with what it would cost. It also refuses a userland naming
   another outright, since the three formats are deliberately not shared. The
   [stability
   chapter](https://gregordinary.github.io/ferroday-cage/stability.html) records
   the decision itself and what would settle it.
 
-One gate deliberately does not run here. `tools/check-keyrings.py` compares
-each vendored trust anchor -- Debian's archive keyring, Alpine's and
-postmarketOS's signing keys, Gentoo's service keys -- against what its
-distribution publishes today, and it reaches the network to do it. It runs
-weekly on a schedule of its own and by hand, never on a pull request: keyring
-drift moves on a scale of months, and four archive fetches on every push would
-make the always-run checks non-hermetic for nothing. Run it before a release,
-and after refreshing a vendored keyring, to confirm the new bytes are the
-published ones.
+One gate deliberately does not run here. `tools/check-keyrings.py` compares each
+vendored trust anchor against what its distribution publishes today, and it
+reaches the network to do it. The anchors are Debian's archive keyring, Alpine's
+and postmarketOS's signing keys, and Gentoo's service keys.
 
-If a doc comment on shared code links a feature-gated item, the `cargo doc`
-above will not catch it: the link resolves under `--all-features` and under
+It runs weekly on a schedule of its own and by hand, never on a pull request.
+Keyring drift moves on a scale of months, and four archive fetches on every push
+would make the always-run checks non-hermetic for nothing. Run it before a
+release, and after refreshing a vendored keyring, to confirm the new bytes are
+the published ones.
+
+A doc comment on shared code can link a feature-gated item, and the `cargo doc`
+above does not catch that. The link resolves under `--all-features` and under
 nothing else. The `features` job documents the whole powerset for that reason,
 and `cargo hack doc -p ferroday-cage --feature-powerset --depth 2 --no-deps
 --no-dev-deps` reproduces it. Where a sentence genuinely names items from two
-features, write it once per combination with `cfg_attr(..., doc = "...")`;
+features, write it once per combination with `cfg_attr(..., doc = "...")`.
 `provision::BuildLayer` is the worked example.
 
-If you touch the guide, build it: `mdbook build docs`. That renders it and does
-not compile it — the guide's Rust blocks are doctests of the library, included
-by `crates/ferroday-cage/src/guide.rs` and compiled by the `cargo test` above,
-so a block that no longer builds fails there. A new chapter is added to that
-module as well as to `docs/src/SUMMARY.md`; a test beside it holds the list to
+If you touch the guide, build it with `mdbook build docs`. That renders it and
+does not compile it. The guide's Rust blocks are doctests of the library,
+included by `crates/ferroday-cage/src/guide.rs` and compiled by the `cargo test`
+above. A block that no longer builds fails there. A new chapter is added to that
+module as well as to `docs/src/SUMMARY.md`. A test beside it holds the list to
 what the guide publishes.
 
 ## Releasing
 
-1. Settle `CHANGELOG.md`: the release's section carries its entries, its
-   heading carries the date, and a fresh `Unreleased` section sits above it
-   with the comparison links updated at the foot of the file.
+1. Settle `CHANGELOG.md`. The release's section carries its entries, and its
+   heading carries the date. A fresh `Unreleased` section sits above it, with
+   the comparison links updated at the foot of the file.
 
    An entry says what changed, in a paragraph. Why it changed that way belongs
    in the doc comment of the thing it explains, or in the guide chapter that
-   covers it — which is where it stays true, and where a reader looking for it
-   will be. A changelog entry that carries the reasoning as well makes it three
-   places to keep right, and turns the file a consumer reads to decide whether
-   to upgrade into a design record. A **Security** entry and a **Breaking.**
-   one get the room to say what a consumer must act on; nothing else needs
-   more.
+   covers it. That is where it stays true, and where a reader looking for it
+   will be. A changelog entry carrying the reasoning as well makes it three
+   places to keep right. It also turns the file a consumer reads to decide
+   whether to upgrade into a design record. A **Security** entry and a
+   **Breaking.** one get the room to say what a consumer must act on, and
+   nothing else needs more.
 2. Bump the version. The library and `fcage` version independently, so bump
    only what changed.
 3. Tag the release and publish, **library first**:
@@ -249,64 +258,66 @@ what the guide publishes.
    cargo publish -p ferroday-cage-cli
    ```
 
-   `ferroday-cage-cli` depends on the library by version as well as by path,
-   so it cannot even be packaged until that version is on crates.io — a
+   `ferroday-cage-cli` depends on the library by version as well as by path, so
+   it cannot even be packaged until that version is on crates.io. A
    workspace-wide publish fails with `no matching package named
    ferroday-cage`. Allow a moment between the two for the index to catch up.
-4. Confirm the guide published: the `pages` job runs on a push to `main`, and
-   the site it serves is what `homepage` in `Cargo.toml` and every
+4. Confirm the guide published. The `pages` job runs on a push to `main`. The
+   site it serves is what `homepage` in `Cargo.toml` names, and what every
    documentation link in `README.md`, `SECURITY.md`, `CONTRIBUTING.md`, and
-   `CHANGELOG.md` point at. Publishing requires the repository's Pages source
+   `CHANGELOG.md` points at. Publishing requires the repository's Pages source
    to be set to "GitHub Actions".
 
-A published version is immutable. The keywords, description, and README shown
-on the registry are recorded at publish time, so correcting any of them takes a
-new version even when no code changes. That metadata is applied by every
-publish rather than by the newest version alone, so releasing a patch on an
-older line replaces the crate page with that line's metadata.
+A published version is immutable. The keywords, description, and README shown on
+the registry are recorded at publish time. Correcting any of them takes a new
+version, even when no code changes. That metadata is applied by every publish
+rather than by the newest version alone. Releasing a patch on an older line
+therefore replaces the crate page with that line's metadata.
 
 ## Code conventions
 
 - **Documentation is part of the change.** Public items carry rustdoc, and
   internal items carry it wherever the behavior is not obvious. Comments
   explain *why*, not *what*.
-- **`unsafe` is confined** to three modules, all in the library: the launch
-  mechanism, the network stack's tap layer, and the terminal relay's signals,
-  which blocks the relayed set and opens the descriptor they arrive on. `fcage`
-  has none. Both crates deny it by default; each block that needs it carries a
-  `SAFETY:` comment stating the invariant it relies on, which is enforced by
-  `clippy::undocumented_unsafe_blocks`. Every consumer of the *library* is safe
-  Rust: nothing in its public API requires a caller to write `unsafe`.
+- **`unsafe` is confined** to three modules, all in the library. They are the
+  launch mechanism, the network stack's tap layer, and the terminal relay's
+  signals. The relay's signals block the relayed set and open the descriptor
+  those signals arrive on. `fcage` has none.
+- **Every `unsafe` block states its invariant.** Both crates deny `unsafe` by
+  default. Each block that needs it carries a `SAFETY:` comment stating the
+  invariant it relies on, which `clippy::undocumented_unsafe_blocks` enforces.
+  Every consumer of the *library* is safe Rust, and nothing in its public API
+  requires a caller to write `unsafe`.
 - **The post-fork stages must not allocate, lock, panic, or call libc.** They
   run between `fork` and `exec` in a process copied from a possibly
   multithreaded caller. Everything they need is marshaled by the caller
-  beforehand; see the `mechanism` module documentation for the full rule.
-- **Errors are typed and name their subject.** A failure reports what failed
-  and what it was operating on — the mount, the resource limit, the command
-  path — rather than an opaque errno. An OS failure is carried as an
-  `io::Error` and returned from `source()`, never as a raw `errno: i32`; where a
-  failure genuinely carried no OS error, that is an `Option<io::Error>` rather
-  than a zero. Constructors take their arguments in one order — operation,
-  locator, cause — and each error type has one of them, plus an `at(op,
-  locator)` form for the `map_err` sites.
+  beforehand. The `mechanism` module documentation states the full rule.
+- **Errors are typed and name their subject.** A failure reports what failed and
+  what it was operating on, rather than an opaque errno: the mount, the resource
+  limit, the command path. An OS failure is carried as an `io::Error` and
+  returned from `source()`, never as a raw `errno: i32`. Where a failure
+  genuinely carried no OS error, that is an `Option<io::Error>` rather than a
+  zero. Constructors take their arguments in one order, operation then locator
+  then cause. Each error type has one of them, plus an `at(op, locator)` form
+  for the `map_err` sites.
 - **A new capability arrives additively** where it can: a new builder method,
   a new enum variant behind `#[non_exhaustive]`, a new accessor on an existing
   request type. See the [stability
   chapter](https://gregordinary.github.io/ferroday-cage/stability.html) for the
   promises this keeps and how they are enforced.
 - **One name for one thing.** A concept the workspace already has an answer for
-  is reached through that answer rather than answered again; the table under
+  is reached through that answer rather than answered again. The table under
   [The shared vocabulary](#the-shared-vocabulary) is the list of them. Where a
-  second answer is warranted, it says so and says why, in the doc comment of the
-  thing that is the second answer — the post-fork path checks in `mechanism`,
-  which cannot allocate, are the worked example. A second answer that says
-  nothing is how the vocabulary comes apart, so an unexplained one is a review
-  comment.
+  second answer is warranted, it says so and says why, in the doc comment of
+  the thing that is the second answer. The post-fork path checks in
+  `mechanism`, which cannot allocate, are the worked example. A second answer
+  that says nothing is how the vocabulary comes apart, so an unexplained one is
+  a review comment.
 - **A shared helper is swept for on arrival.** When a change produces one, the
   change also moves the callers that could have used it, not only the ones it
   was about. The alternative is an abstraction two callers out of five use,
-  which is worse than none: a reader learns the mechanism and then finds it does
-  not transfer.
+  which is worse than none. A reader learns the mechanism and then finds it
+  does not transfer.
 - **Profile keys come from `rename_all`.** A serde container carries
   `rename_all = "kebab-case"` and its fields carry no `rename`. The two
   exceptions state themselves, and both are a plural Rust field naming a
@@ -316,37 +327,37 @@ older line replaces the crate page with that line's metadata.
 
 ### The shared vocabulary
 
-Each row is a question the workspace answers once. Before writing something
-that answers one of them, reach for the answer; before adding a row, check that
-the question is not already here under different words.
+Each row is a question the workspace answers once. Before writing something that
+answers one of them, reach for the answer. Before adding a row, check that the
+question is not already here under different words.
 
 Four rows below name one answer per package format rather than one answer
-outright. Three of them are deliberate for one reason: each format defines its
+outright. Three of them are deliberate for one reason. Each format defines its
 own version ordering, so a shared comparator would have to be told which set of
-rules to apply, which is the format's identity and not a parameter. The rows
+rules to apply. That is the format's identity rather than a parameter. The rows
 are here so the next constraint question is answered by extending its format's
-`version` module rather than by a fourth mechanism somewhere else.
+`version` module, rather than by a fourth mechanism somewhere else.
 
-The three comparators do not share a signature, and that is the formats
-speaking rather than three opinions: dpkg's algorithm is defined over every
-string, so `debian::version::compare` answers an `Ordering` and has nothing to
-refuse, while an apk or a portage version is a token grammar and a string
-outside it is one the mirror should not have published, which is what the other
+The three comparators do not share a signature, and that is the formats speaking
+rather than three opinions. dpkg's algorithm is defined over every string, so
+`debian::version::compare` answers an `Ordering` and has nothing to refuse. An
+apk or a portage version is a token grammar instead. A string outside that
+grammar is one the mirror had no business publishing, which is what the other
 two report as `None`. Each module's own documentation states which it is.
 
 The fourth, `Refusals`, is split for a different reason. Both layers collect
-every refusal and fail once, which is the discipline; what they collect is not
-the same set. A portage resolution refuses in three shapes — an atom nothing
-answers, a blocker, and two builds contending for one slot — and the last two
-have no Debian meaning, so a shared type would carry collections that are
-always empty on one side. Alpine reports one refusal at a time and has no such
-type yet; when it grows one, it is this row it extends.
+every refusal and fail once, which is the discipline, and what they collect is
+not the same set. A portage resolution refuses in three shapes: an atom nothing
+answers, a blocker, and two builds contending for one slot. The last two have no
+Debian meaning, so a shared type would carry collections that are always empty
+on one side. Alpine reports one refusal at a time and has no such type yet. When
+it grows one, it is this row it extends.
 
 | The question | The answer |
 | --- | --- |
-| What may a configured absolute path contain? | `path::absolute_components` |
-| What may a path naming something inside a tree contain? | `path::tree_components` |
-| What may one path component contain? | `path::is_ordinary_component` |
+| What can a configured absolute path contain? | `path::absolute_components` |
+| What can a path naming something inside a tree contain? | `path::tree_components` |
+| What can one path component contain? | `path::is_ordinary_component` |
 | Open a directory the kernel keeps inside a tree | `provision::containment::open_dir` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
 | How do two versions of a package format compare? | `provision::gentoo::version::compare`, `alpine::version::compare`, `debian::version::compare` |
@@ -356,9 +367,9 @@ type yet; when it grows one, it is this row it extends.
 | Which slot does a `slot/subslot` value name? | `provision::gentoo::installed::slot_of` |
 | What did one resolution refuse, and how does it read? | `provision::gentoo::resolve::Refusals`, `debian::resolve::Refusals` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
-| What may a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |
-| What may a release, a component, or an architecture contain? | `provision::coordinate::check` |
-| What may a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
+| What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |
+| What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
+| What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | Read or write a plan document | `provision::document` |
 | Which standard stream did a provisioner's in-cage output come from? | `provision::Stream` |
@@ -391,11 +402,11 @@ Two guards hold the table to the code, and each covers what the other cannot:
   answer in the diagnostic. A site the answer genuinely does not cover carries
   `#[allow(clippy::disallowed_methods)]` and a comment saying which part does
   not fit.
-- `tools/idioms.toml` records where the shapes clippy cannot see — an operator,
-  a hand-written split, a formatted URL — occur today, and
-  `tools/check-idioms.py` fails on any difference. It is not a ban: a new site
-  is sometimes right, and is then recorded there with its reason, which is the
-  same convention in a file rather than a doc comment.
+- `tools/idioms.toml` records where the shapes clippy cannot see occur today,
+  and `tools/check-idioms.py` fails on any difference. Those shapes are an
+  operator, a hand-written split, a formatted URL. It is not a ban. A new site is
+  sometimes right, and is then recorded there with its reason. That is the same
+  convention in a file rather than a doc comment.
 
 Neither guard decides anything. What they buy is that a second answer is
 *chosen*, in a diff a reviewer can see.
@@ -403,12 +414,16 @@ Neither guard decides anything. What they buy is that a second answer is
 ## Commit messages
 
 Write in the imperative mood, describing the change in the repository's own
-terms — what the code now does, not what a task list called it. A body
+terms. Say what the code now does, not what a task list called it. A body
 explaining the reasoning is welcome where the reasoning is not obvious.
 
 ## License
+
+<!-- prose-lint: off -- license text, quoted verbatim. -->
 
 The project is dual-licensed under Apache-2.0 and MIT. Unless you state
 otherwise, any contribution you intentionally submit for inclusion, as defined
 in the Apache-2.0 license, is dual-licensed the same way, with no additional
 terms or conditions.
+
+<!-- prose-lint: on -->

@@ -13,12 +13,12 @@ maintainers.
 
 Please include, as far as you can:
 
-- what the sandbox was configured to do (a profile, or the builder calls);
-- what escaped, was reached, or was observed that should not have been;
-- the kernel version, distribution, and architecture;
-- whether the host had unprivileged user namespaces, Landlock, and seccomp
-  available, and the Landlock ABI if you know it;
-- a reproducer, if you have one.
+- What the sandbox was configured to do, as a profile or as the builder calls.
+- What escaped, was reached, or was observed that the configuration did not grant.
+- The kernel version, the distribution, and the architecture.
+- Whether the host had unprivileged user namespaces, Landlock, and seccomp
+  available, and the Landlock ABI if you know it.
+- A reproducer, if you have one.
 
 You will get an acknowledgement within a few days. Once a fix exists, the
 advisory names the reporter unless you ask otherwise.
@@ -45,18 +45,18 @@ The library's job is to build the boundary it says it builds. In scope:
 - **The default profile as a boundary against hostile code.** It is not one,
   and the guide says so. Confinement of untrusted code is opt-in through the
   [hardening](https://gregordinary.github.io/ferroday-cage/hardening.html)
-  layer; a report that untrusted code did something the default profile never
-  claimed to prevent is a documentation question, not a vulnerability.
+  layer. A report that untrusted code did something the default profile never
+  claimed to prevent is a documentation question rather than a vulnerability.
 - **Resource exhaustion outside the per-process limits.** The library sets
-  `setrlimit` values on request; cgroup governance and disk quotas are the
+  `setrlimit` values on request. Cgroup governance and disk quotas are the
   host's, as the hardening chapter states.
-- **A trusted profile doing what a trusted profile may.** A profile loaded
+- **A trusted profile doing what the trusted path allows.** A profile loaded
   through the trusted path is code-equivalent configuration and can bind any
   host path. Loading an untrusted profile through that path is the caller's
-  bug; `RestrictedProfile` is the path for one.
+  bug, and `RestrictedProfile` is the path for one.
 - **Host misconfiguration.** A kernel without Landlock, without seccomp, or
   with unprivileged user namespaces disabled is reported as such rather than
-  silently degraded — that reporting is the correct behavior.
+  silently degraded. That reporting is the correct behavior.
 
 If you are unsure which side of the line a finding falls on, report it
 privately and we will work it out.
@@ -64,4 +64,4 @@ privately and we will work it out.
 ## Supported versions
 
 The crate is pre-1.0 and under active development. Fixes land on the latest
-release; older versions are not patched.
+release, and older versions are not patched.

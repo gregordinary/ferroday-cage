@@ -1,8 +1,8 @@
 # fcage
 
-Run a command inside an unprivileged Linux sandbox from a shell prompt: its own root
-filesystem view, its own namespaces, and a clean environment, established by talking to
-the kernel directly. No daemon, no image, no root.
+Run a command inside an unprivileged Linux sandbox from a shell prompt. The command gets
+its own root filesystem view, its own namespaces, and a clean environment, established by
+talking to the kernel directly. No daemon, no image, no root.
 
 ```sh
 cargo install ferroday-cage-cli
@@ -11,11 +11,11 @@ fcage --rootfs /srv/rootfs/alpine -- /bin/sh -c 'echo hello from the cage'
 
 `fcage` is a thin consumer of the [`ferroday-cage`](https://crates.io/crates/ferroday-cage)
 library, built with every feature enabled. Any profile the library accepts loads here, and
-every capability of the launch builder and the network stack has a flag — which makes it
-the quickest way to try a configuration before committing to a feature set in a consumer's
-`Cargo.toml`. The provisioners' bootstrap surface has flags too, plans and pins included;
-layered builds, which produce an increment rather than a published rootfs, stay in the
-library.
+every capability of the launch builder and the network stack has a flag. That makes it the
+quickest way to try a configuration before committing to a feature set in a consumer's
+`Cargo.toml`. The provisioners' bootstrap surface has flags too, plans and pins included.
+Layered builds stay in the library, because they produce an increment rather than a
+published root filesystem.
 
 ## Producing the root filesystem
 
@@ -38,11 +38,17 @@ fcage --rootfs ./alpine --provision-alpine v3.23 --alpine-include alpine-base
 fcage --rootfs ./gentoo --provision-gentoo amd64 --gentoo-variant amd64-openrc
 ```
 
-Each provisioner carries its own option set — mirrors and their fallbacks, an
-architecture, a package cache reused across runs, an alternative keyring, extra
-repositories merged into one resolution. `fcage --gentoo-variants amd64` prints what an
-architecture publishes, and `fcage --gentoo-keyring-horizon` prints what the vendored
-Gentoo keyring can still vouch for and until when, reaching no network to do it.
+Each provisioner carries its own option set:
+
+- Mirrors, and the fallbacks to try after them.
+- An architecture.
+- A package cache reused across runs.
+- An alternative keyring.
+- Extra repositories, merged into one resolution.
+
+`fcage --gentoo-variants amd64` prints what an architecture publishes.
+`fcage --gentoo-keyring-horizon` prints what the vendored Gentoo keyring can still vouch
+for and until when, reaching no network to do it.
 
 Two further modes stand on their own:
 
@@ -64,11 +70,11 @@ fcage --rootfs ./root \
     -- /work/build.sh
 ```
 
-`--restrict` is the fallback for a host that disables user namespaces entirely: it confines
+`--restrict` is the fallback for a host that disables user namespaces entirely. It confines
 a plain host process with the same Landlock and seccomp primitives, without a sandbox root.
 
 The isolated network is loopback-only by default. `--netstack` attaches a native userspace
-TCP/IP stack for outbound IPv4 and IPv6 with no helper binary; `--share-net` gives the
+TCP/IP stack for outbound IPv4 and IPv6 with no helper binary. `--share-net` gives the
 command the host's network instead.
 
 Other flags cover mounts and overlays, uid/gid range maps, resource limits, a pseudoterminal
@@ -115,6 +121,8 @@ output format, so a library release does not move it.
 
 ## License
 
+<!-- prose-lint: off -- license text, quoted verbatim. -->
+
 Licensed under either of
 
 - Apache License, Version 2.0
@@ -131,3 +139,5 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
+
+<!-- prose-lint: on -->
