@@ -1878,7 +1878,7 @@ const FLAGS: &[Flag] = &[
         long: "--version",
         section: Section::Help,
         short: Some("-V"),
-        help: &["Print the version"],
+        help: &["Print the fcage and library versions"],
         mode: Mode::Version,
         take: Take::Refused(Arity::Bare),
         ..Flag::DEFAULTS

@@ -25,6 +25,12 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-12
+
+`fcage` 0.5.0. Two of its entries below are breaking, so it takes a new minor
+version while the library, whose changes are additions and corrections, takes
+a patch. It requires library 0.4.4, for `VERSION`.
+
 ### Added
 
 - `VERSION`, the library's own version as its manifest states it. A containment
@@ -34,8 +40,6 @@ consumer upgrading can skip it.
   `--remove-rootfs DIR` deletes `DIR`. It reaches `provision::Remove::remove_lock`,
   which the CLI previously left at its default, so a `DIR.lock` beside a
   directory that merely *holds* rootfs trees was deleted without being named.
-- `fcage --version` reports the library version beside its own, as
-  `fcage 0.4.1 (ferroday-cage 0.4.3)`.
 - `provision::debian::DebianError::Configure` carries `packages`: the packages
   dpkg named under `Errors were encountered while processing`, in the order it
   listed them, appended to the error's `Display` as `, processing systemd,
@@ -54,6 +58,11 @@ consumer upgrading can skip it.
   held a short-dated certificate nothing currently signs with. The final line is
   now the spread, `11 certificates, 10 can sign	expiring between ... and ...`.
   The per-certificate lines are unchanged.
+- **Breaking (`fcage`).** `fcage --version` prints the library's version after
+  its own, as `fcage 0.5.0 (ferroday-cage 0.4.4)`, where it printed only
+  `fcage 0.4.1`. A script that took the version from the end of the line now
+  reads the library's, and one matching the whole line no longer matches. Read
+  `fcage`'s own version as the line's second word.
 - `fcage`: provisioning that finds the destination already present now says so,
   on a run that names no command and so provisions and exits. Such a run
   previously exited 0 having done nothing, which an empty directory the caller
@@ -1253,7 +1262,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.0...v0.4.1
