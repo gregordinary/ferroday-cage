@@ -39,10 +39,30 @@ RECORD = REPO / "tools" / "parity.toml"
 SNAPSHOT = REPO / "crates" / "ferroday-cage" / "public-api.txt"
 CLI = REPO / "crates" / "ferroday-cage-cli" / "src" / "main.rs"
 
-# Not settings. `build` and `default` produce the configured thing rather than
-# configure it, and `get_*` reads back what a setting wrote -- the accessors a
-# consumer inspecting a loaded profile needs, which no flag corresponds to.
-NOT_SETTINGS = {"build", "default"}
+# Not settings. Three roles, none of which configures anything:
+#
+#   A constructor    `new`, `from_reader`, `default`. It produces the builder
+#                    that the settings then configure.
+#   A terminal       `build`, `run`, `write_to`, `write_to_path`, `provision`.
+#                    It consumes the builder and does the thing.
+#   An accessor      `get_*`, which reads back what a setting wrote. These are
+#                    what a consumer inspecting a loaded profile needs, and no
+#                    flag corresponds to one.
+#
+# Named rather than described because the test is a method name and the set is
+# the mechanism: a builder growing a terminal this does not list reads as an
+# unflagged setting, which is the direction that fails loudly rather than
+# quietly.
+NOT_SETTINGS = {
+    "build",
+    "default",
+    "new",
+    "from_reader",
+    "run",
+    "write_to",
+    "write_to_path",
+    "provision",
+}
 
 KINDS = {"code", "positional", "library"}
 

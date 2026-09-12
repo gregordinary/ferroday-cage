@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use ferroday_cage::provision::Provisioned;
 use ferroday_cage::provision::alpine::KeySet as AlpineKeySet;
 use ferroday_cage::provision::debian::{Priority, Repository};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
@@ -266,7 +267,9 @@ const FLAGS: &[Flag] = &[
         placeholder: "FILE",
         help: &[
             "Provision --rootfs from a tar archive (plain, gzip,",
-            "xz, or zstd) when the directory does not exist yet",
+            "xz, or zstd). Runs only when the directory does not",
+            "exist yet: an existing one is reused as it stands,",
+            "whatever it holds",
         ],
         take: Take::One(|options, _flag, value| {
             options.provision_tar = Some(PathBuf::from(value));
@@ -281,7 +284,9 @@ const FLAGS: &[Flag] = &[
         help: &[
             "Bootstrap --rootfs as a Debian SUITE (e.g. trixie)",
             "from the archive; given without a command, provision",
-            "and exit",
+            "and exit. Runs only when the directory does not exist",
+            "yet: an existing one is reused as it stands, whatever",
+            "it holds",
         ],
         take: Take::One(|options, flag, value| {
             options.provision_debian = Some(into_string(flag, value)?);
@@ -526,7 +531,9 @@ const FLAGS: &[Flag] = &[
         help: &[
             "Bootstrap --rootfs as an Alpine RELEASE (e.g. v3.23)",
             "from the archive; given without a command, provision",
-            "and exit",
+            "and exit. Runs only when the directory does not exist",
+            "yet: an existing one is reused as it stands, whatever",
+            "it holds",
         ],
         take: Take::One(|options, flag, value| {
             options.provision_alpine = Some(into_string(flag, value)?);
@@ -747,7 +754,9 @@ const FLAGS: &[Flag] = &[
             "Bootstrap --rootfs from a signed Gentoo stage3 for",
             "ARCH (e.g. amd64); given without a command, provision",
             "and exit. Gentoo publishes one tree per architecture",
-            "rather than a release, so ARCH is the coordinate",
+            "rather than a release, so ARCH is the coordinate.",
+            "Runs only when the directory does not exist yet: an",
+            "existing one is reused as it stands, whatever it holds",
         ],
         take: Take::One(|options, flag, value| {
             options.provision_gentoo = Some(into_string(flag, value)?);
@@ -982,14 +991,28 @@ const FLAGS: &[Flag] = &[
             "including one a range-mapped sandbox wrote and a plain",
             "'rm -rf' cannot remove. Give the --identity-map the",
             "tree was provisioned under; the default is",
-            "'subordinate'. Removing a path that is not there",
-            "succeeds, so the call is repeatable. Takes no other",
-            "option: it removes a rootfs rather than running a",
-            "command in one",
+            "'subordinate'. The sibling lock file DIR.lock goes with",
+            "it, since provisioning wrote that file; --keep-lock",
+            "leaves it. Removing a path that is not there succeeds,",
+            "so the call is repeatable. Takes no other option: it",
+            "removes a rootfs rather than running a command in one",
         ],
         mode: Mode::Remove,
         selects: true,
         take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--keep-lock",
+        section: Section::Provisioning,
+        help: &[
+            "Leave the DIR.lock sibling in place when",
+            "--remove-rootfs deletes DIR. Use it where DIR merely",
+            "contains rootfs trees rather than being one, so that",
+            "DIR.lock is an unrelated file the command never named",
+        ],
+        mode: Mode::Remove,
+        take: Take::Refused(Arity::Bare),
         ..Flag::DEFAULTS
     },
     Flag {
@@ -1912,6 +1935,8 @@ enum Invocation {
     Remove {
         dest: PathBuf,
         map: IdentityMap,
+        /// Whether the `<dest>.lock` sibling goes with the tree.
+        remove_lock: bool,
     },
     /// Print the stage3 variants an architecture publishes.
     GentooVariants {
@@ -2409,11 +2434,22 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Invocation::Version) => {
-            println!("fcage {}", env!("CARGO_PKG_VERSION"));
+            // Both numbers, because they move independently: `fcage 0.4.1` was
+            // correct across library 0.4.2 and 0.4.3, and the library is where
+            // a containment defect would be.
+            println!(
+                "fcage {} (ferroday-cage {})",
+                env!("CARGO_PKG_VERSION"),
+                ferroday_cage::VERSION,
+            );
             ExitCode::SUCCESS
         }
         Ok(Invocation::Run(options)) => run(*options),
-        Ok(Invocation::Remove { dest, map }) => remove_rootfs(&dest, map),
+        Ok(Invocation::Remove {
+            dest,
+            map,
+            remove_lock,
+        }) => remove_rootfs(&dest, map, remove_lock),
         Ok(Invocation::GentooVariants {
             architecture,
             mirror,
@@ -2868,9 +2904,10 @@ fn help_or_version(args: &[OsString]) -> Option<Invocation> {
 
 /// Parses a `--remove-rootfs` command line, excluding the program name.
 ///
-/// A removal takes the destination and the identity map the tree was written
-/// under. Every other flag configures a launch that does not happen here, so
-/// naming one is a usage error rather than a setting with no effect.
+/// A removal takes the destination, the identity map the tree was written
+/// under, and whether the lock sibling goes with it. Every other flag configures
+/// a launch that does not happen here, so naming one is a usage error rather
+/// than a setting with no effect.
 fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     if let Some(answer) = help_or_version(&args) {
         return Ok(answer);
@@ -2879,6 +2916,10 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     // The same default the library's own removal carries: a tree written by a
     // bundled-delegate sandbox is the case that needs the escalation at all.
     let mut map = IdentityMap::Subordinate;
+    // Likewise the library's default. Provisioning wrote `<dest>.lock`, so for
+    // the published rootfs this command is named on, the two round-trip
+    // together; `--keep-lock` is for the `dest` that merely holds such trees.
+    let mut remove_lock = true;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -2897,11 +2938,13 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
             )?;
         } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
             map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
+        } else if arg == "--keep-lock" {
+            remove_lock = false;
         } else {
             return Err(mode_conflict(
                 &arg,
                 "--remove-rootfs",
-                &["--remove-rootfs", "--identity-map"],
+                &["--remove-rootfs", "--identity-map", "--keep-lock"],
             ));
         }
     }
@@ -2912,7 +2955,11 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     // error rather than an `expect` because what upholds it is the shape of the
     // argument vector, not an invariant of this module.
     let dest = dest.ok_or_else(|| "--remove-rootfs requires a value".to_string())?;
-    Ok(Invocation::Remove { dest, map })
+    Ok(Invocation::Remove {
+        dest,
+        map,
+        remove_lock,
+    })
 }
 
 /// Parses a `--gentoo-variants` command line, excluding the program name.
@@ -4102,6 +4149,18 @@ fn stop_with_caller_default(flag: Option<bool>, profile_states_it: bool) -> Opti
     flag.or((!profile_states_it).then_some(true))
 }
 
+/// A `toml` error rendered as the body of one `fcage:` diagnostic.
+///
+/// The crate's `Display` ends with a newline of its own, and every diagnostic
+/// here goes out through `eprintln!`, so formatting one verbatim leaves a blank
+/// line behind the message. Only trailing whitespace is dropped: a parse
+/// diagnostic keeps its span, its caret, and the line breaks between them, and
+/// a single-line refusal -- an `unknown field`, or one of the restricted
+/// policy's -- becomes the one line it reads as.
+fn toml_diagnostic(error: &impl std::fmt::Display) -> String {
+    error.to_string().trim_end().to_string()
+}
+
 /// Loads a profile into a builder, alongside the metadata the CLI reconciles
 /// against its own flags.
 ///
@@ -4121,9 +4180,13 @@ fn load_profile(
 ) -> Result<(CageBuilder, ProfileMeta), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| format!("cannot read profile {}: {err}", path.display()))?;
-    let mut table: toml::Table = text
-        .parse()
-        .map_err(|err| format!("cannot parse profile {}: {err}", path.display()))?;
+    let mut table: toml::Table = text.parse().map_err(|err| {
+        format!(
+            "cannot parse profile {}: {}",
+            path.display(),
+            toml_diagnostic(&err)
+        )
+    })?;
     if override_command {
         table.remove("command");
         table.remove("args");
@@ -4137,14 +4200,22 @@ fn load_profile(
         sets_stop_with_caller: table.contains_key("stop-with-caller"),
     };
     let builder = if restricted {
-        let profile: RestrictedProfile = table
-            .try_into()
-            .map_err(|err| format!("cannot load profile {}: {err}", path.display()))?;
+        let profile: RestrictedProfile = table.try_into().map_err(|err| {
+            format!(
+                "cannot load profile {}: {}",
+                path.display(),
+                toml_diagnostic(&err)
+            )
+        })?;
         profile.into_builder()
     } else {
-        table
-            .try_into()
-            .map_err(|err| format!("cannot load profile {}: {err}", path.display()))?
+        table.try_into().map_err(|err| {
+            format!(
+                "cannot load profile {}: {}",
+                path.display(),
+                toml_diagnostic(&err)
+            )
+        })?
     };
     Ok((builder, meta))
 }
@@ -4156,8 +4227,18 @@ fn load_profile(
 /// plain `rm -rf` cannot delete; the library re-enters the same map to remove
 /// it. A failure exits 125, the code every other setup failure uses: nothing
 /// ran, so there is no command status to report.
-fn remove_rootfs(dest: &Path, map: IdentityMap) -> ExitCode {
-    match ferroday_cage::provision::Remove::new(dest).map(map).run() {
+///
+/// `remove_lock` carries `--keep-lock` through to the library's own setting.
+/// Deleting `<dest>.lock` is right for the published rootfs this command is
+/// usually named on, and a deletion outside what the caller named for a `dest`
+/// that merely holds such trees, which is a distinction only the caller can
+/// make.
+fn remove_rootfs(dest: &Path, map: IdentityMap, remove_lock: bool) -> ExitCode {
+    match ferroday_cage::provision::Remove::new(dest)
+        .map(map)
+        .remove_lock(remove_lock)
+        .run()
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("fcage: {error}");
@@ -4180,6 +4261,12 @@ fn remove_rootfs(dest: &Path, map: IdentityMap) -> ExitCode {
 /// typed, and a parser that consulted it would answer differently under a test
 /// harness than at a prompt. It is still the usage error it looks like, exit
 /// code and all.
+///
+/// Both paths are checked before the walk begins, for the reason a launch
+/// checks its rootfs before building anything: without it a typo surfaces from
+/// wherever the walk happened to meet it, described in the walk's own
+/// vocabulary ("while opening an entry in the exported tree"), which names the
+/// step rather than the mistake.
 fn export_rootfs(
     source: &Path,
     dest: Option<&Path>,
@@ -4192,6 +4279,35 @@ fn export_rootfs(
         eprintln!("fcage: refusing to write an archive to the terminal");
         eprintln!("Try '--export-to FILE', or pipe the output into a compressor.");
         return ExitCode::from(2);
+    }
+
+    match std::fs::metadata(source) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            eprintln!(
+                "fcage: cannot export {}: it is not a directory",
+                source.display(),
+            );
+            return ExitCode::from(125);
+        }
+        Err(error) => {
+            eprintln!("fcage: cannot export {}: {error}", source.display());
+            return ExitCode::from(125);
+        }
+    }
+    // Only a directory standing where the archive goes is refused here. Every
+    // other destination failure belongs to the publish step, which stages beside
+    // the destination and renames: it learns about a read-only parent or a full
+    // filesystem by trying, and a check that raced it would report on a state
+    // that no longer held.
+    if let Some(path) = dest
+        && std::fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+    {
+        eprintln!(
+            "fcage: cannot write the archive to {}: it is a directory",
+            path.display(),
+        );
+        return ExitCode::from(125);
     }
 
     let mut export = ferroday_cage::provision::Export::new(source).map(map);
@@ -4231,38 +4347,63 @@ fn run(options: Options) -> ExitCode {
     if options.restrict {
         return run_restricted(options);
     }
+    // What provisioning did, where an invocation asked for any. `Existing` says
+    // the destination was already a directory and the provisioner never ran,
+    // which is the reuse the flag is meant to allow and also what an empty
+    // directory the user just made looks like.
+    let mut provisioned = None;
     if let Some(tarball) = &options.provision_tar {
         // The parser guarantees a rootfs accompanies --provision-tar. An
         // already-provisioned rootfs is reused as it stands.
         let rootfs = options.rootfs.as_deref().expect("checked at parse time");
         let mut provisioner = ferroday_cage::provision::Tarball::new(tarball);
-        if let Err(error) = ferroday_cage::provision::ensure(rootfs, &mut provisioner) {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
+        match ferroday_cage::provision::ensure(rootfs, &mut provisioner) {
+            Ok(outcome) => provisioned = Some(outcome),
+            Err(error) => {
+                eprintln!("fcage: {error}");
+                return ExitCode::from(125);
+            }
         }
     }
     if let Some(suite) = &options.provision_debian {
         let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-        if let Err(code) = provision_debian(suite, &options, rootfs) {
-            return code;
+        match provision_debian(suite, &options, rootfs) {
+            Ok(outcome) => provisioned = Some(outcome),
+            Err(code) => return code,
         }
     }
     if let Some(release) = &options.provision_alpine {
         let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-        if let Err(code) = provision_alpine(release, &options, rootfs) {
-            return code;
+        match provision_alpine(release, &options, rootfs) {
+            Ok(outcome) => provisioned = Some(outcome),
+            Err(code) => return code,
         }
     }
 
     if let Some(architecture) = &options.provision_gentoo {
         let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-        if let Err(code) = provision_gentoo(architecture, &options, rootfs) {
-            return code;
+        match provision_gentoo(architecture, &options, rootfs) {
+            Ok(outcome) => provisioned = Some(outcome),
+            Err(code) => return code,
         }
     }
 
     // A provisioning run with no command and no profile provisions and exits.
     if options.command_line.is_empty() && options.profile.is_none() {
+        // The one place reuse is worth saying out loud. Everywhere else the
+        // flag is a standing instruction and silence is the point -- it can sit
+        // in an invocation forever and cost nothing once the tree is there. But
+        // a run whose whole purpose was to provision, and which provisioned
+        // nothing, exits 0 having done nothing at all, and an empty directory
+        // the caller just created is indistinguishable from a finished rootfs.
+        if provisioned == Some(Provisioned::Existing) {
+            let rootfs = options.rootfs.as_deref().expect("checked at parse time");
+            eprintln!(
+                "fcage: {} already exists, so nothing was provisioned; \
+                 remove it first to provision again",
+                rootfs.display(),
+            );
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -4673,13 +4814,21 @@ fn compose_netstack_resolv_conf(builder: CageBuilder) -> CageBuilder {
     if resolv_conf_has_routable_nameserver(&contents) {
         return builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf");
     }
+    // The remedies are named as flags rather than as goals. This is the default
+    // configuration on every systemd-resolved host, so it is the warning most
+    // users of --netstack ever see, and "point it at a routable nameserver" is
+    // not something anyone can type.
     eprintln!(
         "fcage: the host's nameservers are all on loopback, which the network stack \
          refuses, so no resolv.conf was composed; the sandbox resolves through whatever \
-         its rootfs ships (point it at a routable nameserver, or give it the gateway \
-         address and pass --netstack-host-loopback, which reaches a host resolver only \
-         when that resolver listens on 127.0.0.1 — not systemd-resolved's 127.0.0.53 \
-         stub)"
+         its rootfs ships"
+    );
+    eprintln!(
+        "Try '--ro-bind FILE /etc/resolv.conf' with a file naming a routable nameserver, \
+         which is taken in place of this composition; or '--netstack-host-loopback' with \
+         the gateway address, which reaches a host resolver only when that resolver \
+         listens on 127.0.0.1, not systemd-resolved's 127.0.0.53 stub; or \
+         '--no-resolv-conf' to leave the rootfs's own and silence this."
     );
     builder
 }
@@ -4852,7 +5001,11 @@ fn plan_from<P, E: std::fmt::Display>(
 /// Bootstraps a Debian rootfs from the archive, printing progress to stderr.
 ///
 /// Returns `Err` with the process exit code on failure.
-fn provision_debian(suite: &str, options: &Options, rootfs: &Path) -> Result<(), ExitCode> {
+fn provision_debian(
+    suite: &str,
+    options: &Options,
+    rootfs: &Path,
+) -> Result<Provisioned, ExitCode> {
     use ferroday_cage::provision::debian::{Debian, Plan};
 
     let mut builder = Debian::builder(suite).extract_only(options.debian_extract_only);
@@ -4910,13 +5063,10 @@ fn provision_debian(suite: &str, options: &Options, rootfs: &Path) -> Result<(),
         ExitCode::from(125)
     })?;
     let mut progress = print_debian_event;
-    ferroday_cage::provision::ensure(rootfs, &mut debian.observe(&mut progress)).map_err(
-        |error| {
-            eprintln!("fcage: {error}");
-            ExitCode::from(125)
-        },
-    )?;
-    Ok(())
+    ferroday_cage::provision::ensure(rootfs, &mut debian.observe(&mut progress)).map_err(|error| {
+        eprintln!("fcage: {error}");
+        ExitCode::from(125)
+    })
 }
 
 /// Prints a Debian bootstrap progress event to stderr.
@@ -4955,7 +5105,11 @@ fn print_debian_event(event: ferroday_cage::provision::debian::DebianEvent<'_>) 
 /// `--alpine-include` names closed over its dependencies; and it has no unsigned
 /// mode and no freshness window, so there is nothing for a `--debian-*`
 /// counterpart of `trust-unsigned` or `allow-stale-release` to relax.
-fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(), ExitCode> {
+fn provision_alpine(
+    release: &str,
+    options: &Options,
+    rootfs: &Path,
+) -> Result<Provisioned, ExitCode> {
     use ferroday_cage::provision::alpine::{Alpine, Plan, Repository};
 
     let usage = |message: String| {
@@ -5044,13 +5198,10 @@ fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(
         ExitCode::from(125)
     })?;
     let mut progress = print_alpine_event;
-    ferroday_cage::provision::ensure(rootfs, &mut alpine.observe(&mut progress)).map_err(
-        |error| {
-            eprintln!("fcage: {error}");
-            ExitCode::from(125)
-        },
-    )?;
-    Ok(())
+    ferroday_cage::provision::ensure(rootfs, &mut alpine.observe(&mut progress)).map_err(|error| {
+        eprintln!("fcage: {error}");
+        ExitCode::from(125)
+    })
 }
 
 /// Bootstraps a Gentoo rootfs from a signed stage3, printing progress to
@@ -5061,7 +5212,11 @@ fn provision_alpine(release: &str, options: &Options, rootfs: &Path) -> Result<(
 /// names are resolved against the root that produced and merged into it. A
 /// command line that names no package does exactly the first, which is what a
 /// stage3 bootstrap has always been.
-fn provision_gentoo(architecture: &str, options: &Options, rootfs: &Path) -> Result<(), ExitCode> {
+fn provision_gentoo(
+    architecture: &str,
+    options: &Options,
+    rootfs: &Path,
+) -> Result<Provisioned, ExitCode> {
     use ferroday_cage::provision::ProvisionEvent;
     use ferroday_cage::provision::gentoo::{Gentoo, Plan};
 
@@ -5112,8 +5267,7 @@ fn provision_gentoo(architecture: &str, options: &Options, rootfs: &Path) -> Res
         .map_err(|error| {
             eprintln!("fcage: {error}");
             ExitCode::from(125)
-        })?;
-    Ok(())
+        })
 }
 
 /// A count of days as a duration.
@@ -5327,6 +5481,14 @@ fn gentoo_packages(
 }
 
 /// Prints what the Gentoo root at `root` already has installed.
+///
+/// An empty listing is reported on stderr rather than left as silence. The
+/// library answers "no packages" for a root whose `/var/db/pkg` is absent,
+/// which is a true answer about a directory that is not there and also exactly
+/// what a mistyped path or a root of some other distribution produces. The
+/// listing itself stays on stdout and the exit stays 0, because nothing failed;
+/// what the note adds is that the reader learns the answer was empty rather
+/// than inferring it from a blank screen.
 fn gentoo_installed(root: &Path) -> ExitCode {
     let installed = match ferroday_cage::provision::gentoo::installed(root) {
         Ok(installed) => installed,
@@ -5335,6 +5497,13 @@ fn gentoo_installed(root: &Path) -> ExitCode {
             return ExitCode::from(125);
         }
     };
+    if installed.is_empty() {
+        eprintln!(
+            "fcage: no packages are installed at {}: its package database is empty or \
+             absent, and an absent one is what a root that is not a Gentoo root looks like",
+            root.display(),
+        );
+    }
     print_listing("the installed listing", |out| {
         for package in installed.packages() {
             writeln!(
@@ -5377,21 +5546,31 @@ fn gentoo_keyring_horizon() -> ExitCode {
                 held.user_id.as_deref().unwrap_or(""),
             )?;
         }
-        // The number a caller acts on, and the reason the list is reported per
-        // certificate: a keyring holds certificates that can vouch for nothing,
-        // and their dates say nothing about how long it stays usable.
-        match horizon
-            .iter()
-            .filter(|held| held.signs)
-            .filter_map(|held| held.expires)
-            .min()
-        {
-            Some(earliest) => writeln!(
-                out,
-                "earliest expiry among the certificates that can sign\t{earliest}"
-            ),
-            None => writeln!(out, "no certificate in the keyring can sign"),
-        }
+        // The spread, and deliberately not a single date to act on. Every
+        // certificate in the keyring is an equally trusted anchor, so which one
+        // signs a given document is the archive's choice rather than a property
+        // this command can read: reducing the list to its earliest expiry
+        // reports the keyring as nearly stale whenever the keyring holds a
+        // short-dated certificate nothing currently signs with. The per-
+        // certificate lines above are the answer, and this says how far apart
+        // they run so a reader knows whether reading them matters.
+        let signing = horizon.iter().filter(|held| held.signs).count();
+        let mut dated = horizon.iter().filter_map(|held| held.expires);
+        let bounds = dated.next().map(|first| {
+            dated.fold((first, first), |(low, high), at| {
+                (low.min(at), high.max(at))
+            })
+        });
+        writeln!(
+            out,
+            "{} certificates, {signing} can sign\t{}",
+            horizon.len(),
+            match bounds {
+                Some((low, high)) if low == high => format!("all expiring {low}"),
+                Some((low, high)) => format!("expiring between {low} and {high}"),
+                None => "none carrying an expiry".to_string(),
+            },
+        )
     })
 }
 
@@ -6526,12 +6705,20 @@ mod tests {
             ["--remove-rootfs=/var/lib/roots/trixie"].as_slice(),
         ] {
             match parse_args(args).expect("the removal should parse") {
-                Invocation::Remove { dest, map } => {
+                Invocation::Remove {
+                    dest,
+                    map,
+                    remove_lock,
+                } => {
                     assert_eq!(dest, PathBuf::from("/var/lib/roots/trixie"));
                     assert_eq!(
                         map,
                         IdentityMap::Subordinate,
                         "the default is the map a bundled-delegate sandbox writes under"
+                    );
+                    assert!(
+                        remove_lock,
+                        "the default takes the lock with the tree, as the library's own does"
                     );
                 }
                 _ => panic!("expected a removal for {args:?}"),
@@ -6549,6 +6736,26 @@ mod tests {
         ] {
             match parse_args(args).expect("the removal should parse") {
                 Invocation::Remove { map, .. } => assert_eq!(map, IdentityMap::Single),
+                _ => panic!("expected a removal for {args:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn keep_lock_spares_the_sibling_the_caller_never_named() {
+        // `<dest>.lock` is the file provisioning wrote beside a published
+        // rootfs, so a removal takes it by default. Where `dest` merely holds
+        // such trees it is an unrelated path, and deleting it is a deletion
+        // outside what the command line named -- silent, and not undoable.
+        for args in [
+            ["--remove-rootfs", "/roots/cache", "--keep-lock"].as_slice(),
+            ["--keep-lock", "--remove-rootfs", "/roots/cache"].as_slice(),
+        ] {
+            match parse_args(args).expect("the removal should parse") {
+                Invocation::Remove { remove_lock, .. } => assert!(
+                    !remove_lock,
+                    "--keep-lock should leave the sibling for {args:?}"
+                ),
                 _ => panic!("expected a removal for {args:?}"),
             }
         }

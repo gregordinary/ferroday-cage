@@ -600,14 +600,28 @@ for held in gentoo.keyring_horizon() {
 # }
 ```
 
-The report is per certificate rather than a single earliest date, because two of
-the eleven lapse about twenty months before the rest and neither signs anything
-this layer reads: one number would say the keyring is nearly stale while the key
-that matters is good for years. `signs` is the other half of reducing the list
-honestly — the keyring holds a DSA-1024 release key from 2004 whose expiry reads
-like every other certificate's, though the public-key floor refuses it and it
-delegates to no signing subkey that would pass. The earliest expiry among the
-certificates that *can* sign is the number to act on.
+The report is per certificate, and there is no single date it reduces to. Two of
+the eleven lapse about twenty months before the rest. One number would therefore
+say the keyring is nearly stale while the certificate the archive currently
+signs with is good for years. `signs` separates a second case. The keyring holds
+a DSA-1024 release key from 2004 whose expiry reads like every other
+certificate's. The public-key floor refuses it, and it delegates to no signing
+subkey that would pass.
+
+What rules out a reduction is that every certificate in the keyring is an
+equally trusted anchor. This layer accepts a signature from any of them. Which
+certificate signs a given document is therefore the archive's choice, and not
+something the keyring records. `signs` says a certificate *could* produce an
+accepted signature, never that anything rests on it today. A short-dated
+certificate the archive happens not to use pulls any earliest-expiry number down
+to itself. That is the reading the per-certificate report exists to avoid.
+
+The date your own provisioning depends on is the one on the certificate that
+verified a document you actually read. This layer reads two: the stage3 pointer
+and a binary package's Manifest. Both are signed today by a subkey of the
+Release Engineering automated weekly key, which runs to 2028-07-01. That is an
+observation about the archive rather than a rule. Gentoo can sign with another
+anchor without telling anyone, and the keyring will still verify it.
 
 Nothing refreshes the keyring at run time, and nothing should: fetching a trust
 anchor at provisioning time would hand the network the power to replace the very
@@ -800,7 +814,7 @@ amd64-openrc	20260810T204554Z	495865168
 $ fcage --gentoo-keyring-horizon
 13EBBDBEDE7A12775DFDB1BABB572E0E2D182910	signs	1846022400	Gentoo Linux Release Engineering (Automated Weekly Release Key) <releng@gentoo.org>
 ...
-earliest expiry among the certificates that can sign	1795718963
+11 certificates, 10 can sign	expiring between 1795718963 and 1846022400
 ```
 
 `--gentoo-variants` reads the signed enumeration, taking `--gentoo-mirror`,

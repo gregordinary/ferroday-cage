@@ -2664,6 +2664,7 @@ impl core::marker::Unpin for ferroday_cage::Terminal
 impl core::marker::UnsafeUnpin for ferroday_cage::Terminal
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Terminal
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Terminal
+pub const ferroday_cage::VERSION: &str
 pub trait ferroday_cage::IdMapper: core::fmt::Debug + core::marker::Send + core::marker::Sync
 pub fn ferroday_cage::IdMapper::apply(&self, u32, &ferroday_cage::ResolvedMap) -> core::result::Result<(), ferroday_cage::IdMapError>
 pub fn ferroday_cage::IdMapper::resolve(&self, &ferroday_cage::IdentityMap) -> core::result::Result<ferroday_cage::ResolvedMap, ferroday_cage::IdMapError>

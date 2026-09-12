@@ -29,6 +29,8 @@ holds a complete rootfs — never a partial one:
 
 - If the destination already exists, it is reused and the provisioner does
   not run. The first launch pays for provisioning; the rest are free.
+  Any existing directory counts, including an empty one the caller just
+  made, so a destination created ahead of time is never provisioned into.
 - Otherwise the provisioner fills a staging directory beside the
   destination, the staging tree's filesystem is synced, and a single
   `rename` publishes it. An interrupted run leaves no destination for a
@@ -170,15 +172,15 @@ capabilities that clear a directory whose own mode denies the write the
 deletion needs — a read-only directory an archive carried in, for one.
 
 At a shell prompt, `fcage --remove-rootfs DIR` removes the tree and its lock
-together, which is the default above and the only behaviour it offers: the mode
-names a published rootfs, which is the case the round-trip is right for. A
-destination that holds published trees rather than being one is a library call
-rather than a flag. `fcage` takes `--identity-map` for the map the tree was
-provisioned under, defaulting to the subordinate one, and is a mode of its own
-that accepts no other option:
+together, which is the default above: the mode names a published rootfs, which
+is the case the round-trip is right for. `--keep-lock` spells the other case,
+where `DIR` merely holds such trees. `fcage` takes `--identity-map` for the map
+the tree was provisioned under, defaulting to the subordinate one, and is a mode
+of its own that accepts no other option:
 
 ```sh
 fcage --remove-rootfs /var/lib/myapp/rootfs
+fcage --remove-rootfs /var/cache/myapp/work --keep-lock
 ```
 
 ### The lock beside the tree

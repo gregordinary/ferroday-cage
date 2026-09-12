@@ -211,6 +211,15 @@ cage of its own.
 //! The crate is under active development and the public API is not yet
 //! stable.
 
+/// The version of this library, as its manifest states it.
+///
+/// A containment defect lives here rather than in whatever binary linked the
+/// crate, and a consumer versions independently of it, so a bug report needs
+/// this number and cannot derive it from the tool's own. `fcage --version`
+/// prints it beside its own for exactly that reason, and any other consumer can
+/// do the same.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod error;
 mod failure;
 // The guide's Rust blocks, compiled as doctests of this crate. Every feature is

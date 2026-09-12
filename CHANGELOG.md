@@ -27,6 +27,15 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `VERSION`, the library's own version as its manifest states it. A containment
+  defect lives in the library rather than in whatever binary linked it, and a
+  consumer versions independently, so a report needs both numbers.
+- `fcage`: `--keep-lock`, which leaves the `DIR.lock` sibling in place when
+  `--remove-rootfs DIR` deletes `DIR`. It reaches `provision::Remove::remove_lock`,
+  which the CLI previously left at its default, so a `DIR.lock` beside a
+  directory that merely *holds* rootfs trees was deleted without being named.
+- `fcage --version` reports the library version beside its own, as
+  `fcage 0.4.1 (ferroday-cage 0.4.3)`.
 - `provision::debian::DebianError::Configure` carries `packages`: the packages
   dpkg named under `Errors were encountered while processing`, in the order it
   listed them, appended to the error's `Display` as `, processing systemd,
@@ -37,6 +46,31 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking (`fcage`).** `--gentoo-keyring-horizon` no longer prints an
+  earliest-expiry summary line. Every certificate in the keyring is an equally
+  trusted anchor and the layer accepts a signature from any of them, so which
+  one the archive signs with is not something the keyring records; reducing the
+  list to its earliest expiry reported the keyring as nearly stale whenever it
+  held a short-dated certificate nothing currently signs with. The final line is
+  now the spread, `11 certificates, 10 can sign	expiring between ... and ...`.
+  The per-certificate lines are unchanged.
+- `fcage`: provisioning that finds the destination already present now says so,
+  on a run that names no command and so provisions and exits. Such a run
+  previously exited 0 having done nothing, which an empty directory the caller
+  had just created is indistinguishable from. All four provisioning flags now
+  state the precondition in `--help`.
+- `fcage`: `--export-rootfs` checks its source and destination before the walk
+  begins, so a missing directory is reported as `cannot export ./nope` rather
+  than from wherever the walk met it.
+- `fcage`: `--gentoo-installed` reports an empty listing rather than printing
+  nothing, since an absent package database is what a root of another
+  distribution looks like.
+- `fcage`: the `--netstack` resolver warning names the flags that answer it
+  (`--ro-bind FILE /etc/resolv.conf`, `--netstack-host-loopback`,
+  `--no-resolv-conf`) instead of phrasing the remedy as a goal.
+- `fcage`: a profile error is one diagnostic again. The `toml` crate's `Display`
+  ends with a newline of its own, so the three sites that wrapped one left a
+  blank line behind.
 - The single-identity map's ownership coverage is documented where it stops.
   Substituting `chown` and `chgrp` covers a maintainer script that runs one of
   those commands; a compiled helper calling `fchownat()`, and any POSIX ACL
@@ -53,6 +87,10 @@ consumer upgrading can skip it.
 
 ### Internal
 
+- `tools/parity.toml` covers `Remove`, `Export`, `CopyIn` and `Tarball`. The
+  gate scoped itself to the six launch and provisioning builders, so
+  `Remove::remove_lock` was a public setting with no flag and nothing recorded
+  that it had none.
 - The crate and `mechanism` module documentation named two homes of `unsafe`
   where there are three; `CONTRIBUTING.md` had it right. `mechanism` no longer
   states a count or names the complement, which is what made it go stale.

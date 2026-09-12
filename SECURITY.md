@@ -16,6 +16,9 @@ Please include, as far as you can:
 - What the sandbox was configured to do, as a profile or as the builder calls.
 - What escaped, was reached, or was observed that the configuration did not grant.
 - The kernel version, the distribution, and the architecture.
+- The library version. A tool built on the library carries its own version,
+  which moves separately. `fcage --version` prints both, and any other consumer
+  can read `ferroday_cage::VERSION`.
 - Whether the host had unprivileged user namespaces, Landlock, and seccomp
   available, and the Landlock ABI if you know it.
 - A reproducer, if you have one.

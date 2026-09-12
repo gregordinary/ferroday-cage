@@ -517,3 +517,69 @@ why = "A transport is a trait object."
 name = "base_layer"
 kind = "library"
 why = "As the Debian builder's."
+
+# The provisioning operations. Each is a builder in the same sense as the six
+# above -- `new`, then settings, then a terminal that consumes it -- and each
+# reaches the same removal, export and copy the library offers a caller. They
+# are here because `Remove::remove_lock` was a public boolean with no flag and
+# nothing recorded that it had none, which is the gap this file exists to close.
+
+[[builder]]
+name = "Remove"
+path = "ferroday_cage::provision::Remove"
+
+[[builder.setting]]
+name = "map"
+flags = ["--identity-map"]
+
+[[builder.setting]]
+name = "mapper"
+kind = "code"
+why = "A mapper is a trait object."
+
+[[builder.setting]]
+name = "remove_lock"
+flags = ["--keep-lock"]
+
+[[builder]]
+name = "Export"
+path = "ferroday_cage::provision::Export"
+
+[[builder.setting]]
+name = "map"
+flags = ["--identity-map"]
+
+[[builder.setting]]
+name = "mapper"
+kind = "code"
+why = "A mapper is a trait object."
+
+[[builder.setting]]
+name = "clamp_mtime"
+flags = ["--clamp-mtime"]
+
+[[builder.setting]]
+name = "filter"
+kind = "code"
+why = "The filter is a predicate over each entry. An argument cannot carry one, and a glob that approximated it would be a second, weaker spelling of the same setting."
+
+[[builder]]
+name = "CopyIn"
+path = "ferroday_cage::provision::CopyIn"
+
+[[builder.setting]]
+name = "map"
+kind = "library"
+why = "`fcage` offers no copy-in at all: it would have to grow a flag naming a source and a destination inside an existing tree, which is a provisioning operation the tool does not have. The map would follow that flag."
+
+[[builder.setting]]
+name = "mapper"
+kind = "code"
+why = "A mapper is a trait object."
+
+# No settings, and recorded so that gaining one is a difference rather than a
+# silence. A tarball is named and then provisioned from; `--provision-tar`
+# reaches both constructors, a path and a reader.
+[[builder]]
+name = "Tarball"
+path = "ferroday_cage::provision::Tarball"

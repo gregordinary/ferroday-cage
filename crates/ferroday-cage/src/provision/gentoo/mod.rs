@@ -531,9 +531,14 @@ impl From<GentooError> for super::ProvisionError {
 /// certificates do not share one date: two of the eleven lapse well before the
 /// rest. Reporting per certificate rather than as a single earliest expiry is
 /// what keeps a keyring whose signing key is good for years from reading as
-/// nearly expired because a certificate it never meets is. Reducing the list to
-/// one number is the caller's judgement, and it needs [`signs`](Self::signs) to
-/// make it well.
+/// nearly expired because a certificate it never meets is.
+///
+/// There is no sound reduction of the list to one date. Every certificate is an
+/// equally trusted anchor and this layer accepts a signature from any of them,
+/// so which one the archive signs with is not recorded here, and an
+/// earliest-expiry number is pulled down by whichever short-dated certificate
+/// the keyring happens to hold. A caller wanting the date its own provisioning
+/// rests on reads it from the certificate that verified a document it fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CertificateHorizon {
@@ -561,8 +566,15 @@ pub struct CertificateHorizon {
     /// delegates to no signing subkey that does. Gentoo's keyring holds one such
     /// certificate, a DSA-1024 release key from 2004. It is harmless — nothing
     /// rests on a key until it produces a signature that passes the gates — but
-    /// its expiry says nothing about how long the keyring remains usable, so a
-    /// caller reducing the list to one number reads this first.
+    /// its expiry says nothing about how long the keyring remains usable.
+    ///
+    /// This is a property of the key material and not a statement about what
+    /// the archive signs with. Every certificate here is an equally trusted
+    /// anchor, and this layer accepts a signature from any of them, so a `true`
+    /// says the certificate *could* produce an accepted signature rather than
+    /// that anything currently rests on it. A caller wanting the date its own
+    /// provisioning depends on takes it from the certificate that verified a
+    /// document it actually read, not by reducing this list.
     pub signs: bool,
 }
 
@@ -840,9 +852,11 @@ impl Gentoo {
     /// verification's own rather than a second reading of the same certificates,
     /// so what is reported here is what a signature would actually be held to.
     ///
-    /// Reducing the list to one number is the caller's: the earliest expiry
-    /// among the certificates that [can sign](CertificateHorizon::signs) is the
-    /// one worth acting on.
+    /// The list does not reduce to one date, and
+    /// [`CertificateHorizon`] says why: the keyring records which certificates
+    /// could sign, never which one the archive signs with. A caller acting on a
+    /// single number takes it from the certificate that verified a document it
+    /// actually read.
     pub fn keyring_horizon(&self) -> Vec<CertificateHorizon> {
         self.keyring
             .horizon()
@@ -2946,9 +2960,11 @@ mod tests {
     #[test]
     fn the_certificates_do_not_share_one_expiry() {
         // The finding the per-certificate report exists for. Two certificates
-        // lapse about twenty months before the rest and neither signs anything
-        // this layer reads, so a single earliest-expiry number would report a
+        // lapse about twenty months before the rest, and the archive signs with
+        // neither today, so a single earliest-expiry number would report a
         // keyring as nearly stale while the key that matters is good for years.
+        // Which certificate the archive signs with is not something the keyring
+        // records, so no reduction over this list can be the one to act on.
         let horizon = gentoo().keyring_horizon();
         let mut dates: Vec<Option<i64>> = horizon.iter().map(|held| held.expires).collect();
         dates.sort_unstable();
