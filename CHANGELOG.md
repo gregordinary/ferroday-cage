@@ -25,6 +25,12 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-09-26
+
+`fcage` 0.5.0, unchanged. Its dependency on the library is a caret range over
+0.4.4, which 0.4.5 satisfies, so a fresh install of it builds against this
+release.
+
 ### Fixed
 
 - The crate builds against rustix 1.1.5. That release withdrew the module the
@@ -1269,7 +1275,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.1...v0.4.2
