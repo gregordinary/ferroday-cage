@@ -2,18 +2,19 @@
 //! supervisor plumbing.
 //!
 //! This module is one of the crate's homes of `unsafe`. The unsafe
-//! surface here is the process-creation and exec boundary — `kernel_fork`,
+//! surface here is the process-creation and exec boundary — `fork`,
 //! `unshare_unsafe`, `execve`, the signal-state calls, and the descriptor
 //! sweep — each with its invariant documented at the call site, and
 //! everything after the fork runs in a child process under the constraints
 //! documented in [`child`].
-//! All syscalls go through rustix's `linux_raw` backend, which issues them
-//! with inline assembly and never touches the libc `errno` slot, the
-//! allocator, or a lock — which is what keeps the post-fork window
-//! async-signal-safe. rustix selects that backend by target and build
-//! configuration, not by the mere fact of depending on rustix, so a
-//! compile-time guard (below) fails the build on any configuration where
-//! rustix would fall back to its libc backend instead.
+//! Every syscall is issued with inline assembly, through rustix's `linux_raw`
+//! backend or, for the calls rustix keeps to its runtime module and those it
+//! does not wrap, the `syscalls` crate: [`sys`] holds the process-level ones.
+//! Neither touches the libc `errno` slot, the allocator, or a lock, which is
+//! what keeps the post-fork window async-signal-safe. rustix selects that
+//! backend by target and build configuration, not by the mere fact of
+//! depending on rustix, so a compile-time guard (below) fails the build on any
+//! configuration where rustix would fall back to its libc backend instead.
 //!
 //! A launch forks a short-lived stage that creates the namespaces and forks
 //! the sandbox's long-lived processes (see [`child`] for the full process
@@ -48,7 +49,8 @@
 // riscv64; architectures rustix drives only through libc by default (powerpc,
 // s390x, mips) are excluded here by omission. The one selector this cannot
 // observe is rustix's own `use-libc` cargo feature, a deliberate opt-out that
-// no default build enables.
+// no default build enables. `sys` states the kernel's signal constants and
+// structure layouts for exactly this set of architectures.
 #[cfg(any(
     rustix_use_libc,
     rustix_no_linux_raw,
@@ -80,6 +82,7 @@ pub(crate) mod frame;
 mod harden;
 mod overlay;
 mod remove;
+pub(crate) mod sys;
 
 #[cfg(feature = "hardening")]
 pub(crate) use harden::probe_landlock_abi;
@@ -116,7 +119,6 @@ use rustix::net::{
 use rustix::pipe::{self, PipeFlags};
 use rustix::process::Signal;
 use rustix::process::{self, Pid, PidfdFlags, WaitId, WaitIdOptions, WaitOptions, WaitStatus};
-use rustix::runtime::{self, Fork};
 use rustix::thread::UnshareFlags;
 
 use crate::error::{Error, SetupStep};
@@ -125,6 +127,7 @@ use crate::idmap::{IdMapper, ResolvedMap};
 use crate::observer::Progress;
 use crate::status::ExitStatus;
 use crate::terminal::Terminal;
+use sys::Fork;
 
 /// What the launch stages build around the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1004,7 +1007,7 @@ pub(super) fn drive_map_gate(
 /// touched no tree, so killing it is a clean end — and it is the only end
 /// available.
 ///
-/// Killed rather than released by closing the gate. `kernel_fork` copies the
+/// Killed rather than released by closing the gate. A fork copies the
 /// whole descriptor table, so any process this caller forked concurrently holds
 /// its own copy of this gate's caller end and keeps the child's peer open
 /// however promptly this one closes. The library's own children sweep their
@@ -1132,9 +1135,9 @@ fn fork_launch(
     // on its own stack and runs `child::stage_a`, which performs raw rustix
     // syscalls over the data frozen above — no allocation, no locking, no
     // libc — and never returns: every path ends in `execve` or `exit_group`.
-    match unsafe { runtime::kernel_fork() } {
+    match unsafe { sys::fork() } {
         Err(errno) => Err(spawn_error(errno)),
-        Ok(Fork::Child(_)) => {
+        Ok(Fork::Child) => {
             let context = child::Context {
                 plan,
                 argv: &argv,
@@ -1185,7 +1188,7 @@ fn fork_launch(
             // closes, so every process that is not the command drops its own
             // copy — this one, `stage_init`'s, and the supervisor's.
             //
-            // The one copy no launch controls is a sibling's: `kernel_fork`
+            // The one copy no launch controls is a sibling's: a fork
             // copies the whole descriptor table, so a child this caller forked
             // between the replica's open just above and this close inherits one,
             // exactly as the map gate records. Every child the library forks —
@@ -1281,7 +1284,7 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
             // the launch cleanly; its report record is superseded by the
             // delegate's error.
             //
-            // Killed rather than released by closing the gate: `kernel_fork`
+            // Killed rather than released by closing the gate: a fork
             // copies the whole descriptor table, so any process this caller
             // forked concurrently holds a copy of this gate's caller end and
             // keeps the peer open however promptly this one closes. The

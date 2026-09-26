@@ -42,10 +42,10 @@ use rustix::fs::{self, AtFlags, Mode, OFlags, RawDir, SeekFrom};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::process::Pid;
-use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
 use super::child::{MapDuty, MapFailure};
+use super::sys::{self, Fork};
 use crate::idmap::IdMapError;
 use crate::wire::wire_enum;
 
@@ -127,9 +127,9 @@ pub(crate) fn remove_tree_mapped(
     // rustix syscalls over the frozen paths and descriptors — no
     // allocation, no locking, no panic — and never returns: every path
     // ends in `exit_group`.
-    match unsafe { runtime::kernel_fork() } {
+    match unsafe { sys::fork() } {
         Err(errno) => Err(spawn_failure(errno)),
-        Ok(Fork::Child(_)) => {
+        Ok(Fork::Child) => {
             // The fork duplicated the caller's end of the gate into this
             // process; close it, so this child pins nothing it does not use.
             // Closing an owned descriptor is a bare `close`, which the
@@ -242,10 +242,10 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
         match failure {
             // The caller left without applying the map; its own error is the
             // diagnostic, and the gate a report would travel on is closed.
-            MapFailure::Abandoned => runtime::exit_group(127),
+            MapFailure::Abandoned => sys::exit_group(127),
             MapFailure::Step(step, errno) => {
                 report(RemoveStep::from(step).wire(), errno);
-                runtime::exit_group(127)
+                sys::exit_group(127)
             }
         }
     }
@@ -253,11 +253,11 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
     match delete_tree(parent, leaf) {
         Ok(()) => {
             let _ = rustix::io::write(gate, &[0u8; 8]);
-            runtime::exit_group(0)
+            sys::exit_group(0)
         }
         Err(errno) => {
             report(RemoveStep::Delete.wire(), errno);
-            runtime::exit_group(127)
+            sys::exit_group(127)
         }
     }
 }
@@ -422,7 +422,7 @@ mod tests {
     ///
     /// The bystander stands in for any process this caller forked concurrently
     /// — one of the library's own children before it has swept, or one the
-    /// consumer forked and that never sweeps at all. `kernel_fork` copies the
+    /// consumer forked and that never sweeps at all. A fork copies the
     /// whole descriptor table, so the bystander holds its own copy of the
     /// caller's end of the removal gate and keeps the peer open no matter how
     /// promptly the caller closes its own. A caller that abandoned the removal
@@ -456,15 +456,15 @@ mod tests {
             // SAFETY: the child branch sleeps through one rustix syscall and
             // then exits — no allocation, no locking, no panic — and never
             // returns.
-            match unsafe { runtime::kernel_fork() } {
-                Ok(Fork::Child(_)) => {
+            match unsafe { sys::fork() } {
+                Ok(Fork::Child) => {
                     // Outlast the caller's abandonment; the test collects this
                     // process rather than waiting the sleep out.
                     let _ = rustix::thread::nanosleep(&rustix::thread::Timespec {
                         tv_sec: 300,
                         tv_nsec: 0,
                     });
-                    runtime::exit_group(0)
+                    sys::exit_group(0)
                 }
                 Ok(Fork::ParentOf(pid)) => {
                     *self

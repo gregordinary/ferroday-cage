@@ -381,6 +381,8 @@ it grows one, it is this row it extends.
 | Name a local path as a `file://` URL | `provision::file_url` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |
+| Fork, exec, exit, or change signal state without libc | `mechanism::sys` |
+| Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |
 | Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending |

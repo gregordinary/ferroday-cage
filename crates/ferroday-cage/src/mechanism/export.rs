@@ -51,12 +51,12 @@ use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::process::{Pid, Signal};
-use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
 use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
 use super::child::MapFailure;
 use super::frame;
+use super::sys::{self, Fork};
 use crate::idmap::IdMapError;
 use crate::wire::wire_enum;
 
@@ -190,9 +190,9 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
     // SAFETY: the child branch runs `export_child`, which performs raw rustix
     // syscalls over the frozen paths and descriptors — no allocation, no
     // locking, no panic — and never returns: every path ends in `exit_group`.
-    match unsafe { runtime::kernel_fork() } {
+    match unsafe { sys::fork() } {
         Err(errno) => Err(StartError::Spawn(errno)),
-        Ok(Fork::Child(_)) => {
+        Ok(Fork::Child) => {
             // The fork duplicated the caller's ends into this process; close
             // what this child does not use, so it pins nothing of the caller's.
             // The read end of its own frame pipe matters most: holding it would
@@ -260,7 +260,7 @@ fn export_child(
 ) -> ! {
     let fail = |step: ExportStep, errno: Errno| -> ! {
         emit_error(stream, step, errno);
-        runtime::exit_group(1)
+        sys::exit_group(1)
     };
 
     let keep = [
@@ -274,7 +274,7 @@ fn export_child(
             // The caller left without applying the map; its own error is the
             // diagnostic, and it is no longer reading the stream a report
             // would travel on.
-            MapFailure::Abandoned => runtime::exit_group(1),
+            MapFailure::Abandoned => sys::exit_group(1),
             MapFailure::Step(step, errno) => fail(step.into(), errno),
         }
     }
@@ -295,7 +295,7 @@ fn export_child(
     match walker.walk_root(root.as_fd()) {
         Ok(()) => {
             emit_tag(stream, FRAME_END);
-            runtime::exit_group(0)
+            sys::exit_group(0)
         }
         Err((step, errno)) => fail(step, errno),
     }
@@ -648,7 +648,7 @@ fn emit_tag_checked(stream: BorrowedFd<'_>, tag: u8) -> Result<(), (ExportStep, 
 ///
 /// Read without blocking, because neither a frame nor an end of input is
 /// guaranteed to arrive: a sibling process the caller forked concurrently holds
-/// its own copy of the child's write end — `kernel_fork` copies the whole
+/// its own copy of the child's write end — a fork copies the whole
 /// descriptor table — so even a dead child's end-of-file can be held off
 /// indefinitely. The child is already dead by the time this runs, so whatever it
 /// wrote is queued in full: an error frame is nine bytes, well under `PIPE_BUF`,

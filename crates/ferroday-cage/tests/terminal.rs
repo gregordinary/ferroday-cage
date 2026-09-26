@@ -308,7 +308,7 @@ fn a_concurrent_export_does_not_withhold_end_of_file() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    // `kernel_fork` copies the whole descriptor table, so a child forked between
+    // A fork copies the whole descriptor table, so a child forked between
     // the replica's open and its close inherits a copy and could hold the
     // session's end-of-file open for as long as it runs. Every such child sweeps
     // its inherited table early, which is what bounds the exposure — asserted

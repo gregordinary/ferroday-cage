@@ -44,6 +44,7 @@ use rustix::thread::{CapabilitiesSecureBits, CapabilitySet, CapabilitySets};
 use syscalls::Sysno;
 
 use super::HardeningPlan;
+use super::sys::errno;
 use crate::error::SetupStep;
 use crate::hardening::{fs_access_for_abi, net_access_for_abi};
 
@@ -432,10 +433,4 @@ fn install_seccomp(program: &[super::SockFilter]) -> Result<(), Errno> {
     }
     .map(|_| ())
     .map_err(errno)
-}
-
-/// Converts a `syscalls` errno into the rustix errno the rest of the
-/// mechanism speaks.
-fn errno(err: syscalls::Errno) -> Errno {
-    Errno::from_raw_os_error(err.into_raw())
 }

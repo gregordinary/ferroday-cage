@@ -21,8 +21,9 @@ use std::ffi::CStr;
 use rustix::io::Errno;
 use rustix::mount::{self, MountFlags, MountPropagationFlags};
 use rustix::process::{self, WaitStatus};
-use rustix::runtime::{self, Fork};
 use rustix::thread::{self, UnshareFlags};
+
+use super::sys::{self, Fork};
 
 /// The outcome of the overlay mount probe.
 pub(crate) enum OverlayProbe {
@@ -58,15 +59,15 @@ pub(crate) fn probe_overlay_mount(merged: &CStr, options: &CStr) -> OverlayProbe
     let uid_line = format!("0 {} 1\n", process::geteuid().as_raw()).into_bytes();
     let gid_line = format!("0 {} 1\n", process::getegid().as_raw()).into_bytes();
 
-    // SAFETY: the child branch runs only raw rustix syscalls over the data
-    // frozen above — no allocation, no locking, no libc — and never returns:
-    // it always ends in `exit_group`. `kernel_fork` is the launch's own
-    // fork primitive.
-    match unsafe { runtime::kernel_fork() } {
+    // SAFETY: the child branch runs only raw syscalls over the data frozen
+    // above — no allocation, no locking, no libc — and never returns: it
+    // always ends in `exit_group`. `sys::fork` is the launch's own fork
+    // primitive.
+    match unsafe { sys::fork() } {
         Err(_) => OverlayProbe::Inconclusive,
-        Ok(Fork::Child(_)) => {
+        Ok(Fork::Child) => {
             let code = probe_child(merged, options, &uid_line, &gid_line);
-            runtime::exit_group(code)
+            sys::exit_group(code)
         }
         Ok(Fork::ParentOf(child)) => match super::wait_for_exit(child) {
             Ok(status) => classify(status),

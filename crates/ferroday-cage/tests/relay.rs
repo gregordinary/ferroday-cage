@@ -320,7 +320,14 @@ impl Caller {
         // pending on that thread's signal descriptor rather than delivered, and
         // nothing runs in signal context. The thread id is the relay's, taken
         // before this driver existed and live for as long as the relay is.
-        unsafe { rustix::runtime::tkill(self.relay, signal) }.expect("the signal is deliverable");
+        unsafe {
+            syscalls::syscall!(
+                syscalls::Sysno::tkill,
+                self.relay.as_raw_nonzero().get(),
+                signal.as_raw()
+            )
+        }
+        .expect("the signal is deliverable");
     }
 }
 

@@ -53,12 +53,12 @@ use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
 };
-use rustix::runtime::{self, Fork, How, KernelSigSet};
 use rustix::thread::LinkNameSpaceType;
 
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
 use crate::mechanism::frame;
 use crate::mechanism::sweep_fds_keeping;
+use crate::mechanism::sys::{self, Fork, How, SigSet};
 use crate::wire::wire_enum;
 
 /// `TUNSETIFF`: create or attach to a tun/tap interface (`_IOW('T', 202, int)`).
@@ -335,11 +335,11 @@ pub(super) fn create(
     // allocation, takes no locks, and ends in `exit_group` — the post-fork
     // constraints documented in `crate::mechanism::child` — and all its
     // inputs were marshaled above.
-    match unsafe { runtime::kernel_fork() } {
+    match unsafe { sys::fork() } {
         Err(errno) => Err(NetStackError::Spawn {
             source: errno.into(),
         }),
-        Ok(Fork::Child(_)) => helper(&context),
+        Ok(Fork::Child) => helper(&context),
         Ok(Fork::ParentOf(child)) => {
             // Close this process's copy of the helper's end so the helper's
             // exit hangs the socket up, then collect the result and reap.
@@ -356,13 +356,13 @@ pub(super) fn create(
 /// step-and-errno record; there is no one to report a reporting failure to.
 fn helper(context: &HelperContext<'_>) -> ! {
     match run_helper(context) {
-        Ok(()) => runtime::exit_group(0),
+        Ok(()) => sys::exit_group(0),
         Err((step, errno)) => {
             let mut record = [0u8; 8];
             record[0..4].copy_from_slice(&(step as u32).to_le_bytes());
             record[4..8].copy_from_slice(&errno.raw_os_error().to_le_bytes());
             let _ = rustix::net::send(context.sock, &record, SendFlags::NOSIGNAL);
-            runtime::exit_group(127)
+            sys::exit_group(127)
         }
     }
 }
@@ -374,9 +374,9 @@ fn run_helper(context: &HelperContext<'_>) -> Result<(), (Step, Errno)> {
     // still kill the helper, which the parent observes as a hangup.
     // SAFETY: replacing the whole mask is safe in a fresh, single-threaded
     // child; nothing here relies on receiving signals.
-    let _ = unsafe { runtime::kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::all())) };
+    let _ = unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::all())) };
 
-    // Then the descriptor table, before anything that can block. `kernel_fork`
+    // Then the descriptor table, before anything that can block. The fork
     // copied the caller's whole table into this process, and an inherited copy
     // is not inert: it holds open a concurrently live sandbox's control socket
     // (which defers the supervisor's hangup detection), a concurrently

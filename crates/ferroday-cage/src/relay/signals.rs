@@ -2,12 +2,12 @@
 //!
 //! # `unsafe`
 //!
-//! Two calls, and rustix offers no safe wrapper for either: `kernel_sigprocmask`
-//! is in its low-level `runtime` module, and `signalfd` it does not wrap at all,
-//! so that one goes through the `syscalls` conduit the crate already carries for
-//! `mount_setattr` and the seccomp install. Both are of the shape "pass a
-//! pointer to a live local of matching size", and neither creates, frees, or
-//! aliases anything.
+//! Two calls, and rustix offers a program like this one a safe wrapper for
+//! neither. The signal mask is set through the launch mechanism's
+//! [`sys::sigprocmask`], and `signalfd` goes through the `syscalls` conduit the
+//! crate already carries for `mount_setattr` and the seccomp install. Both are
+//! of the shape "pass a pointer to a live local of matching size", and neither
+//! creates, frees, or aliases anything.
 
 #![allow(unsafe_code)]
 
@@ -17,10 +17,10 @@ use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 use rustix::process::Signal;
-use rustix::runtime::{How, KernelSigSet};
 use syscalls::Sysno;
 
 use super::RelayError;
+use crate::mechanism::sys::{self, How, SigSet};
 
 /// The signals a relay reads as data rather than letting the kernel act on.
 ///
@@ -158,9 +158,9 @@ impl Signals {
     /// has to get right — the mask this call leaves behind — is independent of
     /// which of them it was.
     fn install_with(
-        open: impl FnOnce(&KernelSigSet) -> Result<OwnedFd, Errno>,
+        open: impl FnOnce(&SigSet) -> Result<OwnedFd, Errno>,
     ) -> Result<Signals, RelayError> {
-        let mut blocked = KernelSigSet::empty();
+        let mut blocked = SigSet::empty();
         for signal in RELAYED {
             blocked.insert(signal);
         }
@@ -168,7 +168,7 @@ impl Signals {
         // Blocking the relayed set interferes with nothing in the process: the
         // standard library installs handlers only for SIGPIPE and the
         // stack-overflow SIGSEGV, neither of which is in it.
-        let previous = unsafe { rustix::runtime::kernel_sigprocmask(How::BLOCK, Some(&blocked)) }
+        let previous = unsafe { sys::sigprocmask(How::Block, Some(&blocked)) }
             .map_err(RelayError::at("blocking the relayed signals"))?;
 
         let fd = open(&blocked).map_err(|errno| {
@@ -186,7 +186,7 @@ impl Signals {
             // SAFETY: `previous` is a live local of exactly the type the call
             // takes, and is the mask this same thread was running under a few
             // instructions ago.
-            let _ = unsafe { rustix::runtime::kernel_sigprocmask(How::SETMASK, Some(&previous)) };
+            let _ = unsafe { sys::sigprocmask(How::SetMask, Some(&previous)) };
             RelayError::io("opening the signal descriptor", io::Error::from(errno))
         })?;
         Ok(Signals { fd })
@@ -239,8 +239,8 @@ impl Signals {
 /// The one call [`Signals::install`] makes that the kernel can refuse for a
 /// reason outside this crate: descriptor exhaustion, or a seccomp policy that
 /// does not permit `signalfd4`.
-fn open_signalfd(blocked: &KernelSigSet) -> Result<OwnedFd, Errno> {
-    // SAFETY: `blocked` is a live reference, and `KernelSigSet` is a transparent
+fn open_signalfd(blocked: &SigSet) -> Result<OwnedFd, Errno> {
+    // SAFETY: `blocked` is a live reference, and `SigSet` is a transparent
     // wrapper over the kernel's own `sigset_t` -- so the pointer is one to that
     // type and the size passed alongside it is that type's, which is what
     // `signalfd4` compares against. The first argument, -1, asks for a new
@@ -251,11 +251,11 @@ fn open_signalfd(blocked: &KernelSigSet) -> Result<OwnedFd, Errno> {
             Sysno::signalfd4,
             -1i32,
             std::ptr::from_ref(blocked),
-            size_of::<KernelSigSet>(),
+            size_of::<SigSet>(),
             SFD_CLOEXEC | SFD_NONBLOCK
         )
     }
-    .map_err(|err| Errno::from_raw_os_error(err.into_raw()))?;
+    .map_err(sys::errno)?;
     // SAFETY: the syscall returned a fresh, owned file descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
@@ -278,7 +278,7 @@ mod tests {
         // pending rather than delivered, and nothing runs in signal context.
         // The thread id is this thread's own and cannot have been recycled
         // while this thread is the one asking for it.
-        unsafe { rustix::runtime::tkill(tid, signal) }.expect("the signal is deliverable");
+        unsafe { sys::tkill(tid, signal) }.expect("the signal is deliverable");
     }
 
     #[test]
@@ -303,17 +303,17 @@ mod tests {
     }
 
     /// This thread's current signal mask, read without changing it.
-    fn mask_here() -> KernelSigSet {
+    fn mask_here() -> SigSet {
         // SAFETY: `None` asks only for the current mask; `how` is then ignored
         // and nothing is set.
-        unsafe { rustix::runtime::kernel_sigprocmask(How::BLOCK, None) }
+        unsafe { sys::sigprocmask(How::Block, None) }
             .expect("reading a thread's own mask cannot fail")
     }
 
     /// Applies `how` with `set` to this thread's mask.
-    fn set_mask_here(how: How, set: &KernelSigSet) {
+    fn set_mask_here(how: How, set: &SigSet) {
         // SAFETY: `set` is a live reference of exactly the type the call takes.
-        unsafe { rustix::runtime::kernel_sigprocmask(how, Some(set)) }
+        unsafe { sys::sigprocmask(how, Some(set)) }
             .expect("setting a thread's own mask cannot fail");
     }
 
@@ -325,9 +325,9 @@ mod tests {
         // having just reported that it could not relay. Restoring the prior mask
         // rather than unblocking the relayed set is what this pins -- a signal
         // the caller had blocked for its own reasons stays blocked.
-        let mut mine = KernelSigSet::empty();
+        let mut mine = SigSet::empty();
         mine.insert(Signal::INT);
-        set_mask_here(How::BLOCK, &mine);
+        set_mask_here(How::Block, &mine);
         assert!(!mask_here().contains(Signal::TERM), "the test's premise");
 
         let err = Signals::install_with(|_| Err(Errno::MFILE))
@@ -351,7 +351,7 @@ mod tests {
             }
         }
 
-        set_mask_here(How::UNBLOCK, &mine);
+        set_mask_here(How::Unblock, &mine);
     }
 
     #[test]

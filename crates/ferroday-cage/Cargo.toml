@@ -25,11 +25,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # `rand` is the kernel's getrandom: the host probes name their scratch entries
 # from it, and the native network stack seeds its TCP sequence numbers from it.
-rustix = { version = "1.1.4", features = ["runtime", "mount", "process", "fs", "pipe", "thread", "net", "system", "event", "stdio", "rand", "pty", "termios"] }
+rustix = { version = "1.1.4", features = ["mount", "process", "fs", "pipe", "thread", "net", "system", "event", "stdio", "rand", "pty", "termios"] }
 # A no_std, libc-free inline-assembly conduit for the syscalls rustix does not
-# wrap: mount_setattr, for recursively read-only bind mounts (core), and the
-# Landlock and seccomp-install calls (the hardening layer). The crate owns the
-# relevant uapi structs and issues the syscalls directly, so no `landlock`
+# wrap for a program like this one: the launch's fork, exec, exit, and signal
+# calls (core), mount_setattr, for recursively read-only bind mounts (core), and
+# the Landlock and seccomp-install calls (the hardening layer). The crate owns
+# the relevant uapi structs and issues the syscalls directly, so no `landlock`
 # crate is needed.
 syscalls = { version = "0.8", default-features = false }
 serde = { version = "1.0", features = ["derive"], optional = true }
@@ -295,10 +296,6 @@ ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = [
     "debian",
     "pty",
 ] }
-# The relay's tests drive a session through a pseudoterminal pair of their own
-# and raise the relayed signals at the thread the relay runs on, neither of
-# which the library's own feature selection covers.
-rustix = { version = "1.1.4", features = ["pty", "runtime", "thread"] }
 toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"

@@ -86,12 +86,12 @@ use rustix::fs::{self, AtFlags, Mode, OFlags, Timestamps};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, SocketFlags, SocketType};
 use rustix::process::{Pid, Signal};
-use rustix::runtime::{self, Fork};
 
 use super::ChildMap;
 use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
 use super::child::MapFailure;
 use super::frame;
+use super::sys::{self, Fork};
 use crate::idmap::IdMapError;
 use crate::path;
 use crate::wire::wire_enum;
@@ -269,7 +269,7 @@ impl CopyChild {
 /// `MSG_DONTWAIT` rather than a blocking read, because neither a record nor an
 /// end of input is guaranteed to arrive: a child killed part-way through the
 /// tree may never report, and a sibling process this caller forked concurrently
-/// holds its own copy of the child's gate end — `kernel_fork` copies the whole
+/// holds its own copy of the child's gate end — a fork copies the whole
 /// descriptor table — so even a dead child's end-of-file can be held off
 /// indefinitely.
 ///
@@ -337,9 +337,9 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
     // SAFETY: the child branch runs `copy_child`, which performs raw rustix
     // syscalls over the frozen paths and descriptors — no allocation, no
     // locking, no panic — and never returns: every path ends in `exit_group`.
-    match unsafe { runtime::kernel_fork() } {
+    match unsafe { sys::fork() } {
         Err(errno) => Err(spawn_failure(errno)),
-        Ok(Fork::Child(_)) => {
+        Ok(Fork::Child) => {
             // The fork duplicated the caller's ends into this process. Closing
             // the write end of its own frame pipe is what lets the child see
             // end of input when the parent is done; holding it would make the
@@ -408,7 +408,7 @@ fn copy_child(
 ) -> ! {
     let fail = |step: CopyStep, errno: Errno| -> ! {
         report(gate, step.wire(), errno.raw_os_error());
-        runtime::exit_group(1)
+        sys::exit_group(1)
     };
 
     // The gate is kept: unlike the export's, it is also the channel the
@@ -418,7 +418,7 @@ fn copy_child(
         match failure {
             // The caller left without applying the map; its own error is the
             // diagnostic, and the gate a report would travel on is closed.
-            MapFailure::Abandoned => runtime::exit_group(1),
+            MapFailure::Abandoned => sys::exit_group(1),
             MapFailure::Step(step, errno) => fail(step.into(), errno),
         }
     }
@@ -435,7 +435,7 @@ fn copy_child(
     match consume(stream, root) {
         Ok(()) => {
             report(gate, OUTCOME_OK, 0);
-            runtime::exit_group(0)
+            sys::exit_group(0)
         }
         Err((step, errno)) => fail(step, errno),
     }

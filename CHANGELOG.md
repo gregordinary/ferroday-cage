@@ -25,6 +25,13 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Fixed
+
+- The crate builds against rustix 1.1.5. That release withdrew the module the
+  launch mechanism took its fork, exec, exit, and signal calls from. Releases
+  up to 0.4.4 fail to compile wherever a fresh resolution selects it. The
+  mechanism makes those calls itself.
+
 ## [0.4.4] - 2026-09-12
 
 `fcage` 0.5.0. Two of its entries below are breaking, so it takes a new minor

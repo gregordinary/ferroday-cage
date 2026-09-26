@@ -36,7 +36,7 @@
 //! that process creates immediately before the fork; see
 //! [`delegate_nested_map`].
 //!
-//! Everything here executes between `kernel_fork` and `execve` or
+//! Everything here executes between [`sys::fork`] and `execve` or
 //! `exit_group`. The caller may be multithreaded, so these processes —
 //! single-threaded copies — must not:
 //!
@@ -47,8 +47,8 @@
 //! - call into libc or the thread runtime, whose state is stale in the
 //!   copy.
 //!
-//! Every operation below is a raw rustix syscall over data frozen by the
-//! caller before the fork.
+//! Every operation below is a raw syscall, through rustix or [`sys`], over
+//! data frozen by the caller before the fork.
 //!
 //! Mount targets are resolved against the new-root descriptor with
 //! `openat2` and `RESOLVE_IN_ROOT`, so an absolute symlink inside the
@@ -71,11 +71,11 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::process::Pid;
 use rustix::process::Signal;
 use rustix::process::{self, PidfdFlags, WaitOptions, WaitStatus};
-use rustix::runtime::{self, How, KernelSigSet, KernelSigaction};
 use rustix::thread;
 use syscalls::Sysno;
 
 use super::frame;
+use super::sys::{self, Disposition, How, SigSet};
 use super::{
     IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdioPlan,
 };
@@ -146,7 +146,7 @@ pub(super) fn stage_a(context: &Context<'_>) -> ! {
         Ok(never) => match never {},
         Err((step, errno, detail)) => {
             report(context.report_fd, step, errno, detail);
-            runtime::exit_group(127)
+            sys::exit_group(127)
         }
     }
 }
@@ -225,8 +225,8 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     };
     // SAFETY: the child process continues with frozen data and raw syscalls
     // only, per this module's constraints, and never returns.
-    match unsafe { runtime::kernel_fork() }.map_err(|errno| (fork_step, errno, 0))? {
-        runtime::Fork::Child(_) => {
+    match unsafe { sys::fork() }.map_err(|errno| (fork_step, errno, 0))? {
+        sys::Fork::Child => {
             if plan.pid_namespace {
                 stage_init(context)
             } else {
@@ -240,7 +240,7 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                 stage_command(context, gate)
             }
         }
-        runtime::Fork::ParentOf(child) => {
+        sys::Fork::ParentOf(child) => {
             let pidfd = match publish_supervised(context, child) {
                 Ok(pidfd) => pidfd,
                 Err(errno) => {
@@ -273,7 +273,7 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
             if plan.pid_namespace {
                 // The init supervises itself from inside the namespace;
                 // this stage's work is done.
-                runtime::exit_group(0)
+                sys::exit_group(0)
             } else {
                 supervisor_hygiene(context);
                 supervise(context, pidfd.as_fd(), child, Role::Outside)
@@ -356,13 +356,13 @@ fn start_own_session(context: &Context<'_>) -> Result<(), Failure> {
 fn stage_init(context: &Context<'_>) -> ! {
     if let Err((step, errno, detail)) = start_own_session(context) {
         report(context.report_fd, step, errno, detail);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
     let procfs = match setup_sandbox(context) {
         Ok(procfs) => procfs,
         Err((step, errno, detail)) => {
             report(context.report_fd, step, errno, detail);
-            runtime::exit_group(127)
+            sys::exit_group(127)
         }
     };
     // The gate the command's nested identity map is established across, created
@@ -372,18 +372,18 @@ fn stage_init(context: &Context<'_>) -> ! {
         Ok(seam) => seam,
         Err((step, errno, detail)) => {
             report(context.report_fd, step, errno, detail);
-            runtime::exit_group(127)
+            sys::exit_group(127)
         }
     };
 
     // SAFETY: as at every fork here: the child process touches only frozen
     // data and raw syscalls, and never returns.
-    match unsafe { runtime::kernel_fork() } {
+    match unsafe { sys::fork() } {
         Err(errno) => {
             report(context.report_fd, SetupStep::ForkCommand, errno, 0);
-            runtime::exit_group(127)
+            sys::exit_group(127)
         }
-        Ok(runtime::Fork::Child(_)) => {
+        Ok(sys::Fork::Child) => {
             // The command keeps its own end of the gate and drops the
             // delegate's side of the seam, which is not its to hold.
             let gate = seam.map(|seam| {
@@ -393,7 +393,7 @@ fn stage_init(context: &Context<'_>) -> ! {
             });
             exec_command(context, gate)
         }
-        Ok(runtime::Fork::ParentOf(command)) => {
+        Ok(sys::Fork::ParentOf(command)) => {
             // The command's pidfd is what lets the supervisor sleep in one
             // poll; opened before anything else so a failure is still
             // reportable.
@@ -401,7 +401,7 @@ fn stage_init(context: &Context<'_>) -> ! {
                 Ok(pidfd) => pidfd,
                 Err(errno) => {
                     report(context.report_fd, SetupStep::WatchCommand, errno, 0);
-                    runtime::exit_group(127)
+                    sys::exit_group(127)
                 }
             };
             // The nested map, established while the report pipe is still open
@@ -420,7 +420,7 @@ fn stage_init(context: &Context<'_>) -> ! {
                 {
                     abandon_command(command);
                     report(context.report_fd, step, errno, detail);
-                    runtime::exit_group(127)
+                    sys::exit_group(127)
                 }
             }
             supervisor_hygiene(context);
@@ -457,7 +457,7 @@ fn stage_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     });
     if let Err((step, errno, detail)) = setup {
         report(context.report_fd, step, errno, detail);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
     exec_command(context, nested_gate)
 }
@@ -496,7 +496,7 @@ fn setup_restriction(context: &Context<'_>) -> Result<(), Failure> {
 fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     if let Err(errno) = wire_stdio(context) {
         report(context.report_fd, SetupStep::WireStdio, errno, 0);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
 
     // The launch gate, when the caller requested one: block until the caller
@@ -509,7 +509,7 @@ fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
         && let Err((step, errno)) = await_proceed(proceed)
     {
         report(context.report_fd, step, errno, 0);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
 
     // The resource limits, applied before the hardening layer: the command
@@ -519,7 +519,7 @@ fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     // by every process the command starts.
     if let Err((step, errno, detail)) = apply_rlimits(context) {
         report(context.report_fd, step, errno, detail);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
 
     // The nested user namespace, entered before anything below it and after
@@ -539,7 +539,7 @@ fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     // any depth.
     if let Err((step, errno, detail)) = enter_nested_namespace(context, nested_gate) {
         report(context.report_fd, step, errno, detail);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
 
     // The opt-in hardening layer and the identity switch, applied last so
@@ -554,18 +554,18 @@ fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     #[cfg(feature = "hardening")]
     if let Err((step, errno)) = super::harden::apply_pre_switch(&context.plan.hardening) {
         report(context.report_fd, step, errno, 0);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
 
     if let Err((step, errno)) = switch_identity(context) {
         report(context.report_fd, step, errno, 0);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
 
     #[cfg(feature = "hardening")]
     if let Err((step, errno)) = super::harden::apply_post_switch(&context.plan.hardening) {
         report(context.report_fd, step, errno, 0);
-        runtime::exit_group(127)
+        sys::exit_group(127)
     }
 
     // `execve` returns only on failure; on success it replaces the process
@@ -577,7 +577,7 @@ fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
         // entries point into CStrings owned by the launch plan and the launch
         // frame, all of which outlive this call.
         unsafe {
-            runtime::execve(
+            sys::execve(
                 &context.plan.program,
                 context.argv.as_ptr(),
                 context.envp.as_ptr(),
@@ -587,7 +587,7 @@ fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
         exec_search(context)
     };
     report(context.report_fd, SetupStep::Exec, errno, 0);
-    runtime::exit_group(127)
+    sys::exit_group(127)
 }
 
 /// Executes the path-lookup candidates in order, returning the errno to report
@@ -612,7 +612,7 @@ fn exec_search(context: &Context<'_>) -> Errno {
         // entries point into CStrings owned by the launch plan and the launch
         // frame, all of which outlive this call; `candidate` is a CString in
         // the plan's own search list.
-        last = unsafe { runtime::execve(candidate, context.argv.as_ptr(), context.envp.as_ptr()) };
+        last = unsafe { sys::execve(candidate, context.argv.as_ptr(), context.envp.as_ptr()) };
         match last {
             Errno::ACCESS => denied = true,
             // Not here, or a filesystem's roundabout way of saying so.
@@ -1482,14 +1482,7 @@ fn supervisor_hygiene(context: &Context<'_>) {
 /// terms. Restored here rather than left out of the scrub, so the window between
 /// the two carries no inherited disposition at all.
 pub(super) fn ignore_sigpipe() -> Result<(), Errno> {
-    let ignore = KernelSigaction {
-        sa_handler_kernel: runtime::kernel_sig_ign(),
-        ..Default::default()
-    };
-    // SAFETY: installing SIG_IGN carries no handler address and so none of
-    // `kernel_sigaction`'s trampoline hazards.
-    unsafe { runtime::kernel_sigaction(Signal::PIPE, Some(ignore)) }?;
-    Ok(())
+    sys::set_disposition(Signal::PIPE, Disposition::Ignore)
 }
 
 /// How often the in-namespace init wakes to collect orphaned descendants.
@@ -1539,7 +1532,7 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
             Err(Errno::INTR) => continue,
             // An unpollable descriptor set has no recovery; exit visibly.
             // As init the exit also tears the namespace down.
-            Err(_) => runtime::exit_group(127),
+            Err(_) => sys::exit_group(127),
         }
 
         let control_ready = watch_control && !fds[0].revents().is_empty();
@@ -1554,7 +1547,7 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
                             // Init's exit has the kernel kill the whole
                             // namespace; no status is reported, and there
                             // is no one to report to.
-                            Role::Init => runtime::exit_group(1),
+                            Role::Init => sys::exit_group(1),
                             // From outside, kill the command and keep
                             // supervising: its exit is still collected.
                             Role::Outside => {
@@ -1596,7 +1589,7 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
             match process::wait(WaitOptions::NOHANG) {
                 Ok(Some((pid, status))) if pid == child => {
                     report_status(context.status_fd, status);
-                    runtime::exit_group(0)
+                    sys::exit_group(0)
                 }
                 Ok(Some(_)) => continue,
                 Ok(None) => break,
@@ -1605,7 +1598,7 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
                 // process: something else reaped it. Unreportable;
                 // exiting without a record surfaces as a lost
                 // supervisor.
-                Err(_) => runtime::exit_group(127),
+                Err(_) => sys::exit_group(127),
             }
         }
     }
@@ -1626,7 +1619,7 @@ fn report_status(fd: BorrowedFd<'_>, status: WaitStatus) {
     } else {
         // Neither exited nor signaled cannot describe a reaped process;
         // exit without a record rather than invent one.
-        runtime::exit_group(127)
+        sys::exit_group(127)
     };
     let mut record = [0u8; 8];
     record[0..4].copy_from_slice(&kind.to_le_bytes());
@@ -1652,10 +1645,8 @@ pub(super) fn reset_signals() -> Result<(), Errno> {
         // SAFETY: the numbers are non-zero and within the kernel's signal
         // range on every architecture.
         let signal = unsafe { Signal::from_raw_unchecked(number) };
-        // SAFETY: installing SIG_DFL carries no handler address and so none
-        // of `kernel_sigaction`'s trampoline hazards.
-        match unsafe { runtime::kernel_sigaction(signal, Some(KernelSigaction::default())) } {
-            Ok(_) => {}
+        match sys::set_disposition(signal, Disposition::Default) {
+            Ok(()) => {}
             // Numbers the kernel reserves are skipped, not errors.
             Err(Errno::INVAL) => {}
             Err(errno) => return Err(errno),
@@ -1665,7 +1656,7 @@ pub(super) fn reset_signals() -> Result<(), Errno> {
     // handler-less signal mid-handler nor races other threads; this process
     // is single-threaded and freshly forked, with no pending set (fork
     // clears it) and, after the loop above, no inherited handler to run.
-    unsafe { runtime::kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty())) }?;
+    unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::empty())) }?;
     Ok(())
 }
 
@@ -2048,7 +2039,7 @@ fn mount_setattr_recursive(target: BorrowedFd<'_>, attr_set: u64) -> Result<(), 
         )
     }
     .map(|_| ())
-    .map_err(|err| Errno::from_raw_os_error(err.into_raw()))
+    .map_err(sys::errno)
 }
 
 /// Remounts only the mount `target` names with `added` set, the fallback for a
