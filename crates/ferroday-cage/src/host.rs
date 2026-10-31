@@ -370,10 +370,8 @@ fn probe_name(prefix: &str) -> String {
 /// concurrent processes, and a process-wide counter in the low half distinguishes
 /// calls within one process, which threads sharing a pid would not be. Combining
 /// the two by exclusive-or keeps the claim in the first sentence true on a host
-/// where `getrandom` fails or returns short — the outcome is then the seed
-/// itself, still unique — where the earlier code kept only whatever `getrandom`
-/// happened to write, and on a failure returned the same string for every call
-/// in a process.
+/// where `getrandom` fails: the outcome is then the seed combined with whatever
+/// [`fill_random`] managed, still unique.
 ///
 /// Uniqueness is not what makes the naming safe in any case: every caller
 /// creates its entry with `O_EXCL` or `mkdirat` and treats a collision as a
@@ -386,21 +384,51 @@ pub(crate) fn unique_hex() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut random = [0u8; 8];
-    let mut filled = 0;
-    while filled < random.len() {
-        match rustix::rand::getrandom(&mut random[filled..], GetRandomFlags::empty()) {
-            // A short read is resumed rather than accepted; `Ok(0)` would
-            // otherwise spin, so it ends the loop with the seed carrying the
-            // remainder.
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(Errno::INTR) => {}
-            Err(_) => break,
-        }
-    }
+    // A failure is tolerated: the seed alone keeps the name unique, and the
+    // randomness only makes it unpredictable.
+    let _ = fill_random(&mut random);
     let seed = (u64::from(std::process::id()) << 32)
         | (COUNTER.fetch_add(1, Ordering::Relaxed) & u64::from(u32::MAX));
     format!("{:016x}", seed ^ u64::from_ne_bytes(random))
+}
+
+/// Fills `buf` from the kernel's randomness.
+///
+/// A short read is resumed where it stopped, and `EINTR` is retried. A read of
+/// nothing into a buffer with room left is not an answer `getrandom` documents,
+/// so it is reported as `EIO` rather than retried, which would spin. What a
+/// failure leaves filled stays in `buf`.
+///
+/// What a failure means is the caller's to decide. [`unique_hex`] carries on
+/// without the randomness, since its seed is unique already, while the network
+/// stack refuses to start without the entropy its TCP sequence numbers need.
+pub(crate) fn fill_random(buf: &mut [u8]) -> Result<(), Errno> {
+    fill_from(buf, |rest| {
+        // The call `clippy.toml` sends every other site here for: this is that
+        // answer.
+        #[expect(clippy::disallowed_methods)]
+        rustix::rand::getrandom(rest, GetRandomFlags::empty())
+    })
+}
+
+/// The body of [`fill_random`], with each read made by `read`.
+///
+/// Split so the answers the kernel rarely gives, a short read, an
+/// interruption, and a read of nothing, are reachable from a test.
+fn fill_from(
+    buf: &mut [u8],
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, Errno>,
+) -> Result<(), Errno> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match read(&mut buf[filled..]) {
+            Ok(0) => return Err(Errno::IO),
+            Ok(read) => filled += read,
+            Err(Errno::INTR) => {}
+            Err(errno) => return Err(errno),
+        }
+    }
+    Ok(())
 }
 
 /// Whether the filesystem hosting `dir` refuses a `user.*` extended attribute,
@@ -889,6 +917,70 @@ mod tests {
         let names: std::collections::HashSet<String> = (0..1000).map(|_| unique_hex()).collect();
         assert_eq!(names.len(), 1000, "unique_hex repeated a name");
         assert!(names.iter().all(|name| name.len() == 16));
+    }
+
+    #[test]
+    fn a_fill_resumes_a_short_read_where_it_stopped() {
+        // Three bytes at a time, counting up, so a fill that restarted rather
+        // than resumed would overwrite what it had and leave the tail zero.
+        let mut next = 1u8;
+        let mut buf = [0u8; 8];
+        fill_from(&mut buf, |rest| {
+            let take = rest.len().min(3);
+            for byte in &mut rest[..take] {
+                *byte = next;
+                next += 1;
+            }
+            Ok(take)
+        })
+        .expect("the fill completes");
+        assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn a_fill_retries_an_interruption_and_reports_a_failure() {
+        let mut interrupted = false;
+        let mut buf = [0u8; 4];
+        fill_from(&mut buf, |rest| match interrupted {
+            false => {
+                interrupted = true;
+                Err(Errno::INTR)
+            }
+            true => {
+                rest.fill(7);
+                Ok(rest.len())
+            }
+        })
+        .expect("an interruption is retried");
+        assert_eq!(buf, [7; 4]);
+
+        assert_eq!(
+            fill_from(&mut buf, |_| Err(Errno::NOSYS)),
+            Err(Errno::NOSYS),
+            "any other failure is the caller's to judge",
+        );
+    }
+
+    #[test]
+    fn a_read_of_nothing_ends_the_fill_rather_than_spinning() {
+        let mut reads = 0;
+        let mut buf = [0u8; 8];
+        let outcome = fill_from(&mut buf, |_| {
+            reads += 1;
+            assert!(reads < 100, "the fill spun on a read of nothing");
+            Ok(0)
+        });
+        assert_eq!(outcome, Err(Errno::IO));
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn the_kernels_randomness_fills_a_buffer() {
+        let mut buf = [0u8; 64];
+        fill_random(&mut buf).expect("the kernel's randomness is available");
+        assert!(buf.iter().any(|&byte| byte != 0));
+        // An empty buffer asks nothing of the kernel.
+        fill_random(&mut []).expect("nothing to fill");
     }
 
     #[test]

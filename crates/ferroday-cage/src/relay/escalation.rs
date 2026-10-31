@@ -42,8 +42,9 @@ enum Stage {
 /// that it passed and leaves the command running, because escalation is a
 /// decision about the caller's program rather than about the sandbox. What this
 /// type adds is that the decision is *stated once* — an interactive session
-/// drives it from [`Relay::run`](crate::relay::Relay::run)'s poll loop, and a
-/// plain wait drives the same value from a loop of its own, so the two cannot
+/// drives it from [`Relay::run`](crate::relay::Relay::run) until the command's
+/// exit is collected, whether or not the command's terminal is still open, and
+/// a plain wait drives the same value from a loop of its own, so the two cannot
 /// disagree about what a timeout means.
 ///
 /// # The deadline runs from construction

@@ -1251,6 +1251,14 @@ fn receive_primary(channel: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
 /// of the channel's sandbox end happens to close. `None` means the report pipe
 /// has something to say, or the channel hung up, and the caller reads the
 /// report next.
+///
+/// The wait has no deadline, deliberately, like the launch's other reads of its
+/// own stages: [`read_report`], [`receive_supervisor`], and the identity-map
+/// gate in [`establish_identity_map`]. Every end they wait on belongs to a
+/// process this launch created, which sends what is awaited or exits, and its
+/// exit closes the end. Only a stage blocked in the kernel holds one open, a
+/// mount against an unresponsive server for instance, and the launch then
+/// waits as long as that mount does.
 fn await_primary(channel: &OwnedFd, report: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
     loop {
         let mut fds = [

@@ -177,10 +177,29 @@ impl UdpTables {
         self.ports.push(UdpPort { port, handle });
     }
 
-    /// The host sockets to wait on, for the pump's poll set: every live
-    /// flow's socket wants to wake the loop when a reply arrives.
-    pub(super) fn host_sockets(&self) -> impl Iterator<Item = &OwnedFd> {
-        self.flows.iter().map(|flow| &flow.host)
+    /// The host sockets to wait on for replies, for the pump's poll set: each
+    /// flow whose port socket has room for a reply right now.
+    ///
+    /// The TCP flows' interest model, applied to UDP. A reply is read only when
+    /// it can be queued (see [`host_to_guest`](Self::host_to_guest)), so a host
+    /// socket whose port socket is full keeps its reply and stays readable.
+    /// Polling it then returns at once on every pass and spins the pump until
+    /// the ring drains. The ring drains on the interface's own schedule, which
+    /// the pump's timeout already follows, and the service pass after that
+    /// drain reads the reply.
+    pub(super) fn reply_interest<'a>(
+        &'a self,
+        sockets: &'a SocketSet<'static>,
+    ) -> impl Iterator<Item = &'a OwnedFd> {
+        self.flows
+            .iter()
+            .filter(move |flow| {
+                self.ports
+                    .iter()
+                    .find(|port| port.port == flow.destination.port)
+                    .is_some_and(|port| sockets.get::<udp::Socket>(port.handle).can_send())
+            })
+            .map(|flow| &flow.host)
     }
 
     /// Moves both directions of every flow: the guest's datagrams out to
@@ -244,6 +263,13 @@ impl UdpTables {
                 };
                 let destination = IpEndpoint::new(local, port);
                 let guest = meta.endpoint;
+                // The classifier withholds a datagram from any other source,
+                // but one behind an IPv6 extension header reaches this socket
+                // unclassified. Its replies would have nowhere to go; see
+                // `Plan::is_guest`.
+                if !plan.is_guest(guest.addr) {
+                    continue;
+                }
                 forward_out(flows, guest, destination, &scratch[..len], plan, now);
             }
         }
@@ -631,6 +657,36 @@ mod tests {
         assert!(
             !drained(&tables.flows[0]),
             "the reply is still on the host socket",
+        );
+    }
+
+    #[test]
+    fn a_flow_is_waited_on_only_while_its_port_can_take_a_reply() {
+        // A reply that cannot be queued stays on the host socket, which then
+        // stays readable; waiting on it would return at once on every pass.
+        let mut tables = UdpTables::new(1500);
+        let mut sockets = SocketSet::new(Vec::new());
+        tables.ensure_port(53, &mut sockets);
+        let (flow_side, _peer) = host_pair();
+        let flow = flow_over(flow_side);
+        let meta = udp::UdpMetadata {
+            endpoint: flow.guest,
+            local_address: Some(flow.destination.addr),
+            meta: Default::default(),
+        };
+        tables.flows.push(flow);
+        assert_eq!(tables.reply_interest(&sockets).count(), 1);
+
+        let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+        for _ in 0..PACKET_SLOTS {
+            socket
+                .send_slice(b"queued", meta)
+                .expect("the ring holds one datagram per slot");
+        }
+        assert_eq!(
+            tables.reply_interest(&sockets).count(),
+            0,
+            "a flow whose port is full is still waited on",
         );
     }
 

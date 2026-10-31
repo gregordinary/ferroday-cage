@@ -39,13 +39,14 @@
 //! FIN or RST is then probed and, when it does not answer, the flow is aborted
 //! and its slot, buffers, and host descriptor released. A flow both of whose
 //! ends stay alive but idle is held until one side closes it or the sandbox
-//! ends, bounded by [`MAX_FLOWS`]. That cap is per attachment: it bounds a
-//! single guest's flows, not the caller process's total. The pump and every
-//! host socket run in the caller's process, so several attachments in one
-//! process share one descriptor table and one heap; the per-guest cap is a
-//! guest's own budget, not a guarantee against a co-resident guest exhausting
-//! the process. The process-shared resource model is set out in
-//! `userspace-networking.md`.
+//! ends, bounded by its budget: [`MAX_FLOWS`] for the connections the guest
+//! opens, and [`MAX_PUBLISHED_FLOWS`] for those arriving through its published
+//! ports. The caps are per attachment: they bound a single guest's flows, not
+//! the caller process's total. The pump and every host socket run in the
+//! caller's process, so several attachments in one process share one
+//! descriptor table and one heap; the per-guest caps are a guest's own budget,
+//! not a guarantee against a co-resident guest exhausting the process. The
+//! process-shared resource model is set out in `userspace-networking.md`.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -59,9 +60,19 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpEndpoint;
 
-/// The most guest TCP connections served at once. A connection attempt
-/// past the cap is answered with a reset.
+/// The most TCP connections of the guest's own opening served at once. A
+/// connection attempt past the cap is answered with a reset.
 pub(super) const MAX_FLOWS: usize = 128;
+
+/// The most connections through the published ports served at once. A
+/// connection accepted past the cap is closed at once.
+///
+/// A budget of its own rather than a share of [`MAX_FLOWS`]. Anyone who can
+/// reach a published port's host address, which for a wildcard address is the
+/// network, could otherwise deny the guest every outbound connection by
+/// holding enough idle ones open. And a guest opening its full budget could
+/// otherwise refuse every published connection.
+pub(super) const MAX_PUBLISHED_FLOWS: usize = 128;
 
 /// Each smoltcp socket's receive and transmit buffer size. The receive
 /// buffer also bounds how much a guest can send toward a slow host peer
@@ -178,6 +189,9 @@ pub(super) struct TcpFlow {
     stalled_since: Option<Instant>,
     /// The flow is finished; the pump reaps it and its socket.
     pub(super) dead: bool,
+    /// The flow arrived through a published port, which decides the budget
+    /// it counts against: [`MAX_PUBLISHED_FLOWS`] rather than [`MAX_FLOWS`].
+    pub(super) published: bool,
 }
 
 impl TcpFlow {
@@ -220,6 +234,7 @@ impl TcpFlow {
             deadline: now + ESTABLISH_DEADLINE,
             stalled_since: None,
             dead: false,
+            published: false,
         })
     }
 
@@ -252,6 +267,7 @@ impl TcpFlow {
             deadline: now + ESTABLISH_DEADLINE,
             stalled_since: None,
             dead: false,
+            published: true,
         }
     }
 
@@ -412,8 +428,8 @@ impl TcpFlow {
     /// close` HTTP and most short request/response protocols — because the
     /// stack sends the first FIN and the guest answers it. smoltcp then holds
     /// the socket in TIME_WAIT for ten seconds, over which the flow would go on
-    /// counting against [`MAX_FLOWS`] and pinning its two [`BUFFER_SIZE`]
-    /// buffers: a sustained rate above `MAX_FLOWS` per ten seconds would fill
+    /// counting against its budget and pinning its two [`BUFFER_SIZE`]
+    /// buffers: a sustained rate above [`MAX_FLOWS`] per ten seconds would fill
     /// the table with remnants and see every further connection refused. The
     /// flow is collapsed instead, which also keeps a fresh connection reusing
     /// the same endpoint pair from being taken for a retransmission of the
@@ -603,7 +619,7 @@ impl TcpFlow {
 /// reclaimed, late. A refused enable leaves no probing at all: the guest answers
 /// the probes its own side of the flow sends, so [`IDLE_TIMEOUT`] does not fire
 /// either, and the flow is held until the guest closes it or the sandbox ends,
-/// bounded only by [`MAX_FLOWS`]. Neither is reachable through the kernel, since
+/// bounded only by its budget. Neither is reachable through the kernel, since
 /// every value here is a constant inside the range it accepts, and neither is a
 /// reason to refuse to forward the guest's traffic.
 fn tune_keep_alive(host: &OwnedFd) {
@@ -664,6 +680,7 @@ mod tests {
                 deadline: Instant::now() + ESTABLISH_DEADLINE,
                 stalled_since: None,
                 dead: false,
+                published: false,
             },
             peer,
         )

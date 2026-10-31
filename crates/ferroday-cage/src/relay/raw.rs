@@ -7,6 +7,7 @@
 //! frame, a process-global save for the panic hook, and one restorer all of them
 //! call.
 
+use std::cell::{Cell, RefCell};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::OnceLock;
 
@@ -101,57 +102,60 @@ pub fn install_panic_restore() {
 ///
 /// Holds the settings it found, so it restores *its own* terminal rather than
 /// the process-global save [`restore_terminal`] replays.
+///
+/// # Only from the foreground
+///
+/// The guard changes the terminal only while this process is in the
+/// terminal's foreground process group. The relay blocks `SIGTTOU`, so a
+/// `tcsetattr` from the background succeeds rather than stopping the process,
+/// and would rewrite the settings of the shell that holds the terminal. A
+/// session started in the background therefore holds a guard that has not yet
+/// entered raw mode, and enters it on the first [`reenter`](Self::reenter)
+/// that finds the process in the foreground. Restoration follows the same
+/// rule from the other side: it writes only where raw mode is in force, so a
+/// guard never hands a terminal settings it did not take from it.
 pub(super) struct RawMode<'fd> {
-    /// The terminal this guard put into raw mode.
+    /// The terminal this guard puts into raw mode.
     fd: BorrowedFd<'fd>,
-    /// Its settings before that.
-    original: Termios,
+    /// Its settings before raw mode was first entered, which every restore
+    /// replays. `None` until the first entry, which a session started in the
+    /// background defers.
+    original: RefCell<Option<Termios>>,
+    /// Whether this guard's raw settings are in force now.
+    raw: Cell<bool>,
 }
 
 impl<'fd> RawMode<'fd> {
-    /// Puts `fd` into raw mode and records what it was.
+    /// Takes charge of `fd` for a session, putting it into raw mode now if this
+    /// process is in its foreground.
     ///
     /// Raw mode is what makes a session behave: keystrokes pass through
     /// unbuffered, and the *sandbox's* line discipline — not the caller's —
     /// turns a typed `^C` into a `SIGINT` for the sandbox's own foreground
     /// process group.
     ///
-    /// Everything fallible happens before the terminal is touched, so a failure
-    /// here leaves it exactly as it was.
+    /// A descriptor that is not a terminal is refused here, whether or not raw
+    /// mode would be entered yet, so the refusal does not depend on where the
+    /// session was started. Everything fallible happens before the terminal is
+    /// touched, so a failure here leaves it exactly as it was.
     pub(super) fn enter(fd: BorrowedFd<'fd>) -> Result<RawMode<'fd>, RelayError> {
-        let original = termios::tcgetattr(fd)
-            .map_err(RelayError::at("reading the caller's terminal settings"))?;
-        // Duplicated before anything is changed, so the process-global save
-        // below cannot fail once the terminal is raw. Wasted where a raw session
-        // has already been recorded, which costs one descriptor for the length
-        // of this call.
-        let duplicate = rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(RelayError::at(
-            "duplicating the caller's terminal descriptor",
-        ))?;
-
-        let mut raw = original.clone();
-        raw.make_raw();
-        termios::tcsetattr(fd, OptionalActions::Now, &raw).map_err(RelayError::at(
-            "putting the caller's terminal into raw mode",
-        ))?;
-
-        // Recorded for the panic hook's reach. The first raw session in the
-        // process wins; a later one is already covered for its own frame by the
-        // guard this returns.
-        let _ = SAVED.set(Saved {
-            fd: duplicate,
-            original: original.clone(),
-        });
-        Ok(RawMode { fd, original })
+        termios::tcgetattr(fd).map_err(RelayError::at("reading the caller's terminal settings"))?;
+        let guard = RawMode {
+            fd,
+            original: RefCell::new(None),
+            raw: Cell::new(false),
+        };
+        guard.enter_in_foreground("putting the caller's terminal into raw mode")?;
+        Ok(guard)
     }
 
     /// Restores this guard's terminal, discarding what was typed at the session
     /// that is ending.
     ///
     /// Idempotent: the stop path restores before stopping and the drop restores
-    /// again, and replaying settings that are already in force changes nothing.
+    /// again, and a restore with raw mode not in force writes nothing.
     pub(super) fn restore(&self) {
-        let _ = termios::tcsetattr(self.fd, OptionalActions::Flush, &self.original);
+        self.write_original(OptionalActions::Flush);
     }
 
     /// Restores this guard's terminal for a stop, keeping what was typed.
@@ -164,25 +168,94 @@ impl<'fd> RawMode<'fd> {
     /// `^Z` was typed at the session `fg` resumes, so it waits there instead.
     /// Draining is what `ssh` and `less` do across a stop for the same reason.
     pub(super) fn restore_for_stop(&self) {
-        let _ = termios::tcsetattr(self.fd, OptionalActions::Drain, &self.original);
+        self.write_original(OptionalActions::Drain);
     }
 
-    /// Re-enters raw mode after a stop, from the settings this guard saved.
+    /// Re-enters raw mode after a continue, from the settings this guard saved,
+    /// if the continue left this process in the foreground.
     ///
     /// Derived from the original rather than from what the terminal carries now,
     /// so a shell that changed something while this process was stopped does not
-    /// become the baseline the session is later restored to.
+    /// become the baseline the session is later restored to. A continue from
+    /// `bg` leaves the process in the background and re-enters nothing; the one
+    /// from a later `fg` does. For a session started in the background, the
+    /// first entry happens here, and it is then that the original is read.
     pub(super) fn reenter(&self) -> Result<(), RelayError> {
-        let mut raw = self.original.clone();
+        self.enter_in_foreground("entering raw mode after a continue")
+    }
+
+    /// Puts the terminal into raw mode if this process is in its foreground and
+    /// raw mode is not already in force.
+    fn enter_in_foreground(&self, op: &'static str) -> Result<(), RelayError> {
+        if self.raw.get() || !in_foreground(self.fd) {
+            return Ok(());
+        }
+        let saved = self.original.borrow().clone();
+        let original = match saved {
+            Some(original) => original,
+            None => self.first_entry()?,
+        };
+        let mut raw = original;
         raw.make_raw();
-        termios::tcsetattr(self.fd, OptionalActions::Now, &raw)
-            .map_err(RelayError::at("re-entering raw mode after a stop"))
+        termios::tcsetattr(self.fd, OptionalActions::Now, &raw).map_err(RelayError::at(op))?;
+        self.raw.set(true);
+        Ok(())
+    }
+
+    /// Reads the settings the first entry finds and records them, for this
+    /// guard and for the panic hook.
+    fn first_entry(&self) -> Result<Termios, RelayError> {
+        let original = termios::tcgetattr(self.fd)
+            .map_err(RelayError::at("reading the caller's terminal settings"))?;
+        // Duplicated before anything is changed, so the process-global save
+        // below cannot fail once the terminal is raw. Wasted where a raw session
+        // has already been recorded, which costs one descriptor for the length
+        // of this call.
+        let duplicate = rustix::io::fcntl_dupfd_cloexec(self.fd, 0).map_err(RelayError::at(
+            "duplicating the caller's terminal descriptor",
+        ))?;
+        // Recorded for the panic hook's reach. The first raw session in the
+        // process wins; a later one is already covered for its own frame by
+        // this guard.
+        let _ = SAVED.set(Saved {
+            fd: duplicate,
+            original: original.clone(),
+        });
+        *self.original.borrow_mut() = Some(original.clone());
+        Ok(original)
+    }
+
+    /// Writes the saved settings back, where raw mode is in force.
+    fn write_original(&self, when: OptionalActions) {
+        if !self.raw.replace(false) {
+            return;
+        }
+        if let Some(original) = self.original.borrow().as_ref() {
+            let _ = termios::tcsetattr(self.fd, when, original);
+        }
     }
 }
 
 impl Drop for RawMode<'_> {
     fn drop(&mut self) {
         self.restore();
+    }
+}
+
+/// Whether this process may change `fd`'s terminal settings without taking
+/// them from a foreground job: it is in the terminal's foreground process
+/// group, or the terminal is not its controlling terminal at all.
+///
+/// The second case is a terminal no job control governs. A pseudoterminal a
+/// program opened for itself is one, and so is a terminal reached from another
+/// session. The kernel answers `ENOTTY` for those, and no `SIGTTOU` would ever
+/// apply to a write, so there is no foreground to defer to. The same reading
+/// covers a controlling terminal whose foreground group has gone, which the
+/// kernel lets anyone in the session write.
+fn in_foreground(fd: BorrowedFd<'_>) -> bool {
+    match termios::tcgetpgrp(fd) {
+        Ok(foreground) => foreground == rustix::process::getpgrp(),
+        Err(_) => true,
     }
 }
 
@@ -326,6 +399,8 @@ mod tests {
             b"ahead",
             "what was typed ahead of a stop was typed at the session that resumes",
         );
+        // Resumed, so the session's own restore has raw mode to undo.
+        raw.reenter().expect("raw mode is re-enterable");
         assert!(
             queued(&|| raw.restore()).is_empty(),
             "what was typed at a session that is over goes nowhere",
@@ -349,6 +424,31 @@ mod tests {
                 .expect("the settings are readable")
                 .local_modes,
             cooked.local_modes,
+        );
+    }
+
+    #[test]
+    fn a_restore_writes_only_where_raw_mode_is_in_force() {
+        // Once the session has restored the terminal, its settings are the
+        // shell's again, and a later restore, the guard's drop among them,
+        // must not replay what the session found over what the shell has
+        // since set.
+        let (primary, replica) = pair();
+        let raw = RawMode::enter(replica.as_fd()).expect("raw mode is enterable");
+        raw.restore_for_stop();
+
+        let mut shells = termios::tcgetattr(&primary).expect("the settings are readable");
+        shells.local_modes.remove(LocalModes::ECHO);
+        termios::tcsetattr(&primary, OptionalActions::Now, &shells)
+            .expect("the settings are settable");
+        drop(raw);
+
+        assert!(
+            !termios::tcgetattr(&primary)
+                .expect("the settings are readable")
+                .local_modes
+                .contains(LocalModes::ECHO),
+            "a guard with raw mode not in force wrote the terminal anyway",
         );
     }
 

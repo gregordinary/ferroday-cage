@@ -13,10 +13,15 @@
 //! sandbox already granted: the caller's user owns the sandbox's user
 //! namespace, and entering it confers the network capabilities inside.
 //!
-//! The stack forwards where the guest could plausibly reach on its own and
-//! nowhere surprising: multicast, broadcast, loopback, and link-local
-//! destinations are refused, with one deliberate exception —
-//! [`host_loopback`](NetStackBuilder::host_loopback) and
+//! The stack is an egress NAT. An accepted destination is reached from the
+//! host's own network position, so the guest reaches what the host reaches:
+//! peers on the host's own networks, and a host service bound to a wildcard
+//! address, through the host's own addresses. Multicast, broadcast, loopback,
+//! and link-local destinations are refused, and link-local covers the IPv4
+//! cloud metadata services. AWS's IPv6 instance services, `fd00:ec2::/32` with
+//! the metadata service at `fd00:ec2::254`, are refused too. A caller that must
+//! bound egress further confines it outside the stack. One exception is
+//! deliberate: [`host_loopback`](NetStackBuilder::host_loopback) and
 //! [`host_loopback_port`](NetStackBuilder::host_loopback_port) map connections
 //! to the gateway address onto the host's loopback. A refused TCP connection is
 //! answered with a reset, with one exception: the guest's own subnet is
@@ -32,7 +37,9 @@
 //! [`publish`](NetStackBuilder::publish) has the stack listen on a host address
 //! and carry each connection it accepts to a TCP port of the guest's.
 //!
-//! Only TCP and UDP are forwarded. The stack answers ICMP echo for the
+//! Only TCP and UDP are forwarded, and only from the guest's own address: a
+//! segment or datagram from any other source is dropped, since nothing sent
+//! back to it could be delivered. The stack answers ICMP echo for the
 //! gateway address and for nothing else, so a ping inside the guest tells the
 //! guest that its gateway is up and says nothing at all about the destination
 //! — a reachable address does not answer, and neither does a refused one.
@@ -61,6 +68,7 @@ use std::thread::JoinHandle;
 
 use rustix::fs::{Mode, OFlags};
 use rustix::pipe::{self, PipeFlags};
+use smoltcp::wire::IpAddress;
 
 use crate::running::Pending;
 
@@ -142,6 +150,23 @@ struct Plan {
     /// The guest ports published on the host, in the order they were asked
     /// for.
     publish: Vec<Publication>,
+}
+
+impl Plan {
+    /// Whether `addr` is the guest's own address in its family.
+    ///
+    /// TCP and UDP are carried from that address alone. A segment or datagram
+    /// from any other source names a peer the stack has no route to: the
+    /// guest's link holds no other host, and the stack resolves no neighbor but
+    /// the guest. Anything sent back to such a source waits on a hardware
+    /// address that never arrives, and a UDP reply waiting at the head of its
+    /// port's transmit ring holds up every reply queued behind it.
+    fn is_guest(&self, addr: IpAddress) -> bool {
+        match IpAddr::from(addr) {
+            IpAddr::V4(addr) => self.v4.as_ref().is_some_and(|v4| v4.guest == addr),
+            IpAddr::V6(addr) => self.v6.as_ref().is_some_and(|v6| v6.guest == addr),
+        }
+    }
 }
 
 /// Which connections to the gateway address the stack carries to the host's
@@ -562,7 +587,8 @@ impl NetStackBuilder {
     /// Names the tap interface inside the sandbox. The default is `tap0`.
     ///
     /// The name must satisfy the kernel's interface-name rules: 1 to 15
-    /// bytes, not `.` or `..`, and free of `/`, `:`, and whitespace.
+    /// bytes, not `.` or `..`, and free of `/`, `:`, and whitespace as the
+    /// kernel reads it, which includes the vertical tab and the byte `0xA0`.
     /// Validated by [`build`](Self::build).
     pub fn interface(mut self, name: impl Into<String>) -> Self {
         self.interface = name.into();
@@ -612,6 +638,10 @@ impl NetStackBuilder {
     /// inside the sandbox, a development web server say, is reached from the
     /// host. A connection the guest refuses, because nothing listens on the
     /// port, is closed on the host side.
+    ///
+    /// At most 128 published connections are carried at once, a budget apart
+    /// from the guest's own connections, so neither kind can crowd out the
+    /// other. A connection past it is closed on the host side as well.
     ///
     /// `host` is the caller's to choose, and it decides who else can connect.
     /// `127.0.0.1` admits the host's own processes, every local user's
@@ -738,9 +768,9 @@ impl NetStackBuilder {
 }
 
 /// Mirrors the kernel's `dev_valid_name`: 1 to 15 bytes (`IFNAMSIZ` minus
-/// the terminator), not `.` or `..`, and free of `/`, `:`, and whitespace.
-/// NUL is additionally rejected so the name embeds cleanly in the
-/// NUL-terminated kernel requests.
+/// the terminator), not `.` or `..`, and free of `/`, `:`, and every byte the
+/// kernel's `isspace` accepts. NUL is additionally rejected so the name embeds
+/// cleanly in the NUL-terminated kernel requests.
 fn interface_name_valid(name: &str) -> bool {
     !name.is_empty()
         && name.len() < 16
@@ -748,7 +778,18 @@ fn interface_name_valid(name: &str) -> bool {
         && name != ".."
         && !name
             .bytes()
-            .any(|byte| byte == b'/' || byte == b':' || byte == 0 || byte.is_ascii_whitespace())
+            .any(|byte| byte == b'/' || byte == b':' || byte == 0 || kernel_isspace(byte))
+}
+
+/// The kernel's `isspace`, which its `_ctype` table defines over bytes: tab,
+/// line feed, vertical tab, form feed, carriage return, space, and `0xA0`, the
+/// Latin-1 no-break space.
+///
+/// Wider than [`u8::is_ascii_whitespace`] by the vertical tab and `0xA0`. The
+/// kernel tests the name byte by byte, so `0xA0` refuses every UTF-8 sequence
+/// that ends in it, `à` (`C3 A0`) among them.
+fn kernel_isspace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ' | 0xA0)
 }
 
 /// An error from building or running a network stack.
@@ -1192,7 +1233,20 @@ mod tests {
 
     #[test]
     fn interface_names_follow_the_kernel_rules() {
-        for name in ["", ".", "..", "a/b", "a:b", "a b", "sixteen-byte-name"] {
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a:b",
+            "a b",
+            "sixteen-byte-name",
+            // The two the kernel's `isspace` adds to ASCII whitespace: the
+            // vertical tab, and 0xA0 as a byte of any UTF-8 sequence.
+            "a\u{b}b",
+            "a\u{a0}b",
+            "\u{e0}",
+        ] {
             let err = NetStack::builder()
                 .interface(name)
                 .build()
@@ -1206,6 +1260,11 @@ mod tests {
             .interface("fifteen-byte-nm")
             .build()
             .expect("a 15-byte name is the longest valid one");
+        // Other bytes past ASCII are names to the kernel.
+        NetStack::builder()
+            .interface("\u{e9}th0")
+            .build()
+            .expect("a name the kernel accepts");
     }
 
     #[test]

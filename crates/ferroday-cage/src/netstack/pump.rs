@@ -40,8 +40,10 @@
 //! poll, and each connection it accepts becomes a flow whose guest-facing
 //! socket *connects* to the guest, from the gateway address and a port of the
 //! stack's choosing, where an outbound flow's socket listens. From there the
-//! two kinds are one: the same splice, the same half-closes, the same
-//! deadlines, and the same [`MAX_FLOWS`](tcp::MAX_FLOWS) budget.
+//! two kinds are one: the same splice, the same half-closes, and the same
+//! deadlines. They differ only in the budget they count against,
+//! [`MAX_PUBLISHED_FLOWS`](tcp::MAX_PUBLISHED_FLOWS) rather than
+//! [`MAX_FLOWS`](tcp::MAX_FLOWS), so neither kind can crowd out the other.
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
@@ -50,7 +52,6 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use rustix::net::SocketFlags;
-use rustix::rand::GetRandomFlags;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp as tcp_socket;
 use smoltcp::time::Instant;
@@ -268,9 +269,11 @@ impl Engine {
                     fds.push(PollFd::new(host, interest));
                 }
             }
-            // A UDP host socket is only ever waited on for replies to
-            // wake the loop; the draining itself is unconditional.
-            for host in self.udp.host_sockets() {
+            // A UDP host socket is waited on only for replies, and only while
+            // its port socket has room for one: a reply that cannot be queued
+            // stays on the host socket, which would otherwise stay readable and
+            // return every poll at once. The draining itself is unconditional.
+            for host in self.udp.reply_interest(&self.sockets) {
                 owners.push(SlotOwner::Udp);
                 fds.push(PollFd::new(host, PollFlags::IN));
             }
@@ -430,13 +433,19 @@ impl Engine {
     /// Acts on one classified frame before the interface sees it, and reports
     /// whether the interface may have it.
     ///
-    /// A TCP connection attempt or a UDP datagram to an admitted destination
-    /// gets the receive socket the interface will deliver to. A request the
-    /// interface would answer on behalf of an address it does not hold is
-    /// withheld — the one thing `any_ip` would otherwise widen beyond
-    /// receiving. Everything else passes through untouched.
+    /// TCP and UDP from any source but the guest's own address are withheld,
+    /// for the reason [`Plan::is_guest`] gives. A TCP connection attempt or a
+    /// UDP datagram to an admitted destination gets the receive socket the
+    /// interface will deliver to. A request the interface would answer on
+    /// behalf of an address it does not hold is withheld — the one thing
+    /// `any_ip` would otherwise widen beyond receiving. Everything else passes
+    /// through untouched.
     fn consider(&mut self, sniff: Sniff) -> bool {
         match sniff {
+            Sniff::TcpSyn { src, .. } | Sniff::Udp { src, .. } if !self.plan.is_guest(src.addr) => {
+                return false;
+            }
+            Sniff::TcpSegment { src } => return self.plan.is_guest(src),
             Sniff::TcpSyn { src, dst } => self.admit_tcp(src, dst),
             Sniff::Udp { src, dst } => self.admit_udp(src, dst),
             Sniff::Resolve { target } => return self.holds(target),
@@ -484,7 +493,7 @@ impl Engine {
         {
             return;
         }
-        if self.flows.len() >= tcp::MAX_FLOWS {
+        if self.held(false) >= tcp::MAX_FLOWS {
             return;
         }
         let Some(target) = host_target(dst, &self.plan) else {
@@ -520,9 +529,9 @@ impl Engine {
     /// Accepts the connections waiting on one published port, each becoming a
     /// flow toward the guest.
     ///
-    /// A connection past [`MAX_FLOWS`](tcp::MAX_FLOWS), or one no local port is
-    /// free for, is accepted and closed at once, which is how the host side
-    /// learns it was refused. A connection the peer abandoned before it was
+    /// A connection past [`MAX_PUBLISHED_FLOWS`](tcp::MAX_PUBLISHED_FLOWS), or
+    /// one no local port is free for, is accepted and closed at once, which is
+    /// how the host side learns it was refused. A connection the peer abandoned before it was
     /// accepted is passed over.
     fn accept(&mut self, index: usize) {
         for _ in 0..ACCEPT_BATCH {
@@ -539,7 +548,7 @@ impl Engine {
                     return;
                 }
             };
-            if self.flows.len() >= tcp::MAX_FLOWS {
+            if self.held(true) >= tcp::MAX_PUBLISHED_FLOWS {
                 continue;
             }
             let (guest, local_addr) = (self.inbound[index].guest, self.inbound[index].local);
@@ -566,6 +575,15 @@ impl Engine {
                 std::time::Instant::now(),
             ));
         }
+    }
+
+    /// How many flows of one kind are held: those through the published ports,
+    /// or those the guest opened.
+    fn held(&self, published: bool) -> usize {
+        self.flows
+            .iter()
+            .filter(|flow| flow.published == published)
+            .count()
     }
 
     /// A local port on `local` that no flow toward `guest` is using, searched
@@ -646,7 +664,10 @@ impl Engine {
 ///
 /// - Multicast, broadcast, unspecified, loopback, and link-local destinations,
 ///   in both families. Refusing loopback specifically shields host services
-///   bound to `127.0.0.1` or `::1`.
+///   bound to `127.0.0.1` or `::1`. Link-local covers the IPv4 cloud metadata
+///   services at `169.254.169.254`.
+/// - AWS's IPv6 instance services, `fd00:ec2::/32`, the metadata service at
+///   `fd00:ec2::254` among them; see [`is_aws_instance_service`].
 /// - The whole IPv4 `0.0.0.0/8` "this network" block and the IPv6 addresses that
 ///   embed an IPv4 one — the mapped `::ffff:a.b.c.d` and the deprecated
 ///   compatible `::a.b.c.d` alike — so an IPv4 refusal cannot be re-expressed in
@@ -670,8 +691,9 @@ impl Engine {
 /// The refusals do not shield a host service bound to a wildcard address
 /// (`0.0.0.0` or `::`): that service is reachable through the host's own
 /// routable IP, which is an ordinary accepted destination, and RFC 1918 LAN
-/// peers are reachable too. A caller that needs to bound egress must confine the
-/// destination itself. The gateway address is the one special case: on a port
+/// peers are reachable too, as is a metadata service at any routable address
+/// but AWS's. A caller that needs to bound egress must confine the destination
+/// itself. The gateway address is the one special case: on a port
 /// `host_loopback` or `host_loopback_port` admits, a connection to it maps to
 /// the host's loopback, port preserved, and on any other port it is refused.
 pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
@@ -718,6 +740,7 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
                 // compatible. `to_ipv4` accepts either, where `to_ipv4_mapped`
                 // would let `::a.b.c.d` through.
                 || addr.to_ipv4().is_some()
+                || is_aws_instance_service(addr)
                 || on_link
             {
                 return None;
@@ -732,18 +755,31 @@ fn prefix_bits(addr: std::net::Ipv6Addr) -> u128 {
     u128::from_be_bytes(addr.octets())
 }
 
+/// Whether `addr` is in `fd00:ec2::/32`, the block AWS serves its IPv6 instance
+/// services from: the metadata service at `fd00:ec2::254`, the DNS resolver at
+/// `fd00:ec2::253`, and the time service at `fd00:ec2::123`.
+///
+/// Their IPv4 counterparts sit in `169.254.0.0/16` and are refused as
+/// link-local. These are unique local addresses instead, which the host routes
+/// like any other, so nothing about the address marks them as the host's own.
+/// The metadata service answers anything on the instance that asks, with the
+/// instance role's credentials among what it serves, so reaching it from the
+/// guest would hand the guest the host's cloud identity. The whole block is
+/// refused, the resolver and the time service with it, as their IPv4
+/// counterparts are.
+fn is_aws_instance_service(addr: std::net::Ipv6Addr) -> bool {
+    matches!(addr.segments(), [0xfd00, 0x0ec2, ..])
+}
+
 /// Eight bytes of kernel entropy for the interface's seed.
+///
+/// A failure fails the attachment: the seed is what the guest-facing TCP
+/// sockets draw their initial sequence numbers from, and the guest is not
+/// trusted to be unable to predict a weak one.
 fn random_seed() -> Result<u64, Errno> {
     let mut bytes = [0u8; 8];
-    loop {
-        match rustix::rand::getrandom(&mut bytes, GetRandomFlags::empty()) {
-            Ok(8) => return Ok(u64::from_ne_bytes(bytes)),
-            // A short read only happens under exotic conditions; retry.
-            Ok(_) => continue,
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(errno),
-        }
-    }
+    crate::host::fill_random(&mut bytes)?;
+    Ok(u64::from_ne_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -808,6 +844,30 @@ mod tests {
             v6("::203.0.113.9", 80),
         ] {
             assert_eq!(host_target(dst, &plan), None, "{dst}");
+        }
+    }
+
+    #[test]
+    fn the_cloud_metadata_services_are_refused() {
+        // The IPv4 service is link-local; AWS's IPv6 block is a unique local
+        // one the host routes, so it is refused by name.
+        let plan = plan(false);
+        for dst in [
+            v4(169, 254, 169, 254, 80),
+            v6("fd00:ec2::254", 80),
+            v6("fd00:ec2::253", 53),
+            v6("fd00:ec2:ffff::1", 443),
+        ] {
+            assert_eq!(host_target(dst, &plan), None, "{dst}");
+        }
+        // The block is exactly a /32: its neighbours are ordinary unique local
+        // destinations.
+        for dst in [v6("fd00:ec3::254", 80), v6("fd00:ec1:ffff::1", 80)] {
+            assert_eq!(
+                host_target(dst, &plan),
+                Some(SocketAddr::from((IpAddr::from(dst.addr), dst.port))),
+                "{dst}",
+            );
         }
     }
 
@@ -902,5 +962,484 @@ mod tests {
             .build()
             .expect("a v4-only configuration is valid");
         assert_eq!(host_target(v6("2001:db8::1", 443), &stack.plan), None);
+    }
+
+    // -- The pump driven over a socket pair ----------------------------------
+    //
+    // A sequenced-packet socket pair stands in for the tap: each write is one
+    // frame, as a tap's is. The test holds the guest's end and writes the
+    // guest's frames into it, so the policy the pump applies to what arrives
+    // there is testable without a tap device or a sandbox.
+
+    use rustix::net::{AddressFamily, SocketType};
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{
+        EthernetFrame, EthernetProtocol, EthernetRepr, IpProtocol, Ipv4Packet, Ipv4Repr,
+        Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    };
+    use std::net::{Ipv6Addr as StdIpv6Addr, SocketAddr as StdSocketAddr, TcpListener, UdpSocket};
+
+    use super::super::{GUEST_MAC, Publication, PumpExit, listen};
+    use super::sniff::classify;
+
+    /// The guest's own IPv4 address under the default plan.
+    const GUEST: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+    /// The gateway's IPv4 address under the default plan.
+    const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+    /// An address nothing on the guest's link holds: the source a guest
+    /// spoofs.
+    const STRANGER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+
+    /// Wraps an IP packet in the Ethernet frame the guest would send it in.
+    fn ethernet(protocol: EthernetProtocol, packet: &[u8]) -> Vec<u8> {
+        let repr = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: protocol,
+        };
+        let mut frame = vec![0u8; repr.buffer_len() + packet.len()];
+        let mut ethernet = EthernetFrame::new_unchecked(&mut frame);
+        repr.emit(&mut ethernet);
+        ethernet.payload_mut().copy_from_slice(packet);
+        frame
+    }
+
+    /// An IPv4 packet carrying `transport`, a segment or datagram already
+    /// checksummed for these addresses.
+    fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, protocol: IpProtocol, transport: &[u8]) -> Vec<u8> {
+        let repr = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: protocol,
+            payload_len: transport.len(),
+            hop_limit: 64,
+        };
+        let mut packet = vec![0u8; repr.buffer_len() + transport.len()];
+        let mut ip = Ipv4Packet::new_unchecked(&mut packet);
+        repr.emit(&mut ip, &ChecksumCapabilities::default());
+        ip.payload_mut().copy_from_slice(transport);
+        ethernet(EthernetProtocol::Ipv4, &packet)
+    }
+
+    /// A UDP datagram from `src` to `dst`, checksummed for their addresses.
+    fn datagram(src: IpEndpoint, dst: IpEndpoint, payload: &[u8]) -> Vec<u8> {
+        let repr = UdpRepr {
+            src_port: src.port,
+            dst_port: dst.port,
+        };
+        let mut bytes = vec![0u8; repr.header_len() + payload.len()];
+        repr.emit(
+            &mut UdpPacket::new_unchecked(&mut bytes),
+            &src.addr,
+            &dst.addr,
+            payload.len(),
+            |buffer| buffer.copy_from_slice(payload),
+            &ChecksumCapabilities::default(),
+        );
+        bytes
+    }
+
+    /// A UDP datagram in an IPv4 frame.
+    fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp = datagram(
+            IpEndpoint::new(src.into(), 40_000),
+            IpEndpoint::new(dst.into(), port),
+            payload,
+        );
+        ipv4(src, dst, IpProtocol::Udp, &udp)
+    }
+
+    /// A connection-opening segment in an IPv4 frame.
+    fn syn_v4(src: Ipv4Addr, dst: Ipv4Addr, port: u16) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: 41_000,
+            dst_port: port,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(7),
+            ack_number: None,
+            window_len: 4096,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let mut segment = vec![0u8; repr.buffer_len()];
+        repr.emit(
+            &mut TcpPacket::new_unchecked(&mut segment),
+            &src.into(),
+            &dst.into(),
+            &ChecksumCapabilities::default(),
+        );
+        ipv4(src, dst, IpProtocol::Tcp, &segment)
+    }
+
+    /// A UDP datagram in an IPv6 frame, behind a hop-by-hop options header
+    /// when `hop_by_hop` is set.
+    ///
+    /// The classifier does not walk extension headers, so a datagram behind
+    /// one reaches its port's socket without having been classified.
+    fn udp_v6(
+        src: StdIpv6Addr,
+        dst: StdIpv6Addr,
+        port: u16,
+        payload: &[u8],
+        hop_by_hop: bool,
+    ) -> Vec<u8> {
+        let udp = datagram(
+            IpEndpoint::new(src.into(), 40_000),
+            IpEndpoint::new(dst.into(), port),
+            payload,
+        );
+        // Next header UDP, a length of zero (eight bytes in all), and one PadN
+        // option filling the rest.
+        let options: &[u8] = match hop_by_hop {
+            true => &[17, 0, 1, 4, 0, 0, 0, 0],
+            false => &[],
+        };
+        let repr = Ipv6Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: match hop_by_hop {
+                true => IpProtocol::HopByHop,
+                false => IpProtocol::Udp,
+            },
+            payload_len: options.len() + udp.len(),
+            hop_limit: 64,
+        };
+        let mut packet = vec![0u8; repr.buffer_len() + options.len() + udp.len()];
+        let mut ip = Ipv6Packet::new_unchecked(&mut packet);
+        repr.emit(&mut ip);
+        let payload = ip.payload_mut();
+        payload[..options.len()].copy_from_slice(options);
+        payload[options.len()..].copy_from_slice(&udp);
+        ethernet(EthernetProtocol::Ipv6, &packet)
+    }
+
+    /// One end of a sequenced-packet pair for the engine, as its tap, and the
+    /// guest's end for the test.
+    fn tap_pair() -> (OwnedFd, OwnedFd) {
+        rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("a socket pair stands in for the tap")
+    }
+
+    /// An engine over `tap`, for a test that drives it on its own thread.
+    fn engine(tap: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> Engine {
+        match Engine::new(tap, plan, listeners) {
+            Ok(engine) => engine,
+            Err(_) => panic!("the engine could not gather entropy"),
+        }
+    }
+
+    /// A pump running on a thread of its own over a socket pair.
+    struct Driven {
+        /// The guest's end of the pair.
+        guest: OwnedFd,
+        /// The stop pipe's write end; dropping it stops the pump.
+        stop: Option<OwnedFd>,
+        /// The pump's thread.
+        pump: Option<std::thread::JoinHandle<PumpExit>>,
+        /// The pump thread's id, for its processor time.
+        tid: i32,
+    }
+
+    impl Driven {
+        fn start(plan: Plan, listeners: Vec<Listener>) -> Driven {
+            let (tap, guest) = tap_pair();
+            let (stop_read, stop_write) =
+                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).expect("a pipe");
+            let (tid_send, tid_receive) = std::sync::mpsc::channel();
+            let pump = std::thread::spawn(move || {
+                let _ = tid_send.send(rustix::thread::gettid().as_raw_nonzero().get());
+                run(tap, stop_read, plan, listeners)
+            });
+            let tid = tid_receive.recv().expect("the pump thread reports its id");
+            Driven {
+                guest,
+                stop: Some(stop_write),
+                pump: Some(pump),
+                tid,
+            }
+        }
+
+        /// Sends one frame as the guest.
+        fn send(&self, frame: &[u8]) {
+            rustix::io::write(&self.guest, frame).expect("the pump's end takes the frame");
+        }
+
+        /// The processor time the pump's thread has used, in clock ticks.
+        fn ticks(&self) -> u64 {
+            let stat = std::fs::read_to_string(format!("/proc/self/task/{}/stat", self.tid))
+                .expect("the pump thread's statistics are readable");
+            // After the parenthesised name: state is the first field, and the
+            // user and system times are the twelfth and thirteenth.
+            let fields: Vec<&str> = stat[stat.rfind(')').expect("a name") + 2..]
+                .split_whitespace()
+                .collect();
+            let field = |at: usize| fields[at].parse::<u64>().expect("a tick count");
+            field(11) + field(12)
+        }
+
+        /// How many ticks the pump's thread uses over `window`.
+        fn ticks_over(&self, window: Duration) -> u64 {
+            let before = self.ticks();
+            std::thread::sleep(window);
+            self.ticks() - before
+        }
+    }
+
+    impl Drop for Driven {
+        fn drop(&mut self) {
+            drop(self.stop.take());
+            if let Some(pump) = self.pump.take() {
+                let _ = pump.join();
+            }
+        }
+    }
+
+    /// A pump that sleeps between events uses next to no processor time; one
+    /// that spins uses a tick every hundredth of a second it is scheduled.
+    /// The window is one second, so a spinning pump shows close to a hundred
+    /// and this bound leaves a sleeping one wide margin.
+    const IDLE_TICKS: u64 = 20;
+
+    /// A host UDP socket on `address` that answers each datagram it receives
+    /// `replies` times, more than the guest's ring holds at once.
+    fn replying_peer(address: StdSocketAddr, replies: usize) -> (UdpSocket, u16) {
+        let socket = UdpSocket::bind(address).expect("a host socket binds");
+        let port = socket.local_addr().expect("an address").port();
+        let peer = socket.try_clone().expect("the socket clones");
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1500];
+            while let Ok((len, from)) = peer.recv_from(&mut buffer) {
+                for _ in 0..replies {
+                    let _ = peer.send_to(&buffer[..len], from);
+                }
+            }
+        });
+        (socket, port)
+    }
+
+    /// The plan with the gateway's `port` mapped onto host loopback.
+    fn mapping(port: u16) -> Plan {
+        NetStack::builder()
+            .host_loopback_port(port)
+            .build()
+            .expect("a valid configuration")
+            .plan
+    }
+
+    #[test]
+    fn tcp_and_udp_from_another_source_are_withheld() {
+        // A reply to an address nothing on the link holds waits on a neighbor
+        // that never answers, so neither kind of traffic is carried from one.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, _guest) = tap_pair();
+        let mut engine = engine(tap, mapping(port), Vec::new());
+
+        for frame in [
+            syn_v4(STRANGER, GATEWAY, port),
+            udp_v4(STRANGER, GATEWAY, port, b"spoofed"),
+        ] {
+            assert!(
+                !engine.consider(classify(&frame)),
+                "a stranger's frame passed"
+            );
+        }
+        assert!(engine.flows.is_empty(), "a stranger's SYN opened a flow");
+        // Every segment is held to the rule, not only the one that opens a
+        // connection.
+        assert!(!engine.consider(Sniff::TcpSegment {
+            src: STRANGER.into()
+        }));
+
+        // The guest's own address is carried as before.
+        assert!(engine.consider(classify(&syn_v4(GUEST, GATEWAY, port))));
+        assert_eq!(engine.flows.len(), 1, "the guest's SYN opened a flow");
+        assert!(engine.consider(Sniff::TcpSegment { src: GUEST.into() }));
+    }
+
+    #[test]
+    fn a_datagram_behind_an_extension_header_from_another_source_opens_no_flow() {
+        // The classifier never sees a datagram behind an extension header, so
+        // the source rule has to hold where the UDP table opens a flow.
+        let Ok(socket) = UdpSocket::bind((StdIpv6Addr::LOCALHOST, 0)) else {
+            eprintln!("skipping: the host has no IPv6 loopback");
+            return;
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("the timeout is settable");
+        let port = socket.local_addr().expect("an address").port();
+        let driven = Driven::start(mapping(port), Vec::new());
+        let guest: StdIpv6Addr = "fd00::15".parse().unwrap();
+        let gateway: StdIpv6Addr = "fd00::2".parse().unwrap();
+        let stranger: StdIpv6Addr = "2001:db8::99".parse().unwrap();
+
+        // The guest's own datagram binds the port's socket and opens a flow.
+        driven.send(&udp_v6(guest, gateway, port, b"from the guest", false));
+        let mut buffer = [0u8; 64];
+        let (len, _) = socket
+            .recv_from(&mut buffer)
+            .expect("the guest's datagram arrives");
+        assert_eq!(&buffer[..len], b"from the guest");
+
+        // A stranger's, behind a hop-by-hop header, reaches that socket too.
+        driven.send(&udp_v6(stranger, gateway, port, b"from a stranger", true));
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("the timeout is settable");
+        match socket.recv_from(&mut buffer) {
+            Ok((len, _)) => panic!(
+                "a stranger's datagram was carried to the host: {:?}",
+                String::from_utf8_lossy(&buffer[..len]),
+            ),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ),
+                "{error}",
+            ),
+        }
+    }
+
+    #[test]
+    fn a_reply_the_guest_cannot_take_yet_does_not_spin_the_pump() {
+        // The stack has not learned the guest's hardware address, since the
+        // guest never asked for the gateway's, so replies queue in the port's
+        // ring until the ring is full. The rest stay on the host socket, which
+        // stays readable; polling it regardless would return at once forever.
+        let (_peer, port) = replying_peer((Ipv4Addr::LOCALHOST, 0).into(), 12);
+        let driven = Driven::start(mapping(port), Vec::new());
+        driven.send(&udp_v4(GUEST, GATEWAY, port, b"query"));
+        // The replies arrive and fill the ring before the window opens.
+        std::thread::sleep(Duration::from_millis(500));
+        let used = driven.ticks_over(Duration::from_secs(1));
+        assert!(
+            used < IDLE_TICKS,
+            "the pump spun: {used} ticks in one second"
+        );
+    }
+
+    #[test]
+    fn published_connections_have_a_budget_of_their_own() {
+        let host = (Ipv4Addr::LOCALHOST, 0).into();
+        let publication = Publication {
+            host,
+            guest_port: 8000,
+        };
+        let listener = listen(&publication).expect("the published port binds");
+        let address = listener.bound;
+        let plan = NetStack::builder()
+            .publish(host, 8000)
+            .host_loopback(true)
+            .build()
+            .expect("a valid configuration")
+            .plan;
+        let (tap, _guest) = tap_pair();
+        let mut engine = engine(tap, plan, vec![listener]);
+
+        // Fill the published budget with flows standing in for idle peers.
+        let mut peers = Vec::new();
+        for at in 0..tcp::MAX_PUBLISHED_FLOWS {
+            let (host_side, peer) = rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+                None,
+            )
+            .expect("a socket pair stands in for a published peer");
+            let handle = engine.sockets.add(tcp_socket::Socket::new(
+                tcp_socket::SocketBuffer::new(vec![0; 64]),
+                tcp_socket::SocketBuffer::new(vec![0; 64]),
+            ));
+            let port = 50_000 + u16::try_from(at).expect("the budget fits a port range");
+            engine.flows.push(TcpFlow::accepted(
+                handle,
+                IpEndpoint::new(GUEST.into(), 8000),
+                IpEndpoint::new(GATEWAY.into(), port),
+                host_side,
+                std::time::Instant::now(),
+            ));
+            peers.push(peer);
+        }
+
+        // One more published connection is accepted and closed at once.
+        let mut late = std::net::TcpStream::connect(address).expect("the listener accepts");
+        late.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is settable");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while engine.flows.len() == tcp::MAX_PUBLISHED_FLOWS && std::time::Instant::now() < deadline
+        {
+            engine.accept(0);
+            let mut byte = [0u8; 1];
+            use std::io::Read as _;
+            match late.read(&mut byte) {
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            engine.flows.len(),
+            tcp::MAX_PUBLISHED_FLOWS,
+            "a published connection past the budget was carried",
+        );
+
+        // And the guest's own connections are not crowded out by them.
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let target = target.local_addr().expect("an address").port();
+        assert!(engine.consider(classify(&syn_v4(GUEST, GATEWAY, target))));
+        assert_eq!(
+            engine.flows.len(),
+            tcp::MAX_PUBLISHED_FLOWS + 1,
+            "the guest's connection was refused for the published ones",
+        );
+        drop(peers);
+    }
+
+    #[test]
+    fn a_listener_that_fails_to_accept_sits_out_the_poll() {
+        // Descriptor exhaustion is the failure this guards against, which a
+        // test cannot arrange without starving every other test in the
+        // process. A listener shut down for reading stands in for it: every
+        // accept on it fails, and it reports itself ready on every poll, as a
+        // listener with a connection it cannot accept does.
+        let host = (Ipv4Addr::LOCALHOST, 0).into();
+        let listener = listen(&Publication {
+            host,
+            guest_port: 8000,
+        })
+        .expect("the published port binds");
+        rustix::net::shutdown(&listener.socket, rustix::net::Shutdown::Read)
+            .expect("the listener shuts down");
+        let mut ready = [PollFd::new(&listener.socket, PollFlags::IN)];
+        assert_eq!(
+            rustix::event::poll(&mut ready, Some(&crate::poll::timeout(Duration::ZERO))),
+            Ok(1),
+            "the stand-in is ready for good, as the failure it stands in for is",
+        );
+        assert!(rustix::net::accept(&listener.socket).is_err());
+        let plan = NetStack::builder()
+            .publish(host, 8000)
+            .build()
+            .expect("a valid configuration")
+            .plan;
+
+        let driven = Driven::start(plan, vec![listener]);
+        std::thread::sleep(Duration::from_millis(200));
+        let used = driven.ticks_over(Duration::from_secs(1));
+        assert!(
+            used < IDLE_TICKS,
+            "the pump spun: {used} ticks in one second"
+        );
     }
 }

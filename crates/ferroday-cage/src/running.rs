@@ -1,12 +1,13 @@
 //! The running-sandbox handle: wait, deadline, terminate, kill.
 
 use std::fmt;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
 use rustix::net::SendFlags;
 use rustix::process;
@@ -231,7 +232,7 @@ impl<'obs> Running<'obs> {
     /// [`Cage::run`]: crate::Cage::run
     /// [`pid_namespace(false)`]: crate::CageBuilder::pid_namespace
     pub fn wait(&mut self) -> Result<ExitStatus, Error> {
-        match self.pump(None)? {
+        match self.pump(None, None)? {
             Some(status) => Ok(status),
             // The pump reports no outcome only where a deadline expired, and
             // there is none here, so this is unreachable today. It is an error
@@ -251,16 +252,33 @@ impl<'obs> Running<'obs> {
     /// the wait can be resumed. The deadline does not kill anything —
     /// escalation is the caller's, per the recipe above.
     pub fn wait_deadline(&mut self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        self.pump(Some(deadline))
+        self.pump(Some(deadline), None)
     }
 
     /// [`wait_deadline`](Self::wait_deadline) with a relative timeout.
     pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
         // A timeout too large for the clock is a wait without one.
         match Instant::now().checked_add(timeout) {
-            Some(deadline) => self.pump(Some(deadline)),
-            None => self.pump(None),
+            Some(deadline) => self.pump(Some(deadline), None),
+            None => self.pump(None, None),
         }
+    }
+
+    /// Waits until the command terminates, the deadline passes, or `wake`
+    /// becomes readable, whichever comes first.
+    ///
+    /// For a waiter with a channel of its own to answer while it waits: the
+    /// terminal relay's signal descriptor, once the session's terminal has
+    /// closed and only the command's exit is left to collect. `Ok(None)` does
+    /// not say which of the two ended the wait, because the caller can ask its
+    /// own clock and drain its own channel, and draining an empty one costs a
+    /// read.
+    pub(crate) fn wait_or_readable(
+        &mut self,
+        deadline: Option<Instant>,
+        wake: BorrowedFd<'_>,
+    ) -> Result<Option<ExitStatus>, Error> {
+        self.pump(deadline, Some(wake))
     }
 
     /// Requests graceful termination: SIGTERM to the command.
@@ -351,9 +369,13 @@ impl<'obs> Running<'obs> {
     }
 
     /// The pump: polls the live channels, delivers captured output, and
-    /// accumulates the status record, until everything settles or the
-    /// deadline passes.
-    fn pump(&mut self, deadline: Option<Instant>) -> Result<Option<ExitStatus>, Error> {
+    /// accumulates the status record, until everything settles, the deadline
+    /// passes, or `wake` becomes readable.
+    fn pump(
+        &mut self,
+        deadline: Option<Instant>,
+        wake: Option<BorrowedFd<'_>>,
+    ) -> Result<Option<ExitStatus>, Error> {
         loop {
             if self.settled() {
                 return self.resolve().map(Some);
@@ -371,11 +393,16 @@ impl<'obs> Running<'obs> {
 
             // One fixed poll slot per channel, so the hot loop allocates
             // nothing. A retired channel's slot watches the pidfd with no
-            // requested events: a valid descriptor the poll ignores.
+            // requested events: a valid descriptor the poll ignores. The
+            // waiter's own channel, where there is none, is the same.
             let mut pollfds = [
                 poll::slot(&self.stdout, &self.pidfd),
                 poll::slot(&self.stderr, &self.pidfd),
                 poll::slot(&self.status, &self.pidfd),
+                match wake {
+                    Some(wake) => PollFd::from_borrowed_fd(wake, PollFlags::IN),
+                    None => PollFd::new(&self.pidfd, PollFlags::empty()),
+                },
             ];
 
             match rustix::event::poll(&mut pollfds, timeout.as_ref()) {
@@ -385,7 +412,7 @@ impl<'obs> Running<'obs> {
                 Err(errno) => return Err(wait_error(errno)),
             }
 
-            let ready: [bool; 3] = std::array::from_fn(|i| !pollfds[i].revents().is_empty());
+            let ready: [bool; 4] = std::array::from_fn(|i| !pollfds[i].revents().is_empty());
             if ready[0] {
                 self.drain_stream(Channel::Stdout)?;
             }
@@ -394,6 +421,17 @@ impl<'obs> Running<'obs> {
             }
             if ready[2] {
                 self.drain_status()?;
+            }
+            // The waiter's channel is answered after this pass's own reads,
+            // so an outcome that arrived beside it is reported rather than
+            // left for the next wait. Without one, the slot's readiness is
+            // the placeholder's, not a waiter's: a pidfd reports a hangup once
+            // its process has been reaped, whatever events were asked for.
+            if wake.is_some() && ready[3] {
+                return match self.settled() {
+                    true => self.resolve().map(Some),
+                    false => Ok(None),
+                };
             }
         }
     }

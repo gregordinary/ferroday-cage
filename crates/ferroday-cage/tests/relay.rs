@@ -24,8 +24,9 @@
 //!
 //! Every test launches a real sandbox, so it skips explicitly, on stderr, where
 //! the host cannot create unprivileged user namespaces;
-//! `FERRODAY_CAGE_REQUIRE_USERNS` turns each skip into a failure. The one
-//! exception is the restriction case, which runs a host binary and needs none.
+//! `FERRODAY_CAGE_REQUIRE_USERNS` turns each skip into a failure. The
+//! exceptions are the restriction cases, which run a host binary and need
+//! none.
 
 #![allow(unsafe_code)]
 
@@ -309,6 +310,24 @@ impl Caller {
         termios::tcgetattr(&self.primary).expect("the settings are readable")
     }
 
+    /// Waits until the caller's terminal is out of raw mode, failing the test
+    /// if it does not come out promptly.
+    ///
+    /// The relay restores the caller's terminal the moment it stops relaying,
+    /// before it waits for the command, so this is the relay's own report that
+    /// the session's terminal has closed.
+    fn expect_restored(&mut self) {
+        let deadline = Instant::now() + PROMPTLY;
+        while is_raw(&self.settings()) {
+            assert!(
+                Instant::now() < deadline,
+                "the relay never stopped relaying; it printed:\n{}",
+                self.seen,
+            );
+            self.settle(Duration::from_millis(50));
+        }
+    }
+
     /// Resizes the caller's terminal. Does not itself signal the relay.
     fn resize(&self, rows: u16, cols: u16) {
         termios::tcsetwinsize(&self.primary, winsize(rows, cols)).expect("the size is settable");
@@ -340,6 +359,14 @@ fn caller_terminal(size: (u16, u16)) -> (OwnedFd, OwnedFd) {
     let replica = rustix::pty::ioctl_tiocgptpeer(&primary, flags).expect("the replica opens");
     termios::tcsetwinsize(&primary, winsize(size.0, size.1)).expect("the size is settable");
     (primary, replica)
+}
+
+/// Whether `settings` are raw: canonical input and echo both off, the two a
+/// cooked terminal always has.
+fn is_raw(settings: &Termios) -> bool {
+    !settings
+        .local_modes
+        .intersects(LocalModes::ICANON | LocalModes::ECHO)
 }
 
 /// A window size in rows and columns.
@@ -723,6 +750,123 @@ fn an_expired_deadline_reports_no_status_against_a_command_that_never_stops_prin
     );
 }
 
+// -- A command that outlives its terminal -------------------------------------
+
+/// A command that closes its standard streams and keeps running. Closing them
+/// closes the last replica, which ends the relaying; `exec` keeps the sleep the
+/// command process itself, so a termination request reaches it directly.
+const CLOSES_ITS_TERMINAL: &str = "echo ready; exec 0<&- 1>&- 2>&-; exec sleep 60";
+
+/// End-of-file on the sandbox's terminal ends the relaying, not the command,
+/// and the deadline still stops the command.
+#[test]
+fn a_deadline_stops_a_command_that_closed_its_terminal() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let cage = shell(rootfs, CLOSES_ITS_TERMINAL);
+    let started = Instant::now();
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        Some((Duration::from_secs(2), Duration::from_secs(1))),
+        |terminal| cage.spawn_terminal(terminal),
+        |caller| caller.expect("ready"),
+    );
+
+    assert!(
+        matches!(session.outcome, Ok(None)),
+        "the deadline passed, so no status is reported: {:?}",
+        session.outcome,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the deadline did not stop the command once its terminal closed",
+    );
+    session.assert_restored();
+}
+
+/// A signal from outside still reaches a command whose terminal has closed.
+///
+/// Raised only once the relay has restored the caller's terminal, which it does
+/// as it stops relaying, so the signal is answered by the wait for the
+/// command's exit rather than by the loop before it.
+#[test]
+fn a_termination_request_reaches_a_command_that_closed_its_terminal() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let cage = shell(rootfs, CLOSES_ITS_TERMINAL);
+    let started = Instant::now();
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        None,
+        |terminal| cage.spawn_terminal(terminal),
+        |caller| {
+            caller.expect("ready");
+            caller.expect_restored();
+            caller.signal(Signal::TERM);
+        },
+    );
+
+    assert_eq!(
+        session.status().signal(),
+        Some(Signal::TERM.as_raw()),
+        "the command was ended by the forwarded request: {:?}",
+        session.outcome,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the request did not reach the command once its terminal closed",
+    );
+    session.assert_restored();
+}
+
+/// An interrupt raised while the session was relayed counts toward the kill
+/// that a second one sends after the terminal has closed.
+///
+/// The command ignores `SIGTERM`, so the first interrupt's request leaves it
+/// running and only the kill ends it. The ignored disposition survives the
+/// `exec`, which keeps the sleep deaf to the request too. The command closes
+/// its terminal only once it reads a line, so the first interrupt is answered
+/// while the session is still relayed.
+#[test]
+fn an_interrupt_before_the_terminal_closed_counts_toward_the_kill() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let cage = shell(
+        rootfs,
+        "trap '' TERM; echo ready; read line; exec 0<&- 1>&- 2>&-; exec sleep 60",
+    );
+    let started = Instant::now();
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        None,
+        |terminal| cage.spawn_terminal(terminal),
+        |caller| {
+            caller.expect("ready");
+            caller.signal(Signal::INT);
+            // Long enough for the relay to read the first and act on it:
+            // identical signals coalesce while pending.
+            caller.settle(Duration::from_millis(500));
+            caller.send("go\n");
+            caller.expect_restored();
+            caller.signal(Signal::INT);
+        },
+    );
+
+    assert_eq!(
+        session.status().signal(),
+        Some(Signal::KILL.as_raw()),
+        "only the kill ends a command that ignores the request: {:?}",
+        session.outcome,
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
 // -- The other launch paths ---------------------------------------------------
 
 /// The network seam's terminal launch relays the same way, and its wait is as
@@ -753,36 +897,12 @@ fn a_session_held_at_the_network_seam_relays_once_it_proceeds() {
 }
 
 /// The restriction fallback's terminal launch relays the same way.
-///
-/// It runs a host binary rather than a sandboxed one, so it needs no user
-/// namespace and no rootfs fixture — but it does need the confinement a
-/// restriction exists to apply, so it skips where the kernel offers no
-/// Landlock. `FERRODAY_CAGE_REQUIRE_LANDLOCK` turns that skip into a failure.
 #[cfg(feature = "hardening")]
 #[test]
 fn a_restricted_session_relays() {
-    if ferroday_cage::host::landlock_abi().is_none() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
-            "Landlock is required but the kernel offers none",
-        );
-        eprintln!("skipping: the kernel offers no Landlock support");
+    let Some(restriction) = restricted_shell("echo marker-from-inside") else {
         return;
-    }
-    // The command runs from the system trees, so they are what it is granted;
-    // the pseudoterminal arrives as descriptors and needs no path at all.
-    let mut builder = ferroday_cage::Restriction::builder()
-        .command("/bin/sh")
-        .args(["-c", "echo marker-from-inside"]);
-    for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
-        if std::path::Path::new(tree).exists() {
-            builder = builder.landlock_fs(
-                ferroday_cage::FsAccess::READ | ferroday_cage::FsAccess::EXECUTE,
-                tree,
-            );
-        }
-    }
-    let restriction = builder.build().expect("a valid restriction configuration");
+    };
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -793,6 +913,272 @@ fn a_restricted_session_relays() {
 
     assert!(session.status().success(), "{}", session.seen);
     session.assert_restored();
+}
+
+/// The restriction fallback's command is bounded by the deadline once its
+/// terminal has closed, as a sandbox's is.
+#[cfg(feature = "hardening")]
+#[test]
+fn a_deadline_stops_a_restricted_command_that_closed_its_terminal() {
+    let Some(restriction) = restricted_shell(CLOSES_ITS_TERMINAL) else {
+        return;
+    };
+    let started = Instant::now();
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        Some((Duration::from_secs(2), Duration::from_secs(1))),
+        |terminal| restriction.spawn_terminal(terminal),
+        |caller| caller.expect("ready"),
+    );
+
+    assert!(
+        matches!(session.outcome, Ok(None)),
+        "the deadline passed, so no status is reported: {:?}",
+        session.outcome,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the deadline did not stop the command once its terminal closed",
+    );
+    session.assert_restored();
+}
+
+/// A restriction running `/bin/sh -c script` from the host's system trees, or
+/// `None`, with the skip reported, where the kernel offers no Landlock.
+///
+/// It runs a host binary rather than a sandboxed one, so it needs no user
+/// namespace and no rootfs fixture. It does need the confinement a restriction
+/// exists to apply, and `FERRODAY_CAGE_REQUIRE_LANDLOCK` turns the skip into a
+/// failure.
+#[cfg(feature = "hardening")]
+fn restricted_shell(script: &str) -> Option<ferroday_cage::Restriction> {
+    if ferroday_cage::host::landlock_abi().is_none() {
+        assert!(
+            std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
+            "Landlock is required but the kernel offers none",
+        );
+        eprintln!("skipping: the kernel offers no Landlock support");
+        return None;
+    }
+    // The command runs from the system trees, so they are what it is granted;
+    // the pseudoterminal arrives as descriptors and needs no path at all.
+    let mut builder = ferroday_cage::Restriction::builder()
+        .command("/bin/sh")
+        .args(["-c", script]);
+    for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+        if std::path::Path::new(tree).exists() {
+            builder = builder.landlock_fs(
+                ferroday_cage::FsAccess::READ | ferroday_cage::FsAccess::EXECUTE,
+                tree,
+            );
+        }
+    }
+    Some(builder.build().expect("a valid restriction configuration"))
+}
+
+// -- Raw mode and the foreground ----------------------------------------------
+
+/// Names the role this test binary plays when it runs itself as the child of
+/// [`a_session_started_in_the_background_leaves_the_terminal_to_its_shell`].
+const BACKGROUND_HELPER: &str = "FERRODAY_CAGE_TEST_BACKGROUND_RELAY";
+
+/// A relay started in the background leaves the terminal's settings to the
+/// shell in the foreground, and enters raw mode once `fg` brings it forward.
+///
+/// The relay blocks `SIGTTOU`, so a `tcsetattr` from the background succeeds
+/// rather than stopping it, and only the relay's own check keeps it from
+/// rewriting a terminal it does not hold. That needs a session with job
+/// control, which this test process cannot become without taking every other
+/// test with it. So it runs this test binary as a child process in a session of
+/// its own, with a fresh pseudoterminal as its controlling terminal, and the
+/// child plays both the shell and the job; see
+/// [`helper_relay_started_in_the_background`].
+#[test]
+fn a_session_started_in_the_background_leaves_the_terminal_to_its_shell() {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    let (primary, replica) = caller_terminal((24, 80));
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let mut command = Command::new(exe);
+    command
+        .args([
+            "--exact",
+            "helper_relay_started_in_the_background",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(BACKGROUND_HELPER, "1")
+        .stdin(Stdio::from(
+            replica.try_clone().expect("the replica clones"),
+        ))
+        .stdout(Stdio::from(
+            replica.try_clone().expect("the replica clones"),
+        ))
+        .stderr(Stdio::from(
+            replica.try_clone().expect("the replica clones"),
+        ));
+    // SAFETY: between fork and exec the child calls only `setsid` and one
+    // ioctl, both async-signal-safe, and allocates nothing. A session of its
+    // own is what lets the replica become the child's controlling terminal.
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::setsid()?;
+            rustix::process::ioctl_tiocsctty(rustix::stdio::stdin())?;
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("the helper starts");
+    // The test's own copy goes, so the helper's exit hangs the primary up.
+    drop(replica);
+
+    // Drained throughout, so neither the helper's report nor the sandbox's
+    // output can fill the terminal and stall the helper.
+    let mut seen = String::new();
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the helper can be waited for") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the helper did not finish; it printed:\n{seen}");
+        }
+        common::drain_until(
+            &primary,
+            Instant::now() + Duration::from_millis(50),
+            &mut seen,
+        );
+    };
+    while common::drain_until(
+        &primary,
+        Instant::now() + Duration::from_millis(100),
+        &mut seen,
+    ) {}
+    assert!(status.success(), "the helper failed; it printed:\n{seen}");
+}
+
+/// Not a test of its own: when [`BACKGROUND_HELPER`] is set, this plays a shell
+/// starting a relayed session with `&` and then bringing it to the foreground.
+/// Without the variable it does nothing.
+///
+/// Its process is a session leader whose controlling terminal is its standard
+/// input. The shell's part is a process group of its own that holds the
+/// foreground, which is what `&` leaves behind. The relay runs on this thread,
+/// and a driver thread plays the shell's `bg` and `fg`. Each continue goes to
+/// the relay's thread rather than to the process, for the reason the module
+/// documentation gives.
+#[test]
+fn helper_relay_started_in_the_background() {
+    use std::os::unix::process::CommandExt as _;
+
+    if std::env::var_os(BACKGROUND_HELPER).is_none() {
+        return;
+    }
+    let rootfs =
+        common::fixture_rootfs().expect("the parent runs the helper only where sandboxes launch");
+    let signals = Signals::install().expect("the relay's signals install");
+    let relay_thread = rustix::thread::gettid();
+    let terminal = rustix::stdio::stdin();
+    assert!(
+        !is_raw(&termios::tcgetattr(terminal).expect("the terminal reports its settings")),
+        "the helper's premise: a cooked terminal",
+    );
+
+    // The shell's process group takes the foreground, leaving this one in the
+    // background, as `&` does.
+    let mut foreground = std::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a process to hold the foreground starts");
+    let shell_group = Pid::from_raw(foreground.id() as i32).expect("a live process id");
+    termios::tcsetpgrp(terminal, shell_group).expect("the foreground moves to the shell's group");
+
+    let cage = shell(rootfs, "echo ready; sleep 60");
+    let (mut running, pty) = cage
+        .spawn_terminal(&Terminal::new())
+        .expect("the command starts on a terminal of its own");
+    let raised = |signal: Signal| {
+        // SAFETY: the relay's thread has this signal blocked, so it is made
+        // pending on that thread's signal descriptor rather than delivered.
+        // The thread id is the relay's, live for as long as the relay is.
+        unsafe {
+            syscalls::syscall!(
+                syscalls::Sysno::tkill,
+                relay_thread.as_raw_nonzero().get(),
+                signal.as_raw()
+            )
+        }
+        .is_ok()
+    };
+    let raw_now = || termios::tcgetattr(terminal).is_ok_and(|settings| is_raw(&settings));
+
+    let (outcome, report) = std::thread::scope(|scope| {
+        // The driver records what it saw and always ends the session, so a
+        // failed observation is reported rather than left as a relay that
+        // never returns.
+        let driver = scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(500));
+            let at_start = raw_now();
+            // `bg`: a continue that leaves the session in the background.
+            raised(Signal::CONT);
+            std::thread::sleep(Duration::from_millis(300));
+            let after_bg = raw_now();
+            // `fg`: the foreground moves to the session's group, then the
+            // continue. This thread inherited the relay's blocked SIGTTOU,
+            // which is what lets a background group take the foreground.
+            let moved = termios::tcsetpgrp(terminal, rustix::process::getpgrp()).is_ok();
+            raised(Signal::CONT);
+            let deadline = Instant::now() + PROMPTLY;
+            let mut after_fg = raw_now();
+            while !after_fg && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                after_fg = raw_now();
+            }
+            raised(Signal::TERM);
+            (at_start, after_bg, moved, after_fg)
+        });
+        let outcome = Relay::new(terminal, rustix::stdio::stdout()).raw(true).run(
+            &mut running,
+            &pty,
+            &signals,
+        );
+        (outcome, driver.join().expect("the driver completes"))
+    });
+    let _ = foreground.kill();
+    let _ = foreground.wait();
+
+    let (at_start, after_bg, moved, after_fg) = report;
+    assert!(
+        !at_start,
+        "a session started in the background put the shell's terminal into raw mode",
+    );
+    assert!(
+        !after_bg,
+        "a continue that left the session in the background entered raw mode",
+    );
+    assert!(moved, "the session's group could not take the foreground");
+    assert!(
+        after_fg,
+        "brought to the foreground, the session stayed cooked"
+    );
+    assert!(
+        !raw_now(),
+        "the terminal was not restored when the session ended",
+    );
+    assert!(
+        matches!(outcome, Ok(Some(_))),
+        "the session ended on the termination request: {outcome:?}",
+    );
 }
 
 // -- Restoration outside a session --------------------------------------------

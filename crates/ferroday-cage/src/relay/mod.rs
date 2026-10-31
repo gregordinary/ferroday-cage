@@ -65,20 +65,42 @@
 //!   call [`Pty::resize`], which is how a full-screen program inside learns to
 //!   redraw.
 //! - **`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`** — forward: terminate the
-//!   sandbox and keep relaying. The sandbox's exit closes the replicas,
-//!   end-of-file ends the loop, and restoration happens on the normal path. A
-//!   second such signal escalates to a kill. These arrive only from *outside*:
-//!   in raw mode a typed `^C` is a byte the relay forwards, which the sandbox's
-//!   own line discipline turns into the sandbox's own `SIGINT`, delivered to the
-//!   sandbox's own foreground process group. Forwarding the four from outside is
-//!   what keeps the caller's shell managing the relaying process as one job and
-//!   that process passing the management on.
+//!   sandbox and keep relaying. The sandbox's exit closes the replicas, which
+//!   ends the relaying, and restoration happens on the normal path. A second
+//!   such signal escalates to a kill. These arrive only from *outside*: in raw
+//!   mode a typed `^C` is a byte the relay forwards, which the sandbox's own
+//!   line discipline turns into the sandbox's own `SIGINT`, delivered to the
+//!   sandbox's own foreground process group. Forwarding the four from outside
+//!   is what keeps the caller's shell managing the relaying process as one job
+//!   and that process passing the management on.
 //! - **`SIGTSTP`** — restore the terminal, then stop with a self-directed
 //!   `SIGSTOP`.
 //! - **`SIGCONT`** — re-enter raw mode and re-read the window size, which may
-//!   have changed while stopped. The discipline `less` follows.
+//!   have changed while stopped. The discipline `less` follows. A continue
+//!   that leaves the process in the background, as `bg` does, re-enters
+//!   nothing.
 //! - **`SIGTTOU`** — blocked for the effect of blocking it, and otherwise
 //!   ignored; see [`Signals`].
+//!
+//! # The session ends with the command, not with its terminal
+//!
+//! End-of-file on the primary means that no replica is open, and nothing more.
+//! The sandbox's own processes hold no copy, so a command that closes its
+//! standard streams ends the relaying and goes on running. [`Relay::run`] then
+//! restores the caller's terminal and waits for the command's exit with the
+//! same deadline and the same signals in force: a timeout still escalates, and
+//! a `SIGINT` or `SIGTERM` from outside still reaches the command.
+//!
+//! # Raw mode belongs to the foreground
+//!
+//! Raw mode is entered only while the relaying process is in the foreground
+//! process group of the terminal it was given. A relay started in the
+//! background, `fcage --terminal ... &`, leaves the terminal to the shell that
+//! holds it. `SIGTTOU` is blocked, so nothing else would stop a background
+//! `tcsetattr`. The relay enters raw mode on the first continue that finds it in
+//! the foreground, which is what `fg` sends. A terminal that is not the
+//! process's controlling terminal has no foreground to defer to, and raw mode
+//! applies at once.
 //!
 //! # The two directions are not symmetric
 //!
@@ -112,7 +134,8 @@
 //! unwinding through it; the optional panic hook, which restores *before* the
 //! default hook prints, because with `OPOST` off a backtrace prints
 //! stair-stepped and a drop runs after the hook; and the stop path, which
-//! restores before the process stops and re-enters raw mode when it continues.
+//! restores before the process stops and re-enters raw mode when it continues
+//! in the foreground.
 //! [`restore_terminal`] states what restoration does and does not promise.
 
 mod escalation;
@@ -172,9 +195,11 @@ const INPUT: usize = 2;
 ///
 /// Two things, both stated:
 ///
-/// - The caller's input descriptor enters raw mode for the loop's duration when
-///   [`raw`](Self::raw) asked for it, and is restored on every exit from
-///   [`run`](Self::run), a panic unwinding through it included.
+/// - The caller's input descriptor enters raw mode while the session is
+///   relayed, when [`raw`](Self::raw) asked for it and the relaying process is
+///   in that terminal's foreground. It is restored when the relaying ends, and
+///   on every exit from [`run`](Self::run), a panic unwinding through it
+///   included.
 /// - The [`Pty`] is left non-blocking. A large paste must not stall the loop, so
 ///   the primary is `O_NONBLOCK` and what it will not take waits behind
 ///   `POLLOUT`. The flag is not undone: the session is over by then, and the
@@ -188,7 +213,7 @@ pub struct Relay<'fd> {
     input: BorrowedFd<'fd>,
     /// Where the sandbox's bytes go.
     output: BorrowedFd<'fd>,
-    /// Whether the input is put into raw mode for the loop's duration.
+    /// Whether the input is put into raw mode while the session is relayed.
     raw: bool,
     /// The bounded stop, or `None` for a session bounded only by the command.
     escalation: Option<Escalation>,
@@ -210,12 +235,17 @@ impl<'fd> Relay<'fd> {
         }
     }
 
-    /// Puts `input` into raw mode for the loop's duration.
+    /// Puts `input` into raw mode while the session is relayed.
     ///
     /// Off by default: the relay never touches termios unasked. Raw mode is what
     /// makes an interactive session behave — keystrokes pass through unbuffered,
     /// and the sandbox's own line discipline turns a typed `^C` into a `SIGINT`
     /// for the sandbox's own foreground process group.
+    ///
+    /// Raw mode is entered only while the relaying process is in the
+    /// terminal's foreground process group, so a session started in the
+    /// background leaves the terminal to the shell holding it until `fg`
+    /// brings the session forward. The module documentation states the rule.
     ///
     /// Asking for it on an input that is not a terminal fails the run rather
     /// than being ignored, because a caller that says so has said something the
@@ -236,21 +266,25 @@ impl<'fd> Relay<'fd> {
         self
     }
 
-    /// Drives the session to end-of-file on the primary, restores what it
-    /// changed, and collects the outcome.
+    /// Drives the session until the command's exit is collected, restores what
+    /// it changed, and reports the outcome.
     ///
     /// `Ok(None)` means a deadline passed, whatever became of the command
-    /// afterwards — [`Escalation::outcome`]'s convention. Returns as soon as the
-    /// session ends: end-of-file on the primary means every replica is closed
-    /// and the command is already gone, so the [`wait`](Running::wait) this
-    /// finishes with does not block.
+    /// afterwards — [`Escalation::outcome`]'s convention.
+    ///
+    /// The session runs in two phases. The first relays both directions until
+    /// end-of-file on the primary, which means only that no replica is open
+    /// any more. A command that closed its standard streams is still running,
+    /// so the second phase waits for its exit, and the deadline and the relayed
+    /// signals bind it there exactly as they bind the first.
     ///
     /// The order on the way in is everything fallible first, then raw mode
     /// immediately before the loop, so every failure before that point leaves
-    /// the caller's terminal untouched. On the way out it reverses: the loop
-    /// ends, the terminal is restored, and only then is the outcome collected —
-    /// which is what keeps a diagnostic from printing stair-stepped down a
-    /// screen still in raw mode.
+    /// the caller's terminal untouched. On the way out it reverses: the relaying
+    /// ends, the terminal is restored, and only then is the command waited out
+    /// — which is what keeps a diagnostic from printing stair-stepped down a
+    /// screen still in raw mode, and what leaves the caller's terminal usable
+    /// for as long as a command with no terminal left takes to exit.
     pub fn run(
         mut self,
         running: &mut Running<'_>,
@@ -277,17 +311,62 @@ impl<'fd> Relay<'fd> {
             .escalation
             .take()
             .unwrap_or_else(|| Escalation::new(None, Duration::ZERO));
-        let outcome = self.pump(running, pty, signals, guard.as_ref(), &mut escalation);
+        // A second interrupt escalates; the first is a request. Shared by the
+        // two phases, so an interrupt that arrives while the session is
+        // relaying counts toward the kill that one after it sends.
+        let mut interrupted = false;
+        let outcome = self.pump(
+            running,
+            pty,
+            signals,
+            guard.as_ref(),
+            &mut escalation,
+            &mut interrupted,
+        );
         drop(guard);
         outcome?;
 
-        // The wait is prompt: the loop ended at end-of-file on the primary,
-        // which means every replica is closed and the command is already gone.
-        let status = running.wait()?;
+        let status = self.await_exit(running, signals, &mut escalation, &mut interrupted)?;
         Ok(escalation.outcome(status))
     }
 
-    /// The loop proper.
+    /// The second phase: waits out a command whose terminal has closed.
+    ///
+    /// End-of-file on the primary says that no replica is open, and nothing
+    /// about the command: the sandbox's own processes drop their copies, so a
+    /// command that closes its standard streams ends the relaying and keeps
+    /// running. What is left to wait for is its exit, and the wait answers the
+    /// same two things the loop does. The deadline is the wait's own, and the
+    /// signal descriptor wakes it, so a passed deadline still escalates and a
+    /// `SIGINT` or `SIGTERM` from outside still reaches the command.
+    ///
+    /// The session's terminal plays no further part. The caller's is already
+    /// restored, so a stop needs no restoration and a continue re-enters
+    /// nothing, and a window change has no terminal left to resize.
+    fn await_exit(
+        &self,
+        running: &mut Running<'_>,
+        signals: &Signals,
+        escalation: &mut Escalation,
+        interrupted: &mut bool,
+    ) -> Result<ExitStatus, RelayError> {
+        loop {
+            // The clock is asked on every pass, as the loop asks it, so a wake
+            // on the signal descriptor cannot postpone a deadline it overlaps.
+            if escalation.passed() {
+                escalation.expire(running)?;
+            }
+            if let Some(status) =
+                running.wait_or_readable(escalation.deadline(), signals.as_fd())?
+            {
+                return Ok(status);
+            }
+            self.handle_signals(running, signals, None, None, interrupted)?;
+        }
+    }
+
+    /// The first phase: relays both directions until end-of-file on the
+    /// primary.
     fn pump(
         &self,
         running: &mut Running<'_>,
@@ -295,13 +374,12 @@ impl<'fd> Relay<'fd> {
         signals: &Signals,
         guard: Option<&RawMode<'_>>,
         escalation: &mut Escalation,
+        interrupted: &mut bool,
     ) -> Result<(), RelayError> {
         let signal_fd = signals.as_fd();
         let mut input_open = true;
         let mut pending: Vec<u8> = Vec::new();
         let mut buf = [0u8; RELAY_BUF];
-        // A second interrupt escalates; the first is a request.
-        let mut interrupted = false;
 
         loop {
             // The caller's input is watched only while there is room to put what
@@ -341,15 +419,15 @@ impl<'fd> Relay<'fd> {
             // makes the expiry a consequence of the clock.
             if escalation.passed() {
                 // Escalate, and keep relaying: the sandbox's exit closes the
-                // replicas, end-of-file ends the loop, and restoration happens
-                // on the normal path.
+                // replicas, end-of-file ends the loop, and the wait that
+                // follows collects the exit.
                 escalation.expire(running)?;
             }
 
             let ready: [PollFlags; 3] = std::array::from_fn(|index| slots[index].revents());
 
             if ready[SIGNALS].intersects(PollFlags::IN) {
-                self.handle_signals(running, pty, signals, guard, &mut interrupted)?;
+                self.handle_signals(running, signals, Some(pty), guard, interrupted)?;
             }
 
             // Drain whatever the primary can take of the pending buffer, then
@@ -392,14 +470,16 @@ impl<'fd> Relay<'fd> {
 
             if ready[PRIMARY].intersects(PollFlags::IN | PollFlags::HUP) {
                 match rustix::io::read(pty, &mut buf) {
-                    // End-of-file on the primary is the session-over signal.
+                    // End-of-file on the primary: no replica is open, so there
+                    // is nothing left to relay in either direction. The command
+                    // may still be running; `await_exit` is what waits for it.
                     Ok(0) => return Ok(()),
                     // Blocking, and outside the poll; see the module's "The two
                     // directions are not symmetric".
                     Ok(read) => write_all(self.output, &buf[..read])?,
                     Err(Errno::INTR | Errno::AGAIN) => {}
                     // Hangup on a pseudoterminal primary is EIO, and it is the
-                    // same end of session.
+                    // same end of relaying.
                     Err(Errno::IO) => return Ok(()),
                     Err(errno) => {
                         return Err(RelayError::at("reading the sandbox's terminal")(errno));
@@ -410,18 +490,26 @@ impl<'fd> Relay<'fd> {
     }
 
     /// Drains the signal descriptor and acts on everything it carried.
+    ///
+    /// `pty` is the session's terminal while it is still being relayed, and
+    /// `None` once it has closed; `guard` is the caller's terminal in raw mode,
+    /// where the session put it there and has not yet restored it.
     fn handle_signals(
         &self,
         running: &mut Running<'_>,
-        pty: &Pty,
         signals: &Signals,
+        pty: Option<&Pty>,
         guard: Option<&RawMode<'_>>,
         interrupted: &mut bool,
     ) -> Result<(), RelayError> {
         while let Some(signal) = signals.next()? {
             match signal {
                 // The caller's terminal changed size; the sandbox's follows.
-                Signal::WINCH => self.follow_size(pty)?,
+                Signal::WINCH => {
+                    if let Some(pty) = pty {
+                        self.follow_size(pty)?;
+                    }
+                }
                 // These arrive only from outside: in raw mode a typed `^C` is a
                 // byte the relay forwards, which the sandbox's own line
                 // discipline turns into the sandbox's own SIGINT.
@@ -435,7 +523,9 @@ impl<'fd> Relay<'fd> {
                 // Restore before stopping, so the shell that resumes finds its
                 // terminal as it left it. The self-directed SIGSTOP returns once
                 // something continues this process, and the SIGCONT that did so
-                // is pending on the descriptor.
+                // is pending on the descriptor. Once the session's terminal has
+                // closed, the caller's is already restored and the stop is all
+                // that is left to do.
                 Signal::TSTP => {
                     if let Some(guard) = guard {
                         guard.restore_for_stop();
@@ -445,10 +535,14 @@ impl<'fd> Relay<'fd> {
                 }
                 // Continued: re-enter raw mode and re-read the size, which may
                 // have changed while stopped. The discipline `less` follows.
+                // A continue that leaves this process in the background, as
+                // `bg` does, re-enters nothing; see `RawMode::reenter`.
                 Signal::CONT => {
                     if let Some(guard) = guard {
                         guard.reenter()?;
-                        self.follow_size(pty)?;
+                        if let Some(pty) = pty {
+                            self.follow_size(pty)?;
+                        }
                     }
                 }
                 _ => {}

@@ -39,6 +39,9 @@ consumer upgrading can skip it.
   log opened for appending. A relayed standard input puts the command in a
   session of its own, as `--stdin null` does, and a relay that cannot deliver
   the command's output exits 125.
+- The network stack refuses AWS's IPv6 instance-service block, `fd00:ec2::/32`,
+  whose metadata service at `fd00:ec2::254` serves the instance role's
+  credentials. The IPv4 metadata service was already refused as link-local.
 - The `pgp` dependency moves to 0.21 and the `ruzstd` floor to 0.9.1. rPGP 0.20
   parsed nested embedded signatures by unbounded recursion, so a signed document
   fetched from a mirror (a Debian `InRelease`, a Gentoo pointer, digest document
@@ -204,6 +207,24 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- `Relay::run`, and so `fcage --terminal`, honors the `Escalation` deadline and
+  the relayed signals until the command's exit is collected. End-of-file on the
+  sandbox's terminal ended the session's supervision, so a command that closed
+  its standard streams outlived `--timeout` and ignored `SIGINT` and `SIGTERM`
+  until it exited on its own. The caller's terminal is restored as soon as the
+  relaying ends, before that wait.
+- A terminal relay started in the background, `fcage --terminal ... &`, no
+  longer puts the shell's terminal into raw mode. Raw mode is entered only while
+  the relaying process is in the terminal's foreground process group, at the
+  start and on each `SIGCONT`, so `fg` enters it and `bg` does not.
+- The network stack no longer spins at full CPU when a UDP reply cannot be
+  delivered to the guest: a host socket is waited on only while the guest's side
+  has room for its reply. TCP and UDP are carried only from the guest's own
+  address, and a frame from any other source is dropped, since nothing sent back
+  to it can be delivered.
+- `NetStackBuilder::build` refuses an interface name holding a vertical tab or
+  the byte `0xA0`, which the kernel refuses, rather than failing at `attach` as
+  `TapCreate`.
 - A provisioner's host-side read of a file inside a tree no longer waits on a
   named pipe left at that path. Opening one for reading waited for a writer that
   never came, which stalled the bootstrap for good. It is now refused, as any

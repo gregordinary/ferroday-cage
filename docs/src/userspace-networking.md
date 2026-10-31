@@ -119,19 +119,20 @@ unrecoverable error, which `stop` then reports.
 
 ### Resource model and tenancy
 
-Each attachment bounds what one guest can consume: a guest serves at most 128
-concurrent TCP flows and tracks at most 256 UDP flows, and each is backed by a
-host socket. The TCP cap counts flows in flight rather than connections made: a
-flow's slot, its buffers, and its host socket are released once the exchange has
-closed on both sides, whichever side closed first, so a guest opening and
-closing connections back to back is not throttled by the table. Those caps are
-per attachment, not per process. The pump and every host socket run in the
-caller's own process, so several attachments in one process draw on one shared
-descriptor table and one heap; the per-guest caps do not partition those shared
-resources between attachments. A guest that fills its own budget can therefore
-consume enough host descriptors to affect a co-resident attachment, or the
-caller's own descriptor-opening operations, once the process's `RLIMIT_NOFILE`
-is reached.
+Each attachment bounds what one guest can consume. A guest serves at most 128
+concurrent TCP flows of its own and 128 more through its published ports. It
+tracks at most 256 UDP flows, and every flow holds a host socket. The TCP caps
+count flows in flight rather than connections made. A flow's slot, buffers, and
+host socket are released once the exchange has closed on both sides, whichever
+closed first. A guest opening and closing connections back to back is therefore
+not throttled by the table.
+
+Those caps are per attachment, not per process. The pump and every host socket
+run in the caller's own process. Several attachments in one process therefore
+share one descriptor table and one heap, which the per-guest caps do not
+partition. Once the process reaches its `RLIMIT_NOFILE`, a guest that fills its
+own budget can starve a co-resident attachment, or the caller's own opening of
+descriptors.
 
 The native stack is accordingly intended for one — or a few mutually trusted —
 sandboxes per process. A caller that must isolate untrusted tenants from one
@@ -141,15 +142,32 @@ system's rather than one shared address space's.
 
 ### What the stack forwards
 
-The stack forwards where the guest could plausibly reach and refuses what it
-should not. Multicast, broadcast, unspecified, loopback, and link-local
-destinations are always refused. A refused TCP connection is answered with a
-reset, so denial costs the guest nothing; a refused UDP datagram is simply
-dropped, and whether the guest also receives an ICMP port-unreachable depends
-on whether the stack happens to hold a socket on that port for another
-destination — read nothing into either outcome. Refusing loopback keeps the
-sandbox away from services bound to the host's `127.0.0.1`. One refusal reaches
-the guest by silence rather than by a reset; it is described below.
+The stack is an egress NAT. A destination it accepts is reached from the host's
+own network position and source address. The guest therefore reaches what the
+host reaches, the host's network neighbors included. A host service bound to a
+wildcard address, `0.0.0.0` or `::`, answers on the host's own addresses. The
+guest reaches it there, though its loopback address is refused. A caller that
+must bound egress confines it outside the stack, with a host firewall or an
+[external stack](#bring-your-own-stack) of its own.
+
+Multicast, broadcast, unspecified, loopback, and link-local destinations are
+always refused. Refusing loopback keeps the sandbox away from services bound to
+the host's `127.0.0.1`.
+
+Link-local covers the cloud metadata services at `169.254.169.254`. AWS also
+serves its instance services over IPv6, from `fd00:ec2::/32`. That block holds
+the metadata service at `fd00:ec2::254`, the DNS resolver, and the time service.
+It is a unique local block the host routes like any other, so the stack refuses
+it by name. A metadata service at any other routable address is reachable.
+
+Only TCP and UDP from the guest's own address are carried. A segment or datagram
+from any other source is dropped, since no reply to it could be delivered.
+
+A refused TCP connection is answered with a reset, so denial costs the guest
+nothing. A refused UDP datagram is dropped. Whether the guest also receives an
+ICMP port-unreachable depends on whether the stack holds a socket on that port
+for another destination. Read nothing into either outcome. One refusal reaches
+the guest by silence rather than by a reset, described below.
 
 Two refusals follow from the same principle. The IPv4 `0.0.0.0/8` block is
 refused in full rather than only the unspecified address, and an IPv6 address
@@ -230,8 +248,11 @@ handle.stop()?;
 A published connection reaches the guest from the gateway address, on the
 guest's address of the listener's family. A guest with nothing listening on the
 port refuses it, and the stack closes the host side. Once both ends are up, a
-published connection is forwarded like any other flow. It shares the same
-half-closes, the same deadlines, and the same flow budget.
+published connection is forwarded like any other flow, with the same
+half-closes and the same deadlines. It counts against a budget of its own, 128
+published connections at once. The stack closes a connection past that on the
+host side. A peer holding published connections open cannot crowd out the
+guest's own connections, nor the guest's crowd out the published ones.
 
 The host address decides who can connect. `127.0.0.1` admits the host's own
 processes, and every local user's process is among them. `0.0.0.0` or `::`

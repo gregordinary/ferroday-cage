@@ -1,17 +1,19 @@
 //! Frame classification ahead of the interface.
 //!
 //! The pump inspects every frame read from the tap before queueing it for
-//! the interface, for two reasons. A TCP connection attempt needs a listening
+//! the interface, for three reasons. A TCP connection attempt needs a listening
 //! socket to exist by the time the interface processes the segment — the
-//! same poll that ingests the SYN. And a request the interface would answer
+//! same poll that ingests the SYN. A request the interface would answer
 //! *on behalf of an address it does not own* has to be withheld from it: the
 //! interface accepts any destination (`any_ip`) so that routed traffic reaches
 //! the flows' sockets, and that switch also makes it answer address resolution
 //! and ICMP echo for the whole address space. Those two are the only frames
 //! whose answer is the interface's own, so classifying them is what keeps
-//! `any_ip` a receive rule rather than a claim of ownership. The classifier is
-//! a pure function over `smoltcp::wire`, with no state and no side effects; it
-//! reports what a frame is, and [`pump`](super::pump) decides.
+//! `any_ip` a receive rule rather than a claim of ownership. And TCP and UDP
+//! are carried only from the guest's own address, so every segment and
+//! datagram reports its source. The classifier is a pure function over
+//! `smoltcp::wire`, with no state and no side effects; it reports what a frame
+//! is, and [`pump`](super::pump) decides.
 //!
 //! Only cleanly parsed, unfragmented frames classify. IP fragmentation is
 //! not compiled in, so the interface rejects every fragment before it
@@ -21,9 +23,11 @@
 //! header is an extension header and extension headers are not walked: a
 //! connection-opening segment behind one classifies as [`Sniff::Other`],
 //! leaving it to the interface, which answers an unmatched segment with a
-//! reset. Checksums are not verified here; the interface remains the
-//! arbiter of validity, and a listener created for a segment the interface
-//! then discards is reaped by the establish deadline.
+//! reset. A datagram behind an extension header reaches its port's socket
+//! without being classified, which is why the UDP table checks the source again
+//! where it opens a flow. Checksums are not verified here; the interface
+//! remains the arbiter of validity, and a listener created for a segment the
+//! interface then discards is reaped by the establish deadline.
 
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Icmpv4Message, Icmpv4Packet,
@@ -40,6 +44,12 @@ pub(super) enum Sniff {
         src: IpEndpoint,
         /// The destination the guest addressed.
         dst: IpEndpoint,
+    },
+    /// Any other TCP segment: the interface delivers it to the flow it
+    /// belongs to, or answers it with a reset.
+    TcpSegment {
+        /// The address the segment came from.
+        src: IpAddress,
     },
     /// A UDP datagram: the interface needs a receive socket bound to its
     /// destination port before it processes the datagram.
@@ -142,7 +152,7 @@ fn classify_transport(
                     dst: IpEndpoint::new(dst, segment.dst_port()),
                 }
             } else {
-                Sniff::Other
+                Sniff::TcpSegment { src }
             }
         }
         IpProtocol::Udp => {
@@ -371,16 +381,21 @@ mod tests {
         }
     }
 
+    /// The guest's address in the fixtures' IPv4 frames.
+    const GUEST_V4: IpAddress = IpAddress::Ipv4(Ipv4Addr::new(10, 0, 2, 15));
+
     #[test]
     fn a_syn_ack_is_not_a_connection_attempt() {
+        // Still classified by its source, which is what holds every TCP segment
+        // to the guest's own address.
         let frame = tcp_frame(false, TcpControl::Syn, Some(TcpSeqNumber(3)));
-        assert_eq!(classify(&frame), Sniff::Other);
+        assert_eq!(classify(&frame), Sniff::TcpSegment { src: GUEST_V4 });
     }
 
     #[test]
     fn a_plain_segment_is_not_a_connection_attempt() {
         let frame = tcp_frame(false, TcpControl::None, Some(TcpSeqNumber(3)));
-        assert_eq!(classify(&frame), Sniff::Other);
+        assert_eq!(classify(&frame), Sniff::TcpSegment { src: GUEST_V4 });
     }
 
     #[test]

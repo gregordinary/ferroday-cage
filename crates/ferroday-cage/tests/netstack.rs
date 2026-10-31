@@ -1,11 +1,12 @@
 //! Integration tests for the native network stack: tap creation inside the
-//! sandbox's namespace, the shared-namespace refusal, and the independence
-//! of the handle's and the sandbox's lifetimes.
+//! sandbox's namespace, the shared-namespace refusal, the independence of the
+//! handle's and the sandbox's lifetimes, and the flows the stack carries in
+//! each direction.
 
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -493,19 +494,12 @@ fn udp_echo() -> (u16, mpsc::Receiver<Vec<u8>>) {
     (port, recv)
 }
 
-#[test]
-fn udp_reaches_a_host_socket() {
-    let Some(rootfs) = common::fixture_rootfs() else {
-        return;
-    };
-    if !common::tun_available() {
-        return;
-    }
-    let (port, received) = udp_echo();
-
-    // The guest sends a datagram through the gateway address, which
-    // host_loopback maps to 127.0.0.1, and reads the echo back. busybox nc
-    // -u sends the line and prints whatever comes back.
+/// Sends one datagram from the guest to the gateway's `port`, through a stack
+/// built by `stack`, and asserts that the host echo on that port received it
+/// and that the guest received the echo.
+///
+/// busybox `nc -u` sends the line and prints whatever comes back.
+fn udp_round_trip(rootfs: &Path, port: u16, received: mpsc::Receiver<Vec<u8>>, stack: NetStack) {
     let mut observer = Collect::default();
     let cage = Cage::builder()
         .rootfs(rootfs)
@@ -519,12 +513,7 @@ fn udp_reaches_a_host_socket() {
     let pending = cage
         .spawn_pending_with(&mut observer)
         .expect("the pending sandbox launches");
-    let handle = NetStack::builder()
-        .host_loopback(true)
-        .build()
-        .expect("a valid stack configuration")
-        .attach(&pending)
-        .expect("the stack attaches");
+    let handle = stack.attach(&pending).expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
     let _ = running.wait_timeout(Duration::from_secs(10));
     running.kill().ok();
@@ -540,6 +529,41 @@ fn udp_reaches_a_host_socket() {
         "datagram",
         "the guest received the echoed datagram",
     );
+}
+
+#[test]
+fn udp_reaches_a_host_socket() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    // The gateway address, which host_loopback maps to 127.0.0.1 on every
+    // port.
+    let (port, received) = udp_echo();
+    let stack = NetStack::builder()
+        .host_loopback(true)
+        .build()
+        .expect("a valid stack configuration");
+    udp_round_trip(rootfs, port, received, stack);
+}
+
+#[test]
+fn udp_reaches_a_host_socket_through_a_named_port() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    // The narrower grant maps UDP as it maps TCP: the one port it names.
+    let (port, received) = udp_echo();
+    let stack = NetStack::builder()
+        .host_loopback_port(port)
+        .build()
+        .expect("a valid stack configuration");
+    udp_round_trip(rootfs, port, received, stack);
 }
 
 #[test]
@@ -802,4 +826,94 @@ fn a_published_port_already_in_use_is_refused_at_attach() {
         matches!(&err, NetStackError::Publish { host, .. } if *host == address),
         "{err:?}",
     );
+}
+
+#[test]
+fn a_published_connection_the_guest_refuses_is_closed_on_the_host() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    // Nothing in the guest listens on the published port. The host listener
+    // accepts regardless, so the guest's refusal reaches the host as the
+    // stack closing the connection, before any byte.
+    let pending = sleeper(rootfs)
+        .spawn_pending()
+        .expect("the pending sandbox launches");
+    let handle = NetStack::builder()
+        .publish((Ipv4Addr::LOCALHOST, 0).into(), 8000)
+        .build()
+        .expect("a valid stack configuration")
+        .attach(&pending)
+        .expect("the stack attaches");
+    let address = handle.published()[0];
+    let mut running = pending.proceed().expect("the command is released");
+
+    let mut stream = std::net::TcpStream::connect(address).expect("the host listener accepts");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("the read timeout is set");
+    let mut buf = [0u8; 16];
+    let outcome = stream.read(&mut buf);
+    running.kill().expect("the kill is delivered");
+    running.wait().expect("the wait completes after a kill");
+    handle.stop().expect("the stack stops cleanly");
+
+    assert!(
+        matches!(outcome, Ok(0))
+            || matches!(&outcome, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "the refused connection was not closed on the host side: {outcome:?}",
+    );
+}
+
+#[test]
+fn a_published_port_reaches_a_server_in_the_guest_over_ipv6() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
+        eprintln!("skipping: the host has no IPv6 loopback");
+        return;
+    }
+    // An IPv6 listener carries its connections to the guest's IPv6 address,
+    // from the gateway's.
+    let mut observer = Collect::default();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "echo hello over ipv6 | /usr/bin/nc -l -p 8000"])
+        .build()
+        .expect("a valid sandbox configuration");
+    let pending = cage
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = NetStack::builder()
+        .publish((Ipv6Addr::LOCALHOST, 0).into(), 8000)
+        .build()
+        .expect("a valid stack configuration")
+        .attach(&pending)
+        .expect("the stack attaches");
+    let address = handle.published()[0];
+    assert!(address.is_ipv6(), "{address}");
+    let mut running = pending.proceed().expect("the command is released");
+
+    let (mut stream, greeting) = connect_published(address);
+    assert_eq!(greeting, "hello over ipv6\n");
+    stream.write_all(b"ping\n").expect("the host writes");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("the host half-closes");
+    let status = running
+        .wait_timeout(Duration::from_secs(10))
+        .expect("the wait completes")
+        .expect("the command exits before the deadline");
+    handle.stop().expect("the stack stops cleanly");
+
+    assert!(status.success(), "the guest's server ran to completion");
+    assert_eq!(String::from_utf8_lossy(&observer.stdout).trim(), "ping");
 }

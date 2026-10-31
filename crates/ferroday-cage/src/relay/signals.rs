@@ -31,13 +31,15 @@ use crate::mechanism::sys::{self, How, SigSet};
 ///
 /// `SIGTTOU` is blocked for the effect of blocking it rather than for anything
 /// read back. A `tcsetattr` from a background process group raises it, and its
-/// default action stops the process — so a relay put into the background would
-/// stop while entering raw mode or, worse, while restoring, leaving the caller's
-/// terminal raw with nothing left to fix it. Blocked, the call succeeds instead,
-/// and the restoration discipline holds from the background as it does from the
-/// foreground. `SIGTTIN` is deliberately *not* blocked: a backgrounded relay
-/// stopping when it tries to read the terminal is the conventional behavior, and
-/// the one the caller's shell reports.
+/// default action stops the process — so a relay put into the background while
+/// raw would stop while restoring, leaving the caller's terminal raw with
+/// nothing left to fix it. Blocked, the call succeeds instead, and the
+/// restoration discipline holds from the background as it does from the
+/// foreground. The same block would let a session *started* in the background
+/// rewrite the terminal of the shell that holds it, which is why raw mode is
+/// entered only from the foreground. `SIGTTIN` is deliberately *not* blocked: a
+/// backgrounded relay stopping when it tries to read the terminal is the
+/// conventional behavior, and the one the caller's shell reports.
 pub(super) const RELAYED: [Signal; 8] = [
     Signal::WINCH,
     Signal::INT,

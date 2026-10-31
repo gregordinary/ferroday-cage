@@ -13,4 +13,5 @@
 # cannot see it, and `tools/check-idioms.py` is what watches instead.
 disallowed-methods = [
   { path = "rustix::fs::openat2", reason = "open a directory contained in a tree through provision::containment::open_dir, which folds in the flags every caller passes and the retry the kernel asks for when a rename races the walk" },
+  { path = "rustix::rand::getrandom", reason = "fill a buffer through host::fill_random, which resumes a short read and cannot spin on an empty one; the caller keeps its own policy for a failure" },
 ]

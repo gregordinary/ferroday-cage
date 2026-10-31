@@ -68,8 +68,10 @@ blocks, so a caller that waits without reading deadlocks — which is why `run`
 and `output` are not terminal entry points at all. When an unbounded `wait()`
 starts, the `Pty` is in one of three states:
 
-- **Drained to end-of-file** — safe. End-of-file means every replica is closed
-  and the command is already gone.
+- **Drained to end-of-file** — safe. End-of-file means every replica is
+  closed, so nothing can block writing to the terminal. It does not mean the
+  command has exited: one that closes its standard streams goes on running, and
+  the wait lasts as long as it does.
 - **Dropped** — safe. After the hangup the command's writes fail with `EIO`
   rather than block, so a caller that has dropped the primary owes the wait no
   drain.
@@ -80,8 +82,8 @@ the same answer: where the caller owns both ends, the feed and the drain are the
 caller's, and a wait that must be bounded is bounded.
 
 **A caller that sends no input** drains to end-of-file and then waits. That
-terminates on its own — the example above is the whole pattern, and its second
-line is the part worth understanding.
+cannot deadlock, and it ends when the command does. The example above is the
+whole pattern, and its second line is the part worth understanding.
 
 **An interactive caller** needs both directions at once, and
 [the relay](#the-relay) is the answer: one poll loop that cannot be stalled by
@@ -417,10 +419,15 @@ left unwatched while that buffer is occupied, so it cannot grow without bound.
 End of input sends `VEOF` to the primary — read from the replica's *current*
 settings rather than assumed, since a program inside is free to have changed it
 — and retires that channel. An invalid input (`fcage --terminal ... 0<&-`) takes
-the same path, since it says the same thing. End-of-file on the primary ends the
-loop. An `Escalation` is the poll deadline, consulted on every wakeup rather
-than only on the one `poll` timed out on, so a sandbox printing without pause
-cannot postpone its own expiry.
+the same path, since it says the same thing. An `Escalation` is the poll
+deadline, consulted on every wakeup rather than only on the one `poll` timed out
+on, so a sandbox printing without pause cannot postpone its own expiry.
+
+End-of-file on the primary ends the relaying, and says nothing more: no replica
+is open, and a command that closed its standard streams is still running. The
+relay restores the caller's terminal and waits for the command's exit. The
+deadline and the relayed signals stay in force, so a timeout still escalates and
+a `SIGTERM` from outside still reaches the command.
 
 Signals are read as data rather than handled: no library code runs in signal
 context, so there are no handlers, no async-signal-safety reasoning, and no
@@ -430,6 +437,14 @@ second one kills it, while a typed `^C` is a byte the sandbox's own line
 discipline acts on; `SIGTSTP` restores and stops; `SIGCONT` re-enters raw mode
 and re-reads the size. The module's own documentation carries the whole table,
 including why `SIGTTOU` is blocked and `SIGTTIN` deliberately is not.
+
+Raw mode is entered only while the relaying process is in the foreground process
+group of its terminal. With `SIGTTOU` blocked, nothing else would stop a session
+started in the background, `fcage --terminal ... &`, from rewriting the settings
+of the shell that holds the terminal. Such a session relays without raw mode,
+and enters it on the first `SIGCONT` that finds it in the foreground, which is
+what `fg` sends. A continue from `bg` leaves it in the background and changes
+nothing.
 
 The two directions are not symmetric: the caller-bound one is a plain blocking
 write, outside the poll. Making it symmetric would need `O_NONBLOCK` on the
@@ -448,7 +463,7 @@ things that between them cover every exit the process can observe: a guard in
 through it; the optional panic hook, which restores *before* the default hook
 prints, because with `OPOST` off a backtrace prints stair-stepped and a drop
 runs after the hook; and the stop path, which restores before the process stops
-and re-enters raw mode when it continues.
+and re-enters raw mode when it continues in the foreground.
 
 `SIGKILL` and `SIGSTOP` are uncatchable and out of scope, with the same honesty
 the leaked-handle case gets: the remedy is `stty sane`, and no process can

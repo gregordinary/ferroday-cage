@@ -193,14 +193,16 @@ impl Default for Terminal {
 /// states, and only the third is a deadlock:
 ///
 /// - **Drained to end-of-file** — safe: end-of-file means every replica is
-///   closed and the command is already gone.
+///   closed, so nothing can block writing to the terminal. It does not mean the
+///   command has exited. A command that closes its standard streams goes on
+///   running, and the wait lasts as long as it does.
 /// - **Dropped** — safe: after the hangup the command's writes fail with `EIO`
 ///   rather than block, so a caller that has dropped the primary owes the wait
 ///   no drain.
 /// - **Held and unread** — the deadlocking case.
 ///
 /// A caller that sends no input drains to end-of-file and then waits, which
-/// terminates on its own:
+/// cannot deadlock and ends when the command does:
 ///
 /// ```no_run
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
