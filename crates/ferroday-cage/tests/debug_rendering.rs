@@ -161,11 +161,11 @@ fn an_absent_delegate_renders_as_absent_and_a_present_one_as_present() {
     // there, so the two cases have to look different.
     let mapper = DirectMapper::new();
     let bare = Remove::new("/srv/rootfs");
-    assert!(format!("{bare:?}").contains("mapper: None"), "{bare:?}");
+    assert!(format!("{bare:?}").contains("id_mapper: None"), "{bare:?}");
 
-    let removal = Remove::new("/srv/rootfs").mapper(mapper);
+    let removal = Remove::new("/srv/rootfs").id_mapper(mapper);
     assert!(
-        format!("{removal:?}").contains("mapper: Some(<dyn IdMapper>)"),
+        format!("{removal:?}").contains("id_mapper: Some(<dyn IdMapper>)"),
         "{removal:?}",
     );
 
@@ -197,11 +197,11 @@ fn an_export_shows_whether_it_has_a_mapper() {
     // The export takes the same delegate as the removal above, and answers the
     // same question about it: present or absent, told apart at a glance.
     let without = format!("{:?}", Export::new("/srv/rootfs"));
-    assert!(without.contains("mapper: None"), "{without}");
+    assert!(without.contains("id_mapper: None"), "{without}");
 
     let mapper = DirectMapper::new();
-    let with = format!("{:?}", Export::new("/srv/rootfs").mapper(mapper));
-    assert!(with.contains("mapper: Some(<dyn IdMapper>)"), "{with}");
+    let with = format!("{:?}", Export::new("/srv/rootfs").id_mapper(mapper));
+    assert!(with.contains("id_mapper: Some(<dyn IdMapper>)"), "{with}");
 }
 
 #[cfg(feature = "tarball")]
@@ -211,8 +211,8 @@ fn an_export_carries_the_settings_that_decide_its_output() {
     // two archives that should have matched reads them off the rendering.
     let mapper = DirectMapper::new();
     let export = Export::new("/srv/rootfs")
-        .map(IdentityMap::Subordinate)
-        .mapper(mapper)
+        .identity_map(IdentityMap::Subordinate)
+        .id_mapper(mapper)
         .clamp_mtime(1_700_000_000);
     let rendering = format!("{export:?}");
     for expected in [
@@ -315,4 +315,51 @@ fn a_pool_names_the_layout_it_would_write() {
     let bare = format!("{:?}", Pool::at(Path::new("/srv/pool")));
     assert!(bare.contains("architecture: None"), "{bare}");
     assert!(bare.contains("date: None"), "{bare}");
+}
+
+/// Every provisioner renders its transport and its identity-map delegate the
+/// same way: by presence, as `<dyn Fetch>` once built and as an `Option` on a
+/// builder, which has not chosen the default transport yet.
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+#[test]
+fn every_provisioner_renders_its_delegates_by_presence() {
+    let mut renderings: Vec<(String, String)> = Vec::new();
+    #[cfg(feature = "debian")]
+    {
+        let builder = Debian::builder("trixie");
+        renderings.push((
+            format!("{builder:?}"),
+            format!("{:?}", builder.build().expect("the bootstrap configures")),
+        ));
+    }
+    #[cfg(feature = "alpine")]
+    {
+        use ferroday_cage::provision::alpine::Alpine;
+        let builder = Alpine::builder("v3.23");
+        renderings.push((
+            format!("{builder:?}"),
+            format!("{:?}", builder.build().expect("the bootstrap configures")),
+        ));
+    }
+    #[cfg(feature = "gentoo")]
+    {
+        use ferroday_cage::provision::gentoo::Gentoo;
+        let builder = Gentoo::builder("amd64");
+        renderings.push((
+            format!("{builder:?}"),
+            format!("{:?}", builder.build().expect("the bootstrap configures")),
+        ));
+    }
+    for (builder, built) in &renderings {
+        assert!(builder.contains("fetcher: None"), "{builder}");
+        assert!(built.contains("fetcher: <dyn Fetch>"), "{built}");
+    }
+    // Gentoo takes no identity-map delegate; the other two render theirs.
+    for (builder, built) in renderings
+        .iter()
+        .filter(|(builder, _)| !builder.starts_with("GentooBuilder"))
+    {
+        assert!(builder.contains("id_mapper: None"), "{builder}");
+        assert!(built.contains("id_mapper: None"), "{built}");
+    }
 }

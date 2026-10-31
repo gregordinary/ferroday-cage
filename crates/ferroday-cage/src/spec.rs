@@ -1584,10 +1584,10 @@ impl CageBuilder {
     /// The delegate is taken by value and kept, as every builder that takes
     /// one keeps it: the [`Cage`] this builds applies it at each launch, long
     /// after the call that configured it, and may be moved to another thread
-    /// with it. A caller naming one delegate to several builders, such as a
-    /// sandbox and the export of the tree it wrote, passes each a clone. A
-    /// delegate whose answers rest on state of its own keeps that state behind
-    /// an [`Arc`], so its clones share it.
+    /// with it. A caller naming one delegate instance to several builders, such
+    /// as a sandbox and the export of the tree it wrote, passes each an
+    /// [`Arc`] of it, which is a delegate too; a `Box<dyn IdMapper>` chosen at
+    /// run time is one as well.
     pub fn id_mapper(mut self, mapper: impl IdMapper + 'static) -> Self {
         self.id_mapper = Some(Arc::new(mapper));
         self

@@ -220,15 +220,17 @@ pub struct Alpine {
 }
 
 impl fmt::Debug for Alpine {
-    /// Renders the configuration. The transport is named by neither its type
-    /// nor its state, since a `Fetch` is a caller's value and this crate knows
-    /// nothing renderable about one.
+    /// Renders the configuration, and the transport and the identity-map
+    /// delegate by their presence rather than their contents: both are a
+    /// caller's code, with nothing useful to show.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Alpine")
             .field("architecture", &self.architecture)
             .field("repositories", &self.repositories)
             .field("world", &self.world)
             .field("excludes", &self.excludes)
+            .field("pins", &self.pins)
+            .field("plan", &self.plan)
             .field("extract_only", &self.extract_only)
             .field("identity_map", &self.identity_map)
             .field(
@@ -239,7 +241,8 @@ impl fmt::Debug for Alpine {
             .field("overlay", &self.overlay)
             .field("source_date_epoch", &self.source_date_epoch)
             .field("base_layer", &self.base_layer)
-            .finish_non_exhaustive()
+            .field("fetcher", &Delegate("dyn Fetch"))
+            .finish()
     }
 }
 
@@ -585,8 +588,9 @@ pub struct AlpineBuilder {
 }
 
 impl fmt::Debug for AlpineBuilder {
-    /// Renders the configuration, naming the keys rather than holding them and
-    /// leaving the transport out, as [`Alpine`]'s own rendering does.
+    /// Renders every setting made so far, naming the keys rather than holding
+    /// them, and the transport and the identity-map delegate by their
+    /// presence, as [`Alpine`]'s own rendering does.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AlpineBuilder")
             .field("release", &self.release)
@@ -610,7 +614,11 @@ impl fmt::Debug for AlpineBuilder {
             .field("source_date_epoch", &self.source_date_epoch)
             .field("base_layer", &self.base_layer)
             .field("repositories", &self.repositories)
-            .finish_non_exhaustive()
+            .field(
+                "fetcher",
+                &self.fetcher.as_ref().map(|_| Delegate("dyn Fetch")),
+            )
+            .finish()
     }
 }
 
@@ -825,9 +833,9 @@ impl AlpineBuilder {
     /// preflight that refuses an unavailable map before any download asks it
     /// too. A tree a site-specific delegate established ownership in is
     /// exported, copied into, and removed through that same delegate:
-    /// [`Export::mapper`](super::Export::mapper),
-    /// [`CopyIn::mapper`](super::CopyIn::mapper), and
-    /// [`Remove::mapper`](super::Remove::mapper). The delegate is taken by
+    /// [`Export::id_mapper`](super::Export::id_mapper),
+    /// [`CopyIn::id_mapper`](super::CopyIn::id_mapper), and
+    /// [`Remove::id_mapper`](super::Remove::id_mapper). The delegate is taken by
     /// value and kept; [`CageBuilder::id_mapper`] says why.
     ///
     /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper

@@ -245,7 +245,7 @@ fn storm(options: &Options, scratch: &Path, trial: u32) -> Result<Misses, String
     // published rootfs with a lock beside it.
     for layer in [&upper, &work] {
         let _ = provision::Remove::new(layer)
-            .map(IdentityMap::Single)
+            .identity_map(IdentityMap::Single)
             .remove_lock(false)
             .run();
     }

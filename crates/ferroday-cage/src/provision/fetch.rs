@@ -146,7 +146,9 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 /// A borrowed transport would tie the provisioner to the frame that lent it,
 /// and so to that frame's thread. A transport that shares state with its
 /// caller, such as a connection pool or a record of what was fetched, holds
-/// that state behind an [`Arc`].
+/// that state behind an [`Arc`]. A transport chosen at run time is a
+/// `Box<dyn Fetch>`, which is a transport too: a box forwards every method to
+/// what it holds.
 ///
 /// [`Cell`]: std::cell::Cell
 /// [`Arc`]: std::sync::Arc
@@ -157,6 +159,12 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 /// body, so an existing implementation keeps compiling. New per-request inputs
 /// arrive as accessors on [`FetchRequest`] rather than as parameters, for the
 /// same reason.
+///
+/// A method added here is forwarded by the `Box` implementation as well,
+/// defaulted ones included. A box that left one out would run the default body
+/// in place of the boxed transport's own, which for [`fetch_all`](Self::fetch_all)
+/// turns a transport's overlapping batch into one request at a time with
+/// nothing to show for it. A test compares the two method lists.
 ///
 /// # Example
 ///
@@ -303,6 +311,27 @@ pub trait Fetch: Send {
                 self.fetch(request, sink)
             })
             .collect()
+    }
+}
+
+/// A boxed transport is a transport, so one chosen at run time is passed
+/// wherever a transport is taken.
+///
+/// Every method forwards to the boxed transport, the defaulted ones included,
+/// so a box runs the transport's own overrides rather than the trait's default
+/// bodies. A caller cannot write this for a `Box<dyn Fetch>` of its own, since
+/// neither the trait nor the type is the caller's.
+impl<F: Fetch + ?Sized> Fetch for Box<F> {
+    fn fetch(
+        &mut self,
+        request: &FetchRequest<'_>,
+        sink: &mut dyn Write,
+    ) -> Result<(), FetchError> {
+        (**self).fetch(request, sink)
+    }
+
+    fn fetch_all(&mut self, jobs: &mut [FetchJob<'_>]) -> Vec<Result<(), FetchError>> {
+        (**self).fetch_all(jobs)
     }
 }
 
@@ -620,6 +649,47 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boxed transport runs the boxed transport's own methods, its
+    /// overridden batch included, rather than the trait's default bodies.
+    #[test]
+    fn a_boxed_transport_forwards_its_own_batch() {
+        /// Records which of its two methods each request went through.
+        #[derive(Default)]
+        struct Batching {
+            took: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl Fetch for Batching {
+            fn fetch(
+                &mut self,
+                _request: &FetchRequest<'_>,
+                _sink: &mut dyn Write,
+            ) -> Result<(), FetchError> {
+                self.took.lock().unwrap().push("fetch");
+                Ok(())
+            }
+            fn fetch_all(&mut self, jobs: &mut [FetchJob<'_>]) -> Vec<Result<(), FetchError>> {
+                self.took.lock().unwrap().push("batch");
+                jobs.iter().map(|_| Ok(())).collect()
+            }
+        }
+
+        let transport = Batching::default();
+        let took = std::sync::Arc::clone(&transport.took);
+        let mut boxed: Box<dyn Fetch> = Box::new(transport);
+        let (mut first, mut second) = (Vec::new(), Vec::new());
+        let mut jobs = [
+            FetchJob::new(FetchRequest::new("file:///one"), &mut first),
+            FetchJob::new(FetchRequest::new("file:///two"), &mut second),
+        ];
+        assert_eq!(boxed.fetch_all(&mut jobs).len(), 2);
+        boxed
+            .fetch(&FetchRequest::new("file:///three"), &mut Vec::new())
+            .expect("the boxed transport serves it");
+
+        // One batch, not one fetch per job, then the single fetch.
+        assert_eq!(*took.lock().unwrap(), ["batch", "fetch"]);
+    }
 
     #[test]
     fn percent_decoding_takes_one_pass_and_refuses_a_malformed_escape() {

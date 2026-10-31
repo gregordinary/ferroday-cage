@@ -66,7 +66,7 @@ pub fn scratch_dir(name: &str) -> PathBuf {
 /// removal by the calling user; such a tree is a [`ranged_scratch`].
 pub fn force_remove_dir_all(path: &Path) {
     let _ = Remove::new(path)
-        .map(IdentityMap::Single)
+        .identity_map(IdentityMap::Single)
         .remove_lock(false)
         .run();
 }
@@ -91,7 +91,7 @@ pub fn ranged_scratch(tag: &str) -> RangedScratch {
 /// Removes a tree that may hold subordinate-owned entries, best effort.
 fn remove_ranged(path: &Path) {
     let _ = Remove::new(path)
-        .map(IdentityMap::Subordinate)
+        .identity_map(IdentityMap::Subordinate)
         .remove_lock(false)
         .run();
 }

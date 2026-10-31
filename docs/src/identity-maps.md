@@ -126,13 +126,12 @@ A caller with site-specific machinery — a privileged broker of its own, a
 different helper — supplies its own implementation through
 [`CageBuilder::id_mapper`], and the bundled delegates step aside.
 
-Every builder that establishes a range map takes the same delegate, under the
-same name or as `mapper`. The Debian and Alpine provisioners launch their
-package scripts' sandboxes through it. A tree built under it is exported, copied
-into, and removed through it too, so its ownership round-trips. Each builder
-takes the delegate by value and keeps it, so a caller passes each one a clone. A
-delegate whose answers rest on state of its own keeps that state behind an
-`Arc`, which its clones share.
+Every builder that establishes a range map takes the same delegate, through an
+`id_mapper` of its own. The Debian and Alpine provisioners launch their package
+scripts' sandboxes through it. A tree built under it is exported, copied into,
+and removed through it too, so its ownership round-trips. Each builder takes the
+delegate by value and keeps it. An `Arc` of a delegate is a delegate too, so one
+instance is shared by passing each builder a clone of the `Arc`.
 
 The fallback is **between delegates, never between tiers**. A range request
 no delegate can satisfy fails at `build`, naming each delegate's refusal and

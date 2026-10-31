@@ -155,7 +155,7 @@ written under the subordinate map or a bundled-delegate range map. Some trees
 need more. Where a site-specific delegate established the ownership, the tree is
 removed through the `Remove` builder instead. Such a delegate is supplied
 through `CageBuilder::id_mapper` and allocates ids the bundled delegates would
-not. `Remove::mapper` re-enters the map using that same delegate:
+not. `Remove::id_mapper` re-enters the map using that same delegate:
 
 ```rust,no_run
 use ferroday_cage::IdentityMap;
@@ -163,8 +163,8 @@ use ferroday_cage::provision::Remove;
 
 # let mapper = ferroday_cage::DirectMapper::new();
 Remove::new("/var/lib/myapp/rootfs")
-    .map(IdentityMap::Subordinate)
-    .mapper(mapper)
+    .identity_map(IdentityMap::Subordinate)
+    .id_mapper(mapper)
     .run()?;
 # Ok::<(), ferroday_cage::provision::ProvisionError>(())
 ```
@@ -173,8 +173,8 @@ Remove::new("/var/lib/myapp/rootfs")
 chain, and nothing to configure.
 
 A tree written under the single-identity map escalates too, named with
-`Remove::map(IdentityMap::Single)`, and there the child writes the map itself
-with no delegate involved. Its ids are the caller's own either way, so the
+`Remove::identity_map(IdentityMap::Single)`, and there the child writes the map
+itself with no delegate involved. Its ids are the caller's own either way, so the
 escalation looks redundant and is not. Root of the mapped namespace holds the
 capabilities that clear a directory whose own mode denies the write. A read-only
 directory an archive carried in is the everyday case.
@@ -243,7 +243,7 @@ use ferroday_cage::IdentityMap;
 use ferroday_cage::provision::Export;
 
 Export::new("/var/lib/myapp/rootfs")
-    .map(IdentityMap::Subordinate)
+    .identity_map(IdentityMap::Subordinate)
     // A fixed SOURCE_DATE_EPOCH makes the archive byte-reproducible; without
     // it, real modification times are recorded.
     .clamp_mtime(1_700_000_000)
@@ -276,7 +276,7 @@ let dev = Path::new("/dev");
 let cache = Path::new("/var/cache/apt/archives");
 
 Export::new("/var/lib/myapp/rootfs")
-    .map(IdentityMap::Subordinate)
+    .identity_map(IdentityMap::Subordinate)
     .filter(move |entry| {
         !entry.path().starts_with(cache)
             && (entry.path() == dev || !entry.path().starts_with(dev))
@@ -375,7 +375,7 @@ fails the export with `ProvisionError::SourceChanged`, naming the file, rather
 than archiving it cut or padded.
 
 As with removal, a tree built under a `CageBuilder::id_mapper` delegate is
-exported through `Export::mapper`. That re-enters the map using the same
+exported through `Export::id_mapper`. That re-enters the map using the same
 delegate rather than the bundled chain.
 
 At a shell prompt, `fcage --export-rootfs DIR` is the same export. It takes
@@ -468,7 +468,7 @@ use ferroday_cage::provision::CopyIn;
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let report = CopyIn::new("./overlay", "/srv/images/trixie")
-    .map(IdentityMap::Subordinate)
+    .identity_map(IdentityMap::Subordinate)
     .run()?;
 
 for entry in &report.skipped {
@@ -722,7 +722,7 @@ use ferroday_cage::provision::Remove;
 
 # fn main() -> Result<(), ferroday_cage::provision::ProvisionError> {
 Remove::overlay_upper("/var/cache/myapp/run-42")
-    .map(IdentityMap::Single)
+    .identity_map(IdentityMap::Single)
     .run()?;
 # Ok(())
 # }

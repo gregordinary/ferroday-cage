@@ -123,3 +123,117 @@ pub fn ferroday_cage::Marked::new() -> Self
         ["ferroday_cage::Marked::Bare"]
     );
 }
+
+/// The wrappers a forwarding implementation of one of the crate's traits is
+/// written for, as the snapshot spells their paths.
+const WRAPPERS: [&str; 2] = ["alloc::boxed::Box<", "alloc::sync::Arc<"];
+
+/// The names of the methods the snapshot lists under the item line `header`,
+/// whose methods it spells as `pub fn {owner}::{name}(...)`.
+fn methods_under<'a>(snapshot: &'a str, header: &str, owner: &str) -> BTreeSet<&'a str> {
+    let prefix = format!("pub fn {owner}::");
+    snapshot
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .map_while(|line| line.strip_prefix(prefix.as_str()))
+        .filter_map(|rest| rest.split('(').next())
+        .collect()
+}
+
+/// Every implementation of one of the crate's traits for a [`WRAPPERS`] type
+/// whose method list differs from the trait's, as `(implementation, the methods
+/// it leaves out)`, and how many forwarding implementations were read.
+fn unforwarded(snapshot: &str) -> (Vec<(String, Vec<String>)>, usize) {
+    let mut gaps = Vec::new();
+    let mut read = 0;
+    for line in snapshot.lines() {
+        let Some(rest) = line.strip_prefix("impl") else {
+            continue;
+        };
+        let Some((head, wrapper)) = rest.rsplit_once(" for ") else {
+            continue;
+        };
+        if !WRAPPERS.iter().any(|known| wrapper.starts_with(known)) {
+            continue;
+        }
+        // The trait is the last path in the head, after any generics.
+        let Some(trait_path) = head
+            .rsplit(' ')
+            .next()
+            .filter(|path| path.starts_with("ferroday_cage::"))
+        else {
+            continue;
+        };
+        let Some(trait_header) = snapshot.lines().find(|candidate| {
+            candidate
+                .strip_prefix("pub trait ")
+                .and_then(|named| named.strip_prefix(trait_path))
+                .is_some_and(|after| after.is_empty() || after.starts_with([':', '<']))
+        }) else {
+            continue;
+        };
+        read += 1;
+        let declared = methods_under(snapshot, trait_header, trait_path);
+        let forwarded = methods_under(snapshot, line, wrapper);
+        let missing: Vec<String> = declared
+            .difference(&forwarded)
+            .map(|name| name.to_string())
+            .collect();
+        if !missing.is_empty() {
+            gaps.push((line.to_string(), missing));
+        }
+    }
+    (gaps, read)
+}
+
+/// A boxed or shared delegate forwards every method of its trait, the
+/// defaulted ones included.
+///
+/// A method a forwarding implementation leaves out still compiles, because the
+/// trait supplies a default body, and the wrapper then runs that body instead
+/// of the wrapped value's own override: a boxed transport would fetch a batch
+/// one request at a time. Nothing but a comparison of the two method lists
+/// notices, and the snapshot holds both.
+#[test]
+fn every_forwarding_implementation_forwards_every_method() {
+    let (gaps, read) = unforwarded(SNAPSHOT);
+    assert!(
+        gaps.is_empty(),
+        "methods a wrapper does not forward: {gaps:#?}"
+    );
+    // `Fetch` for `Box`, and `IdMapper` for `Box` and `Arc`: a rendering this
+    // reading no longer recognizes would otherwise pass by reading nothing.
+    assert!(
+        read >= 3,
+        "only {read} forwarding implementations were read"
+    );
+}
+
+/// The reading above finds what it is for: a snapshot fragment written the way
+/// `cargo public-api` renders one, with a wrapper that leaves out a defaulted
+/// method.
+#[test]
+fn the_reading_finds_a_method_a_wrapper_does_not_forward() {
+    let fragment = "\
+pub trait ferroday_cage::Seam: core::marker::Send
+pub fn ferroday_cage::Seam::defaulted(&mut self)
+pub fn ferroday_cage::Seam::required(&mut self)
+impl<S: ferroday_cage::Seam + ?core::marker::Sized> ferroday_cage::Seam for alloc::boxed::Box<S>
+pub fn alloc::boxed::Box<S>::required(&mut self)
+impl<S: ferroday_cage::Seam + ?core::marker::Sized> ferroday_cage::Seam for alloc::sync::Arc<S>
+pub fn alloc::sync::Arc<S>::defaulted(&mut self)
+pub fn alloc::sync::Arc<S>::required(&mut self)
+";
+    let (gaps, read) = unforwarded(fragment);
+    assert_eq!(read, 2);
+    assert_eq!(
+        gaps,
+        [(
+            "impl<S: ferroday_cage::Seam + ?core::marker::Sized> ferroday_cage::Seam for \
+             alloc::boxed::Box<S>"
+                .to_string(),
+            vec!["defaulted".to_string()],
+        )],
+    );
+}

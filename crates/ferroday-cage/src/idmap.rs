@@ -279,6 +279,10 @@ impl ResolvedMap {
 /// privileged broker, a different helper — supplies its own through
 /// [`CageBuilder::id_mapper`].
 ///
+/// An `Arc` or a `Box` of a delegate is a delegate too, forwarding every
+/// method to what it holds. One instance is shared between builders as an
+/// `Arc`, and one chosen at run time is passed as a `Box<dyn IdMapper>`.
+///
 /// # Stability
 ///
 /// Every method added to this trait in a later release will carry a default
@@ -286,6 +290,11 @@ impl ResolvedMap {
 /// methods take their inputs as loose parameters because those inputs are
 /// closed: a resolution is a request, and an application is a process and the
 /// extents to write it. Anything richer arrives as a new defaulted method.
+///
+/// A method added here is forwarded by the `Arc` and `Box` implementations as
+/// well, defaulted ones included. A wrapper that left one out would run the
+/// default body in place of the wrapped delegate's own. A test compares the
+/// method lists.
 ///
 /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
 pub trait IdMapper: fmt::Debug + Send + Sync {
@@ -307,6 +316,38 @@ pub trait IdMapper: fmt::Debug + Send + Sync {
     /// blocked until this call returns. The map files are write-once, so the
     /// whole map must land in one write per file.
     fn apply(&self, pid: u32, map: &ResolvedMap) -> Result<(), IdMapError>;
+}
+
+/// A shared delegate is a delegate, so one instance can be named to every
+/// builder that must establish the same map.
+///
+/// Every method forwards to the shared delegate, the defaulted ones included.
+/// A caller cannot write this for an `Arc` of a delegate of its own, since
+/// neither the trait nor `Arc` is the caller's.
+impl<M: IdMapper + ?Sized> IdMapper for std::sync::Arc<M> {
+    fn resolve(&self, request: &IdentityMap) -> Result<ResolvedMap, IdMapError> {
+        (**self).resolve(request)
+    }
+
+    fn apply(&self, pid: u32, map: &ResolvedMap) -> Result<(), IdMapError> {
+        (**self).apply(pid, map)
+    }
+}
+
+/// A boxed delegate is a delegate, so one chosen at run time is passed wherever
+/// a delegate is taken.
+///
+/// Every method forwards to the boxed delegate, the defaulted ones included. A
+/// caller cannot write this for a `Box<dyn IdMapper>`, since neither the trait
+/// nor the trait object is the caller's.
+impl<M: IdMapper + ?Sized> IdMapper for Box<M> {
+    fn resolve(&self, request: &IdentityMap) -> Result<ResolvedMap, IdMapError> {
+        (**self).resolve(request)
+    }
+
+    fn apply(&self, pid: u32, map: &ResolvedMap) -> Result<(), IdMapError> {
+        (**self).apply(pid, map)
+    }
 }
 
 /// An identity-map delegate failure.
@@ -1528,6 +1569,55 @@ fn coalesce(allocation: &[(u32, u32)]) -> Vec<(u32, u32)> {
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+
+    /// A shared or boxed delegate runs the delegate's own methods, and a shared
+    /// one is the same instance in every builder it is named to.
+    #[test]
+    fn a_shared_or_boxed_delegate_forwards_every_method() {
+        /// Counts the calls each of its methods takes.
+        #[derive(Debug, Default)]
+        struct Counting {
+            resolved: std::sync::Mutex<usize>,
+            applied: std::sync::Mutex<usize>,
+        }
+        impl IdMapper for Counting {
+            fn resolve(&self, _request: &IdentityMap) -> Result<ResolvedMap, IdMapError> {
+                *self.resolved.lock().unwrap() += 1;
+                let root = IdRange {
+                    inside: 0,
+                    outside: 100_000,
+                    count: 1,
+                };
+                Ok(ResolvedMap::new(vec![root], vec![root]))
+            }
+            fn apply(&self, _pid: u32, _map: &ResolvedMap) -> Result<(), IdMapError> {
+                *self.applied.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        let shared = std::sync::Arc::new(Counting::default());
+        let as_dyn: std::sync::Arc<dyn IdMapper> = std::sync::Arc::clone(&shared) as _;
+        let boxed: Box<dyn IdMapper> = Box::new(std::sync::Arc::clone(&shared));
+        for wrapper in [&as_dyn as &dyn IdMapper, &boxed as &dyn IdMapper] {
+            let map = wrapper
+                .resolve(&IdentityMap::Subordinate)
+                .expect("the delegate resolves");
+            wrapper.apply(1, &map).expect("the delegate applies");
+        }
+        assert_eq!(*shared.resolved.lock().unwrap(), 2);
+        assert_eq!(*shared.applied.lock().unwrap(), 2);
+
+        // Named to a builder, the shared instance is the one asked.
+        crate::Cage::builder()
+            .rootfs("/tmp")
+            .command("/bin/sh")
+            .identity_map(IdentityMap::Subordinate)
+            .id_mapper(std::sync::Arc::clone(&shared))
+            .build()
+            .expect("the shared delegate resolves the build's map");
+        assert_eq!(*shared.resolved.lock().unwrap(), 3);
+    }
 
     /// An identity reads back as it was built, so the value `get_run_as` and a
     /// resolved record hand a caller is one the caller can read.

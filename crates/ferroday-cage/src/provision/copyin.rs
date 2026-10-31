@@ -91,7 +91,7 @@ everything it can create — a named pipe included — and names the rest.
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let report = CopyIn::new("./overlay", "/srv/images/trixie")
-///     .map(IdentityMap::Subordinate)
+///     .identity_map(IdentityMap::Subordinate)
 ///     .run()?;
 ///
 /// for entry in &report.skipped {
@@ -103,8 +103,8 @@ everything it can create — a named pipe included — and names the rest.
 pub struct CopyIn {
     source: PathBuf,
     rootfs: PathBuf,
-    map: IdentityMap,
-    mapper: Option<Arc<dyn IdMapper>>,
+    identity_map: IdentityMap,
+    id_mapper: Option<Arc<dyn IdMapper>>,
 }
 
 impl fmt::Debug for CopyIn {
@@ -114,10 +114,10 @@ impl fmt::Debug for CopyIn {
         f.debug_struct("CopyIn")
             .field("source", &self.source)
             .field("rootfs", &self.rootfs)
-            .field("map", &self.map)
+            .field("identity_map", &self.identity_map)
             .field(
-                "mapper",
-                &self.mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
             )
             .finish()
     }
@@ -146,8 +146,8 @@ impl CopyIn {
         CopyIn {
             source: source.as_ref().to_path_buf(),
             rootfs: rootfs.as_ref().to_path_buf(),
-            map: IdentityMap::Single,
-            mapper: None,
+            identity_map: IdentityMap::Single,
+            id_mapper: None,
         }
     }
 
@@ -157,8 +157,8 @@ impl CopyIn {
     /// must name the same one: the ids on the host are the rootfs's ids offset
     /// by the map, so a copy made through a different map writes ownership the
     /// rootfs will not read back as intended.
-    pub fn map(mut self, map: IdentityMap) -> CopyIn {
-        self.map = map;
+    pub fn identity_map(mut self, map: IdentityMap) -> CopyIn {
+        self.identity_map = map;
         self
     }
 
@@ -175,8 +175,8 @@ impl CopyIn {
     /// keeps it; [`CageBuilder::id_mapper`] says why.
     ///
     /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
-    pub fn mapper(mut self, mapper: impl IdMapper + 'static) -> CopyIn {
-        self.mapper = Some(Arc::new(mapper));
+    pub fn id_mapper(mut self, mapper: impl IdMapper + 'static) -> CopyIn {
+        self.id_mapper = Some(Arc::new(mapper));
         self
     }
 
@@ -194,7 +194,12 @@ impl CopyIn {
     /// inspecting it and opening it; and [`ProvisionError::Io`] for a failure of
     /// the copy machinery, of the walk, or of the in-map writer.
     pub fn run(self) -> Result<CopyReport, ProvisionError> {
-        copy_in_inner(&self.source, &self.rootfs, &self.map, self.mapper.as_ref())
+        copy_in_inner(
+            &self.source,
+            &self.rootfs,
+            &self.identity_map,
+            self.id_mapper.as_ref(),
+        )
     }
 }
 

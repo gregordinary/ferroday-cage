@@ -94,7 +94,7 @@ use crate::{IdMapper, IdentityMap};
 ///
 /// let mut archive = Vec::new();
 /// Export::new("/var/lib/myapp/rootfs")
-///     .map(IdentityMap::Subordinate)
+///     .identity_map(IdentityMap::Subordinate)
 ///     .clamp_mtime(1_700_000_000)
 ///     .write_to(&mut archive)?;
 /// # Ok(())
@@ -102,8 +102,8 @@ use crate::{IdMapper, IdentityMap};
 /// ```
 pub struct Export<'a> {
     rootfs: PathBuf,
-    map: IdentityMap,
-    mapper: Option<Arc<dyn IdMapper>>,
+    identity_map: IdentityMap,
+    id_mapper: Option<Arc<dyn IdMapper>>,
     clamp_mtime: Option<i64>,
     filter: Option<Box<EntryPredicate<'a>>>,
 }
@@ -123,10 +123,10 @@ impl fmt::Debug for Export<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Export")
             .field("rootfs", &self.rootfs)
-            .field("map", &self.map)
+            .field("identity_map", &self.identity_map)
             .field(
-                "mapper",
-                &self.mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
             )
             .field("clamp_mtime", &self.clamp_mtime)
             .field("filter", &self.filter.as_ref().map(|_| Delegate("dyn Fn")))
@@ -151,8 +151,8 @@ impl<'a> Export<'a> {
     pub fn new(rootfs: impl AsRef<Path>) -> Export<'a> {
         Export {
             rootfs: rootfs.as_ref().to_path_buf(),
-            map: IdentityMap::Single,
-            mapper: None,
+            identity_map: IdentityMap::Single,
+            id_mapper: None,
             clamp_mtime: None,
             filter: None,
         }
@@ -165,8 +165,8 @@ impl<'a> Export<'a> {
     /// done under an explicit [`IdentityMap::Ranges`] must be exported through
     /// the identical map, or the host subordinate ids will not round-trip to
     /// the ids the tree was built with.
-    pub fn map(mut self, map: IdentityMap) -> Export<'a> {
-        self.map = map;
+    pub fn identity_map(mut self, map: IdentityMap) -> Export<'a> {
+        self.identity_map = map;
         self
     }
 
@@ -178,16 +178,17 @@ impl<'a> Export<'a> {
     /// bundled-delegate [`Ranges`](IdentityMap::Ranges) one. A tree whose
     /// ownership a site-specific mapper established — one allocating ids the
     /// bundled delegates would not — must be exported through that same mapper,
-    /// so its ids round-trip. The mapper and the [`map`](Self::map) must be the
-    /// pair the tree was built under; a [`Single`](IdentityMap::Single) map
-    /// self-establishes and ignores the mapper, as the launch does.
+    /// so its ids round-trip. The mapper and the
+    /// [`identity_map`](Self::identity_map) must be the pair the tree was built
+    /// under; a [`Single`](IdentityMap::Single) map self-establishes and
+    /// ignores the mapper, as the launch does.
     ///
     /// The delegate is taken by value and kept, as every builder that takes one
     /// keeps it; [`CageBuilder::id_mapper`] says why.
     ///
     /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
-    pub fn mapper(mut self, mapper: impl IdMapper + 'static) -> Export<'a> {
-        self.mapper = Some(Arc::new(mapper));
+    pub fn id_mapper(mut self, mapper: impl IdMapper + 'static) -> Export<'a> {
+        self.id_mapper = Some(Arc::new(mapper));
         self
     }
 
@@ -253,7 +254,7 @@ impl<'a> Export<'a> {
     ///
     /// let dev = Path::new("/dev");
     /// Export::new("/var/lib/myapp/rootfs")
-    ///     .map(IdentityMap::Subordinate)
+    ///     .identity_map(IdentityMap::Subordinate)
     ///     .filter(move |entry| entry.path() == dev || !entry.path().starts_with(dev))
     ///     .write_to_path("/var/lib/myapp/rootfs.tar")?;
     /// # Ok(())
@@ -280,8 +281,8 @@ impl<'a> Export<'a> {
         export_inner(
             &self.rootfs,
             writer,
-            &self.map,
-            self.mapper.as_ref(),
+            &self.identity_map,
+            self.id_mapper.as_ref(),
             self.clamp_mtime,
             self.filter.as_deref(),
         )
@@ -324,7 +325,7 @@ impl<'a> Export<'a> {
     /// use ferroday_cage::provision::Export;
     ///
     /// Export::new("/var/lib/myapp/rootfs")
-    ///     .map(IdentityMap::Subordinate)
+    ///     .identity_map(IdentityMap::Subordinate)
     ///     .write_to_path("/var/lib/myapp/rootfs.tar")?;
     /// # Ok(())
     /// # }
@@ -346,8 +347,8 @@ impl<'a> Export<'a> {
         export_inner(
             &self.rootfs,
             &file,
-            &self.map,
-            self.mapper.as_ref(),
+            &self.identity_map,
+            self.id_mapper.as_ref(),
             self.clamp_mtime,
             self.filter.as_deref(),
         )?;
@@ -411,7 +412,7 @@ pub fn export_tar<W: Write>(
     writer: W,
     map: IdentityMap,
 ) -> Result<(), ProvisionError> {
-    Export::new(rootfs).map(map).write_to(writer)
+    Export::new(rootfs).identity_map(map).write_to(writer)
 }
 
 /// Exports `rootfs`, resolving a range map through `mapper` when given and the

@@ -232,6 +232,10 @@ consumer upgrading can skip it.
   sandbox the bootstrap's package scripts run in, and for the removal of a
   staged layer. A map only a site-specific delegate establishes could not be
   provisioned before.
+- `Box<F>` implements `Fetch` for any transport `F`, and `Arc<M>` and `Box<M>`
+  implement `IdMapper` for any delegate `M`, each forwarding every method. A
+  transport or a delegate chosen at run time is passed as a `Box<dyn ..>`, and
+  one delegate instance is named to several builders as an `Arc`.
 - `DebianBuilder::source_date_epoch`, which gives every maintainer script
   `SOURCE_DATE_EPOCH`, so the accounts a bootstrap creates record the epoch's
   day in `/etc/shadow` rather than the day it ran. An epoch in the first day of
@@ -317,6 +321,13 @@ consumer upgrading can skip it.
   `Box` of one chosen at run time. `Debian` and `DebianBuilder` no longer carry
   a lifetime parameter, and `debian::Observed` carries one, as Alpine's and
   Gentoo's do.
+- **Breaking.** `Export`, `CopyIn` and `Remove` name the identity map and its
+  delegate as `CageBuilder` does: `map` is now `identity_map`, and `mapper` is
+  now `id_mapper`, which takes the delegate by value, as `impl IdMapper +
+  'static`, and keeps it. Pass the mapper itself, cloned or shared through an
+  `Arc` for each builder that needs it. `CopyIn` and `Remove` no longer carry a
+  lifetime parameter. `BuildLayer`, which keeps the delegate it was staged with,
+  is no longer `UnwindSafe` or `RefUnwindSafe`.
 - **Breaking.** `debian::Available` and `alpine::Available` are one type,
   `provision::Available`, which `Debian::available` and `Alpine::available`
   return. Gentoo's type of that name, the stage3 variants a pointer document
@@ -671,6 +682,15 @@ consumer upgrading can skip it.
 - Dependencies refreshed within their ranges. The manifest states why a
   `debian` or `gentoo` build carries two `sha2` lines: `lzma-rust2` selects 0.11,
   and `pgp` still depends on 0.10.
+- `tools/rust_source.py` is the one reading of a source file the census tools
+  take: every comment and every test-only item removed. `tools/check-seam.py`
+  expands grouped imports and resolves `super::` paths, and finds 38 reaches
+  past the provisioning seam, ten of them internal. `tools/check-parity.py`
+  finds every builder in the API snapshot rather than a list of them, which
+  brings it to 23. `tools/check-keyrings.py` reports a keyring Debian adds.
+  `tests/stability.rs` fails on a public enum or struct variant without
+  `#[non_exhaustive]`, and on a forwarding implementation of `Fetch` or
+  `IdMapper` that leaves out one of the trait's methods.
 - Every test skip goes through the testkit's `require` module, which honors its
   `REQUIRE` variable at every site, and `FERRODAY_CAGE_REQUIRE_LANDLOCK_NET` is
   folded into `FERRODAY_CAGE_REQUIRE_LANDLOCK`. The testkit holds one copy of

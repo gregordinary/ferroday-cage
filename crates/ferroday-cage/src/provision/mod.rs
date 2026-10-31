@@ -858,7 +858,7 @@ impl<'obs> Provision<'obs> {
 /// use ferroday_cage::provision::Remove;
 ///
 /// Remove::new("/var/lib/myapp/rootfs")
-///     .map(IdentityMap::Subordinate)
+///     .identity_map(IdentityMap::Subordinate)
 ///     .run()?;
 /// # Ok(())
 /// # }
@@ -868,8 +868,8 @@ pub struct Remove {
     /// The overlay work directory removed after `dest`, for a removal of an
     /// overlay upper.
     work: Option<PathBuf>,
-    map: crate::IdentityMap,
-    mapper: Option<Arc<dyn crate::idmap::IdMapper>>,
+    identity_map: crate::IdentityMap,
+    id_mapper: Option<Arc<dyn crate::idmap::IdMapper>>,
     remove_lock: bool,
 }
 
@@ -882,10 +882,10 @@ impl fmt::Debug for Remove {
         f.debug_struct("Remove")
             .field("dest", &self.dest)
             .field("work", &self.work)
-            .field("map", &self.map)
+            .field("identity_map", &self.identity_map)
             .field(
-                "mapper",
-                &self.mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
             )
             .field("remove_lock", &self.remove_lock)
             .finish()
@@ -914,8 +914,8 @@ impl Remove {
         Remove {
             dest: dest.as_ref().to_path_buf(),
             work: None,
-            map: crate::IdentityMap::Subordinate,
-            mapper: None,
+            identity_map: crate::IdentityMap::Subordinate,
+            id_mapper: None,
             remove_lock: true,
         }
     }
@@ -930,8 +930,8 @@ impl Remove {
     /// with a directory of mode `0`. This removes both, so nothing the overlay
     /// root created outlives it.
     ///
-    /// Name the identity map the sandbox ran under with [`map`](Self::map): a
-    /// sandbox's own default is
+    /// Name the identity map the sandbox ran under with
+    /// [`identity_map`](Self::identity_map): a sandbox's own default is
     /// [`IdentityMap::Single`](crate::IdentityMap::Single), while this
     /// builder's is the subordinate map, for the reason [`Remove::new`] gives.
     /// The map decides how an entry the calling user cannot remove is removed,
@@ -948,15 +948,15 @@ impl Remove {
         Remove {
             dest: upper.to_path_buf(),
             work: crate::spec::overlay_work_dir(upper),
-            map: crate::IdentityMap::Subordinate,
-            mapper: None,
+            identity_map: crate::IdentityMap::Subordinate,
+            id_mapper: None,
             remove_lock: false,
         }
     }
 
     /// Sets the identity map the tree was written under.
-    pub fn map(mut self, map: crate::IdentityMap) -> Remove {
-        self.map = map;
+    pub fn identity_map(mut self, map: crate::IdentityMap) -> Remove {
+        self.identity_map = map;
         self
     }
 
@@ -966,15 +966,15 @@ impl Remove {
     /// whose ownership a site-specific mapper established — one allocating ids
     /// the bundled delegates would not — must be removed through that same
     /// mapper, so it can re-enter the map the tree was written under. The
-    /// mapper and the [`map`](Self::map) must be the pair the tree was built
-    /// under.
+    /// mapper and the [`identity_map`](Self::identity_map) must be the pair the
+    /// tree was built under.
     ///
     /// The delegate is taken by value and kept, as every builder that takes one
     /// keeps it; [`CageBuilder::id_mapper`] says why.
     ///
     /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
-    pub fn mapper(mut self, mapper: impl crate::idmap::IdMapper + 'static) -> Remove {
-        self.mapper = Some(Arc::new(mapper));
+    pub fn id_mapper(mut self, mapper: impl crate::idmap::IdMapper + 'static) -> Remove {
+        self.id_mapper = Some(Arc::new(mapper));
         self
     }
 
@@ -982,11 +982,11 @@ impl Remove {
     /// the bundled chain for `None`: a staged build layer's disposal, which
     /// re-enters the delegate the layer was staged with.
     #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-    pub(crate) fn shared_mapper(
+    pub(crate) fn shared_id_mapper(
         mut self,
         mapper: Option<Arc<dyn crate::idmap::IdMapper>>,
     ) -> Remove {
-        self.mapper = mapper;
+        self.id_mapper = mapper;
         self
     }
 
@@ -1027,12 +1027,12 @@ impl Remove {
     pub fn run(self) -> Result<(), ProvisionError> {
         remove_dest(
             &self.dest,
-            &self.map,
-            self.mapper.as_ref(),
+            &self.identity_map,
+            self.id_mapper.as_ref(),
             self.remove_lock,
         )?;
         match &self.work {
-            Some(work) => remove_dest(work, &self.map, self.mapper.as_ref(), false),
+            Some(work) => remove_dest(work, &self.identity_map, self.id_mapper.as_ref(), false),
             None => Ok(()),
         }
     }
@@ -1233,7 +1233,7 @@ fn ensure_inner(
 /// map, which covers a tree written under
 /// [`IdentityMap::Subordinate`](crate::IdentityMap::Subordinate) or a
 /// bundled-delegate [`IdentityMap::Ranges`](crate::IdentityMap::Ranges). For a
-/// tree built under a caller-supplied delegate, use [`Remove::mapper`].
+/// tree built under a caller-supplied delegate, use [`Remove::id_mapper`].
 pub fn remove(dest: impl AsRef<Path>) -> Result<(), ProvisionError> {
     remove_dest(dest.as_ref(), &crate::IdentityMap::Subordinate, None, true)
 }
@@ -2035,7 +2035,7 @@ mod tests {
         fs::write(&lock, b"someone else's").unwrap();
 
         Remove::overlay_upper(&upper)
-            .map(crate::IdentityMap::Single)
+            .identity_map(crate::IdentityMap::Single)
             .run()
             .expect("the upper is removed");
         assert!(!upper.exists(), "the upper survived");

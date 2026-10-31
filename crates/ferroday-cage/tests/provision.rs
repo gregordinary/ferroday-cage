@@ -1046,7 +1046,7 @@ fn a_single_mapped_removal_clears_a_directory_its_own_mode_locks() {
     }
 
     ferroday_cage::provision::Remove::new(&tree)
-        .map(ferroday_cage::IdentityMap::Single)
+        .identity_map(ferroday_cage::IdentityMap::Single)
         .run()
         .expect("the map-assisted removal succeeds");
     assert!(!tree.exists(), "the tree is gone");

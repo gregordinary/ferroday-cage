@@ -1131,9 +1131,9 @@ impl DebianBuilder {
     /// preflight that refuses an unavailable map before any download asks it
     /// too. A tree a site-specific delegate established ownership in is
     /// exported, copied into, and removed through that same delegate:
-    /// [`Export::mapper`](super::Export::mapper),
-    /// [`CopyIn::mapper`](super::CopyIn::mapper), and
-    /// [`Remove::mapper`](super::Remove::mapper). The delegate is taken by
+    /// [`Export::id_mapper`](super::Export::id_mapper),
+    /// [`CopyIn::id_mapper`](super::CopyIn::id_mapper), and
+    /// [`Remove::id_mapper`](super::Remove::id_mapper). The delegate is taken by
     /// value and kept; [`CageBuilder::id_mapper`] says why.
     ///
     /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper

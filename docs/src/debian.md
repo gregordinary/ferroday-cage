@@ -1079,7 +1079,7 @@ let mut debian = Debian::builder("trixie")
 provision::ensure("/srv/images/trixie", &mut debian)?;
 
 Export::new("/srv/images/trixie")
-    .map(IdentityMap::Subordinate)
+    .identity_map(IdentityMap::Subordinate)
     .clamp_mtime(EPOCH)
     .write_to_path("trixie.tar")?;
 # Ok(())

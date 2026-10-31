@@ -330,7 +330,7 @@ fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
 
     let archive = dir.join("rootfs.tar");
     provision::Export::new(&root)
-        .map(IdentityMap::Single)
+        .identity_map(IdentityMap::Single)
         .write_to_path(&archive)
         .expect("the first export succeeds");
     let published = std::fs::read(&archive).unwrap();
@@ -341,7 +341,7 @@ fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
     // have truncated the archive above to write nothing into it, and removing
     // the truncated result does not bring the previous archive back.
     let err = provision::Export::new(dir.join("absent"))
-        .map(IdentityMap::Single)
+        .identity_map(IdentityMap::Single)
         .write_to_path(&archive)
         .expect_err("a missing source cannot be exported");
     assert!(matches!(err, provision::ProvisionError::Io { .. }), "{err}");
@@ -391,7 +391,7 @@ fn two_threads_exporting_to_one_path_each_publish_a_whole_archive() {
                 .map(|_| {
                     scope.spawn(|| {
                         provision::Export::new(&root)
-                            .map(IdentityMap::Single)
+                            .identity_map(IdentityMap::Single)
                             .write_to_path(&archive)
                     })
                 })
@@ -440,7 +440,7 @@ fn an_archive_written_inside_the_tree_it_exports_is_refused() {
     // is refused with it.
     for dest in [root.join("rootfs.tar"), root.join("var/rootfs.tar")] {
         let err = provision::Export::new(&root)
-            .map(IdentityMap::Single)
+            .identity_map(IdentityMap::Single)
             .write_to_path(&dest)
             .expect_err("a destination inside the tree is refused");
         assert!(
@@ -454,7 +454,7 @@ fn an_archive_written_inside_the_tree_it_exports_is_refused() {
     // prefix with the rootfs is not inside it.
     let sibling = dir.join("rootfs.tar");
     provision::Export::new(&root)
-        .map(IdentityMap::Single)
+        .identity_map(IdentityMap::Single)
         .write_to_path(&sibling)
         .expect("a destination beside the tree is fine");
     assert!(sibling.exists());
@@ -555,8 +555,8 @@ fn explicit_mapper_exports_and_removes() {
     let mapper = SubidMapper::new();
     let mut out = Vec::new();
     provision::Export::new(&work)
-        .map(IdentityMap::Subordinate)
-        .mapper(mapper.clone())
+        .identity_map(IdentityMap::Subordinate)
+        .id_mapper(mapper.clone())
         .write_to(&mut out)
         .expect("export through the explicit mapper should succeed");
     let entries = parse_tar(&out);
@@ -565,8 +565,8 @@ fn explicit_mapper_exports_and_removes() {
 
     // Remove the foreign-owned tree through the same explicit mapper.
     provision::Remove::new(&dir)
-        .map(IdentityMap::Subordinate)
-        .mapper(mapper)
+        .identity_map(IdentityMap::Subordinate)
+        .id_mapper(mapper)
         .run()
         .expect("removal through the explicit mapper should succeed");
     assert!(!dir.exists());
@@ -703,7 +703,7 @@ fn a_removal_whose_delegate_cannot_apply_is_typed() {
     let tree = refuses_plain_removal(&dir);
 
     let err = provision::Remove::new(&tree)
-        .mapper(RefusesToApply)
+        .id_mapper(RefusesToApply)
         .run()
         .expect_err("a delegate that cannot apply the map fails the removal");
     assert!(
@@ -729,8 +729,8 @@ fn an_export_whose_delegate_cannot_apply_is_typed() {
 
     let mut out = Vec::new();
     let err = ferroday_cage::provision::Export::new(&dir)
-        .map(IdentityMap::Subordinate)
-        .mapper(RefusesToApply)
+        .identity_map(IdentityMap::Subordinate)
+        .id_mapper(RefusesToApply)
         .write_to(&mut out)
         .expect_err("a delegate that cannot apply the map fails the export");
     assert!(
@@ -753,7 +753,7 @@ fn a_removal_whose_delegate_cannot_resolve_is_typed() {
     let tree = refuses_plain_removal(&dir);
 
     let err = provision::Remove::new(&tree)
-        .mapper(RefusesToResolve)
+        .id_mapper(RefusesToResolve)
         .run()
         .expect_err("a delegate that cannot resolve the map fails the removal");
     assert!(
@@ -1204,7 +1204,7 @@ fn a_copy_lands_a_file_owned_by_a_non_root_target_uid() {
     let rootfs = dir.join("rootfs");
     std::fs::create_dir_all(&rootfs).unwrap();
     provision::CopyIn::new(&source, &rootfs)
-        .map(IdentityMap::Subordinate)
+        .identity_map(IdentityMap::Subordinate)
         .run()
         .expect("the copy succeeds");
 
@@ -1245,7 +1245,10 @@ fn a_copy_whose_delegate_cannot_resolve_is_typed() {
         count: 1,
     }];
     let map = IdentityMap::ranges(extent.clone(), extent);
-    match provision::CopyIn::new(&source, &rootfs).map(map).run() {
+    match provision::CopyIn::new(&source, &rootfs)
+        .identity_map(map)
+        .run()
+    {
         Err(provision::ProvisionError::CopyUnprivileged { path, .. }) => {
             assert_eq!(path, rootfs);
         }
@@ -1410,7 +1413,7 @@ fn a_copy_does_not_re_own_a_directory_the_root_already_has() {
     std::fs::create_dir_all(source.join("home/alice")).unwrap();
     std::fs::write(source.join("home/alice/.profile"), b"umask 022\n").unwrap();
     provision::CopyIn::new(&source, &rootfs)
-        .map(IdentityMap::Subordinate)
+        .identity_map(IdentityMap::Subordinate)
         .run()
         .expect("the copy succeeds");
 

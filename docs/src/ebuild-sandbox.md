@@ -98,7 +98,7 @@ use ferroday_cage::IdentityMap;
 use ferroday_cage::provision::Remove;
 
 # fn main() -> Result<(), ferroday_cage::provision::ProvisionError> {
-Remove::new("./gentoo-root").map(IdentityMap::Subordinate).run()?;
+Remove::new("./gentoo-root").identity_map(IdentityMap::Subordinate).run()?;
 # Ok(())
 # }
 ```

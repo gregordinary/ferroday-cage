@@ -200,8 +200,8 @@ impl Drop for BuildLayer {
     /// path this never created and may not delete.
     fn drop(&mut self) {
         let _ = crate::provision::Remove::overlay_upper(&self.upper)
-            .map(self.identity_map.clone())
-            .shared_mapper(self.id_mapper.clone())
+            .identity_map(self.identity_map.clone())
+            .shared_id_mapper(self.id_mapper.clone())
             .run();
     }
 }

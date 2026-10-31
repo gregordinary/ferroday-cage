@@ -580,13 +580,13 @@ name = "Remove"
 path = "ferroday_cage::provision::Remove"
 
 [[builder.setting]]
-name = "map"
+name = "identity_map"
 flags = ["--identity-map"]
 
 [[builder.setting]]
-name = "mapper"
+name = "id_mapper"
 kind = "code"
-why = "A mapper is a trait object."
+why = "An identity-map delegate is a trait object. `--identity-map` names the delegates the library bundles."
 
 [[builder.setting]]
 name = "remove_lock"
@@ -597,13 +597,13 @@ name = "Export"
 path = "ferroday_cage::provision::Export"
 
 [[builder.setting]]
-name = "map"
+name = "identity_map"
 flags = ["--identity-map"]
 
 [[builder.setting]]
-name = "mapper"
+name = "id_mapper"
 kind = "code"
-why = "A mapper is a trait object."
+why = "An identity-map delegate is a trait object. `--identity-map` names the delegates the library bundles."
 
 [[builder.setting]]
 name = "clamp_mtime"
@@ -619,14 +619,14 @@ name = "CopyIn"
 path = "ferroday_cage::provision::CopyIn"
 
 [[builder.setting]]
-name = "map"
+name = "identity_map"
 kind = "library"
 why = "`fcage` offers no copy-in at all: it would have to grow a flag naming a source and a destination inside an existing tree, which is a provisioning operation the tool does not have. The map would follow that flag."
 
 [[builder.setting]]
-name = "mapper"
+name = "id_mapper"
 kind = "code"
-why = "A mapper is a trait object."
+why = "An identity-map delegate is a trait object. `--identity-map` names the delegates the library bundles."
 
 # No settings, and recorded so that gaining one is a difference rather than a
 # silence. A tarball is named and then provisioned from; `--provision-tar`

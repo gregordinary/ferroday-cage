@@ -38,7 +38,7 @@ format without the others' dependency weight: the Debian layer pulls
 What keeps the decision cheap in the meantime is that the layers already sit on
 a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
 tar, compress, extract, digest, document and OpenPGP machinery -- and reach
-around it in thirty-one places, ten of which are internal. `tools/seam.toml`
+around it in thirty-eight places, ten of which are internal. `tools/seam.toml`
 records every one with what it would cost, `tools/check-seam.py` fails on any
 difference, and a layer naming another layer is refused outright. A split, when
 it comes, is that list plus the mechanical work.
@@ -185,9 +185,11 @@ Settled so that generalising a parameter later is never a breaking change:
 
 A delegate is taken by value and kept. A provisioner holds its transport for
 its whole life. A builder hands its identity mapper to every sandbox or child
-process it starts. Each delegate crosses a thread with whatever holds it. A
-transport or a mapper that shares state with its caller keeps that state behind
-an `Arc`.
+process it starts. Each delegate crosses a thread with whatever holds it.
+
+A `Box` of either is a delegate too, for one chosen at run time. So is an `Arc`
+of a mapper, for one instance named to several builders. A transport that
+shares state with its caller keeps that state behind an `Arc`.
 
 ## What the profile format promises
 
@@ -286,6 +288,7 @@ Policy that only lives in a document decays. These are enforced:
 | No breaking API change without a version bump | `cargo-semver-checks` against the last release tag, both sides built from their own lockfiles |
 | No unintended public item, path, or re-export | A committed `cargo-public-api` snapshot, diffed in review |
 | No public type loses `Send`/`Sync` | `const` assertions in `tests/auto_traits.rs` |
+| A boxed or shared delegate runs the delegate's own methods | `tests/stability.rs`, comparing each forwarding implementation's methods with its trait's in the API snapshot |
 | Every feature combination compiles | `cargo hack --feature-powerset --depth 2`, plus an explicit featureless check |
 | The MSRV holds | A CI build at the declared `rust-version` |
 | The profile and record key sets are deliberate | `rename_all` on every container, a census of the field-level renames in `tools/idioms.toml`, and tests pinning the key sets of the profile format, of the resolved provenance record, and of `NetStackBuilder` |

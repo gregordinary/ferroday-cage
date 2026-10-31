@@ -4701,7 +4701,7 @@ fn remove_tree(dest: &Path, map: IdentityMap, removal: Removal) -> ExitCode {
         Removal::Rootfs { remove_lock } => Remove::new(dest).remove_lock(remove_lock),
         Removal::OverlayUpper => Remove::overlay_upper(dest),
     };
-    match remove.map(map).run() {
+    match remove.identity_map(map).run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(error),
     }
@@ -4771,7 +4771,7 @@ fn export_rootfs(
         ));
     }
 
-    let mut export = ferroday_cage::provision::Export::new(source).map(map);
+    let mut export = ferroday_cage::provision::Export::new(source).identity_map(map);
     if let Some(epoch) = clamp_mtime {
         export = export.clamp_mtime(epoch);
     }
