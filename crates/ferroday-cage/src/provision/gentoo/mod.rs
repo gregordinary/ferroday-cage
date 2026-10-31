@@ -686,33 +686,33 @@ fn file_name_of(path: &str) -> &str {
 
 /// The stage3 variants an architecture publishes.
 ///
-/// Produced by [`Gentoo::available`], and read out of the signed pointer
+/// Produced by [`Gentoo::variants`], and read out of the signed pointer
 /// document, so this is what Gentoo publishes now rather than what this crate
 /// was compiled knowing. It is a snapshot: the archive regenerates the document
 /// on a schedule, so a build id reported here is the one that was current when
 /// it was read.
-pub struct Available {
+pub struct Variants {
     published: Option<i64>,
     entries: Vec<pointer::Entry>,
 }
 
-impl fmt::Debug for Available {
+impl fmt::Debug for Variants {
     /// Renders how many variants were read and when the document was
     /// regenerated, rather than the whole enumeration: an architecture can
     /// publish forty of them, and the counts are what a reader of a rendering
     /// can act on.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Available")
+        f.debug_struct("Variants")
             .field("variants", &self.entries.len())
             .field("published", &self.published)
             .finish()
     }
 }
 
-impl Available {
+impl Variants {
     /// Every variant the architecture publishes, as the document spells them,
     /// in the order it lists them.
-    pub fn variants(&self) -> impl Iterator<Item = &str> {
+    pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.variant.as_str())
     }
 
@@ -908,13 +908,13 @@ impl Gentoo {
     ///
     /// # fn main() -> Result<(), ferroday_cage::provision::gentoo::GentooError> {
     /// let mut gentoo = Gentoo::builder("amd64").build()?;
-    /// let available = gentoo.available()?;
-    /// assert!(available.contains("amd64-openrc"));
+    /// let variants = gentoo.variants()?;
+    /// assert!(variants.contains("amd64-openrc"));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn available(&mut self) -> Result<Available, GentooError> {
-        self.observe(&mut Silent).available()
+    pub fn variants(&mut self) -> Result<Variants, GentooError> {
+        self.observe(&mut Silent).variants()
     }
 
     /// What the configured binhost publishes.
@@ -1166,7 +1166,7 @@ impl Gentoo {
     ///
     /// # Errors
     ///
-    /// As [`available`](Self::available), plus [`GentooError::Config`] when no
+    /// As [`variants`](Self::variants), plus [`GentooError::Config`] when no
     /// variant was named or the named one is not in the enumeration — which
     /// names what the architecture does offer.
     pub fn resolve(&mut self) -> Result<Stage3, GentooError> {
@@ -1185,7 +1185,7 @@ impl Gentoo {
         let Some(variant) = self.variant.clone() else {
             return Err(GentooError::config(
                 "no variant was named; call GentooBuilder::variant with one of the names \
-                 Gentoo::available reports, such as \"amd64-openrc\"",
+                 Gentoo::variants reports, such as \"amd64-openrc\"",
             ));
         };
         // A pinned build id is the caller saying which build they want, so the
@@ -1616,7 +1616,9 @@ impl Gentoo {
         // not on the way out, so a failure below disposes of a partly-installed
         // increment instead of orphaning it: there is no handle in an `Err` for
         // the caller to drop.
-        let layer = BuildLayer::new(upper, IdentityMap::Single);
+        // Nothing here runs in a sandbox, so the increment was written by the
+        // caller under no map but its own, and no delegate established one.
+        let layer = BuildLayer::new(upper, IdentityMap::Single, None);
         self.install_wave(upper, Some(&base), to)?;
         Ok(layer)
     }
@@ -2154,10 +2156,10 @@ impl fmt::Debug for Observed<'_> {
 }
 
 impl Observed<'_> {
-    /// Reports what the architecture publishes. See [`Gentoo::available`].
-    pub fn available(&mut self) -> Result<Available, GentooError> {
+    /// Reports what the architecture publishes. See [`Gentoo::variants`].
+    pub fn variants(&mut self) -> Result<Variants, GentooError> {
         let pointer = self.gentoo.read_pointer(self.sink)?;
-        Ok(Available {
+        Ok(Variants {
             published: pointer.published(),
             entries: pointer.entries().to_vec(),
         })
@@ -2223,6 +2225,12 @@ fn stop_if_cancelled(to: Reporting<'_>) -> Result<(), GentooError> {
 }
 
 /// A [`Gentoo`] under construction.
+///
+/// It takes no identity map and no identity-map delegate, where the Debian and
+/// Alpine builders take both. Those layers run package scripts in sandboxes,
+/// under the map the root is built for. This one runs nothing in a sandbox: the
+/// stage3 and every binary package are extracted by the calling user, and a
+/// staged layer is removed under the single-identity map.
 pub struct GentooBuilder {
     architecture: String,
     variant: Option<String>,
@@ -2283,7 +2291,7 @@ impl GentooBuilder {
     /// and `x32-openrc` as siblings, so a name relative to `amd64` could not
     /// reach the second at all. It is matched exactly against the signed
     /// enumeration, so an unknown one is refused before anything is fetched,
-    /// naming what the architecture does offer. [`Gentoo::available`] lists them.
+    /// naming what the architecture does offer. [`Gentoo::variants`] lists them.
     pub fn variant(mut self, variant: impl Into<String>) -> GentooBuilder {
         self.variant = Some(variant.into());
         self
@@ -2496,8 +2504,11 @@ impl GentooBuilder {
     /// The archive serves plain HTTP with no redirect to HTTPS, so the bundled
     /// client suffices; a caller wanting TLS, a proxy, or a private mirror
     /// protocol supplies their own.
-    pub fn fetcher(mut self, fetcher: Box<dyn Fetch>) -> GentooBuilder {
-        self.fetcher = Some(fetcher);
+    ///
+    /// The transport is taken by value and kept for the provisioner's whole
+    /// life; [`Fetch`] says why.
+    pub fn fetcher(mut self, fetcher: impl Fetch + 'static) -> GentooBuilder {
+        self.fetcher = Some(Box::new(fetcher));
         self
     }
 
@@ -2981,16 +2992,16 @@ mod tests {
     #[test]
     fn the_enumeration_is_what_the_architecture_publishes() {
         let (_key, mut gentoo) = current();
-        let available = gentoo.available().expect("the pointer verifies");
+        let variants = gentoo.variants().expect("the pointer verifies");
         assert_eq!(
-            available.variants().collect::<Vec<_>>(),
+            variants.names().collect::<Vec<_>>(),
             ["amd64-openrc", "amd64-openrc-splitusr"],
         );
-        assert!(available.contains("amd64-openrc-splitusr"));
-        assert!(!available.contains("amd64"), "no prefix match");
-        assert_eq!(available.build_id("amd64-openrc"), Some(BUILD));
-        assert_eq!(available.size("amd64-openrc"), Some(495_865_168));
-        assert!(available.published().is_some());
+        assert!(variants.contains("amd64-openrc-splitusr"));
+        assert!(!variants.contains("amd64"), "no prefix match");
+        assert_eq!(variants.build_id("amd64-openrc"), Some(BUILD));
+        assert_eq!(variants.size("amd64-openrc"), Some(495_865_168));
+        assert!(variants.published().is_some());
     }
 
     #[test]
@@ -3206,7 +3217,7 @@ mod tests {
         let mut gentoo = provisioner(&key, Box::new(archive(&key, Some(now))));
         gentoo.variant = None;
         let err = gentoo.resolve().expect_err("no variant was named");
-        assert!(err.to_string().contains("Gentoo::available"), "{err}");
+        assert!(err.to_string().contains("Gentoo::variants"), "{err}");
     }
 
     /// The binhost sub-architecture every index test below reads.

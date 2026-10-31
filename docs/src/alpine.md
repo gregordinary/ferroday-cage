@@ -518,7 +518,9 @@ the resulting root is a working userland with that one group ownership flattened
 
 A rootfs that is itself the product wants real ownership, and `identity_map`
 selects it. Under `IdentityMap::Subordinate` the system ids genuinely exist and
-that `chown` succeeds.
+that `chown` succeeds. A site-specific delegate establishes the map where one is
+supplied through `id_mapper`, as [Identity maps](identity-maps.md) describes for
+a sandbox.
 
 ## Extract-only and foreign architectures
 

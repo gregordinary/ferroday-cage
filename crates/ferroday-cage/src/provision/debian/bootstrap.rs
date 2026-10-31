@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::repository::{Repository, Trust};
 use super::{DebianError, DebianEvent, DebianObserver};
@@ -37,7 +38,7 @@ use crate::provision::accounts;
 use crate::provision::document;
 use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
-use crate::{IdentityMap, Observer, Stdio};
+use crate::{IdMapper, IdentityMap, Observer, Stdio};
 
 /// The core packages configured before the rest, in dependency order, so the
 /// base system (accounts, directories, the C library, dpkg itself) is in
@@ -288,6 +289,9 @@ pub(crate) struct Configure<'a> {
     /// The map the wave's cages run under, deciding whether the
     /// single-identity ownership reconciliation happens at all.
     pub(crate) identity_map: &'a IdentityMap,
+    /// The delegate a range map is established through, where the caller
+    /// supplied one.
+    pub(crate) id_mapper: Option<&'a Arc<dyn IdMapper>>,
     /// The maintainer-script environment.
     pub(crate) env: &'a [(String, String)],
     /// The `SOURCE_DATE_EPOCH` that environment carries, if any, by which the
@@ -329,6 +333,7 @@ pub(crate) fn configure(
         source_date_epoch,
         // Read by the dpkg waves this hands the gathered value down to.
         archives_host: _,
+        id_mapper: _,
         env: _,
     } = wave;
     // Under a range map every id Debian assigns is real and every chown
@@ -474,6 +479,7 @@ pub(crate) fn configure_delta(
         source_date_epoch,
         // Read by the dpkg waves this hands the gathered value down to.
         archives_host: _,
+        id_mapper: _,
         env: _,
     } = wave;
     let single = matches!(identity_map, IdentityMap::Single);
@@ -783,6 +789,7 @@ fn run_dpkg(
     let &Configure {
         archives_host,
         identity_map,
+        id_mapper,
         env,
         // The wave's own selection is spelled out in `args` by the caller,
         // which is what dpkg is told to act on.
@@ -807,6 +814,7 @@ fn run_dpkg(
         // staging tree that `provision::ensure`'s error path is removing.
         .stop_with_caller(true)
         .identity_map(identity_map.clone())
+        .shared_id_mapper(id_mapper.cloned())
         .envs(
             env.iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
@@ -1276,6 +1284,7 @@ mod tests {
             installables: &[],
             statoverride: &StatOverride::default(),
             identity_map: &IdentityMap::Single,
+            id_mapper: None,
             env: &[],
             source_date_epoch: None,
         };

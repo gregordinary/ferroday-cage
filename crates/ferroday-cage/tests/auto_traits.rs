@@ -37,7 +37,6 @@ const _: () = assert_send_sync::<ferroday_cage::ResolvedInputs>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedRoot>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedMount>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedIdentity>();
-const _: () = assert_send_sync::<ferroday_cage::ResolvedRunAs>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedStreams>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedStdio>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedRlimit>();
@@ -91,7 +90,11 @@ const _: () = assert_send_sync::<ferroday_cage::host::OverlayBlocker>();
 
 const _: () = assert_send_sync::<ferroday_cage::provision::Provisioned>();
 const _: () = assert_send_sync::<ferroday_cage::provision::ProvisionError>();
-const _: () = assert_send_sync::<ferroday_cage::provision::Remove<'_>>();
+const _: () = assert_send_sync::<ferroday_cage::provision::Remove>();
+const _: () = assert_send_sync::<ferroday_cage::provision::CopyIn>();
+const _: () = assert_send_sync::<ferroday_cage::provision::CopyReport>();
+const _: () = assert_send_sync::<ferroday_cage::provision::SkippedEntry>();
+const _: () = assert_send_sync::<ferroday_cage::provision::SkippedKind>();
 #[cfg(feature = "tarball")]
 const _: () = assert_send_sync::<ferroday_cage::provision::Export<'_>>();
 // The entry an export's filter is offered, and what it says the entry is. Both
@@ -155,8 +158,8 @@ mod debian {
     // can be built on one thread and run on another. Neither is `Sync`: a
     // `Box<dyn Fetch + Send>` is not, and nothing would use one if it were,
     // because every operation on a `Debian` takes `&mut self`.
-    const _: () = assert_send::<debian::Debian<'_>>();
-    const _: () = assert_send::<debian::DebianBuilder<'_>>();
+    const _: () = assert_send::<debian::Debian>();
+    const _: () = assert_send::<debian::DebianBuilder>();
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +197,7 @@ mod gentoo {
     const _: () = assert_send_sync::<gentoo::CertificateHorizon>();
     const _: () = assert_send_sync::<gentoo::GentooError>();
     const _: () = assert_send_sync::<gentoo::Stage3>();
-    const _: () = assert_send_sync::<gentoo::Available>();
+    const _: () = assert_send_sync::<gentoo::Variants>();
     const _: () = assert_send_sync::<gentoo::Catalogue>();
     const _: () = assert_send_sync::<gentoo::Installed>();
     const _: () = assert_send_sync::<gentoo::InstalledPackage>();
@@ -275,7 +278,7 @@ const _: () = assert_send_sync::<ferroday_cage::RestrictedProfile>();
 //   created. `KillHandle` is the piece that does cross threads, and is asserted
 //   `Send + Sync` above.
 //
-// - `Observed<'o, 'a>` borrows a `&mut dyn FnMut` progress sink, for the same
+// - `Observed<'o>` borrows a `&mut dyn FnMut` progress sink, for the same
 //   reason: it lives only for the duration of the call it decorates.
 //
 // - `Provision<'obs>` and `ProvisionRequest<'a>` borrow a

@@ -141,7 +141,15 @@ pub(super) fn scheme_of(url: &str) -> Option<&str> {
 /// transport wrapping a genuinely thread-bound handle keeps that handle in a
 /// [`thread_local!`] or behind a channel to the thread that owns it.
 ///
+/// For the same reason, a provisioner's builder takes its transport by value,
+/// as `impl Fetch + 'static`, and the provisioner keeps it for its whole life.
+/// A borrowed transport would tie the provisioner to the frame that lent it,
+/// and so to that frame's thread. A transport that shares state with its
+/// caller, such as a connection pool or a record of what was fetched, holds
+/// that state behind an [`Arc`].
+///
 /// [`Cell`]: std::cell::Cell
+/// [`Arc`]: std::sync::Arc
 ///
 /// # Stability
 ///

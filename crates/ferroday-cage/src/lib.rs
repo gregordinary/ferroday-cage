@@ -300,7 +300,7 @@ pub use netstack::{NetStack, NetStackBuilder, NetStackError, NetStackHandle};
 pub use observer::{Observer, Output, Progress};
 pub use resolved::{
     ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs, ResolvedLandlockNet,
-    ResolvedMount, ResolvedRlimit, ResolvedRoot, ResolvedRunAs, ResolvedStdio, ResolvedStreams,
+    ResolvedMount, ResolvedRlimit, ResolvedRoot, ResolvedStdio, ResolvedStreams,
 };
 #[cfg(feature = "hardening")]
 pub use restrict::{Restriction, RestrictionBuilder};

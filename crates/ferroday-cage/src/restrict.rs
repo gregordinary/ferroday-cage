@@ -590,6 +590,65 @@ impl RestrictionBuilder {
         self
     }
 
+    /// The configured command path.
+    pub fn get_command(&self) -> Option<&Path> {
+        self.command.as_deref()
+    }
+
+    /// The command's arguments, excluding the conventional `argv[0]`.
+    pub fn get_args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// The caller-set environment variables, in the order they were set.
+    ///
+    /// These are the caller's additions; the command's full environment is
+    /// these composed over the restriction's `PATH`-only base, unless
+    /// [`base_env`](Self::base_env) is off.
+    pub fn get_envs(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.env
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+    }
+
+    /// Whether the deterministic base environment is composed under the
+    /// caller's variables.
+    pub fn get_base_env(&self) -> bool {
+        self.base_env
+    }
+
+    /// The command's working directory, a host path, when one is set.
+    pub fn get_current_dir(&self) -> Option<&Path> {
+        self.workdir.as_deref()
+    }
+
+    /// The command's standard-input disposition.
+    pub fn get_stdin(&self) -> &Stdio {
+        &self.stdin
+    }
+
+    /// The command's standard-output disposition.
+    pub fn get_stdout(&self) -> &Stdio {
+        &self.stdout
+    }
+
+    /// The command's standard-error disposition.
+    pub fn get_stderr(&self) -> &Stdio {
+        &self.stderr
+    }
+
+    /// Whether the command's lifetime is tied to the caller's.
+    pub fn get_stop_with_caller(&self) -> bool {
+        self.stop_with_caller
+    }
+
+    /// The configured resource limits, ordered by resource.
+    pub fn get_rlimits(&self) -> impl Iterator<Item = (Resource, Limit, Limit)> {
+        self.rlimits
+            .iter()
+            .map(|(resource, (soft, hard))| (*resource, *soft, *hard))
+    }
+
     /// Validates the configuration and freezes it into a [`Restriction`].
     ///
     /// All fallible and allocating preparation happens here: the command
@@ -740,6 +799,57 @@ mod tests {
             base_env: _,
             stop_with_caller: _,
         } = RestrictionBuilder::default();
+    }
+
+    /// Every setting the two builders share reads back through a getter of the
+    /// cage builder's name and shape, so a caller judging a launch asks the
+    /// builder rather than tracking what it set.
+    #[test]
+    fn a_restriction_reads_back_the_settings_it_shares_with_a_cage() {
+        let unset = RestrictionBuilder::default();
+        assert_eq!(unset.get_command(), None);
+        assert!(unset.get_args().is_empty());
+        assert_eq!(unset.get_envs().count(), 0);
+        assert!(unset.get_base_env());
+        assert_eq!(unset.get_current_dir(), None);
+        for stream in [unset.get_stdin(), unset.get_stdout(), unset.get_stderr()] {
+            assert!(matches!(stream, Stdio::Inherit), "{stream:?}");
+        }
+        assert!(!unset.get_stop_with_caller());
+        assert_eq!(unset.get_rlimits().count(), 0);
+
+        let set = Restriction::builder()
+            .command("/bin/sh")
+            .args(["-c", "true"])
+            .env("K", "V")
+            .base_env(false)
+            .current_dir("/srv")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Fd(std::sync::Arc::new(
+                std::fs::File::open("/dev/null").unwrap().into(),
+            )))
+            .stop_with_caller(true)
+            .rlimit(Resource::OpenFiles, 64, 128);
+        assert_eq!(set.get_command(), Some(Path::new("/bin/sh")));
+        assert_eq!(
+            set.get_args(),
+            [OsString::from("-c"), OsString::from("true")]
+        );
+        assert_eq!(
+            set.get_envs().collect::<Vec<_>>(),
+            [(OsStr::new("K"), OsStr::new("V"))],
+        );
+        assert!(!set.get_base_env());
+        assert_eq!(set.get_current_dir(), Some(Path::new("/srv")));
+        // Three different dispositions, so each getter is seen to read its own.
+        assert!(matches!(set.get_stdin(), Stdio::Null));
+        assert!(matches!(set.get_stdout(), Stdio::Fd(_)));
+        assert!(matches!(set.get_stderr(), Stdio::Inherit));
+        assert!(set.get_stop_with_caller());
+        assert_eq!(
+            set.get_rlimits().collect::<Vec<_>>(),
+            [(Resource::OpenFiles, Limit::of(64), Limit::of(128))],
+        );
     }
 
     fn restricted_true() -> RestrictionBuilder {

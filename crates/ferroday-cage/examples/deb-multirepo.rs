@@ -291,7 +291,7 @@ fn run(config: Config) -> ExitCode {
 /// `--local-repo` becomes a trusted `file://`
 /// [`Repository`](ferroday_cage::provision::debian::Repository) merged in
 /// alongside.
-fn compose(config: &Config) -> Result<Debian<'static>, ComposeError> {
+fn compose(config: &Config) -> Result<Debian, ComposeError> {
     let mut builder = Debian::builder(&config.suite).include(config.includes.clone());
     if let Some(mirror) = &config.mirror {
         builder = builder.mirror(mirror);

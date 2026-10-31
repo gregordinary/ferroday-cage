@@ -379,7 +379,7 @@ pub(super) fn directory(architecture: &str, sub_architecture: &str) -> String {
 /// Produced by [`Gentoo::packages`](super::Gentoo::packages), and read from the
 /// index the archive serves now rather than from anything compiled into this
 /// crate. It is the binhost's counterpart to
-/// [`Available`](super::Available), and it answers the question a caller has
+/// [`Variants`](super::Variants), and it answers the question a caller has
 /// before they commit to a resolution: whether the archive publishes the thing
 /// they mean to install.
 ///

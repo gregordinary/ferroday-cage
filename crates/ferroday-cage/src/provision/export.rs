@@ -29,6 +29,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::identity::compose_child_map;
 use super::tar::{
@@ -101,7 +102,7 @@ use crate::{IdMapper, IdentityMap};
 pub struct Export<'a> {
     rootfs: PathBuf,
     map: IdentityMap,
-    mapper: Option<&'a dyn IdMapper>,
+    mapper: Option<Arc<dyn IdMapper>>,
     clamp_mtime: Option<i64>,
     filter: Option<Box<EntryPredicate<'a>>>,
 }
@@ -138,6 +139,14 @@ impl<'a> Export<'a> {
     /// The identity map defaults to [`IdentityMap::Single`], under which the
     /// in-map child writes its own one-id map and every entry is recorded as
     /// root — the identity a single-mapped sandbox ran everything as.
+    ///
+    /// That is a sandbox's own default, because an export records every owner
+    /// through the map: it has to be the map the tree was built under, and a
+    /// tree built with every default was built under this one. A [`Remove`]
+    /// defaults to the subordinate map instead, because a removal records no
+    /// ownership.
+    ///
+    /// [`Remove`]: super::Remove
     pub fn new(rootfs: impl AsRef<Path>) -> Export<'a> {
         Export {
             rootfs: rootfs.as_ref().to_path_buf(),
@@ -172,9 +181,12 @@ impl<'a> Export<'a> {
     /// pair the tree was built under; a [`Single`](IdentityMap::Single) map
     /// self-establishes and ignores the mapper, as the launch does.
     ///
+    /// The delegate is taken by value and kept, as every builder that takes one
+    /// keeps it; [`CageBuilder::id_mapper`] says why.
+    ///
     /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
-    pub fn mapper(mut self, mapper: &'a dyn IdMapper) -> Export<'a> {
-        self.mapper = Some(mapper);
+    pub fn mapper(mut self, mapper: impl IdMapper + 'static) -> Export<'a> {
+        self.mapper = Some(Arc::new(mapper));
         self
     }
 
@@ -268,7 +280,7 @@ impl<'a> Export<'a> {
             &self.rootfs,
             writer,
             &self.map,
-            self.mapper,
+            self.mapper.as_ref(),
             self.clamp_mtime,
             self.filter.as_deref(),
         )
@@ -334,7 +346,7 @@ impl<'a> Export<'a> {
             &self.rootfs,
             &file,
             &self.map,
-            self.mapper,
+            self.mapper.as_ref(),
             self.clamp_mtime,
             self.filter.as_deref(),
         )?;
@@ -407,7 +419,7 @@ fn export_inner<W: Write>(
     rootfs: &Path,
     writer: W,
     map: &IdentityMap,
-    mapper: Option<&dyn IdMapper>,
+    mapper: Option<&Arc<dyn IdMapper>>,
     clamp_mtime: Option<i64>,
     filter: Option<&EntryPredicate<'_>>,
 ) -> Result<(), ProvisionError> {

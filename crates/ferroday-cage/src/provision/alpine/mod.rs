@@ -55,6 +55,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Seek as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use keyring::KeySet;
 pub use pin::{UnheldPin, UnheldReason};
@@ -72,11 +73,12 @@ use super::layer::Rooting;
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
-    Available, BuildLayer, Failover, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter,
-    PackageCache, ProvisionError, ProvisionRequest, Provisioner, Stream, mirror_url, walk_mirrors,
+    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, FetchRequest, HttpFetch,
+    LimitedWriter, PackageCache, ProvisionError, ProvisionRequest, Provisioner, Stream, mirror_url,
+    walk_mirrors,
 };
-use crate::IdentityMap;
 use crate::failure::path_io_error;
+use crate::{IdMapper, IdentityMap};
 use bootstrap::ScriptSubject;
 use index::{Index, Record};
 use installed::{Carried, Claim, Database};
@@ -197,6 +199,10 @@ pub struct Alpine {
     extract_only: bool,
     /// The map the script cages run under.
     identity_map: IdentityMap,
+    /// The delegate that map is established through, set by
+    /// [`AlpineBuilder::id_mapper`]; `None` resolves a range map through the
+    /// bundled chain.
+    id_mapper: Option<Arc<dyn IdMapper>>,
     /// Where downloaded packages are kept across runs, where the caller named a
     /// place.
     cache_dir: Option<PathBuf>,
@@ -225,6 +231,10 @@ impl fmt::Debug for Alpine {
             .field("excludes", &self.excludes)
             .field("extract_only", &self.extract_only)
             .field("identity_map", &self.identity_map)
+            .field(
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+            )
             .field("cache_dir", &self.cache_dir)
             .field("overlay", &self.overlay)
             .field("source_date_epoch", &self.source_date_epoch)
@@ -250,6 +260,7 @@ impl Alpine {
             plan: None,
             extract_only: false,
             identity_map: IdentityMap::Single,
+            id_mapper: None,
             cache_dir: None,
             overlay: None,
             source_date_epoch: None,
@@ -517,7 +528,7 @@ impl Alpine {
         // not on the way out, so a failure below disposes of a partly-installed
         // increment instead of orphaning it: there is no handle in an `Err` for
         // the caller to drop.
-        let layer = BuildLayer::new(upper, self.identity_map.clone());
+        let layer = BuildLayer::new(upper, self.identity_map.clone(), self.id_mapper.clone());
         // Refuse a host that cannot establish an unprivileged overlay on the
         // upper's filesystem before any download — the preflight the primitive
         // would make at cage-build time, hoisted ahead of the work. The probe
@@ -564,6 +575,7 @@ pub struct AlpineBuilder {
     plan: Option<Plan>,
     extract_only: bool,
     identity_map: IdentityMap,
+    id_mapper: Option<Arc<dyn IdMapper>>,
     cache_dir: Option<PathBuf>,
     overlay: Option<PathBuf>,
     source_date_epoch: Option<i64>,
@@ -589,6 +601,10 @@ impl fmt::Debug for AlpineBuilder {
             .field("plan", &self.plan)
             .field("extract_only", &self.extract_only)
             .field("identity_map", &self.identity_map)
+            .field(
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+            )
             .field("cache_dir", &self.cache_dir)
             .field("overlay", &self.overlay)
             .field("source_date_epoch", &self.source_date_epoch)
@@ -800,6 +816,26 @@ impl AlpineBuilder {
         self
     }
 
+    /// Supplies the delegate that establishes a range
+    /// [`identity_map`](Self::identity_map), replacing the bundled fallback
+    /// chain, as [`CageBuilder::id_mapper`] does for one sandbox.
+    ///
+    /// Every cage an install script runs in is launched through it, and so is
+    /// the removal of a [`stage_layer`](Alpine::stage_layer) increment. The
+    /// preflight that refuses an unavailable map before any download asks it
+    /// too. A tree a site-specific delegate established ownership in is
+    /// exported, copied into, and removed through that same delegate:
+    /// [`Export::mapper`](super::Export::mapper),
+    /// [`CopyIn::mapper`](super::CopyIn::mapper), and
+    /// [`Remove::mapper`](super::Remove::mapper). The delegate is taken by
+    /// value and kept; [`CageBuilder::id_mapper`] says why.
+    ///
+    /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
+    pub fn id_mapper(mut self, mapper: impl IdMapper + 'static) -> Self {
+        self.id_mapper = Some(Arc::new(mapper));
+        self
+    }
+
     /// Keeps downloaded packages in `dir` across runs.
     ///
     /// Without one, packages are downloaded into a directory beside the rootfs
@@ -905,8 +941,11 @@ impl AlpineBuilder {
     /// The built-in [`HttpFetch`] speaks `http://` and `file://`. Every archive
     /// this layer is written against serves plain HTTP, so a caller needs this
     /// for a mirror behind TLS, behind a proxy, or on a transport of their own.
-    pub fn fetcher(mut self, fetcher: Box<dyn Fetch>) -> Self {
-        self.fetcher = Some(fetcher);
+    ///
+    /// The transport is taken by value and kept for the provisioner's whole
+    /// life; [`Fetch`] says why.
+    pub fn fetcher(mut self, fetcher: impl Fetch + 'static) -> Self {
+        self.fetcher = Some(Box::new(fetcher));
         self
     }
 
@@ -1005,6 +1044,7 @@ impl AlpineBuilder {
             plan: self.plan,
             extract_only: self.extract_only,
             identity_map: self.identity_map,
+            id_mapper: self.id_mapper,
             cache_dir: self.cache_dir,
             overlay: self.overlay,
             source_date_epoch: self.source_date_epoch,
@@ -1608,14 +1648,11 @@ fn preflight(alpine: &Alpine) -> Result<(), AlpineError> {
     preflight_foreign(&host_architecture(), &alpine.architecture)?;
     // The identity posture is never quietly downgraded to the single-identity
     // form.
-    if !matches!(alpine.identity_map, IdentityMap::Single)
-        && let Err(refusal) = crate::idmap::resolve_range_bundled(&alpine.identity_map)
-    {
-        return Err(AlpineError::Config {
+    crate::idmap::establishable(&alpine.identity_map, alpine.id_mapper.as_ref()).map_err(
+        |refusal| AlpineError::Config {
             reason: refusal.to_string(),
-        });
-    }
-    Ok(())
+        },
+    )
 }
 
 /// The whole bootstrap: preflight, then install into the staging tree.
@@ -1776,6 +1813,7 @@ fn install(
             staging: into,
             rooting: Rooting::over(base.map(layer::Base::path)),
             identity_map: &alpine.identity_map,
+            id_mapper: alpine.id_mapper.as_ref(),
             source_date_epoch: alpine.source_date_epoch,
         },
         &database,
@@ -2608,7 +2646,7 @@ mod tests {
     /// delegates everything else.
     struct Unusable {
         refuse: &'static str,
-        rest: Box<dyn Fetch>,
+        rest: Canned,
     }
 
     impl Fetch for Unusable {
@@ -2626,8 +2664,8 @@ mod tests {
 
     /// A transport serving the two published index fixtures at the paths their
     /// repositories publish them under.
-    fn canned() -> Box<dyn Fetch> {
-        Box::new(Canned(HashMap::from([
+    fn canned() -> Canned {
+        Canned(HashMap::from([
             (
                 "http://mirror.invalid/alpine/v3.23/main/x86_64/APKINDEX.tar.gz".to_string(),
                 fixtures::INDEX.to_vec(),
@@ -2636,7 +2674,7 @@ mod tests {
                 "http://mirror.invalid/pmos/v26.06/x86_64/APKINDEX.tar.gz".to_string(),
                 fixtures::POSTMARKETOS_INDEX.to_vec(),
             ),
-        ])))
+        ]))
     }
 
     /// The postmarketOS repository, as a caller configures one.
@@ -2819,10 +2857,10 @@ mod tests {
             .architecture("x86_64")
             .mirror("http://unusable.invalid/alpine")
             .mirror_fallback("http://mirror.invalid/alpine")
-            .fetcher(Box::new(Unusable {
+            .fetcher(Unusable {
                 refuse: "http://unusable.invalid/",
                 rest: canned(),
-            }))
+            })
             .build()
             .expect("the bootstrap configures");
         let err = alpine
@@ -4025,6 +4063,45 @@ mod tests {
             !upper.exists(),
             "the upper it created went with the failure"
         );
+    }
+
+    #[test]
+    fn the_preflight_asks_the_callers_delegate_for_a_range_map() {
+        // A map only a site-specific delegate can establish is one the bundled
+        // chain cannot, so the refusal that stops a bootstrap before any
+        // download has to come from the delegate the caller supplied.
+        #[derive(Debug, Clone, Default)]
+        struct Refusing {
+            asked: Arc<std::sync::Mutex<usize>>,
+        }
+        impl IdMapper for Refusing {
+            fn resolve(
+                &self,
+                _request: &IdentityMap,
+            ) -> Result<crate::ResolvedMap, crate::IdMapError> {
+                *self.asked.lock().unwrap() += 1;
+                Err(crate::IdMapError::unsatisfiable(
+                    "the caller's delegate refuses",
+                ))
+            }
+            fn apply(&self, _pid: u32, _map: &crate::ResolvedMap) -> Result<(), crate::IdMapError> {
+                unreachable!("a refused map is never applied")
+            }
+        }
+
+        let delegate = Refusing::default();
+        let alpine = Alpine::builder("v3.23")
+            .architecture(host_architecture())
+            .identity_map(IdentityMap::Subordinate)
+            .id_mapper(delegate.clone())
+            .build()
+            .expect("the bootstrap configures");
+        let err = preflight(&alpine).expect_err("the delegate refuses the map");
+        assert!(
+            matches!(&err, AlpineError::Config { reason, .. } if reason.contains("the caller's delegate refuses")),
+            "{err}",
+        );
+        assert_eq!(*delegate.asked.lock().unwrap(), 1);
     }
 
     #[test]

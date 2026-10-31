@@ -117,6 +117,8 @@ fn a_builder_shows_its_settings_and_names_its_delegate() {
         "trust_unsigned: true",
         // No fetcher was substituted, so the default is still to be resolved.
         "fetcher: None",
+        // Nor an identity-map delegate, so a range map takes the bundled chain.
+        "id_mapper: None",
     ] {
         assert!(
             rendering.contains(expected),
@@ -161,7 +163,7 @@ fn an_absent_delegate_renders_as_absent_and_a_present_one_as_present() {
     let bare = Remove::new("/srv/rootfs");
     assert!(format!("{bare:?}").contains("mapper: None"), "{bare:?}");
 
-    let removal = Remove::new("/srv/rootfs").mapper(&mapper);
+    let removal = Remove::new("/srv/rootfs").mapper(mapper);
     assert!(
         format!("{removal:?}").contains("mapper: Some(<dyn IdMapper>)"),
         "{removal:?}",
@@ -198,7 +200,7 @@ fn an_export_shows_whether_it_has_a_mapper() {
     assert!(without.contains("mapper: None"), "{without}");
 
     let mapper = DirectMapper::new();
-    let with = format!("{:?}", Export::new("/srv/rootfs").mapper(&mapper));
+    let with = format!("{:?}", Export::new("/srv/rootfs").mapper(mapper));
     assert!(with.contains("mapper: Some(<dyn IdMapper>)"), "{with}");
 }
 
@@ -210,7 +212,7 @@ fn an_export_carries_the_settings_that_decide_its_output() {
     let mapper = DirectMapper::new();
     let export = Export::new("/srv/rootfs")
         .map(IdentityMap::Subordinate)
-        .mapper(&mapper)
+        .mapper(mapper)
         .clamp_mtime(1_700_000_000);
     let rendering = format!("{export:?}");
     for expected in [

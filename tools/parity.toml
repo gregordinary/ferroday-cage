@@ -408,6 +408,11 @@ name = "identity_map"
 flags = ["--debian-identity-map"]
 
 [[builder.setting]]
+name = "id_mapper"
+kind = "code"
+why = "An identity-map delegate is a trait object. `--debian-identity-map` names the delegates the library bundles."
+
+[[builder.setting]]
 name = "source_date_epoch"
 flags = ["--debian-source-date-epoch"]
 
@@ -481,6 +486,11 @@ flags = ["--alpine-keys"]
 [[builder.setting]]
 name = "identity_map"
 flags = ["--alpine-identity-map"]
+
+[[builder.setting]]
+name = "id_mapper"
+kind = "code"
+why = "An identity-map delegate is a trait object. `--alpine-identity-map` names the delegates the library bundles."
 
 [[builder.setting]]
 name = "source_date_epoch"

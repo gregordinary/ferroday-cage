@@ -23,42 +23,18 @@ use crate::mechanism::ChildMap;
 /// A resolved range-map delegate: the mapper that applies the map, and the
 /// extents it resolved.
 ///
-/// Held by the caller across the fork because a [`ChildMap`] borrows both. A
-/// bundled delegate is owned here, since nothing else holds it.
-pub(super) struct ResolvedDelegate<'a> {
-    /// Where the mapper came from.
-    source: Source<'a>,
+/// Held by the caller across the fork because a [`ChildMap`] borrows both.
+pub(super) struct ResolvedDelegate {
+    /// The delegate that applies the map: the caller's, or the bundled one that
+    /// accepted the request.
+    mapper: Arc<dyn IdMapper>,
     /// The extents the mapper resolved.
     map: ResolvedMap,
 }
 
-/// Where a [`ResolvedDelegate`]'s mapper came from, which decides whether this
-/// holds it or borrows it.
-enum Source<'a> {
-    /// The caller supplied it.
-    Caller(&'a dyn IdMapper),
-    /// It came from the bundled chain, resolved here.
-    Bundled(Arc<dyn IdMapper>),
-}
-
-impl ResolvedDelegate<'_> {
-    /// The delegate that applies the map.
-    fn mapper(&self) -> &dyn IdMapper {
-        match &self.source {
-            Source::Caller(mapper) => *mapper,
-            Source::Bundled(mapper) => mapper.as_ref(),
-        }
-    }
-
-    /// The extents to write.
-    fn map(&self) -> &ResolvedMap {
-        &self.map
-    }
-}
-
 /// The child's identity map, together with the storage a [`ChildMap`] borrows
 /// from: the formatted map lines, or the delegate and its extents.
-pub(super) enum ChildMapSource<'a> {
+pub(super) enum ChildMapSource {
     /// The single-identity map, which the child writes itself.
     SelfMap {
         /// The `uid_map` line.
@@ -67,10 +43,10 @@ pub(super) enum ChildMapSource<'a> {
         gid_line: Vec<u8>,
     },
     /// A range map, applied from outside by the delegate.
-    Delegated(ResolvedDelegate<'a>),
+    Delegated(ResolvedDelegate),
 }
 
-impl ChildMapSource<'_> {
+impl ChildMapSource {
     /// The map to hand the child, borrowed from this.
     pub(super) fn child_map(&self) -> ChildMap<'_> {
         match self {
@@ -78,8 +54,8 @@ impl ChildMapSource<'_> {
                 ChildMap::SelfMap { uid_line, gid_line }
             }
             ChildMapSource::Delegated(delegate) => ChildMap::Delegated {
-                mapper: delegate.mapper(),
-                map: delegate.map(),
+                mapper: delegate.mapper.as_ref(),
+                map: &delegate.map,
             },
         }
     }
@@ -93,51 +69,28 @@ impl ChildMapSource<'_> {
 ///
 /// The error is the reason the range map could not be resolved, for the caller
 /// to wrap in the error its own operation reports.
-pub(super) fn compose_child_map<'a>(
+pub(super) fn compose_child_map(
     map: &IdentityMap,
-    mapper: Option<&'a dyn IdMapper>,
-) -> Result<ChildMapSource<'a>, String> {
+    mapper: Option<&Arc<dyn IdMapper>>,
+) -> Result<ChildMapSource, String> {
     match map {
         IdentityMap::Single => {
             let (uid_line, gid_line) = crate::idmap::single_identity_lines();
             Ok(ChildMapSource::SelfMap { uid_line, gid_line })
         }
         IdentityMap::Ranges { .. } | IdentityMap::Subordinate => {
-            resolve_delegate(map, mapper).map(ChildMapSource::Delegated)
-        }
-    }
-}
-
-/// Resolves the delegate a range map is applied through: the caller's mapper
-/// when one was supplied, and the bundled chain otherwise.
-///
-/// The error is the reason no delegate could satisfy the request — for the
-/// bundled chain, every candidate's refusal in turn.
-///
-/// Both go through the step a build resolves its own range map with, so a
-/// malformed request, or a malformed map from the delegate, is refused here by
-/// name rather than reaching the kernel as an `EINVAL` at the write.
-fn resolve_delegate<'a>(
-    map: &IdentityMap,
-    mapper: Option<&'a dyn IdMapper>,
-) -> Result<ResolvedDelegate<'a>, String> {
-    // The caller's own error already says no delegate could establish the map,
-    // so a refusal contributes its reason alone; an invalid map says so.
-    let reason = |err: ConfigError| match err {
-        ConfigError::IdentityMapUnavailable { reason, .. } => reason,
-        other => other.to_string(),
-    };
-    match mapper {
-        Some(mapper) => Ok(ResolvedDelegate {
-            source: Source::Caller(mapper),
-            map: crate::idmap::resolve_range(map, mapper).map_err(reason)?,
-        }),
-        None => {
-            let (mapper, resolved) = crate::idmap::resolve_range_bundled(map).map_err(reason)?;
-            Ok(ResolvedDelegate {
-                source: Source::Bundled(mapper),
-                map: resolved,
-            })
+            // The step a build resolves its own range map with, so a malformed
+            // request, or a malformed map from the delegate, is refused here by
+            // name rather than reaching the kernel as an `EINVAL` at the write.
+            // The caller's own error already says no delegate could establish
+            // the map, so a refusal contributes its reason alone; an invalid
+            // map says so.
+            let (mapper, map) =
+                crate::idmap::resolve_delegate(map, mapper).map_err(|err| match err {
+                    ConfigError::IdentityMapUnavailable { reason, .. } => reason,
+                    other => other.to_string(),
+                })?;
+            Ok(ChildMapSource::Delegated(ResolvedDelegate { mapper, map }))
         }
     }
 }
@@ -172,7 +125,8 @@ mod tests {
         // malformed request is refused by name before a delegate is asked,
         // rather than reaching the kernel as an EINVAL at the write.
         let malformed = IdentityMap::ranges(Vec::new(), Vec::new());
-        let reason = match compose_child_map(&malformed, Some(&Obliging)) {
+        let obliging: Arc<dyn IdMapper> = Arc::new(Obliging);
+        let reason = match compose_child_map(&malformed, Some(&obliging)) {
             Err(reason) => reason,
             Ok(_) => panic!("a malformed request is refused"),
         };

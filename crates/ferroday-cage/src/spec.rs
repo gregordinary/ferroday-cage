@@ -1580,8 +1580,27 @@ impl CageBuilder {
     /// during each launch, against the launch stage held at an internal
     /// gate. [`IdentityMap::Single`] needs no delegate and never consults
     /// one.
+    ///
+    /// The delegate is taken by value and kept, as every builder that takes
+    /// one keeps it: the [`Cage`] this builds applies it at each launch, long
+    /// after the call that configured it, and may be moved to another thread
+    /// with it. A caller naming one delegate to several builders, such as a
+    /// sandbox and the export of the tree it wrote, passes each a clone. A
+    /// delegate whose answers rest on state of its own keeps that state behind
+    /// an [`Arc`], so its clones share it.
     pub fn id_mapper(mut self, mapper: impl IdMapper + 'static) -> Self {
         self.id_mapper = Some(Arc::new(mapper));
+        self
+    }
+
+    /// Supplies a delegate another builder already holds, or clears one.
+    ///
+    /// A provisioner hands each sandbox it launches the `Arc` it keeps, so the
+    /// one delegate its caller supplied applies every map, rather than a second
+    /// wrapping of it.
+    #[cfg(any(feature = "debian", feature = "alpine"))]
+    pub(crate) fn shared_id_mapper(mut self, mapper: Option<Arc<dyn IdMapper>>) -> Self {
+        self.id_mapper = mapper;
         self
     }
 
@@ -2213,13 +2232,7 @@ impl CageBuilder {
             request => {
                 // A configured delegate is the whole chain: its refusal is
                 // final. Without one, the bundled delegates are tried in turn.
-                let (mapper, map) = match &self.id_mapper {
-                    Some(mapper) => (
-                        Arc::clone(mapper),
-                        idmap::resolve_range(request, mapper.as_ref())?,
-                    ),
-                    None => idmap::resolve_range_bundled(request)?,
-                };
+                let (mapper, map) = idmap::resolve_delegate(request, self.id_mapper.as_ref())?;
                 IdentityPlan::Ranged { mapper, map }
             }
         };
@@ -6022,9 +6035,9 @@ pub(crate) mod serde_tests {
     /// paths, with an array index rendered as `[]`.
     ///
     /// The one reading behind each serde format's key pin: the profile format
-    /// here, which needs the hardening layer to name every key, and
-    /// `NetStackBuilder`'s beside the network stack.
-    #[cfg(any(feature = "hardening", feature = "netstack"))]
+    /// here, which needs the hardening layer to name every key,
+    /// `NetStackBuilder`'s beside the network stack, and the resolved
+    /// provenance record's beside the record.
     pub(crate) fn profile_keys(rendered: &str) -> Vec<String> {
         fn walk(value: &toml::Value, prefix: &str, into: &mut Vec<String>) {
             match value {

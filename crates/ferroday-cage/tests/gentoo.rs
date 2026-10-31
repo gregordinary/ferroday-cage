@@ -45,41 +45,39 @@ fn the_archive_publishes_the_enumeration_this_layer_reads() {
     let mut gentoo = Gentoo::builder(ARCHITECTURE)
         .build()
         .expect("the architecture and the vendored keyring are usable");
-    let available = gentoo
-        .available()
+    let variants = gentoo
+        .variants()
         .expect("the archive serves a pointer this layer can verify and read");
 
     // The variant the tests install, spelled as the whole compound the document
     // publishes. If this stops holding, the archive has renamed what it offers.
     assert!(
-        available.contains(VARIANT),
+        variants.contains(VARIANT),
         "{ARCHITECTURE} publishes {VARIANT}; it offers {:?}",
-        available.variants().collect::<Vec<_>>(),
+        variants.names().collect::<Vec<_>>(),
     );
     // A sub-architecture is a sibling in the same document rather than a
     // variant of the one it was fetched under. This is the finding the variant
     // spelling rests on, so it is worth catching upstream changing its mind.
     assert!(
-        available
-            .variants()
-            .any(|variant| variant.starts_with("x32-")),
+        variants.names().any(|variant| variant.starts_with("x32-")),
         "amd64's document lists x32 variants as siblings: {:?}",
-        available.variants().collect::<Vec<_>>(),
+        variants.names().collect::<Vec<_>>(),
     );
 
     // The build id belongs to the entry rather than to the document: the x32
     // entries are routinely months older than the rest.
-    let build = available
+    let build = variants
         .build_id(VARIANT)
         .expect("the variant it just reported");
     assert_eq!(build.len(), 16, "a build id is a timestamp: {build}");
     assert!(
-        available.size(VARIANT).is_some_and(|size| size > 1 << 26),
+        variants.size(VARIANT).is_some_and(|size| size > 1 << 26),
         "a stage3 is hundreds of megabytes",
     );
     // The regeneration timestamp is the only freshness bound there is, and a
     // resolve refuses without it.
-    assert!(available.published().is_some(), "the pointer states its ts");
+    assert!(variants.published().is_some(), "the pointer states its ts");
 }
 
 #[test]

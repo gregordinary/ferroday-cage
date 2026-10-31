@@ -19,7 +19,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use crate::Network;
-use crate::idmap::IdRange;
+use crate::idmap::{IdRange, Identity};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction};
 
@@ -30,9 +30,11 @@ use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction};
 /// # Stability
 ///
 /// This type's *shape* follows the compatibility promise like any other public
-/// item. Its *contents* do not: they report the defaults in force, and those
-/// are explicitly outside the promise — the mount profile and the base
-/// environment may both change in a patch release. That is the reason to
+/// item, and with the `serde` feature that includes the keys it serializes to:
+/// a test pins every key the record can carry. Its *contents* do not: they
+/// report the defaults in force, and those are explicitly outside the promise
+/// — the mount profile and the base environment may both change in a patch
+/// release. That is the reason to
 /// record the value rather than assume it, and a consumer that needs the
 /// contents themselves to be stable should set
 /// [`managed_mounts(false)`](crate::CageBuilder::managed_mounts) and
@@ -89,6 +91,10 @@ pub struct ResolvedInputs {
     /// The identity the command switches to before it executes, when one is
     /// configured with [`run_as`](crate::CageBuilder::run_as).
     ///
+    /// It is the configured [`Identity`], which a build has validated against
+    /// the map in [`identity`](Self::identity) and does not change: every id
+    /// is a sandbox-inside one, as that map holds it.
+    ///
     /// `None` runs the command as uid 0 of the sandbox's user namespace, or,
     /// for a restriction, as the calling user. Whether a build sees uid 0 or
     /// another id changes what it produces: a Debian build's
@@ -97,8 +103,11 @@ pub struct ResolvedInputs {
     /// A switch to a non-root id clears the command's capabilities, unless a
     /// keep set carries some across it, which [`hardening`](Self::hardening)
     /// records. A configured identity of any id also sets
-    /// [`no_new_privileges`](Self::no_new_privileges).
-    pub run_as: Option<ResolvedRunAs>,
+    /// [`no_new_privileges`](Self::no_new_privileges). Under the
+    /// single-identity map no supplementary group can be set, and the command
+    /// keeps the list it inherited, every entry of which the map presents as
+    /// the overflow gid.
+    pub run_as: Option<Identity>,
     /// Whether the command runs with the no-new-privileges flag set, so that a
     /// set-user-ID binary or a file capability grants nothing across
     /// `execve`.
@@ -224,24 +233,6 @@ pub enum ResolvedIdentity {
     },
 }
 
-/// The identity a built sandbox's command switches to before it executes.
-///
-/// The resolved counterpart of [`Identity`](crate::Identity), with every id a
-/// sandbox-inside one, as the map in [`ResolvedInputs::identity`] holds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-pub struct ResolvedRunAs {
-    /// The uid the command runs as.
-    pub uid: u32,
-    /// The gid the command runs as.
-    pub gid: u32,
-    /// The supplementary groups the command runs with. Under the
-    /// single-identity map none can be set, and the command keeps the list it
-    /// inherited, every entry of which the map presents as the overflow gid.
-    pub groups: Vec<u32>,
-}
-
 /// Where a built sandbox wires the command's three standard streams.
 ///
 /// What a build produces depends on what the command sees, and these are that:
@@ -272,7 +263,11 @@ pub struct ResolvedRunAs {
 /// rather than about what that launch's command saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
 pub struct ResolvedStreams {
     /// Where the command's standard input reads from.
     pub stdin: ResolvedStdio,
@@ -311,7 +306,11 @@ pub enum ResolvedStdio {
 /// in the record beside the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
 pub struct ResolvedRlimit {
     /// The kernel resource the limit governs.
     pub resource: Resource,
@@ -381,7 +380,11 @@ pub enum ResolvedHardening {
 /// One Landlock filesystem grant a built sandbox enrols.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
 pub struct ResolvedLandlockFs {
     /// The granted path, as the command sees it after the root swap.
     pub path: PathBuf,
@@ -404,7 +407,11 @@ pub struct ResolvedLandlockFs {
 /// One Landlock network grant a built sandbox enrols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
 pub struct ResolvedLandlockNet {
     /// The TCP port the grant governs.
     pub port: u16,
@@ -528,10 +535,9 @@ impl ResolvedInputs {
                 .map(|op| project_mount(&op.action))
                 .collect(),
             identity: project_identity(plan),
-            run_as: plan.run_as.as_ref().map(|run_as| ResolvedRunAs {
-                uid: run_as.uid.as_raw(),
-                gid: run_as.gid.as_raw(),
-                groups: run_as.groups.iter().map(|gid| gid.as_raw()).collect(),
+            run_as: plan.run_as.as_ref().map(|run_as| {
+                Identity::new(run_as.uid.as_raw(), run_as.gid.as_raw())
+                    .groups(run_as.groups.iter().map(|gid| gid.as_raw()))
             }),
             no_new_privileges: no_new_privileges(plan),
             network: plan.network,
@@ -816,8 +822,256 @@ mod tests {
 
 #[cfg(all(test, feature = "serde"))]
 mod serde_tests {
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{
+        ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
+        ResolvedLandlockNet, ResolvedMount, ResolvedRlimit, ResolvedRoot, ResolvedStdio,
+        ResolvedStreams,
+    };
+    use crate::idmap::{IdRange, Identity};
+    use crate::limits::{Limit, Resource};
     use crate::scratch::Scratch;
-    use crate::{Cage, RawMount};
+    use crate::{Cage, Network, RawMount};
+
+    /// The keys the records below render between them, in sorted order.
+    const EXPECTED_RECORD_KEYS: [&str; 52] = [
+        "env",
+        "env.SOURCE_DATE_EPOCH",
+        "hardening",
+        "hardening.keep-capabilities",
+        "hardening.kind",
+        "hardening.landlock-fs",
+        "hardening.landlock-fs[].access",
+        "hardening.landlock-fs[].path",
+        "hardening.landlock-net",
+        "hardening.landlock-net[].access",
+        "hardening.landlock-net[].port",
+        "hardening.landlock-scope",
+        "hardening.seccomp-instructions",
+        "identity",
+        "identity.gid",
+        "identity.gid[].count",
+        "identity.gid[].inside",
+        "identity.gid[].outside",
+        "identity.kind",
+        "identity.uid",
+        "identity.uid[].count",
+        "identity.uid[].inside",
+        "identity.uid[].outside",
+        "mounts",
+        "mounts[].data",
+        "mounts[].flags",
+        "mounts[].fstype",
+        "mounts[].kind",
+        "mounts[].path",
+        "mounts[].read-only",
+        "mounts[].source",
+        "mounts[].target",
+        "network",
+        "no-new-privileges",
+        "rlimits",
+        "rlimits[].hard",
+        "rlimits[].resource",
+        "rlimits[].soft",
+        "root",
+        "root.kind",
+        "root.lower",
+        "root.path",
+        "root.upper",
+        "root.work",
+        "run-as",
+        "run-as.gid",
+        "run-as.groups",
+        "run-as.uid",
+        "streams",
+        "streams.stderr",
+        "streams.stdin",
+        "streams.stdout",
+    ];
+
+    /// Records that between them hold every field and every variant the
+    /// record's types have, every optional field set.
+    ///
+    /// Built directly rather than from a cage, because no one host builds them
+    /// all: an overlay root needs an unprivileged overlay, a host root a
+    /// restriction, and an unavailable hardening layer a build without the
+    /// feature. The struct literals name every field, so a field added to any
+    /// of the types fails to compile here until it is given a value.
+    fn every_shape() -> Vec<ResolvedInputs> {
+        let extent = IdRange {
+            inside: 0,
+            outside: 100_000,
+            count: 65_536,
+        };
+        let streams = ResolvedStreams {
+            stdin: ResolvedStdio::Null,
+            stdout: ResolvedStdio::Fd,
+            stderr: ResolvedStdio::Inherit,
+        };
+        let everything = ResolvedInputs {
+            root: ResolvedRoot::Plain {
+                path: PathBuf::from("/srv/rootfs"),
+            },
+            env: vec![(
+                OsString::from("SOURCE_DATE_EPOCH"),
+                OsString::from("1700000000"),
+            )],
+            mounts: vec![
+                ResolvedMount::Tmpfs {
+                    target: PathBuf::from("/tmp"),
+                    flags: 6,
+                    data: "mode=1777".to_string(),
+                },
+                ResolvedMount::Procfs {
+                    target: PathBuf::from("/proc"),
+                },
+                ResolvedMount::Devpts {
+                    target: PathBuf::from("/dev/pts"),
+                    data: "newinstance".to_string(),
+                },
+                ResolvedMount::Bind {
+                    source: PathBuf::from("/etc"),
+                    target: PathBuf::from("/usr/src"),
+                    read_only: true,
+                },
+                ResolvedMount::Raw {
+                    source: Some(PathBuf::from("none")),
+                    target: PathBuf::from("/dev/shm"),
+                    fstype: Some("tmpfs".to_string()),
+                    flags: 2,
+                    data: Some("size=1m".to_string()),
+                },
+                ResolvedMount::Symlink {
+                    path: PathBuf::from("/dev/fd"),
+                    target: PathBuf::from("/proc/self/fd"),
+                },
+            ],
+            identity: ResolvedIdentity::Ranged {
+                uid: vec![extent],
+                gid: vec![extent],
+            },
+            run_as: Some(Identity::new(1000, 1000).groups([1000, 27])),
+            no_new_privileges: true,
+            network: Network::Host,
+            streams,
+            rlimits: vec![ResolvedRlimit {
+                resource: Resource::OpenFiles,
+                soft: Limit::of(1024),
+                hard: Limit::UNLIMITED,
+            }],
+            hardening: ResolvedHardening::Applied {
+                landlock_fs: vec![ResolvedLandlockFs {
+                    path: PathBuf::from("/usr"),
+                    access: 1,
+                }],
+                landlock_net: vec![ResolvedLandlockNet {
+                    port: 443,
+                    access: 2,
+                }],
+                landlock_scope: 3,
+                seccomp_instructions: Some(4),
+                keep_capabilities: Some(5),
+            },
+        };
+        let overlaid = ResolvedInputs {
+            root: ResolvedRoot::Overlay {
+                lower: vec![PathBuf::from("/srv/base")],
+                upper: PathBuf::from("/srv/upper"),
+                work: PathBuf::from("/srv/.upper.work"),
+            },
+            identity: ResolvedIdentity::Single,
+            hardening: ResolvedHardening::Unavailable,
+            ..everything.clone()
+        };
+        let restricted = ResolvedInputs {
+            root: ResolvedRoot::Host,
+            identity: ResolvedIdentity::Caller,
+            ..everything.clone()
+        };
+        vec![everything, overlaid, restricted]
+    }
+
+    /// Which variant of each of the record's enums a record holds.
+    ///
+    /// Every match is exhaustive, with no wildcard, so a variant added to any of
+    /// them fails to compile here until it is named, and then fails
+    /// [`the_record_format_keys_are_what_they_are`] until [`every_shape`] holds
+    /// one.
+    fn variants(record: &ResolvedInputs) -> Vec<&'static str> {
+        let root = match record.root {
+            ResolvedRoot::Host => "root host",
+            ResolvedRoot::Plain { .. } => "root plain",
+            ResolvedRoot::Overlay { .. } => "root overlay",
+        };
+        let identity = match record.identity {
+            ResolvedIdentity::Caller => "identity caller",
+            ResolvedIdentity::Single => "identity single",
+            ResolvedIdentity::Ranged { .. } => "identity ranged",
+        };
+        let hardening = match record.hardening {
+            ResolvedHardening::Unavailable => "hardening unavailable",
+            ResolvedHardening::Applied { .. } => "hardening applied",
+        };
+        let mounts = record.mounts.iter().map(|mount| match mount {
+            ResolvedMount::Tmpfs { .. } => "mount tmpfs",
+            ResolvedMount::Procfs { .. } => "mount procfs",
+            ResolvedMount::Devpts { .. } => "mount devpts",
+            ResolvedMount::Bind { .. } => "mount bind",
+            ResolvedMount::Raw { .. } => "mount raw",
+            ResolvedMount::Symlink { .. } => "mount symlink",
+        });
+        [root, identity, hardening]
+            .into_iter()
+            .chain(mounts)
+            .collect()
+    }
+
+    /// Every key the serialized provenance record can carry.
+    ///
+    /// The record is meant to be stored in an artifact's provenance and read
+    /// back by tools that never saw the build that wrote it, so its keys are a
+    /// format as much as the profile's are. They come from field names and
+    /// `rename_all` on each container, so a Rust-side rename, a changed
+    /// container attribute, and a newly added field all move a key silently.
+    /// This is what notices. A deliberate change to the format updates this
+    /// list, and the diff is the review.
+    #[test]
+    fn the_record_format_keys_are_what_they_are() {
+        let records = every_shape();
+        let held: BTreeSet<&str> = records.iter().flat_map(variants).collect();
+        assert_eq!(
+            held,
+            BTreeSet::from([
+                "hardening applied",
+                "hardening unavailable",
+                "identity caller",
+                "identity ranged",
+                "identity single",
+                "mount bind",
+                "mount devpts",
+                "mount procfs",
+                "mount raw",
+                "mount symlink",
+                "mount tmpfs",
+                "root host",
+                "root overlay",
+                "root plain",
+            ]),
+            "a variant the records do not hold has no keys pinned",
+        );
+
+        let mut keys = Vec::new();
+        for record in &records {
+            let rendered = toml::to_string(record).expect("the record serializes");
+            keys.extend(crate::spec::serde_tests::profile_keys(&rendered));
+        }
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys, EXPECTED_RECORD_KEYS, "the record format's keys moved");
+    }
 
     /// The record a consumer stamps into provenance is a TOML document, and
     /// its shape is what that consumer's own format has to accommodate.
@@ -1046,11 +1300,7 @@ mod serde_tests {
         assert_ne!(root, builder, "the identity the build ran as is not");
         assert_eq!(
             builder.run_as,
-            Some(crate::ResolvedRunAs {
-                uid: 1000,
-                gid: 1000,
-                groups: vec![1000, 27],
-            }),
+            Some(crate::Identity::new(1000, 1000).groups([1000, 27])),
         );
         assert!(root.no_new_privileges && builder.no_new_privileges);
 

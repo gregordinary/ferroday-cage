@@ -38,6 +38,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
@@ -852,17 +853,17 @@ impl<'obs> Provision<'obs> {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Remove<'a> {
+pub struct Remove {
     dest: PathBuf,
     /// The overlay work directory removed after `dest`, for a removal of an
     /// overlay upper.
     work: Option<PathBuf>,
     map: crate::IdentityMap,
-    mapper: Option<&'a dyn crate::idmap::IdMapper>,
+    mapper: Option<Arc<dyn crate::idmap::IdMapper>>,
     remove_lock: bool,
 }
 
-impl fmt::Debug for Remove<'_> {
+impl fmt::Debug for Remove {
     /// Renders the tree, the overlay work directory removed with it, the map
     /// both were written under, whether a caller-supplied mapper was given, and
     /// whether the publication lock is removed with the tree. The mapper
@@ -881,17 +882,25 @@ impl fmt::Debug for Remove<'_> {
     }
 }
 
-impl<'a> Remove<'a> {
+impl Remove {
     /// Returns a removal of the tree at `dest`.
     ///
     /// The identity map defaults to
-    /// [`IdentityMap::Subordinate`](crate::IdentityMap::Subordinate), which is
-    /// what a tree written by a bundled-delegate sandbox needs.
+    /// [`IdentityMap::Subordinate`](crate::IdentityMap::Subordinate), where a
+    /// sandbox, an export and a [`CopyIn`] default to
+    /// [`IdentityMap::Single`](crate::IdentityMap::Single). The difference is
+    /// deliberate. A removal writes no ownership anywhere, so any map under
+    /// which every owner in the tree is mapped removes it. The subordinate map
+    /// maps every id the bundled delegates hand out, the caller as id 0 and its
+    /// whole subordinate allocation, so it reaches a tree a single-mapped
+    /// sandbox wrote as well as a range-mapped one. On a host where no delegate
+    /// can establish it, a tree a single-mapped sandbox wrote is removed by
+    /// naming [`Single`](crate::IdentityMap::Single).
     ///
     /// The publication lock beside `dest` is removed with the tree, matching
     /// [`remove`]; [`remove_lock(false)`](Self::remove_lock) is how a caller
     /// whose `dest` is not itself a published rootfs declines that.
-    pub fn new(dest: impl AsRef<Path>) -> Remove<'a> {
+    pub fn new(dest: impl AsRef<Path>) -> Remove {
         Remove {
             dest: dest.as_ref().to_path_buf(),
             work: None,
@@ -914,16 +923,17 @@ impl<'a> Remove<'a> {
     /// Name the identity map the sandbox ran under with [`map`](Self::map): a
     /// sandbox's own default is
     /// [`IdentityMap::Single`](crate::IdentityMap::Single), while this
-    /// builder's is the subordinate map. The map decides how an entry the
-    /// calling user cannot remove is removed, so a tree a range-mapped sandbox
-    /// wrote needs its map, and a single-mapped one needs no subordinate ids.
+    /// builder's is the subordinate map, for the reason [`Remove::new`] gives.
+    /// The map decides how an entry the calling user cannot remove is removed,
+    /// so a tree a range-mapped sandbox wrote needs its map, and a single-mapped
+    /// one needs no subordinate ids.
     ///
     /// The publication lock is not removed: an upper is not a published rootfs,
     /// so a `<upper>.lock` beside it is a path this removal has no claim to. An
     /// overlay that names its own work directory through
     /// [`Overlay::work`](crate::Overlay::work) removes that directory with a
     /// [`Remove::new`] of its own, with the lock declined.
-    pub fn overlay_upper(upper: impl AsRef<Path>) -> Remove<'a> {
+    pub fn overlay_upper(upper: impl AsRef<Path>) -> Remove {
         let upper = upper.as_ref();
         Remove {
             dest: upper.to_path_buf(),
@@ -935,7 +945,7 @@ impl<'a> Remove<'a> {
     }
 
     /// Sets the identity map the tree was written under.
-    pub fn map(mut self, map: crate::IdentityMap) -> Remove<'a> {
+    pub fn map(mut self, map: crate::IdentityMap) -> Remove {
         self.map = map;
         self
     }
@@ -948,8 +958,25 @@ impl<'a> Remove<'a> {
     /// mapper, so it can re-enter the map the tree was written under. The
     /// mapper and the [`map`](Self::map) must be the pair the tree was built
     /// under.
-    pub fn mapper(mut self, mapper: &'a dyn crate::idmap::IdMapper) -> Remove<'a> {
-        self.mapper = Some(mapper);
+    ///
+    /// The delegate is taken by value and kept, as every builder that takes one
+    /// keeps it; [`CageBuilder::id_mapper`] says why.
+    ///
+    /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
+    pub fn mapper(mut self, mapper: impl crate::idmap::IdMapper + 'static) -> Remove {
+        self.mapper = Some(Arc::new(mapper));
+        self
+    }
+
+    /// Removes through a delegate another builder already holds, or through
+    /// the bundled chain for `None`: a staged build layer's disposal, which
+    /// re-enters the delegate the layer was staged with.
+    #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+    pub(crate) fn shared_mapper(
+        mut self,
+        mapper: Option<Arc<dyn crate::idmap::IdMapper>>,
+    ) -> Remove {
+        self.mapper = mapper;
         self
     }
 
@@ -976,7 +1003,7 @@ impl<'a> Remove<'a> {
     /// finish, and a publication waits for the removal in turn, so neither
     /// sees the other half done. A removal that declines the lock takes no part
     /// in that exclusion.
-    pub fn remove_lock(mut self, remove: bool) -> Remove<'a> {
+    pub fn remove_lock(mut self, remove: bool) -> Remove {
         self.remove_lock = remove;
         self
     }
@@ -988,9 +1015,14 @@ impl<'a> Remove<'a> {
     ///
     /// As [`remove`].
     pub fn run(self) -> Result<(), ProvisionError> {
-        remove_dest(&self.dest, &self.map, self.mapper, self.remove_lock)?;
+        remove_dest(
+            &self.dest,
+            &self.map,
+            self.mapper.as_ref(),
+            self.remove_lock,
+        )?;
         match &self.work {
-            Some(work) => remove_dest(work, &self.map, self.mapper, false),
+            Some(work) => remove_dest(work, &self.map, self.mapper.as_ref(), false),
             None => Ok(()),
         }
     }
@@ -1215,7 +1247,7 @@ pub fn remove(dest: impl AsRef<Path>) -> Result<(), ProvisionError> {
 fn remove_dest(
     dest: &Path,
     map: &crate::IdentityMap,
-    mapper: Option<&dyn crate::idmap::IdMapper>,
+    mapper: Option<&Arc<dyn crate::idmap::IdMapper>>,
     lock: bool,
 ) -> Result<(), ProvisionError> {
     let held = match lock_path(dest).filter(|_| lock) {
@@ -1361,7 +1393,7 @@ pub(crate) fn lock_exclusive(path: &Path) -> io::Result<std::os::fd::OwnedFd> {
 pub(crate) fn remove_tree(
     dest: &Path,
     map: &crate::IdentityMap,
-    mapper: Option<&dyn crate::idmap::IdMapper>,
+    mapper: Option<&Arc<dyn crate::idmap::IdMapper>>,
 ) -> Result<(), ProvisionError> {
     use std::os::unix::ffi::OsStrExt;
 

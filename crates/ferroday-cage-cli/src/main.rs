@@ -4942,22 +4942,16 @@ fn run(options: Options) -> ExitCode {
 
     // Every launch below hands the sandbox `fcage`'s own standard streams,
     // unless a terminal replaces all three, so each is judged and any that is a
-    // file is relayed rather than handed over. The builder is asked rather than
-    // the flags, so a profile's stream settings count exactly as `--stdin` does.
-    let inherited = if options.terminal {
-        [false; 3]
-    } else {
-        [
-            matches!(builder.get_stdin(), Stdio::Inherit),
-            matches!(builder.get_stdout(), Stdio::Inherit),
-            matches!(builder.get_stderr(), Stdio::Inherit),
-        ]
+    // file is relayed rather than handed over.
+    let streams = StreamSettings {
+        get: [
+            CageBuilder::get_stdin,
+            CageBuilder::get_stdout,
+            CageBuilder::get_stderr,
+        ],
+        set: [CageBuilder::stdin, CageBuilder::stdout, CageBuilder::stderr],
     };
-    let (mut builder, relay) = match relay_streams(
-        builder,
-        inherited,
-        [CageBuilder::stdin, CageBuilder::stdout, CageBuilder::stderr],
-    ) {
+    let (mut builder, relay) = match relay_streams(builder, &streams, options.terminal) {
         Ok(relayed) => relayed,
         Err(code) => return code,
     };
@@ -5000,22 +4994,41 @@ fn run(options: Options) -> ExitCode {
     finish(relay, outcome.map_err(Failure::from))
 }
 
+/// A launch builder's three standard-stream settings, in stream order: the
+/// getter that reads each and the setter that replaces it.
+///
+/// [`CageBuilder`] and [`RestrictionBuilder`] spell the three alike, so one
+/// wiring serves both.
+struct StreamSettings<B> {
+    /// Each stream's disposition as the builder holds it.
+    get: [fn(&B) -> &Stdio; 3],
+    /// Each stream's setter.
+    set: [fn(B, Stdio) -> B; 3],
+}
+
 /// Judges `fcage`'s standard streams for a launch, and routes each one that is
 /// a file through a relay.
 ///
-/// `inherited` says, in stream order, whether the launch would hand the stream
-/// over as `fcage` holds it, and `set` is the builder's setter for each.
-/// [`CageBuilder`] and [`RestrictionBuilder`] spell the three alike, so one
-/// wiring serves both. A refused stream, or a relay that cannot start, is
-/// reported here and ends the run with [`FAILED`] before anything is launched.
+/// A stream the builder leaves inherited is handed over as `fcage` holds it,
+/// unless `terminal` says a pseudoterminal replaces all three. The builder is
+/// asked rather than the flags, so a profile's stream settings count exactly as
+/// `--stdin` does. A refused stream, or a relay that cannot start, is reported
+/// here and ends the run with [`FAILED`] before anything is launched.
 fn relay_streams<B>(
     builder: B,
-    inherited: [bool; 3],
-    set: [fn(B, Stdio) -> B; 3],
+    streams: &StreamSettings<B>,
+    terminal: bool,
 ) -> Result<(B, streams::StreamRelay), ExitCode> {
+    let inherited = if terminal {
+        [false; 3]
+    } else {
+        streams
+            .get
+            .map(|get| matches!(get(&builder), Stdio::Inherit))
+    };
     let mut relay = streams::StreamRelay::start(inherited).map_err(fail)?;
     let mut builder = builder;
-    for (replacement, set) in relay.take_replacements().into_iter().zip(set) {
+    for (replacement, set) in relay.take_replacements().into_iter().zip(streams.set) {
         if let Some(stdio) = replacement {
             builder = set(builder, stdio);
         }
@@ -5296,9 +5309,6 @@ fn run_restricted(options: Options) -> ExitCode {
     if let Some(chdir) = options.chdir {
         builder = builder.current_dir(chdir);
     }
-    // Read before the disposition moves into the builder; the stream relay
-    // below needs to know whether standard input is inherited.
-    let stdin_inherited = matches!(options.stdin, None | Some(Stdio::Inherit));
     if let Some(stdin) = options.stdin {
         builder = builder.stdin(stdin);
     }
@@ -5343,17 +5353,20 @@ fn run_restricted(options: Options) -> ExitCode {
     }
 
     // As for a sandbox: each stream is judged, and one that is a file is relayed
-    // rather than handed over. A restriction's output pair has no flag, so only
-    // standard input can have been sent elsewhere.
-    let (builder, relay) = match relay_streams(
-        builder,
-        [stdin_inherited, true, true],
-        [
+    // rather than handed over.
+    let streams = StreamSettings {
+        get: [
+            RestrictionBuilder::get_stdin,
+            RestrictionBuilder::get_stdout,
+            RestrictionBuilder::get_stderr,
+        ],
+        set: [
             RestrictionBuilder::stdin,
             RestrictionBuilder::stdout,
             RestrictionBuilder::stderr,
         ],
-    ) {
+    };
+    let (builder, relay) = match relay_streams(builder, &streams, false) {
         Ok(relayed) => relayed,
         Err(code) => return code,
     };
@@ -5849,17 +5862,17 @@ fn gentoo_variants(
         Ok(gentoo) => gentoo,
         Err(error) => return fail(error),
     };
-    let available = match gentoo.available() {
-        Ok(available) => available,
+    let variants = match gentoo.variants() {
+        Ok(variants) => variants,
         Err(error) => return fail(error),
     };
     // The build id belongs beside the variant rather than in a heading: a
     // sub-architecture is built on its own cadence, so one document routinely
     // points different variants at different builds.
     print_listing("the variant listing", |out| {
-        for variant in available.variants() {
-            let build = available.build_id(variant).unwrap_or("");
-            let size = available.size(variant).unwrap_or(0);
+        for variant in variants.names() {
+            let build = variants.build_id(variant).unwrap_or("");
+            let size = variants.size(variant).unwrap_or(0);
             writeln!(out, "{variant}\t{build}\t{size}")?;
         }
         Ok(())

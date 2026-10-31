@@ -39,6 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::installed::{DB_DIR, Database, EXEC_DIR};
 use super::repository::Repository;
@@ -47,7 +48,7 @@ use crate::provision::Stream;
 use crate::provision::accounts;
 use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
-use crate::{IdentityMap, Observer, Stdio};
+use crate::{IdMapper, IdentityMap, Observer, Stdio};
 
 /// The set the caller asked for, as against the closure it resolved to.
 pub(super) const WORLD: &str = "etc/apk/world";
@@ -113,6 +114,9 @@ pub(super) struct Site<'a> {
     pub(super) rooting: Rooting<'a>,
     /// The map the script cages run under.
     pub(super) identity_map: &'a IdentityMap,
+    /// The delegate a range map is established through, where the caller
+    /// supplied one.
+    pub(super) id_mapper: Option<&'a Arc<dyn IdMapper>>,
     /// The `SOURCE_DATE_EPOCH` every script is given, and the date the accounts
     /// the run creates are recorded at. `None` gives the scripts none and
     /// leaves the dates as they wrote them.
@@ -333,6 +337,7 @@ fn launch(
         staging,
         rooting,
         identity_map,
+        id_mapper,
         source_date_epoch,
     } = site;
     let mut builder = rooting
@@ -353,6 +358,7 @@ fn launch(
         // writing into a staging tree the error path is removing.
         .stop_with_caller(true)
         .identity_map(identity_map.clone())
+        .shared_id_mapper(id_mapper.cloned())
         .build()
         .map_err(AlpineError::Launch)?;
     let mut output = ScriptOutput { emit: observer };
@@ -788,6 +794,76 @@ pub(super) use super::apk::ScriptKind;
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+
+    #[test]
+    fn a_script_cage_is_launched_through_the_callers_delegate() {
+        // The map an install script runs under is established through the
+        // delegate the caller supplied, or a map only it can establish could
+        // not be used at all. The delegate here resolves the caller alone and
+        // refuses to apply it, so the launch fails at the gate, before anything
+        // runs in the tree, and the refusal is the delegate's.
+        #[derive(Debug, Default)]
+        struct Recording {
+            applied: std::sync::Mutex<usize>,
+        }
+        impl IdMapper for Recording {
+            fn resolve(
+                &self,
+                _request: &IdentityMap,
+            ) -> Result<crate::ResolvedMap, crate::IdMapError> {
+                let caller = |outside: u32| crate::IdRange {
+                    inside: 0,
+                    outside,
+                    count: 1,
+                };
+                Ok(crate::ResolvedMap::new(
+                    vec![caller(rustix::process::getuid().as_raw())],
+                    vec![caller(rustix::process::getgid().as_raw())],
+                ))
+            }
+            fn apply(&self, _pid: u32, _map: &crate::ResolvedMap) -> Result<(), crate::IdMapError> {
+                *self.applied.lock().unwrap() += 1;
+                Err(crate::IdMapError::unsatisfiable(
+                    "the caller's delegate will not apply",
+                ))
+            }
+        }
+
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let staging = Scratch::for_test("alpine-script", "delegate");
+        let recording = Arc::new(Recording::default());
+        let delegate = Arc::clone(&recording) as Arc<dyn IdMapper>;
+        let site = Site {
+            staging: &staging,
+            rooting: Rooting::over(None),
+            identity_map: &IdentityMap::Subordinate,
+            id_mapper: Some(&delegate),
+            source_date_epoch: None,
+        };
+        let subject = ScriptSubject {
+            name: "probe".to_string(),
+            version: "1.0-r0".to_string(),
+            scripts: Vec::new(),
+            triggers: Vec::new(),
+        };
+        let mut observer = |_event: AlpineEvent<'_>| {};
+        let err = launch(
+            site,
+            "/bin/true",
+            &subject,
+            ScriptKind::PostInstall,
+            &[],
+            &mut observer,
+        )
+        .expect_err("the delegate refuses to apply the map");
+        assert!(
+            matches!(&err, AlpineError::Launch(crate::Error::IdentityMap(_))),
+            "{err}",
+        );
+        assert_eq!(*recording.applied.lock().unwrap(), 1);
+    }
 
     #[test]
     fn a_pattern_matches_the_way_fnmatch_with_pathname_does() {

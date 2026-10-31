@@ -36,6 +36,14 @@ The map the builder takes and the bootstrap's own cages run under, imported \
 once by the layer and once by its bootstrap."""
 
 [[layer.reach]]
+name = "IdMapper"
+count = 2
+kind = "public"
+why = """\
+The delegate the builder takes for that map and hands each of the bootstrap's \
+cages, imported once by the layer and once by its bootstrap."""
+
+[[layer.reach]]
 name = "Observer"
 count = 1
 kind = "public"
@@ -64,9 +72,9 @@ name = "idmap"
 count = 2
 kind = "internal"
 why = """\
-`idmap::resolve_range_bundled`, the preflight that refuses an unavailable or \
-malformed range map before anything is downloaded. Nothing public answers the \
-question."""
+`idmap::establishable`, the preflight that refuses an unavailable or malformed \
+range map, through the caller's delegate or the bundled chain, before anything \
+is downloaded. Nothing public answers the question."""
 
 [[layer.reach]]
 name = "failure"
@@ -102,6 +110,12 @@ kind = "public"
 why = "As in the Debian layer: once by the layer, once by its bootstrap."
 
 [[layer.reach]]
+name = "IdMapper"
+count = 2
+kind = "public"
+why = "As in the Debian layer: once by the layer, once by its bootstrap."
+
+[[layer.reach]]
 name = "Observer"
 count = 1
 kind = "public"
@@ -123,7 +137,7 @@ why = "`host::overlay_blocker`, the preflight a layered build makes."
 name = "idmap"
 count = 1
 kind = "internal"
-why = "`idmap::resolve_range_bundled`, as in the Debian layer."
+why = "`idmap::establishable`, as in the Debian layer."
 
 [[layer.reach]]
 name = "failure"

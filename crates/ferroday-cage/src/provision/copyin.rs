@@ -19,6 +19,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rustix::fs::{self, AtFlags, OFlags};
 
@@ -98,14 +99,14 @@ everything it can create — a named pipe included — and names the rest.
 /// # Ok(())
 /// # }
 /// ```
-pub struct CopyIn<'a> {
+pub struct CopyIn {
     source: PathBuf,
     rootfs: PathBuf,
     map: IdentityMap,
-    mapper: Option<&'a dyn IdMapper>,
+    mapper: Option<Arc<dyn IdMapper>>,
 }
 
-impl fmt::Debug for CopyIn<'_> {
+impl fmt::Debug for CopyIn {
     /// Renders every setting, and the mapper by its presence rather than its
     /// contents: it is a caller's trait object, with nothing useful to show.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -121,7 +122,7 @@ impl fmt::Debug for CopyIn<'_> {
     }
 }
 
-impl<'a> CopyIn<'a> {
+impl CopyIn {
     /// Returns a copy of the tree at `source` into the rootfs at `rootfs`.
     ///
     /// A symbolic link at `source` itself is followed, as one at any other
@@ -132,7 +133,15 @@ impl<'a> CopyIn<'a> {
     /// in-map child writes its own one-id map and every entry lands as root —
     /// what a single-mapped sandbox sees, and what such a sandbox could have
     /// written itself.
-    pub fn new(source: impl AsRef<Path>, rootfs: impl AsRef<Path>) -> CopyIn<'a> {
+    ///
+    /// That is a sandbox's own default, because a copy writes every owner
+    /// through the map: it has to be the map the root was built under, and a
+    /// root built with every default was built under this one. A [`Remove`]
+    /// defaults to the subordinate map instead, because a removal writes no
+    /// ownership.
+    ///
+    /// [`Remove`]: super::Remove
+    pub fn new(source: impl AsRef<Path>, rootfs: impl AsRef<Path>) -> CopyIn {
         CopyIn {
             source: source.as_ref().to_path_buf(),
             rootfs: rootfs.as_ref().to_path_buf(),
@@ -147,7 +156,7 @@ impl<'a> CopyIn<'a> {
     /// must name the same one: the ids on the host are the rootfs's ids offset
     /// by the map, so a copy made through a different map writes ownership the
     /// rootfs will not read back as intended.
-    pub fn map(mut self, map: IdentityMap) -> CopyIn<'a> {
+    pub fn map(mut self, map: IdentityMap) -> CopyIn {
         self.map = map;
         self
     }
@@ -161,9 +170,12 @@ impl<'a> CopyIn<'a> {
     /// [`Single`](IdentityMap::Single) map self-establishes and ignores the
     /// mapper, as the launch does.
     ///
+    /// The delegate is taken by value and kept, as every builder that takes one
+    /// keeps it; [`CageBuilder::id_mapper`] says why.
+    ///
     /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
-    pub fn mapper(mut self, mapper: &'a dyn IdMapper) -> CopyIn<'a> {
-        self.mapper = Some(mapper);
+    pub fn mapper(mut self, mapper: impl IdMapper + 'static) -> CopyIn {
+        self.mapper = Some(Arc::new(mapper));
         self
     }
 
@@ -181,7 +193,7 @@ impl<'a> CopyIn<'a> {
     /// inspecting it and opening it; and [`ProvisionError::Io`] for a failure of
     /// the copy machinery, of the walk, or of the in-map writer.
     pub fn run(self) -> Result<CopyReport, ProvisionError> {
-        copy_in_inner(&self.source, &self.rootfs, &self.map, self.mapper)
+        copy_in_inner(&self.source, &self.rootfs, &self.map, self.mapper.as_ref())
     }
 }
 
@@ -257,7 +269,7 @@ fn copy_in_inner(
     source: &Path,
     rootfs: &Path,
     map: &IdentityMap,
-    mapper: Option<&dyn IdMapper>,
+    mapper: Option<&Arc<dyn IdMapper>>,
 ) -> Result<CopyReport, ProvisionError> {
     let rootfs_c = CString::new(rootfs.as_os_str().as_bytes()).map_err(|_| {
         ProvisionError::io(

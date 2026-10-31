@@ -146,7 +146,9 @@ pub struct IdRange {
 
 /// The identity the command executes as inside the sandbox.
 ///
-/// Configured with [`CageBuilder::run_as`]; the default is root inside. The
+/// Configured with [`CageBuilder::run_as`]; the default is root inside. A built
+/// sandbox reports the identity it switches to as
+/// [`ResolvedInputs::run_as`](crate::ResolvedInputs::run_as). The
 /// switch sits within the hardening layer, after securebits,
 /// no-new-privileges, and Landlock and before the capability drop and the
 /// seccomp filter, so it is the identity the command holds from its first
@@ -202,6 +204,22 @@ impl Identity {
     pub fn groups<I: IntoIterator<Item = u32>>(mut self, groups: I) -> Identity {
         self.groups = groups.into_iter().collect();
         self
+    }
+
+    /// The uid the command runs as, a sandbox-inside id.
+    pub fn get_uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// The gid the command runs as, a sandbox-inside id.
+    pub fn get_gid(&self) -> u32 {
+        self.gid
+    }
+
+    /// The supplementary groups, sandbox-inside ids, in the order they were
+    /// given.
+    pub fn get_groups(&self) -> &[u32] {
+        &self.groups
     }
 }
 
@@ -532,19 +550,53 @@ fn validate_resolved(map: &ResolvedMap) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Resolves a range request to the delegate that applies it and the extents
+/// it resolved: the configured delegate, whose refusal is final, and the
+/// bundled chain where none is configured.
+///
+/// The step every range map passes through: a build, a provisioner's
+/// preflight, an export, a copy in, and a map-assisted removal alike. The
+/// request is validated before any delegate sees it and the delegate's answer
+/// after, so a malformed map is a typed refusal naming its defect rather than
+/// an `EINVAL` from the kernel at the write.
+pub(crate) fn resolve_delegate(
+    request: &IdentityMap,
+    configured: Option<&std::sync::Arc<dyn IdMapper>>,
+) -> Result<(std::sync::Arc<dyn IdMapper>, ResolvedMap), ConfigError> {
+    match configured {
+        Some(mapper) => {
+            let map = resolve_range(request, mapper.as_ref())?;
+            Ok((std::sync::Arc::clone(mapper), map))
+        }
+        None => resolve_range_bundled(request),
+    }
+}
+
+/// Whether `request` can be established, through the configured delegate or
+/// the bundled chain: the preflight a provisioner takes before it downloads
+/// anything, so an unavailable range map is a configuration refusal rather than
+/// a failure partway through a run. The single-identity map needs no delegate
+/// and is always establishable.
+///
+/// The map is resolved here and dropped; each sandbox the run launches
+/// resolves its own at its build.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) fn establishable(
+    request: &IdentityMap,
+    configured: Option<&std::sync::Arc<dyn IdMapper>>,
+) -> Result<(), ConfigError> {
+    match request {
+        IdentityMap::Single => Ok(()),
+        _ => resolve_delegate(request, configured).map(drop),
+    }
+}
+
 /// Resolves a range request through the caller's own delegate, whose refusal
 /// is final.
 ///
-/// One of the two entry points of the step every range map passes through,
-/// with [`resolve_range_bundled`]: a build, an export, a copy in, and a
-/// map-assisted removal alike. The request is validated before any delegate
-/// sees it and the delegate's answer after, so a malformed map is a typed
-/// refusal naming its defect rather than an `EINVAL` from the kernel at the
-/// write.
-pub(crate) fn resolve_range(
-    request: &IdentityMap,
-    mapper: &dyn IdMapper,
-) -> Result<ResolvedMap, ConfigError> {
+/// One of the two halves of [`resolve_delegate`], with
+/// [`resolve_range_bundled`].
+fn resolve_range(request: &IdentityMap, mapper: &dyn IdMapper) -> Result<ResolvedMap, ConfigError> {
     // The delegate's refusal is carried whole, as the error's source, as well as
     // read into its reason.
     checked(request, || {
@@ -559,9 +611,9 @@ pub(crate) fn resolve_range(
 /// Resolves a range request through the bundled delegates, returning the one
 /// that accepted it with the map it resolved.
 ///
-/// The other entry point of [`resolve_range`]'s step, for a caller that
-/// configured no delegate of its own.
-pub(crate) fn resolve_range_bundled(
+/// The other half of [`resolve_delegate`], for a caller that configured no
+/// delegate of its own.
+fn resolve_range_bundled(
     request: &IdentityMap,
 ) -> Result<(std::sync::Arc<dyn IdMapper>, ResolvedMap), ConfigError> {
     // The chain's reason collects a refusal from each delegate, so there is no
@@ -1484,6 +1536,19 @@ fn coalesce(allocation: &[(u32, u32)]) -> Vec<(u32, u32)> {
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+
+    /// An identity reads back as it was built, so the value `get_run_as` and a
+    /// resolved record hand a caller is one the caller can read.
+    #[test]
+    fn an_identity_reads_back_what_it_was_built_from() {
+        let plain = Identity::new(250, 100);
+        assert_eq!((plain.get_uid(), plain.get_gid()), (250, 100));
+        assert!(plain.get_groups().is_empty());
+
+        let grouped = plain.groups([100, 27, 4]);
+        assert_eq!((grouped.get_uid(), grouped.get_gid()), (250, 100));
+        assert_eq!(grouped.get_groups(), [100, 27, 4], "in the order given");
+    }
 
     #[test]
     fn an_unparsable_map_line_is_skipped_rather_than_abandoning_the_file() {

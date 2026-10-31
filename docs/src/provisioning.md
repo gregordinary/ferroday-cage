@@ -164,7 +164,7 @@ use ferroday_cage::provision::Remove;
 # let mapper = ferroday_cage::DirectMapper::new();
 Remove::new("/var/lib/myapp/rootfs")
     .map(IdentityMap::Subordinate)
-    .mapper(&mapper)
+    .mapper(mapper)
     .run()?;
 # Ok::<(), ferroday_cage::provision::ProvisionError>(())
 ```

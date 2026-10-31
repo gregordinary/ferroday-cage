@@ -223,7 +223,8 @@ pub fn ferroday_cage::provision::alpine::AlpineBuilder::cache_dir(self, impl cor
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::components<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::exclude<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::extract_only(self, bool) -> Self
-pub fn ferroday_cage::provision::alpine::AlpineBuilder::fetcher(self, alloc::boxed::Box<dyn ferroday_cage::provision::Fetch>) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::fetcher(self, impl ferroday_cage::provision::Fetch + 'static) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::id_mapper(self, impl ferroday_cage::IdMapper + 'static) -> Self
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::identity_map(self, ferroday_cage::IdentityMap) -> Self
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::include<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::keys(self, ferroday_cage::provision::alpine::KeySet) -> Self
@@ -490,58 +491,59 @@ impl core::marker::Unpin for ferroday_cage::provision::debian::UnheldReason
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::UnheldReason
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::UnheldReason
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::UnheldReason
-pub struct ferroday_cage::provision::debian::Debian<'a>
-impl<'a> ferroday_cage::provision::debian::Debian<'a>
-pub fn ferroday_cage::provision::debian::Debian<'a>::available(&mut self) -> core::result::Result<ferroday_cage::provision::Available, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Debian<'a>::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::DebianBuilder<'a>
-pub fn ferroday_cage::provision::debian::Debian<'a>::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Debian<'a>::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Debian<'a>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
-impl<'a> ferroday_cage::provision::debian::Debian<'a>
-pub fn ferroday_cage::provision::debian::Debian<'a>::observe<'o>(&'o mut self, &'o mut dyn ferroday_cage::provision::debian::DebianObserver) -> ferroday_cage::provision::debian::Observed<'o, 'a>
-impl core::fmt::Debug for ferroday_cage::provision::debian::Debian<'_>
-pub fn ferroday_cage::provision::debian::Debian<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Debian<'_>
-pub fn ferroday_cage::provision::debian::Debian<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
-impl<'a> core::marker::Freeze for ferroday_cage::provision::debian::Debian<'a>
-impl<'a> core::marker::Send for ferroday_cage::provision::debian::Debian<'a>
-impl<'a> !core::marker::Sync for ferroday_cage::provision::debian::Debian<'a>
-impl<'a> core::marker::Unpin for ferroday_cage::provision::debian::Debian<'a>
-impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Debian<'a>
-impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Debian<'a>
-impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Debian<'a>
-pub struct ferroday_cage::provision::debian::DebianBuilder<'a>
-impl<'a> ferroday_cage::provision::debian::DebianBuilder<'a>
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::allow_stale_release(self, bool) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::architecture(self, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::base_layer(self, impl core::convert::AsRef<std::path::Path>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::base_priority(self, ferroday_cage::provision::debian::Priority) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::build(self) -> core::result::Result<ferroday_cage::provision::debian::Debian<'a>, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::cache_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::components<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::exclude<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::extract_only(self, bool) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::fetcher(self, alloc::boxed::Box<(dyn ferroday_cage::provision::Fetch + 'a)>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::identity_map(self, ferroday_cage::IdentityMap) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::include<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::keyring(self, impl core::convert::AsRef<std::path::Path>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::mirror(self, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::pin(self, ferroday_cage::provision::debian::Plan) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::plan(self, ferroday_cage::provision::debian::Plan) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::pre_configure_overlay(self, impl core::convert::AsRef<std::path::Path>) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::repository(self, ferroday_cage::provision::debian::Repository) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::source_date_epoch(self, i64) -> Self
-pub fn ferroday_cage::provision::debian::DebianBuilder<'a>::trust_unsigned(self, bool) -> Self
-impl core::fmt::Debug for ferroday_cage::provision::debian::DebianBuilder<'_>
-pub fn ferroday_cage::provision::debian::DebianBuilder<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::marker::Freeze for ferroday_cage::provision::debian::DebianBuilder<'a>
-impl<'a> core::marker::Send for ferroday_cage::provision::debian::DebianBuilder<'a>
-impl<'a> !core::marker::Sync for ferroday_cage::provision::debian::DebianBuilder<'a>
-impl<'a> core::marker::Unpin for ferroday_cage::provision::debian::DebianBuilder<'a>
-impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::DebianBuilder<'a>
-impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::DebianBuilder<'a>
-impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::DebianBuilder<'a>
+pub struct ferroday_cage::provision::debian::Debian
+impl ferroday_cage::provision::debian::Debian
+pub fn ferroday_cage::provision::debian::Debian::available(&mut self) -> core::result::Result<ferroday_cage::provision::Available, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Debian::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::debian::DebianBuilder
+pub fn ferroday_cage::provision::debian::Debian::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Debian::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Debian::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::debian::Debian
+pub fn ferroday_cage::provision::debian::Debian::observe<'o>(&'o mut self, &'o mut dyn ferroday_cage::provision::debian::DebianObserver) -> ferroday_cage::provision::debian::Observed<'o>
+impl core::fmt::Debug for ferroday_cage::provision::debian::Debian
+pub fn ferroday_cage::provision::debian::Debian::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Debian
+pub fn ferroday_cage::provision::debian::Debian::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl core::marker::Freeze for ferroday_cage::provision::debian::Debian
+impl core::marker::Send for ferroday_cage::provision::debian::Debian
+impl !core::marker::Sync for ferroday_cage::provision::debian::Debian
+impl core::marker::Unpin for ferroday_cage::provision::debian::Debian
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Debian
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Debian
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Debian
+pub struct ferroday_cage::provision::debian::DebianBuilder
+impl ferroday_cage::provision::debian::DebianBuilder
+pub fn ferroday_cage::provision::debian::DebianBuilder::allow_stale_release(self, bool) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::architecture(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::base_layer(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::base_priority(self, ferroday_cage::provision::debian::Priority) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::build(self) -> core::result::Result<ferroday_cage::provision::debian::Debian, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::DebianBuilder::cache_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::components<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn ferroday_cage::provision::debian::DebianBuilder::exclude<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn ferroday_cage::provision::debian::DebianBuilder::extract_only(self, bool) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::fetcher(self, impl ferroday_cage::provision::Fetch + 'static) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::id_mapper(self, impl ferroday_cage::IdMapper + 'static) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::identity_map(self, ferroday_cage::IdentityMap) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::include<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn ferroday_cage::provision::debian::DebianBuilder::keyring(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::mirror(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::pin(self, ferroday_cage::provision::debian::Plan) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::plan(self, ferroday_cage::provision::debian::Plan) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::pre_configure_overlay(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::repository(self, ferroday_cage::provision::debian::Repository) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::source_date_epoch(self, i64) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::trust_unsigned(self, bool) -> Self
+impl core::fmt::Debug for ferroday_cage::provision::debian::DebianBuilder
+pub fn ferroday_cage::provision::debian::DebianBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::debian::DebianBuilder
+impl core::marker::Send for ferroday_cage::provision::debian::DebianBuilder
+impl !core::marker::Sync for ferroday_cage::provision::debian::DebianBuilder
+impl core::marker::Unpin for ferroday_cage::provision::debian::DebianBuilder
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::DebianBuilder
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::DebianBuilder
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::DebianBuilder
 #[non_exhaustive] pub struct ferroday_cage::provision::debian::Interpreter
 pub ferroday_cage::provision::debian::Interpreter::enabled: bool
 pub ferroday_cage::provision::debian::Interpreter::flags: alloc::string::String
@@ -555,23 +557,23 @@ impl core::marker::Unpin for ferroday_cage::provision::debian::Interpreter
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Interpreter
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Interpreter
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Interpreter
-pub struct ferroday_cage::provision::debian::Observed<'o, 'a>
-impl ferroday_cage::provision::debian::Observed<'_, '_>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::available(&mut self) -> core::result::Result<ferroday_cage::provision::Available, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
-impl core::fmt::Debug for ferroday_cage::provision::debian::Observed<'_, '_>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Observed<'_, '_>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
-impl<'o, 'a> core::marker::Freeze for ferroday_cage::provision::debian::Observed<'o, 'a>
-impl<'o, 'a> !core::marker::Send for ferroday_cage::provision::debian::Observed<'o, 'a>
-impl<'o, 'a> !core::marker::Sync for ferroday_cage::provision::debian::Observed<'o, 'a>
-impl<'o, 'a> core::marker::Unpin for ferroday_cage::provision::debian::Observed<'o, 'a>
-impl<'o, 'a> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Observed<'o, 'a>
-impl<'o, 'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Observed<'o, 'a>
-impl<'o, 'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Observed<'o, 'a>
+pub struct ferroday_cage::provision::debian::Observed<'o>
+impl ferroday_cage::provision::debian::Observed<'_>
+pub fn ferroday_cage::provision::debian::Observed<'_>::available(&mut self) -> core::result::Result<ferroday_cage::provision::Available, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Observed<'_>::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Observed<'_>::resolve_layer(&mut self) -> core::result::Result<ferroday_cage::provision::debian::Plan, ferroday_cage::provision::debian::DebianError>
+pub fn ferroday_cage::provision::debian::Observed<'_>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
+impl core::fmt::Debug for ferroday_cage::provision::debian::Observed<'_>
+pub fn ferroday_cage::provision::debian::Observed<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Observed<'_>
+pub fn ferroday_cage::provision::debian::Observed<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl<'o> core::marker::Freeze for ferroday_cage::provision::debian::Observed<'o>
+impl<'o> !core::marker::Send for ferroday_cage::provision::debian::Observed<'o>
+impl<'o> !core::marker::Sync for ferroday_cage::provision::debian::Observed<'o>
+impl<'o> core::marker::Unpin for ferroday_cage::provision::debian::Observed<'o>
+impl<'o> core::marker::UnsafeUnpin for ferroday_cage::provision::debian::Observed<'o>
+impl<'o> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debian::Observed<'o>
+impl<'o> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Observed<'o>
 pub struct ferroday_cage::provision::debian::ParsePriorityError
 impl ferroday_cage::provision::debian::ParsePriorityError
 pub fn ferroday_cage::provision::debian::ParsePriorityError::text(&self) -> &str
@@ -807,22 +809,6 @@ impl<'a> core::marker::Unpin for ferroday_cage::provision::gentoo::GentooEvent<'
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::GentooEvent<'a>
 impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::GentooEvent<'a>
 impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::GentooEvent<'a>
-pub struct ferroday_cage::provision::gentoo::Available
-impl ferroday_cage::provision::gentoo::Available
-pub fn ferroday_cage::provision::gentoo::Available::build_id(&self, &str) -> core::option::Option<&str>
-pub fn ferroday_cage::provision::gentoo::Available::contains(&self, &str) -> bool
-pub fn ferroday_cage::provision::gentoo::Available::published(&self) -> core::option::Option<i64>
-pub fn ferroday_cage::provision::gentoo::Available::size(&self, &str) -> core::option::Option<u64>
-pub fn ferroday_cage::provision::gentoo::Available::variants(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str>
-impl core::fmt::Debug for ferroday_cage::provision::gentoo::Available
-pub fn ferroday_cage::provision::gentoo::Available::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for ferroday_cage::provision::gentoo::Available
-impl core::marker::Send for ferroday_cage::provision::gentoo::Available
-impl core::marker::Sync for ferroday_cage::provision::gentoo::Available
-impl core::marker::Unpin for ferroday_cage::provision::gentoo::Available
-impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Available
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Available
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Available
 pub struct ferroday_cage::provision::gentoo::Catalogue
 impl ferroday_cage::provision::gentoo::Catalogue
 pub fn ferroday_cage::provision::gentoo::Catalogue::builds(&self) -> usize
@@ -856,12 +842,12 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::
 pub struct ferroday_cage::provision::gentoo::Gentoo
 impl ferroday_cage::provision::gentoo::Gentoo
 pub fn ferroday_cage::provision::gentoo::Gentoo::architecture(&self) -> &str
-pub fn ferroday_cage::provision::gentoo::Gentoo::available(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Available, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Gentoo::builder(impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::Gentoo::keyring_horizon(&self) -> alloc::vec::Vec<ferroday_cage::provision::gentoo::CertificateHorizon>
 pub fn ferroday_cage::provision::gentoo::Gentoo::packages(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Catalogue, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Gentoo::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Stage3, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Gentoo::resolve_packages(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::gentoo::Plan, ferroday_cage::provision::gentoo::GentooError>
+pub fn ferroday_cage::provision::gentoo::Gentoo::variants(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Variants, ferroday_cage::provision::gentoo::GentooError>
 impl ferroday_cage::provision::gentoo::Gentoo
 pub fn ferroday_cage::provision::gentoo::Gentoo::observe<'o>(&'o mut self, &'o mut dyn ferroday_cage::provision::gentoo::GentooObserver) -> ferroday_cage::provision::gentoo::Observed<'o>
 pub fn ferroday_cage::provision::gentoo::Gentoo::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
@@ -883,7 +869,7 @@ pub fn ferroday_cage::provision::gentoo::GentooBuilder::binhost(self, impl core:
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::build(self) -> core::result::Result<ferroday_cage::provision::gentoo::Gentoo, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::build_id(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::cache_dir(self, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::gentoo::GentooBuilder
-pub fn ferroday_cage::provision::gentoo::GentooBuilder::fetcher(self, alloc::boxed::Box<dyn ferroday_cage::provision::Fetch>) -> ferroday_cage::provision::gentoo::GentooBuilder
+pub fn ferroday_cage::provision::gentoo::GentooBuilder::fetcher(self, impl ferroday_cage::provision::Fetch + 'static) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::install<I, S>(self, I) -> ferroday_cage::provision::gentoo::GentooBuilder where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::max_pointer_age(self, impl core::convert::Into<core::option::Option<core::time::Duration>>) -> ferroday_cage::provision::gentoo::GentooBuilder
 pub fn ferroday_cage::provision::gentoo::GentooBuilder::mirror(self, impl core::convert::Into<alloc::string::String>) -> ferroday_cage::provision::gentoo::GentooBuilder
@@ -928,11 +914,11 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gento
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::InstalledPackage
 pub struct ferroday_cage::provision::gentoo::Observed<'o>
 impl ferroday_cage::provision::gentoo::Observed<'_>
-pub fn ferroday_cage::provision::gentoo::Observed<'_>::available(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Available, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Observed<'_>::packages(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Catalogue, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Observed<'_>::resolve(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Stage3, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Observed<'_>::resolve_packages(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::gentoo::Plan, ferroday_cage::provision::gentoo::GentooError>
 pub fn ferroday_cage::provision::gentoo::Observed<'_>::stage_layer(&mut self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::BuildLayer, ferroday_cage::provision::ProvisionError>
+pub fn ferroday_cage::provision::gentoo::Observed<'_>::variants(&mut self) -> core::result::Result<ferroday_cage::provision::gentoo::Variants, ferroday_cage::provision::gentoo::GentooError>
 impl core::fmt::Debug for ferroday_cage::provision::gentoo::Observed<'_>
 pub fn ferroday_cage::provision::gentoo::Observed<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::gentoo::Observed<'_>
@@ -988,6 +974,22 @@ impl core::marker::Unpin for ferroday_cage::provision::gentoo::Stage3
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Stage3
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Stage3
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Stage3
+pub struct ferroday_cage::provision::gentoo::Variants
+impl ferroday_cage::provision::gentoo::Variants
+pub fn ferroday_cage::provision::gentoo::Variants::build_id(&self, &str) -> core::option::Option<&str>
+pub fn ferroday_cage::provision::gentoo::Variants::contains(&self, &str) -> bool
+pub fn ferroday_cage::provision::gentoo::Variants::names(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+pub fn ferroday_cage::provision::gentoo::Variants::published(&self) -> core::option::Option<i64>
+pub fn ferroday_cage::provision::gentoo::Variants::size(&self, &str) -> core::option::Option<u64>
+impl core::fmt::Debug for ferroday_cage::provision::gentoo::Variants
+pub fn ferroday_cage::provision::gentoo::Variants::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Variants
+impl core::marker::Send for ferroday_cage::provision::gentoo::Variants
+impl core::marker::Sync for ferroday_cage::provision::gentoo::Variants
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Variants
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Variants
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Variants
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Variants
 pub trait ferroday_cage::provision::gentoo::GentooObserver
 pub fn ferroday_cage::provision::gentoo::GentooObserver::cancelled(&mut self) -> bool
 pub fn ferroday_cage::provision::gentoo::GentooObserver::progress(&mut self, ferroday_cage::provision::gentoo::GentooEvent<'_>)
@@ -1165,6 +1167,8 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Availabl
 pub struct ferroday_cage::provision::BuildLayer
 impl ferroday_cage::provision::BuildLayer
 pub fn ferroday_cage::provision::BuildLayer::path(&self) -> &std::path::Path
+impl core::fmt::Debug for ferroday_cage::provision::BuildLayer
+pub fn ferroday_cage::provision::BuildLayer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for ferroday_cage::provision::BuildLayer
 pub fn ferroday_cage::provision::BuildLayer::drop(&mut self)
 impl core::marker::Freeze for ferroday_cage::provision::BuildLayer
@@ -1172,23 +1176,23 @@ impl core::marker::Send for ferroday_cage::provision::BuildLayer
 impl core::marker::Sync for ferroday_cage::provision::BuildLayer
 impl core::marker::Unpin for ferroday_cage::provision::BuildLayer
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::BuildLayer
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::BuildLayer
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::BuildLayer
-pub struct ferroday_cage::provision::CopyIn<'a>
-impl<'a> ferroday_cage::provision::CopyIn<'a>
-pub fn ferroday_cage::provision::CopyIn<'a>::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::CopyIn<'a>
-pub fn ferroday_cage::provision::CopyIn<'a>::mapper(self, &'a dyn ferroday_cage::IdMapper) -> ferroday_cage::provision::CopyIn<'a>
-pub fn ferroday_cage::provision::CopyIn<'a>::new(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::CopyIn<'a>
-pub fn ferroday_cage::provision::CopyIn<'a>::run(self) -> core::result::Result<ferroday_cage::provision::CopyReport, ferroday_cage::provision::ProvisionError>
-impl core::fmt::Debug for ferroday_cage::provision::CopyIn<'_>
-pub fn ferroday_cage::provision::CopyIn<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::marker::Freeze for ferroday_cage::provision::CopyIn<'a>
-impl<'a> core::marker::Send for ferroday_cage::provision::CopyIn<'a>
-impl<'a> core::marker::Sync for ferroday_cage::provision::CopyIn<'a>
-impl<'a> core::marker::Unpin for ferroday_cage::provision::CopyIn<'a>
-impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::CopyIn<'a>
-impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::CopyIn<'a>
-impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::CopyIn<'a>
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::BuildLayer
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::BuildLayer
+pub struct ferroday_cage::provision::CopyIn
+impl ferroday_cage::provision::CopyIn
+pub fn ferroday_cage::provision::CopyIn::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::CopyIn
+pub fn ferroday_cage::provision::CopyIn::mapper(self, impl ferroday_cage::IdMapper + 'static) -> ferroday_cage::provision::CopyIn
+pub fn ferroday_cage::provision::CopyIn::new(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::CopyIn
+pub fn ferroday_cage::provision::CopyIn::run(self) -> core::result::Result<ferroday_cage::provision::CopyReport, ferroday_cage::provision::ProvisionError>
+impl core::fmt::Debug for ferroday_cage::provision::CopyIn
+pub fn ferroday_cage::provision::CopyIn::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::CopyIn
+impl core::marker::Send for ferroday_cage::provision::CopyIn
+impl core::marker::Sync for ferroday_cage::provision::CopyIn
+impl core::marker::Unpin for ferroday_cage::provision::CopyIn
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::CopyIn
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::CopyIn
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::CopyIn
 #[non_exhaustive] pub struct ferroday_cage::provision::CopyReport
 pub ferroday_cage::provision::CopyReport::skipped: alloc::vec::Vec<ferroday_cage::provision::SkippedEntry>
 impl core::marker::Freeze for ferroday_cage::provision::CopyReport
@@ -1203,7 +1207,7 @@ impl<'a> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::clamp_mtime(self, i64) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::filter(self, impl core::ops::function::Fn(&ferroday_cage::provision::ExportEntry<'_>) -> bool + core::marker::Send + core::marker::Sync + 'a) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::Export<'a>
-pub fn ferroday_cage::provision::Export<'a>::mapper(self, &'a dyn ferroday_cage::IdMapper) -> ferroday_cage::provision::Export<'a>
+pub fn ferroday_cage::provision::Export<'a>::mapper(self, impl ferroday_cage::IdMapper + 'static) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Export<'a>
 pub fn ferroday_cage::provision::Export<'a>::write_to<W: std::io::Write>(self, W) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::Export<'a>::write_to_path(self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
@@ -1310,23 +1314,23 @@ impl<'a> core::marker::Unpin for ferroday_cage::provision::ProvisionRequest<'a>
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::ProvisionRequest<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ProvisionRequest<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ProvisionRequest<'a>
-pub struct ferroday_cage::provision::Remove<'a>
-impl<'a> ferroday_cage::provision::Remove<'a>
-pub fn ferroday_cage::provision::Remove<'a>::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::Remove<'a>
-pub fn ferroday_cage::provision::Remove<'a>::mapper(self, &'a dyn ferroday_cage::IdMapper) -> ferroday_cage::provision::Remove<'a>
-pub fn ferroday_cage::provision::Remove<'a>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Remove<'a>
-pub fn ferroday_cage::provision::Remove<'a>::overlay_upper(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Remove<'a>
-pub fn ferroday_cage::provision::Remove<'a>::remove_lock(self, bool) -> ferroday_cage::provision::Remove<'a>
-pub fn ferroday_cage::provision::Remove<'a>::run(self) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
-impl core::fmt::Debug for ferroday_cage::provision::Remove<'_>
-pub fn ferroday_cage::provision::Remove<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::marker::Freeze for ferroday_cage::provision::Remove<'a>
-impl<'a> core::marker::Send for ferroday_cage::provision::Remove<'a>
-impl<'a> core::marker::Sync for ferroday_cage::provision::Remove<'a>
-impl<'a> core::marker::Unpin for ferroday_cage::provision::Remove<'a>
-impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::Remove<'a>
-impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Remove<'a>
-impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Remove<'a>
+pub struct ferroday_cage::provision::Remove
+impl ferroday_cage::provision::Remove
+pub fn ferroday_cage::provision::Remove::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::Remove
+pub fn ferroday_cage::provision::Remove::mapper(self, impl ferroday_cage::IdMapper + 'static) -> ferroday_cage::provision::Remove
+pub fn ferroday_cage::provision::Remove::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Remove
+pub fn ferroday_cage::provision::Remove::overlay_upper(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Remove
+pub fn ferroday_cage::provision::Remove::remove_lock(self, bool) -> ferroday_cage::provision::Remove
+pub fn ferroday_cage::provision::Remove::run(self) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl core::fmt::Debug for ferroday_cage::provision::Remove
+pub fn ferroday_cage::provision::Remove::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::Remove
+impl core::marker::Send for ferroday_cage::provision::Remove
+impl core::marker::Sync for ferroday_cage::provision::Remove
+impl core::marker::Unpin for ferroday_cage::provision::Remove
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::Remove
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Remove
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Remove
 #[non_exhaustive] pub struct ferroday_cage::provision::SkippedEntry
 pub ferroday_cage::provision::SkippedEntry::kind: ferroday_cage::provision::SkippedKind
 pub ferroday_cage::provision::SkippedEntry::path: std::path::PathBuf
@@ -1372,10 +1376,10 @@ impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::alpine:
 pub fn ferroday_cage::provision::alpine::Alpine::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::alpine::Observed<'_>
 pub fn ferroday_cage::provision::alpine::Observed<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
-impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Debian<'_>
-pub fn ferroday_cage::provision::debian::Debian<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
-impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Observed<'_, '_>
-pub fn ferroday_cage::provision::debian::Observed<'_, '_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Debian
+pub fn ferroday_cage::provision::debian::Debian::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::debian::Observed<'_>
+pub fn ferroday_cage::provision::debian::Observed<'_>::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::gentoo::Gentoo
 pub fn ferroday_cage::provision::gentoo::Gentoo::provision(&mut self, &ferroday_cage::provision::ProvisionRequest<'_>) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl ferroday_cage::provision::Provisioner for ferroday_cage::provision::gentoo::Observed<'_>
@@ -2235,6 +2239,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::IdRange
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::IdRange
 pub struct ferroday_cage::Identity
 impl ferroday_cage::Identity
+pub fn ferroday_cage::Identity::get_gid(&self) -> u32
+pub fn ferroday_cage::Identity::get_groups(&self) -> &[u32]
+pub fn ferroday_cage::Identity::get_uid(&self) -> u32
 pub fn ferroday_cage::Identity::groups<I: core::iter::traits::collect::IntoIterator<Item = u32>>(self, I) -> ferroday_cage::Identity
 pub fn ferroday_cage::Identity::new(u32, u32) -> ferroday_cage::Identity
 impl core::marker::Freeze for ferroday_cage::Identity
@@ -2512,7 +2519,7 @@ pub ferroday_cage::ResolvedInputs::network: ferroday_cage::Network
 pub ferroday_cage::ResolvedInputs::no_new_privileges: bool
 pub ferroday_cage::ResolvedInputs::rlimits: alloc::vec::Vec<ferroday_cage::ResolvedRlimit>
 pub ferroday_cage::ResolvedInputs::root: ferroday_cage::ResolvedRoot
-pub ferroday_cage::ResolvedInputs::run_as: core::option::Option<ferroday_cage::ResolvedRunAs>
+pub ferroday_cage::ResolvedInputs::run_as: core::option::Option<ferroday_cage::Identity>
 pub ferroday_cage::ResolvedInputs::streams: ferroday_cage::ResolvedStreams
 impl core::marker::Freeze for ferroday_cage::ResolvedInputs
 impl core::marker::Send for ferroday_cage::ResolvedInputs
@@ -2564,17 +2571,6 @@ impl core::marker::Unpin for ferroday_cage::ResolvedRlimit
 impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedRlimit
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedRlimit
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedRlimit
-#[non_exhaustive] pub struct ferroday_cage::ResolvedRunAs
-pub ferroday_cage::ResolvedRunAs::gid: u32
-pub ferroday_cage::ResolvedRunAs::groups: alloc::vec::Vec<u32>
-pub ferroday_cage::ResolvedRunAs::uid: u32
-impl core::marker::Freeze for ferroday_cage::ResolvedRunAs
-impl core::marker::Send for ferroday_cage::ResolvedRunAs
-impl core::marker::Sync for ferroday_cage::ResolvedRunAs
-impl core::marker::Unpin for ferroday_cage::ResolvedRunAs
-impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedRunAs
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedRunAs
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedRunAs
 #[non_exhaustive] pub struct ferroday_cage::ResolvedStreams
 pub ferroday_cage::ResolvedStreams::stderr: ferroday_cage::ResolvedStdio
 pub ferroday_cage::ResolvedStreams::stdin: ferroday_cage::ResolvedStdio
@@ -2625,6 +2621,16 @@ pub fn ferroday_cage::RestrictionBuilder::command(self, impl core::convert::AsRe
 pub fn ferroday_cage::RestrictionBuilder::current_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::envs<I, K, V>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = (K, V)>, K: core::convert::AsRef<std::ffi::os_str::OsStr>, V: core::convert::AsRef<std::ffi::os_str::OsStr>
+pub fn ferroday_cage::RestrictionBuilder::get_args(&self) -> &[std::ffi::os_str::OsString]
+pub fn ferroday_cage::RestrictionBuilder::get_base_env(&self) -> bool
+pub fn ferroday_cage::RestrictionBuilder::get_command(&self) -> core::option::Option<&std::path::Path>
+pub fn ferroday_cage::RestrictionBuilder::get_current_dir(&self) -> core::option::Option<&std::path::Path>
+pub fn ferroday_cage::RestrictionBuilder::get_envs(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&std::ffi::os_str::OsStr, &std::ffi::os_str::OsStr)>
+pub fn ferroday_cage::RestrictionBuilder::get_rlimits(&self) -> impl core::iter::traits::iterator::Iterator<Item = (ferroday_cage::limits::Resource, ferroday_cage::limits::Limit, ferroday_cage::limits::Limit)>
+pub fn ferroday_cage::RestrictionBuilder::get_stderr(&self) -> &ferroday_cage::Stdio
+pub fn ferroday_cage::RestrictionBuilder::get_stdin(&self) -> &ferroday_cage::Stdio
+pub fn ferroday_cage::RestrictionBuilder::get_stdout(&self) -> &ferroday_cage::Stdio
+pub fn ferroday_cage::RestrictionBuilder::get_stop_with_caller(&self) -> bool
 pub fn ferroday_cage::RestrictionBuilder::landlock_fs(self, ferroday_cage::FsAccess, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::landlock_net(self, ferroday_cage::NetAccess, u16) -> Self
 pub fn ferroday_cage::RestrictionBuilder::landlock_scope<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>>(self, I) -> Self

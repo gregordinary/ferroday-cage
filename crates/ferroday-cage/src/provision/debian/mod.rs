@@ -56,6 +56,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use arch::{Interpreter, foreign_interpreter, host_architecture};
 pub use index::{ParsePriorityError, Priority, build_depend_names};
@@ -75,9 +76,9 @@ use super::{
     LimitedWriter, PackageCache, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner,
     Staged, Stream, mirror_url, walk_mirrors,
 };
-use crate::IdentityMap;
 use crate::failure::path_io_error;
 use crate::status::ExitStatus;
+use crate::{IdMapper, IdentityMap};
 use bootstrap::{Installable, StatOverride};
 use index::{Index, Package};
 use pin::Pins;
@@ -115,7 +116,7 @@ const DEFAULT_MIRROR: &str = "http://deb.debian.org/debian";
 /// provision on a worker. It is not `Sync`: every operation takes `&mut self`,
 /// so a shared reference cannot do anything with one. [`Fetch`] carries the
 /// same bound for this reason.
-pub struct Debian<'a> {
+pub struct Debian {
     suite: String,
     architecture: String,
     base_priority: Priority,
@@ -142,7 +143,10 @@ pub struct Debian<'a> {
     /// The archive sources, the primary at index zero followed by any
     /// additional repositories, merged into one resolution.
     repositories: Vec<Repository>,
-    fetcher: Box<dyn Fetch + 'a>,
+    fetcher: Box<dyn Fetch>,
+    /// The caller's identity-map delegate, set by [`DebianBuilder::id_mapper`];
+    /// `None` resolves a range map through the bundled chain.
+    id_mapper: Option<Arc<dyn IdMapper>>,
 }
 
 /// The builder's configuration, borrowed apart from its transport.
@@ -176,6 +180,9 @@ struct Bootstrap<'a> {
     extract_only: bool,
     /// The map the bootstrap's cages run under.
     identity_map: &'a IdentityMap,
+    /// The delegate a range map is established through, where the caller
+    /// supplied one.
+    id_mapper: Option<&'a Arc<dyn IdMapper>>,
     /// The caller's package cache, or `None` for one beside the staging tree.
     cache_dir: Option<&'a Path>,
     /// A tree laid over the staging root between the unpack and configure
@@ -185,7 +192,7 @@ struct Bootstrap<'a> {
     source_date_epoch: Option<i64>,
 }
 
-impl<'a> Debian<'a> {
+impl Debian {
     /// The configuration and the transport, borrowed apart.
     ///
     /// Two values rather than one because the transport is used mutably while
@@ -204,6 +211,7 @@ impl<'a> Debian<'a> {
             pin,
             extract_only,
             identity_map,
+            id_mapper,
             cache_dir,
             overlay,
             source_date_epoch,
@@ -227,6 +235,7 @@ impl<'a> Debian<'a> {
                 pin,
                 extract_only: *extract_only,
                 identity_map,
+                id_mapper: id_mapper.as_ref(),
                 cache_dir: cache_dir.as_deref(),
                 overlay: overlay.as_deref(),
                 source_date_epoch: *source_date_epoch,
@@ -390,7 +399,7 @@ fn validate_pin(
     Ok(())
 }
 
-impl fmt::Debug for Debian<'_> {
+impl fmt::Debug for Debian {
     /// Renders the bootstrap's settings and its repositories. The fetcher is a
     /// caller's trait object and renders as its presence rather than its
     /// contents; each repository names its trust anchor without dumping it.
@@ -411,13 +420,17 @@ impl fmt::Debug for Debian<'_> {
             .field("base_layer", &self.base_layer)
             .field("repositories", &self.repositories)
             .field("fetcher", &Delegate("dyn Fetch"))
+            .field(
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+            )
             .finish()
     }
 }
 
-impl<'a> Debian<'a> {
+impl Debian {
     /// Returns a builder for a bootstrap of `suite` (for example `trixie`).
-    pub fn builder(suite: impl Into<String>) -> DebianBuilder<'a> {
+    pub fn builder(suite: impl Into<String>) -> DebianBuilder {
         DebianBuilder {
             suite: suite.into(),
             architecture: None,
@@ -440,6 +453,7 @@ impl<'a> Debian<'a> {
             allow_stale: false,
             repositories: Vec::new(),
             fetcher: None,
+            id_mapper: None,
         }
     }
 
@@ -640,13 +654,13 @@ impl<'a> Debian<'a> {
         // binaries, and a range map must be establishable.
         arch::preflight_foreign(&arch::host_architecture(), &self.architecture)
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
-        if !matches!(self.identity_map, IdentityMap::Single)
-            && let Err(refusal) = crate::idmap::resolve_range_bundled(&self.identity_map)
-        {
-            return Err(wrap(DebianError::Config {
-                reason: refusal.to_string(),
-            }));
-        }
+        crate::idmap::establishable(&self.identity_map, self.id_mapper.as_ref()).map_err(
+            |refusal| {
+                wrap(DebianError::Config {
+                    reason: refusal.to_string(),
+                })
+            },
+        )?;
 
         // The base's configured set seeds the resolver, and reading it refuses a
         // base that is not a configured bootstrap.
@@ -663,7 +677,7 @@ impl<'a> Debian<'a> {
         // not on the way out, so a failure below disposes of a partly-installed
         // increment instead of orphaning it: there is no handle in an `Err` for
         // the caller to drop.
-        let layer = BuildLayer::new(upper, self.identity_map.clone());
+        let layer = BuildLayer::new(upper, self.identity_map.clone(), self.id_mapper.clone());
         let scratch = upper
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -729,6 +743,7 @@ impl<'a> Debian<'a> {
             installables: &installables,
             statoverride: &statoverride,
             identity_map: config.identity_map,
+            id_mapper: config.id_mapper,
             env: &env,
             source_date_epoch: config.source_date_epoch,
         };
@@ -744,7 +759,7 @@ impl<'a> Debian<'a> {
 }
 
 /// Builder for a [`Debian`] provisioner.
-pub struct DebianBuilder<'a> {
+pub struct DebianBuilder {
     suite: String,
     architecture: Option<String>,
     mirror: Option<String>,
@@ -770,10 +785,11 @@ pub struct DebianBuilder<'a> {
     trust_unsigned: bool,
     allow_stale: bool,
     repositories: Vec<Repository>,
-    fetcher: Option<Box<dyn Fetch + 'a>>,
+    fetcher: Option<Box<dyn Fetch>>,
+    id_mapper: Option<Arc<dyn IdMapper>>,
 }
 
-impl fmt::Debug for DebianBuilder<'_> {
+impl fmt::Debug for DebianBuilder {
     /// Renders every setting made so far, including the primary repository's,
     /// which are held separately until [`build`](Self::build) assembles them.
     /// The keyring is named by its path rather than read, and the fetcher — a
@@ -804,11 +820,15 @@ impl fmt::Debug for DebianBuilder<'_> {
                 "fetcher",
                 &self.fetcher.as_ref().map(|_| Delegate("dyn Fetch")),
             )
+            .field(
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+            )
             .finish()
     }
 }
 
-impl<'a> DebianBuilder<'a> {
+impl DebianBuilder {
     /// Sets the target architecture (a Debian name such as `amd64` or
     /// `arm64`). The default is the host's architecture.
     pub fn architecture(mut self, architecture: impl Into<String>) -> Self {
@@ -1102,6 +1122,26 @@ impl<'a> DebianBuilder<'a> {
         self
     }
 
+    /// Supplies the delegate that establishes a range
+    /// [`identity_map`](Self::identity_map), replacing the bundled fallback
+    /// chain, as [`CageBuilder::id_mapper`] does for one sandbox.
+    ///
+    /// Every cage the bootstrap's dpkg runs in is launched through it, and so
+    /// is the removal of a [`stage_layer`](Debian::stage_layer) increment. The
+    /// preflight that refuses an unavailable map before any download asks it
+    /// too. A tree a site-specific delegate established ownership in is
+    /// exported, copied into, and removed through that same delegate:
+    /// [`Export::mapper`](super::Export::mapper),
+    /// [`CopyIn::mapper`](super::CopyIn::mapper), and
+    /// [`Remove::mapper`](super::Remove::mapper). The delegate is taken by
+    /// value and kept; [`CageBuilder::id_mapper`] says why.
+    ///
+    /// [`CageBuilder::id_mapper`]: crate::CageBuilder::id_mapper
+    pub fn id_mapper(mut self, mapper: impl IdMapper + 'static) -> Self {
+        self.id_mapper = Some(Arc::new(mapper));
+        self
+    }
+
     /// Sets a directory to cache downloaded packages in, content-addressed
     /// and reused across bootstraps. Without one, packages are downloaded to
     /// a directory beside the tree being built and discarded when the run ends,
@@ -1264,10 +1304,11 @@ impl<'a> DebianBuilder<'a> {
     /// Substitutes the transport. The default speaks plain HTTP and
     /// `file://`; a consumer needing HTTPS or a proxy supplies their own.
     ///
-    /// [`Fetch`] requires `Send`, so the boxed transport is `Send` too and the
-    /// finished [`Debian`] can be moved to another thread.
-    pub fn fetcher(mut self, fetcher: Box<dyn Fetch + 'a>) -> Self {
-        self.fetcher = Some(fetcher);
+    /// The transport is taken by value and kept for the provisioner's whole
+    /// life, so the finished [`Debian`] can be moved to another thread with
+    /// it; [`Fetch`] says why.
+    pub fn fetcher(mut self, fetcher: impl Fetch + 'static) -> Self {
+        self.fetcher = Some(Box::new(fetcher));
         self
     }
 
@@ -1293,7 +1334,7 @@ impl<'a> DebianBuilder<'a> {
     ///
     /// Returns [`DebianError::Io`] when a keyring named by
     /// [`keyring`](Self::keyring) cannot be read.
-    pub fn build(self) -> Result<Debian<'a>, DebianError> {
+    pub fn build(self) -> Result<Debian, DebianError> {
         if self.suite.trim().is_empty() {
             return Err(DebianError::Config {
                 reason: "no suite was given".to_string(),
@@ -1406,17 +1447,18 @@ impl<'a> DebianBuilder<'a> {
             base_layer: self.base_layer,
             repositories,
             fetcher: self.fetcher.unwrap_or_else(|| Box::new(HttpFetch::new())),
+            id_mapper: self.id_mapper,
         })
     }
 }
 
-impl Provisioner for Debian<'_> {
+impl Provisioner for Debian {
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
         self.provision_reporting(request.staging(), &mut RunObserver { request })
     }
 }
 
-impl<'a> Debian<'a> {
+impl Debian {
     /// Binds a [`DebianObserver`] for one run, returning a provisioner that
     /// reports to it.
     ///
@@ -1449,7 +1491,7 @@ impl<'a> Debian<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn observe<'o>(&'o mut self, sink: &'o mut dyn DebianObserver) -> Observed<'o, 'a> {
+    pub fn observe<'o>(&'o mut self, sink: &'o mut dyn DebianObserver) -> Observed<'o> {
         Observed { debian: self, sink }
     }
 
@@ -1471,12 +1513,12 @@ impl<'a> Debian<'a> {
 /// a caller hands to [`provision::ensure`](crate::provision::ensure) when it
 /// wants progress; and it mirrors the provisioner's own entry points so a
 /// resolution or a staged layer can report too.
-pub struct Observed<'o, 'a> {
-    debian: &'o mut Debian<'a>,
+pub struct Observed<'o> {
+    debian: &'o mut Debian,
     sink: &'o mut dyn DebianObserver,
 }
 
-impl fmt::Debug for Observed<'_, '_> {
+impl fmt::Debug for Observed<'_> {
     /// Renders the bootstrap being observed. The sink is a caller's closure, so
     /// it renders as its presence rather than its contents.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1487,7 +1529,7 @@ impl fmt::Debug for Observed<'_, '_> {
     }
 }
 
-impl Observed<'_, '_> {
+impl Observed<'_> {
     /// Resolves the install plan, reporting progress. See [`Debian::resolve`].
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
         let suite = self.debian.suite.clone();
@@ -1538,7 +1580,7 @@ impl Observed<'_, '_> {
     }
 }
 
-impl Provisioner for Observed<'_, '_> {
+impl Provisioner for Observed<'_> {
     /// Reports to the sink bound here rather than to the run's observer: the
     /// caller chose the richer, Debian-specific channel by using
     /// [`Debian::observe`]. Either can stop the bootstrap: the sink through
@@ -1568,6 +1610,7 @@ fn bootstrap_suite(
         plan,
         extract_only,
         identity_map,
+        id_mapper,
         cache_dir,
         overlay,
         source_date_epoch,
@@ -1585,13 +1628,11 @@ fn bootstrap_suite(
         // A range map must be establishable before anything is downloaded:
         // an unavailable map is a configuration problem, and the identity
         // posture is never quietly downgraded to the single-identity form.
-        if !matches!(identity_map, IdentityMap::Single)
-            && let Err(refusal) = crate::idmap::resolve_range_bundled(identity_map)
-        {
-            return Err(wrap(DebianError::Config {
+        crate::idmap::establishable(identity_map, id_mapper).map_err(|refusal| {
+            wrap(DebianError::Config {
                 reason: refusal.to_string(),
-            }));
-        }
+            })
+        })?;
     }
 
     let packages = match plan {
@@ -1631,6 +1672,7 @@ fn bootstrap_suite(
             installables: &installables,
             statoverride: &statoverride,
             identity_map,
+            id_mapper,
             env: &env,
             source_date_epoch,
         };
@@ -2642,6 +2684,9 @@ fn verify_digest(url: &str, bytes: &[u8], expected: &str) -> Result<(), DebianEr
 /// third-party archive need not. A merged unstable index is under a hundred
 /// megabytes of text, so this leaves room for any real archive while keeping
 /// a few megabytes of compressed input from expanding without bound.
+///
+/// A [`Pool`] publish holds the index it merges into to the same bound, since
+/// that index is read before any release has recorded a length for it.
 const MAX_UNSIZED_INDEX: u64 = 256 * 1024 * 1024;
 
 /// Decompresses a fetched index into text, refusing one that expands past
@@ -3536,12 +3581,7 @@ mod tests {
 
     /// A release for `trixie` on amd64 whose one index is `index`, served
     /// uncompressed, and the transport answering both from one mirror.
-    fn unsigned_archive(
-        index: &[u8],
-    ) -> (
-        Debian<'static>,
-        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    ) {
+    fn unsigned_archive(index: &[u8]) -> (Debian, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let release = format!(
             "Suite: trixie\nArchitectures: amd64\nComponents: main\nSHA256:\n {} {} \
              main/binary-amd64/Packages\n",
@@ -3569,7 +3609,7 @@ mod tests {
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
             .trust_unsigned(true)
-            .fetcher(Box::new(fetcher))
+            .fetcher(fetcher)
             .build()
             .expect("the builder validates");
         (debian, asked)
@@ -3712,7 +3752,7 @@ mod tests {
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
             .trust_unsigned(true)
-            .fetcher(Box::new(fetcher))
+            .fetcher(fetcher)
             .build()
             .expect("the builder validates");
         let err = debian
@@ -3742,7 +3782,7 @@ mod tests {
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
             .trust_unsigned(true)
-            .fetcher(Box::new(fetcher))
+            .fetcher(fetcher)
             .build()
             .expect("the builder validates");
         let err = debian.available().expect_err("the release lists no index");
@@ -4430,7 +4470,7 @@ mod tests {
 
     /// An extract-only bootstrap of `plan`, from a mirror serving `deb` as its
     /// one package, with `cache` as the caller's cache.
-    fn plan_bootstrap(plan: Plan, deb: Vec<u8>, cache: &Path) -> Debian<'static> {
+    fn plan_bootstrap(plan: Plan, deb: Vec<u8>, cache: &Path) -> Debian {
         Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
@@ -4438,7 +4478,7 @@ mod tests {
             .plan(plan)
             .extract_only(true)
             .cache_dir(cache)
-            .fetcher(Box::new(Table {
+            .fetcher(Table {
                 bodies: [(
                     "https://mirror.example/debian/pool/one.deb".to_string(),
                     deb,
@@ -4446,7 +4486,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 asked: std::sync::Arc::default(),
-            }))
+            })
             .build()
             .expect("the builder validates")
     }

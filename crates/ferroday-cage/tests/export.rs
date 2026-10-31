@@ -556,7 +556,7 @@ fn explicit_mapper_exports_and_removes() {
     let mut out = Vec::new();
     provision::Export::new(&work)
         .map(IdentityMap::Subordinate)
-        .mapper(&mapper)
+        .mapper(mapper.clone())
         .write_to(&mut out)
         .expect("export through the explicit mapper should succeed");
     let entries = parse_tar(&out);
@@ -566,7 +566,7 @@ fn explicit_mapper_exports_and_removes() {
     // Remove the foreign-owned tree through the same explicit mapper.
     provision::Remove::new(&dir)
         .map(IdentityMap::Subordinate)
-        .mapper(&mapper)
+        .mapper(mapper)
         .run()
         .expect("removal through the explicit mapper should succeed");
     assert!(!dir.exists());
@@ -703,7 +703,7 @@ fn a_removal_whose_delegate_cannot_apply_is_typed() {
     let tree = refuses_plain_removal(&dir);
 
     let err = provision::Remove::new(&tree)
-        .mapper(&RefusesToApply)
+        .mapper(RefusesToApply)
         .run()
         .expect_err("a delegate that cannot apply the map fails the removal");
     assert!(
@@ -730,7 +730,7 @@ fn an_export_whose_delegate_cannot_apply_is_typed() {
     let mut out = Vec::new();
     let err = ferroday_cage::provision::Export::new(&dir)
         .map(IdentityMap::Subordinate)
-        .mapper(&RefusesToApply)
+        .mapper(RefusesToApply)
         .write_to(&mut out)
         .expect_err("a delegate that cannot apply the map fails the export");
     assert!(
@@ -753,7 +753,7 @@ fn a_removal_whose_delegate_cannot_resolve_is_typed() {
     let tree = refuses_plain_removal(&dir);
 
     let err = provision::Remove::new(&tree)
-        .mapper(&RefusesToResolve)
+        .mapper(RefusesToResolve)
         .run()
         .expect_err("a delegate that cannot resolve the map fails the removal");
     assert!(

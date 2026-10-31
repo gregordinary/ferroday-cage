@@ -69,7 +69,7 @@ use ferroday_cage::provision::gentoo::Gentoo;
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut gentoo = Gentoo::builder("amd64").build()?;
-for variant in gentoo.available()?.variants() {
+for variant in gentoo.variants()?.names() {
     println!("{variant}");
 }
 // amd64-desktop-openrc, amd64-hardened-systemd, amd64-openrc,

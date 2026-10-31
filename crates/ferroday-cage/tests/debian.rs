@@ -87,6 +87,152 @@ fn hermetic_extract_only_bootstrap() {
     assert_eq!(mode, 0o2755, "the setgid bit is preserved");
 }
 
+/// An identity-map delegate a test supplies: it records what it is asked, and
+/// resolves every request to the caller alone, or refuses it, and refuses to
+/// apply what it resolved.
+#[derive(Debug, Clone, Default)]
+struct Delegate {
+    /// Whether `resolve` refuses.
+    refuses: bool,
+    /// What it was asked, in order: `resolve` and `apply`.
+    asked: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl ferroday_cage::IdMapper for Delegate {
+    fn resolve(
+        &self,
+        _request: &ferroday_cage::IdentityMap,
+    ) -> Result<ferroday_cage::ResolvedMap, ferroday_cage::IdMapError> {
+        self.asked.lock().unwrap().push("resolve");
+        if self.refuses {
+            return Err(ferroday_cage::IdMapError::unsatisfiable(
+                "the caller's delegate refuses",
+            ));
+        }
+        let caller = |outside: u32| ferroday_cage::IdRange {
+            inside: 0,
+            outside,
+            count: 1,
+        };
+        Ok(ferroday_cage::ResolvedMap::new(
+            vec![caller(rustix::process::getuid().as_raw())],
+            vec![caller(rustix::process::getgid().as_raw())],
+        ))
+    }
+
+    fn apply(
+        &self,
+        _pid: u32,
+        _map: &ferroday_cage::ResolvedMap,
+    ) -> Result<(), ferroday_cage::IdMapError> {
+        self.asked.lock().unwrap().push("apply");
+        Err(ferroday_cage::IdMapError::unsatisfiable(
+            "the caller's delegate will not apply",
+        ))
+    }
+}
+
+#[test]
+fn hermetic_a_bootstrap_establishes_its_map_through_the_callers_delegate() {
+    // A range map only a site-specific delegate can establish is one the
+    // bundled chain cannot, so every place a bootstrap establishes the map has
+    // to ask the caller's delegate: the preflight before any download, and the
+    // cage each dpkg wave runs in.
+    let dir = common::scratch_dir("debian-delegate");
+    let base = Tar::new()
+        .dir("./usr", 0o755)
+        .dir("./usr/bin", 0o755)
+        .file("./usr/bin/hello", 0o755, b"#!/bin/true\n")
+        .finish();
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[Pkg::required("base", deb(&base), "")],
+    );
+    let bootstrap = |delegate: &Delegate, at: &str| {
+        let mut debian = Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(mirror.clone())
+            .trust_unsigned(true)
+            .cache_dir(dir.join(format!("{at}-cache")))
+            .identity_map(ferroday_cage::IdentityMap::Subordinate)
+            .id_mapper(delegate.clone())
+            .build()
+            .expect("the builder validates");
+        let err = provision::ensure(dir.join(at), &mut debian)
+            .expect_err("the delegate fails the bootstrap");
+        let ProvisionError::Other { source, .. } = err else {
+            panic!("expected a Debian error, got {err:?}");
+        };
+        *source
+            .downcast::<ferroday_cage::provision::debian::DebianError>()
+            .expect("a Debian error")
+    };
+
+    // The preflight asks the delegate, and its refusal stops the bootstrap
+    // before a package is downloaded.
+    let refusing = Delegate {
+        refuses: true,
+        ..Delegate::default()
+    };
+    match bootstrap(&refusing, "refused") {
+        ferroday_cage::provision::debian::DebianError::Config { reason, .. } => {
+            assert!(reason.contains("the caller's delegate refuses"), "{reason}");
+        }
+        other => panic!("a refused map is a configuration refusal: {other:?}"),
+    }
+    assert_eq!(*refusing.asked.lock().unwrap(), ["resolve"]);
+    let downloaded = std::fs::read_dir(dir.join("refused-cache"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(downloaded, 0, "a package was downloaded before the refusal");
+
+    // So does staging a layer, before it reads the base.
+    let refusing = Delegate {
+        refuses: true,
+        ..Delegate::default()
+    };
+    let mut layered = Debian::builder("trixie")
+        .architecture("amd64")
+        .mirror(mirror.clone())
+        .trust_unsigned(true)
+        .base_layer(dir.join("no-base"))
+        .identity_map(ferroday_cage::IdentityMap::Subordinate)
+        .id_mapper(refusing.clone())
+        .build()
+        .expect("the builder validates");
+    let err = layered
+        .stage_layer(dir.join("upper"))
+        .expect_err("the delegate refuses the layer's map");
+    assert!(
+        err.to_string().contains("the caller's delegate refuses"),
+        "{err}"
+    );
+    assert_eq!(*refusing.asked.lock().unwrap(), ["resolve"]);
+
+    // The dpkg wave's cage is launched through it too. Launching one needs a
+    // user namespace, which is where the delegate is asked to apply the map.
+    if !common::require::userns() {
+        return;
+    }
+    let obliging = Delegate::default();
+    match bootstrap(&obliging, "launched") {
+        ferroday_cage::provision::debian::DebianError::Launch(
+            ferroday_cage::Error::IdentityMap(refusal),
+        ) => {
+            assert!(refusal.to_string().contains("will not apply"), "{refusal}");
+        }
+        other => panic!("the wave's launch fails at the delegate: {other:?}"),
+    }
+    let asked = obliging.asked.lock().unwrap().clone();
+    assert_eq!(
+        asked.last(),
+        Some(&"apply"),
+        "the wave's cage was not launched through the delegate: {asked:?}",
+    );
+}
+
 #[test]
 fn hermetic_resolve_reports_the_plan_without_downloading() {
     // resolve() fetches and verifies the release and index and resolves the
@@ -897,6 +1043,141 @@ fn hermetic_republishing_changed_bytes_replaces_the_file_and_its_digest() {
     assert_eq!(digest, common::deb_repo::sha256_hex(&second));
 }
 
+/// Makes a named pipe at `path`.
+fn make_fifo(path: &Path) {
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
+    mknodat(CWD, path, FileType::Fifo, Mode::from_raw_mode(0o644), 0)
+        .unwrap_or_else(|errno| panic!("a named pipe at {}: {errno}", path.display()));
+}
+
+/// Publishes `debs` into `pool` on a thread of its own, failing the test if the
+/// publish has not returned within a deadline rather than waiting on it.
+///
+/// An open of a named pipe waits for a writer that never comes, so a publish
+/// that opened one would never return. The thread is left behind if it does
+/// not, which ends with the test process.
+fn publish_within_deadline(
+    pool: &Path,
+    debs: Vec<std::path::PathBuf>,
+) -> Result<(), ferroday_cage::provision::debian::DebianError> {
+    let pool = pool.to_path_buf();
+    let (done, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(trixie_pool(&pool).publish(debs)));
+    outcome
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the publish returned rather than waiting on a named pipe")
+}
+
+#[test]
+fn hermetic_a_pipe_or_link_at_a_pool_file_is_replaced_rather_than_read() {
+    // A republish reads the file the pool already holds at a package's name,
+    // and the copy of each index it already holds under its digest, to decide
+    // whether to write them again. Neither name is the pool's to trust blindly:
+    // a named pipe there would stall the publish on its open, and a link would
+    // be followed out of the pool and its target's bytes taken as the pool's.
+    // Each is replaced by the file the publish writes instead.
+    let dir = common::scratch_dir("debian-pool-planted");
+    let bytes = deb_with_control(
+        "Package: tool\nVersion: 1.0\nArchitecture: amd64\nDescription: a tool\n",
+        &Tar::new()
+            .dir("./usr", 0o755)
+            .file("./usr/bin/tool", 0o755, b"v\n")
+            .finish(),
+    );
+    let source = dir.join("tool.deb");
+    std::fs::write(&source, &bytes).unwrap();
+    let pool = dir.join("pool");
+    trixie_pool(&pool).publish([&source]).unwrap();
+
+    let published = pool.join("pool/main/t/tool/tool_1.0_amd64.deb");
+    let by_hash = pool.join("dists/trixie/main/binary-amd64/by-hash/SHA256");
+    let index_digest = common::deb_repo::sha256_hex(
+        &std::fs::read(pool.join("dists/trixie/main/binary-amd64/Packages")).unwrap(),
+    );
+    let index_copy = by_hash.join(&index_digest);
+    let is_file = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_file()
+    };
+    assert!(is_file(&published) && is_file(&index_copy));
+
+    // A pipe at both names: the republish returns, and each name holds the file
+    // the pool wrote.
+    for planted in [&published, &index_copy] {
+        std::fs::remove_file(planted).unwrap();
+        make_fifo(planted);
+    }
+    publish_within_deadline(&pool, vec![source.clone()]).expect("the republish succeeds");
+    assert!(is_file(&published), "the pipe at the package was replaced");
+    assert_eq!(std::fs::read(&published).unwrap(), bytes);
+    assert!(
+        is_file(&index_copy),
+        "the pipe at the index copy was replaced"
+    );
+
+    // A link to the same bytes outside the pool reads as already published
+    // when it is followed, which would leave the pool serving a file it does
+    // not hold. It is replaced with the pool's own copy instead.
+    let outside = dir.join("outside.deb");
+    std::fs::write(&outside, &bytes).unwrap();
+    std::fs::remove_file(&published).unwrap();
+    std::os::unix::fs::symlink(&outside, &published).unwrap();
+    publish_within_deadline(&pool, vec![source]).expect("the republish succeeds");
+    assert!(is_file(&published), "the link at the package was replaced");
+    assert_eq!(std::fs::read(&published).unwrap(), bytes);
+}
+
+#[test]
+fn hermetic_a_pipe_at_the_index_a_publish_merges_into_fails_it_promptly() {
+    // A publish merges into the index the pool already holds, so it cannot go on
+    // without reading it: one it skipped would drop every package published
+    // before. A named pipe there fails the publish, naming the index, instead of
+    // stalling it on the open.
+    let dir = common::scratch_dir("debian-pool-planted-index");
+    let pool = dir.join("pool");
+    trixie_pool(&pool).publish::<&Path>([]).unwrap();
+    let index = pool.join("dists/trixie/main/binary-amd64/Packages");
+    std::fs::remove_file(&index).unwrap();
+    make_fifo(&index);
+
+    match publish_within_deadline(&pool, Vec::new()) {
+        Err(ferroday_cage::provision::debian::DebianError::Io { path, .. }) => {
+            assert_eq!(path, index, "the failure names the index");
+        }
+        other => panic!("a pipe at the index is a host failure naming it: {other:?}"),
+    }
+}
+
+#[test]
+fn hermetic_a_link_at_another_components_index_is_not_named() {
+    // Each publish rescans the suite and names every index it holds, so the
+    // scan reads indexes this publish did not write. A link at one of them is
+    // looked at rather than followed: the release names only the files the
+    // pool holds, and a link to bytes elsewhere is not one.
+    let dir = common::scratch_dir("debian-pool-linked-index");
+    let pool = dir.join("pool");
+    trixie_pool(&pool).publish::<&Path>([]).unwrap();
+    let contrib = pool.join("dists/trixie/contrib/binary-amd64");
+    std::fs::create_dir_all(&contrib).unwrap();
+    let outside = dir.join("Packages");
+    std::fs::write(&outside, b"").unwrap();
+    std::os::unix::fs::symlink(&outside, contrib.join("Packages")).unwrap();
+    make_fifo(&contrib.join("Packages.gz"));
+
+    publish_within_deadline(&pool, Vec::new()).expect("the publish succeeds");
+    let release = std::fs::read_to_string(pool.join("dists/trixie/Release")).unwrap();
+    assert!(
+        !release.contains("contrib/"),
+        "a link or a pipe was named as an index: {release}",
+    );
+    assert!(
+        release.contains("main/binary-amd64/Packages\n"),
+        "{release}"
+    );
+}
+
 #[test]
 fn hermetic_resolve_layer_omits_the_base_packages() {
     // A layered resolution treats the base's configured set as satisfied and
@@ -1157,7 +1438,7 @@ fn hermetic_a_plan_is_the_increment_a_layered_build_installs() {
         .cache_dir(dir.join("cache"))
         .base_layer(&base_dir)
         .plan(plan)
-        .fetcher(Box::new(watcher))
+        .fetcher(watcher)
         .build()
         .expect("the builder validates");
     let _ = staging.stage_layer(dir.join("upper"));
@@ -1272,7 +1553,7 @@ fn an_archive_coordinate_the_repository_cannot_be_addressed_by_is_refused() {
     // caller never wrote. They pass the same check the pool holds its own
     // coordinates to, so an archive this crate writes and one it reads agree on
     // what an archive may be called.
-    let refused = |what: &str, build: Result<Debian<'_>, _>| match build {
+    let refused = |what: &str, build: Result<Debian, _>| match build {
         Err(ferroday_cage::provision::debian::DebianError::Config { reason, .. }) => {
             assert!(reason.contains(what), "{what}: {reason}");
         }
@@ -2829,7 +3110,7 @@ fn a_pinned_install_fetches_no_release_and_no_index() {
         .cache_dir(dir.join("cache"))
         .extract_only(true)
         .plan(plan)
-        .fetcher(Box::new(watcher))
+        .fetcher(watcher)
         .build()
         .expect("the pinned builder validates");
     provision::ensure(dir.join("rootfs"), &mut pinned).expect("the pinned bootstrap runs");
@@ -2969,11 +3250,10 @@ fn a_plan_refuses_every_setting_that_would_shape_a_resolution() {
             .trust_unsigned(true)
             .plan(plan)
     };
-    let refusal =
-        |builder: ferroday_cage::provision::debian::DebianBuilder<'_>| match builder.build() {
-            Err(ferroday_cage::provision::debian::DebianError::Config { reason, .. }) => reason,
-            other => panic!("expected a configuration refusal, got {other:?}"),
-        };
+    let refusal = |builder: ferroday_cage::provision::debian::DebianBuilder| match builder.build() {
+        Err(ferroday_cage::provision::debian::DebianError::Config { reason, .. }) => reason,
+        other => panic!("expected a configuration refusal, got {other:?}"),
+    };
 
     assert!(refusal(base(plan.clone()).include(["git"])).contains("include()"));
     assert!(refusal(base(plan.clone()).exclude(["git"])).contains("exclude()"));
@@ -3107,7 +3387,7 @@ fn hermetic_a_pin_selects_its_version_where_the_archive_offers_a_higher_one() {
 
 /// Resolves a bootstrap, taking it by value so a builder chain reads in one
 /// expression.
-fn live_resolve(mut debian: Debian<'_>) -> Plan {
+fn live_resolve(mut debian: Debian) -> Plan {
     debian.resolve().expect("the resolution runs")
 }
 

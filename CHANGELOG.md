@@ -182,6 +182,15 @@ consumer upgrading can skip it.
 - `CageBuilder::mount` and `CageBuilder::mounts`, which add a `Mount` of either
   kind to the one mount sequence, so a sequence read back through `get_mounts`
   carries over to another builder whole.
+- `RestrictionBuilder` reports its configuration through the getters
+  `CageBuilder` has for the settings the two share: `get_command`, `get_args`,
+  `get_envs`, `get_base_env`, `get_current_dir`, `get_stdin`, `get_stdout`,
+  `get_stderr`, `get_stop_with_caller` and `get_rlimits`.
+- `ResolvedInputs::run_as`, the `Identity` the command switches to, and
+  `ResolvedInputs::no_new_privileges`. A record previously read the same for a
+  build run as uid 0 and one run as another id. `Identity::get_uid`, `get_gid`
+  and `get_groups` read the identity it reports, as they read
+  `CageBuilder::get_run_as`.
 - `ConfigError::OverlayOptionsTooLong`, refusing an overlay whose mount options
   exceed the 4095 bytes `mount(2)` passes on whole. The kernel cut a longer
   string short, and the remainder could mount a different work directory.
@@ -215,6 +224,11 @@ consumer upgrading can skip it.
   had named for this, leaves the work directory behind. `fcage`:
   `--remove-overlay-upper DIR`, which takes `--identity-map` as
   `--remove-rootfs` does.
+- `DebianBuilder::id_mapper` and `AlpineBuilder::id_mapper`, which supply the
+  delegate that establishes a range identity map: for the preflight, for every
+  sandbox the bootstrap's package scripts run in, and for the removal of a
+  staged layer. A map only a site-specific delegate establishes could not be
+  provisioned before.
 - `DebianBuilder::source_date_epoch`, which gives every maintainer script
   `SOURCE_DATE_EPOCH`, so the accounts a bootstrap creates record the epoch's
   day in `/etc/shadow` rather than the day it ran. An epoch in the first day of
@@ -286,6 +300,18 @@ consumer upgrading can skip it.
   reading back, or publishing a download, and a package cache that cannot be
   created, are `ProvisionError::Io` in every layer. Gentoo reported both, and
   Debian and Alpine the download steps, as the layer's own `Io`.
+- **Breaking.** `DebianBuilder::fetcher`, `AlpineBuilder::fetcher` and
+  `GentooBuilder::fetcher` take the transport by value, as `impl Fetch +
+  'static`, rather than as a `Box<dyn Fetch>`: pass the transport itself, or a
+  `Box` of one chosen at run time. `Debian` and `DebianBuilder` no longer carry
+  a lifetime parameter, and `debian::Observed` carries one, as Alpine's and
+  Gentoo's do.
+- **Breaking.** `debian::Available` and `alpine::Available` are one type,
+  `provision::Available`, which `Debian::available` and `Alpine::available`
+  return. Gentoo's type of that name, the stage3 variants a pointer document
+  publishes, is `gentoo::Variants`, and `Gentoo::available` and
+  `gentoo::Observed::available` are `variants`. `Variants::names` replaces
+  `Available::variants`.
 - **Breaking.** `debian::build_depend_names` takes the architecture the root is
   built for, and evaluates each alternative's architecture restriction against
   it: literal names, `any`, `<os>-any`, and `any-<cpu>`. It chooses the first
@@ -484,6 +510,10 @@ consumer upgrading can skip it.
 - The Debian package pool's publish lock is close-on-exec, so a process spawned
   during a publish no longer keeps the pool locked after the publish returns.
   The export's internal duplicate of its frame stream is close-on-exec as well.
+- Publishing into a `debian::Pool` no longer follows a symbolic link or waits on
+  a named pipe at a name the pool already holds. A link or a pipe where a
+  package or an index copy belongs is replaced, and one where the index being
+  merged into belongs fails the publish.
 - A provisioner's host-side read of a file inside a tree no longer waits on a
   named pipe left at that path, or holds a file a script made arbitrarily large.
   Nothing but a regular file is opened, and each read refuses a file past a
@@ -564,6 +594,11 @@ consumer upgrading can skip it.
   `idmap::single_identity_lines` formats the single-identity map's two lines
   before a fork. A short identity-map write in a sandbox stage reports
   `EMSGSIZE`, as the host side already did.
+- Every range identity map passes through `idmap::resolve_delegate`, which
+  takes the configured delegate, whose refusal is final, or the bundled chain,
+  and validates the request and the delegate's answer: a build, an export, a
+  copy in, a map-assisted removal, and the Debian and Alpine preflights, which
+  ask it through `idmap::establishable`.
 - The host side's reading and writing of a tree is `provision::containment` and
   `provision::rooted`. `containment::create_dirs` creates a chain of missing
   directories for the extractor and `Rooted` alike, and `containment::copy_up`
@@ -623,6 +658,9 @@ consumer upgrading can skip it.
   mdBook's download against its digest, and builds the semver baseline from the
   last release tag with its own lockfile. It sets
   `FERRODAY_CAGE_REQUIRE_OVERLAY` and `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE`.
+- The profile-format pin covers every key the format can carry, a pin of the
+  resolved provenance record's serialized keys covers every key the record can
+  carry, and `NetStackBuilder`'s keys have a pin of their own.
 
 ## [0.4.5] - 2026-09-26
 

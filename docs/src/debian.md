@@ -581,6 +581,11 @@ recorded `SHA256` always names content the pool holds. Republishing a `.deb` the
 pool already has compares digests and writes nothing, leaving a warm pool
 untouched.
 
+A publish reads what the pool already holds without following a symbolic link,
+and opens only a regular file. A link or a named pipe where a package or an
+index copy belongs is replaced by the file the publish writes. One where the
+merged index belongs fails the publish, which cannot go on without that index.
+
 ### Publishing in parallel
 
 A pipeline that builds components in parallel can publish each one the moment it
@@ -1524,7 +1529,9 @@ override is involved. The tree is a correct Debian system as `dpkg` and
 
 The map requires the `subid` feature and a host that can establish it. A
 bootstrap that cannot fails before any download, rather than falling back to the
-flattened form. Because the ownership is real, it reaches the host. A directory
+flattened form. A site-specific delegate establishes the map instead where one
+is supplied through `id_mapper`, as [Identity maps](identity-maps.md) describes
+for a sandbox. Because the ownership is real, it reaches the host. A directory
 the system chowns to a non-root id refuses the plain caller's removal.
 [`provision::remove`](provisioning.md#removing-a-rootfs) deletes the produced
 tree either way, re-entering the map where ownership requires it.

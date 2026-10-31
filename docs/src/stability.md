@@ -38,7 +38,7 @@ format without the others' dependency weight: the Debian layer pulls
 What keeps the decision cheap in the meantime is that the layers already sit on
 a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
 tar, compress, extract, digest, document and OpenPGP machinery -- and reach
-around it in twenty-seven places, ten of which are internal. `tools/seam.toml`
+around it in thirty-one places, ten of which are internal. `tools/seam.toml`
 records every one with what it would cost, `tools/check-seam.py` fails on any
 difference, and a layer naming another layer is refused outright. A split, when
 it comes, is that list plus the mechanical work.
@@ -127,8 +127,8 @@ stores is bounded; a seam it only borrows for the duration of a call is not.**
 
 | Trait | How the library holds it | Bounds |
 | --- | --- | --- |
-| `IdMapper` | Stored in `CageBuilder` and the `Cage` it builds | `Send + Sync` |
-| `Fetch` | Stored in `Debian` | `Send` |
+| `IdMapper` | Stored in every builder that takes one, and in the `Cage` a `CageBuilder` builds | `Send + Sync` |
+| `Fetch` | Stored in `Debian`, `Alpine`, and `Gentoo` | `Send` |
 | `Provisioner` | `&mut dyn`, for one `ensure` call | None |
 | `Observer` | `&mut dyn`, for one run | None |
 
@@ -172,6 +172,13 @@ Settled so that generalising a parameter later is never a breaking change:
 | An owned string the callee keeps | `impl Into<String>` |
 | Borrowed text the callee only reads | `&str` |
 | A collection | `impl IntoIterator<Item = ...>` |
+| A delegate the callee keeps: a transport, an identity mapper | `impl Fetch + 'static`, `impl IdMapper + 'static` |
+
+A delegate is taken by value and kept. A provisioner holds its transport for
+its whole life. A builder hands its identity mapper to every sandbox or child
+process it starts. Each delegate crosses a thread with whatever holds it. A
+transport or a mapper that shares state with its caller keeps that state behind
+an `Arc`.
 
 ## What the profile format promises
 
@@ -247,7 +254,9 @@ and they are complements rather than alternatives:
   inputs a build actually ran under rather than leaving them to be inferred.
   This is verification, and it is worth doing even with both opt-outs set,
   because it is what catches the case where a declaration and the sandbox
-  disagree.
+  disagree. Its serialized keys are part of its type's shape, which the API
+  promises cover. A stored record reads the same way under a later compatible
+  release.
 
 ## Minimum supported Rust version
 
@@ -270,7 +279,7 @@ Policy that only lives in a document decays. These are enforced:
 | No public type loses `Send`/`Sync` | `const` assertions in `tests/auto_traits.rs` |
 | Every feature combination compiles | `cargo hack --feature-powerset --depth 2`, plus an explicit featureless check |
 | The MSRV holds | A CI build at the declared `rust-version` |
-| The profile key set is deliberate | `rename_all` on every container, a census of the field-level renames in `tools/idioms.toml`, and tests pinning the key sets of the profile format and of `NetStackBuilder` |
+| The profile and record key sets are deliberate | `rename_all` on every container, a census of the field-level renames in `tools/idioms.toml`, and tests pinning the key sets of the profile format, of the resolved provenance record, and of `NetStackBuilder` |
 | Every public enum and every struct variant is `#[non_exhaustive]` | `tests/stability.rs`, reading the committed API snapshot |
 | The untrusted-profile surface cannot widen silently | `check_restricted` destructures `CageBuilder` exhaustively, so a new field fails to compile until it is classified |
 | A userland reaching past the provisioning seam is a decision | `tools/check-seam.py` against the record in `tools/seam.toml` |

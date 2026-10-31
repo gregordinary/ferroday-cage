@@ -242,8 +242,8 @@ what a build produces:
 
 - **`identity`** — the identity map: which ids exist inside the sandbox. A
   file's recorded ownership follows from it.
-- **`run-as`** — the id the command runs as, where one is configured, and
-  uid 0 where the key is absent. A Debian build's `Rules-Requires-Root`
+- **`run-as`** — the id the command runs as, where one is configured, in the
+  keys a profile's `[run-as]` table takes, and uid 0 where the key is absent. A Debian build's `Rules-Requires-Root`
   handling turns on exactly this. A non-root id also leaves the command no
   capabilities, unless the hardening keep set carries some across.
 - **`no-new-privileges`** — whether a set-user-ID binary or a file capability
@@ -267,8 +267,9 @@ provenance record has to be readable without knowing which build wrote it.
 `unavailable` and an applied posture with no controls are different facts: the
 second is a build that could have hardened and did not.
 
-The value's *shape* is stable API; its *contents* follow the defaults and may
-change, which is precisely why recording it is worth doing.
+The value's *shape* is stable API, and so are the keys it serializes to. Its
+*contents* follow the defaults and may change, which is precisely why recording
+it is worth doing.
 
 [`Cage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html
 [`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html

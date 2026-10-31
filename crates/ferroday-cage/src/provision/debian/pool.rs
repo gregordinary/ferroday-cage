@@ -71,14 +71,17 @@ use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
+use rustix::fs::FileType;
+
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
 use super::check_coordinate;
-use super::{DebianError, arch, deb, release, version};
+use super::{DebianError, MAX_UNSIZED_INDEX, arch, deb, release, version};
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::document;
+use crate::provision::rooted::Rooted;
 use crate::provision::{Staged, file_url, write_atomically};
 
 /// A trusted local package pool, configured then published to.
@@ -509,11 +512,20 @@ fn write_pool<P: AsRef<Path>>(
     // taken. Everything from here to the end of the call is one publish.
     mkdir_all(pool_dir)?;
     let _lock = lock_pool(pool_dir)?;
+    // Every file the pool already holds is read through this rather than by
+    // its host path. The pool is the caller's own output, but a name in it can
+    // still hold something its writer did not leave there: a symbolic link is
+    // refused rather than followed, and a named pipe rather than waited on.
+    let tree = Rooted::open(pool_dir).map_err(DebianError::at("opening the pool", pool_dir))?;
 
-    let suite_dir = pool_dir.join("dists").join(claims.suite);
-    let binary_dir = suite_dir
+    // Each path is spelled once relative to the pool, for the reads through
+    // `tree`, and joined onto the pool for the writes beside them.
+    let suite_rel = Path::new("dists").join(claims.suite);
+    let binary_rel = suite_rel
         .join(component)
         .join(format!("binary-{architecture}"));
+    let suite_dir = pool_dir.join(&suite_rel);
+    let binary_dir = pool_dir.join(&binary_rel);
     mkdir_all(&binary_dir)?;
 
     // Before anything this call writes can be described by it, whatever signed
@@ -525,7 +537,7 @@ fn write_pool<P: AsRef<Path>>(
     // same prior index and drop this one's packages.
     let mut by_name: BTreeMap<String, Entry> = BTreeMap::new();
     let packages_path = binary_dir.join("Packages");
-    if let Some(existing) = read_if_present(&packages_path)? {
+    if let Some(existing) = read_if_present(&tree, &binary_rel.join("Packages"), &packages_path)? {
         for block in split_paragraphs(&existing) {
             if let Some(entry) = Entry::from_stanza(block) {
                 insert_highest(&mut by_name, entry);
@@ -535,7 +547,7 @@ fn write_pool<P: AsRef<Path>>(
 
     // Add each freshly-built .deb: copy it into the pool and index it.
     for deb_path in debs {
-        let entry = index_deb(pool_dir, component, architecture, deb_path.as_ref())?;
+        let entry = index_deb(&tree, pool_dir, component, architecture, deb_path.as_ref())?;
         insert_highest(&mut by_name, entry);
     }
 
@@ -555,10 +567,10 @@ fn write_pool<P: AsRef<Path>>(
 
     // The by-hash copies are what a reader holding an older Release resolves
     // against, so they are written before the Release that supersedes it.
-    let by_hash_dir = binary_dir.join("by-hash").join("SHA256");
-    mkdir_all(&by_hash_dir)?;
-    write_by_hash(&by_hash_dir, &packages_bytes)?;
-    write_by_hash(&by_hash_dir, &packages_gz)?;
+    let by_hash_rel = binary_rel.join("by-hash").join("SHA256");
+    mkdir_all(&pool_dir.join(&by_hash_rel))?;
+    write_by_hash(&tree, pool_dir, &by_hash_rel, &packages_bytes)?;
+    write_by_hash(&tree, pool_dir, &by_hash_rel, &packages_gz)?;
 
     // The conventional names, for a reader that does not ask by hash.
     write_file(&packages_path, &packages_bytes)?;
@@ -572,7 +584,7 @@ fn write_pool<P: AsRef<Path>>(
     // so the release describes everything the suite holds. This call's own
     // indexes are already on disk by now, so the scan picks them up with the
     // rest and needs no special case for them.
-    let sections = scan_sections(&suite_dir)?;
+    let sections = scan_sections(&tree, pool_dir, &suite_rel)?;
     let release = build_release(claims, &sections);
     write_file(&suite_dir.join("Release"), release.as_bytes())?;
 
@@ -635,16 +647,33 @@ fn lock_pool(pool_dir: &Path) -> Result<std::os::fd::OwnedFd, DebianError> {
 /// Writes an index body under its own digest, the name a reader asks for when
 /// the release declares `Acquire-By-Hash`.
 ///
-/// The path is the content, so an existing file already holds these bytes and
-/// the write is skipped. Nothing here is ever rewritten or removed: an entry a
-/// later publish supersedes is what a reader still working from the release
-/// that named it resolves against.
-fn write_by_hash(by_hash_dir: &Path, bytes: &[u8]) -> Result<(), DebianError> {
-    let path = by_hash_dir.join(Algorithm::Sha256.hex_of(bytes));
-    if path.exists() {
+/// The path is the content, so a regular file already there holds these bytes
+/// and the write is skipped. Nothing here is ever rewritten or removed: an
+/// entry a later publish supersedes is what a reader still working from the
+/// release that named it resolves against. Anything else at the name, a link or
+/// a named pipe, holds no index, and is replaced by the rename that publishes
+/// one.
+fn write_by_hash(
+    tree: &Rooted,
+    pool_dir: &Path,
+    by_hash_rel: &Path,
+    bytes: &[u8],
+) -> Result<(), DebianError> {
+    let rel = by_hash_rel.join(Algorithm::Sha256.hex_of(bytes));
+    let path = pool_dir.join(&rel);
+    let held = tree
+        .stat(&rel)
+        .map_err(DebianError::at("writing a pool file", &path))?;
+    if held.is_some_and(|stat| is_regular(&stat)) {
         return Ok(());
     }
     write_file(&path, bytes)
+}
+
+/// Whether `stat` describes a regular file, the one kind of entry the pool
+/// writes at the names it reads back.
+fn is_regular(stat: &rustix::fs::Stat) -> bool {
+    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
 }
 
 /// A retained pool entry: the identity the highest-version dedupe keys on, plus
@@ -846,6 +875,7 @@ fn checked_version(version: &str) -> Result<(), String> {
 /// is being published is refused rather than indexed under a digest for content
 /// that is not there.
 fn index_deb(
+    tree: &Rooted,
     pool_dir: &Path,
     component: &str,
     architecture: &str,
@@ -879,11 +909,11 @@ fn index_deb(
     // routine rewrite of a file a reader may be fetching. Comparing first makes
     // it a no-op instead. A `.deb` whose bytes differ at the same version is
     // still written, the documented republish case.
-    if let Some((digest, size)) = already_published(&dest, &mut source) {
+    if let Some((mut published, digest, size)) = already_published(tree, &rel, &mut source) {
         // The published file is the offered one byte for byte, so the stanza is
-        // read from the file the index will name, and the digest already taken
-        // from it stands.
-        let control = control_of(&dest, deb_path, architecture, &offered)?;
+        // read from the file the index will name, through the descriptor the
+        // comparison read, and the digest already taken from it stands.
+        let control = control_of(&mut published, &dest, deb_path, architecture, &offered)?;
         return Ok(Entry {
             name: offered.name,
             version: offered.version,
@@ -894,8 +924,9 @@ fn index_deb(
     // Stage beside the destination, describe what was staged, then rename: the
     // rename is what makes the new bytes visible, and it happens only once the
     // stanza that will name them has been read back from them.
-    let staged = stage(&dest, &mut source)?;
-    let (control, (digest, size)) = describe(staged.path(), deb_path, architecture, &offered)?;
+    let (staged, mut copy) = stage(&dest, &mut source)?;
+    let (control, (digest, size)) =
+        describe(&mut copy, staged.path(), deb_path, architecture, &offered)?;
     staged
         .publish()
         .map_err(DebianError::at("publishing a .deb into the pool", &dest))?;
@@ -926,11 +957,14 @@ fn stanza_text(control: &str, rel: &str, size: u64, digest: &str) -> String {
 /// Reads the control member of a `.deb` the pool holds, checking that it is
 /// still the package the destination path was derived from.
 ///
-/// `expected` differs from what the file carries only if the `.deb` was
-/// rewritten between being located and being copied, which would otherwise file
-/// one package under another package's name. Errors are attributed to
-/// `deb_path`, the file the caller offered, since that is the file at fault.
+/// `file` is the pool's copy, read from its start, and `path` is where it sits,
+/// to name a failure of the descriptor itself. `expected` differs from what the
+/// file carries only if the `.deb` was rewritten between being located and
+/// being copied, which would otherwise file one package under another package's
+/// name. Errors about the package are attributed to `deb_path`, the file the
+/// caller offered, since that is the file at fault.
 fn control_of(
+    file: &mut File,
     path: &Path,
     deb_path: &Path,
     architecture: &str,
@@ -940,8 +974,9 @@ fn control_of(
         path: deb_path.to_path_buf(),
         reason,
     };
-    let mut file = File::open(path).map_err(DebianError::at("reading a .deb in the pool", path))?;
-    let control = deb::read_control_from(&mut file).map_err(|err| bad(err.to_string()))?;
+    file.rewind()
+        .map_err(DebianError::at("reading a .deb in the pool", path))?;
+    let control = deb::read_control_from(file).map_err(|err| bad(err.to_string()))?;
     if identity(&control, architecture).map_err(&bad)? != *expected {
         return Err(bad(
             "it changed while it was being published, and now names a different package"
@@ -953,36 +988,47 @@ fn control_of(
 
 /// Reads back what the pool's own copy of a `.deb` says about itself: its
 /// control member, its digest, and its size.
+///
+/// `file` is the staging copy's own descriptor, which [`Staged::beside`] opens
+/// for reading as well as writing so the copy is checked through the descriptor
+/// that wrote it rather than through a second open of its name.
 fn describe(
+    file: &mut File,
     path: &Path,
     deb_path: &Path,
     architecture: &str,
     expected: &Identity,
 ) -> Result<(String, (String, u64)), DebianError> {
-    let control = control_of(path, deb_path, architecture, expected)?;
-    let mut file =
-        File::open(path).map_err(DebianError::at("digesting a .deb in the pool", path))?;
-    let digest = digest::stream(Algorithm::Sha256, &mut file)
+    let control = control_of(file, path, deb_path, architecture, expected)?;
+    let digest = file
+        .rewind()
+        .and_then(|()| digest::stream(Algorithm::Sha256, file))
         .map_err(DebianError::at("digesting a .deb in the pool", path))?;
     Ok((control, digest))
 }
 
-/// Reports whether the pool already holds `source` byte for byte at `dest`,
-/// returning the published file's digest and size when it does.
+/// Reports whether the pool already holds `source` byte for byte at `rel`,
+/// returning the published file with its digest and size when it does.
 ///
 /// Sizes are compared first, so a `.deb` that changed length is recognised
 /// without reading either file. The digest returned is taken from the published
 /// file rather than from the one the caller offered, so the index names a digest
-/// of what the pool holds.
+/// of what the pool holds, and the file comes back so the stanza is read from
+/// the same descriptor.
 ///
-/// Anything that makes the answer unclear — an absent file, an unreadable one, a
-/// read that fails partway — is answered no, and the publish proceeds to write
-/// the destination. That is the same answer the whole-file comparison this
-/// replaced gave, and it is the right one: rewriting is how a pool file damaged
-/// out of band is repaired, and a genuine problem with the caller's own `.deb`
-/// surfaces when it is copied.
-fn already_published(dest: &Path, source: &mut File) -> Option<(String, u64)> {
-    let mut published = File::open(dest).ok()?;
+/// The published file is opened through the pool's [`Rooted`], so only a
+/// regular file is read: a symbolic link at the name is not followed out of the
+/// pool, and a named pipe is not waited on.
+///
+/// Anything that makes the answer unclear — an absent file, one that is not a
+/// regular file, an unreadable one, a read that fails partway — is answered no,
+/// and the publish proceeds to write the destination. That is the same answer
+/// the whole-file comparison this replaced gave, and it is the right one:
+/// rewriting is how a pool file damaged out of band is repaired, the rename that
+/// publishes it replacing whatever held the name, and a genuine problem with the
+/// caller's own `.deb` surfaces when it is copied.
+fn already_published(tree: &Rooted, rel: &str, source: &mut File) -> Option<(File, String, u64)> {
+    let mut published = tree.reader(rel).ok()?;
     if published.metadata().ok()?.len() != source.metadata().ok()?.len() {
         return None;
     }
@@ -990,11 +1036,11 @@ fn already_published(dest: &Path, source: &mut File) -> Option<(String, u64)> {
     source.rewind().ok()?;
     let (offered, _) = digest::stream(Algorithm::Sha256, source).ok()?;
     let (held, size) = digest::stream(Algorithm::Sha256, &mut published).ok()?;
-    (offered == held).then_some((held, size))
+    (offered == held).then_some((published, held, size))
 }
 
 /// Places a copy of `source` beside `dest` as a [`Staged`] file, ready to be
-/// renamed onto it.
+/// renamed onto it, returned with the staging file's own descriptor.
 ///
 /// The payload is cloned with `FICLONE` when the source and the pool sit on one
 /// filesystem that can share extents. The clone is a metadata operation: it
@@ -1011,7 +1057,7 @@ fn already_published(dest: &Path, source: &mut File) -> Option<(String, u64)> {
 /// through, which is always correct and never holds more than a chunk. The
 /// fallback is the common one for a pool that does not share a filesystem with
 /// the build tree, so it is a path taken rather than a path of last resort.
-fn stage(dest: &Path, source: &mut File) -> Result<Staged, DebianError> {
+fn stage(dest: &Path, source: &mut File) -> Result<(Staged, File), DebianError> {
     let (staged, mut file) =
         Staged::beside(dest).map_err(DebianError::at("staging a .deb for", dest))?;
 
@@ -1027,7 +1073,7 @@ fn stage(dest: &Path, source: &mut File) -> Result<Staged, DebianError> {
                 staged.path(),
             ))?;
     }
-    Ok(staged)
+    Ok((staged, file))
 }
 
 /// Inserts an entry, keeping the higher version when the name recurs. A
@@ -1117,11 +1163,20 @@ struct Section {
 /// A `binary-*` directory sitting directly in the suite root is skipped. That
 /// is the flat-repository layout, which has no component, and a release has no
 /// way to name a section that belongs to none.
-fn scan_sections(suite_dir: &Path) -> Result<Vec<Section>, DebianError> {
+///
+/// `suite_rel` is the suite's path within the pool, which `tree` holds. The
+/// walk lists directories by their host paths, under `pool_dir`, and the
+/// indexes it finds are read through `tree`.
+fn scan_sections(
+    tree: &Rooted,
+    pool_dir: &Path,
+    suite_rel: &Path,
+) -> Result<Vec<Section>, DebianError> {
+    let suite_dir = pool_dir.join(suite_rel);
     let mut sections = Vec::new();
     // Each entry is a directory to scan and the component path it stands for.
     // The suite root stands for no component, hence the empty string.
-    let mut pending = vec![(suite_dir.to_path_buf(), String::new())];
+    let mut pending = vec![(suite_dir, String::new())];
     while let Some((dir, component)) = pending.pop() {
         let scanning = DebianError::at("scanning the suite for its indexes", &dir);
         let entries = std::fs::read_dir(&dir).map_err(scanning)?;
@@ -1144,7 +1199,13 @@ fn scan_sections(suite_dir: &Path) -> Result<Vec<Section>, DebianError> {
             };
             match name.strip_prefix("binary-") {
                 Some(architecture) if !architecture.is_empty() && !component.is_empty() => {
-                    read_indexes(&entry.path(), &component, architecture, &mut sections)?;
+                    let index_dir = Index {
+                        rel: &suite_rel.join(&component).join(&name),
+                        host: &entry.path(),
+                        component: &component,
+                        architecture,
+                    };
+                    read_indexes(tree, &index_dir, &mut sections)?;
                 }
                 // `binary-` with no architecture, or one in the suite root.
                 Some(_) => {}
@@ -1159,6 +1220,18 @@ fn scan_sections(suite_dir: &Path) -> Result<Vec<Section>, DebianError> {
     Ok(sections)
 }
 
+/// One `binary-<architecture>` directory the scan found, by both of its names.
+struct Index<'a> {
+    /// The directory's path within the pool, which the reads resolve.
+    rel: &'a Path,
+    /// Its host path, which a failure names.
+    host: &'a Path,
+    /// The component it belongs to.
+    component: &'a str,
+    /// The architecture it describes.
+    architecture: &'a str,
+}
+
 /// Digests the indexes directly inside one `binary-<architecture>` directory.
 ///
 /// Only `Packages` and `Packages.gz` are read, so the by-hash copies beside them
@@ -1166,24 +1239,31 @@ fn scan_sections(suite_dir: &Path) -> Result<Vec<Section>, DebianError> {
 /// and a release names each section once, by its conventional path.
 ///
 /// An index that is absent is not named, and neither is one that is not a
-/// regular file, which is not an index whatever else it is. Both are quiet
-/// rather than fatal, because the suite is scanned as it is found and a publish
-/// describes what is there.
+/// regular file, which is not an index whatever else it is: a symbolic link is
+/// looked at rather than followed, and a named pipe is never opened. Both are
+/// quiet rather than fatal, because the suite is scanned as it is found and a
+/// publish describes what is there.
 fn read_indexes(
-    binary_dir: &Path,
-    component: &str,
-    architecture: &str,
+    tree: &Rooted,
+    index_dir: &Index<'_>,
     sections: &mut Vec<Section>,
 ) -> Result<(), DebianError> {
+    let &Index {
+        rel,
+        host,
+        component,
+        architecture,
+    } = index_dir;
     for name in ["Packages", "Packages.gz"] {
-        let path = binary_dir.join(name);
-        if !path.metadata().is_ok_and(|meta| meta.is_file()) {
+        let rel = rel.join(name);
+        let path = host.join(name);
+        let digesting = || DebianError::at("digesting a pool index", &path);
+        let held = tree.stat(&rel).map_err(digesting())?;
+        if !held.is_some_and(|stat| is_regular(&stat)) {
             continue;
         }
-        let digesting = DebianError::at("digesting a pool index", &path);
-        let mut file = File::open(&path).map_err(digesting)?;
-        let (digest, size) = digest::stream(Algorithm::Sha256, &mut file)
-            .map_err(DebianError::at("digesting a pool index", &path))?;
+        let mut file = tree.reader(&rel).map_err(digesting())?;
+        let (digest, size) = digest::stream(Algorithm::Sha256, &mut file).map_err(digesting())?;
         sections.push(Section {
             component: component.to_string(),
             architecture: architecture.to_string(),
@@ -1308,17 +1388,26 @@ fn split_paragraphs(text: &str) -> Vec<String> {
     blocks
 }
 
-/// Reads a file to a string if it exists, returning `None` when it is absent.
-fn read_if_present(path: &Path) -> Result<Option<String>, DebianError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(DebianError::Io {
-            op: "reading the existing index",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
+/// Reads the index the pool already holds at `rel` as text, returning `None`
+/// when there is none. `path` is its host path, which a failure names.
+///
+/// Read through the pool's [`Rooted`], so anything at the name that is not a
+/// regular file fails the publish rather than being followed or waited on: the
+/// index is what the publish merges into, and one it cannot read would drop
+/// every package published before. It is held to [`MAX_UNSIZED_INDEX`], the
+/// most the provisioner reads of an index whose size nothing has vouched for,
+/// which a prior index is until this publish's own release records it.
+fn read_if_present(tree: &Rooted, rel: &Path, path: &Path) -> Result<Option<String>, DebianError> {
+    let reading = || DebianError::at("reading the existing index", path);
+    let Some(bytes) = tree
+        .read_if_present(rel, MAX_UNSIZED_INDEX)
+        .map_err(reading())?
+    else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|err| reading()(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))
 }
 
 /// Creates a directory and its parents.
@@ -1362,7 +1451,7 @@ mod tests {
         let mut head = [0u8; 4096];
         source.read_exact(&mut head).unwrap();
 
-        let staged = stage(&dir.join("published.deb"), &mut source).expect("staging succeeds");
+        let (staged, _) = stage(&dir.join("published.deb"), &mut source).expect("staging succeeds");
         assert_eq!(
             std::fs::read(staged.path()).unwrap(),
             bytes,

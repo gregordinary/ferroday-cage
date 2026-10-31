@@ -17,9 +17,12 @@
 //! the tree being built or on an overlay of a base and that tree is a property
 //! of whether the build is layered, not of the archive it installs from.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::{Cage, CageBuilder, IdentityMap};
+use super::Delegate;
+use crate::{Cage, CageBuilder, IdMapper, IdentityMap};
 
 /// Where a wave of a provisioning run is rooted.
 ///
@@ -127,7 +130,6 @@ impl<'a> Rooting<'a> {
     feature = "gentoo",
     doc = "[`Gentoo::stage_layer`]: crate::provision::gentoo::Gentoo::stage_layer"
 )]
-#[derive(Debug)]
 pub struct BuildLayer {
     /// The overlay upper the increment was installed into: the build root's
     /// writable layer.
@@ -135,15 +137,39 @@ pub struct BuildLayer {
     /// The identity map the increment was configured under, which decides how the
     /// upper and the work directory beside it are removed.
     identity_map: IdentityMap,
+    /// The delegate that map was established through, where the provisioner's
+    /// caller supplied one, so the removal re-enters the same map.
+    id_mapper: Option<Arc<dyn IdMapper>>,
+}
+
+impl fmt::Debug for BuildLayer {
+    /// Renders the upper and the map, and the delegate by its presence rather
+    /// than its contents: it is a caller's trait object.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BuildLayer")
+            .field("upper", &self.upper)
+            .field("identity_map", &self.identity_map)
+            .field(
+                "id_mapper",
+                &self.id_mapper.as_ref().map(|_| Delegate("dyn IdMapper")),
+            )
+            .finish()
+    }
 }
 
 impl BuildLayer {
     /// Builds a layer handle over a staged `upper`, which disposal removes with
-    /// the work directory the overlay-rooted cage manages beside it.
-    pub(crate) fn new(upper: &Path, identity_map: IdentityMap) -> BuildLayer {
+    /// the work directory the overlay-rooted cage manages beside it, through the
+    /// map and the delegate the increment was staged under.
+    pub(crate) fn new(
+        upper: &Path,
+        identity_map: IdentityMap,
+        id_mapper: Option<Arc<dyn IdMapper>>,
+    ) -> BuildLayer {
         BuildLayer {
             upper: upper.to_path_buf(),
             identity_map,
+            id_mapper,
         }
     }
 
@@ -159,12 +185,13 @@ impl BuildLayer {
 
 impl Drop for BuildLayer {
     /// Removes the upper and the overlay work directory beside it, through the
-    /// map the increment was staged under.
+    /// map the increment was staged under and the delegate that established it.
     ///
     /// That map rather than the subordinate default: an explicit range map
     /// allocates ids the bundled chain would not, and a removal the calling
     /// user is refused has to re-enter the map the tree's ownership was written
-    /// in. Under the single map the ids are the caller's own, and the
+    /// in, through the delegate that wrote it. Under the single map the ids are
+    /// the caller's own, and the
     /// escalation is for the mode-`0` directory the overlay leaves in its work
     /// area, should anything be left inside it.
     ///
@@ -174,6 +201,7 @@ impl Drop for BuildLayer {
     fn drop(&mut self) {
         let _ = crate::provision::Remove::overlay_upper(&self.upper)
             .map(self.identity_map.clone())
+            .shared_mapper(self.id_mapper.clone())
             .run();
     }
 }
@@ -202,7 +230,7 @@ mod tests {
         std::fs::set_permissions(work.join("work"), std::fs::Permissions::from_mode(0o000))
             .unwrap();
 
-        let layer = BuildLayer::new(&upper, IdentityMap::Single);
+        let layer = BuildLayer::new(&upper, IdentityMap::Single, None);
         assert_eq!(layer.path(), upper.as_path());
         drop(layer);
 
@@ -230,7 +258,7 @@ mod tests {
         // sibling, and for the escalating one, which did.
         for map in [IdentityMap::Single, IdentityMap::Subordinate] {
             std::fs::create_dir_all(&upper).unwrap();
-            drop(BuildLayer::new(&upper, map));
+            drop(BuildLayer::new(&upper, map, None));
             assert!(!upper.exists(), "the upper is removed");
             assert!(
                 sibling.exists(),
@@ -238,5 +266,63 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read(&sibling).unwrap(), b"someone else's");
+    }
+
+    /// A delegate that records the map it is asked for and refuses it.
+    #[derive(Debug, Default)]
+    struct Recording {
+        asked: std::sync::Mutex<Vec<IdentityMap>>,
+    }
+
+    impl IdMapper for Recording {
+        fn resolve(&self, request: &IdentityMap) -> Result<crate::ResolvedMap, crate::IdMapError> {
+            self.asked.lock().unwrap().push(request.clone());
+            Err(crate::IdMapError::unsatisfiable(
+                "the test's delegate refuses",
+            ))
+        }
+
+        fn apply(&self, _pid: u32, _map: &crate::ResolvedMap) -> Result<(), crate::IdMapError> {
+            unreachable!("a refused map is never applied")
+        }
+    }
+
+    #[test]
+    fn a_layer_drop_escalates_through_the_delegate_it_was_staged_with() {
+        // A removal the caller is refused re-enters the map the layer was
+        // staged under. Where the provisioner's caller supplied the delegate
+        // that established that map, the bundled chain may not be able to
+        // establish it at all, so the drop has to ask the same delegate.
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "root removes a mode-0 directory without escalating",
+            );
+            return;
+        }
+        let dir = Scratch::for_test("layer", "dispose-delegate");
+        let upper = dir.join("upper");
+        let sealed = upper.join("sealed");
+        std::fs::create_dir_all(sealed.join("inside")).unwrap();
+        // A directory the caller cannot search, so the plain removal is
+        // refused and the escalation is what is left.
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let delegate = Arc::new(Recording::default());
+        let layer = BuildLayer::new(
+            &upper,
+            IdentityMap::Subordinate,
+            Some(Arc::clone(&delegate) as Arc<dyn IdMapper>),
+        );
+        drop(layer);
+
+        assert_eq!(
+            *delegate.asked.lock().unwrap(),
+            [IdentityMap::Subordinate],
+            "the escalation did not ask the layer's delegate",
+        );
+        assert!(upper.exists(), "the refused escalation removed nothing");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
