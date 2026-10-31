@@ -1975,6 +1975,10 @@ fn layered_build_stages_only_the_increment_over_a_pristine_base() {
             .contains("Package: hello"),
         "the increment's dpkg state landed in the upper",
     );
+    // Neither the base's bootstrap nor the increment's waves keep dpkg's log of
+    // their run.
+    assert!(!base.join("var/log/dpkg.log").exists());
+    assert!(!upper.join("var/log/dpkg.log").exists());
 
     // Build against the merged view: `hello` runs, proving the overlay root joins
     // the base's C library and the increment's binary into one view.
@@ -2156,6 +2160,78 @@ fn full_bootstrap_under_a_range_map_carries_real_ownership() {
     // escalated path itself is exercised by the identity tests.
     provision::remove(&rootfs).expect("the removal succeeds");
     assert!(!rootfs.exists());
+}
+
+/// A dated bootstrap: the accounts its scripts create carry the epoch's day,
+/// and the root keeps no record of the run and no machine id it generated.
+///
+/// Range-mapped because `systemd`, which writes the machine id and creates
+/// accounts with `systemd-sysusers`, assigns ownership the single-identity map
+/// cannot represent.
+#[cfg(feature = "subid")]
+#[test]
+fn a_dated_bootstrap_keeps_the_epoch_and_no_record_of_its_run() {
+    if !network_enabled() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    if ferroday_cage::host::range_map_blocker().is_some() {
+        eprintln!("skipping: no delegate can establish a range map");
+        return;
+    }
+    const EPOCH: i64 = 1_700_000_000;
+    let scratch = common::scratch_dir("debian-dated");
+    let rootfs = scratch.join("rootfs");
+    {
+        let mut debian = Debian::builder("trixie")
+            .include(["systemd", "dbus"])
+            .identity_map(ferroday_cage::IdentityMap::Subordinate)
+            .source_date_epoch(EPOCH)
+            .cache_dir(common::download_cache("debian"))
+            .build()
+            .expect("the builder validates");
+        provision::ensure(&rootfs, &mut debian).expect("the dated bootstrap runs");
+    }
+
+    // Every account records its last password change as the epoch's day:
+    // those `pwconv` converts, those `useradd` creates, and those
+    // `systemd-sysusers` creates alike. Without the epoch each is the build day.
+    let shadow = std::fs::read_to_string(rootfs.join("etc/shadow")).expect("the shadow file reads");
+    let day = (EPOCH / 86_400).to_string();
+    let accounts: Vec<&str> = shadow.lines().collect();
+    assert!(
+        accounts.len() > 10,
+        "the base system created its accounts: {shadow}"
+    );
+    for account in accounts {
+        assert_eq!(
+            account.split(':').nth(2),
+            Some(day.as_str()),
+            "{account} is dated by the epoch",
+        );
+    }
+
+    // What the waves recorded of their run is gone, and the machine id a script
+    // generated is left empty for the machine the root is deployed to.
+    for record in [
+        "var/log/dpkg.log",
+        "var/log/alternatives.log",
+        "var/cache/ldconfig/aux-cache",
+        "var/lib/dbus/machine-id",
+    ] {
+        assert!(
+            std::fs::symlink_metadata(rootfs.join(record)).is_err(),
+            "{record} is not kept",
+        );
+    }
+    assert_eq!(
+        std::fs::read(rootfs.join("etc/machine-id")).expect("systemd's machine id file is kept"),
+        b"",
+    );
+
+    provision::remove(&rootfs).expect("the removal succeeds");
 }
 
 /// A payload for a fixture package: one file under `/usr/bin` named for it.

@@ -108,6 +108,41 @@ const AWK: &str = "usr/bin/awk";
 /// The apt configuration the single-identity map needs.
 const APT_SANDBOX_USER: &str = "etc/apt/apt.conf.d/00fcage-single-identity";
 
+/// What the configure waves record of their own run, which a finished root
+/// does not keep.
+///
+/// Each describes the run rather than the root. dpkg's log and
+/// `update-alternatives`' log time-stamp every action the waves took, and
+/// `ldconfig`'s auxiliary cache records the inode and change time of every
+/// library it read, which differ between two trees holding the same files.
+/// Nothing needs them: the logs are history, and `ldconfig` rebuilds its cache
+/// on its next run. The list is `mmdebstrap`'s, less the apt logs a bootstrap
+/// that drives dpkg directly never writes.
+const RUN_RECORDS: [&str; 3] = [
+    "var/log/dpkg.log",
+    "var/log/alternatives.log",
+    "var/cache/ldconfig/aux-cache",
+];
+
+/// The system's machine id.
+///
+/// `systemd`'s configuration writes a random one, which every machine a root is
+/// deployed to would then share. `machine-id(5)` asks a generic image to carry
+/// the file missing or empty, and `systemd` generates a fresh id at boot from
+/// either. Empty is the state kept, as `mmdebstrap` keeps it. A missing file
+/// also makes that boot a first boot, which runs the first-boot units and
+/// presets, and whether a root's first boot does that is the deployment's
+/// decision rather than the bootstrap's.
+const MACHINE_ID: &str = "etc/machine-id";
+
+/// The mode `systemd-machine-id-setup` gives [`MACHINE_ID`].
+const MACHINE_ID_MODE: u32 = 0o444;
+
+/// D-Bus's own copy of the machine id, which its configuration copies from
+/// [`MACHINE_ID`] or generates. Removed rather than emptied, as `mmdebstrap`
+/// removes it: D-Bus reads the system's id when its own is absent.
+const DBUS_MACHINE_ID: &str = "var/lib/dbus/machine-id";
+
 /// The mount point the downloaded packages are bound to inside the cage.
 ///
 /// Deliberately not `/var/cache/apt/archives`: the `apt` package ships and
@@ -205,8 +240,6 @@ fn record_path(line: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
-/// Configures every unpacked package, leaving a consistent dpkg database.
-///
 /// What a configure wave installs, and the environment it installs it in.
 ///
 /// The same five values travel from a bootstrap down through `configure`,
@@ -227,12 +260,18 @@ pub(crate) struct Configure<'a> {
     pub(crate) env: &'a [(String, String)],
 }
 
-/// `env` is the maintainer-script environment; `repositories` compose the
+/// Configures every unpacked package, leaving a consistent dpkg database.
+///
+/// `wave` carries the packages, the maintainer-script environment, and the
+/// identity map the cages run under, which decides whether the single-identity
+/// ownership reconciliation happens at all. `repositories` compose the
 /// `sources.list` and `sources.list.d` entries written into the finished
 /// rootfs, each signed repository's keyring written there as its `signed-by`
-/// trust anchor so the sources verify. `identity_map` is the map the cages run
-/// under, deciding whether the single-identity ownership reconciliation happens
-/// at all. `progress` receives dpkg's output.
+/// trust anchor so the sources verify. `observer` receives dpkg's output.
+///
+/// Once the last wave has run, what it recorded of its own run is
+/// [cleared](clear_run_state), so the finished rootfs carries no log of the
+/// bootstrap and no machine identity it generated.
 ///
 /// Under the single-identity map the reconciliation neutralizes the
 /// [`chown`/`chgrp` commands](OWNERSHIP_TOOLS), so a maintainer script that
@@ -330,12 +369,13 @@ pub(crate) fn configure(
         observer,
     )?;
 
-    // Restore the real tools and remove the bootstrap-only files, then write
-    // the finished rootfs's apt sources.
+    // Restore the real tools, remove the bootstrap-only files and what the
+    // waves recorded of the run, then write the finished rootfs's apt sources.
     if single {
         restore_ownership_stubs(&tree)?;
     }
     remove_policy_rc_d(&tree)?;
+    clear_run_state(&tree)?;
     write_repository_sources(&tree, repositories)?;
     if single {
         write_apt_sandbox_user(&tree)?;
@@ -369,7 +409,9 @@ pub(crate) fn configure(
 /// where [`configure`]'s does — a compiled helper or a POSIX ACL still fails —
 /// and the overlay is not the variable: an increment runs under the map of the
 /// base it increments, so a package needing real ids fails here for the same
-/// reason it fails in a full bootstrap.
+/// reason it fails in a full bootstrap. What the increment's waves record of
+/// their run is [cleared](clear_run_state) from the upper as a full bootstrap
+/// clears it from the rootfs.
 ///
 /// `overlay_source` is the caller's pre-configure overlay, laid over the upper
 /// between the unpack and configure waves exactly as for a full bootstrap.
@@ -440,12 +482,16 @@ pub(crate) fn configure_delta(
         observer,
     )?;
 
-    // Reveal the base's real ownership tools through the overlay again and drop
-    // the daemon-startup policy from the increment.
+    // Reveal the base's real ownership tools through the overlay again, and drop
+    // the daemon-startup policy and what the increment's waves recorded of their
+    // run. Removing a record from the upper reveals whatever copy the base holds
+    // at that path, which is the base's own; a base this library bootstrapped
+    // holds none.
     if single {
         restore_delta_ownership_stubs(&tree)?;
     }
     remove_policy_rc_d(&tree)?;
+    clear_run_state(&tree)?;
 
     // dpkg copied the base's status database up into the upper on its first
     // write, so the merged database — base plus increment — is read from the
@@ -743,6 +789,25 @@ fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianErro
     } else {
         Err(DebianError::NotConfigured { packages: missing })
     }
+}
+
+/// Removes what the configure waves leave that belongs to their run rather
+/// than to the root: the [run records](RUN_RECORDS) and the machine identity a
+/// maintainer script generated.
+///
+/// The machine id is emptied only where a script wrote one. A root without
+/// `systemd` carries no file, and creating one would add state no package asked
+/// for. A file the read refuses to follow, a symbolic link among them, is left
+/// alone, since a link is not an id this run generated.
+fn clear_run_state(tree: &Rooted) -> Result<(), DebianError> {
+    for path in RUN_RECORDS.into_iter().chain([DBUS_MACHINE_ID]) {
+        remove_if_present(tree, path)?;
+    }
+    if tree.read(MACHINE_ID).is_ok_and(|id| !id.is_empty()) {
+        tree.write_mode(MACHINE_ID, b"", MACHINE_ID_MODE)
+            .map_err(at("emptying", tree, MACHINE_ID))?;
+    }
+    Ok(())
 }
 
 /// Writes `/usr/sbin/policy-rc.d` returning 101, so package installation does
@@ -1171,6 +1236,81 @@ mod tests {
             Path::new("mawk"),
         );
         assert!(fs::symlink_metadata(staging.join("usr/sbin/policy-rc.d")).is_err());
+    }
+
+    #[test]
+    fn the_run_state_is_cleared_and_the_machine_id_emptied() {
+        // What the waves left of their own run: two logs, the ldconfig cache,
+        // and the two copies of a machine id the scripts generated.
+        let (staging, tree) = rooted_tree("run-state");
+        let id = b"bab73fe9c7e4506ef70334906ab8378f\n";
+        for path in RUN_RECORDS {
+            tree.write(path, b"recorded during the run\n").unwrap();
+        }
+        tree.write(DBUS_MACHINE_ID, id).unwrap();
+        tree.write_mode(MACHINE_ID, id, 0o444).unwrap();
+
+        clear_run_state(&tree).expect("the run state is cleared");
+
+        for path in RUN_RECORDS.into_iter().chain([DBUS_MACHINE_ID]) {
+            assert!(
+                fs::symlink_metadata(staging.join(path)).is_err(),
+                "{path} is removed",
+            );
+        }
+        // The system's id is kept as a file, empty, at the mode systemd gives
+        // it, so the machine the root is deployed to generates its own.
+        let machine_id = staging.join(MACHINE_ID);
+        assert_eq!(fs::read(&machine_id).unwrap(), b"");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&machine_id).unwrap().permissions().mode() & 0o7777,
+            MACHINE_ID_MODE,
+        );
+    }
+
+    #[test]
+    fn a_root_without_a_machine_id_is_not_given_one() {
+        // A root without systemd carries no machine id, and clearing the run's
+        // state creates none; an already-empty one is not rewritten.
+        let (staging, tree) = rooted_tree("no-machine-id");
+        clear_run_state(&tree).expect("an absent state clears");
+        assert!(fs::symlink_metadata(staging.join(MACHINE_ID)).is_err());
+
+        tree.write_mode(MACHINE_ID, b"", 0o644).unwrap();
+        clear_run_state(&tree).expect("an empty id clears");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(staging.join(MACHINE_ID))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644,
+            "an empty id is left as it stands",
+        );
+    }
+
+    #[test]
+    fn a_link_at_a_run_record_cannot_reach_out_of_the_tree() {
+        // The cleanup runs after every maintainer script, so a script can leave
+        // a link at any of the paths it clears. A link at a record is removed as
+        // the name it is; a link at the machine id is not an id the run
+        // generated, and the file it names is not emptied through it.
+        let (staging, tree) = rooted_tree("run-state-links");
+        let victim = staging.join("victim");
+        fs::write(&victim, b"host contents\n").unwrap();
+        for path in ["var/log/dpkg.log", MACHINE_ID] {
+            let planted = staging.join(path);
+            fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        }
+
+        clear_run_state(&tree).expect("the run state is cleared");
+
+        assert_eq!(fs::read(&victim).unwrap(), b"host contents\n");
+        assert!(fs::symlink_metadata(staging.join("var/log/dpkg.log")).is_err());
+        assert_eq!(fs::read_link(staging.join(MACHINE_ID)).unwrap(), victim);
     }
 
     #[test]

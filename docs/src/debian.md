@@ -62,8 +62,12 @@ A bootstrap runs in stages:
 
    Under the single-identity map it also configures apt to run its download
    methods as root. The `_apt` user apt would otherwise drop to is not
-   represented in that map. A range map keeps apt's default sandbox. When every
-   package reaches the installed state, the tree is published.
+   represented in that map. A range map keeps apt's default sandbox.
+
+   It removes what the waves recorded of their own run and empties any machine
+   id a package generated. [What a bootstrap does not
+   keep](#what-a-bootstrap-does-not-keep) lists both. When every package
+   reaches the installed state, the tree is published.
 
 A bootstrapped tree carries no `/etc/resolv.conf`, because the provisioner
 writes none. A resolver configuration belongs to wherever the tree is deployed,
@@ -1067,6 +1071,36 @@ A negative epoch is refused at `build` with `DebianError::Config`, because the
 account tools read the variable as unsigned and date from the clock instead.
 The epoch is a moment already past: the shadow tools refuse one later than the
 build host's clock.
+
+### What a bootstrap does not keep
+
+Some of what configuration writes carries its run whatever the date. Every
+bootstrap removes these once its last configure wave has run, with or without an
+epoch:
+
+- `/var/log/dpkg.log` and `/var/log/alternatives.log`, which time-stamp every
+  action the waves took.
+- `/var/cache/ldconfig/aux-cache`, which records the inode and change time of
+  every library `ldconfig` read. `ldconfig` rebuilds it on its next run.
+- `/var/lib/dbus/machine-id`, D-Bus's copy of the machine id. D-Bus reads
+  `/etc/machine-id` when its own copy is absent.
+
+The list matches what `mmdebstrap` removes by default, less the apt logs a
+bootstrap that drives dpkg directly never writes. A layered build removes the
+same files from its upper.
+
+Where a package wrote `/etc/machine-id`, as `systemd`'s configuration does, the
+file is kept and emptied. The id `systemd` writes is random, and every machine
+deployed from the root would otherwise share it. An empty file is one of the two
+states `machine-id(5)` gives a generic image. From it, `systemd` generates a
+fresh id at boot without treating that boot as a first boot. A deployment that
+wants first-boot behavior, unit presets and `ConditionFirstBoot=` units, removes
+the file.
+
+A sandbox has no such boot, so a program that asks for the machine id inside one
+finds none until one is generated. `systemd-machine-id-setup`, run in the root,
+writes `/etc/machine-id`, which D-Bus reads as well. In a root without
+`systemd`, `dbus-uuidgen --ensure` writes D-Bus's own copy.
 
 ### What stays the caller's
 

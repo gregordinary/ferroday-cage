@@ -76,6 +76,13 @@ consumer upgrading can skip it.
   `spawn_pending_terminal` waits for the terminal, so a setup failure before it
   exists is reported there rather than from `proceed`. A restriction's terminal
   still comes from the host's `/dev/ptmx`.
+- **Breaking.** A Debian bootstrap, and a layered build's increment, keeps no
+  record of its run. Once its last configure wave has run it removes
+  `/var/log/dpkg.log`, `/var/log/alternatives.log`,
+  `/var/cache/ldconfig/aux-cache`, and `/var/lib/dbus/machine-id`, and empties
+  an `/etc/machine-id` a package wrote. A program that asks for the machine id
+  in a sandbox, with no boot to generate one, now finds none until
+  `systemd-machine-id-setup` or `dbus-uuidgen --ensure` runs in the root.
 
 ### Internal
 
