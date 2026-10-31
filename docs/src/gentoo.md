@@ -740,10 +740,11 @@ directory serves several architectures and binhosts.
 
 A cached entry is verified on the read, not trusted for having been verified
 once. What sits at a cache path is bytes on a disk this crate does not own. A
-cache hit and a fresh download therefore go through the same check. An entry that does not
-verify is not the archive's file, whatever it is, and the run downloads it
-again. A fresh download that does not verify fails the run. It is removed, so a
-later run does not meet the same refusal in its own cache.
+cache hit and a fresh download therefore go through the same check. An entry
+that does not verify is not the archive's file, whatever it is. It is removed,
+and the run downloads it again. A fresh download is checked before it is renamed
+into the cache, so one that does not verify fails the run without ever being
+published.
 
 What is verified is what is extracted. The tarball is extracted through the
 descriptor its digest was taken through, and a container's image through the
@@ -839,12 +840,12 @@ events a bootstrap does, because both go through one code path.
 
 The same observer stops the run. `ProvisionObserver::cancelled` is consulted at
 each step boundary: before a document is fetched, once the resolution is in
-hand, and before the digest pass. Unlike the other userlands, it is also
-consulted while the tarball is arriving. This layer has no
-package boundary to break the work up. A check that ran only around the download
-would answer a caller who asked to stop once all of it had been fetched. A run
-stopped this way fails with `ProvisionError::Cancelled`, leaves no root behind,
-and leaves no partial tarball in the cache.
+hand, and before a cached tarball's digest pass. It is also consulted while the
+tarball is arriving, as every layer consults it during a download. A stage3 has
+no package boundary to break the work up. A check that ran only around the
+download would answer a caller who asked to stop once all of it had arrived. A
+run stopped this way fails with `ProvisionError::Cancelled`, leaves no root
+behind, and leaves no partial tarball in the cache.
 
 ## The command line
 

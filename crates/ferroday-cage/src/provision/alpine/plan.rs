@@ -444,18 +444,7 @@ impl Plan {
     /// and the architecture is recorded in the root's installed database.
     pub fn parse_document(text: &str) -> Result<Plan, AlpineError> {
         let stanzas = document::parse(text);
-        let (header, rest) = stanzas
-            .split_first()
-            .ok_or_else(|| plan_document("the document holds no stanzas".to_string()))?;
-
-        let format = header
-            .get("Format")
-            .ok_or_else(|| plan_document("the first stanza has no Format field".to_string()))?;
-        if format != FORMAT {
-            return Err(plan_document(format!(
-                "the document is in format {format:?}, and this library reads {FORMAT:?}",
-            )));
-        }
+        let (header, rest) = document::header(&stanzas, FORMAT).map_err(plan_document)?;
         let mut plan = Plan {
             release: required(header.get("Release"), "Release", "the header")?,
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
@@ -467,9 +456,8 @@ impl Plan {
         for stanza in rest {
             if let Some(name) = stanza.get("Package") {
                 let at_package = format!("the package {name}");
-                let at = number(stanza.get("Index"), "Index", &at_package)?
+                let at = number::<usize>(stanza.get("Index"), "Index", &at_package)?
                     .ok_or_else(|| plan_document(format!("the package {name} names no index")))?;
-                let at = usize::try_from(at).unwrap_or(usize::MAX);
                 if at >= plan.indexes.len() {
                     return Err(plan_document(format!(
                         "the package {name} names index {at}, which the document does not carry \
@@ -516,9 +504,10 @@ impl Plan {
             })?;
             // The number is written out so the document reads on its own, and
             // checked rather than trusted: a document whose indexes are out of
-            // order would silently attribute packages to the wrong mirror.
+            // order would silently attribute packages to the wrong mirror. It is
+            // held to the spelling the writer gives it, as every number is.
             let expected = plan.indexes.len();
-            if at.parse::<usize>().ok() != Some(expected) {
+            if at != expected.to_string() {
                 return Err(plan_document(format!(
                     "the index stanzas are numbered out of order: expected {expected}, found \
                      {at:?}",
@@ -586,21 +575,15 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Alpine
     document::required(value, field, at).map_err(plan_document)
 }
 
-/// Reads an optional numeric field, absent giving no value.
+/// Reads an optional numeric field, reporting a refusal the same way.
 ///
-/// A value that is not a number refuses the document rather than reading as
-/// absent. Reading it as absent would drop it on the way out, and a document
-/// that came back missing a line it was given is the one failure the carried
-/// fields exist to prevent.
-fn number(value: Option<&str>, field: &str, at: &str) -> Result<Option<u64>, AlpineError> {
-    match value {
-        Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
-            plan_document(format!(
-                "{at} has a {field} of {value:?}, which is not a number"
-            ))
-        }),
-        None => Ok(None),
-    }
+/// The rule is [`document::number`]'s.
+fn number<T: std::str::FromStr>(
+    value: Option<&str>,
+    field: &str,
+    at: &str,
+) -> Result<Option<T>, AlpineError> {
+    document::number(value, field, at).map_err(plan_document)
 }
 
 /// Builds the document error.

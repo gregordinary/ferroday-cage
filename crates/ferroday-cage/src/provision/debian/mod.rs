@@ -39,7 +39,6 @@
 //! ```
 
 mod arch;
-mod available;
 mod bootstrap;
 mod deb;
 mod index;
@@ -54,26 +53,27 @@ mod version;
 
 use layer::InstalledSet;
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub use arch::{Interpreter, foreign_interpreter, host_architecture};
-pub use available::Available;
 pub use index::{ParsePriorityError, Priority, build_depend_names};
 pub use pin::{UnheldPin, UnheldReason};
 pub use plan::{Plan, PlannedPackage, ResolvedArchive};
 pub use pool::Pool;
 pub use repository::{Repository, RepositoryBuilder};
 
+use super::cache;
 use super::coordinate::{self, Nesting};
 use super::digest::{self, Algorithm};
 use super::document::Carried;
 use super::extract::{Extraction, Placement};
 use super::rooted::Rooted;
 use super::{
-    BuildLayer, Delegate, Failover, Fetch, FetchError, FetchJob, FetchRequest, HttpFetch,
+    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, FetchRequest, HttpFetch,
     LimitedWriter, PackageCache, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner,
-    Stream, mirror_url, staging_path, walk_mirrors,
+    Staged, Stream, mirror_url, walk_mirrors,
 };
 use crate::IdentityMap;
 use crate::failure::path_io_error;
@@ -2142,15 +2142,16 @@ impl Failover for DebianError {
 /// live pool is served by the repository's snapshot backstop.
 ///
 /// What is *missing* from the cache is fetched in batches first, through
-/// [`Fetch::fetch_all`], so a transport that can overlap several requests does.
+/// [`cache::prefetch`], so a transport that can overlap several requests does.
 /// That step is an optimization and nothing more: a package it does not deliver
-/// is downloaded by the walk below exactly as though the batch had not run, and
-/// the walk is still what decides that a package arrived, verified.
+/// is downloaded by the walk below exactly as though the batch had not run.
+/// Either way a download is published only once its digest has matched
+/// ([`verify_deb`]), so the cache never holds a `.deb` that was not checked.
 ///
-/// Both the cache pass and the walk ask [`is_cached`] rather than whether a file
-/// exists. An entry left short by a crash, or altered since, is therefore
-/// downloaded again whichever of the two meets it, and a package the batch could
-/// not deliver reaches every mirror rather than stopping at a corrupt entry.
+/// The cache pass asks [`is_cached`] rather than whether a file exists. An
+/// entry left short by a crash, or altered since, is therefore downloaded again,
+/// and a package the batch could not deliver reaches every mirror rather than
+/// stopping at a corrupt entry.
 fn acquire_debs(
     fetcher: &mut dyn Fetch,
     repositories: &[Repository],
@@ -2158,9 +2159,7 @@ fn acquire_debs(
     archives_host: &Path,
     observer: &mut dyn DebianObserver,
 ) -> Result<Vec<Installable>, ProvisionError> {
-    std::fs::create_dir_all(archives_host).map_err(|source| {
-        ProvisionError::io("creating the package directory", archives_host, source)
-    })?;
+    cache::create(archives_host)?;
 
     // The cache pass, before anything is fetched: what a caller is told it is
     // downloading is what a batch and the walk between them go on to fetch, in
@@ -2190,19 +2189,53 @@ fn acquire_debs(
         });
     }
 
-    prefetch_debs(fetcher, repositories, &missing, observer)?;
+    // Every job asks the package's own repository's first mirror, which is the
+    // one the walk would ask first too.
+    let (batched, jobs): (Vec<usize>, Vec<cache::Job<'_>>) = missing
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (package, dest))| {
+            let mirror = repositories[package.origin].mirrors.first()?;
+            let job = cache::Job {
+                url: mirror_url(mirror, &package.filename),
+                entry: cache::Entry {
+                    path: dest,
+                    size: package.size,
+                },
+            };
+            Some((at, job))
+        })
+        .unzip();
+    let delivered = cache::prefetch(fetcher, &jobs, observer, |job, mut file| {
+        let (package, dest) = &missing[batched[job]];
+        verify_deb(&mut file, dest, &jobs[job].url, &package.sha256)
+    })
+    .map_err(|failure| failure.into_provision(wrap))?;
+    let mut acquired = vec![false; missing.len()];
+    for (at, delivered) in batched.into_iter().zip(delivered) {
+        acquired[at] = delivered.is_some();
+    }
 
-    for (package, dest) in &missing {
-        // A package boundary: whatever has been downloaded is complete, and
-        // the staging tree is untouched, so stopping here costs nothing.
-        if observer.cancelled() {
-            return Err(ProvisionError::Cancelled);
-        }
-        if is_cached(dest, &package.sha256) {
+    for ((package, dest), acquired) in missing.iter().zip(acquired) {
+        if acquired {
             continue;
         }
-        let mirrors = &repositories[package.origin].mirrors;
-        download_deb(fetcher, mirrors, package, dest, observer).map_err(wrap)?;
+        // The walk asks the observer at each mirror and on every write of the
+        // body, so a cancelled run stops within one package's worth of bytes,
+        // and what has been published by then is complete and verified.
+        cache::download(
+            fetcher,
+            &repositories[package.origin].mirrors,
+            |mirror| mirror_url(mirror, &package.filename),
+            cache::Entry {
+                path: dest,
+                size: package.size,
+            },
+            observer,
+            |mut file, url, _| verify_deb(&mut file, dest, url, &package.sha256),
+            || FetchError::not_found(&package.filename),
+        )
+        .map_err(|failure| failure.into_provision(wrap))?;
     }
 
     Ok(packages
@@ -2220,13 +2253,40 @@ fn acquire_debs(
 ///
 /// Validating a cached kernel package costs the memory of validating a shell
 /// script, which is the property every read and write of a `.deb` in this
-/// crate keeps. An entry that is absent, unreadable, truncated, or altered
-/// answers `false`, and a download replaces it: a rename onto the name is what
-/// publishes the replacement.
+/// crate keeps. An entry that is absent, unreadable, not a regular file,
+/// truncated, or altered answers `false`, and a download replaces it: a rename
+/// onto the name is what publishes the replacement.
 fn is_cached(dest: &Path, sha256: &str) -> bool {
-    std::fs::File::open(dest)
-        .and_then(|mut file| digest::stream(Algorithm::Sha256, &mut file))
-        .is_ok_and(|(digest, _)| digest == sha256)
+    cache::open_entry(dest).is_ok_and(|mut file| {
+        verify_deb(&mut file, dest, &dest.display().to_string(), sha256).is_ok()
+    })
+}
+
+/// Holds a `.deb` to the SHA-256 its index recorded, reading `file` from its
+/// start.
+///
+/// The one check a package is held to, whichever produced the file: a cache
+/// hit, a download before it is published, and the copy a run installs from.
+/// `entry` is where the package is or is about to be, for a read that fails;
+/// `subject` names the bytes in a refusal, the URL they were fetched from or the
+/// path they were read at.
+fn verify_deb(
+    file: &mut File,
+    entry: &Path,
+    subject: &str,
+    sha256: &str,
+) -> Result<(), DebianError> {
+    let (actual, _) = digest::stream(Algorithm::Sha256, file)
+        .map_err(DebianError::at("reading the package", entry))?;
+    if actual == sha256 {
+        Ok(())
+    } else {
+        Err(DebianError::Digest {
+            subject: subject.to_string(),
+            expected: sha256.to_string(),
+            actual,
+        })
+    }
 }
 
 /// Copies the packages a run installs out of a cache the caller named, into a
@@ -2256,13 +2316,7 @@ fn private_copy(
         return Ok(None);
     }
     let private = PackageCache::beside(tree, None, DEB_CACHE);
-    std::fs::create_dir_all(private.path()).map_err(|source| {
-        ProvisionError::io(
-            "creating the installation directory",
-            private.path(),
-            source,
-        )
-    })?;
+    cache::create(private.path())?;
     for installable in installables {
         let name = format!("{}.deb", installable.sha256);
         let from = cache_dir.join(&name);
@@ -2272,215 +2326,14 @@ fn private_copy(
     Ok(Some(private))
 }
 
-/// Copies one package to `to`, through a staging file beside it and a rename,
-/// so a copy left over from an earlier run is replaced rather than trusted.
+/// Copies one package to `to`, through a [`Staged`] file beside it, so a copy
+/// left over from an earlier run is replaced rather than trusted.
 fn copy_package(from: &Path, to: &Path) -> io::Result<()> {
-    let staged = staging_path(to);
-    let mut source = std::fs::File::open(from)?;
-    // Created exclusively, which establishes that the name is this call's
-    // alone and refuses a symlink pre-planted at it rather than writing
-    // through it.
-    let mut copy = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged)?;
-    let copied = io::copy(&mut source, &mut copy).and_then(|_| std::fs::rename(&staged, to));
-    if copied.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    copied
-}
-
-/// How many packages one batch asks for.
-///
-/// Each job holds an open staging file for as long as the batch runs, so this
-/// is a bound on descriptors rather than on the transport, which decides for
-/// itself how many of a batch to have in flight. It is also the granularity a
-/// cancelled bootstrap stops at, which is the reason it is not larger.
-const BATCH: usize = 32;
-
-/// Fills the cache with the packages a bootstrap is about to install, several
-/// at a time.
-///
-/// Every job asks the package's own repository's first mirror, which is the one
-/// the walk would ask first too. A job that does not arrive, or arrives and does
-/// not verify, simply leaves the cache without that package, and the walk that
-/// follows downloads it with every mirror available to it. Nothing here decides
-/// that a package is present: the rename is, and it happens only over bytes
-/// whose digest matched.
-fn prefetch_debs(
-    fetcher: &mut dyn Fetch,
-    repositories: &[Repository],
-    missing: &[(&Wanted, PathBuf)],
-    observer: &mut dyn DebianObserver,
-) -> Result<(), ProvisionError> {
-    for batch in missing.chunks(BATCH) {
-        if observer.cancelled() {
-            return Err(ProvisionError::Cancelled);
-        }
-        let mut staged = Vec::with_capacity(batch.len());
-        for (package, dest) in batch {
-            let Some(mirror) = repositories[package.origin].mirrors.first() else {
-                continue;
-            };
-            let url = mirror_url(mirror, &package.filename);
-            observer.progress(DebianEvent::Fetching { url: &url });
-            let path = staging_path(dest);
-            // Created exclusively, which establishes that the name is this
-            // call's alone and refuses a symlink pre-planted at it rather than
-            // writing through it.
-            let Ok(file) = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            else {
-                continue;
-            };
-            // Capped as the per-package download is, and for the same reason:
-            // the size travels with the request, but a transport is free to
-            // ignore it, and the sink is the one place the bound cannot be.
-            let sink = digest::DigestWriter::new(Algorithm::Sha256, file);
-            let cap = package.size.unwrap_or(u64::MAX);
-            staged.push((*package, dest, url, path, LimitedWriter::new(sink, cap)));
-        }
-
-        let outcomes = {
-            let mut jobs: Vec<FetchJob<'_>> = staged
-                .iter_mut()
-                .map(|(package, _dest, url, _path, sink)| {
-                    let request = FetchRequest::new(url);
-                    let request = match package.size {
-                        Some(size) => request.sized(size),
-                        None => request,
-                    };
-                    FetchJob::new(request, sink)
-                })
-                .collect();
-            fetcher.fetch_all(&mut jobs)
-        };
-
-        for ((package, dest, _url, path, sink), outcome) in staged.into_iter().zip(outcomes) {
-            let published = outcome.is_ok()
-                && sink
-                    .into_inner()
-                    .finish()
-                    .is_ok_and(|(actual, _size)| actual == package.sha256)
-                && std::fs::rename(&path, dest).is_ok();
-            if !published {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Downloads one package into the cache, walking its repository's mirrors.
-///
-/// The walk is [`fetch_from_mirrors`]'s: a mirror that reports the package
-/// missing or fails at the transport advances to the next, and the last such
-/// failure is reported once none is left. A digest mismatch is not one of those
-/// — it says the bytes are wrong rather than absent — so it fails the download
-/// where it happens, as it does everywhere else in the module.
-fn download_deb(
-    fetcher: &mut dyn Fetch,
-    mirrors: &[String],
-    package: &Wanted,
-    dest: &Path,
-    observer: &mut dyn DebianObserver,
-) -> Result<(), DebianError> {
-    walk_mirrors(
-        mirrors,
-        |mirror| {
-            let url = mirror_url(mirror, &package.filename);
-            observer.progress(DebianEvent::Fetching { url: &url });
-            fetch_verified(fetcher, &url, &package.sha256, package.size, dest)
-        },
-        || {
-            DebianError::Fetch(FetchError::NotFound {
-                url: package.filename.clone(),
-            })
-        },
-    )
-}
-
-/// Fetches `url` into `dest`, verified and atomically.
-///
-/// The body is written to a staging file beside the destination as it arrives,
-/// digested on the way through, and renamed onto the destination only once the
-/// digest is `expected`. Two things fall out of doing it in that order. A `.deb`
-/// never exists in memory as one buffer, so downloading a 90 MB kernel package
-/// costs what downloading a shell script costs — the property the cache check
-/// above and [`Pool::publish`] are both written for. And nothing unverified is
-/// ever visible at the destination, because the rename is what puts it there;
-/// the staging name is unique to this call, so a concurrent download of the same
-/// package publishes its own file rather than consuming this one.
-///
-/// The staging file is not synced before the rename, for the reason
-/// [`write_atomically`] gives: what is read back is verified against a digest,
-/// so an entry left short by a crash is rejected and fetched again, which is
-/// cheaper than syncing every download against a failure that costs only a
-/// repeat.
-///
-/// `size` is the length the index recorded for the package, where one is known.
-/// It travels with the request and bounds the staging file, so a mirror that
-/// answers a request for a two-megabyte `.deb` with an endless body fills no
-/// more disk than the package weighs. The digest still decides whether the
-/// bytes are the package; this only decides how many of them are read.
-///
-/// Anything that fails takes the staging file with it, so a mirror that dies
-/// mid-body leaves nothing for the next one to trip over.
-fn fetch_verified(
-    fetcher: &mut dyn Fetch,
-    url: &str,
-    expected: &str,
-    size: Option<u64>,
-    dest: &Path,
-) -> Result<(), DebianError> {
-    let staged = staging_path(dest);
-
-    // Created exclusively, which establishes that the name is this call's alone
-    // and refuses a symlink pre-planted at it rather than writing through it.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .map_err(DebianError::at("staging a package", &staged))?;
-
-    let mut sink = digest::DigestWriter::new(Algorithm::Sha256, file);
-    let request = FetchRequest::new(url);
-    let fetched = match size {
-        Some(size) => {
-            let mut capped = super::LimitedWriter::new(&mut sink, size);
-            fetcher.fetch(&request.sized(size), &mut capped)
-        }
-        None => fetcher.fetch(&request, &mut sink),
-    };
-    let digested = sink
-        .finish()
-        .map_err(DebianError::at("writing a package", &staged));
-
-    let published = fetched
-        .map_err(DebianError::Fetch)
-        .and(digested)
-        .and_then(|(actual, _size)| {
-            if actual == expected {
-                Ok(())
-            } else {
-                Err(DebianError::Digest {
-                    subject: url.to_string(),
-                    expected: expected.to_string(),
-                    actual,
-                })
-            }
-        })
-        .and_then(|()| {
-            std::fs::rename(&staged, dest).map_err(DebianError::at("publishing a package", dest))
-        });
-
-    if published.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    published
+    let mut source = cache::open_entry(from)?;
+    let (staged, mut copy) = Staged::beside(to)?;
+    io::copy(&mut source, &mut copy)?;
+    drop(copy);
+    staged.publish()
 }
 
 /// One `.deb` to acquire: what the download needs and nothing else.
@@ -2619,7 +2472,7 @@ fn extract_packages(
             .next()
             .expect("the deb path has a file name");
         let path = archives_host.join(filename);
-        let mut file = std::fs::File::open(&path)
+        let mut file = cache::open_entry(&path)
             .map_err(|err| ProvisionError::io("reading the package", &path, err))?;
         // Re-verify against the digest the package was acquired under, rather
         // than trust the bytes on disk: the download and this read are separate
@@ -2632,15 +2485,13 @@ fn extract_packages(
         // property the download and `Pool::publish` both keep, held to here as
         // well. `extract_deb` rewinds before it seeks to the data member, so the
         // digest pass leaving the file at its end costs nothing.
-        let (actual, _) = digest::stream(Algorithm::Sha256, &mut file)
-            .map_err(|err| ProvisionError::io("reading the package", &path, err))?;
-        if actual != installable.sha256 {
-            return Err(wrap(DebianError::Digest {
-                subject: path.display().to_string(),
-                expected: installable.sha256.clone(),
-                actual,
-            }));
-        }
+        verify_deb(
+            &mut file,
+            &path,
+            &path.display().to_string(),
+            &installable.sha256,
+        )
+        .map_err(wrap)?;
         deb::extract_deb(
             &installable.name,
             &mut file,
@@ -2904,12 +2755,13 @@ pub trait DebianObserver {
 
     /// Whether the work should stop.
     ///
-    /// Consulted at the points where stopping is clean: each mirror a release
-    /// or an index walk asks, each package downloaded or extracted, and the
-    /// start of each `dpkg` wave. So a [`resolve`](Observed::resolve) or an
+    /// Consulted at the points where stopping is clean: each mirror a release,
+    /// an index or a package walk asks, each batch of downloads, each write of
+    /// a package's body as it downloads, each package extracted, and the start
+    /// of each `dpkg` wave. So a [`resolve`](Observed::resolve) or an
     /// [`available`](Observed::available) stops on its way through the
-    /// archives, and a bootstrap between two waves as well as between two
-    /// packages.
+    /// archives, and a bootstrap between two waves, between two packages, or
+    /// part way through a download.
     ///
     /// Returning `true` aborts with [`DebianError::Cancelled`], which a
     /// provisioning run reports as [`ProvisionError::Cancelled`]. A run driven
@@ -2922,6 +2774,18 @@ pub trait DebianObserver {
     /// [`ProvisionError::Cancelled`]: crate::provision::ProvisionError::Cancelled
     fn cancelled(&mut self) -> bool {
         false
+    }
+}
+
+/// A download's view of the observer: the layer's own fetch event, and its
+/// answer to whether the run should stop.
+impl cache::Watch for dyn DebianObserver + '_ {
+    fn fetching(&mut self, url: &str) {
+        self.progress(DebianEvent::Fetching { url });
+    }
+
+    fn cancelled(&mut self) -> bool {
+        DebianObserver::cancelled(self)
     }
 }
 
@@ -4640,71 +4504,5 @@ mod tests {
             .collect();
         names.sort();
         names
-    }
-
-    #[test]
-    fn a_download_publishes_only_what_matches_the_recorded_digest() {
-        // The bytes are written to a staging file as they arrive and digested on
-        // the way through, so nothing is held in memory and nothing unverified
-        // is ever visible at the destination: the rename is what puts it there.
-        let dir = Scratch::new("download-verified");
-        let dest = dir.join("package.deb");
-
-        let err = fetch_verified(
-            &mut Canned(b"not what the archive recorded"),
-            "file:///ignored-by-the-canned-transport",
-            &Algorithm::Sha256.hex_of(b"the recorded bytes"),
-            None,
-            &dest,
-        )
-        .expect_err("a mismatched download is refused");
-        assert!(matches!(err, DebianError::Digest { .. }), "{err}");
-        assert!(!dest.exists(), "unverified bytes were published");
-        assert!(
-            entries_of(&dir).is_empty(),
-            "a failed download left its staging file behind: {:?}",
-            entries_of(&dir),
-        );
-
-        fetch_verified(
-            &mut Canned(b"the recorded bytes"),
-            "file:///ignored-by-the-canned-transport",
-            &Algorithm::Sha256.hex_of(b"the recorded bytes"),
-            Some(b"the recorded bytes".len() as u64),
-            &dest,
-        )
-        .expect("a matching download publishes");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"the recorded bytes");
-        assert_eq!(entries_of(&dir), ["package.deb"]);
-    }
-
-    #[test]
-    fn a_download_stops_at_the_size_the_index_recorded() {
-        // The index records what the package weighs, so a mirror answering with
-        // more is answering with something else. A transport of the caller's is
-        // free to ignore the size the request declares, so the bound is applied
-        // at the sink too — which is the one place it cannot be ignored — and
-        // the disk it would have filled is never written.
-        let dir = Scratch::new("download-capped");
-        let dest = dir.join("package.deb");
-
-        let err = fetch_verified(
-            &mut Canned(&[b'x'; 4096]),
-            "file:///ignored-by-the-canned-transport",
-            &Algorithm::Sha256.hex_of(&[b'x'; 4096]),
-            Some(16),
-            &dest,
-        )
-        .expect_err("a body over the recorded size is refused");
-        assert!(
-            matches!(err, DebianError::Fetch(FetchError::Io { .. })),
-            "{err}"
-        );
-        assert!(!dest.exists(), "an oversized download was published");
-        assert!(
-            entries_of(&dir).is_empty(),
-            "a refused download left its staging file behind: {:?}",
-            entries_of(&dir),
-        );
     }
 }

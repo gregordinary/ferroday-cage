@@ -327,35 +327,24 @@ impl<'a> Export<'a> {
         // Unique to this call, so two exports to one destination -- two
         // threads of one process included -- stage separately and the later
         // rename wins, which is what two shell redirections to one path do.
-        let staging = super::staging_path(path);
-        let file = fs::File::options()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-            .map_err(|err| ProvisionError::io("creating", &staging, err))?;
+        let (staged, file) = super::Staged::beside(path)
+            .map_err(|err| ProvisionError::io("creating the staging file for", path, err))?;
 
-        let written = export_inner(
+        export_inner(
             &self.rootfs,
             &file,
             &self.map,
             self.mapper,
             self.clamp_mtime,
             self.filter.as_deref(),
-        )
-        .and_then(|()| {
-            file.sync_all()
-                .map_err(|err| ProvisionError::io("syncing", &staging, err))
-        });
-        if let Err(err) = written {
-            let _ = fs::remove_file(&staging);
-            return Err(err);
-        }
+        )?;
+        file.sync_all()
+            .map_err(|err| ProvisionError::io("syncing", staged.path(), err))?;
         drop(file);
 
-        fs::rename(&staging, path).map_err(|err| {
-            let _ = fs::remove_file(&staging);
-            ProvisionError::io("publishing", path, err)
-        })?;
+        staged
+            .publish()
+            .map_err(|err| ProvisionError::io("publishing", path, err))?;
         // The rename is durable only once the directory entry is, which is what
         // keeps a crash from resurrecting the destination the rename replaced.
         let parent_dir =

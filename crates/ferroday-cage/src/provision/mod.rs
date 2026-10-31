@@ -46,7 +46,11 @@ use crate::failure::path_io_error;
 use crate::mechanism::frame;
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
+mod available;
+#[cfg(any(feature = "debian", feature = "alpine"))]
 mod binfmt;
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+mod cache;
 #[cfg(feature = "tarball")]
 mod compress;
 pub(crate) mod containment;
@@ -91,6 +95,10 @@ mod tar;
 #[cfg(feature = "tarball")]
 mod tarball;
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub use available::Available;
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+pub(crate) use cache::PackageCache;
 pub use copyin::{CopyIn, CopyReport, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, ExportEntry, ExportKind, export_tar};
@@ -1504,116 +1512,105 @@ pub(crate) fn now_epoch() -> Option<i64> {
         .map(|since| since.as_secs() as i64)
 }
 
-/// The path of a staging file for `dest`: a hidden name beside it, unique to
-/// the call that asked for it.
+/// A file written beside the entry it is to become, and published by renaming
+/// it onto that entry.
 ///
-/// The name is unique so that concurrent writers of one destination — provisions
-/// sharing a package cache, publishers sharing a pool, two threads exporting to
-/// one archive — each stage their own file and each publish it with a rename. A
-/// staging name shared between them would let one writer's rename consume the
-/// other's file, publishing a file still being written and failing the second
-/// writer with `ENOENT`. A name keyed to the process alone is shared that way by
-/// every thread in it.
+/// This is how everything the crate publishes into a directory others read is
+/// written: a downloaded package or tarball, a copy of a cached package, a pool
+/// file, an exported archive. The bytes go to the staging file, the caller
+/// checks or syncs what it needs to, and only then does
+/// [`publish`](Self::publish) rename it over the destination. Nothing at the
+/// destination is ever a file still being written, and a destination that
+/// already held a complete file keeps it until the new one is complete too.
 ///
-/// The staging file is a sibling of the destination, so the rename that
-/// publishes it stays within one directory and one filesystem. A caller creates
-/// it exclusively, which is what establishes that the name is the caller's
-/// alone; nothing already at the name is ever removed to make room.
+/// The staging name is a hidden sibling of the destination, unique to the call
+/// that made it, so the rename stays within one directory and one filesystem,
+/// and concurrent writers of one destination each stage their own file. That is
+/// provisions sharing a package cache, publishers sharing a pool, or two
+/// threads exporting to one archive. A staging name shared between them would
+/// let one writer's rename consume the other's file, publishing a file still
+/// being written and failing the second writer with `ENOENT`. A name keyed to
+/// the process alone is shared that way by every thread in it.
+///
+/// The file is created exclusively, which establishes that the name is this
+/// call's alone and refuses a symbolic link planted at it rather than writing
+/// through it. Nothing already at the name is ever removed to make room. What
+/// is removed is this call's own file, when the value is dropped unpublished,
+/// so a failure at any step leaves nothing behind in a directory that outlives
+/// the call and never reuses the name.
 #[cfg(feature = "tarball")]
-fn staging_path(dest: &Path) -> PathBuf {
-    let dir = dest.parent().unwrap_or(Path::new("."));
-    let name = dest.file_name().unwrap_or(dest.as_os_str());
-    let mut staging = OsString::from(".");
-    staging.push(name);
-    staging.push(format!(".{}.partial", crate::host::unique_hex()));
-    dir.join(staging)
-}
-
-/// The directory a run downloads its packages into, and whether the run owns it.
-///
-/// A caller that names a cache directory owns it: it survives the run, which is
-/// the whole point of naming one. A run that names none downloads into a derived
-/// sibling of the tree it is building, and that directory is the run's own.
-///
-/// A derived cache is removed when the value is dropped rather than at the end
-/// of the successful path, so a failure disposes of it exactly as a success
-/// does. Every `?` between creating the cache and finishing the bootstrap would
-/// otherwise leave a base system's worth of packages beside a rootfs that was
-/// never published, and nothing later clears it: the publication's own cleanup
-/// removes the staging tree, and [`remove`] removes the destination and its
-/// lock, neither of which this is.
-#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-pub(crate) struct PackageCache {
+pub(crate) struct Staged {
+    /// The staging file's name.
     path: PathBuf,
-    owned: bool,
+    /// The destination the rename publishes it at.
+    dest: PathBuf,
+    /// Whether the rename happened, after which the name is no longer this
+    /// value's to remove.
+    published: bool,
 }
 
-#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-impl PackageCache {
-    /// The cache for a run building `tree`: the caller's, or a sibling of the
-    /// tree named after it with `suffix`.
+#[cfg(feature = "tarball")]
+impl Staged {
+    /// Creates the staging file for `dest`, returning it with a descriptor open
+    /// for reading and writing.
     ///
-    /// A sibling, not a child: an extracted package's entries land under the
-    /// tree, so a cache beneath it could be overwritten before it is read, but a
-    /// sibling is out of the extraction's contained reach.
-    ///
-    /// The suffix is the layer's, so two provisioners building one destination
-    /// do not each dispose of the other's downloads.
-    pub(crate) fn beside(tree: &Path, cache_dir: Option<&Path>, suffix: &str) -> PackageCache {
-        match cache_dir {
-            Some(dir) => PackageCache {
-                path: dir.to_path_buf(),
-                owned: false,
-            },
-            None => PackageCache {
-                path: PackageCache::derived(tree, suffix),
-                owned: true,
-            },
-        }
+    /// Readable as well as writable so that what was written can be read back
+    /// and checked through the descriptor that wrote it, before it is
+    /// published, rather than through a second open of a name.
+    pub(crate) fn beside(dest: &Path) -> io::Result<(Staged, fs::File)> {
+        let dir = dest.parent().unwrap_or(Path::new("."));
+        let name = dest.file_name().unwrap_or(dest.as_os_str());
+        let mut staging = OsString::from(".");
+        staging.push(name);
+        staging.push(format!(".{}.partial", crate::host::unique_hex()));
+        let path = dir.join(staging);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let staged = Staged {
+            path,
+            dest: dest.to_path_buf(),
+            published: false,
+        };
+        Ok((staged, file))
     }
 
-    /// The directory a run building `tree` derives for itself, and removes,
-    /// when the caller names none: the sibling of the tree named after it with
-    /// `suffix`.
-    ///
-    /// Answered on its own so a caller can tell whether a directory it was
-    /// handed is that one, which the run would remove as its own.
-    pub(crate) fn derived(tree: &Path, suffix: &str) -> PathBuf {
-        let mut sibling = tree.as_os_str().to_os_string();
-        sibling.push(suffix);
-        PathBuf::from(sibling)
-    }
-
-    /// The directory itself, to download into and to read back from.
+    /// The staging file's own name, for a failure that is the staging file's.
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Renames the staging file onto its destination.
+    ///
+    /// A descriptor the caller still holds keeps reading the file it opened,
+    /// which after the rename is the published entry. A failed rename leaves
+    /// the destination as it was, and the staging file goes when the value is
+    /// dropped.
+    pub(crate) fn publish(mut self) -> io::Result<()> {
+        fs::rename(&self.path, &self.dest)?;
+        self.published = true;
+        Ok(())
+    }
 }
 
-#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-impl Drop for PackageCache {
+#[cfg(feature = "tarball")]
+impl Drop for Staged {
     fn drop(&mut self) {
-        if self.owned {
-            // Best effort, as a drop must be. The cache holds what the run
-            // downloaded, all of it the calling user's own.
-            let _ = remove_tree(&self.path, &crate::IdentityMap::Single, None);
+        if !self.published {
+            // Best effort, as a drop must be. The name is unique to this call,
+            // so what is removed is this call's own file and nothing else.
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
 
-/// Writes bytes to `dest` atomically, via a staging file in its directory and a
-/// rename onto the destination.
+/// Writes bytes to `dest` atomically, through a [`Staged`] file renamed onto
+/// it.
 ///
-/// This is how the Debian layer publishes a cache entry — a fetched index, a
-/// downloaded package, a pool file — so that two processes provisioning at once
-/// cannot show each other a half-written file. The Alpine and Gentoo layers
-/// stage and rename through [`staging_path`] at the point they stream a body to
-/// disk instead, because what they publish arrives as a stream rather than as
-/// bytes already in hand.
-///
-/// The staging file is created exclusively, which establishes that the name is
-/// this call's alone and refuses a symlink pre-planted at it rather than writing
-/// through it. [`staging_path`] describes why the name is unique per call.
+/// For bytes already in hand, such as a pool's index files. What arrives as a
+/// stream is staged the same way at the point it is written to disk.
 ///
 /// The staging file is not synced before the rename. What a reader takes from
 /// these files is verified against a digest, so a file left short by a crash is
@@ -1626,27 +1623,10 @@ impl Drop for PackageCache {
 pub(crate) fn write_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
-    let tmp = staging_path(dest);
-
-    // Only a failure after this point removes the staging file: the exclusive
-    // create is what establishes that the name is this call's alone, so a
-    // cleanup ahead of it could delete a file the caller does not own.
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-
-    // Leaving a staging file behind would accumulate in a directory that
-    // outlives the call, since no later one reuses the name.
-    if let Err(err) = file.write_all(bytes) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
+    let (staged, mut file) = Staged::beside(dest)?;
+    file.write_all(bytes)?;
     drop(file);
-
-    fs::rename(&tmp, dest).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
+    staged.publish()
 }
 
 #[cfg(test)]

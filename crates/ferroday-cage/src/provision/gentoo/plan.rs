@@ -275,22 +275,17 @@ impl Plan {
     /// the shape an index would have guaranteed is checked here.
     pub fn parse_document(text: &str) -> Result<Plan, GentooError> {
         let stanzas = document::parse(text);
-        let (header, rest) = stanzas
-            .split_first()
-            .ok_or_else(|| plan_document("the document holds no stanzas"))?;
-
-        let format = header
-            .get("Format")
-            .ok_or_else(|| plan_document("the first stanza has no Format field"))?;
-        if format != FORMAT {
-            return Err(plan_document(format!(
-                "the document is in format {format:?}, and this library reads {FORMAT:?}",
-            )));
-        }
+        let (header, rest) = document::header(&stanzas, FORMAT).map_err(plan_document)?;
         let mut plan = Plan {
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             binhost: required(header.get("Binhost"), "Binhost", "the header")?,
-            index_timestamp: signed_number(
+            // Signed because the field it reads is: an index states its
+            // `TIMESTAMP` as an unsigned number and a mirror may state one above
+            // `i64::MAX`, which `Preamble::generated` carries as the negative it
+            // became. The field is provenance and nothing rests on it, so a plan
+            // that recorded such a timestamp must read back as itself rather
+            // than refusing the whole document over a line no decision consults.
+            index_timestamp: number::<i64>(
                 header.get("Index-Timestamp"),
                 "Index-Timestamp",
                 "the header",
@@ -307,10 +302,10 @@ impl Plan {
             let package = PlannedPackage {
                 name: name.to_string(),
                 version: required(stanza.get("Version"), "Version", &at)?,
-                build_id: number(stanza.get("Build-Id"), "Build-Id", &at)?
+                build_id: number::<u64>(stanza.get("Build-Id"), "Build-Id", &at)?
                     .ok_or_else(|| plan_document(format!("{at} states no Build-Id")))?,
                 path: required(stanza.get("Path"), "Path", &at)?,
-                size: number(stanza.get("Size"), "Size", &at)?
+                size: number::<u64>(stanza.get("Size"), "Size", &at)?
                     .ok_or_else(|| plan_document(format!("{at} states no Size")))?,
                 md5: required(stanza.get("MD5"), "MD5", &at)?,
                 carried: document::carried(stanza, PACKAGE_FIELDS),
@@ -354,39 +349,17 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Gentoo
     document::required(value, field, at).map_err(plan_document)
 }
 
-/// Reads an optional unsigned numeric field, refusing one that is present and
-/// malformed.
-fn number(value: Option<&str>, field: &str, at: &str) -> Result<Option<u64>, GentooError> {
-    parse_number(value, field, at)
-}
-
-/// Reads an optional signed numeric field, refusing one that is present and
+/// Reads an optional numeric field, refusing one that is present and
 /// malformed.
 ///
-/// Signed because the field it reads is: an index states its `TIMESTAMP` as an
-/// unsigned number and a mirror may state one above `i64::MAX`, which
-/// [`Preamble::generated`](super::index::Preamble::generated) carries as the
-/// negative it became. The field is provenance and nothing rests on it, so a
-/// plan that recorded such a timestamp must read back as itself rather than
-/// refusing the whole document over a line no decision consults.
-fn signed_number(value: Option<&str>, field: &str, at: &str) -> Result<Option<i64>, GentooError> {
-    parse_number(value, field, at)
-}
-
-/// The reading both share, so a number's refusal is worded once.
-fn parse_number<T: std::str::FromStr>(
+/// The rule is [`document::number`]'s; only whose document the refusal is
+/// about belongs here.
+fn number<T: std::str::FromStr>(
     value: Option<&str>,
     field: &str,
     at: &str,
 ) -> Result<Option<T>, GentooError> {
-    match value {
-        None => Ok(None),
-        Some(text) => text.parse().map(Some).map_err(|_| {
-            plan_document(format!(
-                "{at} states a {field} of {text:?}, which is not a number"
-            ))
-        }),
-    }
+    document::number(value, field, at).map_err(plan_document)
 }
 
 /// A document this library cannot read or write.

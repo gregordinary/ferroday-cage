@@ -192,7 +192,10 @@ content address to name a cache entry by. Entries are keyed by published file
 name instead, and the full re-verification is what makes that safe.
 
 A package is never held in memory: the bytes are written to a staging file as
-they arrive, and installing reads that file back.
+they arrive. That file is read back and checked as a cache entry is. It is
+renamed into the cache only once it reads as the package the plan names. Nothing
+unverified is ever visible at a cache path, and installing reads the file
+through the descriptor the check read.
 
 ## Resolving, replaying, and pinning
 

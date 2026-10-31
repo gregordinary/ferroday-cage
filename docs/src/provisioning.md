@@ -115,19 +115,19 @@ reports each entry and its progress through the archive. The [Debian
 provisioner](debian.md) reports its own richer events through the
 `ProvisionEvent::Debian` variant: fetches, resolution, downloads, and dpkg's
 output. It honors the same cancellation check at each mirror, between packages,
-and between dpkg waves. The [Alpine
+while each package downloads, and between dpkg waves. The [Alpine
 provisioner](alpine.md) reports the same progress through
 `ProvisionEvent::Alpine`, and the [Gentoo provisioner](gentoo.md) through
 `ProvisionEvent::Gentoo`. A consumer reports any of the userlands by changing
 the type it matches on.
 
 Where the clean stopping points are is the provisioner's own question. A package
-boundary answers it wherever there is one. The Gentoo layer's stage3 wave has
-none, because a stage3 is a single file of several hundred megabytes. That layer
-therefore consults the check while the tarball is being written, as well as at
-the step boundaries around it. A download stopped there leaves nothing behind in
-the cache. Its binary-package wave has package boundaries like the other two,
-and uses them.
+boundary answers it wherever there is one. A download is the exception, since a
+Gentoo stage3 is a single file of several hundred megabytes. Every userland
+therefore also consults the check while a download is being written, and a
+download stopped there leaves nothing behind in the cache. A batch of downloads
+fetched at once is the one place it is not consulted mid-body. The transport
+writes those from threads of its own, so the check waits for the batch's end.
 
 ## Removing a rootfs
 

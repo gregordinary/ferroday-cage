@@ -130,9 +130,9 @@ adapter across every provisioner. Either observer can stop the run.
 The sink is a `DebianObserver`, and a closure is one — which is why the example
 passes a function. A caller that also wants to *stop* a bootstrap implements the
 trait instead and answers its `cancelled`. The bootstrap consults it at each
-mirror it asks for a release or an index, at each package, and before each dpkg
-wave. A stopped bootstrap fails with `ProvisionError::Cancelled` and leaves no
-root behind.
+mirror it asks for a release, an index or a package, during each download, and
+before each dpkg wave. A stopped bootstrap fails with `ProvisionError::Cancelled`
+and leaves no root behind.
 
 The sink is also the way to cancel a `Debian::observe(...).resolve()` or
 `.available()`. Both run outside a provisioning run, with no `Provision`

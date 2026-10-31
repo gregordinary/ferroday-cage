@@ -68,6 +68,7 @@ mod vdb;
 mod version;
 
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -78,6 +79,7 @@ pub use plan::{Plan, PlannedPackage};
 
 use pointer::Pointer;
 
+use super::cache;
 use super::compress;
 use super::coordinate::{self, Nesting};
 use super::digest::{self, Algorithm};
@@ -85,9 +87,9 @@ use super::layer::BuildLayer;
 use super::openpgp::{Keyring, OpenPgpError};
 use super::rooted::Rooted;
 use super::{
-    Delegate, Failover, Fetch, FetchError, FetchJob, FetchRequest, HttpFetch, LimitedWriter,
-    PackageCache, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball,
-    mirror_url, walk_mirrors,
+    Delegate, Failover, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter, PackageCache,
+    ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball, mirror_url,
+    walk_mirrors,
 };
 use crate::IdentityMap;
 use crate::failure::path_io_error;
@@ -352,9 +354,9 @@ pub enum GentooError {
     /// it.
     ///
     /// The chain held as far as the document; what a mirror served is not what
-    /// the document vouched for. The bytes are not extracted, and the cached
-    /// file is removed so a later run downloads afresh rather than meeting the
-    /// same refusal from its own cache.
+    /// the document vouched for. The bytes are not extracted. A download that
+    /// does not match is never published into the cache, and a cached file that
+    /// does not match is removed and downloaded again.
     #[non_exhaustive]
     Digest {
         /// The tarball the digest was taken over.
@@ -1509,28 +1511,29 @@ impl Gentoo {
         // something a later run would find and clear.
         let cache =
             PackageCache::beside(request.staging(), self.cache_dir.as_deref(), STAGE3_CACHE);
-        std::fs::create_dir_all(cache.path())
-            .map_err(GentooError::at("creating the download cache", cache.path()))?;
+        cache::create(cache.path())?;
         let tarball = cache.path().join(stage3.file_name());
 
         // The bytes are verified before the extractor sees them, rather than
         // streamed through it as they arrive: an archive that turns out not to
         // be the one the signed document named would otherwise already have
-        // written most of a root filesystem.
+        // written most of a root filesystem. The size the signed enumeration
+        // recorded bounds what the download may spend.
         let verified = cached_or_fetched(
-            &tarball,
+            self.fetcher.as_mut(),
+            &self.mirrors,
+            &format!("releases/{}/autobuilds/{}", self.architecture, stage3.path),
+            cache::Entry {
+                path: &tarball,
+                size: Some(stage3.size),
+            },
             to,
-            |to| {
-                // A digest pass over the whole tarball is the second long step,
-                // and what precedes it is a complete file in a cache that
-                // outlives the run, so stopping here costs the download nothing.
-                stop_if_cancelled(to)?;
+            |file, to| {
                 to.progress(GentooEvent::Verifying {
                     path: tarball.as_path(),
                 });
-                verify(&tarball, stage3.sha512())
+                verify(file, &tarball, stage3.sha512())
             },
-            |to| self.download(&stage3, &tarball, to),
         )?;
 
         to.progress(GentooEvent::Extracting {
@@ -1626,10 +1629,11 @@ impl Gentoo {
     /// alone, because that is what a package manager inside the finished
     /// sandbox sees.
     ///
-    /// Cancellation is consulted between packages and while each one is being
-    /// downloaded. A wave installing a hundred packages is the longest thing
-    /// this layer does, and a check that ran only around it would answer a
-    /// caller who asked to stop once all of it had arrived.
+    /// Cancellation is consulted between packages, between batches of
+    /// downloads, and while a package the batch did not deliver is downloaded.
+    /// A wave installing a hundred packages is the longest thing this layer
+    /// does, and a check that ran only around it would answer a caller who
+    /// asked to stop once all of it had arrived.
     fn install_wave(
         &mut self,
         root: &Path,
@@ -1693,8 +1697,7 @@ impl Gentoo {
         for planned in &plan.packages {
             let path = cache_entry(cache.path(), &directory, planned);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(GentooError::at("creating the download cache", parent))?;
+                cache::create(parent)?;
             }
             cached.push(path);
         }
@@ -1705,7 +1708,28 @@ impl Gentoo {
             .filter(|(_, path)| !path.is_file())
             .map(|(planned, path)| (planned, path.as_path()))
             .collect();
-        self.prefetch_packages(&directory, &missing, to)?;
+
+        // Fetched several at a time first, each from the first mirror, which is
+        // the one the walk would ask first too; what the batch does not deliver
+        // the merge below fetches. A container the batch publishes has passed
+        // the check a merge holds it to, and the merge reads it again through a
+        // descriptor of its own, which is what keeps the batch's descriptors to
+        // one batch's worth.
+        if let Some(mirror) = self.mirrors.first() {
+            let jobs: Vec<cache::Job<'_>> = missing
+                .iter()
+                .map(|(planned, path)| cache::Job {
+                    url: mirror_url(mirror, &format!("{directory}/{}", planned.path)),
+                    entry: package_entry(path, planned),
+                })
+                .collect();
+            let keyring = &self.keyring;
+            cache::prefetch(self.fetcher.as_mut(), &jobs, to, |job, file| {
+                let (planned, path) = missing[job];
+                gpkg::Package::read(file, path, planned, keyring).map(drop)
+            })
+            .map_err(|failure| failure.into_provision(ProvisionError::from))?;
+        }
 
         // `last` is `counter` plus a non-empty plan's length, so the first
         // ordinal does not overflow either.
@@ -1713,16 +1737,13 @@ impl Gentoo {
         for ((planned, cached), ordinal) in plan.packages.iter().zip(&cached).zip(ordinals) {
             stop_if_cancelled(to)?;
             let keyring = &self.keyring;
-            let (fetcher, mirrors) = (&mut self.fetcher, &self.mirrors);
             let package = cached_or_fetched(
-                cached,
+                self.fetcher.as_mut(),
+                &self.mirrors,
+                &format!("{directory}/{}", planned.path),
+                package_entry(cached, planned),
                 to,
-                |_| {
-                    gpkg::Package::open(cached, planned, keyring).inspect_err(|_| {
-                        let _ = std::fs::remove_file(cached);
-                    })
-                },
-                |to| download_package(fetcher.as_mut(), mirrors, &directory, planned, cached, to),
+                |file, _| gpkg::Package::read(file, cached, planned, keyring),
             )?;
             to.progress(GentooEvent::Merging {
                 package: &planned.name,
@@ -1732,148 +1753,23 @@ impl Gentoo {
         }
         Ok(())
     }
-
-    /// How many packages one batch asks for.
-    ///
-    /// Each job holds an open staging file for as long as the batch runs, so
-    /// this is a bound on descriptors rather than on the transport, which
-    /// decides for itself how many of a batch to have in flight. It is also the
-    /// granularity a cancelled wave stops at, which is the reason it is not
-    /// larger.
-    const BATCH: usize = 32;
-
-    /// Fills the cache with the packages a wave is about to merge, several at a
-    /// time, through [`Fetch::fetch_all`].
-    ///
-    /// Every job asks the first mirror, which is the one the walk would ask
-    /// first too. A job that does not arrive leaves the cache without that
-    /// package and the walk that follows fetches it with every mirror available
-    /// to it, so this is an optimization and nothing more. What the rename
-    /// publishes is a complete container rather than a verified one, exactly as
-    /// [`download_package`] does: the verification is the read that follows,
-    /// which is the same read a cache hit goes through.
-    fn prefetch_packages(
-        &mut self,
-        directory: &str,
-        missing: &[(&PlannedPackage, &Path)],
-        to: Reporting<'_>,
-    ) -> Result<(), GentooError> {
-        let Some(mirror) = self.mirrors.first().cloned() else {
-            return Ok(());
-        };
-        for batch in missing.chunks(Self::BATCH) {
-            stop_if_cancelled(to)?;
-            let mut staged = Vec::with_capacity(batch.len());
-            for (planned, dest) in batch {
-                let url = mirror_url(&mirror, &format!("{directory}/{}", planned.path));
-                to.progress(GentooEvent::Fetching { url: &url });
-                let path = super::staging_path(dest);
-                let Ok(file) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                else {
-                    continue;
-                };
-                // Capped as the per-package download is, at the smaller of the
-                // index's number and this layer's own ceiling: nothing signs
-                // the index, so its number can be wrong in both directions,
-                // and a transport is free to ignore the size on the request.
-                let sink = io::BufWriter::new(file);
-                let cap = planned.size.min(MAX_PACKAGE_BYTES);
-                staged.push((*planned, *dest, url, path, LimitedWriter::new(sink, cap)));
-            }
-
-            let outcomes = {
-                let mut jobs: Vec<FetchJob<'_>> = staged
-                    .iter_mut()
-                    .map(|(planned, _dest, url, _path, sink)| {
-                        let bound = planned.size.min(MAX_PACKAGE_BYTES);
-                        FetchJob::new(FetchRequest::new(url).sized(bound), sink)
-                    })
-                    .collect();
-                self.fetcher.fetch_all(&mut jobs)
-            };
-
-            for ((_planned, dest, _url, path, sink), outcome) in staged.into_iter().zip(outcomes) {
-                let published = outcome.is_ok()
-                    && sink.into_inner().into_inner().is_ok()
-                    && std::fs::rename(&path, dest).is_ok();
-                if !published {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Downloads a stage3 into the cache, atomically.
-    ///
-    /// The body is written to a staging file beside the destination and renamed
-    /// onto it, so a partial download is never visible at the cache path and a
-    /// concurrent download of the same build publishes its own file rather than
-    /// consuming this one. What the rename publishes is a complete body rather
-    /// than a verified one; the verification is the read that follows.
-    ///
-    /// The size the signed enumeration recorded bounds what the download may
-    /// spend. It is a length a verified source declared, so it travels as
-    /// [`FetchRequest::sized`] as well as capping the writer.
-    fn download(
-        &mut self,
-        stage3: &Stage3,
-        dest: &Path,
-        to: Reporting<'_>,
-    ) -> Result<(), GentooError> {
-        let fetcher = &mut self.fetcher;
-        let architecture = &self.architecture;
-        walk_mirrors(
-            &self.mirrors,
-            |mirror| {
-                stop_if_cancelled(to)?;
-                let url = mirror_url(
-                    mirror,
-                    &format!("releases/{architecture}/autobuilds/{}", stage3.path),
-                );
-                to.progress(GentooEvent::Fetching { url: &url });
-                fetch_to(fetcher.as_mut(), &url, stage3.size, dest, STAGE3, to)
-            },
-            || GentooError::Fetch(no_mirror(&stage3.path)),
-        )
-    }
 }
 
-/// Downloads one binary package into the cache, atomically.
+/// The cache entry a binary package fills, bounded by the length the index
+/// published for it *and* by [`MAX_PACKAGE_BYTES`].
 ///
-/// Bounded by the length the index published for it *and* by
-/// [`MAX_PACKAGE_BYTES`], because the index's number can be wrong in both
-/// directions and only one of them fails closed. Understated, it stops the
-/// download short and the container fails its digest. Overstated, it merely
-/// relaxes the bound — a transport caps at the smaller of the declared size and
-/// its own ceiling — so a hostile or damaged index buys whatever that ceiling
-/// is, once per package. Nothing signs the index, so this layer keeps a ceiling
-/// of its own and the smaller of the two wins.
-///
-/// A function of the transport and the mirror list rather than a method, so a
-/// caller can hold the keyring that verifies the result at the same time.
-fn download_package(
-    fetcher: &mut dyn Fetch,
-    mirrors: &[String],
-    directory: &str,
-    planned: &PlannedPackage,
-    dest: &Path,
-    to: Reporting<'_>,
-) -> Result<(), GentooError> {
-    walk_mirrors(
-        mirrors,
-        |mirror| {
-            stop_if_cancelled(to)?;
-            let url = mirror_url(mirror, &format!("{directory}/{}", planned.path));
-            to.progress(GentooEvent::Fetching { url: &url });
-            let bound = planned.size.min(MAX_PACKAGE_BYTES);
-            fetch_to(fetcher, &url, bound, dest, BINARY_PACKAGE, to)
-        },
-        || GentooError::Fetch(no_mirror(&planned.path)),
-    )
+/// Both, because the index's number can be wrong in both directions and only
+/// one of them fails closed. Understated, it stops the download short and the
+/// container fails its digest. Overstated, it merely relaxes the bound — a
+/// transport caps at the smaller of the declared size and its own ceiling — so
+/// a hostile or damaged index buys whatever that ceiling is, once per package.
+/// Nothing signs the index, so this layer keeps a ceiling of its own and the
+/// smaller of the two wins.
+fn package_entry<'a>(path: &'a Path, planned: &PlannedPackage) -> cache::Entry<'a> {
+    cache::Entry {
+        path,
+        size: Some(planned.size.min(MAX_PACKAGE_BYTES)),
+    }
 }
 
 /// Where the cache under `cache` holds the container `planned` names, which
@@ -1897,186 +1793,64 @@ fn cache_entry(cache: &Path, directory: &str, planned: &PlannedPackage) -> PathB
     cache.join(directory).join(&planned.path)
 }
 
-/// What the cache holds at `cached`, verified; or, where it holds nothing that
-/// verifies, what `fetch` leaves there, verified.
+/// What the cache holds at `entry`, verified; or, where it holds nothing that
+/// verifies, what the mirror walk fetches into it, verified before it is
+/// published there.
 ///
 /// The one rule both of this layer's caches keep. A cache entry is bytes on a
 /// disk this crate does not own, so it is verified on the read rather than
 /// trusted for having been verified once. One that does not verify is not the
-/// archive's file, whatever it is: a body a crash cut short, a container a
-/// batch fetched from a mirror that served the wrong bytes, something put there
-/// by hand. It is a download waiting to happen rather than a refusal, so the
-/// mirror walk fetches it again and what that leaves is held to the same check.
-/// A fresh download that does not verify is a refusal.
+/// archive's file, whatever it is: a body a crash cut short, something put
+/// there by hand. It is a download waiting to happen rather than a refusal, so
+/// it is removed and the mirror walk fetches the entry again, through
+/// [`cache::download`] and the same `verify`. A fresh download that does not
+/// verify is a refusal, and is never published.
 ///
-/// `verify` removes what it refuses, so a refused download leaves nothing for a
-/// later run to meet the same refusal in. A cancellation it reports is the
-/// run's own outcome rather than a verdict on the entry, and ends the call.
+/// `suffix` is the entry's path below a mirror. `verify` reads the file from its
+/// start and hands back what the caller goes on with, the descriptor it read
+/// through among it, so what is extracted or merged is what was verified.
 fn cached_or_fetched<T>(
-    cached: &Path,
-    to: Reporting<'_>,
-    mut verify: impl FnMut(Reporting<'_>) -> Result<T, GentooError>,
-    fetch: impl FnOnce(Reporting<'_>) -> Result<(), GentooError>,
-) -> Result<T, GentooError> {
-    if cached.is_file() {
-        match verify(&mut *to) {
-            Ok(verified) => return Ok(verified),
-            Err(GentooError::Cancelled) => return Err(GentooError::Cancelled),
-            Err(_) => {}
-        }
-    }
-    fetch(&mut *to)?;
-    verify(to)
-}
-
-/// What a download is of, so the three operations [`fetch_to`] can fail at name
-/// their subject.
-///
-/// Spelled out per caller rather than composed from one noun, because an error's
-/// operation is a `&'static str` throughout this crate: naming what failed is
-/// part of the convention, and formatting the subject in would make each
-/// operation a `String` that outlives nothing.
-#[derive(Clone, Copy)]
-struct Downloading {
-    /// Creating the staging file beside the destination.
-    staging: &'static str,
-    /// Writing the body into it.
-    writing: &'static str,
-    /// Renaming it onto the destination.
-    publishing: &'static str,
-}
-
-/// A stage3 tarball.
-const STAGE3: Downloading = Downloading {
-    staging: "staging a stage3",
-    writing: "writing a stage3",
-    publishing: "publishing a stage3",
-};
-
-/// A binary package's container.
-const BINARY_PACKAGE: Downloading = Downloading {
-    staging: "staging a binary package",
-    writing: "writing a binary package",
-    publishing: "publishing a binary package",
-};
-
-/// Writes one URL's body to `dest` through a staging file beside it.
-///
-/// A cancelled run stops mid-body rather than at the end of it: the write is
-/// where a bootstrap spends its time, and a check that only ran between mirrors
-/// would leave a caller who asked to stop waiting for the whole tarball.
-fn fetch_to(
     fetcher: &mut dyn Fetch,
-    url: &str,
-    size: u64,
-    dest: &Path,
-    what: Downloading,
+    mirrors: &[String],
+    suffix: &str,
+    entry: cache::Entry<'_>,
     to: Reporting<'_>,
-) -> Result<(), GentooError> {
-    let staged = super::staging_path(dest);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .map_err(GentooError::at(what.staging, &staged))?;
-
-    let mut sink = io::BufWriter::new(file);
-    let (fetched, cancelled) = {
-        let mut body = CancellableWriter {
-            inner: LimitedWriter::new(&mut sink, size),
-            to,
-            cancelled: false,
-        };
-        let fetched = fetcher.fetch(&FetchRequest::new(url).sized(size), &mut body);
-        (fetched, body.cancelled)
-    };
-    // The last buffer is written here rather than by `BufWriter`'s own `Drop`,
-    // which has nowhere to report a failure and so swallows it. A body whose
-    // tail never reached the disk would otherwise be renamed into the cache and
-    // reported by the read that follows as a digest failure -- an authenticity
-    // answer to a local write failure, which is the wrong thing to tell a caller
-    // and the wrong thing for them to act on.
-    let flushed = sink
-        .into_inner()
-        .map(|_| ())
-        .map_err(|err| GentooError::at(what.writing, &staged)(err.into_error()));
-
-    // A stopped write reaches the transport as a write failure, which is what
-    // the sink has to answer it with; what it means is the run's own outcome,
-    // and reporting it as a transport failure would send a mirror walk to the
-    // next mirror to do the same thing again.
-    let published = if cancelled {
-        Err(GentooError::Cancelled)
-    } else {
-        fetched
-            .map_err(GentooError::Fetch)
-            .and(flushed)
-            .and_then(|()| {
-                std::fs::rename(&staged, dest).map_err(GentooError::at(what.publishing, dest))
-            })
-    };
-    if published.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    published
-}
-
-/// A sink that stops accepting bytes once the run has been cancelled.
-///
-/// The other userlands need nothing like it: they download packages, so a check
-/// between two of them stops a bootstrap within one package's worth of bytes. A
-/// stage3 is a single file of several hundred megabytes, and a check that ran
-/// only at the step boundaries around it would answer a caller who asked to stop
-/// once the whole thing had arrived.
-///
-/// The binary packages go through it too, since they share [`fetch_to`]. There
-/// the argument is weaker per file and stronger per run: a package is a few
-/// megabytes, and an install wave is a hundred of them.
-///
-/// The stop is recorded here rather than read back out of the [`io::Error`] the
-/// transport returns: a `Fetch` implementation is a caller's own and may report
-/// a failed write however it likes, and this is the one thing about it this
-/// crate knows first-hand.
-struct CancellableWriter<'a, W> {
-    inner: W,
-    to: Reporting<'a>,
-    cancelled: bool,
-}
-
-impl<W: io::Write> io::Write for CancellableWriter<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.to.cancelled() {
-            self.cancelled = true;
-            // Not `Interrupted`, which `io::copy` and `write_all` retry: a
-            // cancellation is the one write failure that must not be retried.
-            return Err(io::Error::other("the bootstrap was cancelled"));
+    mut verify: impl FnMut(File, Reporting<'_>) -> Result<T, GentooError>,
+) -> Result<T, ProvisionError> {
+    // Anything at the name that is not a regular file, a link or a pipe, is not
+    // the archive's file either, and the download publishes over it by renaming.
+    if let Ok(file) = cache::open_entry(entry.path) {
+        // Verifying is a long read of a complete file in a cache that outlives
+        // the run, so stopping ahead of it costs nothing.
+        stop_if_cancelled(to)?;
+        if let Ok(verified) = verify(file, to) {
+            return Ok(verified);
         }
-        self.inner.write(buf)
+        let _ = std::fs::remove_file(entry.path);
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
+    cache::download(
+        fetcher,
+        mirrors,
+        |mirror| mirror_url(mirror, suffix),
+        entry,
+        to,
+        |file, _, to| verify(file, to),
+        || no_mirror(suffix),
+    )
+    .map_err(|failure| failure.into_provision(ProvisionError::from))
 }
 
-/// Holds a cached tarball to the SHA-512 the signed document recorded, and
-/// returns the descriptor the digest was taken through.
+/// Holds a tarball to the SHA-512 the signed document recorded, reading `file`
+/// from its start, and returns the descriptor the digest was taken through.
 ///
 /// The descriptor is the result, rather than a yes, because what is verified
 /// is the file it reads: the extractor reads it again from the start, and a
-/// path opened a second time names whatever the cache holds by then.
-///
-/// A tarball that does not match is removed rather than left in the cache. It
-/// is not the archive's file whatever it is, and leaving it would make every
-/// later run of the same build fail identically out of its own cache, which
-/// reads as a permanent failure rather than as a mirror that served the wrong
-/// bytes once.
-fn verify(tarball: &Path, expected: &str) -> Result<std::fs::File, GentooError> {
-    let mut file = std::fs::File::open(tarball).map_err(GentooError::at("opening", tarball))?;
+/// path opened a second time names whatever the cache holds by then. `tarball`
+/// names it in a refusal.
+fn verify(mut file: File, tarball: &Path, expected: &str) -> Result<File, GentooError> {
     let (actual, _) = digest::stream(Algorithm::Sha512, &mut file)
         .map_err(GentooError::at("digesting", tarball))?;
     if actual != expected {
-        let _ = std::fs::remove_file(tarball);
         return Err(GentooError::Digest {
             subject: tarball.display().to_string(),
             expected: expected.to_string(),
@@ -2084,6 +1858,18 @@ fn verify(tarball: &Path, expected: &str) -> Result<std::fs::File, GentooError> 
         });
     }
     Ok(file)
+}
+
+/// A download's view of the observer: the layer's own fetch event, and its
+/// answer to whether the run should stop.
+impl cache::Watch for dyn GentooObserver + '_ {
+    fn fetching(&mut self, url: &str) {
+        self.progress(GentooEvent::Fetching { url });
+    }
+
+    fn cancelled(&mut self) -> bool {
+        GentooObserver::cancelled(self)
+    }
 }
 
 /// Something the Gentoo provisioner is doing, reported to a [`GentooObserver`]
@@ -2281,7 +2067,8 @@ pub trait GentooObserver {
     /// Whether the work should stop.
     ///
     /// Consulted at the boundaries where stopping is clean — a mirror in a
-    /// walk, a package boundary, either side of a long download. Returning
+    /// walk, a package boundary, a batch of downloads, either side of a long
+    /// download — and on each write of a download's body. Returning
     /// `true` aborts with [`GentooError::Cancelled`], and a run driven through
     /// [`provision::ensure`](super::ensure) then removes the staging tree, so a
     /// cancelled bootstrap leaves no destination behind.
@@ -3939,6 +3726,29 @@ mod tests {
                 "verifying",
                 "extracting"
             ],
+        );
+    }
+
+    #[test]
+    fn a_cache_that_cannot_be_created_is_a_host_failure() {
+        // A cache directory is no format's, so failing to create one is the
+        // shared host failure whichever layer's cache it is.
+        let scratch = Scratch::for_test("gentoo", "cache-uncreatable");
+        let (_key, mut gentoo) = current();
+        let occupied = scratch.join("occupied");
+        std::fs::write(&occupied, b"a file, not a directory").unwrap();
+        gentoo.cache_dir = Some(occupied.join("cache"));
+        let err = crate::provision::ensure(scratch.join("root"), &mut gentoo)
+            .expect_err("a cache under a file cannot be created");
+        assert!(
+            matches!(
+                &err,
+                ProvisionError::Io {
+                    op: "creating the package cache",
+                    ..
+                }
+            ),
+            "{err:?}",
         );
     }
 

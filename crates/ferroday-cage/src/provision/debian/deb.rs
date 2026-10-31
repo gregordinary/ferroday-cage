@@ -29,9 +29,6 @@ const AR_MAGIC: &[u8] = b"!<arch>\n";
 /// The size of one `ar` member header.
 const AR_HEADER: usize = 60;
 
-/// The chunk size the streaming reads work in.
-const CHUNK: usize = 64 * 1024;
-
 /// The largest `control.tar` member [`read_control_from`] will read, compressed
 /// and decompressed alike.
 ///
@@ -46,8 +43,8 @@ const CHUNK: usize = 64 * 1024;
 /// inside the wire bound decompresses to as much `./control` as its author
 /// chose. It is also read before anything about the package has been
 /// authenticated. Applied to the decompressed stream the bound covers the time
-/// as well as the memory — an entry the reader skips past is decompressed too —
-/// and a member over it is refused as a control archive that ends early.
+/// as well as the memory, since an entry the reader skips past is decompressed
+/// too, and a `./control` declaring more than it is refused before it is read.
 const CONTROL_MEMBER_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Extracts a `.deb`'s `data.tar` member into an ongoing extraction.
@@ -224,19 +221,7 @@ fn control_from_tar(member: &[u8]) -> Result<String, ProvisionError> {
         if name != b"control" {
             continue;
         }
-        // The reserve is a hint taken from the entry header, so it is capped:
-        // the vector grows to whatever the entry actually holds, and a header
-        // claiming more than it carries does not get to ask for it up front.
-        let claimed = usize::try_from(entry.size).unwrap_or(0);
-        let mut bytes = Vec::with_capacity(claimed.min(CHUNK));
-        let mut chunk = [0u8; 4096];
-        loop {
-            let got = archive.read_data(&mut chunk)?;
-            if got == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..got]);
-        }
+        let bytes = archive.read_entry(CONTROL_MEMBER_LIMIT)?;
         return String::from_utf8(bytes)
             .map_err(|_| control_error("the control file is not UTF-8"));
     }
@@ -436,35 +421,52 @@ mod tests {
         assert!(err.to_string().contains("no control.tar member"), "{err}");
     }
 
-    #[test]
-    fn a_control_member_that_decompresses_past_the_ceiling_is_refused() {
-        // The wire bound holds the compressed member, and the member is a
-        // compression format: one comfortably inside it decompresses to as much
-        // `./control` as its author chose. Read before anything about the
-        // package is authenticated, so it is refused rather than accumulated.
+    /// A `.deb` whose control member is `tar`, gzipped, asserting that the
+    /// compressed member is inside the wire bound so the decompressed one is
+    /// what a refusal answers.
+    fn gzipped_control(tar: &[u8]) -> Vec<u8> {
         use std::io::Write as _;
         let compressed = {
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-            encoder
-                .write_all(&control_tar(&vec![b'x'; CONTROL_MEMBER_LIMIT as usize + 1]))
-                .expect("the bomb compresses");
+            encoder.write_all(tar).expect("the bomb compresses");
             encoder.finish().expect("the encoder finishes")
         };
         assert!(
             (compressed.len() as u64) < CONTROL_MEMBER_LIMIT,
             "the fixture must be inside the wire bound to test the other one",
         );
-
         let mut archive = AR_MAGIC.to_vec();
         ar_member(&mut archive, "debian-binary", b"2.0\n");
         ar_member(&mut archive, "control.tar.gz", &compressed);
+        archive
+    }
+
+    #[test]
+    fn a_control_member_that_decompresses_past_the_ceiling_is_refused() {
+        // The wire bound holds the compressed member, and the member is a
+        // compression format: one comfortably inside it decompresses to as much
+        // `./control` as its author chose. Read before anything about the
+        // package is authenticated, so it is refused rather than accumulated,
+        // on the length its header declares.
+        let archive = gzipped_control(&control_tar(&vec![b'x'; CONTROL_MEMBER_LIMIT as usize + 1]));
         let err = read_control_from(&mut Cursor::new(&archive))
-            .expect_err("a control member past the decompressed ceiling is refused");
-        assert!(
-            err.to_string().contains("ends inside an entry's data"),
-            "{err}",
-        );
+            .expect_err("a control file past the ceiling is refused");
+        assert!(err.to_string().contains("more than the"), "{err}");
+
+        // An entry ahead of `./control` is decompressed to be skipped, so the
+        // ceiling holds the stream as well as the file it is after.
+        let skipped = ferroday_cage_testkit::tar::Tar::new()
+            .file(
+                "./postinst",
+                0o755,
+                &vec![b'x'; CONTROL_MEMBER_LIMIT as usize + 1],
+            )
+            .file("./control", 0o644, b"Package: tool\n")
+            .finish();
+        let err = read_control_from(&mut Cursor::new(&gzipped_control(&skipped)))
+            .expect_err("a control archive past the ceiling is refused");
+        assert!(err.to_string().contains("ends inside an entry"), "{err}",);
     }
 
     #[test]

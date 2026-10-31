@@ -213,6 +213,21 @@ count = 1
 why = "The answer."
 
 [[idiom]]
+name = "a staging file created by hand"
+pattern = '\.create_new\(true\)'
+answer = """\
+`provision::Staged`, which creates the staging file exclusively under a name \
+unique to the call, removes it on any failure, and publishes it by a rename. \
+Six downloads, a pool, an export, and two copies each staged and cleaned up \
+for themselves, and only one of the downloads checked what it published \
+before the rename."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/mod.rs"
+count = 1
+why = "The answer."
+
+[[idiom]]
 name = "the host's temporary directory"
 pattern = 'env::temp_dir\(\)'
 answer = """\

@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use super::available::Available;
 use super::pin::{PinMatch, Pins};
 use super::version::{self, Constraint};
+use crate::provision::Available;
 use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
 use crate::provision::fetch::percent_decode;

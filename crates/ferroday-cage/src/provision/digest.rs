@@ -195,23 +195,21 @@ pub(crate) fn stream(algorithm: Algorithm, reader: &mut impl Read) -> io::Result
 
 /// A writer that digests everything written through it on its way to `inner`.
 ///
-/// The write-side counterpart of [`stream`]. A [`Fetch`](super::Fetch) writes a
-/// resource to a sink as it arrives, so a download that digests at the sink
-/// learns what it received without holding it: the bytes go to their file and to
-/// the hasher in one pass, and the caller decides whether to publish the file
-/// only after the digest is known.
+/// The write-side counterpart of [`stream`], for bytes a copy is moving anyway:
+/// a reader that hands one segment of a container to a sink learns the
+/// segment's digest in the same pass, as the Alpine container reader does.
 ///
-/// A layer that keeps what it downloads in a cache verifies on the read instead,
-/// so that a file the cache already held and one this run fetched go through the
-/// same check; such a build has no caller for this.
-#[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+/// A download is not digested this way. What a download leaves in a cache is
+/// checked by reading it back, through the check a cache hit goes through, so a
+/// file this run fetched and one an earlier run left are held to one rule.
+#[cfg_attr(not(feature = "alpine"), allow(dead_code))]
 pub(crate) struct DigestWriter<W> {
     inner: W,
     hasher: Hasher,
     written: u64,
 }
 
-#[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+#[cfg_attr(not(feature = "alpine"), allow(dead_code))]
 impl<W: Write> DigestWriter<W> {
     /// Wraps `inner`, digesting what passes through under `algorithm`.
     pub(crate) fn new(algorithm: Algorithm, inner: W) -> DigestWriter<W> {

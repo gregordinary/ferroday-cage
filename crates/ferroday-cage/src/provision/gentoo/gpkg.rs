@@ -193,12 +193,17 @@ pub(super) struct Package {
 }
 
 impl Package {
-    /// Opens the container at `path` and holds it to everything above.
+    /// Reads the container `container`, from its start, and holds it to
+    /// everything above.
     ///
-    /// `planned` is what the resolution chose, and what the container's own
-    /// metadata is checked against. It is the plan's entry rather than the
-    /// index record because both ways of reaching an install go through a plan:
-    /// one resolved here, and one a caller kept and handed back.
+    /// `path` names it in a failure. `planned` is what the resolution chose,
+    /// and what the container's own metadata is checked against. It is the
+    /// plan's entry rather than the index record because both ways of reaching
+    /// an install go through a plan: one resolved here, and one a caller kept
+    /// and handed back.
+    ///
+    /// The descriptor is the caller's, so the container checked is the one the
+    /// caller holds: a cache entry it opened, or a download not yet published.
     ///
     /// # Errors
     ///
@@ -209,12 +214,12 @@ impl Package {
     /// it lists that is absent, no image or metadata archive, or metadata that
     /// names a different package — and [`GentooError::Io`] where the file could
     /// not be read.
-    pub(super) fn open(
+    pub(super) fn read(
+        mut container: std::fs::File,
         path: &Path,
         planned: &PlannedPackage,
         keyring: &Keyring,
     ) -> Result<Package, GentooError> {
-        let mut container = std::fs::File::open(path).map_err(GentooError::at("opening", path))?;
         let scan = scan(path, &mut container)?;
         let manifest = Manifest::verify(path, &scan, keyring)?;
         manifest.hold(path, &scan)?;
@@ -392,32 +397,27 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             Role::Format | Role::Image | Role::Other => None,
         };
         let mut buffered = Vec::new();
-        let mut member = Member {
-            archive,
-            left: entry.size,
-        };
         let (sha512, size) = match held {
             // Refused on the length the entry declares, before a byte of it is
-            // held. `Member` reads no further than that length, so it was
-            // already the bound a `take` restated -- and a take stops at the
-            // ceiling whether the member ends there or runs past it, so the
-            // count it returns cannot tell the two apart and refused a member
-            // that fits with a reason that is not true of it.
-            Some(limit) if entry.size > limit => {
-                return Err(container(
-                    path,
-                    format!("holds a {name} of more than {limit} bytes"),
-                ));
+            // held, and never cut at the ceiling: a member that fits is read
+            // whole and one past it is refused as what it is.
+            Some(limit) => {
+                buffered = archive
+                    .read_entry(limit)
+                    .map_err(|err| container(path, err.to_string()))?;
+                (Algorithm::Sha512.hex_of(&buffered), buffered.len() as u64)
             }
-            Some(_) => {
-                let taken = io::copy(&mut member, &mut buffered)
-                    .map_err(GentooError::at("reading a container member", path))?;
-                (Algorithm::Sha512.hex_of(&buffered), taken)
+            None => {
+                let mut member = Member {
+                    archive,
+                    left: entry.size,
+                };
+                let digested = digest::stream(Algorithm::Sha512, &mut member)
+                    .map_err(GentooError::at("digesting a container member", path))?;
+                archive = member.archive;
+                digested
             }
-            None => digest::stream(Algorithm::Sha512, &mut member)
-                .map_err(GentooError::at("digesting a container member", path))?,
         };
-        archive = member.archive;
 
         match role {
             Role::Format => scan.marked = true,
@@ -622,46 +622,31 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
     let inner =
         compress::decompress(&head, compressed).map_err(|err| container(path, err.to_string()))?;
     let mut inner = TarReader::new(inner);
-    let mut read = 0u64;
+    // What the files may hold between them, which is what each is read under:
+    // the metadata is one budget, however the archive divides it.
+    let mut left = MAX_METADATA_BYTES;
+    while let Some(entry) = inner
+        .next_entry()
+        .map_err(|err| container(path, err.to_string()))?
     {
-        while let Some(entry) = inner
-            .next_entry()
-            .map_err(|err| container(path, err.to_string()))?
-        {
-            if entry.typeflag == b'5' {
-                continue;
-            }
-            let Some(name) = std::str::from_utf8(&entry.path)
-                .ok()
-                .and_then(|name| name.strip_prefix(METADATA_DIR))
-                .filter(|name| path::is_ordinary_component(name.as_bytes()))
-            else {
-                // Anything that is not a plain file directly under
-                // `metadata/` is not a metadata file, and the layer writes
-                // out only what it recognizes.
-                continue;
-            };
-            read += entry.size;
-            if read > MAX_METADATA_BYTES {
-                return Err(container(
-                    path,
-                    format!("holds more than {MAX_METADATA_BYTES} bytes of metadata"),
-                ));
-            }
-            let mut bytes = vec![0u8; usize::try_from(entry.size).unwrap_or(usize::MAX)];
-            let mut filled = 0;
-            while filled < bytes.len() {
-                let got = inner
-                    .read_data(&mut bytes[filled..])
-                    .map_err(|err| container(path, err.to_string()))?;
-                if got == 0 {
-                    break;
-                }
-                filled += got;
-            }
-            bytes.truncate(filled);
-            files.insert(name.to_string(), bytes);
+        if entry.typeflag == b'5' {
+            continue;
         }
+        let Some(name) = std::str::from_utf8(&entry.path)
+            .ok()
+            .and_then(|name| name.strip_prefix(METADATA_DIR))
+            .filter(|name| path::is_ordinary_component(name.as_bytes()))
+        else {
+            // Anything that is not a plain file directly under `metadata/` is
+            // not a metadata file, and the layer writes out only what it
+            // recognizes.
+            continue;
+        };
+        let bytes = inner
+            .read_entry(left)
+            .map_err(|err| container(path, err.to_string()))?;
+        left -= bytes.len() as u64;
+        files.insert(name.to_string(), bytes);
     }
     Ok(files)
 }
@@ -986,7 +971,12 @@ mod tests {
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let path = dir.join("package.gpkg.tar");
         built.write(&path, &key);
-        Package::open(&path, wanted, &fixture::keyring(&key))
+        Package::read(
+            std::fs::File::open(&path).expect("the container opens"),
+            &path,
+            wanted,
+            &fixture::keyring(&key),
+        )
     }
 
     #[test]
@@ -1020,8 +1010,13 @@ mod tests {
         let key = fixture::signing_key("gentoo <infra@test.invalid>");
         Built::ordinary().write(&path, &key);
         let keyring = fixture::keyring(&key);
-        let package =
-            Package::open(&path, &planned(CPV, 1), &keyring).expect("the container verifies");
+        let package = Package::read(
+            std::fs::File::open(&path).expect("the container opens"),
+            &path,
+            &planned(CPV, 1),
+            &keyring,
+        )
+        .expect("the container verifies");
 
         // What another build publishing its own container at the same path
         // does: a staging file renamed over it, which is how every one of the
@@ -1311,8 +1306,13 @@ mod tests {
         let path = dir.join("package.gpkg.tar");
         Built::ordinary().write(&path, &fixture::signing_key("forger <f@test.invalid>"));
         let trusted = fixture::signing_key("releng <releng@test.invalid>");
-        let err = Package::open(&path, &planned(CPV, 1), &fixture::keyring(&trusted))
-            .expect_err("a forged Manifest is refused");
+        let err = Package::read(
+            std::fs::File::open(&path).expect("the container opens"),
+            &path,
+            &planned(CPV, 1),
+            &fixture::keyring(&trusted),
+        )
+        .expect_err("a forged Manifest is refused");
         assert!(matches!(err, GentooError::Signature { .. }), "{err:?}");
     }
 
@@ -1322,8 +1322,13 @@ mod tests {
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let path = dir.join("package.gpkg.tar");
         Built::ordinary().write(&path, &key);
-        let package = Package::open(&path, &planned(CPV, 1), &fixture::keyring(&key))
-            .expect("the container opens");
+        let package = Package::read(
+            std::fs::File::open(&path).expect("the container opens"),
+            &path,
+            &planned(CPV, 1),
+            &fixture::keyring(&key),
+        )
+        .expect("the container opens");
 
         let mut archive = package.image(&path).expect("the image opens");
         let mut names = Vec::new();

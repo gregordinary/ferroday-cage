@@ -190,7 +190,7 @@ pub(super) fn merge(
 /// The database directory this package's entry belongs at.
 ///
 /// Composed from the plan rather than from the container. The two say the same
-/// thing — [`Package::open`](super::gpkg::Package::open) refuses a container
+/// thing — [`Package::read`](super::gpkg::Package::read) refuses a container
 /// whose `CATEGORY`, `PF` and `BUILD_ID` are not the ones the plan named — and
 /// composing from the plan is what makes that a statement about one reading
 /// instead of two: the bytes the identity check held are the bytes the path is
@@ -344,8 +344,13 @@ mod tests {
         std::fs::create_dir_all(&root).expect("the root is created");
         let rooted = Rooted::open(&root).expect("the root opens");
         let planned = planned(CPV, 1);
-        let package = Package::open(&container, &planned, &fixture::keyring(&key))
-            .expect("the container opens");
+        let package = Package::read(
+            std::fs::File::open(&container).expect("the container opens"),
+            &container,
+            &planned,
+            &fixture::keyring(&key),
+        )
+        .expect("the container opens");
         merge(
             &root, None, &rooted, &container, &package, &planned, counter,
         )

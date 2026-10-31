@@ -127,6 +127,13 @@ consumer upgrading can skip it.
   pattern's and the path's lengths. A pattern of many `*`s, from a package's
   signed metadata or a layered base's `triggers` file, could hold the bootstrap
   for minutes per directory.
+- A package or tarball downloaded into a cache is checked before it is renamed
+  into place, in every layer, so another run sharing the cache never reads
+  unverified bytes there. The Alpine and Gentoo layers published a complete body
+  first and checked it on the read that followed. A cache entry is opened only
+  when it is a regular file: a symbolic link or a named pipe planted at a cache
+  path reads as a missing entry and is replaced, rather than followed out of the
+  cache or waited on.
 - The Gentoo stage3 is extracted from the descriptor its SHA-512 was taken
   through, so another run renaming a download over a shared cache entry between
   the check and the extraction cannot substitute unverified bytes.
@@ -263,6 +270,10 @@ consumer upgrading can skip it.
   `subject`, the URL of the release or of the index. A release that lists no
   index for a component is reported as `Release`, and an index that does not
   decompress as `Index` rather than `Io`.
+- **Breaking.** A host failure on the download path, in staging, writing,
+  reading back, or publishing a download, and a package cache that cannot be
+  created, are `ProvisionError::Io` in every layer. Gentoo reported both, and
+  Debian and Alpine the download steps, as the layer's own `Io`.
 - **Breaking.** `debian::build_depend_names` takes the architecture the root is
   built for, and evaluates each alternative's architecture restriction against
   it: literal names, `any`, `<os>-any`, and `any-<cpu>`. It chooses the first
@@ -315,6 +326,10 @@ consumer upgrading can skip it.
   and `/`, so a path holding a space, a newline, or a non-UTF-8 byte names one
   URL, and the bundled fetcher decodes it back. It no longer fails for a
   non-UTF-8 path.
+- A plan document's numbers are read as the writer spells them: digits, with a
+  sign only where the field can be negative. A `Size` of `+5`, or an archive or
+  index stanza numbered `+1`, is refused rather than read and written back
+  differently.
 - The guide's recipe for a reproducible provenance record declares the procfs a
   container needs, and the doctests run it. As written it failed `build`.
 
@@ -440,6 +455,12 @@ consumer upgrading can skip it.
   same run, as an Alpine one already was. A corrupt `.deb` the batched prefetch
   did not deliver was kept, and every later run failed extracting it; a Gentoo
   stage3 or binary package failed the run.
+- A `DebianObserver` or `AlpineObserver` bound with `observe` stops a
+  provisioning run when its `cancelled` answers true. A Debian run consulted only
+  the `Provision` observer, and an Alpine one only for a layered build. A Debian
+  or Alpine run asks while a package downloads, not only between packages, as a
+  Gentoo run already did for its tarball. A batch of downloads fetched at once
+  still stops at the batch's end.
 - `DebianEvent::Downloading` counts the packages being downloaded rather than the
   plan's, as `AlpineEvent::Downloading` does.
 - A Debian or Alpine pin holding a version two repositories offer over different
@@ -514,12 +535,24 @@ consumer upgrading can skip it.
   both bootstraps ask. `containment::open_typed_file` opens a file a walk just
   inspected for `Rooted`, the export child and `CopyIn`, and `open_created_fifo`
   opens a named pipe just created for the extractor and the copy-in child.
+- `provision::cache` holds the package cache: `PackageCache`, the one way a
+  cache directory is created, the one way an entry is opened, and the one
+  staged, verified download path, mirror walk and batch alike, for all three
+  layers. `provision::Staged` is the one staging file, which every download,
+  `write_atomically`, the Debian pool, and `Export::write_to_path` write
+  through.
 - `provision::lock_exclusive` takes every lock file, and `provision::remove_tree`
   over `mechanism::delete_tree` removes every tree. `clippy.toml` refuses
   `rustix::fs::flock`, `rustix::io::dup`, `std::fs::remove_dir_all`,
   `rustix::fs::chmodat`, `rustix::fs::chmod`, and `rustix::rand::getrandom`,
   each with the answer that replaces it. `host::fill_random` is the
   `getrandom` answer.
+- `TarReader::read_entry` is the one bounded read of a tar entry into memory,
+  for Debian control files, Alpine metadata members, Gentoo container members and
+  tar's own long names. `compress::read_fully` is the one filling read under
+  the decoders, and `compress::Codec` names the formats `decompress` recognizes.
+- `provision::document::header` and `document::number` read every plan
+  document's header and number fields, in all three layers.
 - `mechanism::overlay_options` composes an overlay's mount options for a build
   and for the host probe, `spec::validate_command` validates the command for both
   builders, and `MountAction::arrival` reads what a mount op brings to rest on

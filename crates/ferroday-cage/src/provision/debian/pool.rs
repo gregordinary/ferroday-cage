@@ -79,7 +79,7 @@ use super::{DebianError, arch, deb, release, version};
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::document;
-use crate::provision::{file_url, staging_path, write_atomically};
+use crate::provision::{Staged, file_url, write_atomically};
 
 /// A trusted local package pool, configured then published to.
 ///
@@ -895,18 +895,9 @@ fn index_deb(
     // rename is what makes the new bytes visible, and it happens only once the
     // stanza that will name them has been read back from them.
     let staged = stage(&dest, &mut source)?;
-    let described = describe(&staged, deb_path, architecture, &offered);
-    let (control, digest, size) = match described {
-        Ok((control, (digest, size))) => (control, digest, size),
-        Err(err) => {
-            let _ = std::fs::remove_file(&staged);
-            return Err(err);
-        }
-    };
-    std::fs::rename(&staged, &dest)
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&staged);
-        })
+    let (control, (digest, size)) = describe(staged.path(), deb_path, architecture, &offered)?;
+    staged
+        .publish()
         .map_err(DebianError::at("publishing a .deb into the pool", &dest))?;
 
     Ok(Entry {
@@ -1002,7 +993,7 @@ fn already_published(dest: &Path, source: &mut File) -> Option<(String, u64)> {
     (offered == held).then_some((held, size))
 }
 
-/// Places a copy of `source` beside `dest` under a staging name, ready to be
+/// Places a copy of `source` beside `dest` as a [`Staged`] file, ready to be
 /// renamed onto it.
 ///
 /// The payload is cloned with `FICLONE` when the source and the pool sit on one
@@ -1020,30 +1011,22 @@ fn already_published(dest: &Path, source: &mut File) -> Option<(String, u64)> {
 /// through, which is always correct and never holds more than a chunk. The
 /// fallback is the common one for a pool that does not share a filesystem with
 /// the build tree, so it is a path taken rather than a path of last resort.
-fn stage(dest: &Path, source: &mut File) -> Result<PathBuf, DebianError> {
-    let staged = staging_path(dest);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .map_err(DebianError::at("staging a .deb", &staged))?;
+fn stage(dest: &Path, source: &mut File) -> Result<Staged, DebianError> {
+    let (staged, mut file) =
+        Staged::beside(dest).map_err(DebianError::at("staging a .deb for", dest))?;
 
     // A declined clone leaves the staging file as it was created — empty — so
     // the fallback writes it from the start. Every failure is a fallback: the
     // copy is correct wherever the clone would have been.
     if rustix::fs::ioctl_ficlone(&file, &*source).is_err() {
-        let copied = source
+        source
             .rewind()
             .and_then(|()| std::io::copy(source, &mut file))
-            .map(|_| ());
-        if let Err(err) = copied {
-            let _ = std::fs::remove_file(&staged);
-            return Err(DebianError::at("copying a .deb into the pool", &staged)(
-                err,
-            ));
-        }
+            .map_err(DebianError::at(
+                "copying a .deb into the pool",
+                staged.path(),
+            ))?;
     }
-    drop(file);
     Ok(staged)
 }
 
@@ -1381,7 +1364,7 @@ mod tests {
 
         let staged = stage(&dir.join("published.deb"), &mut source).expect("staging succeeds");
         assert_eq!(
-            std::fs::read(&staged).unwrap(),
+            std::fs::read(staged.path()).unwrap(),
             bytes,
             "staging did not reproduce the whole source",
         );

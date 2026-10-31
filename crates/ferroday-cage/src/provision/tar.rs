@@ -243,16 +243,16 @@ impl<R: Read> TarReader<R> {
             match entry.typeflag {
                 // GNU long name / long link: the data names the next entry.
                 b'L' => {
-                    gnu_longname = Some(self.read_metadata(header_offset)?);
+                    gnu_longname = Some(self.read_metadata()?);
                     trim_trailing_nuls(gnu_longname.as_mut().expect("just set"));
                 }
                 b'K' => {
-                    gnu_longlink = Some(self.read_metadata(header_offset)?);
+                    gnu_longlink = Some(self.read_metadata()?);
                     trim_trailing_nuls(gnu_longlink.as_mut().expect("just set"));
                 }
                 // Pax extended headers.
                 b'x' => {
-                    let data = self.read_metadata(header_offset)?;
+                    let data = self.read_metadata()?;
                     let records =
                         parse_pax(&data).map_err(|reason| malformed(header_offset, reason))?;
                     pax_entry = Some(match pax_entry {
@@ -276,7 +276,7 @@ impl<R: Read> TarReader<R> {
                     // The records are still parsed, so a malformed global
                     // header is a malformed archive rather than a block read
                     // past without looking.
-                    let data = self.read_metadata(header_offset)?;
+                    let data = self.read_metadata()?;
                     parse_pax(&data).map_err(|reason| malformed(header_offset, reason))?;
                 }
                 _ => {
@@ -491,28 +491,55 @@ impl<R: Read> TarReader<R> {
         }
     }
 
-    /// Reads the current (metadata) entry's data in full, with a sanity
-    /// cap, and drains its padding.
-    fn read_metadata(&mut self, header_offset: u64) -> Result<Vec<u8>, ProvisionError> {
-        if self.data_remaining > METADATA_LIMIT {
+    /// Reads what is left of the current entry's data into memory, refusing an
+    /// entry that holds more than `limit` bytes.
+    ///
+    /// The one way an entry is held whole, for the members a reader acts on as
+    /// a unit: a control file, a package's metadata, a GNU long name. The
+    /// ceiling is the caller's, since only the caller knows what the entry is.
+    ///
+    /// The refusal is made on the length the header declares, before a byte of
+    /// the data is read, and is never a truncation: [`read_data`](Self::read_data)
+    /// delivers exactly the declared length or fails, so what is returned is
+    /// the whole entry. A declared length is still the archive's own claim
+    /// until the bytes arrive, so the reservation made up front is the smaller
+    /// of it and [`RESERVE`], and the buffer grows from there with what the
+    /// archive actually holds. A header claiming the whole ceiling for an entry
+    /// that stops short of it costs the reservation, not the ceiling.
+    pub(crate) fn read_entry(&mut self, limit: u64) -> Result<Vec<u8>, ProvisionError> {
+        let declared = self.data_remaining;
+        if declared > limit {
             return Err(malformed(
-                header_offset,
-                "a metadata entry is implausibly large",
+                self.offset,
+                &format!("an entry of {declared} bytes is more than the {limit} accepted for it"),
             ));
         }
-        let mut data = Vec::with_capacity(usize::try_from(self.data_remaining).expect("capped"));
-        let mut chunk = [0u8; 4096];
+        let reserve = usize::try_from(declared).map_or(RESERVE, |declared| declared.min(RESERVE));
+        let mut data = Vec::with_capacity(reserve);
+        let mut chunk = [0u8; 8192];
         loop {
             let got = self.read_data(&mut chunk)?;
             if got == 0 {
-                break;
+                return Ok(data);
             }
             data.extend_from_slice(&chunk[..got]);
         }
+    }
+
+    /// Reads the current (metadata) entry's data in full, under
+    /// [`METADATA_LIMIT`], and drains its padding.
+    fn read_metadata(&mut self) -> Result<Vec<u8>, ProvisionError> {
+        let data = self.read_entry(METADATA_LIMIT)?;
         self.drain_current()?;
         Ok(data)
     }
 }
+
+/// The most [`TarReader::read_entry`] reserves before an entry's data arrives.
+///
+/// Every entry read whole is a few kilobytes in practice, so this covers the
+/// real ones in one allocation, and a larger one grows past it as it is read.
+const RESERVE: usize = 64 * 1024;
 
 /// Builds [`ProvisionError::Archive`].
 fn malformed(offset: u64, reason: &str) -> ProvisionError {
@@ -1459,5 +1486,71 @@ mod tests {
         let entry = reader.next_entry().unwrap().expect("the file");
         assert_eq!(entry.path, b"file.txt");
         assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    /// An archive of one regular file holding `body`, with a header declaring
+    /// `declared` bytes for it.
+    fn one_file(declared: u64, body: &[u8]) -> Vec<u8> {
+        let mut archive = sized_header(b"entry", declared, b'0').to_vec();
+        archive.extend_from_slice(body);
+        archive.resize(archive.len().next_multiple_of(BLOCK as usize), 0);
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        archive
+    }
+
+    #[test]
+    fn an_entry_is_read_whole_up_to_its_ceiling_and_refused_past_it() {
+        let body = vec![b'x'; 3000];
+
+        // At the ceiling exactly, the entry is the whole of it, and the reader
+        // goes on to the next entry from where it ends.
+        let archive = one_file(body.len() as u64, &body);
+        let mut reader = TarReader::new(&archive[..]);
+        reader.next_entry().unwrap().expect("the file");
+        assert_eq!(reader.read_entry(body.len() as u64).unwrap(), body);
+        assert!(reader.next_entry().unwrap().is_none());
+
+        // One byte under it, the entry is refused on its declared length rather
+        // than read as far as the ceiling and handed back cut short.
+        let mut reader = TarReader::new(&archive[..]);
+        reader.next_entry().unwrap().expect("the file");
+        let err = reader
+            .read_entry(body.len() as u64 - 1)
+            .expect_err("an entry past its ceiling is refused");
+        assert!(
+            err.to_string()
+                .contains("of 3000 bytes is more than the 2999"),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn an_entry_declaring_more_than_the_archive_holds_is_not_returned_short() {
+        // The declared length is inside the ceiling, so it is believed until the
+        // bytes run out, and then the read fails: what comes back is a whole
+        // entry or nothing.
+        let mut archive = sized_header(b"entry", 1 << 20, b'0').to_vec();
+        archive.extend_from_slice(&[b'x'; 700]);
+        let mut reader = TarReader::new(&archive[..]);
+        reader.next_entry().unwrap().expect("the file");
+        let err = reader
+            .read_entry(1 << 30)
+            .expect_err("an entry the archive does not hold is refused");
+        assert!(
+            err.to_string().contains("ends inside an entry's data"),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn a_metadata_entry_is_held_to_its_ceiling() {
+        // A GNU long name past the metadata ceiling is refused, through the same
+        // read every whole-entry reader in the crate goes through.
+        let mut archive = sized_header(b"././@LongLink", METADATA_LIMIT + 1, b'L').to_vec();
+        archive.extend_from_slice(&[0u8; BLOCK as usize]);
+        let err = TarReader::new(&archive[..])
+            .next_entry()
+            .expect_err("a long name past the ceiling is refused");
+        assert!(err.to_string().contains("more than the"), "{err}");
     }
 }

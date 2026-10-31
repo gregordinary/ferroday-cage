@@ -562,8 +562,9 @@ pub(super) fn data_reader<R: Read>(inner: R) -> GzDecoder<BufReader<R>> {
 /// Reads every member of a decompressed metadata segment into memory.
 ///
 /// `subject` names what is being read, for the error. The caller has already
-/// bounded the segment's decompressed size; this bounds nothing further, since
-/// the members of a segment sum to it.
+/// bounded the segment's decompressed size, and the members of a segment sum to
+/// it, so no member can hold more than the segment does. That is the ceiling
+/// each is read under: a header announcing more is refused before it is read.
 pub(super) fn members(subject: &str, segment: &[u8]) -> Result<Vec<Member>, AlpineError> {
     let mut reader = TarReader::new(segment);
     let mut members = Vec::new();
@@ -572,20 +573,7 @@ pub(super) fn members(subject: &str, segment: &[u8]) -> Result<Vec<Member>, Alpi
     };
     while let Some(entry) = reader.next_entry().map_err(malformed)? {
         let name = String::from_utf8_lossy(&entry.path).into_owned();
-        // The reservation is clamped to what the segment could possibly hold. A
-        // tar header's size field is the archive's own claim, and a member that
-        // announces more than the segment contains would otherwise reserve that
-        // much before the read that contradicts it.
-        let claimed = usize::try_from(entry.size).unwrap_or(usize::MAX);
-        let mut data = Vec::with_capacity(claimed.min(segment.len()));
-        let mut chunk = [0u8; 8 * 1024];
-        loop {
-            let got = reader.read_data(&mut chunk).map_err(malformed)?;
-            if got == 0 {
-                break;
-            }
-            data.extend_from_slice(&chunk[..got]);
-        }
+        let data = reader.read_entry(segment.len() as u64).map_err(malformed)?;
         members.push(Member { name, data });
     }
     Ok(members)

@@ -18,16 +18,45 @@ use std::path::PathBuf;
 
 /// Why a handler cannot run a foreign binary.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Missing {
+enum Missing {
     /// The kernel has no handler for the interpreter at all.
     Unregistered,
     /// A handler is registered, and this is what is wrong with it.
     Unusable(&'static str),
 }
 
+/// Why a full bootstrap for `target` cannot run on a `host` host, as the
+/// message a caller is shown, or nothing where it can.
+///
+/// The caller has decided already that the host does not run `target` natively,
+/// which is a question asked in its own architecture names. `interpreter` is
+/// the `qemu-user` interpreter it maps `target` onto, or `None` where no qemu
+/// target covers it. What follows is the same for every layer: the handler must
+/// be registered, enabled, and carry the fix-binary flag, and a refusal names
+/// the remedy and the builder's `extract_only` as the alternative.
+pub(crate) fn preflight(host: &str, target: &str, interpreter: Option<&str>) -> Result<(), String> {
+    let Some(interpreter) = interpreter else {
+        return Err(format!(
+            "a full bootstrap for {target} on a {host} host needs a qemu-user binfmt handler, and \
+             {target} is not a known qemu target; use extract_only instead"
+        ));
+    };
+    ready(interpreter).map_err(|missing| match missing {
+        Missing::Unregistered => format!(
+            "a full bootstrap for {target} on a {host} host needs the qemu-{interpreter} binfmt \
+             handler registered (install qemu-user-static and binfmt support); use extract_only \
+             to lay out the root filesystem without running its binaries"
+        ),
+        Missing::Unusable(reason) => format!(
+            "the qemu-{interpreter} binfmt handler is registered but {reason}; a foreign \
+             bootstrap needs it enabled and registered with the fix-binary (F) flag"
+        ),
+    })
+}
+
 /// Whether the `qemu-<interpreter>` handler can run a foreign binary from a
 /// cage.
-pub(crate) fn ready(interpreter: &str) -> Result<(), Missing> {
+fn ready(interpreter: &str) -> Result<(), Missing> {
     let registration = read(interpreter)
         .map_err(|_| Missing::Unusable("its registration could not be read"))?
         .ok_or(Missing::Unregistered)?;
@@ -155,6 +184,33 @@ mod tests {
         assert_eq!(
             ready("a\0name"),
             Err(Missing::Unusable("its registration could not be read")),
+        );
+    }
+
+    #[test]
+    fn a_foreign_bootstrap_is_refused_with_the_remedy_and_the_alternative() {
+        // One message for every layer: the architectures are each layer's own
+        // names, and what is wrong and what to do about it is the kernel's.
+        let unknown = preflight("x86_64", "vax", None).expect_err("qemu has no vax target");
+        assert!(
+            unknown.contains("vax is not a known qemu target") && unknown.contains("extract_only"),
+            "{unknown}",
+        );
+
+        let unregistered = preflight("x86_64", "imaginary", Some("an-interpreter-no-kernel-has"))
+            .expect_err("no handler is registered");
+        assert!(
+            unregistered.contains("needs the qemu-an-interpreter-no-kernel-has binfmt handler")
+                && unregistered.contains("on a x86_64 host")
+                && unregistered.contains("extract_only"),
+            "{unregistered}",
+        );
+
+        let unreadable =
+            preflight("x86_64", "imaginary", Some("a\0name")).expect_err("nothing could look");
+        assert!(
+            unreadable.contains("registered but its registration could not be read"),
+            "{unreadable}",
         );
     }
 }

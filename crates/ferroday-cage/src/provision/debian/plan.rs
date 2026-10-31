@@ -368,18 +368,7 @@ impl Plan {
     /// digest is not one a fetch could be composed from.
     pub fn parse_document(text: &str) -> Result<Plan, DebianError> {
         let stanzas = document::parse(text);
-        let (header, rest) = stanzas
-            .split_first()
-            .ok_or_else(|| document("the document holds no stanzas".to_string()))?;
-
-        let format = header
-            .get("Format")
-            .ok_or_else(|| document("the first stanza has no Format field".to_string()))?;
-        if format != FORMAT {
-            return Err(document(format!(
-                "the document is in format {format:?}, and this library reads {FORMAT:?}"
-            )));
-        }
+        let (header, rest) = document::header(&stanzas, FORMAT).map_err(document)?;
         let mut plan = Plan {
             suite: required(header.get("Suite"), "Suite", "the header")?,
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
@@ -390,20 +379,15 @@ impl Plan {
 
         for stanza in rest {
             if let Some(name) = stanza.get("Package") {
-                let at = stanza
-                    .get("Archive")
-                    .ok_or_else(|| document(format!("the package {name} names no archive")))?
-                    .parse::<usize>()
-                    .map_err(|_| {
-                        document(format!("the package {name} has a malformed archive index"))
-                    })?;
+                let at_package = format!("the package {name}");
+                let at = number::<usize>(stanza.get("Archive"), "Archive", &at_package)?
+                    .ok_or_else(|| document(format!("the package {name} names no archive")))?;
                 if at >= plan.archives.len() {
                     return Err(document(format!(
                         "the package {name} names archive {at}, which the document does not \
                          carry — archive stanzas must precede the packages that refer to them",
                     )));
                 }
-                let at_package = format!("the package {name}");
                 let package = PlannedPackage {
                     name: name.to_string(),
                     version: required(stanza.get("Version"), "Version", &at_package)?,
@@ -440,9 +424,10 @@ impl Plan {
             })?;
             // The index is written out so the document reads on its own, and
             // checked rather than trusted: a document whose archives are out of
-            // order would silently attribute packages to the wrong mirror.
+            // order would silently attribute packages to the wrong mirror. It is
+            // held to the spelling the writer gives it, as every number is.
             let expected = plan.archives.len();
-            if index.parse::<usize>().ok() != Some(expected) {
+            if index != expected.to_string() {
                 return Err(document(format!(
                     "the archive stanzas are numbered out of order: expected {expected}, \
                      found {index:?}",
@@ -544,23 +529,6 @@ const PACKAGE_FIELDS: &[&str] = &[
     "Size",
 ];
 
-/// Reads an optional numeric field, absent giving no value.
-///
-/// A value that is not a number refuses the document rather than reading as
-/// absent. Reading it as absent would drop it on the way out, and a document
-/// that came back missing a line it was given is the one failure the carried
-/// fields exist to prevent.
-fn number(value: Option<&str>, field: &str, at: &str) -> Result<Option<u64>, DebianError> {
-    match value {
-        Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
-            document(format!(
-                "{at} has a {field} of {value:?}, which is not a number"
-            ))
-        }),
-        None => Ok(None),
-    }
-}
-
 /// Reads a required field, reporting a refusal as this layer's document
 /// failure.
 ///
@@ -568,6 +536,17 @@ fn number(value: Option<&str>, field: &str, at: &str) -> Result<Option<u64>, Deb
 /// only whose document the refusal is about belongs here.
 fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, DebianError> {
     document::required(value, field, at).map_err(document)
+}
+
+/// Reads an optional numeric field, reporting a refusal the same way.
+///
+/// The rule is [`document::number`]'s.
+fn number<T: std::str::FromStr>(
+    value: Option<&str>,
+    field: &str,
+    at: &str,
+) -> Result<Option<T>, DebianError> {
+    document::number(value, field, at).map_err(document)
 }
 
 /// Builds the document error.

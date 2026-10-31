@@ -141,6 +141,37 @@ pub(crate) fn carried(stanza: &Stanza, known: &[&str]) -> Carried {
         .collect()
 }
 
+/// Splits a plan document's stanzas into its header and the stanzas after it,
+/// holding the header to `format`.
+///
+/// Every layer's plan opens with a header stanza whose `Format` names the
+/// document's format and its version, and a reader reads only the one it was
+/// written for: a document of another format, or of a later version of this
+/// one, is refused rather than read as far as its fields happen to overlap.
+///
+/// # Errors
+///
+/// Returns the reason where the document holds no stanza, where its first
+/// states no `Format`, or where the format is not `format`. Each layer wraps it
+/// in its own document failure, as [`required`]'s.
+pub(crate) fn header<'a>(
+    stanzas: &'a [Stanza],
+    format: &str,
+) -> Result<(&'a Stanza, &'a [Stanza]), String> {
+    let (header, rest) = stanzas
+        .split_first()
+        .ok_or_else(|| "the document holds no stanzas".to_string())?;
+    let found = header
+        .get("Format")
+        .ok_or_else(|| "the first stanza has no Format field".to_string())?;
+    if found != format {
+        return Err(format!(
+            "the document is in format {found:?}, and this library reads {format:?}",
+        ));
+    }
+    Ok((header, rest))
+}
+
 /// Reads a required field, naming where it was missing from.
 ///
 /// # Errors
@@ -153,6 +184,44 @@ pub(crate) fn required(value: Option<&str>, field: &str, at: &str) -> Result<Str
         Some(_) => Err(format!("{at} has an empty {field} field")),
         None => Err(format!("{at} has no {field} field")),
     }
+}
+
+/// Reads an optional numeric field, absent giving no value, naming where a
+/// malformed one was found.
+///
+/// A value that is not a number refuses the document rather than reading as
+/// absent. Reading it as absent would drop it on the way out, and a document
+/// that came back missing a line it was given is the one failure the carried
+/// fields exist to prevent.
+///
+/// A number is ASCII digits, after a `-` for a type that has negatives, and
+/// nothing else. That is how the writer spells one. Rust's own integer parser
+/// also takes a leading `+`, and a document read that way would be written back
+/// without it, as a document other than the one that was read.
+///
+/// # Errors
+///
+/// Returns the reason where the field is present and is not a number of type
+/// `T`, one out of its range included. Each layer wraps it in its own document
+/// failure, as [`required`]'s.
+pub(crate) fn number<T: std::str::FromStr>(
+    value: Option<&str>,
+    field: &str,
+    at: &str,
+) -> Result<Option<T>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(number) = value.parse()
+    {
+        return Ok(Some(number));
+    }
+    Err(format!(
+        "{at} has a {field} of {value:?}, which is not a number"
+    ))
 }
 
 /// Reads a space-separated list field, absent or empty giving no entries.
@@ -355,5 +424,70 @@ impl Draft {
         }
         out.push('\n');
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_header_is_the_first_stanza_and_names_the_format_read() {
+        let stanzas = parse("Format: plan 1\nSuite: x\n\nPackage: a\n\nPackage: b\n");
+        let (first, rest) = header(&stanzas, "plan 1").expect("the header reads");
+        assert_eq!(first.get("Suite"), Some("x"));
+        assert_eq!(rest.len(), 2);
+
+        let refusal = |text: &str| {
+            header(&parse(text), "plan 1")
+                .map(|_| ())
+                .expect_err("the document is refused")
+        };
+        assert!(refusal("").contains("holds no stanzas"));
+        assert!(refusal("Suite: x\n").contains("no Format field"));
+        assert!(refusal("Format: plan 2\n").contains("\"plan 2\""));
+        // Matched exactly: a reader of one version does not read another's, and
+        // the comparison is not loosened by case or by a suffix.
+        assert!(refusal("Format: PLAN 1\n").contains("format"));
+        assert!(refusal("Format: plan 10\n").contains("format"));
+    }
+
+    #[test]
+    fn a_number_is_digits_spelled_as_the_writer_spells_them() {
+        let read = |value: &str| number::<u64>(Some(value), "Size", "the package a");
+        assert_eq!(read("0"), Ok(Some(0)));
+        assert_eq!(read("1024"), Ok(Some(1024)));
+        assert_eq!(read(&u64::MAX.to_string()), Ok(Some(u64::MAX)));
+        assert_eq!(
+            number::<u64>(None, "Size", "the package a"),
+            Ok(None),
+            "absent is no value"
+        );
+
+        // Rust's parser takes a leading `+`, which the writer never writes, so a
+        // document reading it would not write back as itself.
+        for refused in [
+            "+5",
+            "",
+            "-",
+            "5 ",
+            "0x10",
+            "1e3",
+            "-5",
+            "18446744073709551616",
+        ] {
+            let reason = read(refused).expect_err(refused);
+            assert_eq!(
+                reason,
+                format!("the package a has a Size of {refused:?}, which is not a number"),
+            );
+        }
+
+        // A signed type takes the sign it can hold, and only that one.
+        let signed = |value: &str| number::<i64>(Some(value), "Index-Timestamp", "the header");
+        assert_eq!(signed("-42"), Ok(Some(-42)));
+        assert_eq!(signed(&i64::MIN.to_string()), Ok(Some(i64::MIN)));
+        assert!(signed("+42").is_err());
+        assert!(signed("--42").is_err());
     }
 }

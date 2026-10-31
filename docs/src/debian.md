@@ -119,11 +119,12 @@ reads the copy. A cache is shared and outlives the run, so a package replaced
 there after it was verified never reaches dpkg.
 
 A package is never held in memory. The bytes are written to a staging file as
-they arrive and digested on the way through. The file is renamed into the cache
-only once the digest matches the one the archive recorded. Installing
-reads it back the same way, streaming the `data.tar` through the decompressor
-into the extractor. So a 90 MB kernel package costs what a shell script costs,
-and nothing unverified is ever visible at a cache path.
+they arrive, then read back and digested as a cache entry is. The file is
+renamed into the cache only once the digest matches the one the archive
+recorded. Installing reads it back the same way, streaming the `data.tar`
+through the decompressor into the extractor. So a 90 MB kernel package costs
+what a shell script costs, and nothing unverified is ever visible at a cache
+path.
 
 One cache directory serves any number of concurrent bootstraps, in one process
 or several, whether or not their package sets overlap. Each entry is staged
@@ -1441,7 +1442,8 @@ The batch decides nothing. A job it does not deliver simply leaves the cache
 without that package. The wave behind it then downloads that package with every
 mirror available to it, exactly as though the batch had not run. Whether a
 package is present is still the rename, and the rename happens only over bytes
-that verified.
+that verified. A canceled bootstrap stops at the end of a batch, not part way
+through it. The transport writes a batch's bodies from threads of its own.
 
 A transport therefore sees calls from more than one thread only when it says so,
 by overriding `fetch_all`. The default body, and every `fetch`, run on the

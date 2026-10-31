@@ -121,32 +121,17 @@ fn runs_natively(host: &str, target: &str) -> bool {
 /// foreign one runs the target's `dpkg` and maintainer scripts through a
 /// `qemu-user` binfmt handler, which must be registered with the fix-binary
 /// (`F`) flag so the interpreter is preloaded and no binary is copied into the
-/// rootfs. The `F` flag makes the kernel open and hold the interpreter at
-/// registration time, so it keeps working after the cage pivots into the target
-/// rootfs, where the interpreter's own path no longer resolves; the launch path
-/// never touches the binfmt registration. A clear, actionable message names the
-/// remedy and points at extract-only as the alternative.
+/// root filesystem. The `F` flag makes the kernel open and hold the interpreter
+/// at registration time, so it keeps working after the cage pivots into the
+/// target root, where the interpreter's own path no longer resolves; the launch
+/// path never touches the binfmt registration. The question and its message are
+/// [`binfmt::preflight`]'s, which the Alpine layer asks too; the architecture
+/// names are this layer's.
 pub(crate) fn preflight_foreign(host: &str, target: &str) -> Result<(), String> {
     if runs_natively(host, target) {
         return Ok(());
     }
-    let Some(interpreter) = qemu_interpreter(target) else {
-        return Err(format!(
-            "a full bootstrap for {target} on a {host} host needs a qemu-user binfmt \
-             handler, and {target} is not a known qemu target; use extract-only instead"
-        ));
-    };
-    binfmt::ready(interpreter).map_err(|reason| match reason {
-        binfmt::Missing::Unregistered => format!(
-            "a full bootstrap for {target} on a {host} host needs the qemu-{interpreter} \
-             binfmt handler registered (install qemu-user-static and binfmt support); \
-             use extract-only to lay out the rootfs without running target binaries"
-        ),
-        binfmt::Missing::Unusable(reason) => format!(
-            "the qemu-{interpreter} binfmt handler is registered but {reason}; a foreign \
-             bootstrap needs it enabled and registered with the fix-binary (F) flag"
-        ),
-    })
+    binfmt::preflight(host, target, qemu_interpreter(target))
 }
 
 /// The `qemu-user` interpreter the kernel will execute `architecture` binaries

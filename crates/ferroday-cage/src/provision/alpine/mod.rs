@@ -52,16 +52,17 @@ mod version;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Seek as _};
 use std::path::{Path, PathBuf};
 
-pub use index::Available;
 pub use keyring::KeySet;
 pub use pin::{UnheldPin, UnheldReason};
 pub use plan::{Plan, PlannedPackage, ResolvedIndex};
 pub use repository::{Repository, RepositoryBuilder};
 
 use super::binfmt;
+use super::cache;
 use super::coordinate::{self, Nesting};
 use super::digest::Algorithm;
 use super::extract::{Extraction, Placement};
@@ -71,7 +72,7 @@ use super::layer::Rooting;
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
-    BuildLayer, Failover, Fetch, FetchError, FetchJob, FetchRequest, HttpFetch, LimitedWriter,
+    Available, BuildLayer, Failover, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter,
     PackageCache, ProvisionError, ProvisionRequest, Provisioner, Stream, mirror_url, walk_mirrors,
 };
 use crate::IdentityMap;
@@ -1322,15 +1323,28 @@ pub trait AlpineObserver {
 
     /// Whether the bootstrap should stop.
     ///
-    /// Consulted where stopping is clean — a package boundary, a script
-    /// boundary. Returning `true` aborts with [`ProvisionError::Cancelled`],
-    /// and a run driven through [`provision::ensure`](super::ensure) then
-    /// removes the staging tree, so a cancelled bootstrap leaves no destination
-    /// behind.
+    /// Consulted where stopping is clean — a package boundary, a mirror a
+    /// download walks, a batch of downloads, a script boundary — and on each
+    /// write of a package's body as it downloads. Returning `true` aborts with
+    /// [`ProvisionError::Cancelled`], and a run driven through
+    /// [`provision::ensure`](super::ensure) then removes the staging tree, so a
+    /// cancelled bootstrap leaves no destination behind.
     ///
     /// [`ProvisionError::Cancelled`]: super::ProvisionError::Cancelled
     fn cancelled(&mut self) -> bool {
         false
+    }
+}
+
+/// A download's view of the observer: the layer's own fetch event, and its
+/// answer to whether the run should stop.
+impl cache::Watch for dyn AlpineObserver + '_ {
+    fn fetching(&mut self, url: &str) {
+        self.progress(AlpineEvent::Fetching { url });
+    }
+
+    fn cancelled(&mut self) -> bool {
+        AlpineObserver::cancelled(self)
     }
 }
 
@@ -1794,6 +1808,12 @@ fn joined(carried: &[String], mine: impl IntoIterator<Item = String>) -> Vec<Str
 /// publishes no digest of the whole file, so what identifies a package is its
 /// signature, the control identity the index recorded, and the `datahash`
 /// binding its file tree — all of which this reads anyway.
+///
+/// A download is held to the same read ([`read_acquired`]) before it is
+/// published, so the cache never holds a package that was not checked, and the
+/// [`Acquired`] that check produced is the one the root is laid down from. Each
+/// package is read once, whichever produced it.
+///
 /// Each package is fetched over the mirrors of the repository that serves the
 /// index it came from, walked in configured order, so a package that has rotated
 /// off a live mirror is served by that repository's backstop. The plan's own
@@ -1807,8 +1827,7 @@ fn acquire(
     cache: &Path,
     observer: &mut dyn AlpineObserver,
 ) -> Result<Vec<Acquired>, ProvisionError> {
-    std::fs::create_dir_all(cache)
-        .map_err(|err| ProvisionError::io("creating the package directory", cache, err))?;
+    cache::create(cache)?;
 
     // Positional, and `validate_plan` has already held the plan to it, so a slot
     // a package names is one this resolves.
@@ -1817,8 +1836,9 @@ fn acquire(
     // The cache pass and the announcement, before anything is fetched: what a
     // caller is told it is downloading is what the batch and the walk between
     // them go on to fetch, in the order the plan names them.
+    let mut acquired: Vec<Option<Acquired>> = Vec::with_capacity(plan.packages.len());
     let mut missing: Vec<Missing<'_>> = Vec::new();
-    for planned in &plan.packages {
+    for (at, planned) in plan.packages.iter().enumerate() {
         if observer.cancelled() {
             return Err(ProvisionError::Cancelled);
         }
@@ -1850,14 +1870,19 @@ fn acquire(
 
         // A cached entry that does not read back as this package is not an
         // error; it is a download waiting to happen.
-        if read_acquired(&path, planned, architecture).is_err() {
+        let held = cache::open_entry(&path)
+            .map_err(AlpineError::at("reading a package", &path))
+            .and_then(|file| read_acquired(file, &path, planned, architecture));
+        if held.is_err() {
             missing.push(Missing {
+                at,
                 planned,
                 index,
                 mirrors,
                 path,
             });
         }
+        acquired.push(held.ok());
     }
 
     // Announced over what is actually being fetched, once the cache has been
@@ -1874,123 +1899,87 @@ fn acquire(
         });
     }
 
-    prefetch(fetcher, &missing, architecture, observer)?;
-
-    for entry in &missing {
-        // A package boundary: whatever has been downloaded is complete and the
-        // staging tree is untouched, so stopping here costs nothing.
-        if observer.cancelled() {
-            return Err(ProvisionError::Cancelled);
+    // Every job asks the package's own first mirror, which is the one the walk
+    // would ask first too.
+    let (batched, jobs): (Vec<&Missing<'_>>, Vec<cache::Job<'_>>) = missing
+        .iter()
+        .filter_map(|entry| {
+            let mirror = entry.mirrors.first()?;
+            let job = cache::Job {
+                url: entry.url(mirror, architecture),
+                entry: entry.cache_entry(),
+            };
+            Some((entry, job))
+        })
+        .unzip();
+    let delivered = cache::prefetch(fetcher, &jobs, observer, |job, file| {
+        let entry = batched[job];
+        read_acquired(file, &entry.path, entry.planned, architecture)
+    })
+    .map_err(|failure| failure.into_provision(wrap))?;
+    for (entry, held) in batched.iter().zip(delivered) {
+        if held.is_some() {
+            acquired[entry.at] = held;
         }
-        if read_acquired(&entry.path, entry.planned, architecture).is_ok() {
-            continue;
-        }
-        download_over(
-            fetcher,
-            entry.mirrors,
-            entry.index,
-            entry.planned,
-            architecture,
-            &entry.path,
-            observer,
-        )
-        .map_err(wrap)?;
     }
 
-    plan.packages
-        .iter()
-        .map(|planned| {
-            read_acquired(&cache.join(planned.file_name()), planned, architecture).map_err(wrap)
-        })
-        .collect()
+    for entry in &missing {
+        if acquired[entry.at].is_some() {
+            continue;
+        }
+        // The walk asks the observer at each mirror and on every write of the
+        // body, so a cancelled run stops within one package's worth of bytes,
+        // and what has been published by then is complete and verified.
+        let held = cache::download(
+            fetcher,
+            entry.mirrors,
+            |mirror| entry.url(mirror, architecture),
+            entry.cache_entry(),
+            observer,
+            |file, _, _| read_acquired(file, &entry.path, entry.planned, architecture),
+            || FetchError::not_found(entry.planned.file_name()),
+        )
+        .map_err(|failure| failure.into_provision(wrap))?;
+        acquired[entry.at] = Some(held);
+    }
+
+    Ok(acquired
+        .into_iter()
+        .map(|held| held.expect("the cache, the batch or the walk acquired every package"))
+        .collect())
 }
 
 /// A package the cache does not hold, and where to fetch it from.
 struct Missing<'a> {
+    /// Its position in the plan.
+    at: usize,
     planned: &'a PlannedPackage,
     index: &'a ResolvedIndex,
     mirrors: &'a [String],
+    /// Its entry in the cache.
     path: PathBuf,
 }
 
-/// How many packages one batch asks for.
-///
-/// Each job holds an open staging file for as long as the batch runs, so this
-/// is a bound on descriptors rather than on the transport, which decides for
-/// itself how many of a batch to have in flight. It is also the granularity a
-/// cancelled bootstrap stops at, which is the reason it is not larger.
-const BATCH: usize = 32;
+impl Missing<'_> {
+    /// The package's URL on `mirror`.
+    fn url(&self, mirror: &str, architecture: &str) -> String {
+        mirror_url(
+            &self.index.directory_under(mirror),
+            &format!("{architecture}/{}", self.planned.file_name()),
+        )
+    }
 
-/// Fills the cache with the packages a bootstrap is about to install, several
-/// at a time, through [`Fetch::fetch_all`].
-///
-/// Every job asks the package's own first mirror, which is the one the walk
-/// would ask first too. A job that does not arrive leaves the cache without
-/// that package and the walk that follows fetches it with every mirror
-/// available to it, so this is an optimization and nothing more. What the
-/// rename publishes is a *complete* body rather than a verified one, exactly as
-/// [`download`] does: the verification is the read that follows, which is the
-/// same read a cache hit goes through.
-fn prefetch(
-    fetcher: &mut dyn Fetch,
-    missing: &[Missing<'_>],
-    architecture: &str,
-    observer: &mut dyn AlpineObserver,
-) -> Result<(), ProvisionError> {
-    for batch in missing.chunks(BATCH) {
-        if observer.cancelled() {
-            return Err(ProvisionError::Cancelled);
-        }
-        let mut staged = Vec::with_capacity(batch.len());
-        for entry in batch {
-            let Some(mirror) = entry.mirrors.first() else {
-                continue;
-            };
-            let url = mirror_url(
-                &entry.index.directory_under(mirror),
-                &format!("{architecture}/{}", entry.planned.file_name()),
-            );
-            observer.progress(AlpineEvent::Fetching { url: &url });
-            let path = super::staging_path(&entry.path);
-            let Ok(file) = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            else {
-                continue;
-            };
-            // Capped as the per-package download is: the size travels with
-            // the request, but a transport is free to ignore it.
-            let sink = std::io::BufWriter::new(file);
-            let cap = entry.planned.size.unwrap_or(u64::MAX);
-            staged.push((entry, url, path, LimitedWriter::new(sink, cap)));
-        }
-
-        let outcomes = {
-            let mut jobs: Vec<FetchJob<'_>> = staged
-                .iter_mut()
-                .map(|(entry, url, _path, sink)| {
-                    let request = FetchRequest::new(url);
-                    let request = match entry.planned.size {
-                        Some(size) => request.sized(size),
-                        None => request,
-                    };
-                    FetchJob::new(request, sink)
-                })
-                .collect();
-            fetcher.fetch_all(&mut jobs)
-        };
-
-        for ((entry, _url, path, sink), outcome) in staged.into_iter().zip(outcomes) {
-            let published = outcome.is_ok()
-                && sink.into_inner().into_inner().is_ok()
-                && std::fs::rename(&path, &entry.path).is_ok();
-            if !published {
-                let _ = std::fs::remove_file(&path);
-            }
+    /// The cache entry the download fills, held to the index's `S:`.
+    ///
+    /// A length a verified source declared, so it travels with the request as
+    /// well as capping the writer; an index that states none leaves the download
+    /// bounded by the fetcher's own ceiling, which is weaker rather than wrong.
+    fn cache_entry(&self) -> cache::Entry<'_> {
+        cache::Entry {
+            path: &self.path,
+            size: self.planned.size,
         }
     }
-    Ok(())
 }
 
 /// Reads a cached `.apk` and holds it to the plan entry it answers.
@@ -2001,9 +1990,11 @@ fn prefetch(
 /// verified index, or out of a plan a caller kept — and the package's own name,
 /// version and architecture are compared to the plan's.
 ///
-/// The file the checks were made against is carried out in the [`Acquired`],
-/// rather than the path being opened again where the tree is laid down: the two
-/// opens would be two files, and only the first of them was verified.
+/// `file` is the package, read from its start, and `path` its entry in the
+/// cache, for the errors. The file the checks were made against is carried out
+/// in the [`Acquired`], rather than the path being opened again where the tree
+/// is laid down: the two opens would be two files, and only the first of them
+/// was verified.
 ///
 /// The binding is what a signature alone cannot do. A signature says that *some*
 /// package was signed; without the binding a mirror answers a request for
@@ -2012,12 +2003,12 @@ fn prefetch(
 /// already fixed, and [`apk::Anchor`] records why it is read rather than
 /// verified.
 fn read_acquired(
+    mut file: File,
     path: &Path,
     planned: &PlannedPackage,
     architecture: &str,
 ) -> Result<Acquired, AlpineError> {
     let subject = planned.file_name();
-    let mut file = std::fs::File::open(path).map_err(AlpineError::at("reading a package", path))?;
     let size = file
         .metadata()
         .map_err(AlpineError::at("measuring a package", path))?
@@ -2068,97 +2059,6 @@ fn read_acquired(
         path: path.to_path_buf(),
         size,
     })
-}
-
-/// Downloads one package, walking the mirrors of the repository that serves it.
-///
-/// A mirror that [could not serve it](FetchError::is_failover) advances the walk
-/// and the last such failure is reported once none is left, which is the
-/// discipline the index walk and the Debian layer's package walk both follow.
-/// Nothing else advances it: a body that arrives and does not verify is refused
-/// where it is read, since what arrived was answered for by the URL that was
-/// asked for.
-fn download_over(
-    fetcher: &mut dyn Fetch,
-    mirrors: &[String],
-    index: &ResolvedIndex,
-    planned: &PlannedPackage,
-    architecture: &str,
-    dest: &Path,
-    observer: &mut dyn AlpineObserver,
-) -> Result<(), AlpineError> {
-    walk_mirrors(
-        mirrors,
-        |mirror| {
-            let url = mirror_url(
-                &index.directory_under(mirror),
-                &format!("{architecture}/{}", planned.file_name()),
-            );
-            observer.progress(AlpineEvent::Fetching { url: &url });
-            download(fetcher, &url, planned, dest)
-        },
-        || AlpineError::Fetch(FetchError::not_found(planned.file_name())),
-    )
-}
-
-/// Downloads one package into the cache, atomically.
-///
-/// The body is written to a staging file beside the destination and renamed onto
-/// it, so a partial body is never visible at the cache path and a concurrent
-/// download of the same package publishes its own file rather than consuming
-/// this one. What the rename publishes is a *complete* body rather than a
-/// verified one: the verification happens on the read that follows, which is the
-/// same read a cache hit goes through — one code path, whichever produced the
-/// file — and an entry that does not verify is downloaded again rather than
-/// trusted.
-///
-/// The index's `S:` bounds what the download may spend. It is a length a
-/// verified source declared, so it travels as [`FetchRequest::sized`] as well as
-/// capping the writer; an index that states none leaves the download bounded by
-/// the fetcher's own ceiling, which is weaker rather than wrong.
-fn download(
-    fetcher: &mut dyn Fetch,
-    url: &str,
-    planned: &PlannedPackage,
-    dest: &Path,
-) -> Result<(), AlpineError> {
-    let staged = super::staging_path(dest);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .map_err(AlpineError::at("staging a package", &staged))?;
-
-    let mut sink = std::io::BufWriter::new(file);
-    let request = FetchRequest::new(url);
-    let fetched = match planned.size {
-        Some(size) => {
-            let mut capped = LimitedWriter::new(&mut sink, size);
-            fetcher.fetch(&request.sized(size), &mut capped)
-        }
-        None => fetcher.fetch(&request, &mut sink),
-    };
-    // The last buffer is written here rather than by `BufWriter`'s own `Drop`,
-    // which has nowhere to report a failure and so swallows it. A body whose
-    // tail never reached the disk would otherwise be renamed into the cache and
-    // reported by the read that follows as a digest or container failure — an
-    // authenticity answer to a local write failure, which is the wrong thing to
-    // tell the caller and the wrong thing for them to act on.
-    let flushed = sink
-        .into_inner()
-        .map(|_| ())
-        .map_err(|err| AlpineError::at("writing a package", &staged)(err.into_error()));
-
-    let published = fetched
-        .map_err(AlpineError::Fetch)
-        .and(flushed)
-        .and_then(|()| {
-            std::fs::rename(&staged, dest).map_err(AlpineError::at("publishing a package", dest))
-        });
-    if published.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    published
 }
 
 /// The order the closure is laid down and configured in: a package after
@@ -2328,9 +2228,9 @@ fn record_entry(
 ///
 /// A bootstrap the host runs natively needs nothing. A foreign one runs the
 /// target's `busybox` and install scripts through a `qemu-user` binfmt handler,
-/// which is the kernel-side question [`binfmt::ready`] answers; the names here
-/// are Alpine's, and the mapping onto qemu's is this layer's own because each
-/// distribution spells its architectures differently.
+/// which is the kernel-side question [`binfmt::preflight`] answers and words for
+/// every layer. The names here are Alpine's, and the mapping onto qemu's is this
+/// layer's own because each distribution spells its architectures differently.
 fn preflight_foreign(host: &str, target: &str) -> Result<(), AlpineError> {
     // Identical architectures always run. Beyond that, an x86_64 host runs x86
     // binaries through the near-universal IA-32 compatibility mode, and the
@@ -2340,7 +2240,14 @@ fn preflight_foreign(host: &str, target: &str) -> Result<(), AlpineError> {
     if host == target || (host == "x86_64" && target == "x86") {
         return Ok(());
     }
-    let interpreter = match target {
+    binfmt::preflight(host, target, qemu_interpreter(target))
+        .map_err(|reason| AlpineError::Config { reason })
+}
+
+/// The `qemu-user` interpreter that runs `architecture`'s binaries, by the name
+/// its binfmt handler is registered under, or `None` where qemu has none.
+fn qemu_interpreter(architecture: &str) -> Option<&'static str> {
+    Some(match architecture {
         "x86_64" => "x86_64",
         "x86" => "i386",
         "aarch64" => "aarch64",
@@ -2349,27 +2256,7 @@ fn preflight_foreign(host: &str, target: &str) -> Result<(), AlpineError> {
         "s390x" => "s390x",
         "riscv64" => "riscv64",
         "loongarch64" => "loongarch64",
-        _ => {
-            return Err(AlpineError::Config {
-                reason: format!(
-                    "a full bootstrap for {target} on a {host} host needs a qemu-user binfmt \
-                     handler, and {target} is not a known qemu target; use extract_only instead"
-                ),
-            });
-        }
-    };
-    binfmt::ready(interpreter).map_err(|missing| AlpineError::Config {
-        reason: match missing {
-            binfmt::Missing::Unregistered => format!(
-                "a full bootstrap for {target} on a {host} host needs the qemu-{interpreter} \
-                 binfmt handler registered (install qemu-user-static and binfmt support); use \
-                 extract_only to lay out the rootfs without running target binaries"
-            ),
-            binfmt::Missing::Unusable(reason) => format!(
-                "the qemu-{interpreter} binfmt handler is registered but {reason}; a foreign \
-                 bootstrap needs it enabled and registered with the fix-binary (F) flag"
-            ),
-        },
+        _ => return None,
     })
 }
 
@@ -3270,16 +3157,26 @@ mod tests {
             .expect("it was asked for");
         let path = scratch.join(planned.file_name());
         std::fs::write(&path, fixtures::POSTMARKETOS_BASELAYOUT).expect("the package is writable");
-        let held = read_acquired(&path, planned, "x86_64")
-            .expect("the served package is the one the index named");
+        let held = read_acquired(
+            File::open(&path).expect("the package opens"),
+            &path,
+            planned,
+            "x86_64",
+        )
+        .expect("the served package is the one the index named");
         assert_eq!(held.package.info.name, "postmarketos-baselayout");
 
         // And the binding is doing real work: the same file refused where the
         // plan names another version of it.
         let mut moved = planned.clone();
         moved.version = "61-r0".to_string();
-        let err = read_acquired(&path, &moved, "x86_64")
-            .expect_err("the mirror served a package the plan did not name");
+        let err = read_acquired(
+            File::open(&path).expect("the package opens"),
+            &path,
+            &moved,
+            "x86_64",
+        )
+        .expect_err("the mirror served a package the plan did not name");
         assert!(matches!(err, AlpineError::Config { .. }), "{err}");
     }
 
@@ -3530,8 +3427,13 @@ mod tests {
             let path = cache.join(planned.file_name());
             std::fs::write(&path, container).expect("the package is writable");
             acquired.push(
-                read_acquired(&path, &planned, "x86_64")
-                    .expect("the package answers the plan entry"),
+                read_acquired(
+                    File::open(&path).expect("the package opens"),
+                    &path,
+                    &planned,
+                    "x86_64",
+                )
+                .expect("the package answers the plan entry"),
             );
         }
 
@@ -3589,15 +3491,25 @@ mod tests {
         let mut planned = planned_from(fixtures::ALPINE_BASELAYOUT, "x86_64");
         planned.name = "musl".to_string();
         planned.version = "1.2.5-r23".to_string();
-        let err = read_acquired(&path, &planned, "x86_64")
-            .expect_err("the served package is not the one the plan identified");
+        let err = read_acquired(
+            File::open(&path).expect("the package opens"),
+            &path,
+            &planned,
+            "x86_64",
+        )
+        .expect_err("the served package is not the one the plan identified");
         assert!(matches!(err, AlpineError::Digest { .. }), "{err}");
 
         // And a plan whose own fields contradict the package it identifies.
         let mut planned = planned_from(fixtures::MUSL, "x86_64");
         planned.name = "not-musl".to_string();
-        let err = read_acquired(&path, &planned, "x86_64")
-            .expect_err("the plan names a package the container does not");
+        let err = read_acquired(
+            File::open(&path).expect("the package opens"),
+            &path,
+            &planned,
+            "x86_64",
+        )
+        .expect_err("the plan names a package the container does not");
         assert!(
             matches!(&err, AlpineError::Config { reason } if reason.contains("not-musl")),
             "{err}",
@@ -3610,8 +3522,13 @@ mod tests {
         let path = scratch.join("musl-1.2.5-r23.apk");
         std::fs::write(&path, fixtures::MUSL).expect("the package is writable");
         let planned = planned_from(fixtures::MUSL, "aarch64");
-        let err = read_acquired(&path, &planned, "aarch64")
-            .expect_err("an x86_64 package is not an aarch64 one");
+        let err = read_acquired(
+            File::open(&path).expect("the package opens"),
+            &path,
+            &planned,
+            "aarch64",
+        )
+        .expect_err("an x86_64 package is not an aarch64 one");
         assert!(
             matches!(&err, AlpineError::Config { reason } if reason.contains("architecture")),
             "{err}",
@@ -4286,6 +4203,56 @@ mod tests {
         let installed = std::fs::read_to_string(root.join("lib/apk/db/installed"))
             .expect("the database is written");
         assert!(installed.contains("\nP:musl\n"), "{installed}");
+    }
+
+    #[test]
+    fn a_download_that_is_not_the_package_never_reaches_the_cache() {
+        // A download is checked as a cache hit is, before it is renamed into
+        // the cache, so a mirror serving another package under the planned
+        // package's name leaves nothing at the cache path for a later run, or
+        // another run sharing the cache, to meet.
+        let scratch = Scratch::new("alpine-download-checked");
+        let repository = scratch.join("mirror/v3.23/main/x86_64");
+        std::fs::create_dir_all(&repository).expect("the repository tree is creatable");
+        std::fs::write(repository.join("APKINDEX.tar.gz"), fixtures::INDEX)
+            .expect("the index is writable");
+        std::fs::write(repository.join("musl-1.2.5-r23.apk"), fixtures::MUSL)
+            .expect("the package is writable");
+        let mirror =
+            crate::provision::file_url(&scratch.join("mirror")).expect("the path is nameable");
+        let plan = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .include(["musl"])
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect("musl resolves");
+
+        // The mirror now answers for musl with a validly signed package that is
+        // not musl.
+        std::fs::write(
+            repository.join("musl-1.2.5-r23.apk"),
+            fixtures::ALPINE_BASELAYOUT,
+        )
+        .expect("the package is writable");
+        let cache = scratch.join("cache");
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .plan(plan)
+            .extract_only(true)
+            .cache_dir(&cache)
+            .build()
+            .expect("the bootstrap configures");
+        let err = crate::provision::ensure(scratch.join("root"), &mut alpine)
+            .expect_err("the package served is not the one planned");
+        assert!(err.to_string().contains("musl"), "{err}");
+        let held: Vec<_> = std::fs::read_dir(&cache)
+            .expect("the cache was created")
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(held.is_empty(), "the cache holds {held:?}");
     }
 
     #[test]

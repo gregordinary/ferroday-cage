@@ -19,13 +19,14 @@
 //! letters are ignored and unknown syntax is refused.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 use super::AlpineError;
 use super::pin::{Fit, Pins};
 use super::sign::IDENTITY_PREFIX;
 use super::version::{self, Constraint};
+use crate::provision::Available;
 
 /// The architecture value a package carries when it belongs to every
 /// architecture the repository serves: in an index's `A:`, a `.PKGINFO`'s
@@ -531,70 +532,6 @@ impl Index {
     /// records to back a membership question would be the wrong trade.
     pub(super) fn into_available(self) -> Available {
         Available::new(self.by_name.into_keys().collect(), self.providers)
-    }
-}
-
-/// The package names a configured set of repositories offers.
-///
-/// Produced by [`Alpine::available`](super::Alpine::available). It is a
-/// snapshot: the repositories it was built from can publish at any time, so a
-/// name it reports is a name that was there when the index was read.
-///
-/// # Stability
-///
-/// Opaque, and deliberately so: what it stores is an implementation detail, and
-/// a caller sees only the questions it answers.
-pub struct Available {
-    /// Every resolvable name: the real packages of the merged index, plus every
-    /// virtual name something in it provides.
-    names: HashSet<String>,
-    /// Each virtual name's providers, sorted, as the index indexed them.
-    providers: HashMap<String, Vec<String>>,
-}
-
-impl fmt::Debug for Available {
-    /// Renders how much was read rather than what. A merged archive is tens of
-    /// thousands of names, and a rendering that listed them would fill a log
-    /// with something no reader can act on.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Available")
-            .field("names", &self.names.len())
-            .field("virtual_names", &self.providers.len())
-            .finish()
-    }
-}
-
-impl Available {
-    /// Builds the projection from a merged index's two name sets.
-    fn new(real: HashSet<String>, providers: HashMap<String, Vec<String>>) -> Available {
-        let mut names = real;
-        names.extend(providers.keys().cloned());
-        Available { names, providers }
-    }
-
-    /// Whether `name` resolves in these repositories, as a real package or as a
-    /// virtual name something provides.
-    ///
-    /// Availability is answered at the level of the name: this reports whether
-    /// the repositories offer the name, not whether they offer a version
-    /// satisfying some constraint.
-    pub fn contains(&self, name: &str) -> bool {
-        self.names.contains(name)
-    }
-
-    /// The real packages that provide the virtual name `name`, in a stable
-    /// order.
-    ///
-    /// Empty for a name nothing provides, which includes an ordinary real
-    /// package: a package is not a provider of itself unless its own `p:` says
-    /// so. Reporting them lets a caller say *what* satisfies a name such as
-    /// `so:libc.musl-x86_64.so.1` rather than only that something does.
-    pub fn providers(&self, name: &str) -> impl Iterator<Item = &str> {
-        self.providers
-            .get(name)
-            .map_or(&[][..], Vec::as_slice)
-            .iter()
-            .map(String::as_str)
     }
 }
 

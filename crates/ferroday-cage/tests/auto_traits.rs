@@ -112,16 +112,19 @@ const _: () = assert_send::<ferroday_cage::provision::Tarball>();
 
 // ---------------------------------------------------------------------------
 // What every userland provisioner shares: the transport seam, the overlay upper
-// a layered build stages into, and the stream an in-cage command's output is
-// attributed to.
+// a layered build stages into, the stream an in-cage command's output is
+// attributed to, and the names a set of repositories offers.
 // ---------------------------------------------------------------------------
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod shared {
-    use ferroday_cage::provision::{BuildLayer, FetchError, FetchRequest, HttpFetch, Stream};
+    use ferroday_cage::provision::{
+        Available, BuildLayer, FetchError, FetchRequest, HttpFetch, Stream,
+    };
 
     use super::*;
 
+    const _: () = assert_send_sync::<Available>();
     const _: () = assert_send_sync::<FetchError>();
     const _: () = assert_send_sync::<FetchRequest<'_>>();
     const _: () = assert_send_sync::<HttpFetch>();
@@ -167,7 +170,6 @@ mod alpine {
     use super::*;
 
     const _: () = assert_send_sync::<alpine::AlpineError>();
-    const _: () = assert_send_sync::<alpine::Available>();
     const _: () = assert_send_sync::<alpine::KeySet>();
     const _: () = assert_send_sync::<alpine::Repository>();
     const _: () = assert_send_sync::<alpine::RepositoryBuilder>();
