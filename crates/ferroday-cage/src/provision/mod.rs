@@ -1398,15 +1398,23 @@ impl PackageCache {
                 path: dir.to_path_buf(),
                 owned: false,
             },
-            None => {
-                let mut sibling = tree.as_os_str().to_os_string();
-                sibling.push(suffix);
-                PackageCache {
-                    path: PathBuf::from(sibling),
-                    owned: true,
-                }
-            }
+            None => PackageCache {
+                path: PackageCache::derived(tree, suffix),
+                owned: true,
+            },
         }
+    }
+
+    /// The directory a run building `tree` derives for itself, and removes,
+    /// when the caller names none: the sibling of the tree named after it with
+    /// `suffix`.
+    ///
+    /// Answered on its own so a caller can tell whether a directory it was
+    /// handed is that one, which the run would remove as its own.
+    pub(crate) fn derived(tree: &Path, suffix: &str) -> PathBuf {
+        let mut sibling = tree.as_os_str().to_os_string();
+        sibling.push(suffix);
+        PathBuf::from(sibling)
     }
 
     /// The directory itself, to download into and to read back from.

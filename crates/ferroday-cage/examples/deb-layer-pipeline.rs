@@ -258,7 +258,7 @@ fn build_component(config: &Config, at: usize, source: &Path) -> Result<(), Stri
     // plus the pool the earlier components have fed.
     let control = std::fs::read_to_string(source.join("debian/control"))
         .map_err(|error| format!("cannot read {name}'s debian/control: {error}"))?;
-    let build_deps = build_depend_names(&control);
+    let build_deps = build_depend_names(&control, &config.arch);
 
     let pool_repo = pool_repository(config)?;
     let upper = config.base.with_file_name(format!(".{name}.layer"));

@@ -114,7 +114,8 @@ provisioning into a logging system writes one adapter. The `Tarball` provisioner
 reports each entry and its progress through the archive. The [Debian
 provisioner](debian.md) reports its own richer events through the
 `ProvisionEvent::Debian` variant: fetches, resolution, downloads, and dpkg's
-output. It honors the same cancellation check between packages. The [Alpine
+output. It honors the same cancellation check at each mirror, between packages,
+and between dpkg waves. The [Alpine
 provisioner](alpine.md) reports the same progress through
 `ProvisionEvent::Alpine`, and the [Gentoo provisioner](gentoo.md) through
 `ProvisionEvent::Gentoo`. A consumer reports any of the userlands by changing

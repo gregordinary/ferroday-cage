@@ -71,6 +71,10 @@ consumer upgrading can skip it.
 - Only a text signature verifies a cleartext-signed document. A standalone or
   timestamp signature by an archive key covers no document, and rPGP verified
   one against any body sharing its first byte.
+- The Debian provisioner bounds a package index's decompression by the
+  uncompressed length the signed release states for it, or by 256 MiB where the
+  release states none, and refuses an index that expands past it. A few
+  megabytes of compressed index could expand without bound in memory.
 - The Gentoo binary-package index, which nothing signs, is read only as gzip or
   plain text, the two forms the archive publishes, and is refused rather than
   truncated when it decompresses past 256 MiB. Its parser bounds how deeply
@@ -87,6 +91,17 @@ consumer upgrading can skip it.
   `cache_dir` no longer serve each other's builds: an `x86-64-v3` build could
   reach an `x86-64` root. Containers cached under the previous layout are not
   read again and can be deleted.
+- A Debian bootstrap with a `cache_dir` installs from a copy of each package in
+  a directory only the run writes, so dpkg reads the bytes the extraction
+  verified. It re-read each package from the shared cache, by path, minutes
+  after verifying it.
+- A Debian bootstrap initializes the dpkg database through the tree's own root,
+  so a package that ships `var/lib/dpkg` or `var/lib/dpkg/status` as a symbolic
+  link out of the tree cannot make the bootstrap create files on the host.
+- A Debian repository's mirror URL holding whitespace or a control character is
+  refused at `build`. It is written verbatim into the finished root's
+  `sources.list`, where a space split the line and a newline added a source of
+  its own.
 
 ### Added
 
@@ -116,6 +131,11 @@ consumer upgrading can skip it.
   days the run wrote into `/etc/shadow` and `/etc/shadow-` are rewritten once
   the scripts have run. A negative epoch is refused at `build`. `fcage`:
   `--alpine-source-date-epoch EPOCH`.
+- `debian::PlannedPackage::size` records the length of the `.deb`, written as
+  `Size` in a plan document. Installing a plan holds each download to it.
+- `DebianError::Cancelled`, which `Debian::observe(..).resolve()` and
+  `.available()` return when the observer cancels. They stop at each mirror the
+  release and index walks ask, and a bootstrap also stops before each dpkg wave.
 
 ### Changed
 
@@ -142,6 +162,38 @@ consumer upgrading can skip it.
   `dbus`'s service generates a fresh id from the missing file before it starts.
   A program that asks for the machine id in a sandbox now finds none until
   `dbus-uuidgen --ensure=/etc/machine-id` runs in the root.
+- **Breaking.** A Debian bootstrap no longer writes its trust anchor over the
+  `debian-archive-keyring` package's own file, where the package's next upgrade
+  replaced a caller's keyring with Debian's. A keyring given with
+  `DebianBuilder::keyring` is written to
+  `/usr/share/keyrings/fcage-archive-keyring.gpg`, a path no package ships, and
+  the root's `sources.list` names it. With the embedded keyring, `sources.list`
+  names the package's `/usr/share/keyrings/debian-archive-keyring.gpg` where dpkg
+  records the package as installed and owning that file, so the root follows
+  the archive's key rotation; a root without it gets the embedded keyring at the
+  `fcage-archive-keyring` path. An additional repository whose keyring would
+  take either path is refused.
+- **Breaking.** `debian::DebianError::HashMismatch { path, .. }` is
+  `DebianError::Digest { subject, expected, actual }`, the shape the Alpine and
+  Gentoo errors use: `subject` is the URL the bytes were fetched from, or the
+  path of a cached package. `Signature`, `Release`, and `Index` gain a
+  `subject`, the URL of the release or of the index. A release that lists no
+  index for a component is reported as `Release`, and an index that does not
+  decompress as `Index` rather than `Io`.
+- **Breaking.** `debian::build_depend_names` takes the architecture the root is
+  built for, and evaluates each alternative's architecture restriction against
+  it: literal names, `any`, `<os>-any`, and `any-<cpu>`. It chooses the first
+  alternative that applies. The restrictions were ignored, so a control file
+  with a `[hurd-any]` dependency failed to resolve.
+- `DebianBuilder::build` and `debian::RepositoryBuilder::build` parse a caller's
+  keyring and refuse one holding no usable key with `DebianError::Config`. A bad
+  keyring failed only after the first release had been fetched.
+- `DebianBuilder::build` refuses `extract_only` alongside `base_layer`.
+  `stage_layer` configured the increment regardless, so the setting was ignored.
+- `provision::file_url` percent-encodes every byte outside the unreserved set
+  and `/`, so a path holding a space, a newline, or a non-UTF-8 byte names one
+  URL, and the bundled fetcher decodes it back. It no longer fails for a
+  non-UTF-8 path.
 
 ### Fixed
 
@@ -149,6 +201,12 @@ consumer upgrading can skip it.
   named pipe left at that path. Opening one for reading waited for a writer that
   never came, which stalled the bootstrap for good. It is now refused, as any
   path that is not a regular file is.
+- A Debian or Gentoo cache entry that does not verify is downloaded again in the
+  same run, as an Alpine one already was. A corrupt `.deb` the batched prefetch
+  did not deliver was kept, and every later run failed extracting it; a Gentoo
+  stage3 or binary package failed the run.
+- `DebianEvent::Downloading` counts the packages being downloaded rather than the
+  plan's, as `AlpineEvent::Downloading` does.
 - Gentoo atoms follow portage and the package manager specification. A
   `=cat/pkg-1.2*` atom matches only at a version-part boundary, so
   `=dev-lang/python-3.1*` no longer admits 3.12. A package name may not contain

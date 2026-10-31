@@ -9,16 +9,19 @@
 //!
 //! The constraint is applied where the index is built, in
 //! [`Index::merge`](super::index::Index::merge), because that is the one place
-//! a version is chosen. A pinned name whose version no repository offers keeps
-//! the highest instead, so [`Pins::check`] can report what the archives carry
-//! rather than only that something is missing; the check runs before the
-//! closure is computed, so the fallback is never resolved against.
+//! a version is chosen. Where several repositories offer the pinned version,
+//! the one recording the pinned bytes is kept, so a repository that rebuilt the
+//! version cannot shadow one that still carries the original. A pinned name
+//! whose version no repository offers keeps the highest instead, so
+//! [`Pins::check`] can report what the archives carry rather than only that
+//! something is missing; the check runs before the closure is computed, so the
+//! fallback is never resolved against.
 
 use std::collections::HashMap;
 use std::fmt;
 
 use super::DebianError;
-use super::index::Index;
+use super::index::{Index, Package};
 use super::plan::Plan;
 use super::version;
 
@@ -87,6 +90,26 @@ impl Pins {
             .is_some_and(|pinned| version::compare(&pinned.version, version).is_eq())
     }
 
+    /// How closely `package` answers what this pin holds its name to.
+    ///
+    /// A package whose name the pin does not hold answers
+    /// [`PinMatch::Neither`], as one at another version does.
+    pub(super) fn matching(&self, package: &Package) -> PinMatch {
+        if !self.holds(&package.name, &package.version) {
+            return PinMatch::Neither;
+        }
+        // A plain `==`, as in `check` below and for the same reason.
+        if self
+            .by_name
+            .get(&package.name)
+            .is_some_and(|pinned| pinned.sha256 == package.sha256)
+        {
+            PinMatch::VersionAndBytes
+        } else {
+            PinMatch::Version
+        }
+    }
+
     /// Checks that the merged index can supply every pinned package at the
     /// version and with the bytes the pin records.
     ///
@@ -135,6 +158,18 @@ impl Pins {
         unheld.sort_by(|a, b| a.package.cmp(&b.package));
         Err(DebianError::Pin { unheld })
     }
+}
+
+/// How closely one index entry answers a pin, ordered from the least to the
+/// most: a merge keeps the closest entry a pinned name is offered at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum PinMatch {
+    /// Another version, or a name the pin does not hold.
+    Neither,
+    /// The pinned version, recording other bytes than the pin does.
+    Version,
+    /// The pinned version and the pinned bytes.
+    VersionAndBytes,
 }
 
 /// One package a [`pin`](super::DebianBuilder::pin) could not be held to.
@@ -343,6 +378,45 @@ mod tests {
             }
             other => panic!("expected a pin refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_repository_with_the_pinned_bytes_wins_over_an_earlier_one_without_them() {
+        // One version in two repositories, rebuilt in the first: an exact tie
+        // otherwise resolves to the earlier repository, which would refuse a pin
+        // the later repository can hold. Whichever order they are offered in,
+        // the entry with the pinned bytes is the one kept.
+        let rebuilt = stanza("p", "1.0", B);
+        let original = stanza("p", "1.0", A);
+        let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+        for inputs in [
+            [(0, rebuilt.as_str()), (1, original.as_str())],
+            [(0, original.as_str()), (1, rebuilt.as_str())],
+        ] {
+            let index = Index::merge(inputs, "amd64", &pins);
+            let kept = index.get("p").expect("p is in the index");
+            assert_eq!(kept.sha256, A, "offered as {inputs:?}");
+            pins.check(&index)
+                .expect("a repository holds the pinned bytes");
+        }
+
+        // A pinned version with the pinned bytes nowhere is still the version a
+        // merge keeps over a higher one, so the refusal names the digest rather
+        // than another version.
+        let higher = stanza("p", "2.0", A);
+        let index = Index::merge(
+            [(0, higher.as_str()), (1, rebuilt.as_str())],
+            "amd64",
+            &pins,
+        );
+        assert!(
+            matches!(
+                pins.check(&index),
+                Err(DebianError::Pin { ref unheld })
+                    if matches!(unheld[0].reason, UnheldReason::Digest { .. }),
+            ),
+            "the pinned version is kept and its bytes refused",
+        );
     }
 
     #[test]

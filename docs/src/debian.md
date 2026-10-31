@@ -54,11 +54,15 @@ A bootstrap runs in stages:
    bootstrap. Because configuration runs in the sandbox, it needs no privilege
    on the host.
 
-   It writes the tree's `sources.list` and installs the archive keyring as its
-   `signed-by` trust anchor, so the finished tree is apt-usable. An in-sandbox
-   `apt-get update` verifies the release against that keyring without the
-   `debian-archive-keyring` package, which the base install set does not pull
-   in.
+   It writes the tree's `sources.list` with a `signed-by` keyring, so the
+   finished tree is apt-usable. A release verified against the embedded archive
+   keyring names `/usr/share/keyrings/debian-archive-keyring.gpg`. That file
+   belongs to the `debian-archive-keyring` package `apt` depends on, whose
+   upgrades deliver the keys the archive rotates to, and nothing is written over
+   it. A keyring supplied with [`keyring`] is written to
+   `/usr/share/keyrings/fcage-archive-keyring.gpg`, a path no package ships, and
+   keeping it current is the caller's. A tree without the keyring package gets
+   the embedded keyring at that path instead.
 
    Under the single-identity map it also configures apt to run its download
    methods as root. The `_apt` user apt would otherwise drop to is not
@@ -100,13 +104,19 @@ for a tree that goes on to be exported.
 that resolves the same version then reuses the file instead of fetching it
 again. Entries are content-addressed by digest, and every reuse verifies the
 file against that digest. A truncated or altered entry is therefore downloaded
-again rather than trusted. A cache directory is the caller's: it is created if
-absent and never removed, which is what makes it a cache.
+again rather than trusted, from every mirror the package's repository lists. A
+cache directory is the caller's: it is created if absent and never removed,
+which is what makes it a cache.
 
 Without one, packages are downloaded into a directory beside the tree being
 built and discarded when the run ends. That holds whether the run succeeded or
 failed, so a bootstrap that fails partway leaves nothing beside the tree it did
 not publish.
+
+With one, the packages a run installs are first copied from the cache into that
+same run-owned directory. Extraction verifies the copy, and every dpkg wave
+reads the copy. A cache is shared and outlives the run, so a package replaced
+there after it was verified never reaches dpkg.
 
 A package is never held in memory. The bytes are written to a staging file as
 they arrive and digested on the way through. The file is renamed into the cache
@@ -821,6 +831,7 @@ SHA256: 7b217b217b217b217b217b217b217b217b217b217b217b217b217b217b217b21
 Filename: pool/main/b/base-files/base-files_13.6_arm64.deb
 Archive: 0
 Installed-Size: 340
+Size: 69412
 
 Package: local-tool
 Version: 2.4-1
@@ -841,8 +852,8 @@ an absent optional field being absent rather than empty. `local-tool` names
 `Archive: 1`, which is what says it will be fetched from the pool rather than
 from the Debian mirror.
 
-`Installed-Size` and `Source` are optional, and each stanza above carries one of
-them to show it.
+`Installed-Size`, `Source`, and `Size` are optional, and the stanzas above carry
+them between them to show each.
 
 `Installed-Size` is the archive's own figure, in the kibibytes [Debian Policy
 5.6.20](https://www.debian.org/doc/debian-policy/ch-controlfields.html#installed-size)
@@ -851,6 +862,11 @@ against a mirror's value directly. It is an estimate. The package's build produc
 its staged tree, so it neither measures an installed filesystem nor accounts for
 the target's block size. A total over a plan is best presented as the archive's
 accounting rather than as what an image will weigh.
+
+`Size` is the length of the `.deb` in bytes, as the index states it. Installing
+a plan fetches no index, so this is what bounds the download before its digest
+is checked. A stanza without one leaves the download bounded by the fetcher's
+own ceiling, which is weaker rather than wrong.
 
 `Source` names the source package a binary package was built from, with any
 parenthesized source version dropped. It is absent for the common case of a
@@ -900,8 +916,8 @@ library that share a `Format` version it is byte-identical too, in both
 directions. A document the newer writes reads and re-writes unchanged through
 the older. A field added to the format is written after every field the older
 readers knew. That is exactly where those readers put a field they do not know
-back. `Installed-Size` and `Source` sit after `Archive` for that reason
-rather than beside the fields they describe.
+back. `Installed-Size`, `Source`, and `Size` sit after `Archive` for that
+reason rather than beside the fields they describe.
 
 What no round trip can promise is byte identity across *writers*. Another
 implementation of this format might interleave its fields with the known ones
@@ -1244,6 +1260,11 @@ its layers must share a suite, an architecture, and an [identity
 map](identity-maps.md). A base configured under one map carries ownership a
 layer under another would not agree with.
 
+The increment is always configured. Running dpkg over the merged view is what
+registers it in the base's database, so `extract_only` alongside `base_layer` is
+refused at `build`. An extract-only increment would leave files in the merged
+root that no database records.
+
 The increment's configuration runs the target's binaries, so a foreign
 architecture needs the same `qemu-user` binfmt handler a full bootstrap does.
 Staging roots a sandbox on an unprivileged overlay, which the host must support.
@@ -1297,12 +1318,13 @@ refuses a document of more than 8,192 lines or 16 signatures. Each bound keeps a
 mirror from choosing how much work checking its answer costs. A release past
 one is refused, never read short.
 
-A different keyring is supplied with [`keyring`]. [`trust_unsigned`] accepts an
-unsigned `Release` for a local mirror under the caller's control, the equivalent
-of apt's `trusted=yes`. It removes the only authenticity check, leaving the
-transport to supply one. So `build` requires a transport that does: every mirror
-of an unsigned repository must be `file://` or `https://`. Any other scheme is
-refused, `http://` among them.
+A different keyring is supplied with [`keyring`]. `build` reads and parses it, so
+a file that holds no usable key is refused there, before anything is fetched.
+[`trust_unsigned`] accepts an unsigned `Release` for a local mirror under the
+caller's control, the equivalent of apt's `trusted=yes`. It removes the only
+authenticity check, leaving the transport to supply one. So `build` requires a
+transport that does: every mirror of an unsigned repository must be `file://` or
+`https://`. Any other scheme is refused, `http://` among them.
 
 The rule is an allow-list rather than a refusal of `http://`. A refusal names
 only the plaintext scheme it was written for, and a caller-supplied transport
@@ -1384,6 +1406,12 @@ One naming any other host is refused rather than read as a path relative to the
 current directory. [`file_url`] builds the URL for a local path, and is what
 [`Pool::mirror_url`] answers with. It makes a relative path absolute. Such a URL
 carries a path from a root and has no way to spell one that is not.
+
+[`file_url`] writes a byte a URL cannot hold as written as a percent escape, so
+`/srv/My Pool` becomes `file:///srv/My%20Pool`. The bundled fetcher and apt both
+decode it back into the path. A mirror URL is one word of the finished tree's
+`sources.list`, so one carrying whitespace or a control character is refused at
+`build`.
 
 A transport is `Send`, because the provisioner owns it and is itself `Send`.
 [Thread bounds](stability.md#thread-bounds) covers the rule.

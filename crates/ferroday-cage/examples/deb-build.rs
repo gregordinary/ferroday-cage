@@ -337,8 +337,11 @@ fn run(config: Config) -> ExitCode {
 /// declared build dependencies. An already-provisioned root is reused as it
 /// stands, so its baked dependency set is whatever the first run installed.
 fn provision(config: &Config, control: &Path) -> Result<(), ExitCode> {
+    // The bootstrap below names no architecture, so it targets the host's, and
+    // the restrictions in the control file are evaluated against that.
+    let architecture = provision::debian::host_architecture();
     let declared = std::fs::read_to_string(control)
-        .map(|text| provision::debian::build_depend_names(&text))
+        .map(|text| provision::debian::build_depend_names(&text, &architecture))
         .unwrap_or_default();
 
     let mut builder = Debian::builder(&config.suite)

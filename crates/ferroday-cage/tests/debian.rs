@@ -1800,21 +1800,44 @@ fn full_bootstrap_configures_a_runnable_trixie() {
             .expect("the full bootstrap runs");
     }
 
-    // The finished rootfs is apt-usable: the archive keyring is written as the
-    // signed-by trust anchor, and the sources.list references it. The base
-    // closure does not install debian-archive-keyring, so without this the
-    // apt-get update below would have no key to verify the release against.
-    let anchor = std::fs::read(rootfs.join("usr/share/keyrings/debian-archive-keyring.gpg"))
-        .expect("the trust anchor is written");
-    assert!(
-        !anchor.is_empty(),
-        "the trust anchor holds the archive keyring the release was verified against",
-    );
+    // The finished rootfs is apt-usable. The release was verified against the
+    // embedded archive keyring, and apt depends on debian-archive-keyring, so
+    // the sources.list names the keyring that package installed: its upgrades
+    // deliver the keys the archive rotates to. No copy is written beside it.
     let sources = std::fs::read_to_string(rootfs.join("etc/apt/sources.list"))
         .expect("the sources.list is written");
     assert!(
         sources.contains("[signed-by=/usr/share/keyrings/debian-archive-keyring.gpg]"),
-        "the sources.list is signed-by the trust anchor: {sources:?}"
+        "the sources.list names the package's keyring: {sources:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(rootfs.join("usr/share/keyrings/fcage-archive-keyring.gpg"))
+            .is_err(),
+        "a default bootstrap writes no keyring of its own",
+    );
+
+    // The files the keyring package ships are its own: nothing the bootstrap
+    // wrote went over them, so the package's next upgrade has nothing to put
+    // back.
+    let mut verify = Vec::new();
+    struct Collect<'a>(&'a mut Vec<u8>);
+    impl ferroday_cage::Observer for Collect<'_> {
+        fn stdout(&mut self, chunk: &[u8]) {
+            self.0.extend_from_slice(chunk);
+        }
+    }
+    let status = ferroday_cage::Cage::builder()
+        .rootfs(&rootfs)
+        .command("/usr/bin/dpkg")
+        .args(["--verify", "debian-archive-keyring"])
+        .build()
+        .expect("the cage builds")
+        .run_with(&mut Collect(&mut verify))
+        .expect("dpkg runs in the finished rootfs");
+    assert!(
+        status.success() && verify.is_empty(),
+        "debian-archive-keyring's files are the package's own: {}",
+        String::from_utf8_lossy(&verify),
     );
 
     // Every base package reached the installed state; run dpkg in the cage
@@ -1832,9 +1855,9 @@ fn full_bootstrap_configures_a_runnable_trixie() {
         "dpkg --list succeeds in the bootstrapped rootfs"
     );
 
-    // The real proof of the trust anchor: apt-get update verifies the release
-    // from inside the rootfs against the signed-by keyring. A missing or
-    // untrusted anchor makes apt exit non-zero here.
+    // The real proof of the anchor: apt-get update verifies the release from
+    // inside the rootfs against the signed-by keyring. A missing or untrusted
+    // keyring makes apt exit non-zero here.
     let status = ferroday_cage::Cage::builder()
         .rootfs(&rootfs)
         .network(ferroday_cage::Network::Host)
@@ -2899,7 +2922,10 @@ fn a_pinned_install_refuses_a_digest_mismatch_without_trying_elsewhere() {
     let (dir, mirror, plan) = resolved_fixture("debian-pinned-mismatch");
     let pool_deb = dir.join("repo").join(&plan.packages[0].filename);
     let mut bytes = std::fs::read(&pool_deb).unwrap();
-    bytes.extend_from_slice(b"tampered");
+    // Altered in place rather than extended: the plan records the length too,
+    // and a body longer than that is refused before its digest is taken.
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
     std::fs::write(&pool_deb, &bytes).unwrap();
 
     let mut pinned = Debian::builder("trixie")
@@ -3217,7 +3243,10 @@ fn hermetic_a_pin_holds_the_archive_half_and_lets_a_local_build_float() {
     let rootfs = dir.join("replayed");
     let refusal = provision::ensure(&rootfs, &mut verbatim)
         .expect_err("the recompiled kernel does not match the recorded digest");
-    assert!(refusal.to_string().contains("recorded digest"), "{refusal}",);
+    assert!(
+        refusal.to_string().contains("digest the archive recorded"),
+        "{refusal}",
+    );
 
     // The same plan with the locally built half dropped holds the archive and
     // resolves the kernel at whatever the local repository now serves.

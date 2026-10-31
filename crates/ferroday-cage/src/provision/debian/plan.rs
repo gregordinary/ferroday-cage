@@ -217,6 +217,18 @@ pub struct PlannedPackage {
     /// A consumer grouping by source should key on `source.unwrap_or(name)`
     /// rather than on the field alone, which is correct for both.
     pub source: Option<String>,
+    /// The length of the `.deb` on the wire in bytes, when the archive states
+    /// one.
+    ///
+    /// It bounds what the download may spend before its digest is checked.
+    /// Installing a plan fetches no index to read the length from, so the plan
+    /// carries it: without it, such a download is bounded by the fetcher's own
+    /// ceiling instead, which is weaker rather than wrong, since the digest
+    /// still decides whether the bytes are the package.
+    ///
+    /// `None` when the stanza carried no `Size`, or when a plan document
+    /// written before this field existed is read back.
+    pub size: Option<u64>,
     /// Fields this package's stanza carried that this version does not know.
     carried: Carried,
 }
@@ -330,6 +342,8 @@ impl Plan {
             let installed_size = package.installed_size.map(|kib| kib.to_string());
             stanza.put_optional("Installed-Size", installed_size.as_deref());
             stanza.put_optional("Source", package.source.as_deref());
+            let size = package.size.map(|bytes| bytes.to_string());
+            stanza.put_optional("Size", size.as_deref());
             stanza.put_carried(&package.carried);
             stanza.render(&mut out).map_err(document)?;
         }
@@ -401,12 +415,17 @@ impl Plan {
                     sha256: required(stanza.get("SHA256"), "SHA256", &at_package)?,
                     filename: required(stanza.get("Filename"), "Filename", &at_package)?,
                     archive: at,
-                    installed_size: kibibytes(stanza.get("Installed-Size"), &at_package)?,
+                    installed_size: number(
+                        stanza.get("Installed-Size"),
+                        "Installed-Size",
+                        &at_package,
+                    )?,
                     // Read verbatim rather than folded against the package's own
                     // name: the writer never states a source that matches, so a
                     // document that does was written by hand, and echoing it back
                     // unchanged is what keeps the round trip byte-faithful.
                     source: stanza.get("Source").map(str::to_string),
+                    size: number(stanza.get("Size"), "Size", &at_package)?,
                     carried: document::carried(stanza, PACKAGE_FIELDS),
                 };
                 if let Some(reason) = package.unaddressable() {
@@ -486,6 +505,7 @@ impl PlannedPackage {
             archive: package.origin,
             installed_size: package.installed_size,
             source: package.source.clone(),
+            size: package.size,
             carried: Carried::new(),
         }
     }
@@ -521,19 +541,20 @@ const PACKAGE_FIELDS: &[&str] = &[
     "Archive",
     "Installed-Size",
     "Source",
+    "Size",
 ];
 
-/// Reads an optional size field, absent giving no value.
+/// Reads an optional numeric field, absent giving no value.
 ///
 /// A value that is not a number refuses the document rather than reading as
 /// absent. Reading it as absent would drop it on the way out, and a document
 /// that came back missing a line it was given is the one failure the carried
 /// fields exist to prevent.
-fn kibibytes(value: Option<&str>, at: &str) -> Result<Option<u64>, DebianError> {
+fn number(value: Option<&str>, field: &str, at: &str) -> Result<Option<u64>, DebianError> {
     match value {
         Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
             document(format!(
-                "{at} has an Installed-Size of {value:?}, which is not a size in kibibytes",
+                "{at} has a {field} of {value:?}, which is not a number"
             ))
         }),
         None => Ok(None),
@@ -601,6 +622,7 @@ mod tests {
                     installed_size: Some(340),
                     // Its own source, as most packages are.
                     source: None,
+                    size: Some(69_412),
                     carried: Carried::new(),
                 },
                 PlannedPackage {
@@ -615,6 +637,7 @@ mod tests {
                     // Policy permits.
                     installed_size: None,
                     source: Some("local-suite".to_string()),
+                    size: None,
                     carried: Carried::new(),
                 },
             ],
@@ -662,6 +685,7 @@ SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 Filename: pool/main/b/base-files/base-files_13.6_arm64.deb
 Archive: 0
 Installed-Size: 340
+Size: 69412
 
 Package: local-tool
 Version: 1:2.4-1
@@ -966,7 +990,7 @@ Source: local-suite
     }
 
     /// The package-stanza fields the format's first readers knew, before
-    /// `Installed-Size` and `Source` joined them.
+    /// `Installed-Size`, `Source`, and `Size` joined them.
     const PACKAGE_FIELDS_AS_FIRST_WRITTEN: &[&str] = &[
         "Package",
         "Version",
@@ -1016,8 +1040,8 @@ Source: local-suite
 
     #[test]
     fn a_field_added_since_the_format_was_first_written_survives_an_older_reader() {
-        // Why Installed-Size and Source are written after Archive rather than
-        // beside the fields they describe. An older reader carries a field it
+        // Why Installed-Size, Source, and Size are written after Archive rather
+        // than beside the fields they describe. An older reader carries a field it
         // does not know and re-emits it after the ones it does, so a field
         // written between the older ones comes back from that reader with the
         // stanza's lines reordered -- and a record pinning the document's
@@ -1026,6 +1050,7 @@ Source: local-suite
         let document = sample().to_document().unwrap();
         assert!(document.contains("\nInstalled-Size: 340\n"), "{document}");
         assert!(document.contains("\nSource: local-suite\n"), "{document}");
+        assert!(document.contains("\nSize: 69412\n"), "{document}");
         assert_eq!(as_an_older_reader_rewrites(&document), document);
     }
 
@@ -1038,27 +1063,36 @@ Source: local-suite
         for package in &mut plan.packages {
             package.installed_size = None;
             package.source = None;
+            package.size = None;
         }
         let document = plan.to_document().unwrap();
         assert!(!document.contains("Installed-Size"), "{document}");
         assert!(!document.contains("Source"), "{document}");
+        assert!(!document.contains("Size"), "{document}");
         assert_eq!(Plan::parse_document(&document).unwrap(), plan);
     }
 
     #[test]
-    fn a_malformed_installed_size_is_refused_rather_than_read_as_absent() {
+    fn a_malformed_size_is_refused_rather_than_read_as_absent() {
         // Reading it as absent would drop the line on the way out, which is
         // the loss the carried fields exist to prevent.
-        let document = sample()
-            .to_document()
-            .unwrap()
-            .replace("Installed-Size: 340", "Installed-Size: 340 kB");
-        match Plan::parse_document(&document) {
-            Err(DebianError::PlanDocument { reason }) => {
-                assert!(reason.contains("base-files"), "{reason}");
-                assert!(reason.contains("kibibytes"), "{reason}");
+        for (field, from, to) in [
+            (
+                "Installed-Size",
+                "Installed-Size: 340",
+                "Installed-Size: 340 kB",
+            ),
+            ("Size", "Size: 69412", "Size: 69 kB"),
+        ] {
+            let document = sample().to_document().unwrap().replace(from, to);
+            match Plan::parse_document(&document) {
+                Err(DebianError::PlanDocument { reason }) => {
+                    assert!(reason.contains("base-files"), "{reason}");
+                    assert!(reason.contains(field), "{reason}");
+                    assert!(reason.contains("not a number"), "{reason}");
+                }
+                other => panic!("expected a {field} refusal, got {other:?}"),
             }
-            other => panic!("expected a size refusal, got {other:?}"),
         }
     }
 

@@ -675,6 +675,12 @@ impl HttpFetch {
 /// follows it is a path from the root. The path need not exist, so the URL for
 /// a repository is available before it is written.
 ///
+/// Every byte outside the letters, the digits, `-`, `.`, `_`, `~`, and the
+/// separator is written as a percent escape. A path holding a space, a newline,
+/// or a byte that is not UTF-8 is therefore still one URL, and one word of the
+/// apt source line a Debian root names its repository by; this module's
+/// fetcher and apt both decode the escapes back into the path.
+///
 /// A caller reaches this for any repository that lives on this machine —
 /// a Debian pool, which answers for itself through `Pool::mirror_url`, or an
 /// apk repository assembled some other way; the result goes to the mirror
@@ -682,12 +688,14 @@ impl HttpFetch {
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Url`] for a path that is not valid UTF-8, which no URL
-/// can spell, and [`FetchError::Io`] when the current directory cannot be read
-/// to make a relative path absolute. The failure is the transport's because the
+/// Returns [`FetchError::Io`] when the current directory cannot be read to
+/// make a relative path absolute. The failure is the transport's because the
 /// locator is: a path that cannot be named is a resource that cannot be
 /// addressed, whichever layer wanted to address it.
 pub fn file_url(path: &Path) -> Result<String, FetchError> {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
     let absolute = std::path::absolute(path).map_err(|source| {
         FetchError::io(
             "resolving a path for its file:// URL",
@@ -695,19 +703,22 @@ pub fn file_url(path: &Path) -> Result<String, FetchError> {
             source,
         )
     })?;
-    let text = absolute.to_str().ok_or_else(|| {
-        FetchError::url(
-            absolute.display().to_string(),
-            "the path is not valid UTF-8 and cannot be named by a file:// URL",
-        )
-    })?;
-    Ok(format!("file://{text}"))
+    let mut escaped = String::with_capacity(absolute.as_os_str().len());
+    for &byte in absolute.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            escaped.push(char::from(byte));
+        } else {
+            // Writing to a `String` cannot fail.
+            let _ = write!(escaped, "%{byte:02X}");
+        }
+    }
+    Ok(format!("file://{escaped}"))
 }
 
 /// Reads a local file for a `file://` URL, refusing one that runs past `cap`
 /// bytes.
 fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write, cap: u64) -> Result<(), FetchError> {
-    let path = local_file_path(url, rest)?;
+    let path = decode_file_path(url, local_file_path(url, rest)?)?;
     let mut file = File::open(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             FetchError::not_found(url)
@@ -718,6 +729,45 @@ fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write, cap: u64) -> Result<(
     let mut sink = super::LimitedWriter::new(sink, cap);
     io::copy(&mut file, &mut sink).map_err(FetchError::at("reading the file", url))?;
     Ok(())
+}
+
+/// The local path a `file://` URL's path spells, its percent escapes decoded.
+///
+/// [`file_url`] escapes every byte outside a small safe set, and this reads such
+/// a path back. A component holding an escape must decode to an
+/// [ordinary component](crate::path::is_ordinary_component): an escape may
+/// spell any byte of a name, but not a separator the written URL does not show,
+/// a NUL that would end the path, or a whole `.` or `..` that would step through
+/// the tree where the written URL names an entry. Each of those is refused
+/// rather than decoded, so decoding never lets a URL reach a path its written
+/// form does not. A component written without an escape is taken as written.
+///
+/// A layer joins an index-supplied name onto a `file://` mirror as the index
+/// spells it, so the name is decoded once here, as an HTTP server decodes the
+/// same name in a request line. The refusal above is what keeps an escape in
+/// such a name from reaching anything its written form does not.
+fn decode_file_path(url: &str, path: &str) -> Result<std::path::PathBuf, FetchError> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let refuse = |reason: &str| FetchError::url(url, reason);
+    let mut decoded = Vec::with_capacity(path.len());
+    for (index, component) in path.split('/').enumerate() {
+        if index > 0 {
+            decoded.push(b'/');
+        }
+        let name = super::fetch::percent_decode(component.as_bytes())
+            .ok_or_else(|| refuse("the path carries a malformed percent escape"))?;
+        if name != component.as_bytes() && !crate::path::is_ordinary_component(&name) {
+            return Err(refuse(
+                "a percent escape spells a separator, a NUL, or a `.` or `..` component, which \
+                 would change the path rather than name an entry in it",
+            ));
+        }
+        decoded.extend_from_slice(&name);
+    }
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        decoded,
+    )))
 }
 
 /// The local path a `file://` URL names, refusing one that names another
@@ -2284,19 +2334,77 @@ mod tests {
         );
     }
 
+    /// The local path the fetcher reads for `url`, or the refusal.
+    fn read_back(url: &str) -> Result<std::path::PathBuf, FetchError> {
+        let rest = strip_scheme(url, "file://").expect("a file:// URL");
+        decode_file_path(url, local_file_path(url, rest)?)
+    }
+
     #[test]
-    fn a_relative_path_is_made_absolute_and_a_non_utf8_one_is_refused() {
-        // A `file://` URL carries a path from a root, and carries it as text.
+    fn a_relative_path_is_made_absolute_and_every_byte_is_nameable() {
+        // A `file://` URL carries a path from a root, and carries it as text,
+        // so a byte that is not text, or text a URL cannot hold as written, is
+        // an escape.
         let url = file_url(Path::new("pool")).unwrap();
         let expected = std::env::current_dir().unwrap().join("pool");
-        assert_eq!(url, format!("file://{}", expected.display()));
+        assert_eq!(read_back(&url).unwrap(), expected);
 
         use std::os::unix::ffi::OsStrExt as _;
-        let raw = std::ffi::OsStr::from_bytes(b"/srv/\xff\xfe");
-        assert!(matches!(
-            file_url(Path::new(raw)),
-            Err(FetchError::Url { .. }),
-        ));
+        for (path, spelled) in [
+            (&b"/srv/\xff\xfe"[..], "file:///srv/%FF%FE"),
+            (b"/srv/My Pool/100%", "file:///srv/My%20Pool/100%25"),
+            (b"/srv/a\nb", "file:///srv/a%0Ab"),
+            (b"/srv/plain-name_1.0~rc", "file:///srv/plain-name_1.0~rc"),
+        ] {
+            let path = Path::new(std::ffi::OsStr::from_bytes(path));
+            let url = file_url(path).unwrap();
+            assert_eq!(url, spelled);
+            assert!(!url.contains(char::is_whitespace), "{url:?}");
+            assert_eq!(read_back(&url).unwrap(), path, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_path_a_url_must_escape_is_read_through_its_url() {
+        // The pool a caller names by path is the one the fetcher reads, however
+        // the path is spelled.
+        let dir = Scratch::new("http-file-url-escaped");
+        let pool = dir.join("My Pool 100%");
+        std::fs::create_dir(&pool).unwrap();
+        std::fs::write(pool.join("Release"), b"contents").unwrap();
+
+        let url = crate::provision::mirror_url(&file_url(&pool).unwrap(), "Release");
+        let mut out = Vec::new();
+        HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut out)
+            .unwrap();
+        assert_eq!(out, b"contents");
+    }
+
+    #[test]
+    fn an_escape_that_would_change_the_path_is_refused() {
+        // Decoding is one pass over each component as written, and an escape
+        // may spell a name but never the shape of the path: no separator the
+        // written URL does not show, no NUL, and no dot segment.
+        for url in [
+            "file:///srv/pool/a%2F..%2F..%2Fetc/passwd",
+            "file:///srv/pool/%2e%2e/%2E%2E/etc/passwd",
+            "file:///srv/pool/.%2e/etc/passwd",
+            "file:///srv/pool/x%00y",
+            "file:///srv/pool/%zz",
+            "file:///srv/pool/x%",
+        ] {
+            assert!(
+                matches!(read_back(url), Err(FetchError::Url { .. })),
+                "{url} should be refused",
+            );
+        }
+        // A dot segment written as one is the caller's to write, as it was
+        // before any escape was read: `std::path::absolute` keeps one.
+        assert_eq!(
+            read_back("file:///srv/pool/../other").unwrap(),
+            Path::new("/srv/pool/../other"),
+        );
     }
 
     #[test]

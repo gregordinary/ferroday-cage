@@ -18,16 +18,26 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::DebianError;
-use super::bootstrap::{self, TRUST_ANCHOR_STEM};
+use super::bootstrap::{self, PACKAGE_KEYRING_STEM, TRUST_ANCHOR_STEM};
 use super::check_coordinate;
+use super::{DebianError, EMBEDDED_KEYRING};
 use crate::provision::coordinate::Nesting;
+use crate::provision::openpgp::Keyring;
 
 /// A repository's trust anchor: the keyring its signature is verified against,
 /// or an explicit decision to trust it unsigned.
 #[derive(Clone)]
 pub(crate) enum Trust {
-    /// The release signature is verified against these keyring bytes.
+    /// The release signature is verified against the Debian archive keyring
+    /// this library embeds: the primary repository's anchor when the caller
+    /// names no keyring of their own.
+    ///
+    /// Told apart from [`Signed`](Self::Signed) because the finished root has
+    /// a better anchor for it than a copy: the `debian-archive-keyring` package
+    /// ships the same keys and keeps them current as the archive rotates them.
+    Archive,
+    /// The release signature is verified against these keyring bytes, a
+    /// caller's own.
     Signed(Vec<u8>),
     /// The release is trusted without a signature, apt's `[trusted=yes]`.
     Unsigned,
@@ -40,6 +50,7 @@ impl fmt::Debug for Trust {
     /// otherwise indistinguishable from a whole one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Trust::Archive => write!(f, "Archive({} bytes)", EMBEDDED_KEYRING.len()),
             Trust::Signed(keyring) => write!(f, "Signed({} bytes)", keyring.len()),
             Trust::Unsigned => f.write_str("Unsigned"),
         }
@@ -118,20 +129,21 @@ impl Repository {
     ///
     /// The primary owns `sources.list` and the canonical keyring path rather
     /// than a named `sources.list.d` entry, so it carries no name. Its trust
-    /// anchor is the resolved keyring bytes — the embedded archive keyring, or a
-    /// caller substitution — unless the caller trusts it unsigned.
+    /// anchor is the caller's keyring where `keyring` holds one, and the
+    /// embedded archive keyring where it is `None`, unless the caller trusts it
+    /// unsigned.
     pub(crate) fn primary(
         suite: String,
         mirrors: Vec<String>,
         components: Vec<String>,
-        keyring: Vec<u8>,
+        keyring: Option<Vec<u8>>,
         trust_unsigned: bool,
         allow_stale: bool,
     ) -> Result<Repository, DebianError> {
-        let trust = if trust_unsigned {
-            Trust::Unsigned
-        } else {
-            Trust::Signed(keyring)
+        let trust = match keyring {
+            _ if trust_unsigned => Trust::Unsigned,
+            Some(keyring) => Trust::Signed(keyring),
+            None => Trust::Archive,
         };
         let repository = Repository {
             mirrors,
@@ -168,6 +180,7 @@ impl Repository {
     /// repository is trusted unsigned.
     pub(crate) fn keyring(&self) -> Option<&[u8]> {
         match &self.trust {
+            Trust::Archive => Some(EMBEDDED_KEYRING),
             Trust::Signed(bytes) => Some(bytes),
             Trust::Unsigned => None,
         }
@@ -192,6 +205,13 @@ impl Repository {
     /// the coordinates it publishes under, so a pool this crate writes and a
     /// repository this crate reads agree on what an archive may be called.
     ///
+    /// A mirror URL becomes one word of that `deb` line too, so it may hold no
+    /// whitespace, which would split it into two, and no control character, a
+    /// newline among them, which would end the line and start one the caller
+    /// never wrote. A local path holding either is spelled with percent escapes
+    /// instead, which is what [`file_url`](crate::provision::file_url) writes
+    /// and what apt reads back.
+    ///
     /// `trust_unsigned` skips the archive signature, so authenticity rests on
     /// the transport alone, and the check is that the transport provides some:
     /// every mirror of an unsigned repository must be `file://` — local, under
@@ -211,6 +231,20 @@ impl Repository {
             return Err(DebianError::Config {
                 reason: "a repository needs at least one mirror URL".to_string(),
             });
+        }
+        for mirror in &self.mirrors {
+            if mirror
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+            {
+                return Err(DebianError::Config {
+                    reason: format!(
+                        "the mirror URL {mirror:?} carries whitespace or a control character, \
+                         which the finished root's apt sources cannot hold; percent-encode it, \
+                         as file_url does for a local path"
+                    ),
+                });
+            }
         }
         check_coordinate("the repository's suite", &self.suite, Nesting::Nested)?;
         for component in &self.components {
@@ -348,15 +382,18 @@ impl RepositoryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns a [`DebianError::Config`] when no mirror was set, when a signed
-    /// repository names no keyring, when the keyring cannot be read, when an
-    /// unsigned repository is reached over `http://`, when a supplied name is
-    /// not a portable file-name stem, or when the suite or a component is one
-    /// the repository cannot be addressed by: an empty value, one carrying
-    /// whitespace or a control character, or one that would resolve outside the
-    /// mirror root through a leading `/`, a `..` segment, or an empty or `.`
-    /// segment. Either may otherwise contain slashes, since both may name a
-    /// subtree.
+    /// Returns a [`DebianError::Config`] when no mirror was set, when a mirror
+    /// URL carries whitespace or a control character, when a signed repository
+    /// names no keyring, when the keyring is not an OpenPGP keyring holding a
+    /// usable key, when an unsigned repository is reached over `http://`, when
+    /// a supplied name is not a portable file-name stem, or when the suite or a
+    /// component is one the repository cannot be addressed by: an empty value,
+    /// one carrying whitespace or a control character, or one that would
+    /// resolve outside the mirror root through a leading `/`, a `..` segment,
+    /// or an empty or `.` segment. Either may otherwise contain slashes, since
+    /// both may name a subtree.
+    ///
+    /// Returns [`DebianError::Io`] when the keyring cannot be read.
     pub fn build(self) -> Result<Repository, DebianError> {
         let Some(primary) = self.mirror else {
             return Err(DebianError::Config {
@@ -385,9 +422,7 @@ impl RepositoryBuilder {
                      unsigned with trust_unsigned(true)"
                     .to_string(),
             })?;
-            let bytes = std::fs::read(&path)
-                .map_err(DebianError::at("reading the repository keyring", &path))?;
-            Trust::Signed(bytes)
+            Trust::Signed(read_keyring(&path, "reading the repository keyring")?)
         };
 
         let repository = Repository {
@@ -401,6 +436,25 @@ impl RepositoryBuilder {
         repository.validate()?;
         Ok(repository)
     }
+}
+
+/// Reads a keyring a caller named, refusing one that does not parse.
+///
+/// The keyring is parsed again for every release it verifies, so parsing it here
+/// decides nothing on its own. What it buys is the moment of the refusal: a file
+/// that is not a keyring, or one whose every key is revoked, fails the build that
+/// named it rather than the first fetch, after a release has been downloaded.
+///
+/// `op` names the read in the error a failure to read the file reports.
+pub(crate) fn read_keyring(path: &Path, op: &'static str) -> Result<Vec<u8>, DebianError> {
+    let bytes = std::fs::read(path).map_err(DebianError::at(op, path))?;
+    Keyring::parse(&bytes).map_err(|err| DebianError::Config {
+        reason: format!(
+            "the keyring {} is not usable as a trust anchor: {err}",
+            path.display()
+        ),
+    })?;
+    Ok(bytes)
 }
 
 /// The mirror schemes that authenticate what they serve, and so are the ones an
@@ -471,11 +525,25 @@ fn validate_name(name: &str) -> Result<(), DebianError> {
 /// primary's `sources.list` still names the anchor by path, so an additional
 /// repository claiming the name would leave the finished rootfs verifying the
 /// primary archive against a third party's key.
+///
+/// [`PACKAGE_KEYRING_STEM`] is refused too, though no repository writes it: it
+/// is the `debian-archive-keyring` package's own, which every root with `apt`
+/// holds, whose upgrade would replace a repository's keyring written there, and
+/// which a default primary's `sources.list` names.
 pub(crate) fn validate_distinct_entries(repositories: &[Repository]) -> Result<(), DebianError> {
     let mut seen: Vec<String> = Vec::with_capacity(repositories.len());
     seen.push(TRUST_ANCHOR_STEM.to_string());
     for (index, repository) in repositories.iter().enumerate().skip(1) {
         let stem = repository.entry_stem(index);
+        if stem == PACKAGE_KEYRING_STEM {
+            return Err(DebianError::Config {
+                reason: format!(
+                    "the keyring {:?} belongs to the debian-archive-keyring package, whose \
+                     upgrades would replace the repository's: give the repository another name",
+                    bootstrap::keyring_path(&stem)
+                ),
+            });
+        }
         if seen.contains(&stem) {
             return Err(DebianError::Config {
                 reason: format!(
@@ -541,9 +609,76 @@ mod tests {
     }
 
     #[test]
+    fn a_name_a_package_owns_the_keyring_of_is_refused() {
+        // Every finished root installs debian-archive-keyring, and its next
+        // upgrade would put Debian's keys back where this repository's were.
+        let set = [named(None), named(Some(PACKAGE_KEYRING_STEM))];
+        let err = validate_distinct_entries(&set).unwrap_err();
+        assert!(
+            matches!(&err, DebianError::Config { reason } if reason.contains("debian-archive-keyring package")),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn distinct_names_and_generated_stems_are_accepted() {
         let set = [named(None), named(Some("local")), named(None), named(None)];
         assert!(validate_distinct_entries(&set).is_ok());
+    }
+
+    #[test]
+    fn a_keyring_that_does_not_parse_is_refused_when_the_repository_is_built() {
+        // Refused here rather than after the first release has been fetched,
+        // which is where the keyring is next read.
+        let scratch = crate::scratch::Scratch::new("repository-bad-keyring");
+        let path = scratch.join("not-a-keyring.gpg");
+        std::fs::write(&path, b"this is not an OpenPGP keyring").unwrap();
+        let err = Repository::builder("trixie")
+            .mirror("https://example.invalid/debian")
+            .keyring(&path)
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(&err, DebianError::Config { reason } if reason.contains("not-a-keyring.gpg")),
+            "{err}",
+        );
+
+        // And a keyring that cannot be read at all is a host failure, naming it.
+        let missing = Repository::builder("trixie")
+            .mirror("https://example.invalid/debian")
+            .keyring(scratch.join("absent.gpg"))
+            .build()
+            .unwrap_err();
+        assert!(matches!(missing, DebianError::Io { .. }), "{missing}");
+    }
+
+    #[test]
+    fn a_mirror_url_a_sources_line_cannot_carry_is_refused() {
+        // The mirror is one word of the `deb` line the finished root's apt
+        // reads: a space splits it, and a newline writes a line of its own.
+        for mirror in [
+            "file:///srv/My Pool",
+            "https://example.invalid/debian\ndeb [trusted=yes] http://evil.invalid/ x main",
+            "https://example.invalid/de\tbian",
+            "https://example.invalid/debian\u{85}",
+        ] {
+            let err = Repository::builder("trixie")
+                .mirror("file:///srv/debs")
+                .mirror_fallback(mirror)
+                .trust_unsigned(true)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(&err, DebianError::Config { reason } if reason.contains("percent-encode")),
+                "{mirror:?}: {err}",
+            );
+        }
+        // The percent-encoded spelling of the same pool is accepted.
+        Repository::builder("trixie")
+            .mirror("file:///srv/My%20Pool")
+            .trust_unsigned(true)
+            .build()
+            .expect("an encoded space is one word");
     }
 
     #[test]

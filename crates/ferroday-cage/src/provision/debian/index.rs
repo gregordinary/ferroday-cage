@@ -12,10 +12,11 @@ use std::collections::HashMap;
 use std::fmt;
 
 use super::available::Available;
-use super::pin::Pins;
+use super::pin::{PinMatch, Pins};
 use super::version::{self, Constraint};
 use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
+use crate::provision::fetch::percent_decode;
 
 /// One package's metadata from a `Packages` index.
 #[derive(Debug, Clone)]
@@ -300,8 +301,10 @@ pub(super) fn is_safe_pool_path(filename: &str) -> bool {
     if !is_safe_pool_shape(filename.as_bytes()) {
         return false;
     }
+    // Every `%` the written form holds begins an escape, so a `%` in the decoded
+    // form is one an escape produced: the byte a second pass would decode.
     match percent_decode(filename.as_bytes()) {
-        Some(decoded) => is_safe_pool_shape(&decoded),
+        Some(decoded) => !decoded.contains(&b'%') && is_safe_pool_shape(&decoded),
         None => false,
     }
 }
@@ -314,38 +317,6 @@ fn is_safe_pool_shape(path: &[u8]) -> bool {
         && !path
             .split(|byte| *byte == b'/')
             .any(|component| component == b"..")
-}
-
-/// Percent-decodes `path`, or `None` where an escape is malformed or decodes to
-/// a `%` — the byte that would let a second decoding pass reveal something this
-/// one did not see.
-fn percent_decode(path: &[u8]) -> Option<Vec<u8>> {
-    let mut decoded = Vec::with_capacity(path.len());
-    let mut bytes = path.iter().copied();
-    while let Some(byte) = bytes.next() {
-        if byte != b'%' {
-            decoded.push(byte);
-            continue;
-        }
-        let high = hex_value(bytes.next()?)?;
-        let low = hex_value(bytes.next()?)?;
-        let value = high * 16 + low;
-        if value == b'%' {
-            return None;
-        }
-        decoded.push(value);
-    }
-    Some(decoded)
-}
-
-/// The value of one hexadecimal digit, either case.
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// The package set of one suite: the highest version of each real name, plus
@@ -375,10 +346,12 @@ impl Index {
     /// is retained when a later one does not compare greater.
     ///
     /// A name `pins` holds selects the pinned version instead of the highest,
-    /// again taking the first repository that offers it. Where no repository
-    /// offers the pinned version the highest is kept, so [`Pins::check`] can
-    /// report what the archives carry rather than only that something is
-    /// missing; that check runs before anything resolves against the index.
+    /// preferring a repository that records the pinned bytes for it and
+    /// otherwise taking the first repository that offers it. Where no
+    /// repository offers the pinned version the highest is kept, so
+    /// [`Pins::check`] can report what the archives carry rather than only
+    /// that something is missing; that check runs before anything resolves
+    /// against the index.
     pub(crate) fn merge<'a>(
         inputs: impl IntoIterator<Item = (usize, &'a str)>,
         architecture: &str,
@@ -400,12 +373,17 @@ impl Index {
                 };
                 let keep = match by_name.get(&package.name) {
                     None => true,
-                    // A pin already satisfied is not displaced, by a higher
-                    // version or by a later repository offering the same one.
+                    // The entry closest to the pin is kept: the pinned version
+                    // with the pinned bytes, then the pinned version, then the
+                    // highest. A later repository displaces an earlier one only
+                    // by being closer, so among equals the first is kept, as an
+                    // unpinned tie keeps it.
                     Some(existing) if pins.names(&package.name) => {
-                        !pins.holds(&package.name, &existing.version)
-                            && (pins.holds(&package.name, &package.version)
-                                || higher(&package, existing))
+                        let (offered, held) = (pins.matching(&package), pins.matching(existing));
+                        offered > held
+                            || (offered == PinMatch::Neither
+                                && held == PinMatch::Neither
+                                && higher(&package, existing))
                     }
                     Some(existing) => higher(&package, existing),
                 };
@@ -560,25 +538,34 @@ fn parse_constraint(text: &str) -> Option<Constraint> {
 }
 
 /// The build dependencies of a source package, read from a `debian/control`
-/// file.
+/// file, as they apply to a build for `architecture`.
 ///
 /// Parses the `Build-Depends`, `Build-Depends-Arch`, and `Build-Depends-Indep`
 /// fields of the control text's first stanza — the source stanza — and returns
-/// one package name per relationship: the first alternative of an `a | b`
-/// group, with version constraints, architecture qualifiers, and build-profile
-/// restrictions stripped, matching the resolver's discipline. Names are
-/// returned in field order and deduplicated, keeping the first appearance.
-/// Architecture and profile restrictions are not evaluated, so the result is a
-/// superset that is safe to install into a build environment.
+/// one package name per relationship. Names are returned in field order and
+/// deduplicated, keeping the first appearance.
+///
+/// Each alternative's architecture restriction is evaluated against
+/// `architecture`, as Debian Policy 7.1 defines it: an alternative whose list
+/// excludes the architecture is ignored, a relationship whose every alternative
+/// is ignored contributes nothing, and the first alternative left is the name
+/// returned, as the archive's build daemons choose it. A list term is a
+/// literal architecture name, `any`, or an `<os>-<cpu>` wildcard with either
+/// half `any` (`linux-any`, `any-amd64`). A term this does not recognize —
+/// a three- or four-part wildcard naming an ABI or a C library — keeps the
+/// alternative rather than dropping it. Version constraints, architecture
+/// qualifiers (`:native`), and build-profile restrictions are stripped, and
+/// profiles are not evaluated, so what remains of the result is a superset
+/// that is safe to install into a build environment.
 ///
 /// The names are meant for
 /// [`DebianBuilder::include`](crate::provision::debian::DebianBuilder::include),
 /// which bakes them into the bootstrap so a package build runs without
-/// resolving its build dependencies at build time. The caller supplies the
-/// control text from wherever the source lives — a working tree, a git
-/// checkout, or an archive `Sources` stanza — so the source of the metadata is
-/// the caller's to choose.
-pub fn build_depend_names(control: &str) -> Vec<String> {
+/// resolving its build dependencies at build time; `architecture` is the one
+/// that bootstrap targets. The caller supplies the control text from wherever
+/// the source lives — a working tree, a git checkout, or an archive `Sources`
+/// stanza — so the source of the metadata is the caller's to choose.
+pub fn build_depend_names(control: &str, architecture: &str) -> Vec<String> {
     let stanzas = document::parse(control);
     let Some(source) = stanzas.first() else {
         return Vec::new();
@@ -589,8 +576,12 @@ pub fn build_depend_names(control: &str) -> Vec<String> {
         let Some(value) = source.get(field) else {
             continue;
         };
-        for group in parse_relations(value) {
-            if let Some(atom) = group.into_iter().next()
+        for group in value.split(',') {
+            let chosen = group
+                .split('|')
+                .filter(|alternative| applies_to(alternative, architecture))
+                .find_map(parse_atom);
+            if let Some(atom) = chosen
                 && seen.insert(atom.name.clone())
             {
                 names.push(atom.name);
@@ -598,6 +589,84 @@ pub fn build_depend_names(control: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Whether a relationship alternative's architecture restriction admits
+/// `architecture`.
+///
+/// An alternative with no list admits every architecture. A list of plain terms
+/// admits the architectures any term matches, and a list of negated ones the
+/// architectures none matches; Policy forbids mixing the two, and a list that
+/// does is not read as excluding anything. Where a term is one [`arch_matches`]
+/// cannot decide, the answer leans to keeping the alternative: an unneeded
+/// build dependency costs space, and a missing one fails the build.
+fn applies_to(alternative: &str, architecture: &str) -> bool {
+    let Some(open) = alternative.find('[') else {
+        return true;
+    };
+    let Some(close) = alternative[open..].find(']') else {
+        return true;
+    };
+    let terms: Vec<&str> = alternative[open + 1..open + close]
+        .split_whitespace()
+        .collect();
+    let negated = terms.iter().filter(|term| term.starts_with('!')).count();
+    if terms.is_empty() || (negated != 0 && negated != terms.len()) {
+        return true;
+    }
+    if negated == 0 {
+        terms
+            .iter()
+            .any(|term| arch_matches(architecture, term) != Some(false))
+    } else {
+        terms
+            .iter()
+            .all(|term| arch_matches(architecture, &term[1..]) != Some(true))
+    }
+}
+
+/// Whether the architecture restriction term `term` names `architecture`, or
+/// `None` where the term is a wildcard of a shape this does not decide.
+///
+/// A term without an `any` part is a literal architecture name. Of the
+/// wildcards, `any` names every architecture, and a two-part `<os>-<cpu>`
+/// names those whose operating system and CPU match its halves, either of
+/// which may be `any`. An architecture name carries its operating system as a
+/// prefix, `hurd-amd64` or `musl-linux-amd64`, except on Linux, where it
+/// carries none; its CPU is dpkg's, so `armhf` and `armel` are both `arm`.
+fn arch_matches(architecture: &str, term: &str) -> Option<bool> {
+    if term == architecture {
+        return Some(true);
+    }
+    let parts: Vec<&str> = term.split('-').collect();
+    if !parts.contains(&"any") {
+        return Some(false);
+    }
+    match parts[..] {
+        ["any"] => Some(true),
+        [os, cpu] => {
+            let (own_os, own_cpu) = os_and_cpu(architecture);
+            Some((os == "any" || os == own_os) && (cpu == "any" || cpu == own_cpu))
+        }
+        _ => None,
+    }
+}
+
+/// The operating system and the CPU an architecture name stands for, as dpkg
+/// names them.
+fn os_and_cpu(architecture: &str) -> (&str, &str) {
+    let (prefix, cpu) = match architecture.rsplit_once('-') {
+        Some((prefix, cpu)) => (prefix, cpu),
+        None => ("linux", architecture),
+    };
+    // A prefix may name a C library ahead of the system: `musl-linux`.
+    let os = prefix.rsplit('-').next().unwrap_or(prefix);
+    let cpu = match cpu {
+        "armhf" | "armel" => "arm",
+        "x32" => "amd64",
+        other => other,
+    };
+    (os, cpu)
 }
 
 #[cfg(test)]
@@ -1017,7 +1086,7 @@ Depends: libc6, should-not-appear
         // across the three fields (debhelper-compat appears twice), and the
         // binary stanza's Depends ignored.
         assert_eq!(
-            build_depend_names(control),
+            build_depend_names(control, "amd64"),
             [
                 "debhelper-compat",
                 "libfoo-dev",
@@ -1026,11 +1095,73 @@ Depends: libc6, should-not-appear
                 "texinfo"
             ]
         );
+        // The same control text built for another architecture drops what is
+        // restricted to amd64.
+        assert_eq!(
+            build_depend_names(control, "arm64"),
+            ["debhelper-compat", "mawk", "libbar-dev", "texinfo"]
+        );
+    }
+
+    #[test]
+    fn an_alternative_another_architecture_needs_is_ignored() {
+        // Policy 7.1: an alternative whose list excludes the architecture is
+        // ignored, so the next one is chosen, and a relationship left with no
+        // alternative contributes nothing. The shape real control files use for
+        // a port's own toolchain.
+        let control = "\
+Source: p
+Build-Depends: libhurd-dev [hurd-any] | libbsd-dev,
+ libselinux1-dev [linux-any],
+ libkvm-dev [kfreebsd-any],
+ valgrind [!armel !hurd-i386],
+ gcc-multilib [any-amd64],
+ libarm-dev [any-arm],
+ libnot-x32 [!x32],
+ libfuture [gnu-any-any-loong64]
+";
+        assert_eq!(
+            build_depend_names(control, "amd64"),
+            [
+                "libbsd-dev",
+                "libselinux1-dev",
+                "valgrind",
+                "gcc-multilib",
+                "libnot-x32",
+                // A four-part wildcard is not one this decides, and the
+                // alternative is kept rather than dropped.
+                "libfuture",
+            ],
+        );
+        assert_eq!(
+            build_depend_names(control, "armel"),
+            [
+                "libbsd-dev",
+                "libselinux1-dev",
+                "libarm-dev",
+                "libnot-x32",
+                "libfuture",
+            ],
+        );
+        assert_eq!(
+            build_depend_names(control, "hurd-i386"),
+            ["libhurd-dev", "libnot-x32", "libfuture"],
+        );
+        assert_eq!(
+            build_depend_names(control, "x32"),
+            [
+                "libbsd-dev",
+                "libselinux1-dev",
+                "valgrind",
+                "gcc-multilib",
+                "libfuture",
+            ],
+        );
     }
 
     #[test]
     fn build_depend_names_tolerates_absent_fields_and_empty_input() {
-        assert!(build_depend_names("").is_empty());
-        assert!(build_depend_names("Source: x\nMaintainer: y\n").is_empty());
+        assert!(build_depend_names("", "amd64").is_empty());
+        assert!(build_depend_names("Source: x\nMaintainer: y\n", "amd64").is_empty());
     }
 }

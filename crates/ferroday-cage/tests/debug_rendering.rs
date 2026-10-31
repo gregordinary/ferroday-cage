@@ -27,11 +27,20 @@ use ferroday_cage::provision::Export;
 #[cfg(feature = "debian")]
 use ferroday_cage::provision::debian::{Debian, Pool, Repository};
 
-/// A recognizable stand-in for a keyring, so a test can look for its bytes in
-/// a rendering. `build` reads the file without parsing it, which is what lets
-/// this be plain text.
+/// A keyring a test can look for in a rendering: the Debian archive keyring
+/// the crate vendors. `build` parses the keyring it is given, so the stand-in
+/// has to be a real one.
 #[cfg(feature = "debian")]
-const ANCHOR: &[u8] = b"NOT-A-REAL-KEYRING-BUT-DISTINCTIVE-ENOUGH-TO-FIND";
+const ANCHOR: &[u8] = include_bytes!("../src/provision/debian/keyring/debian-archive-keyring.gpg");
+
+/// How the anchor's leading bytes read in a rendering that dumped them, as a
+/// byte vector's `Debug` writes one.
+#[cfg(feature = "debian")]
+fn anchor_dumped() -> String {
+    format!("{:?}", &ANCHOR[..16])
+        .trim_end_matches(']')
+        .to_string()
+}
 
 /// Writes the stand-in anchor to a file of its own, in a scratch directory the
 /// returned guard removes when it drops.
@@ -234,7 +243,7 @@ fn no_trust_anchor_bytes_reach_a_rendering() {
 
     let rendering = format!("{repository:?}");
     assert!(
-        !rendering.contains("NOT-A-REAL-KEYRING"),
+        !rendering.contains(&anchor_dumped()),
         "the anchor bytes reached the rendering: {rendering}",
     );
     assert!(
@@ -249,7 +258,7 @@ fn no_trust_anchor_bytes_reach_a_rendering() {
         .keyring(&path);
     let rendering = format!("{unbuilt:?}");
     assert!(
-        !rendering.contains("NOT-A-REAL-KEYRING"),
+        !rendering.contains(&anchor_dumped()),
         "the builder read the anchor into its rendering: {rendering}",
     );
     assert!(
@@ -267,7 +276,8 @@ fn no_trust_anchor_bytes_reach_a_rendering() {
 
     // The primary carries the embedded archive keyring, which is the largest
     // anchor the crate ever holds and the one a default bootstrap has without
-    // the caller doing anything. A rendering of the bootstrap stays small.
+    // the caller doing anything. A rendering of the bootstrap stays small, and
+    // names the anchor as the embedded one rather than as a caller's.
     let default = Debian::builder("trixie")
         .build()
         .expect("the builder validates");
@@ -277,7 +287,7 @@ fn no_trust_anchor_bytes_reach_a_rendering() {
         "a bootstrap rendered {} characters, which is a dumped keyring: {rendering}",
         rendering.len(),
     );
-    assert!(rendering.contains("Signed("), "{rendering}");
+    assert!(rendering.contains("Archive("), "{rendering}");
 }
 
 #[cfg(feature = "debian")]

@@ -578,9 +578,55 @@ pub(crate) fn mirror_url(mirror: &str, suffix: &str) -> String {
     )
 }
 
+/// Decodes the percent escapes in `text`, or `None` where one is malformed: a
+/// `%` not followed by two hexadecimal digits.
+///
+/// One pass, and only one. What the decoded bytes may hold is the caller's
+/// question, because it differs with what the text is: a pool path out of a
+/// Debian index is refused if decoding leaves anything a second pass could
+/// decode again, and a `file://` path is refused where an escape would change
+/// the path's shape rather than spell a name in it.
+pub(crate) fn percent_decode(text: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut bytes = text.iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'%' {
+            decoded.push(byte);
+            continue;
+        }
+        let high = hex_value(bytes.next()?)?;
+        let low = hex_value(bytes.next()?)?;
+        decoded.push(high << 4 | low);
+    }
+    Some(decoded)
+}
+
+/// The value of one hexadecimal digit, either case.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decoding_takes_one_pass_and_refuses_a_malformed_escape() {
+        assert_eq!(
+            percent_decode(b"My%20Pool/caf%C3%a9").as_deref(),
+            Some("My Pool/caf\u{e9}".as_bytes()),
+        );
+        // A decoded `%` is not decoded again.
+        assert_eq!(percent_decode(b"%252e").as_deref(), Some(&b"%2e"[..]));
+        for malformed in [&b"%"[..], b"%2", b"%zz", b"x%g0"] {
+            assert_eq!(percent_decode(malformed), None, "{malformed:?}");
+        }
+    }
 
     /// The accessor hands back the scheme as the URL spells it, rather than a
     /// case-folded copy.

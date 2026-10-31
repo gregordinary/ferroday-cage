@@ -56,6 +56,11 @@ example reads them from the tree through
 returns the package names, and folds them into the bootstrap's install set
 alongside the toolchain. `--build-dep` adds packages beyond the declared set.
 
+The names are the ones that apply to the architecture the root is built for,
+the host's here. An alternative restricted to other architectures, such as
+`libhurd-dev [hurd-any]`, is skipped in favor of the next one, as the archive's
+own build daemons skip it.
+
 Discovering build dependencies this way, and baking them into the root, keeps to
 the provisioner's model: it speaks to the archive directly and resolves the
 whole install set — toolchain, declared build dependencies, and their closure —
@@ -120,15 +125,18 @@ That is the Debian-specific channel, carrying the events only a bootstrap has �
 fetches, resolution, per-package downloads, and dpkg's own output. The same
 events also reach a [`Provision::observe`](provisioning.md#progress-and-cancellation)
 observer, wrapped as `ProvisionEvent::Debian`, for a consumer that wants one
-adapter across every provisioner; and either way the run honours that observer's
-cancellation check between packages.
+adapter across every provisioner. Either observer can stop the run.
 
 The sink is a `DebianObserver`, and a closure is one — which is why the example
 passes a function. A caller that also wants to *stop* a bootstrap implements the
-trait instead and answers its `cancelled`, which is consulted at the same
-boundaries: a package, an extraction. That is the only way to cancel a
-`Debian::observe(...).resolve()` or `.available()`, which run outside a
-provisioning run and so have no `Provision` observer to ask.
+trait instead and answers its `cancelled`. The bootstrap consults it at each
+mirror it asks for a release or an index, at each package, and before each dpkg
+wave. A stopped bootstrap fails with `ProvisionError::Cancelled` and leaves no
+root behind.
+
+The sink is also the way to cancel a `Debian::observe(...).resolve()` or
+`.available()`. Both run outside a provisioning run, with no `Provision`
+observer to ask, and stop at a mirror boundary with `DebianError::Cancelled`.
 
 ```rust,ignore
 impl DebianObserver for Progress {

@@ -141,6 +141,18 @@ impl Rooted {
         self.create(relative.as_ref(), contents, mode)
     }
 
+    /// Creates the directory `relative` and every missing directory above it,
+    /// each at the default directory mode. A directory already there, or an
+    /// in-tree link to one, is left as it is.
+    ///
+    /// Every link of the chain resolves inside the tree, the leaf included, so
+    /// a symbolic link a package shipped in place of one of them names a
+    /// directory of the tree rather than of the host.
+    pub(crate) fn create_dir_all(&self, relative: impl AsRef<Path>) -> io::Result<()> {
+        self.create_dirs(&components(relative.as_ref())?)?;
+        Ok(())
+    }
+
     /// Reads the file at `relative`.
     ///
     /// `O_NOFOLLOW`: a symbolic link at the leaf fails the read rather than

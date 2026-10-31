@@ -303,12 +303,13 @@ impl Pool {
     /// under. A relative root is made absolute against the current directory,
     /// since a `file://` URL cannot carry a relative path; the pool need not
     /// exist yet, so the URL is available before the first
-    /// [`publish`](Self::publish).
+    /// [`publish`](Self::publish). A byte of the root a URL cannot hold as
+    /// written, a space among them, is written as a percent escape, as
+    /// [`file_url`] writes it.
     ///
     /// # Errors
     ///
-    /// Returns [`DebianError::Fetch`] for a root that is not valid UTF-8, which
-    /// cannot be spelled in a URL, and for a current directory that cannot be
+    /// Returns [`DebianError::Fetch`] for a current directory that cannot be
     /// read to make a relative root absolute. A path that cannot be named is a
     /// resource that cannot be addressed, so the failure is the transport's.
     pub fn mirror_url(&self) -> Result<String, DebianError> {

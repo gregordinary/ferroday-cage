@@ -386,6 +386,7 @@ pub fn F::progress(&mut self, ferroday_cage::provision::alpine::AlpineEvent<'_>)
 pub fn ferroday_cage::provision::alpine::host_architecture() -> alloc::string::String
 pub mod ferroday_cage::provision::debian
 #[non_exhaustive] pub enum ferroday_cage::provision::debian::DebianError
+pub ferroday_cage::provision::debian::DebianError::Cancelled
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Config
 pub ferroday_cage::provision::debian::DebianError::Config::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Configure
@@ -395,13 +396,14 @@ pub ferroday_cage::provision::debian::DebianError::Configure::wave: &'static str
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Deb
 pub ferroday_cage::provision::debian::DebianError::Deb::path: std::path::PathBuf
 pub ferroday_cage::provision::debian::DebianError::Deb::reason: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Digest
+pub ferroday_cage::provision::debian::DebianError::Digest::actual: alloc::string::String
+pub ferroday_cage::provision::debian::DebianError::Digest::expected: alloc::string::String
+pub ferroday_cage::provision::debian::DebianError::Digest::subject: alloc::string::String
 pub ferroday_cage::provision::debian::DebianError::Fetch(ferroday_cage::provision::FetchError)
-#[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::HashMismatch
-pub ferroday_cage::provision::debian::DebianError::HashMismatch::actual: alloc::string::String
-pub ferroday_cage::provision::debian::DebianError::HashMismatch::expected: alloc::string::String
-pub ferroday_cage::provision::debian::DebianError::HashMismatch::path: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Index
 pub ferroday_cage::provision::debian::DebianError::Index::reason: alloc::string::String
+pub ferroday_cage::provision::debian::DebianError::Index::subject: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Io
 pub ferroday_cage::provision::debian::DebianError::Io::op: &'static str
 pub ferroday_cage::provision::debian::DebianError::Io::path: std::path::PathBuf
@@ -418,10 +420,12 @@ pub ferroday_cage::provision::debian::DebianError::Pin::unheld: alloc::vec::Vec<
 pub ferroday_cage::provision::debian::DebianError::PlanDocument::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Release
 pub ferroday_cage::provision::debian::DebianError::Release::reason: alloc::string::String
+pub ferroday_cage::provision::debian::DebianError::Release::subject: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Resolve
 pub ferroday_cage::provision::debian::DebianError::Resolve::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Signature
 pub ferroday_cage::provision::debian::DebianError::Signature::reason: alloc::string::String
+pub ferroday_cage::provision::debian::DebianError::Signature::subject: alloc::string::String
 impl ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::at(&'static str, impl core::convert::Into<std::path::PathBuf>) -> impl core::ops::function::FnOnce(core::io::error::Error) -> ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::debian::DebianError
@@ -628,6 +632,7 @@ pub ferroday_cage::provision::debian::PlannedPackage::filename: alloc::string::S
 pub ferroday_cage::provision::debian::PlannedPackage::installed_size: core::option::Option<u64>
 pub ferroday_cage::provision::debian::PlannedPackage::name: alloc::string::String
 pub ferroday_cage::provision::debian::PlannedPackage::sha256: alloc::string::String
+pub ferroday_cage::provision::debian::PlannedPackage::size: core::option::Option<u64>
 pub ferroday_cage::provision::debian::PlannedPackage::source: core::option::Option<alloc::string::String>
 pub ferroday_cage::provision::debian::PlannedPackage::version: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::debian::PlannedPackage
@@ -723,7 +728,7 @@ pub fn ferroday_cage::provision::debian::DebianObserver::progress(&mut self, fer
 impl<F: core::ops::function::FnMut(ferroday_cage::provision::debian::DebianEvent<'_>)> ferroday_cage::provision::debian::DebianObserver for F
 pub fn F::cancelled(&mut self) -> bool
 pub fn F::progress(&mut self, ferroday_cage::provision::debian::DebianEvent<'_>)
-pub fn ferroday_cage::provision::debian::build_depend_names(&str) -> alloc::vec::Vec<alloc::string::String>
+pub fn ferroday_cage::provision::debian::build_depend_names(&str, &str) -> alloc::vec::Vec<alloc::string::String>
 pub fn ferroday_cage::provision::debian::foreign_interpreter(&str) -> core::option::Option<ferroday_cage::provision::debian::Interpreter>
 pub fn ferroday_cage::provision::debian::host_architecture() -> alloc::string::String
 pub mod ferroday_cage::provision::gentoo

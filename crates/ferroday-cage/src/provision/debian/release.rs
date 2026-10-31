@@ -11,25 +11,16 @@
 use std::collections::HashMap;
 
 use crate::provision::digest::Algorithm;
-use crate::provision::openpgp::OpenPgpError;
 use crate::provision::{document, now_epoch};
 
-/// A failure establishing or reading the release.
-#[derive(Debug)]
-pub(crate) enum ReleaseError {
-    /// The signature over the `InRelease` document was not acceptable, or the
-    /// keyring it would have been judged against could not be read.
-    OpenPgp(OpenPgpError),
-    /// The release is well-signed but malformed, expired, or does not offer
-    /// the requested architecture or component.
-    Release(String),
-}
-
-impl From<OpenPgpError> for ReleaseError {
-    fn from(err: OpenPgpError) -> ReleaseError {
-        ReleaseError::OpenPgp(err)
-    }
-}
+/// Why a release cannot be used: it is malformed, expired, or does not offer
+/// what was asked.
+///
+/// A reason rather than an error, because the subject is the caller's: the
+/// URL the release was fetched from, which this module never sees. The caller
+/// reports it as [`DebianError::Release`](super::DebianError::Release) naming
+/// that URL.
+pub(crate) type Refusal = String;
 
 /// A parsed `Release` body: the index digests and the release's own claims.
 pub(crate) struct Release {
@@ -58,11 +49,11 @@ pub(crate) struct Release {
 impl Release {
     /// Parses a release body (the verified `InRelease` text, or a trusted
     /// `Release`).
-    pub(crate) fn parse(body: &str) -> Result<Release, ReleaseError> {
+    pub(crate) fn parse(body: &str) -> Result<Release, Refusal> {
         let stanza = document::parse(body)
             .into_iter()
             .next()
-            .ok_or_else(|| ReleaseError::Release("the release file is empty".to_string()))?;
+            .ok_or_else(|| "the release file is empty".to_string())?;
 
         // A line the reader cannot use is dropped rather than failing the
         // release: a real archive's list names files this crate never asks for
@@ -131,20 +122,20 @@ impl Release {
         architecture: &str,
         components: &[String],
         require_valid_until: bool,
-    ) -> Result<(), ReleaseError> {
+    ) -> Result<(), Refusal> {
         self.check_suite(suite)?;
         if !self.architectures.iter().any(|arch| arch == architecture) {
-            return Err(ReleaseError::Release(format!(
+            return Err(format!(
                 "the suite does not offer architecture {architecture} (offers {})",
                 self.architectures.join(", "),
-            )));
+            ));
         }
         for component in components {
             if !self.components.iter().any(|offered| offered == component) {
-                return Err(ReleaseError::Release(format!(
+                return Err(format!(
                     "the suite does not offer component {component} (offers {})",
                     self.components.join(", "),
-                )));
+                ));
             }
         }
         self.check_freshness(require_valid_until)?;
@@ -160,16 +151,16 @@ impl Release {
     /// transport) could answer a request for one suite with a genuine,
     /// validly-signed release for another — a silent cross-suite or downgrade
     /// substitution. This is the binding `debootstrap` and `apt` enforce.
-    fn check_suite(&self, requested: &str) -> Result<(), ReleaseError> {
+    fn check_suite(&self, requested: &str) -> Result<(), Refusal> {
         let identifies_as = |field: &Option<String>| field.as_deref() == Some(requested);
         if identifies_as(&self.suite) || identifies_as(&self.codename) {
             return Ok(());
         }
-        Err(ReleaseError::Release(format!(
+        Err(format!(
             "the release does not identify as suite {requested} (its Suite is {}, its Codename is {})",
             self.suite.as_deref().unwrap_or("absent"),
             self.codename.as_deref().unwrap_or("absent"),
-        )))
+        ))
     }
 
     /// Enforces release freshness when `require_valid_until` is set: a
@@ -193,29 +184,22 @@ impl Release {
     /// stable. Such a release simply carries no freshness bound. The caller
     /// relaxes the check entirely on a trusted local mirror, or when
     /// deliberately pinning a historical snapshot whose deadline has passed.
-    fn check_freshness(&self, require_valid_until: bool) -> Result<(), ReleaseError> {
+    fn check_freshness(&self, require_valid_until: bool) -> Result<(), Refusal> {
         if !require_valid_until {
             return Ok(());
         }
         let Some(valid_until) = self.valid_until.as_deref() else {
             return Ok(());
         };
-        let deadline = parse_rfc5322(valid_until).ok_or_else(|| {
-            ReleaseError::Release(format!(
-                "the release Valid-Until {valid_until} is unparseable"
-            ))
-        })?;
+        let deadline = parse_rfc5322(valid_until)
+            .ok_or_else(|| format!("the release Valid-Until {valid_until} is unparseable"))?;
         let now = now_epoch().ok_or_else(|| {
-            ReleaseError::Release(
-                "the system clock is before the Unix epoch, so release freshness cannot be \
-                 established"
-                    .to_string(),
-            )
+            "the system clock is before the Unix epoch, so release freshness cannot be \
+             established"
+                .to_string()
         })?;
         if now > deadline {
-            return Err(ReleaseError::Release(format!(
-                "the release expired at {valid_until}"
-            )));
+            return Err(format!("the release expired at {valid_until}"));
         }
         Ok(())
     }
@@ -501,7 +485,7 @@ Components: main
         let err = release
             .check("trixie", "amd64", &["main".to_string()], false)
             .unwrap_err();
-        assert!(matches!(err, ReleaseError::Release(_)));
+        assert!(err.contains("does not identify as suite trixie"), "{err}");
         // The matching suite passes the same check.
         release
             .check("bookworm", "amd64", &["main".to_string()], false)
@@ -654,7 +638,7 @@ Valid-Until: Mon, 01 Jan 1990 00:00:00 UTC
         let err = release
             .check("trixie", "amd64", &["main".to_string()], true)
             .unwrap_err();
-        assert!(matches!(err, ReleaseError::Release(_)));
+        assert!(err.contains("expired"), "{err}");
         // The same stale release is accepted when freshness is not required
         // (a trusted local mirror, or a deliberately pinned snapshot).
         release

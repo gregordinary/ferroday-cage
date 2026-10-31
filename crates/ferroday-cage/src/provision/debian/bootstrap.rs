@@ -66,23 +66,38 @@ const OWNERSHIP_TOOLS: [&str; 2] = ["chown", "chgrp"];
 /// wrote, so the restore can delete a stub it has no real tool to put back.
 const OWNERSHIP_STUB: &str = "#!/bin/sh\nexit 0\n";
 
-/// The file-name stem the primary repository's trust anchor takes in the
-/// finished rootfs, and so the one name an additional repository may not claim:
-/// [`repository::validate_distinct_entries`] refuses a set that would write a
-/// second keyring here.
+/// The file-name stem a trust anchor the bootstrap writes for the primary
+/// repository takes in the finished rootfs, and so a name an additional
+/// repository may not claim: [`repository::validate_distinct_entries`] refuses
+/// a set that would write a second keyring here.
+///
+/// A stem no package ships, so nothing the root goes on to upgrade replaces
+/// what is written here. It holds a caller's keyring, which the caller keeps
+/// current, or the embedded archive keyring where the root has no
+/// `debian-archive-keyring` package to name instead; see
+/// [`write_repository_sources`].
 ///
 /// [`repository::validate_distinct_entries`]: super::repository::validate_distinct_entries
-pub(crate) const TRUST_ANCHOR_STEM: &str = "debian-archive-keyring";
+pub(crate) const TRUST_ANCHOR_STEM: &str = "fcage-archive-keyring";
 
-/// Where a repository's trust anchor is written in the finished rootfs, and the
-/// `signed-by` its [sources file](write_repository_sources) references. A binary
-/// OpenPGP keyring here lets an in-rootfs `apt-get update` verify the release
-/// without the `debian-archive-keyring` package, which the base closure does not
-/// pull in.
+/// The package that ships Debian's archive keyring. `apt` depends on it, so
+/// every root with `apt` holds it, and its upgrades are how a root learns the
+/// keys the archive rotates to.
+pub(crate) const ARCHIVE_KEYRING_PACKAGE: &str = "debian-archive-keyring";
+
+/// The file-name stem of the keyring [`ARCHIVE_KEYRING_PACKAGE`] installs,
+/// which no repository's anchor may take: the package's upgrades replace the
+/// file, and a default primary's `sources.list` names it.
+pub(crate) const PACKAGE_KEYRING_STEM: &str = "debian-archive-keyring";
+
+/// Where a repository's keyring is in the finished rootfs, and the `signed-by`
+/// its [sources file](write_repository_sources) references.
 ///
-/// The primary's stem is [`TRUST_ANCHOR_STEM`] and an additional repository's is
-/// its [`entry_stem`](Repository::entry_stem); both land in this one directory,
-/// which is why they share one collision set rather than two.
+/// The primary's stem is [`PACKAGE_KEYRING_STEM`] where it names the package's
+/// keyring, and [`TRUST_ANCHOR_STEM`] where the bootstrap writes one; an
+/// additional repository's is its [`entry_stem`](Repository::entry_stem). All
+/// of them land in this one directory, which is why they share one collision
+/// set rather than two.
 pub(crate) fn keyring_path(stem: &str) -> String {
     format!("/usr/share/keyrings/{stem}.gpg")
 }
@@ -152,7 +167,8 @@ const DBUS_MACHINE_ID: &str = "var/lib/dbus/machine-id";
 pub(crate) const ARCHIVES: &str = "/fcage-debs";
 
 /// A package to install: its name, the path to its `.deb` inside the cage, and
-/// the SHA-256 the `.deb` was verified against, for re-verification on read.
+/// the SHA-256 the `.deb` was acquired under, which the extraction verifies the
+/// file `dpkg` goes on to read against.
 pub(crate) struct Installable {
     pub name: String,
     pub deb_path: String,
@@ -246,8 +262,9 @@ fn record_path(line: &str) -> Option<&str> {
 /// `core_install` and `run_dpkg`, and were threaded through each positionally.
 /// Gathered here, a step names what it reads.
 pub(crate) struct Configure<'a> {
-    /// The host directory the `.deb` files were downloaded into, bound
-    /// read-only into each dpkg cage.
+    /// The host directory the `.deb` files are installed from, bound read-only
+    /// into each dpkg cage: one only this run writes, so what `dpkg` reads is
+    /// what the extraction verified.
     pub(crate) archives_host: &'a Path,
     /// The packages to install, in the order they were resolved.
     pub(crate) installables: &'a [Installable],
@@ -711,6 +728,11 @@ fn precreate_shadow(tree: &Rooted) -> Result<(), DebianError> {
 /// tree alone; a layered build roots on an overlay of the pristine base and the
 /// increment's upper, so dpkg reads the base's configured database and lands its
 /// writes in the disposable upper.
+///
+/// The observer is asked whether to stop before the wave starts. A wave runs
+/// for minutes and is not interrupted once begun, so the boundary between two
+/// waves is where a cancelled bootstrap stops; the tree it leaves is discarded
+/// whole, so a half-configured database is not a hazard.
 fn run_dpkg(
     name: &'static str,
     staging: &Path,
@@ -719,6 +741,9 @@ fn run_dpkg(
     wave: &Configure<'_>,
     observer: &mut dyn DebianObserver,
 ) -> Result<(), DebianError> {
+    if observer.cancelled() {
+        return Err(DebianError::Cancelled);
+    }
     let &Configure {
         archives_host,
         identity_map,
@@ -732,7 +757,7 @@ fn run_dpkg(
         .builder(staging)
         .command("/usr/bin/dpkg")
         .args(args)
-        // Read-only so a wave cannot rewrite the caller's package cache, in the
+        // Read-only so a wave cannot rewrite the packages it installs, in the
         // ordinary course of unpacking or otherwise. The command enters a nested
         // user namespace before it execs, which locks the flag, so this holds
         // even though dpkg runs as namespace root — as a maintainer script needs
@@ -766,8 +791,9 @@ fn run_dpkg(
     }
 }
 
-/// Verifies every selected package reached `install ok installed`.
-fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianError> {
+/// The packages the tree's dpkg status database records as `install ok
+/// installed`.
+fn installed_packages(tree: &Rooted) -> Result<HashSet<String>, DebianError> {
     let text =
         read_text(tree, STATUS).map_err(at("reading the dpkg status database", tree, STATUS))?;
     let mut installed = HashSet::new();
@@ -778,6 +804,12 @@ fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianErro
             installed.insert(name.to_string());
         }
     }
+    Ok(installed)
+}
+
+/// Verifies every selected package reached `install ok installed`.
+fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianError> {
+    let installed = installed_packages(tree)?;
     let mut missing: Vec<String> = selected
         .iter()
         .filter(|name| !installed.contains(*name))
@@ -893,16 +925,25 @@ fn write_dselect_method(tree: &Rooted) -> Result<(), DebianError> {
 
 /// Writes every repository's apt source into the finished rootfs.
 ///
-/// The primary repository (index zero) owns `/etc/apt/sources.list` and, when
-/// signed, the [`TRUST_ANCHOR_STEM`] keyring path. Each additional
-/// repository writes `/etc/apt/sources.list.d/<name>.list` and, when signed,
-/// its own `/usr/share/keyrings/<name>.gpg`, referenced by a `signed-by` so an
-/// in-rootfs `apt-get update` verifies it against that keyring without the
-/// `debian-archive-keyring` package the base closure does not install. An
-/// unsigned repository writes a `[trusted=yes]` line and no keyring, apt's own
-/// posture for a source under the caller's control. Each source names the
-/// repository's primary mirror; a snapshot backstop is a fetch-time concern and
-/// is not written into the installed system.
+/// The primary repository (index zero) owns `/etc/apt/sources.list`. Each
+/// additional repository writes `/etc/apt/sources.list.d/<name>.list` and, when
+/// signed, its own `/usr/share/keyrings/<name>.gpg`, referenced by a
+/// `signed-by` so an in-rootfs `apt-get update` verifies it against the keyring
+/// the bootstrap verified it against. An unsigned repository writes a
+/// `[trusted=yes]` line and no keyring, apt's own posture for a source under
+/// the caller's control. Each source names the repository's primary mirror; a
+/// snapshot backstop is a fetch-time concern and is not written into the
+/// installed system.
+///
+/// The primary's keyring depends on where it came from. A keyring of the
+/// caller's is written at [`TRUST_ANCHOR_STEM`], a path no package ships, so
+/// it stays the caller's to rotate. Where the bootstrap verified against the
+/// embedded archive keyring, the line names the keyring the
+/// `debian-archive-keyring` package installed instead, and writes nothing: the
+/// package carries the same keys and its upgrades deliver the ones the archive
+/// rotates to, which a copy written now would never learn. A root that does
+/// not hold the package, which is one without `apt`, gets the embedded keyring
+/// at [`TRUST_ANCHOR_STEM`], so its line still verifies.
 fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Result<(), DebianError> {
     for (index, repository) in repositories.iter().enumerate() {
         let (list_path, anchor_path) = if index == 0 {
@@ -922,6 +963,13 @@ fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Resul
         };
 
         let options = match &repository.trust {
+            Trust::Archive if ships_archive_keyring(tree)? => {
+                format!("[signed-by={}]", keyring_path(PACKAGE_KEYRING_STEM))
+            }
+            Trust::Archive => {
+                write_keyring(tree, &anchor_path, super::EMBEDDED_KEYRING)?;
+                format!("[signed-by={anchor_path}]")
+            }
             Trust::Signed(keyring) => {
                 write_keyring(tree, &anchor_path, keyring)?;
                 format!("[signed-by={anchor_path}]")
@@ -940,6 +988,27 @@ fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Resul
         write_sources_file(tree, &list_path, &line)?;
     }
     Ok(())
+}
+
+/// Whether the tree holds the archive keyring [`ARCHIVE_KEYRING_PACKAGE`]
+/// ships, at the path a sources line names it by.
+///
+/// Asked of dpkg's own records rather than of the file. The status database
+/// says whether the package is installed, and the package's file list says
+/// whether it owns the path: a file a script left there, or one a later
+/// release of the package stops shipping, is not one an upgrade keeps current.
+fn ships_archive_keyring(tree: &Rooted) -> Result<bool, DebianError> {
+    if !installed_packages(tree)?.contains(ARCHIVE_KEYRING_PACKAGE) {
+        return Ok(false);
+    }
+    let list = format!("var/lib/dpkg/info/{ARCHIVE_KEYRING_PACKAGE}.list");
+    let files = match read_text(tree, &list) {
+        Ok(files) => files,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(at("reading the package's file list", tree, &list)(source)),
+    };
+    let keyring = keyring_path(PACKAGE_KEYRING_STEM);
+    Ok(files.lines().any(|line| line == keyring))
 }
 
 /// Writes a keyring into the finished rootfs at an absolute in-rootfs path,
@@ -1076,6 +1145,39 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_bootstrap_stops_before_the_next_wave() {
+        // A wave runs for minutes and is not interrupted once begun, so the
+        // boundary before one is where a cancelled bootstrap stops, and it stops
+        // before a sandbox is built for the wave.
+        struct Stop;
+        impl DebianObserver for Stop {
+            fn cancelled(&mut self) -> bool {
+                true
+            }
+        }
+        let scratch = Scratch::for_test("bootstrap", "cancelled-wave");
+        let wave = Configure {
+            archives_host: &scratch.join("archives"),
+            installables: &[],
+            statoverride: &StatOverride::default(),
+            identity_map: &IdentityMap::Single,
+            env: &[],
+        };
+        let outcome = run_dpkg(
+            "configure",
+            &scratch.join("no-such-tree"),
+            Rooting::Whole,
+            &["--configure", "--pending"],
+            &wave,
+            &mut Stop,
+        );
+        assert!(
+            matches!(outcome, Err(DebianError::Cancelled)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
     fn the_primary_sources_list_is_signed_by_the_trust_anchor() {
         // The primary owns sources.list and the canonical keyring path; the deb
         // line must carry a signed-by naming it, or apt would reject the release
@@ -1104,6 +1206,166 @@ mod tests {
                 "deb [signed-by={}] http://deb.debian.org/debian trixie main contrib\n",
                 keyring_path(TRUST_ANCHOR_STEM)
             ),
+        );
+    }
+
+    /// A primary verified against the embedded archive keyring, the default.
+    fn archive_repo() -> Repository {
+        Repository {
+            mirrors: vec!["http://deb.debian.org/debian".to_string()],
+            suite: "trixie".to_string(),
+            components: vec!["main".to_string()],
+            trust: Trust::Archive,
+            allow_stale: false,
+            name: None,
+        }
+    }
+
+    /// Records the keyring package in the tree's dpkg database at `status`,
+    /// owning `owns`, and lays its keyring where it ships one.
+    fn record_keyring_package(tree: &Rooted, status: &str, owns: &[&str]) {
+        tree.write(
+            STATUS,
+            format!(
+                "Package: base-files\nStatus: install ok installed\nVersion: 13.8\n\n\
+                 Package: {ARCHIVE_KEYRING_PACKAGE}\nStatus: {status}\nVersion: 2025.1\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut list = String::from("/.\n/usr/share/keyrings\n");
+        for path in owns {
+            list.push_str(path);
+            list.push('\n');
+        }
+        tree.write(
+            format!("var/lib/dpkg/info/{ARCHIVE_KEYRING_PACKAGE}.list"),
+            list.as_bytes(),
+        )
+        .unwrap();
+        tree.write(
+            keyring_path(PACKAGE_KEYRING_STEM),
+            b"the keys the package keeps current",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_default_primary_names_the_keyring_its_package_keeps_current() {
+        // The archive rotates its signing keys and delivers new ones through
+        // the keyring package's upgrades, so a root verified against the
+        // embedded keyring names the package's file rather than a copy that
+        // would never learn them, and writes nothing over it.
+        let (staging, tree) = rooted_tree("sources-archive-keyring");
+        record_keyring_package(
+            &tree,
+            "install ok installed",
+            &[&keyring_path(PACKAGE_KEYRING_STEM)],
+        );
+
+        write_repository_sources(&tree, &[archive_repo()]).expect("the sources are written");
+
+        assert_eq!(
+            fs::read_to_string(staging.join("etc/apt/sources.list")).unwrap(),
+            format!(
+                "deb [signed-by={}] http://deb.debian.org/debian trixie main\n",
+                keyring_path(PACKAGE_KEYRING_STEM)
+            ),
+        );
+        assert_eq!(
+            fs::read(staging.join(keyring_path(PACKAGE_KEYRING_STEM).trim_start_matches('/')))
+                .unwrap(),
+            b"the keys the package keeps current",
+            "the package's keyring is the package's",
+        );
+        assert!(
+            fs::symlink_metadata(
+                staging.join(keyring_path(TRUST_ANCHOR_STEM).trim_start_matches('/'))
+            )
+            .is_err(),
+            "no copy of the keys is written",
+        );
+    }
+
+    #[test]
+    fn a_default_primary_without_the_keyring_package_gets_the_embedded_keyring() {
+        // A root without apt holds no keyring package, or dpkg's records do not
+        // say it ships the file a line would name. The embedded keyring is then
+        // written at the private stem, so the line still verifies.
+        let anchor = keyring_path(TRUST_ANCHOR_STEM);
+        for (tag, status, owns) in [
+            ("absent", None, &[][..]),
+            (
+                "unpacked",
+                Some("install ok unpacked"),
+                &[&*keyring_path(PACKAGE_KEYRING_STEM)][..],
+            ),
+            (
+                "unowned",
+                Some("install ok installed"),
+                &["/usr/share/keyrings/other.pgp"][..],
+            ),
+        ] {
+            let (staging, tree) = rooted_tree(&format!("sources-archive-{tag}"));
+            match status {
+                Some(status) => record_keyring_package(&tree, status, owns),
+                None => tree
+                    .write(
+                        STATUS,
+                        b"Package: base-files\nStatus: install ok installed\n",
+                    )
+                    .unwrap(),
+            }
+
+            write_repository_sources(&tree, &[archive_repo()]).expect("the sources are written");
+
+            assert_eq!(
+                fs::read_to_string(staging.join("etc/apt/sources.list")).unwrap(),
+                format!("deb [signed-by={anchor}] http://deb.debian.org/debian trixie main\n"),
+                "{tag}",
+            );
+            assert_eq!(
+                fs::read(staging.join(anchor.trim_start_matches('/'))).unwrap(),
+                super::super::EMBEDDED_KEYRING,
+                "{tag}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_callers_keyring_stays_at_the_private_stem_beside_the_package() {
+        // A caller's keyring is the caller's to rotate, and the package's
+        // upgrades must not replace it, so it is written where no package
+        // writes even when the keyring package is installed.
+        let (staging, tree) = rooted_tree("sources-caller-keyring");
+        record_keyring_package(
+            &tree,
+            "install ok installed",
+            &[&keyring_path(PACKAGE_KEYRING_STEM)],
+        );
+        let primary = signed_repo(
+            "http://deb.debian.org/debian",
+            "trixie",
+            &["main"],
+            b"the caller's keys",
+            None,
+        );
+
+        write_repository_sources(&tree, &[primary]).expect("the sources are written");
+
+        let anchor = keyring_path(TRUST_ANCHOR_STEM);
+        assert_eq!(
+            fs::read_to_string(staging.join("etc/apt/sources.list")).unwrap(),
+            format!("deb [signed-by={anchor}] http://deb.debian.org/debian trixie main\n"),
+        );
+        assert_eq!(
+            fs::read(staging.join(anchor.trim_start_matches('/'))).unwrap(),
+            b"the caller's keys",
+        );
+        assert_eq!(
+            fs::read(staging.join(keyring_path(PACKAGE_KEYRING_STEM).trim_start_matches('/')))
+                .unwrap(),
+            b"the keys the package keeps current",
         );
     }
 

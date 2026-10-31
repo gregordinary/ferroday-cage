@@ -3,11 +3,10 @@
 //! [`Available`] is the read-only counterpart to a resolve: where
 //! [`Debian::resolve`](super::Debian::resolve) answers "what would a bootstrap
 //! of this include set install", this answers "does this archive carry that
-//! name at all". Neither resolver behaviour substitutes for it, and both are
-//! correct for what they are — a top-level include naming nothing fails the
-//! whole resolve, so a batch of them answers only whether they were all there,
-//! and an unsatisfiable transitive dependency is dropped deliberately, since
-//! dpkg configures with `--force-depends`.
+//! name at all". A resolve cannot substitute for it, and is correct for what it
+//! is: it fails the whole closure over every include or dependency nothing
+//! satisfies, so a batch of names answers only whether all of them, and
+//! everything they depend on, were there.
 //!
 //! The type is a projection rather than a retained index. A merged trixie amd64
 //! index is on the order of 69,000 packages with their relation vectors, which
@@ -64,12 +63,10 @@ impl Available {
     /// Whether `name` resolves in these archives, as a real package or as a
     /// virtual name something provides.
     ///
-    /// Availability is answered at the level of the name, which is the level
-    /// the resolver works at: a dependency's version constraint and
-    /// architecture qualifier are parsed away on the grounds that a single
-    /// suite is internally consistent. So this reports whether the archives
-    /// offer the name, not whether they offer a version satisfying some
-    /// constraint — the library does not solve version constraints.
+    /// Availability is answered at the level of the name. This reports whether
+    /// the archives offer the name, not whether they offer a version satisfying
+    /// some constraint: the resolver enforces a dependency's constraint, but
+    /// that is a question about one closure, and this computes none.
     pub fn contains(&self, name: &str) -> bool {
         self.names.contains(name)
     }
