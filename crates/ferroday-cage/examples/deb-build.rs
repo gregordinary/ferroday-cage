@@ -75,7 +75,7 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::debian::{Debian, DebianEvent};
 use ferroday_cage::provision::{self, Provisioned};
-use ferroday_cage::{Cage, ConfigError, Error, Network};
+use ferroday_cage::{Cage, ConfigError, Error, ErrorChain, Network};
 
 mod common;
 
@@ -327,7 +327,7 @@ fn run(config: Config) -> ExitCode {
             ExitCode::from(status.shell_code())
         }
         Err(error) => {
-            eprintln!("deb-build: {error}");
+            eprintln!("deb-build: {}", ErrorChain::new(&error));
             ExitCode::from(error.shell_code())
         }
     }
@@ -355,7 +355,10 @@ fn provision(config: &Config, control: &Path) -> Result<(), ExitCode> {
     let mut debian = builder.build().map_err(|error| {
         failure(
             "deb-build",
-            &format!("cannot configure the bootstrap: {error}"),
+            &format!(
+                "cannot configure the bootstrap: {}",
+                ErrorChain::new(&error)
+            ),
         )
     })?;
     let mut progress = print_progress;
@@ -369,7 +372,10 @@ fn provision(config: &Config, control: &Path) -> Result<(), ExitCode> {
         Ok(_) => Ok(()),
         Err(error) => Err(failure(
             "deb-build",
-            &format!("cannot provision the build root: {error}"),
+            &format!(
+                "cannot provision the build root: {}",
+                ErrorChain::new(&error)
+            ),
         )),
     }
 }
@@ -436,6 +442,6 @@ fn report_build_error(error: &Error) {
             "deb-build: build root {} is unusable; it is provisioned on the first run",
             path.display()
         ),
-        other => eprintln!("deb-build: {other}"),
+        other => eprintln!("deb-build: {}", ErrorChain::new(other)),
     }
 }

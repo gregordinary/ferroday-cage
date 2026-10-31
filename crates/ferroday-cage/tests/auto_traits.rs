@@ -286,6 +286,10 @@ const _: () = assert_send_sync::<ferroday_cage::RestrictedProfile>();
 //   the provisioning thread, and the request exists only for the duration of
 //   `Provisioner::provision`.
 //
+// - `ErrorChain<'a>` borrows a `&dyn Error`, which carries no thread bounds so
+//   that it renders any error at all, a caller's own included. It lives for the
+//   one `format!` that prints it.
+//
 // The rule the crate follows is that a seam it *stores* carries thread bounds
 // and a seam it merely *borrows* for one call does not. `Fetch` and `IdMapper`
 // are stored, and are bounded; `Observer` and the progress sink are borrowed,

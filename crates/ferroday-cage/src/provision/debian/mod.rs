@@ -78,7 +78,7 @@ use super::{
 };
 use crate::failure::path_io_error;
 use crate::status::ExitStatus;
-use crate::{IdMapper, IdentityMap};
+use crate::{ErrorChain, IdMapper, IdentityMap};
 use bootstrap::{Installable, StatOverride};
 use index::{Index, Package};
 use pin::Pins;
@@ -657,7 +657,7 @@ impl Debian {
         crate::idmap::establishable(&self.identity_map, self.id_mapper.as_ref()).map_err(
             |refusal| {
                 wrap(DebianError::Config {
-                    reason: refusal.to_string(),
+                    reason: ErrorChain::new(&refusal).to_string(),
                 })
             },
         )?;
@@ -1630,7 +1630,7 @@ fn bootstrap_suite(
         // posture is never quietly downgraded to the single-identity form.
         crate::idmap::establishable(identity_map, id_mapper).map_err(|refusal| {
             wrap(DebianError::Config {
-                reason: refusal.to_string(),
+                reason: ErrorChain::new(&refusal).to_string(),
             })
         })?;
     }
@@ -2706,7 +2706,8 @@ fn decompress_index(url: &str, bytes: &[u8], limit: u64) -> Result<String, Debia
         .map_err(|err| unusable(format!("its header cannot be read: {err}")))?;
     let mut reader = super::compress::decompress(&head, cursor).map_err(|err| {
         unusable(format!(
-            "it is not a stream this library decompresses: {err}"
+            "it is not a stream this library decompresses: {}",
+            ErrorChain::new(&err)
         ))
     })?;
     let mut text = Vec::new();
@@ -3132,9 +3133,7 @@ impl fmt::Display for DebianError {
             DebianError::Config { reason } => {
                 write!(f, "the Debian bootstrap is misconfigured: {reason}")
             }
-            DebianError::Fetch(err) => {
-                write!(f, "the Debian bootstrap could not fetch a resource: {err}")
-            }
+            DebianError::Fetch(_) => f.write_str("the Debian bootstrap could not fetch a resource"),
             DebianError::Signature { subject, reason } => {
                 write!(f, "the signature over {subject} was not accepted: {reason}")
             }
@@ -3174,9 +3173,9 @@ impl fmt::Display for DebianError {
                 "these packages were not configured: {}",
                 packages.join(", "),
             ),
-            DebianError::Launch(err) => write!(f, "a configuration step could not launch: {err}"),
-            DebianError::Overlay(err) => {
-                write!(f, "the pre-configure overlay could not be applied: {err}")
+            DebianError::Launch(_) => f.write_str("a configuration step could not launch"),
+            DebianError::Overlay(_) => {
+                f.write_str("the pre-configure overlay could not be applied")
             }
             DebianError::Deb { path, reason } => {
                 write!(
@@ -3196,13 +3195,11 @@ impl fmt::Display for DebianError {
             DebianError::PlanDocument { reason } => {
                 write!(f, "the install plan document is not usable: {reason}")
             }
-            DebianError::Io { op, path, source } => {
-                write!(
-                    f,
-                    "a Debian bootstrap step failed while {op} {}: {source}",
-                    path.display()
-                )
-            }
+            DebianError::Io { op, path, .. } => write!(
+                f,
+                "a Debian bootstrap step failed while {op} {}",
+                path.display()
+            ),
         }
     }
 }
@@ -3906,7 +3903,7 @@ mod tests {
         // And it is reported against the mirror that carries the bad URL rather
         // than against the backstop, which is the whole reason a `Url` failure
         // does not advance the walk.
-        let reason = result.unwrap_err().to_string();
+        let reason = ErrorChain::new(&result.unwrap_err()).to_string();
         assert!(reason.contains("primary.example"), "{reason}");
         assert!(!reason.contains("snapshot.example"), "{reason}");
     }
@@ -3930,7 +3927,7 @@ mod tests {
         let result =
             fetch_from_mirrors(&mut fetcher, &mirrors, "dists/stable/Release", &mut Silent);
         assert_eq!(fetcher.asked.len(), 2, "{:?}", fetcher.asked);
-        let reason = result.unwrap_err().to_string();
+        let reason = ErrorChain::new(&result.unwrap_err()).to_string();
         assert!(reason.contains("last.example"), "{reason}");
         assert!(!reason.contains("first.example"), "{reason}");
     }

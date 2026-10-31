@@ -1509,6 +1509,7 @@ pub ferroday_cage::ConfigError::BindSourceUnusable::source: core::io::error::Err
 pub ferroday_cage::ConfigError::CommandMissing
 #[non_exhaustive] pub ferroday_cage::ConfigError::CommandNotAbsolute
 pub ferroday_cage::ConfigError::CommandNotAbsolute::command: std::path::PathBuf
+pub ferroday_cage::ConfigError::CommandNotAbsolute::lookup_offered: bool
 #[non_exhaustive] pub ferroday_cage::ConfigError::EmbeddedNul
 pub ferroday_cage::ConfigError::EmbeddedNul::value: std::ffi::os_str::OsString
 #[non_exhaustive] pub ferroday_cage::ConfigError::EnvNameInvalid
@@ -2171,6 +2172,18 @@ impl core::marker::Unpin for ferroday_cage::DirectMapper
 impl core::marker::UnsafeUnpin for ferroday_cage::DirectMapper
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::DirectMapper
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::DirectMapper
+pub struct ferroday_cage::ErrorChain<'a>
+impl<'a> ferroday_cage::ErrorChain<'a>
+pub fn ferroday_cage::ErrorChain<'a>::new(&'a (dyn core::error::Error + 'static)) -> ferroday_cage::ErrorChain<'a>
+impl core::fmt::Display for ferroday_cage::ErrorChain<'_>
+pub fn ferroday_cage::ErrorChain<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Freeze for ferroday_cage::ErrorChain<'a>
+impl<'a> !core::marker::Send for ferroday_cage::ErrorChain<'a>
+impl<'a> !core::marker::Sync for ferroday_cage::ErrorChain<'a>
+impl<'a> core::marker::Unpin for ferroday_cage::ErrorChain<'a>
+impl<'a> core::marker::UnsafeUnpin for ferroday_cage::ErrorChain<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ErrorChain<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::ErrorChain<'a>
 pub struct ferroday_cage::ExitStatus(_)
 impl ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::code(&self) -> core::option::Option<i32>

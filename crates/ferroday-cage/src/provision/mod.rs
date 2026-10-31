@@ -409,6 +409,12 @@ pub enum Provisioned {
 ///
 /// Provisioning is a separate act from launching a sandbox, and carries its
 /// own error type; it never appears inside [`Error`](crate::Error).
+///
+/// As with every error type in this crate, the message says what failed and on
+/// what, and the cause underneath is returned from
+/// [`source`](std::error::Error::source) rather than repeated in it: an OS
+/// error, or a provisioner's own error under [`Other`](Self::Other). Print one
+/// through [`ErrorChain`](crate::ErrorChain) to show the whole chain.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ProvisionError {
@@ -610,14 +616,24 @@ impl ProvisionError {
     /// The channel for a [`Provisioner`] implemented outside this crate: its
     /// error type travels intact and is reachable through
     /// [`source`](std::error::Error::source), so a consumer can downcast to it.
+    /// The wrapper's own message says only that provisioning failed, and the
+    /// provisioner's error is the next layer of the chain.
     ///
     /// # Example
     ///
     /// ```
+    /// use std::error::Error as _;
+    ///
+    /// use ferroday_cage::ErrorChain;
     /// use ferroday_cage::provision::ProvisionError;
     ///
     /// let err = ProvisionError::other("the mirror rejected the request");
-    /// assert!(err.to_string().contains("the mirror rejected the request"));
+    /// let cause = err.source().expect("the provisioner's error");
+    /// assert_eq!(cause.to_string(), "the mirror rejected the request");
+    /// assert_eq!(
+    ///     ErrorChain::new(&err).to_string(),
+    ///     "provisioning failed: the mirror rejected the request",
+    /// );
     /// ```
     pub fn other(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> ProvisionError {
         ProvisionError::Other {
@@ -647,12 +663,8 @@ impl fmt::Display for ProvisionError {
                 "cannot publish a rootfs at {}: the path has no final component or is not a directory",
                 path.display(),
             ),
-            ProvisionError::Io { op, path, source } => {
-                write!(
-                    f,
-                    "provisioning failed while {op} {}: {source}",
-                    path.display()
-                )
+            ProvisionError::Io { op, path, .. } => {
+                write!(f, "provisioning failed while {op} {}", path.display())
             }
             ProvisionError::Archive { offset, reason } => {
                 write!(f, "malformed archive at offset {offset}: {reason}")
@@ -677,15 +689,13 @@ impl fmt::Display for ProvisionError {
                 path.display(),
             ),
             ProvisionError::Cancelled => f.write_str("provisioning was cancelled"),
-            ProvisionError::Other { source } => write!(f, "provisioning failed: {source}"),
-            ProvisionError::RemoveUnprivileged {
-                path,
-                source,
-                reason,
-            } => write!(
+            // The provisioner's own error says what failed; this layer says
+            // only that it was provisioning, and leaves the rest to `source`.
+            ProvisionError::Other { .. } => f.write_str("provisioning failed"),
+            ProvisionError::RemoveUnprivileged { path, reason, .. } => write!(
                 f,
-                "cannot remove {}: {source}; the tree holds ids the caller cannot act on, \
-                 and no delegate can establish the identity map to remove them ({reason})",
+                "cannot remove {}: the tree holds ids the caller cannot act on, and no delegate \
+                 can establish the identity map to remove them ({reason})",
                 path.display(),
             ),
             ProvisionError::CopyUnprivileged { path, reason } => write!(
@@ -1430,7 +1440,9 @@ pub(crate) fn remove_tree(
             crate::mechanism::RemoveFailure::Step { step, errno } => {
                 ProvisionError::io(step.describe(), dest, io::Error::from_raw_os_error(errno))
             }
-            crate::mechanism::RemoveFailure::Map(err) => unprivileged(denied, err.to_string()),
+            crate::mechanism::RemoveFailure::Map(err) => {
+                unprivileged(denied, crate::failure::ErrorChain::new(&err).to_string())
+            }
             crate::mechanism::RemoveFailure::Malformed => ProvisionError::io(
                 "reading the removal process's outcome",
                 dest,

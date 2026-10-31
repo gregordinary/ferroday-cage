@@ -73,7 +73,7 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent};
 use ferroday_cage::provision::{self, ProvisionEvent, Provisioned, Tarball};
-use ferroday_cage::{Cage, ConfigError, Error, IdentityMap, Network};
+use ferroday_cage::{Cage, ConfigError, Error, ErrorChain, IdentityMap, Network};
 
 mod common;
 
@@ -323,7 +323,7 @@ fn run(config: Config) -> ExitCode {
             match builder.build() {
                 Ok(gentoo) => Some(Source::Archive(Box::new(gentoo), variant.clone())),
                 Err(error) => {
-                    return failure("ebuild-sandbox", &error.to_string());
+                    return failure("ebuild-sandbox", &ErrorChain::new(&error).to_string());
                 }
             }
         }
@@ -359,7 +359,7 @@ fn run(config: Config) -> ExitCode {
             Err(error) => {
                 return failure(
                     "ebuild-sandbox",
-                    &format!("cannot provision the stage3: {error}"),
+                    &format!("cannot provision the stage3: {}", ErrorChain::new(&error)),
                 );
             }
         }
@@ -420,7 +420,7 @@ fn launch(cage: Cage) -> ExitCode {
     match cage.run() {
         Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
-            eprintln!("ebuild-sandbox: {error}");
+            eprintln!("ebuild-sandbox: {}", ErrorChain::new(&error));
             ExitCode::from(error.shell_code())
         }
     }
@@ -442,6 +442,6 @@ fn report_build_error(error: &Error) {
         Error::Config(ConfigError::IdentityMapUnavailable { reason, .. }) => {
             eprintln!("ebuild-sandbox: a uid/gid range map is required and unavailable: {reason}")
         }
-        other => eprintln!("ebuild-sandbox: {other}"),
+        other => eprintln!("ebuild-sandbox: {}", ErrorChain::new(other)),
     }
 }

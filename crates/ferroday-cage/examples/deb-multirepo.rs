@@ -69,7 +69,7 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::debian::{Debian, DebianError, DebianEvent, Repository};
 use ferroday_cage::provision::{self, Provisioned};
-use ferroday_cage::{Cage, ConfigError, Error};
+use ferroday_cage::{Cage, ConfigError, Error, ErrorChain};
 
 mod common;
 
@@ -236,12 +236,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
 fn run(config: Config) -> ExitCode {
     let mut debian = match compose(&config) {
         Ok(debian) => debian,
-        Err(error) => {
-            return failure(
-                "deb-multirepo",
-                &format!("cannot configure the bootstrap: {error}"),
-            );
-        }
+        Err(error) => return failure("deb-multirepo", &ErrorChain::new(&error).to_string()),
     };
 
     let mut progress = print_progress;
@@ -258,7 +253,7 @@ fn run(config: Config) -> ExitCode {
             }
             Err(error) => failure(
                 "deb-multirepo",
-                &format!("cannot resolve the plan: {error}"),
+                &format!("cannot resolve the plan: {}", ErrorChain::new(&error)),
             ),
         };
     }
@@ -273,7 +268,7 @@ fn run(config: Config) -> ExitCode {
         Err(error) => {
             return failure(
                 "deb-multirepo",
-                &format!("cannot provision the root: {error}"),
+                &format!("cannot provision the root: {}", ErrorChain::new(&error)),
             );
         }
     }
@@ -374,7 +369,7 @@ fn launch(rootfs: &Path, argv: &[OsString]) -> ExitCode {
     match cage.run() {
         Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
-            eprintln!("deb-multirepo: {error}");
+            eprintln!("deb-multirepo: {}", ErrorChain::new(&error));
             ExitCode::from(error.shell_code())
         }
     }
@@ -382,6 +377,11 @@ fn launch(rootfs: &Path, argv: &[OsString]) -> ExitCode {
 
 /// A failure composing the provisioner: an unreadable local repository, or an
 /// invalid bootstrap configuration.
+///
+/// It follows the library's convention for an error: the message says what
+/// failed and on what, and the cause is the [`source`](std::error::Error::source)
+/// that [`ErrorChain`] renders after it.
+#[derive(Debug)]
 enum ComposeError {
     LocalRepo {
         path: PathBuf,
@@ -399,14 +399,19 @@ impl From<DebianError> for ComposeError {
 impl std::fmt::Display for ComposeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ComposeError::LocalRepo { path, source } => {
-                write!(
-                    f,
-                    "local repository {} is unreadable: {source}",
-                    path.display()
-                )
+            ComposeError::LocalRepo { path, .. } => {
+                write!(f, "local repository {} is unreadable", path.display())
             }
-            ComposeError::Debian(error) => write!(f, "{error}"),
+            ComposeError::Debian(_) => f.write_str("cannot configure the bootstrap"),
+        }
+    }
+}
+
+impl std::error::Error for ComposeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ComposeError::LocalRepo { source, .. } => Some(source),
+            ComposeError::Debian(error) => Some(error),
         }
     }
 }
@@ -451,6 +456,6 @@ fn report_launch_error(error: &Error) {
             "deb-multirepo: root {} is unusable; it is provisioned on the first run",
             path.display()
         ),
-        other => eprintln!("deb-multirepo: {other}"),
+        other => eprintln!("deb-multirepo: {}", ErrorChain::new(other)),
     }
 }

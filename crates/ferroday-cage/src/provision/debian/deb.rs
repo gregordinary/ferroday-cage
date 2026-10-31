@@ -256,6 +256,7 @@ fn deb_error(package: &str, reason: &str) -> ProvisionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorChain;
 
     /// Seeks to `member`, reporting the reason rather than a typed error, and
     /// returns it with the bytes the member holds.
@@ -264,11 +265,11 @@ mod tests {
         let size = seek_to_member(&mut cursor, member, None, &|reason: String| {
             ProvisionError::other(reason)
         })
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| ErrorChain::new(&err).to_string())?;
         let mut bytes = vec![0u8; size as usize];
         cursor
             .read_exact(&mut bytes)
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| ErrorChain::new(&err).to_string())?;
         Ok(bytes)
     }
 
@@ -405,7 +406,12 @@ mod tests {
         ]);
         let err = read_control_from(&mut Cursor::new(&archive))
             .expect_err("a .deb with no control member is rejected");
-        assert!(err.to_string().contains("no control.tar member"), "{err}");
+        assert!(
+            ErrorChain::new(&err)
+                .to_string()
+                .contains("no control.tar member"),
+            "{err}"
+        );
     }
 
     /// A `.deb` whose control member is `tar`, gzipped, asserting that the
@@ -472,6 +478,11 @@ mod tests {
 
         let err = read_control_from(&mut Cursor::new(&archive))
             .expect_err("an implausible control member is refused");
-        assert!(err.to_string().contains("implausibly large"), "{err}");
+        assert!(
+            ErrorChain::new(&err)
+                .to_string()
+                .contains("implausibly large"),
+            "{err}"
+        );
     }
 }

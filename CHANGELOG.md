@@ -201,6 +201,9 @@ consumer upgrading can skip it.
 - `ExitStatus::exited` and `ExitStatus::signaled`, which build the status a
   command would report, for a caller that reports an outcome of its own in the
   same convention.
+- `ErrorChain`, which renders an error and every cause beneath it on one line,
+  as `error: cause: cause`. `fcage` and the examples print every error through
+  it.
 - `NetStackBuilder::host_loopback_port`, which maps connections to the gateway
   address on one port onto host loopback, where `host_loopback(true)` maps every
   port. The two combine. `fcage`: `--netstack-host-port PORT`.
@@ -300,6 +303,14 @@ consumer upgrading can skip it.
   reading back, or publishing a download, and a package cache that cannot be
   created, are `ProvisionError::Io` in every layer. Gentoo reported both, and
   Debian and Alpine the download steps, as the layer's own `Io`.
+- **Breaking.** No error's message repeats its cause. Each error type's
+  `Display` says what failed and what it was operating on, and the cause
+  underneath, an OS error or another of the library's errors such as the
+  `ConfigError` inside `Error::Config`, is reached only through `source()`. A
+  chain renderer such as anyhow's `{:#}` prints each layer once, where it printed
+  the OS error two or three times. A consumer that prints an error with `{}` now
+  prints its outermost layer alone, and renders the chain to keep the cause:
+  through `ErrorChain`, or its own error-reporting crate.
 - **Breaking.** `DebianBuilder::fetcher`, `AlpineBuilder::fetcher` and
   `GentooBuilder::fetcher` take the transport by value, as `impl Fetch +
   'static`, rather than as a `Box<dyn Fetch>`: pass the transport itself, or a
@@ -341,6 +352,11 @@ consumer upgrading can skip it.
   `CAP_SETFCAP` only for a map naming the parent's uid 0, which only a root
   caller's map does, and a root caller's helper does not take its capabilities
   from the file. Match on the remaining variants.
+- An Alpine or Gentoo fetch failure names the bootstrap it stopped, as a Debian
+  one does: `the Alpine bootstrap could not fetch a resource`, with the fetch's
+  own error beneath it. A Gentoo host failure reads `a Gentoo bootstrap step
+  failed while ...`, as Debian's and Alpine's do, rather than repeating
+  `ProvisionError::Io`'s words.
 - Extraction resolves a symbolic link in the tree as the root filesystem does:
   an absolute link re-anchors at the destination, so `var/run -> /run` carries
   an entry beneath it to the root's own `run/`, and the pre-configure overlay
@@ -418,6 +434,9 @@ consumer upgrading can skip it.
   the overlay itself is refused.
 - A command of `.` or `..` under `path_lookup` is refused at build as the
   relative path it is, rather than failing at launch with `EACCES`.
+- A restriction's refusal of a bare command name no longer suggests path
+  lookup, which a restriction does not offer. `ConfigError::CommandNotAbsolute`
+  carries `lookup_offered`, which is `false` for a restriction.
 - A raw remount or propagation change at `/proc` no longer makes `build` refuse
   the profile with `NestedUsernsNeedsProcfs`, since neither mounts anything over
   the procfs. A raw move is read as `mount(2)` reads it, and a move naming
@@ -599,6 +618,9 @@ consumer upgrading can skip it.
   and validates the request and the delegate's answer: a build, an export, a
   copy in, a map-assisted removal, and the Debian and Alpine preflights, which
   ask it through `idmap::establishable`.
+- `ErrorChain` is the one walk of an error's causes, recorded in the idiom
+  census, and every place the library turns one of its own errors into a text
+  reason renders it through `ErrorChain`.
 - The host side's reading and writing of a tree is `provision::containment` and
   `provision::rooted`. `containment::create_dirs` creates a chain of missing
   directories for the extractor and `Rooted` alike, and `containment::copy_up`

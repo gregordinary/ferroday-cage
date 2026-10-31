@@ -65,7 +65,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ferroday_cage::provision;
-use ferroday_cage::{Cage, IdentityMap, Overlay};
+use ferroday_cage::{Cage, ErrorChain, IdentityMap, Overlay};
 
 mod common;
 
@@ -84,7 +84,10 @@ fn main() -> ExitCode {
     let scratch = std::env::temp_dir().join(format!("overlay-race-{}", std::process::id()));
     let _ = ferroday_cage::provision::remove(&scratch);
     if let Err(err) = lay_out_layers(&scratch) {
-        eprintln!("overlay-race: preparing the layers: {err}");
+        eprintln!(
+            "overlay-race: preparing the layers: {}",
+            ErrorChain::new(&err)
+        );
         return ExitCode::FAILURE;
     }
 
@@ -246,8 +249,10 @@ fn storm(options: &Options, scratch: &Path, trial: u32) -> Result<Misses, String
             .remove_lock(false)
             .run();
     }
-    copy_tree(&scratch.join("upper"), &upper).map_err(|err| format!("staging the upper: {err}"))?;
-    std::fs::create_dir_all(&work).map_err(|err| format!("staging the work dir: {err}"))?;
+    copy_tree(&scratch.join("upper"), &upper)
+        .map_err(|err| format!("staging the upper: {}", ErrorChain::new(&err)))?;
+    std::fs::create_dir_all(&work)
+        .map_err(|err| format!("staging the work dir: {}", ErrorChain::new(&err)))?;
 
     let cage = Cage::builder()
         .overlay(
@@ -260,8 +265,10 @@ fn storm(options: &Options, scratch: &Path, trial: u32) -> Result<Misses, String
         .command("/bin/sh")
         .args(["-c", &script(options)])
         .build()
-        .map_err(|err| format!("building the cage: {err}"))?;
-    let output = cage.output().map_err(|err| format!("running: {err}"))?;
+        .map_err(|err| format!("building the cage: {}", ErrorChain::new(&err)))?;
+    let output = cage
+        .output()
+        .map_err(|err| format!("running: {}", ErrorChain::new(&err)))?;
 
     let text = String::from_utf8_lossy(&output.stdout);
     Ok(Misses {

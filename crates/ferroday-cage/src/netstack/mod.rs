@@ -977,56 +977,37 @@ impl fmt::Display for NetStackError {
                 f,
                 "cannot publish the guest's port {guest_port} on {host}: {reason}"
             ),
-            NetStackError::Publish { host, source } => write!(
-                f,
-                "could not listen on {host} to publish a port of the sandbox: {source}"
-            ),
+            NetStackError::Publish { host, .. } => {
+                write!(
+                    f,
+                    "could not listen on {host} to publish a port of the sandbox"
+                )
+            }
             NetStackError::SharedNamespace => f.write_str(
                 "the sandbox shares the caller's network namespace; a network stack \
                  attaches only to a private one",
             ),
-            NetStackError::NamespaceJoin {
-                which,
-                source: None,
-            } => write!(
+            NetStackError::NamespaceJoin { which, .. } => write!(
                 f,
                 "could not join the sandbox's network namespace while {which}"
             ),
-            NetStackError::NamespaceJoin {
-                which,
-                source: Some(source),
-            } => write!(
-                f,
-                "could not join the sandbox's network namespace while {which}: {source}"
-            ),
-            NetStackError::TapOpen { source } => {
-                write!(f, "could not open /dev/net/tun: {source}")
+            NetStackError::TapOpen { .. } => f.write_str("could not open /dev/net/tun"),
+            NetStackError::TapCreate { name, .. } => {
+                write!(f, "could not create the tap interface {name}")
             }
-            NetStackError::TapCreate { name, source } => {
-                write!(f, "could not create the tap interface {name}: {source}")
+            NetStackError::TapConfigure { detail, .. } => {
+                write!(f, "could not configure the tap interface while {detail}")
             }
-            NetStackError::TapConfigure { detail, source } => write!(
-                f,
-                "could not configure the tap interface while {detail}: {source}"
+            NetStackError::TapHandoff { .. } => f.write_str(
+                "could not send the tap descriptor back from the network stack's helper",
             ),
-            NetStackError::TapHandoff { source } => write!(
-                f,
-                "could not send the tap descriptor back from the network stack's helper: {source}"
-            ),
-            NetStackError::Spawn { source } => write!(
-                f,
-                "could not start the network stack's helper or pump: {source}"
-            ),
+            NetStackError::Spawn { .. } => {
+                f.write_str("could not start the network stack's helper or pump")
+            }
             NetStackError::HelperLost => {
                 f.write_str("the network stack's tap helper exited without delivering a result")
             }
-            NetStackError::Pump { op, source: None } => {
-                write!(f, "the network stack pump failed while {op}")
-            }
-            NetStackError::Pump {
-                op,
-                source: Some(source),
-            } => write!(f, "the network stack pump failed while {op}: {source}"),
+            NetStackError::Pump { op, .. } => write!(f, "the network stack pump failed while {op}"),
         }
     }
 }

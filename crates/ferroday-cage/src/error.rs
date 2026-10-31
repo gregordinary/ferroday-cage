@@ -10,9 +10,17 @@
 //! guidance — what failed, what it was operating on, and what to do about it —
 //! and one of them is chosen by a guard rather than by a variant:
 //! `CommandNotAbsolute` says something different about a bare name than about
-//! a relative path with a slash, because path lookup is the remedy for one and
-//! misdirection for the other. Attribute strings hold a label well and a
-//! paragraph badly, and the paragraph is what a caller acts on.
+//! a relative path with a slash, and different again to a builder with no path
+//! lookup, because path lookup is the remedy for one and misdirection for the
+//! others. Attribute strings hold a label well and a paragraph badly, and the
+//! paragraph is what a caller acts on.
+//!
+//! No message repeats its cause. A variant that carries an OS error, or another
+//! error of the crate's, returns it from `source()`, and its own message says
+//! what failed and what it was operating on and stops there. A wrapper such as
+//! [`Error::Config`] is a layer like any other, with a message of its own. A
+//! renderer that walks the chain, such as [`ErrorChain`](crate::ErrorChain),
+//! then prints each layer once.
 //!
 //! The cost is real and worth naming: a variant, its message, and its cause sit
 //! in three places in this file. What the arrangement buys is that the messages
@@ -245,13 +253,18 @@ pub enum ConfigError {
     ///
     /// The message names the remedy that fits: a bare command name — the most
     /// common form of this mistake — is resolvable with
-    /// [`path_lookup`](crate::CageBuilder::path_lookup), while a relative path
-    /// is never searched and must be made absolute. That includes `.` and `..`,
-    /// which carry no slash but name directories rather than commands.
+    /// [`path_lookup`](crate::CageBuilder::path_lookup) where the builder
+    /// offers it, while a relative path is never searched and must be made
+    /// absolute. That includes `.` and `..`, which carry no slash but name
+    /// directories rather than commands.
     #[non_exhaustive]
     CommandNotAbsolute {
         /// The command path as it was given to the builder.
         command: PathBuf,
+        /// Whether the builder that refused it resolves a bare name by path
+        /// lookup: `true` for a [`CageBuilder`](crate::CageBuilder), and
+        /// `false` for a restriction, which never searches `PATH`.
+        lookup_offered: bool,
     },
     /// The managed mount profile was opted out of, while one of its mounts was
     /// explicitly asked for. The two cannot both be honored.
@@ -466,7 +479,12 @@ pub enum ConfigError {
     /// identifies one.
     #[non_exhaustive]
     IdentityMapUnavailable {
-        /// Why each delegate refused, and any identified host blocker.
+        /// Why each delegate refused, each refusal rendered with its causes,
+        /// and any identified host blocker.
+        ///
+        /// The message includes it only for the bundled chain. A configured
+        /// delegate's refusal is the `source`, which a renderer reaches on its
+        /// own, so repeating it here would print it twice.
         reason: String,
         /// The refusal of the delegate configured with
         /// [`id_mapper`](crate::CageBuilder::id_mapper), which is the whole
@@ -653,23 +671,36 @@ impl fmt::Display for ConfigError {
                 "a rootfs and an overlay root are both configured, but exactly one root is \
                  in force; drop one of the two",
             ),
-            ConfigError::RootfsUnusable { path, source } => {
-                write!(f, "cannot use {} as the rootfs: {}", path.display(), source,)
+            ConfigError::RootfsUnusable { path, .. } => {
+                write!(f, "cannot use {} as the rootfs", path.display())
             }
             ConfigError::RootfsIsHostRoot => {
                 f.write_str("the host root directory cannot be the rootfs")
             }
             ConfigError::CommandMissing => f.write_str("no command was provided"),
             // A bare name is the usual case, and `path_lookup` is exactly its
-            // remedy; a relative path is never searched, so pointing at path
-            // lookup there would be misdirection.
-            ConfigError::CommandNotAbsolute { command } if is_command_name(command) => write!(
+            // remedy where the builder has it. A relative path is never
+            // searched, and a restriction searches nothing, so pointing at path
+            // lookup for either would be misdirection.
+            ConfigError::CommandNotAbsolute {
+                command,
+                lookup_offered: true,
+            } if is_command_name(command) => write!(
                 f,
                 "the command path {} is not absolute; give an absolute path, or enable \
                  path lookup to resolve a bare command name against the sandbox's PATH",
                 command.display(),
             ),
-            ConfigError::CommandNotAbsolute { command } => {
+            ConfigError::CommandNotAbsolute {
+                command,
+                lookup_offered: false,
+            } if is_command_name(command) => write!(
+                f,
+                "the command path {} is not absolute; a restriction never searches PATH for \
+                 a bare command name, so give an absolute path",
+                command.display(),
+            ),
+            ConfigError::CommandNotAbsolute { command, .. } => {
                 write!(f, "the command path {} is not absolute", command.display())
             }
             ConfigError::ManagedMountsContradiction { toggle } => write!(
@@ -681,12 +712,9 @@ impl fmt::Display for ConfigError {
                 f,
                 "path lookup has nothing to search: PATH {path:?} holds no absolute directory",
             ),
-            ConfigError::BindSourceUnusable { path, source } => write!(
-                f,
-                "cannot use {} as a bind-mount source: {}",
-                path.display(),
-                source,
-            ),
+            ConfigError::BindSourceUnusable { path, .. } => {
+                write!(f, "cannot use {} as a bind-mount source", path.display())
+            }
             ConfigError::MountTargetInvalid { path } => write!(
                 f,
                 "the mount target {} is not a normal absolute path inside the rootfs",
@@ -779,12 +807,19 @@ impl fmt::Display for ConfigError {
             ConfigError::IdentityMapInvalid { reason } => {
                 write!(f, "the identity map is invalid: {reason}")
             }
-            ConfigError::IdentityMapUnavailable { reason, .. } => {
-                write!(
-                    f,
-                    "no delegate can establish the requested identity map: {reason}"
-                )
-            }
+            // A configured delegate's refusal is the source, which `reason`
+            // only renders; the bundled chain's reason collects one from each
+            // delegate and has no single error to return.
+            ConfigError::IdentityMapUnavailable {
+                source: Some(_), ..
+            } => f.write_str("no delegate can establish the requested identity map"),
+            ConfigError::IdentityMapUnavailable {
+                reason,
+                source: None,
+            } => write!(
+                f,
+                "no delegate can establish the requested identity map: {reason}"
+            ),
             ConfigError::RunAsUnmapped { id, space } => {
                 write!(
                     f,
@@ -825,15 +860,10 @@ impl fmt::Display for ConfigError {
             ConfigError::OverlayUpperMissing => {
                 f.write_str("the overlay root names no upper layer for its writes")
             }
-            ConfigError::OverlayDirUnusable {
-                layer,
-                path,
-                source,
-            } => write!(
+            ConfigError::OverlayDirUnusable { layer, path, .. } => write!(
                 f,
-                "cannot use {} as the overlay {layer} directory: {}",
+                "cannot use {} as the overlay {layer} directory",
                 path.display(),
-                source,
             ),
             ConfigError::OverlayDirUnowned { layer, path } => write!(
                 f,
@@ -892,6 +922,12 @@ impl std::error::Error for ConfigError {
 /// configuration, an unsupported host, a failed setup step, or a failure to
 /// spawn or wait. The sandboxed command's own exit code is data, carried by
 /// [`ExitStatus`], and is never an `Error`.
+///
+/// The message says what failed and what it was operating on. The cause
+/// underneath, such as the OS error a setup step met or the [`ConfigError`] a
+/// build refused with, is returned from
+/// [`source`](std::error::Error::source) rather than repeated in it. Print an
+/// error through [`ErrorChain`](crate::ErrorChain) to show both.
 ///
 /// [`Cage::run`]: crate::Cage::run
 /// [`ExitStatus`]: crate::ExitStatus
@@ -1076,13 +1112,13 @@ impl Error {
     /// ```
     /// use std::process::ExitCode;
     ///
-    /// use ferroday_cage::Cage;
+    /// use ferroday_cage::{Cage, ErrorChain};
     ///
     /// fn launch(rootfs: &str) -> ExitCode {
     ///     match Cage::builder().command("/bin/true").rootfs(rootfs).build() {
     ///         Ok(_cage) => ExitCode::SUCCESS,
     ///         Err(error) => {
-    ///             eprintln!("myapp: {error}");
+    ///             eprintln!("myapp: {}", ErrorChain::new(&error));
     ///             ExitCode::from(error.shell_code())
     ///         }
     ///     }
@@ -1107,67 +1143,52 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Config(err) => write!(f, "invalid sandbox configuration: {err}"),
+            Error::Config(_) => f.write_str("invalid sandbox configuration"),
+            // The guidance sits in parentheses wherever the message carries a
+            // cause, so the cause a renderer appends reads as the reason for the
+            // failure rather than for the remedy.
             Error::UsernsUnavailable {
                 blocker: Some(blocker),
                 ..
-            } => write!(f, "unprivileged user namespaces are unavailable: {blocker}"),
-            Error::UsernsUnavailable {
-                blocker: None,
-                source,
             } => write!(
                 f,
-                "the kernel denied user namespace creation ({}); a seccomp filter or LSM \
-                 policy may be blocking unprivileged user namespaces",
-                source,
+                "unprivileged user namespaces are unavailable ({blocker})"
+            ),
+            Error::UsernsUnavailable { blocker: None, .. } => f.write_str(
+                "the kernel denied user namespace creation (a seccomp filter or an LSM policy \
+                 may be blocking unprivileged user namespaces)",
             ),
             Error::NestedUsernsBudgetExhausted { .. } => f.write_str(
-                "the sandbox could not enter its nested user namespace: the host's user \
-                 namespace budget is exhausted. Every launch holds two user namespaces; \
+                "the sandbox could not enter its nested user namespace, because the host's \
+                 user namespace budget is exhausted (every launch holds two user namespaces; \
                  raise user.max_user_namespaces, or reduce the number of namespaces already \
-                 live",
+                 live)",
             ),
             Error::KeyQuotaExhausted { .. } => f.write_str(
-                "the sandbox could not be given a session keyring of its own: the calling \
-                 user's kernel key quota is exhausted. Every running sandbox holds one keyring; \
-                 raise kernel.keys.maxkeys and kernel.keys.maxbytes, or run fewer sandboxes \
-                 at once",
+                "the sandbox could not be given a session keyring of its own, because the \
+                 calling user's kernel key quota is exhausted (every running sandbox holds one \
+                 keyring; raise kernel.keys.maxkeys and kernel.keys.maxbytes, or run fewer \
+                 sandboxes at once)",
             ),
             Error::Setup {
                 step,
-                source,
                 detail: Some(detail),
-            } => write!(
-                f,
-                "sandbox setup failed while {step} ({detail}): {}",
-                source,
-            ),
+                ..
+            } => write!(f, "sandbox setup failed while {step} ({detail})"),
             Error::Setup {
-                step,
-                source,
-                detail: None,
-            } => write!(f, "sandbox setup failed while {step}: {}", source,),
-            Error::Spawn { source } => {
-                write!(f, "could not spawn the sandbox process: {}", source,)
-            }
-            Error::Wait { source } => write!(
-                f,
-                "could not collect the sandbox process outcome: {}",
-                source,
-            ),
+                step, detail: None, ..
+            } => write!(f, "sandbox setup failed while {step}"),
+            Error::Spawn { .. } => f.write_str("could not spawn the sandbox process"),
+            Error::Wait { .. } => f.write_str("could not collect the sandbox process outcome"),
             Error::SupervisorLost => {
                 f.write_str("the sandbox supervisor exited without reporting the command's outcome")
             }
-            Error::Signal { source } => write!(f, "could not signal the sandbox: {}", source,),
-            Error::IdentityMap(err) => {
-                write!(f, "could not establish the identity map: {err}")
-            }
-            Error::Terminal { source } => {
-                write!(f, "a pseudoterminal operation failed: {}", source,)
-            }
+            Error::Signal { .. } => f.write_str("could not signal the sandbox"),
+            Error::IdentityMap(_) => f.write_str("could not establish the identity map"),
+            Error::Terminal { .. } => f.write_str("a pseudoterminal operation failed"),
             Error::TerminalsExhausted { .. } => f.write_str(
-                "the host has no free pseudoterminal to allocate; /proc/sys/kernel/pty/max \
-                 states the ceiling, less /proc/sys/kernel/pty/reserve for a sandbox's own",
+                "the host has no free pseudoterminal to allocate (/proc/sys/kernel/pty/max \
+                 states the ceiling, less /proc/sys/kernel/pty/reserve for a sandbox's own)",
             ),
             Error::StreamIsDirectory { stream } => write!(
                 f,
@@ -1253,28 +1274,45 @@ mod tests {
     fn a_bare_command_name_is_told_about_path_lookup() {
         let err = ConfigError::CommandNotAbsolute {
             command: PathBuf::from("sh"),
+            lookup_offered: true,
         };
         let message = err.to_string();
         assert!(
             message.contains("the command path sh is not absolute"),
             "{message}"
         );
-        assert!(message.contains("path lookup"), "{message}");
+        assert!(message.contains("enable path lookup"), "{message}");
+    }
+
+    #[test]
+    fn a_bare_command_name_is_not_offered_path_lookup_a_builder_lacks() {
+        // A restriction runs a host command and searches no `PATH`, so the
+        // remedy a sandbox's builder offers would be one this builder has not.
+        let err = ConfigError::CommandNotAbsolute {
+            command: PathBuf::from("sh"),
+            lookup_offered: false,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("the command path sh is not absolute"),
+            "{message}"
+        );
+        assert!(message.contains("never searches PATH"), "{message}");
+        assert!(!message.contains("path lookup"), "{message}");
     }
 
     #[test]
     fn a_relative_command_path_is_not_told_about_path_lookup() {
         // Path lookup never searches a path containing a slash, so naming it
         // here would send the caller down a road that does not lead anywhere.
-        let err = ConfigError::CommandNotAbsolute {
-            command: PathBuf::from("./bin/sh"),
-        };
-        let message = err.to_string();
-        assert!(
-            message.contains("the command path ./bin/sh is not absolute"),
-            "{message}"
-        );
-        assert!(!message.contains("path lookup"), "{message}");
+        for lookup_offered in [true, false] {
+            let err = ConfigError::CommandNotAbsolute {
+                command: PathBuf::from("./bin/sh"),
+                lookup_offered,
+            };
+            let message = err.to_string();
+            assert_eq!(message, "the command path ./bin/sh is not absolute");
+        }
     }
 
     #[test]

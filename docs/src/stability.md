@@ -108,6 +108,15 @@ constructors: `FetchError::not_found`, `IdMapError::unsatisfiable`,
 are `#[non_exhaustive]` so they can gain fields, which means struct-literal
 construction is reserved to the crate.
 
+### Reading errors
+
+Every error type's message says what failed and what it was operating on, and
+stops there. The cause underneath is returned from `source()` and never
+repeated in the message. That cause is an OS error, or another error of the
+library's, such as the `ConfigError` inside `Error::Config`. Printing an error
+with `{}` therefore prints one layer of it. `ErrorChain` renders every layer on
+one line, as do anyhow's `{:#}` and eyre's reports, and each layer appears once.
+
 ### Extension traits
 
 `Provisioner`, `Fetch`, `IdMapper`, and `Observer` are the seams a consumer

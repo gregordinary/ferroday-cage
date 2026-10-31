@@ -39,6 +39,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::ConfigError;
+use crate::failure::ErrorChain;
 
 /// The kernel's ceiling on identity-map extents, `UID_GID_MAP_MAX_EXTENTS`.
 ///
@@ -395,14 +396,7 @@ impl fmt::Display for IdMapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IdMapError::Unsatisfiable { reason } => f.write_str(reason),
-            IdMapError::HelperSpawn {
-                helper,
-                source: None,
-            } => write!(f, "could not execute {helper}"),
-            IdMapError::HelperSpawn {
-                helper,
-                source: Some(source),
-            } => write!(f, "could not execute {helper}: {source}"),
+            IdMapError::HelperSpawn { helper, .. } => write!(f, "could not execute {helper}"),
             IdMapError::HelperFailed { helper, detail } => {
                 if detail.is_empty() {
                     write!(f, "{helper} refused the map")
@@ -410,9 +404,7 @@ impl fmt::Display for IdMapError {
                     write!(f, "{helper} refused the map: {detail}")
                 }
             }
-            IdMapError::MapWrite { which, source } => {
-                write!(f, "could not write {which}: {source}")
-            }
+            IdMapError::MapWrite { which, .. } => write!(f, "could not write {which}"),
         }
     }
 }
@@ -598,12 +590,12 @@ pub(crate) fn establishable(
 /// [`resolve_range_bundled`].
 fn resolve_range(request: &IdentityMap, mapper: &dyn IdMapper) -> Result<ResolvedMap, ConfigError> {
     // The delegate's refusal is carried whole, as the error's source, as well as
-    // read into its reason.
+    // rendered with its causes into the reason.
     checked(request, || {
         mapper
             .resolve(request)
             .map(|map| ((), map))
-            .map_err(|err| (err.to_string(), Some(err)))
+            .map_err(|err| (ErrorChain::new(&err).to_string(), Some(err)))
     })
     .map(|((), map)| map)
 }
@@ -1474,7 +1466,7 @@ fn resolve_default_chain(
     let direct: std::sync::Arc<dyn IdMapper> = std::sync::Arc::new(DirectMapper::new());
     match direct.resolve(request) {
         Ok(map) => return Ok((direct, map)),
-        Err(err) => reasons.push(format!("direct: {err}")),
+        Err(err) => reasons.push(format!("direct: {}", ErrorChain::new(&err))),
     }
 
     #[cfg(feature = "subid")]
@@ -1482,7 +1474,7 @@ fn resolve_default_chain(
         let subid: std::sync::Arc<dyn IdMapper> = std::sync::Arc::new(SubidMapper::new());
         match subid.resolve(request) {
             Ok(map) => return Ok((subid, map)),
-            Err(err) => reasons.push(format!("subid: {err}")),
+            Err(err) => reasons.push(format!("subid: {}", ErrorChain::new(&err))),
         }
     }
 

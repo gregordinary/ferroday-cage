@@ -2098,7 +2098,7 @@ impl CageBuilder {
                 .clone(),
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
-        let command = validate_command(self.command, self.path_lookup)?;
+        let command = validate_command(self.command, Some(self.path_lookup))?;
         let program_search = if command.searched {
             // A `PATH` with no absolute entry leaves nothing to search. Refuse
             // it here rather than fall through to an `execve` of the bare name,
@@ -2447,7 +2447,7 @@ impl<'de> serde::Deserialize<'de> for RestrictedProfile {
         let builder = CageBuilder::deserialize(deserializer)?;
         builder
             .check_restricted()
-            .map_err(serde::de::Error::custom)?;
+            .map_err(|err| serde::de::Error::custom(crate::failure::ErrorChain::new(&err)))?;
         Ok(RestrictedProfile(builder))
     }
 }
@@ -3927,8 +3927,10 @@ pub(crate) struct ValidCommand {
 /// NUL, and either an absolute path or a bare name that `path_lookup` resolves.
 ///
 /// [`CageBuilder::build`] and `RestrictionBuilder::build` both read their
-/// command through this, so the two accept the same commands. A restriction
-/// passes `path_lookup` as `false`: it never searches the host's `PATH`.
+/// command through this, so the two accept the same commands. `path_lookup` is
+/// the builder's setting, or `None` for a builder that has none: a restriction
+/// never searches the host's `PATH`, and its refusal of a bare name says so
+/// rather than offering a lookup it cannot do.
 ///
 /// An empty path is the absence of a command written down, and every later
 /// check reads it as something else: it carries no slash, so a path lookup takes
@@ -3943,7 +3945,7 @@ pub(crate) struct ValidCommand {
 /// refused as one whether path lookup is on or not.
 pub(crate) fn validate_command(
     command: Option<PathBuf>,
-    path_lookup: bool,
+    path_lookup: Option<bool>,
 ) -> Result<ValidCommand, Error> {
     let command = command.ok_or(ConfigError::CommandMissing)?;
     if command.as_os_str().is_empty() {
@@ -3953,9 +3955,13 @@ pub(crate) fn validate_command(
     // The execvp rule plus the absolute-path requirement: a bare name is
     // resolved against `PATH` only when path lookup is opted into, and anything
     // else must be absolute. A relative path is never searched.
-    let searched = path_lookup && is_command_name(&command);
+    let searched = path_lookup == Some(true) && is_command_name(&command);
     if !command.is_absolute() && !searched {
-        return Err(ConfigError::CommandNotAbsolute { command }.into());
+        return Err(ConfigError::CommandNotAbsolute {
+            command,
+            lookup_offered: path_lookup.is_some(),
+        }
+        .into());
     }
     Ok(ValidCommand {
         path: command,
@@ -4287,12 +4293,16 @@ mod tests {
                     .path_lookup(lookup)
                     .build()
                     .unwrap_err();
+                let message = crate::failure::ErrorChain::new(&err).to_string();
                 assert!(
-                    !err.to_string().contains("path lookup"),
-                    "{command} under path_lookup({lookup}): {err}",
+                    !message.contains("path lookup"),
+                    "{command} under path_lookup({lookup}): {message}",
                 );
                 match err {
-                    Error::Config(ConfigError::CommandNotAbsolute { command: refused }) => {
+                    Error::Config(ConfigError::CommandNotAbsolute {
+                        command: refused,
+                        lookup_offered: true,
+                    }) => {
                         assert_eq!(refused, Path::new(command));
                     }
                     other => panic!("{command} under path_lookup({lookup}): {other}"),

@@ -166,7 +166,18 @@ impl fmt::Display for StartError {
                 "{stream} is {what}; a command is given a pipe, a socket, a character \
                  device, or a file's contents, and nothing else"
             ),
-            StartError::Io(error) => write!(f, "cannot relay the standard streams: {error}"),
+            StartError::Io(_) => f.write_str("cannot relay the standard streams"),
+        }
+    }
+}
+
+impl std::error::Error for StartError {
+    /// The OS error underneath a plumbing failure. A refused stream carries
+    /// none: nothing failed, `fcage` declined it.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StartError::Refused { .. } => None,
+            StartError::Io(error) => Some(error),
         }
     }
 }

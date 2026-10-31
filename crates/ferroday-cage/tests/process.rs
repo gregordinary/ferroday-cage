@@ -279,10 +279,10 @@ fn a_soft_limit_above_its_hard_limit_is_a_config_error() {
         .rlimit(Resource::Processes, 64, 32)
         .build()
         .unwrap_err();
-    match err {
-        Error::Config(ConfigError::RlimitInvalid { resource, .. }) => {
-            assert_eq!(resource, Resource::Processes);
-            assert!(err.to_string().contains("RLIMIT_NPROC"), "{err}");
+    match &err {
+        Error::Config(config @ ConfigError::RlimitInvalid { resource, .. }) => {
+            assert_eq!(*resource, Resource::Processes);
+            assert!(config.to_string().contains("RLIMIT_NPROC"), "{config}");
         }
         other => panic!("expected RlimitInvalid, got {other:?}"),
     }

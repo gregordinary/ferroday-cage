@@ -29,6 +29,7 @@ use super::bootstrap::{ARCH, REPOSITORIES, ScriptKind, ScriptSubject, WORLD};
 use super::index::Record;
 use super::installed::{Carried, DB_DIR, Existing};
 use super::{AlpineError, apk};
+use crate::ErrorChain;
 use crate::provision::rooted::Rooted;
 
 /// The database a base layer's packages are recorded in.
@@ -319,8 +320,9 @@ fn read_scripts(tree: &Rooted, base: &Path) -> Result<Vec<u8>, AlpineError> {
         crate::provision::compress::decompress(&compressed, io::empty()).map_err(|err| {
             AlpineError::Config {
                 reason: format!(
-                    "the base layer at {}: its {SCRIPTS_GZ} is not readable: {err}",
+                    "the base layer at {}: its {SCRIPTS_GZ} is not readable: {}",
                     base.display(),
+                    ErrorChain::new(&err),
                 ),
             }
         })?;

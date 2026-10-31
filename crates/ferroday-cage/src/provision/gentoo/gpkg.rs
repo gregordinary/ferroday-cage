@@ -83,6 +83,7 @@ use std::path::Path;
 
 use super::plan::PlannedPackage;
 use super::{GentooError, MAX_METADATA_BYTES};
+use crate::ErrorChain;
 use crate::path;
 use crate::provision::compress;
 use crate::provision::digest::{self, Algorithm};
@@ -256,7 +257,7 @@ impl Package {
         let mut archive = TarReader::new(io::BufReader::new(file));
         while let Some(entry) = archive
             .next_entry()
-            .map_err(|err| container(path, err.to_string()))?
+            .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?
         {
             let is_image = entry.typeflag != b'5'
                 && split_member(&entry.path)
@@ -272,7 +273,7 @@ impl Package {
             let head = compress::sniff_head(&mut member)
                 .map_err(GentooError::at("reading the image archive", path))?;
             let inner = compress::decompress(&head, member)
-                .map_err(|err| container(path, err.to_string()))?;
+                .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
             return Ok(TarReader::new(inner));
         }
         Err(container(
@@ -332,7 +333,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
     let mut prefix: Option<Vec<u8>> = None;
     while let Some(entry) = archive
         .next_entry()
-        .map_err(|err| container(path, err.to_string()))?
+        .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?
     {
         // Directory entries describe the container's own layout rather than
         // being members of it, and the Manifest does not list them.
@@ -404,7 +405,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             Some(limit) => {
                 buffered = archive
                     .read_entry(limit)
-                    .map_err(|err| container(path, err.to_string()))?;
+                    .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
                 (Algorithm::Sha512.hex_of(&buffered), buffered.len() as u64)
             }
             None => {
@@ -619,15 +620,15 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
     let mut compressed = scan.metadata.as_slice();
     let head = compress::sniff_head(&mut compressed)
         .map_err(GentooError::at("reading the metadata archive", path))?;
-    let inner =
-        compress::decompress(&head, compressed).map_err(|err| container(path, err.to_string()))?;
+    let inner = compress::decompress(&head, compressed)
+        .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
     let mut inner = TarReader::new(inner);
     // What the files may hold between them, which is what each is read under:
     // the metadata is one budget, however the archive divides it.
     let mut left = MAX_METADATA_BYTES;
     while let Some(entry) = inner
         .next_entry()
-        .map_err(|err| container(path, err.to_string()))?
+        .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?
     {
         if entry.typeflag == b'5' {
             continue;
@@ -644,7 +645,7 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
         };
         let bytes = inner
             .read_entry(left)
-            .map_err(|err| container(path, err.to_string()))?;
+            .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
         left -= bytes.len() as u64;
         files.insert(name.to_string(), bytes);
     }

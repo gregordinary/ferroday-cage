@@ -48,7 +48,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ferroday_cage::{Cage, CageBuilder, ConfigError, Error, Network};
+use ferroday_cage::{Cage, CageBuilder, ConfigError, Error, ErrorChain, Network};
 
 mod common;
 
@@ -293,7 +293,11 @@ fn run_list(dir: &Path) -> ExitCode {
         Err(err) => {
             return failure(
                 "orchestrator",
-                &format!("cannot read profile directory {}: {err}", dir.display()),
+                &format!(
+                    "cannot read profile directory {}: {}",
+                    dir.display(),
+                    ErrorChain::new(&err)
+                ),
             );
         }
     };
@@ -398,8 +402,13 @@ fn group_profile_path(dir: &Path, group: &str) -> Result<PathBuf, String> {
 
 /// Reads a group profile and deserializes it into a builder.
 fn load_group(path: &Path) -> Result<CageBuilder, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| format!("cannot read group profile {}: {err}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "cannot read group profile {}: {}",
+            path.display(),
+            ErrorChain::new(&err)
+        )
+    })?;
     toml::from_str(&text)
         .map_err(|err| format!("cannot parse group profile {}: {err}", path.display()))
 }
@@ -410,7 +419,7 @@ fn launch(cage: Cage) -> ExitCode {
     match cage.spawn().and_then(|mut running| running.wait()) {
         Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
-            eprintln!("orchestrator: {error}");
+            eprintln!("orchestrator: {}", ErrorChain::new(&error));
             ExitCode::from(error.shell_code())
         }
     }
@@ -426,6 +435,6 @@ fn report_build_error(group: &str, error: &Error) {
         Error::Config(ConfigError::RootfsMissing) => eprintln!(
             "orchestrator: group '{group}' sets no rootfs; add one to the profile or pass --rootfs DIR"
         ),
-        other => eprintln!("orchestrator: {other}"),
+        other => eprintln!("orchestrator: {}", ErrorChain::new(other)),
     }
 }

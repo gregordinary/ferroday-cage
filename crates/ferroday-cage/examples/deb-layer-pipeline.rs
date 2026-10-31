@@ -67,7 +67,7 @@ use ferroday_cage::provision::debian::{
     Debian, DebianEvent, Pool, Repository, build_depend_names, host_architecture,
 };
 use ferroday_cage::provision::{self, Provisioned};
-use ferroday_cage::{Cage, Network};
+use ferroday_cage::{Cage, ErrorChain, Network};
 
 mod common;
 
@@ -201,7 +201,7 @@ fn run(config: Config) -> Result<(), String> {
     // declare it as a repository before anything has been published into it.
     pool(&config)
         .publish::<&Path>([])
-        .map_err(|error| format!("cannot create the pool: {error}"))?;
+        .map_err(|error| format!("cannot create the pool: {}", ErrorChain::new(&error)))?;
 
     for (at, component) in config.components.iter().enumerate() {
         build_component(&config, at, component)?;
@@ -218,9 +218,12 @@ fn provision_base(config: &Config) -> Result<(), String> {
     if let Some(cache) = &config.cache {
         builder = builder.cache_dir(cache);
     }
-    let mut debian = builder
-        .build()
-        .map_err(|error| format!("cannot configure the base bootstrap: {error}"))?;
+    let mut debian = builder.build().map_err(|error| {
+        format!(
+            "cannot configure the base bootstrap: {}",
+            ErrorChain::new(&error)
+        )
+    })?;
 
     let mut progress = print_progress;
     match provision::ensure(&config.base, &mut debian.observe(&mut progress)) {
@@ -232,7 +235,10 @@ fn provision_base(config: &Config) -> Result<(), String> {
             Ok(())
         }
         Ok(_) => Ok(()),
-        Err(error) => Err(format!("cannot provision the base: {error}")),
+        Err(error) => Err(format!(
+            "cannot provision the base: {}",
+            ErrorChain::new(&error)
+        )),
     }
 }
 
@@ -252,8 +258,12 @@ fn build_component(config: &Config, at: usize, source: &Path) -> Result<(), Stri
 
     // This component's declared build dependencies, resolved against the archive
     // plus the pool the earlier components have fed.
-    let control = std::fs::read_to_string(source.join("debian/control"))
-        .map_err(|error| format!("cannot read {name}'s debian/control: {error}"))?;
+    let control = std::fs::read_to_string(source.join("debian/control")).map_err(|error| {
+        format!(
+            "cannot read {name}'s debian/control: {}",
+            ErrorChain::new(&error)
+        )
+    })?;
     let build_deps = build_depend_names(&control, &config.arch);
 
     let pool_repo = pool_repository(config)?;
@@ -268,20 +278,33 @@ fn build_component(config: &Config, at: usize, source: &Path) -> Result<(), Stri
     if let Some(cache) = &config.cache {
         builder = builder.cache_dir(cache);
     }
-    let mut debian = builder
-        .build()
-        .map_err(|error| format!("cannot configure {name}'s layer: {error}"))?;
+    let mut debian = builder.build().map_err(|error| {
+        format!(
+            "cannot configure {name}'s layer: {}",
+            ErrorChain::new(&error)
+        )
+    })?;
     let mut progress = print_progress;
     let layer = debian
         .observe(&mut progress)
         .stage_layer(&upper)
-        .map_err(|error| format!("cannot stage {name}'s build root: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "cannot stage {name}'s build root: {}",
+                ErrorChain::new(&error)
+            )
+        })?;
 
     // Build against the merged base-plus-increment view. The output subdirectory
     // is where this component's packages land and, from there, are published.
     let out_dir = config.output.join(&name);
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|error| format!("cannot create {}'s output: {error}", name))?;
+    std::fs::create_dir_all(&out_dir).map_err(|error| {
+        format!(
+            "cannot create {}'s output: {}",
+            name,
+            ErrorChain::new(&error)
+        )
+    })?;
     let status = Cage::builder()
         .overlay_rootfs(&config.base, layer.path())
         .bind_ro(source, SOURCE_DEST)
@@ -294,9 +317,14 @@ fn build_component(config: &Config, at: usize, source: &Path) -> Result<(), Stri
         .command(SHELL)
         .args(["-e", "-u", "-c", BUILD_SCRIPT])
         .build()
-        .map_err(|error| format!("cannot compose {name}'s build cage: {error}"))?
+        .map_err(|error| {
+            format!(
+                "cannot compose {name}'s build cage: {}",
+                ErrorChain::new(&error)
+            )
+        })?
         .run()
-        .map_err(|error| format!("cannot launch {name}'s build: {error}"))?;
+        .map_err(|error| format!("cannot launch {name}'s build: {}", ErrorChain::new(&error)))?;
 
     // Drop the layer before publishing: the build's artifacts are already in the
     // host output directory, and the increment has served its purpose.
@@ -315,9 +343,12 @@ fn build_component(config: &Config, at: usize, source: &Path) -> Result<(), Stri
             deb.file_name().unwrap_or(OsStr::new("?")).to_string_lossy()
         );
     }
-    pool(config)
-        .publish(&debs)
-        .map_err(|error| format!("cannot publish {name}'s packages: {error}"))?;
+    pool(config).publish(&debs).map_err(|error| {
+        format!(
+            "cannot publish {name}'s packages: {}",
+            ErrorChain::new(&error)
+        )
+    })?;
     Ok(())
 }
 
@@ -326,21 +357,29 @@ fn build_component(config: &Config, at: usize, source: &Path) -> Result<(), Stri
 fn pool_repository(config: &Config) -> Result<Repository, String> {
     // The pool names its own mirror URL, so the pipeline holds no copy of the
     // archive layout.
-    let mirror = pool(config)
-        .mirror_url()
-        .map_err(|error| format!("cannot resolve the pool's mirror URL: {error}"))?;
+    let mirror = pool(config).mirror_url().map_err(|error| {
+        format!(
+            "cannot resolve the pool's mirror URL: {}",
+            ErrorChain::new(&error)
+        )
+    })?;
     Repository::builder(&config.suite)
         .mirror(mirror)
         .trust_unsigned(true)
         .name("pipeline-pool")
         .build()
-        .map_err(|error| format!("cannot configure the pool repository: {error}"))
+        .map_err(|error| {
+            format!(
+                "cannot configure the pool repository: {}",
+                ErrorChain::new(&error)
+            )
+        })
 }
 
 /// Collects the `.deb` and `.ddeb` files a build left in `out_dir`.
 fn collect_debs(out_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut debs: Vec<PathBuf> = std::fs::read_dir(out_dir)
-        .map_err(|error| format!("cannot read the build output: {error}"))?
+        .map_err(|error| format!("cannot read the build output: {}", ErrorChain::new(&error)))?
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {

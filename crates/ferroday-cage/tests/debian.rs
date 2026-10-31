@@ -205,9 +205,10 @@ fn hermetic_a_bootstrap_establishes_its_map_through_the_callers_delegate() {
     let err = layered
         .stage_layer(dir.join("upper"))
         .expect_err("the delegate refuses the layer's map");
+    let message = ferroday_cage::ErrorChain::new(&err).to_string();
     assert!(
-        err.to_string().contains("the caller's delegate refuses"),
-        "{err}"
+        message.contains("the caller's delegate refuses"),
+        "{message}"
     );
     assert_eq!(*refusing.asked.lock().unwrap(), ["resolve"]);
 
@@ -1962,9 +1963,10 @@ fn hermetic_stops_a_package_at_the_size_the_index_recorded() {
     let ProvisionError::Other { source: inner, .. } = &err else {
         panic!("expected a boxed Debian error, got {err:?}");
     };
+    let reported = ferroday_cage::ErrorChain::new(&**inner).to_string();
     assert!(
-        inner.to_string().contains("maximum size"),
-        "the oversized body is refused at the bound: {inner}"
+        reported.contains("maximum size"),
+        "the oversized body is refused at the bound: {reported}"
     );
     assert!(!rootfs.exists());
     // Nothing oversized was left in the cache, and nothing was published there.
@@ -3194,7 +3196,7 @@ fn a_pinned_install_whose_package_is_gone_fails_naming_the_package() {
     let ProvisionError::Other { source: inner, .. } = &err else {
         panic!("expected a boxed Debian error, got {err:?}");
     };
-    let message = inner.to_string();
+    let message = ferroday_cage::ErrorChain::new(&**inner).to_string();
     assert!(
         message.contains(&gone),
         "the report names the package: {message}"
@@ -3529,9 +3531,10 @@ fn hermetic_a_pin_holds_the_archive_half_and_lets_a_local_build_float() {
     let rootfs = dir.join("replayed");
     let refusal = provision::ensure(&rootfs, &mut verbatim)
         .expect_err("the recompiled kernel does not match the recorded digest");
+    let reported = ferroday_cage::ErrorChain::new(&refusal).to_string();
     assert!(
-        refusal.to_string().contains("digest the archive recorded"),
-        "{refusal}",
+        reported.contains("digest the archive recorded"),
+        "{reported}",
     );
 
     // The same plan with the locally built half dropped holds the archive and

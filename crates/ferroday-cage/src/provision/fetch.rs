@@ -501,9 +501,7 @@ impl fmt::Display for FetchError {
             FetchError::Status { url, code } => {
                 write!(f, "fetching {url} failed with HTTP status {code}")
             }
-            FetchError::Io { url, op, source } => {
-                write!(f, "fetching {url} failed while {op}: {source}")
-            }
+            FetchError::Io { url, op, .. } => write!(f, "fetching {url} failed while {op}"),
         }
     }
 }

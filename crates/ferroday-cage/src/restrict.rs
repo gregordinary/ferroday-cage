@@ -659,7 +659,7 @@ impl RestrictionBuilder {
     pub fn build(self) -> Result<Restriction, Error> {
         // The rule a sandbox reads its command by, without path lookup: a
         // restriction never searches the host's `PATH`.
-        let command = spec::validate_command(self.command, false)?;
+        let command = spec::validate_command(self.command, None)?;
         let exec_label = spec::exec_label(&command.path, &[]);
         let (rlimits, rlimit_labels) = spec::lower_rlimits(&self.rlimits)?;
         let args = self
@@ -878,6 +878,33 @@ mod tests {
             err,
             Error::Config(ConfigError::CommandNotAbsolute { .. })
         ));
+    }
+
+    #[test]
+    fn a_bare_command_is_refused_without_an_offer_of_path_lookup() {
+        // A restriction has no path lookup, so the refusal of a bare name
+        // cannot point at one: it says the name is never searched.
+        let err = Restriction::builder()
+            .command("true")
+            .seccomp(SeccompPolicy::Curated)
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Config(ConfigError::CommandNotAbsolute {
+                    lookup_offered: false,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        let Error::Config(config) = &err else {
+            unreachable!()
+        };
+        let message = config.to_string();
+        assert!(message.contains("never searches PATH"), "{message}");
+        assert!(!message.contains("path lookup"), "{message}");
     }
 
     #[test]

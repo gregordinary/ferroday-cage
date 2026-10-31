@@ -91,6 +91,7 @@ use super::{
     ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball, mirror_url,
     walk_mirrors,
 };
+use crate::ErrorChain;
 use crate::IdentityMap;
 use crate::failure::path_io_error;
 
@@ -507,14 +508,12 @@ impl fmt::Display for GentooError {
                  document states {expected}, the bytes are {actual}",
             ),
             GentooError::Cancelled => f.write_str("the bootstrap was cancelled"),
-            GentooError::Fetch(err) => write!(f, "{err}"),
-            GentooError::Io { op, path, source } => {
-                write!(
-                    f,
-                    "provisioning failed while {op} {}: {source}",
-                    path.display()
-                )
-            }
+            GentooError::Fetch(_) => f.write_str("the Gentoo bootstrap could not fetch a resource"),
+            GentooError::Io { op, path, .. } => write!(
+                f,
+                "a Gentoo bootstrap step failed while {op} {}",
+                path.display()
+            ),
         }
     }
 }
@@ -1355,8 +1354,11 @@ struct Fetched {
 /// smaller archive, and its own package count cannot be relied on to notice,
 /// since the count is optional and the mirror's to write.
 fn read_index_body(served: &Fetched, limit: u64) -> Result<index::Index, GentooError> {
-    let unreadable = |err: &dyn fmt::Display| {
-        GentooError::index(&served.url, format!("could not be read: {err}"))
+    let unreadable = |err: &(dyn std::error::Error + 'static)| {
+        GentooError::index(
+            &served.url,
+            format!("could not be read: {}", ErrorChain::new(err)),
+        )
     };
     let mut body = served.body.as_slice();
     let head = compress::sniff_head(&mut body).map_err(|err| unreadable(&err))?;
@@ -3662,7 +3664,7 @@ mod tests {
         let root = scratch.join("root");
         let err =
             crate::provision::ensure(&root, &mut gentoo).expect_err("the digest does not match");
-        let reported = err.to_string();
+        let reported = ErrorChain::new(&err).to_string();
         assert!(reported.contains("does not have the digest"), "{reported}");
         assert!(!root.exists(), "no root is published");
         assert!(
@@ -3915,7 +3917,10 @@ mod tests {
         let err = installing(&key, BINHOST, built.clone(), &scratch.join("cache"))
             .install_wave(&full, None, &mut Silent)
             .expect_err("no ordinal is left");
-        assert!(err.to_string().contains("merge counter"), "{err}");
+        assert!(
+            ErrorChain::new(&err).to_string().contains("merge counter"),
+            "{err}"
+        );
         assert!(
             !full.join("usr/lib/libz.so.1.3.2").exists(),
             "nothing merged"

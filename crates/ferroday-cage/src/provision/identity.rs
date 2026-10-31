@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::IdentityMap;
 use crate::error::ConfigError;
+use crate::failure::ErrorChain;
 use crate::idmap::{IdMapper, ResolvedMap};
 use crate::mechanism::ChildMap;
 
@@ -88,7 +89,7 @@ pub(super) fn compose_child_map(
             let (mapper, map) =
                 crate::idmap::resolve_delegate(map, mapper).map_err(|err| match err {
                     ConfigError::IdentityMapUnavailable { reason, .. } => reason,
-                    other => other.to_string(),
+                    other => ErrorChain::new(&other).to_string(),
                 })?;
             Ok(ChildMapSource::Delegated(ResolvedDelegate { mapper, map }))
         }

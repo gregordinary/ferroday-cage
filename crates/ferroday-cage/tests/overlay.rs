@@ -218,9 +218,10 @@ fn a_missing_stacked_lower_names_its_role() {
         ),
         "{err}"
     );
+    let message = ferroday_cage::ErrorChain::new(&err).to_string();
     assert!(
-        err.to_string().contains("overlay lower directory"),
-        "the message should name the layer: {err}"
+        message.contains("overlay lower directory"),
+        "the message should name the layer: {message}"
     );
 }
 
@@ -263,9 +264,10 @@ fn a_work_directory_on_another_filesystem_is_refused_by_name() {
         .expect_err("a work directory on another filesystem must be refused");
     let left_behind = work.exists();
     let _ = std::fs::remove_dir(&work);
+    let message = ferroday_cage::ErrorChain::new(&err).to_string();
     assert!(
-        err.to_string().contains("overlay work directory"),
-        "the refusal must name the work directory: {err}"
+        message.contains("overlay work directory"),
+        "the refusal must name the work directory: {message}"
     );
     assert!(
         !left_behind,

@@ -13,9 +13,12 @@
 //! A status maps to a process exit code through
 //! [`ExitStatus::shell_code`](ferroday_cage::ExitStatus::shell_code) and a
 //! library failure through [`Error::shell_code`](ferroday_cage::Error::shell_code):
-//! the library owns those conventions and states them once. What is here is the
-//! two codes an example reports of itself, for a command line it cannot
-//! understand and for a failure that is not a launch's.
+//! the library owns those conventions and states them once. An error is printed
+//! through [`ErrorChain`](ferroday_cage::ErrorChain), which renders it with the
+//! causes its own message leaves to `source()`, and that rendering is the
+//! library's too. What is here is the two codes an example reports of itself,
+//! for a command line it cannot understand and for a failure that is not a
+//! launch's.
 //!
 //! The `fcage` binary keeps helpers of its own that answer the same three
 //! questions, and that is where the sharing stops. A crate's examples are not

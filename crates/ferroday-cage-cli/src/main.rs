@@ -56,9 +56,9 @@ use ferroday_cage::provision::alpine::KeySet as AlpineKeySet;
 use ferroday_cage::provision::debian::{Priority, Repository};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
-    Bind, Cage, CageBuilder, Capability, Error, ExitStatus, FsAccess, IdRange, Identity,
-    IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, Network, Overlay, RawMount,
-    Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg,
+    Bind, Cage, CageBuilder, Capability, Error, ErrorChain, ExitStatus, FsAccess, IdRange,
+    Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, Network, Overlay,
+    RawMount, Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg,
     SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
 };
 use serde::Deserialize as _;
@@ -81,10 +81,59 @@ const FAILED: u8 = 125;
 
 /// Reports a failure of `fcage`'s own on standard error, and returns
 /// [`FAILED`].
-fn fail(message: impl std::fmt::Display) -> ExitCode {
-    eprintln!("fcage: {message}");
+fn fail(diagnostic: impl Into<Diagnostic>) -> ExitCode {
+    eprintln!("fcage: {}", diagnostic.into().0);
     ExitCode::from(FAILED)
 }
+
+/// What [`fail`] reports: a message of `fcage`'s own, or an error rendered with
+/// every cause beneath it.
+///
+/// The library's errors, and the OS errors `fcage` meets on its own, keep their
+/// causes out of their messages and return them from `source()`. Printing one
+/// with `{}` would therefore drop the OS error underneath it, so each converts
+/// through [`ErrorChain`] instead. The conversions name each error type rather
+/// than covering every type at once, so an error type without one is refused as
+/// an argument to [`fail`] at compile time, rather than accepted as a message
+/// that has lost its cause.
+struct Diagnostic(String);
+
+impl From<String> for Diagnostic {
+    fn from(message: String) -> Diagnostic {
+        Diagnostic(message)
+    }
+}
+
+impl From<std::fmt::Arguments<'_>> for Diagnostic {
+    fn from(message: std::fmt::Arguments<'_>) -> Diagnostic {
+        Diagnostic(message.to_string())
+    }
+}
+
+/// Declares the conversion of each error type `fcage` reports into a
+/// [`Diagnostic`], rendered through [`ErrorChain`].
+macro_rules! diagnostic_from_errors {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl From<$error> for Diagnostic {
+                fn from(error: $error) -> Diagnostic {
+                    Diagnostic(ErrorChain::new(&error).to_string())
+                }
+            }
+        )+
+    };
+}
+
+diagnostic_from_errors!(
+    Error,
+    ferroday_cage::NetStackError,
+    ferroday_cage::provision::ProvisionError,
+    ferroday_cage::provision::alpine::AlpineError,
+    ferroday_cage::provision::debian::DebianError,
+    ferroday_cage::provision::gentoo::GentooError,
+    RelayError,
+    streams::StartError,
+);
 
 /// The exit code of a writer whose reader went away: what a process `SIGPIPE`
 /// killed exits with, which is what a shell expects of a pipeline's early end.
@@ -3956,7 +4005,7 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
     }
     builder
         .build()
-        .map_err(|error| format!("--debian-repository: {error}"))
+        .map_err(|error| format!("--debian-repository: {}", ErrorChain::new(&error)))
 }
 
 /// Where an apk repository's trusted keys come from.
@@ -4027,18 +4076,29 @@ fn alpine_key_set(
 ) -> Result<AlpineKeySet, String> {
     let directory = match keys {
         AlpineKeys::Alpine => {
-            return AlpineKeySet::alpine(architecture).map_err(|err| format!("{flag}: {err}"));
+            return AlpineKeySet::alpine(architecture)
+                .map_err(|err| format!("{flag}: {}", ErrorChain::new(&err)));
         }
         AlpineKeys::PostmarketOs => return Ok(AlpineKeySet::postmarketos()),
         AlpineKeys::Dir(directory) => directory,
     };
 
     let mut entries: Vec<PathBuf> = std::fs::read_dir(directory)
-        .map_err(|err| format!("{flag}: reading {}: {err}", directory.display()))?
+        .map_err(|err| {
+            format!(
+                "{flag}: reading {}: {}",
+                directory.display(),
+                ErrorChain::new(&err)
+            )
+        })?
         .map(|entry| {
-            entry
-                .map(|entry| entry.path())
-                .map_err(|err| format!("{flag}: reading {}: {err}", directory.display()))
+            entry.map(|entry| entry.path()).map_err(|err| {
+                format!(
+                    "{flag}: reading {}: {}",
+                    directory.display(),
+                    ErrorChain::new(&err)
+                )
+            })
         })
         .collect::<Result<_, _>>()?;
     entries.sort();
@@ -4055,10 +4115,15 @@ fn alpine_key_set(
                 path.display(),
             ));
         };
-        let pem = std::fs::read_to_string(&path)
-            .map_err(|err| format!("{flag}: reading {}: {err}", path.display()))?;
+        let pem = std::fs::read_to_string(&path).map_err(|err| {
+            format!(
+                "{flag}: reading {}: {}",
+                path.display(),
+                ErrorChain::new(&err)
+            )
+        })?;
         set.insert(name, &pem)
-            .map_err(|err| format!("{flag}: {err}"))?;
+            .map_err(|err| format!("{flag}: {}", ErrorChain::new(&err)))?;
     }
     if set.is_empty() {
         return Err(format!(
@@ -4566,8 +4631,13 @@ fn load_profile(
     override_command: bool,
     restricted: bool,
 ) -> Result<(CageBuilder, ProfileMeta), String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| format!("cannot read profile {}: {err}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "cannot read profile {}: {}",
+            path.display(),
+            ErrorChain::new(&err)
+        )
+    })?;
     let mut table: toml::Table = text.parse().map_err(|err| {
         format!(
             "cannot parse profile {}: {}",
@@ -4679,7 +4749,13 @@ fn export_rootfs(
                 source.display(),
             ));
         }
-        Err(error) => return fail(format_args!("cannot export {}: {error}", source.display())),
+        Err(error) => {
+            return fail(format_args!(
+                "cannot export {}: {}",
+                source.display(),
+                ErrorChain::new(&error),
+            ));
+        }
     }
     // Only a directory standing where the archive goes is refused here. Every
     // other destination failure belongs to the publish step, which stages beside
@@ -5053,7 +5129,10 @@ fn finish(relay: streams::StreamRelay, outcome: Result<Option<ExitStatus>, Failu
 fn settle(relay: streams::StreamRelay) -> bool {
     let failures = relay.finish();
     for (streams, error) in &failures {
-        eprintln!("fcage: relaying the command's {streams}: {error}");
+        eprintln!(
+            "fcage: relaying the command's {streams}: {}",
+            ErrorChain::new(error)
+        );
     }
     failures.is_empty()
 }
@@ -5177,7 +5256,7 @@ fn run_with_netstack(
     };
     let handle = match stack.attach(&pending) {
         Ok(handle) => handle,
-        Err(error) => return finish(relay, Err(Failure::Fcage(error.to_string()))),
+        Err(error) => return finish(relay, Err(Failure::Fcage(error.into()))),
     };
     // A publication that left the port to the kernel is useless until the
     // caller knows which one it got. Said before the command is released, and
@@ -5208,7 +5287,10 @@ fn run_with_netstack(
     // output, and after the terminal relay has restored the caller's terminal,
     // so it is not stair-stepped.
     if let Err(error) = stopped {
-        eprintln!("fcage: the network stack did not stop cleanly: {error}");
+        eprintln!(
+            "fcage: the network stack did not stop cleanly: {}",
+            ErrorChain::new(&error)
+        );
     }
     report(outcome, delivered)
 }
@@ -5449,7 +5531,7 @@ enum Failure {
     Cage(Error),
     /// A part of `fcage`'s own failed, such as the network stack or the
     /// terminal relay's plumbing, which exits [`FAILED`].
-    Fcage(String),
+    Fcage(Diagnostic),
 }
 
 impl From<Error> for Failure {
@@ -5465,7 +5547,7 @@ impl From<RelayError> for Failure {
     fn from(error: RelayError) -> Failure {
         match error {
             RelayError::Cage(error) => Failure::Cage(error),
-            other => Failure::Fcage(other.to_string()),
+            other => Failure::Fcage(other.into()),
         }
     }
 }
@@ -5475,10 +5557,10 @@ impl Failure {
     fn report(self) -> ExitCode {
         match self {
             Failure::Cage(error) => {
-                eprintln!("fcage: {error}");
+                eprintln!("fcage: {}", ErrorChain::new(&error));
                 ExitCode::from(error.shell_code())
             }
-            Failure::Fcage(message) => fail(message),
+            Failure::Fcage(diagnostic) => fail(diagnostic),
         }
     }
 }
@@ -5502,13 +5584,24 @@ fn conclude(outcome: Result<Option<ExitStatus>, Failure>) -> ExitCode {
 /// is one question, and its answer names the path the caller typed rather than
 /// the layer that could not read it. Both failures are environment failures, so
 /// both are 125.
-fn plan_from<P, E: std::fmt::Display>(
+fn plan_from<P, E: std::error::Error + 'static>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<P, E>,
 ) -> Result<P, ExitCode> {
-    let document = std::fs::read_to_string(path)
-        .map_err(|error| fail(format_args!("reading {}: {error}", path.display())))?;
-    parse(&document).map_err(|error| fail(format_args!("{}: {error}", path.display())))
+    let document = std::fs::read_to_string(path).map_err(|error| {
+        fail(format_args!(
+            "reading {}: {}",
+            path.display(),
+            ErrorChain::new(&error)
+        ))
+    })?;
+    parse(&document).map_err(|error| {
+        fail(format_args!(
+            "{}: {}",
+            path.display(),
+            ErrorChain::new(&error)
+        ))
+    })
 }
 
 /// Bootstraps a Debian rootfs from the archive, printing progress to stderr.
@@ -5691,11 +5784,10 @@ fn provision_alpine(
         if !spec.components.is_empty() {
             repository = repository.components(spec.components.clone());
         }
-        builder = builder.repository(
-            repository
-                .build()
-                .map_err(|error| usage(format!("--alpine-repository: {error}")))?,
-        );
+        builder =
+            builder.repository(repository.build().map_err(|error| {
+                usage(format!("--alpine-repository: {}", ErrorChain::new(&error)))
+            })?);
     }
 
     let mut alpine = builder.build().map_err(fail)?;
@@ -5913,7 +6005,7 @@ fn listing_status(subject: &str, written: std::io::Result<()>) -> u8 {
         Ok(()) => 0,
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => broken_pipe(),
         Err(error) => {
-            eprintln!("fcage: cannot write {subject}: {error}");
+            eprintln!("fcage: cannot write {subject}: {}", ErrorChain::new(&error));
             FAILED
         }
     }

@@ -337,3 +337,17 @@ quietly ignoring what the caller asked for rather than a failure."""
 path = "crates/ferroday-cage/src/provision/gentoo/atom.rs"
 count = 1
 why = "The answer."
+
+[[idiom]]
+name = "walking an error's chain of causes"
+pattern = '\.source\(\)'
+answer = """\
+`ErrorChain`, which renders an error and every cause beneath it on one line. \
+No error's message repeats its cause, so a reader that stops at `Display` \
+drops the OS error underneath, and a second walk is a second decision about \
+how the layers join and which repeated cause to drop."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/failure.rs"
+count = 2
+why = "The answer."

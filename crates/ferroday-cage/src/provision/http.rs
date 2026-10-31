@@ -1321,6 +1321,7 @@ fn deadline_elapsed(op: &'static str, url: &str) -> FetchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::failure::ErrorChain;
     use crate::scratch::Scratch;
 
     /// Serves one canned response to each of `connections` requests on a
@@ -1642,7 +1643,10 @@ mod tests {
         let err = fetcher
             .fetch(&FetchRequest::new(&served.url), &mut out)
             .expect_err("the chain runs past the fetch's deadline");
-        assert!(err.to_string().contains("deadline"), "{err}");
+        assert!(
+            ErrorChain::new(&err).to_string().contains("deadline"),
+            "{err}"
+        );
         drop(fetcher);
     }
 
@@ -1912,7 +1916,10 @@ mod tests {
             .connect("http://mirror.example/x", addrs.into_iter(), Some(past))
             .expect_err("the deadline ends the walk");
         assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
-        assert!(err.to_string().contains(DEADLINE_ELAPSED), "{err}");
+        assert!(
+            ErrorChain::new(&err).to_string().contains(DEADLINE_ELAPSED),
+            "{err}"
+        );
         // The mirror walk is right to ask the next mirror about it.
         assert!(err.is_failover(), "{err}");
     }
@@ -1957,7 +1964,9 @@ mod tests {
             .fetch(&FetchRequest::new(&url), &mut Vec::new())
             .expect_err("a peer that never answers is refused");
         assert!(
-            err.to_string().contains("interim responses"),
+            ErrorChain::new(&err)
+                .to_string()
+                .contains("interim responses"),
             "{err}, expected the interim-response refusal"
         );
         assert!(err.is_failover(), "{err}");
@@ -2034,7 +2043,12 @@ mod tests {
             .expect_err("the chain never arrives at a body");
         assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
         assert!(err.is_failover(), "{err}");
-        assert!(err.to_string().contains("more than 5 redirects"), "{err}");
+        assert!(
+            ErrorChain::new(&err)
+                .to_string()
+                .contains("more than 5 redirects"),
+            "{err}"
+        );
         served.join().expect("the server thread ends");
     }
 
@@ -2211,7 +2225,10 @@ mod tests {
                 .expect_err("an https:// target cannot be followed");
             assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
             assert!(err.is_failover(), "{err}");
-            assert!(err.to_string().contains(TLS_REMEDY), "{err}");
+            assert!(
+                ErrorChain::new(&err).to_string().contains(TLS_REMEDY),
+                "{err}"
+            );
             served.join().expect("the server thread ends");
         }
 

@@ -326,6 +326,13 @@ therefore replaces the crate page with that line's metadata.
   zero. Constructors take their arguments in one order, operation then locator
   then cause. Each error type has one of them, plus an `at(op, locator)` form
   for the `map_err` sites.
+
+  A message does not repeat its cause. An error whose `source()` returns one
+  says what failed and on what, and leaves the cause to `source()`. A variant
+  wrapping another error is a layer like any other, with a message of its own.
+  A renderer that walks the chain then prints each layer once. The workspace
+  prints an error through `ErrorChain`, and the tests in `failure` hold every
+  error type to the rule.
 - **A new capability arrives additively** where it can: a new builder method,
   a new enum variant behind `#[non_exhaustive]`, a new accessor on an existing
   request type. See the [stability
@@ -424,6 +431,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Declare an enum together with the roster of its own variants | `roster::roster_enum!` |
 | State a `poll` deadline, or retire a `poll` slot | `poll::timeout`, `poll::slot` |
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
+| Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code` |
 | Make a scratch tree that clears itself | `scratch::Scratch`, or `common::scratch_dir` from a test suite |
 | What happens when a run's timeout runs out? | `relay::Escalation` |

@@ -101,7 +101,7 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent, Plan};
 use ferroday_cage::provision::{Provision, ProvisionEvent};
-use ferroday_cage::{Cage, Error};
+use ferroday_cage::{Cage, Error, ErrorChain};
 
 mod common;
 use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
@@ -253,13 +253,17 @@ fn run(options: Options) -> Result<ExitCode, String> {
         // choice -- and the builder's own architecture and binhost have to be
         // the ones it was resolved for, which `build()` checks.
         let document = std::fs::read_to_string(path)
-            .map_err(|err| format!("reading {}: {err}", path.display()))?;
-        builder = builder.plan(Plan::parse_document(&document).map_err(|err| err.to_string())?);
+            .map_err(|err| format!("reading {}: {}", path.display(), ErrorChain::new(&err)))?;
+        builder = builder.plan(
+            Plan::parse_document(&document).map_err(|err| ErrorChain::new(&err).to_string())?,
+        );
     }
     if let Some(cache) = &options.cache {
         builder = builder.cache_dir(cache);
     }
-    let mut gentoo = builder.build().map_err(|error| error.to_string())?;
+    let mut gentoo = builder
+        .build()
+        .map_err(|error| ErrorChain::new(&error).to_string())?;
 
     // A plan is resolved against the root it would install into, for the reason
     // the module documentation gives: on this archive there is no meaningful
@@ -267,8 +271,12 @@ fn run(options: Options) -> Result<ExitCode, String> {
     if options.plan_only {
         let plan = gentoo
             .resolve_packages(&options.rootfs)
-            .map_err(|error| error.to_string())?;
-        print!("{}", plan.to_document().map_err(|error| error.to_string())?);
+            .map_err(|error| ErrorChain::new(&error).to_string())?;
+        print!(
+            "{}",
+            plan.to_document()
+                .map_err(|error| ErrorChain::new(&error).to_string())?
+        );
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -280,7 +288,7 @@ fn run(options: Options) -> Result<ExitCode, String> {
     let outcome = Provision::new(&options.rootfs)
         .observe(&mut progress)
         .run(&mut gentoo)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ErrorChain::new(&error).to_string())?;
     eprintln!(
         "{PROGRAM}: the root at {} is {outcome:?}",
         options.rootfs.display()
@@ -300,7 +308,7 @@ fn run(options: Options) -> Result<ExitCode, String> {
         .env("HOME", "/root")
         .build()
         .and_then(|cage| cage.run())
-        .map_err(|error: Error| error.to_string())?;
+        .map_err(|error: Error| ErrorChain::new(&error).to_string())?;
     Ok(ExitCode::from(status.shell_code()))
 }
 

@@ -974,7 +974,8 @@ fn a_tarball_extracts_from_a_reader() {
     // The stream is spent; a second run says so rather than publishing an
     // empty rootfs.
     let err = ensure(dir.join("second"), &mut tarball).unwrap_err();
-    assert!(err.to_string().contains("consumed by an earlier"), "{err}");
+    let message = ferroday_cage::ErrorChain::new(&err).to_string();
+    assert!(message.contains("consumed by an earlier"), "{message}");
     assert!(!dir.join("second").exists());
 
     common::force_remove_dir_all(&dir);

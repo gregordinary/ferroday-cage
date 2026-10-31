@@ -78,6 +78,7 @@ use flate2::write::GzEncoder;
 
 use super::check_coordinate;
 use super::{DebianError, MAX_UNSIZED_INDEX, arch, deb, release, version};
+use crate::ErrorChain;
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::document;
@@ -891,7 +892,8 @@ fn index_deb(
 
     // Where the .deb belongs in the pool is what its own control stanza says it
     // is, so the location is settled before anything is written.
-    let control = deb::read_control_from(&mut source).map_err(|err| bad(err.to_string()))?;
+    let control = deb::read_control_from(&mut source)
+        .map_err(|err| bad(ErrorChain::new(&err).to_string()))?;
     let offered = identity(&control, architecture).map_err(&bad)?;
     let rel = pool_path(
         component,
@@ -976,7 +978,8 @@ fn control_of(
     };
     file.rewind()
         .map_err(DebianError::at("reading a .deb in the pool", path))?;
-    let control = deb::read_control_from(file).map_err(|err| bad(err.to_string()))?;
+    let control =
+        deb::read_control_from(file).map_err(|err| bad(ErrorChain::new(&err).to_string()))?;
     if identity(&control, architecture).map_err(&bad)? != *expected {
         return Err(bad(
             "it changed while it was being published, and now names a different package"

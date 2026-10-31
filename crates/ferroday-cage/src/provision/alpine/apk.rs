@@ -29,6 +29,7 @@ use flate2::bufread::GzDecoder;
 use super::AlpineError;
 use super::keyring::KeySet;
 use super::sign::Signatures;
+use crate::ErrorChain;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::tar::TarReader;
 use crate::provision::{LimitedWriter, ProvisionError};
@@ -569,7 +570,10 @@ pub(super) fn members(subject: &str, segment: &[u8]) -> Result<Vec<Member>, Alpi
     let mut reader = TarReader::new(segment);
     let mut members = Vec::new();
     let malformed = |err: ProvisionError| {
-        AlpineError::container(subject, format!("a segment is not a readable tar: {err}"))
+        AlpineError::container(
+            subject,
+            format!("a segment is not a readable tar: {}", ErrorChain::new(&err)),
+        )
     };
     while let Some(entry) = reader.next_entry().map_err(malformed)? {
         let name = String::from_utf8_lossy(&entry.path).into_owned();

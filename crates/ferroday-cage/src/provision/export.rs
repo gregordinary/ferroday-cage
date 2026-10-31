@@ -36,6 +36,7 @@ use super::tar::{
     BLOCK, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad, ustar_block,
 };
 use super::{Delegate, ProvisionError};
+use crate::failure::ErrorChain;
 use crate::mechanism::{
     ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
     StartError, kill_export, start_export,
@@ -450,7 +451,7 @@ fn export_inner<W: Write>(
         Err(StartError::Map(err)) => {
             return Err(ProvisionError::ExportUnprivileged {
                 path: rootfs.to_path_buf(),
-                reason: err.to_string(),
+                reason: ErrorChain::new(&err).to_string(),
             });
         }
     };

@@ -78,7 +78,7 @@ use super::{
     walk_mirrors,
 };
 use crate::failure::path_io_error;
-use crate::{IdMapper, IdentityMap};
+use crate::{ErrorChain, IdMapper, IdentityMap};
 use bootstrap::ScriptSubject;
 use index::{Index, Record};
 use installed::{Carried, Claim, Database};
@@ -1650,7 +1650,7 @@ fn preflight(alpine: &Alpine) -> Result<(), AlpineError> {
     // form.
     crate::idmap::establishable(&alpine.identity_map, alpine.id_mapper.as_ref()).map_err(
         |refusal| AlpineError::Config {
-            reason: refusal.to_string(),
+            reason: ErrorChain::new(&refusal).to_string(),
         },
     )
 }
@@ -2532,12 +2532,12 @@ impl fmt::Display for AlpineError {
                 script,
                 status,
             } => write!(f, "the {package} {script} script {status}"),
-            AlpineError::Launch(err) => write!(f, "{err}"),
+            AlpineError::Launch(_) => f.write_str("an install script could not launch"),
             AlpineError::Cancelled => f.write_str("the bootstrap was cancelled"),
-            AlpineError::Fetch(err) => write!(f, "{err}"),
-            AlpineError::Io { op, path, source } => write!(
+            AlpineError::Fetch(_) => f.write_str("the Alpine bootstrap could not fetch a resource"),
+            AlpineError::Io { op, path, .. } => write!(
                 f,
-                "an Alpine bootstrap step failed while {op} {}: {source}",
+                "an Alpine bootstrap step failed while {op} {}",
                 path.display(),
             ),
         }
@@ -2884,7 +2884,7 @@ mod tests {
         assert!(matches!(err, AlpineError::Fetch(_)), "{err}");
         // And it names the mirror that was asked, not the path alone: the walk
         // keeps the last failure so the diagnostic survives the walk.
-        let reason = err.to_string();
+        let reason = ErrorChain::new(&err).to_string();
         assert!(reason.contains("http://empty.invalid/alpine"), "{reason}");
     }
 
@@ -2901,10 +2901,8 @@ mod tests {
             .fetcher(canned())
             .build()
             .expect("the bootstrap configures");
-        let reason = alpine
-            .available()
-            .expect_err("no mirror serves it")
-            .to_string();
+        let err = alpine.available().expect_err("no mirror serves it");
+        let reason = ErrorChain::new(&err).to_string();
         assert!(reason.contains("http://empty.invalid/last"), "{reason}");
         assert!(!reason.contains("/first"), "{reason}");
     }
@@ -3826,7 +3824,10 @@ mod tests {
         let Err(err) = alpine.stage_layer(scratch.join("upper")) else {
             panic!("no base layer was set");
         };
-        assert!(err.to_string().contains("stage_layer"), "{err}");
+        assert!(
+            ErrorChain::new(&err).to_string().contains("stage_layer"),
+            "{err}"
+        );
 
         // And the other way round: a provisioner that has a base is a layered
         // one, and bootstrapping a whole root into the caller's directory would
@@ -3843,7 +3844,10 @@ mod tests {
         let Err(err) = crate::provision::ensure(scratch.join("whole"), &mut layered) else {
             panic!("a base layer was set");
         };
-        assert!(err.to_string().contains("stage_layer"), "{err}");
+        assert!(
+            ErrorChain::new(&err).to_string().contains("stage_layer"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4058,7 +4062,10 @@ mod tests {
         else {
             panic!("Alpine publishes no systemd");
         };
-        assert!(err.to_string().contains("systemd"), "{err}");
+        assert!(
+            ErrorChain::new(&err).to_string().contains("systemd"),
+            "{err}"
+        );
         assert!(
             !upper.exists(),
             "the upper it created went with the failure"
@@ -4324,7 +4331,7 @@ mod tests {
             .expect("the bootstrap configures");
         let err = crate::provision::ensure(scratch.join("root"), &mut alpine)
             .expect_err("the package served is not the one planned");
-        assert!(err.to_string().contains("musl"), "{err}");
+        assert!(ErrorChain::new(&err).to_string().contains("musl"), "{err}");
         let held: Vec<_> = std::fs::read_dir(&cache)
             .expect("the cache was created")
             .map(|entry| entry.unwrap().file_name())

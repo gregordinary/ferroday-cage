@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ferroday_cage::provision::{self, Tarball};
-use ferroday_cage::{Cage, Error, NetStack, NetStackError};
+use ferroday_cage::{Cage, Error, ErrorChain, NetStack, NetStackError};
 
 mod common;
 
@@ -94,7 +94,10 @@ fn main() -> ExitCode {
     if let Err(error) = provision::ensure(&options.rootfs, &mut Tarball::new(&options.tarball)) {
         return failure(
             "fetch-sandbox",
-            &format!("provisioning the rootfs failed: {error}"),
+            &format!(
+                "provisioning the rootfs failed: {}",
+                ErrorChain::new(&error)
+            ),
         );
     }
 
@@ -106,12 +109,15 @@ fn main() -> ExitCode {
         // stack's own failures are this example's, and 125 is what it says
         // about those.
         Err(FetchFailure::Cage(error)) => {
-            eprintln!("fetch-sandbox: {error}");
+            eprintln!("fetch-sandbox: {}", ErrorChain::new(&error));
             ExitCode::from(error.shell_code())
         }
         Err(FetchFailure::Stack(error)) => failure(
             "fetch-sandbox",
-            &format!("the network stack could not be attached: {error}"),
+            &format!(
+                "the network stack could not be attached: {}",
+                ErrorChain::new(&error)
+            ),
         ),
     }
 }
@@ -178,7 +184,10 @@ fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
     // Tear the stack down once the command has exited. A failure here loses
     // no data, so it is a warning rather than the run's outcome.
     if let Err(error) = handle.stop() {
-        eprintln!("fetch-sandbox: the network stack did not stop cleanly: {error}");
+        eprintln!(
+            "fetch-sandbox: the network stack did not stop cleanly: {}",
+            ErrorChain::new(&error)
+        );
     }
 
     Ok(ExitCode::from(status.shell_code()))

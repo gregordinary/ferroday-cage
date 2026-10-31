@@ -77,6 +77,15 @@ range map, through the caller's delegate or the bundled chain, before anything \
 is downloaded. Nothing public answers the question."""
 
 [[layer.reach]]
+name = "ErrorChain"
+count = 2
+kind = "public"
+why = """\
+The renderer that flattens one of the crate's own errors into a reason with \
+its causes: an index that does not decompress, a `.deb` the pool cannot read, \
+and a range map no delegate can establish."""
+
+[[layer.reach]]
 name = "failure"
 count = 1
 kind = "internal"
@@ -140,6 +149,12 @@ kind = "internal"
 why = "`idmap::establishable`, as in the Debian layer."
 
 [[layer.reach]]
+name = "ErrorChain"
+count = 3
+kind = "public"
+why = "As in the Debian layer, for a container's, a base layer's, and a refused map's reasons."
+
+[[layer.reach]]
 name = "failure"
 count = 1
 kind = "internal"
@@ -159,6 +174,12 @@ name = "IdentityMap"
 count = 1
 kind = "public"
 why = "The map a staged layer records."
+
+[[layer.reach]]
+name = "ErrorChain"
+count = 2
+kind = "public"
+why = "As in the other two layers, for an index's and a container's reasons."
 
 [[layer.reach]]
 name = "failure"

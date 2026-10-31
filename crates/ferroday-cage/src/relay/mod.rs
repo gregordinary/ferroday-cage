@@ -653,10 +653,8 @@ impl RelayError {
 impl std::fmt::Display for RelayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RelayError::Cage(error) => write!(f, "the relayed sandbox failed: {error}"),
-            RelayError::Io { op, source } => {
-                write!(f, "the terminal relay failed while {op}: {source}")
-            }
+            RelayError::Cage(_) => f.write_str("the relayed sandbox failed"),
+            RelayError::Io { op, .. } => write!(f, "the terminal relay failed while {op}"),
         }
     }
 }

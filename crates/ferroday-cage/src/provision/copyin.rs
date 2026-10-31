@@ -27,6 +27,7 @@ use super::containment;
 use super::identity::compose_child_map;
 use super::{Delegate, ProvisionError};
 use crate::IdentityMap;
+use crate::failure::ErrorChain;
 use crate::idmap::{IdMapper, IdRange};
 use crate::mechanism::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
 use crate::mechanism::frame;
@@ -320,7 +321,7 @@ fn failure(err: CopyFailure, rootfs: &Path) -> ProvisionError {
     match err {
         CopyFailure::Map(err) => ProvisionError::CopyUnprivileged {
             path: rootfs.to_path_buf(),
-            reason: err.to_string(),
+            reason: ErrorChain::new(&err).to_string(),
         },
         CopyFailure::Step { step, errno } => ProvisionError::Io {
             op: step.describe(),

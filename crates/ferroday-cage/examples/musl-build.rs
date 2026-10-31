@@ -64,7 +64,7 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::alpine::{Alpine, AlpineEvent};
 use ferroday_cage::provision::{self, Provisioned};
-use ferroday_cage::{Cage, ConfigError, Error, Network};
+use ferroday_cage::{Cage, ConfigError, Error, ErrorChain, Network};
 
 mod common;
 
@@ -323,7 +323,7 @@ fn run(config: Config) -> ExitCode {
             ExitCode::from(status.shell_code())
         }
         Err(error) => {
-            eprintln!("musl-build: {error}");
+            eprintln!("musl-build: {}", ErrorChain::new(&error));
             ExitCode::from(error.shell_code())
         }
     }
@@ -344,7 +344,10 @@ fn provision(config: &Config) -> Result<(), ExitCode> {
     let mut alpine = builder.build().map_err(|error| {
         failure(
             "musl-build",
-            &format!("cannot configure the bootstrap: {error}"),
+            &format!(
+                "cannot configure the bootstrap: {}",
+                ErrorChain::new(&error)
+            ),
         )
     })?;
     let mut progress = print_progress;
@@ -358,7 +361,10 @@ fn provision(config: &Config) -> Result<(), ExitCode> {
         Ok(_) => Ok(()),
         Err(error) => Err(failure(
             "musl-build",
-            &format!("cannot provision the build root: {error}"),
+            &format!(
+                "cannot provision the build root: {}",
+                ErrorChain::new(&error)
+            ),
         )),
     }
 }
@@ -435,7 +441,7 @@ fn interpreter(path: &Path) -> Result<Option<String>, String> {
     /// The segment type that names an interpreter.
     const PT_INTERP: u32 = 3;
 
-    let elf = std::fs::read(path).map_err(|err| err.to_string())?;
+    let elf = std::fs::read(path).map_err(|err| ErrorChain::new(&err).to_string())?;
     let at = |offset: usize, width: usize| -> Result<u64, String> {
         let bytes = elf
             .get(offset..offset + width)
@@ -480,6 +486,6 @@ fn report_build_error(error: &Error) {
             "musl-build: build root {} is unusable; it is provisioned on the first run",
             path.display()
         ),
-        other => eprintln!("musl-build: {other}"),
+        other => eprintln!("musl-build: {}", ErrorChain::new(other)),
     }
 }

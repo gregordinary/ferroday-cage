@@ -69,8 +69,10 @@
 //! [`run`](Cage::run) returns the command's [`ExitStatus`] whenever the
 //! command was executed — a non-zero exit is data, not an error. [`Error`]
 //! is reserved for the library failing, and a setup failure inside the
-//! sandbox names the exact step, the OS error, and the mount it concerned,
-//! rather than surfacing an opaque exit.
+//! sandbox names the exact step and the mount it concerned, with the OS error
+//! as its [`source`](std::error::Error::source), rather than surfacing an
+//! opaque exit. An error's own message does not repeat its cause, and
+//! [`ErrorChain`] renders the two together on one line.
 //!
 //! # Streaming and the handle
 //!
@@ -283,6 +285,7 @@ mod terminal;
 mod wire;
 
 pub use error::{ConfigError, Error, OverlayLayer, SetupStep};
+pub use failure::ErrorChain;
 #[cfg(feature = "hardening")]
 pub use hardening::{
     Capability, FsAccess, LandlockScope, NetAccess, ParseCapabilityError, ParseFsAccessError,

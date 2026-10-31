@@ -75,7 +75,7 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::debian::{Debian, DebianEvent, foreign_interpreter};
 use ferroday_cage::provision::{self, Provisioned};
-use ferroday_cage::{Cage, ConfigError, Error, Network, SeccompPolicy};
+use ferroday_cage::{Cage, ConfigError, Error, ErrorChain, Network, SeccompPolicy};
 
 mod common;
 
@@ -342,7 +342,7 @@ fn run(config: Config) -> ExitCode {
     match cage.run() {
         Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
-            eprintln!("cross-arch-test: {error}");
+            eprintln!("cross-arch-test: {}", ErrorChain::new(&error));
             ExitCode::from(error.shell_code())
         }
     }
@@ -445,7 +445,10 @@ fn provision(config: &Config) -> Result<(), ExitCode> {
     let mut debian = builder.build().map_err(|error| {
         failure(
             "cross-arch-test",
-            &format!("cannot configure the bootstrap: {error}"),
+            &format!(
+                "cannot configure the bootstrap: {}",
+                ErrorChain::new(&error)
+            ),
         )
     })?;
     let mut progress = print_progress;
@@ -463,7 +466,7 @@ fn provision(config: &Config) -> Result<(), ExitCode> {
         Ok(_) => Ok(()),
         Err(error) => Err(failure(
             "cross-arch-test",
-            &format!("cannot provision the root: {error}"),
+            &format!("cannot provision the root: {}", ErrorChain::new(&error)),
         )),
     }
 }
@@ -513,6 +516,6 @@ fn report_build_error(error: &Error) {
             "cross-arch-test: root {} is unusable; it is provisioned on the first run",
             path.display()
         ),
-        other => eprintln!("cross-arch-test: {other}"),
+        other => eprintln!("cross-arch-test: {}", ErrorChain::new(other)),
     }
 }

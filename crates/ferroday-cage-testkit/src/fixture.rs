@@ -9,7 +9,7 @@
 //! Every test that launches against the fixture therefore also exercises the
 //! extraction path.
 
-use std::fmt::Display;
+use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -26,7 +26,7 @@ use crate::scratch::{cache_dir, scratch_dir};
 /// `provision` runs at most once per process, the first time any test asks; it
 /// is handed the verified tarball and the directory to publish the root at.
 #[track_caller]
-pub fn fixture_rootfs<T, E: Display>(
+pub fn fixture_rootfs<T, E: Error + 'static>(
     provision: impl FnOnce(&Path, &Path) -> Result<T, E>,
 ) -> Option<&'static Path> {
     if !crate::require::userns() {
@@ -40,7 +40,9 @@ pub fn fixture_rootfs<T, E: Display>(
 /// The fixture script downloads and verifies the pinned minirootfs tarball.
 /// The fixture is shared by every test in the workspace and must be treated as
 /// read-only.
-fn fixture<T, E: Display>(provision: impl FnOnce(&Path, &Path) -> Result<T, E>) -> &'static Path {
+fn fixture<T, E: Error + 'static>(
+    provision: impl FnOnce(&Path, &Path) -> Result<T, E>,
+) -> &'static Path {
     static ROOTFS: OnceLock<PathBuf> = OnceLock::new();
     ROOTFS.get_or_init(|| {
         let output = Command::new("sh")
@@ -62,7 +64,10 @@ fn fixture<T, E: Display>(provision: impl FnOnce(&Path, &Path) -> Result<T, E>) 
             .expect("the fixture tarball is named *.tar.gz");
         let rootfs = tarball.with_file_name(name);
         if let Err(err) = provision(&tarball, &rootfs) {
-            panic!("the fixture rootfs is provisionable: {err}");
+            panic!(
+                "the fixture rootfs is provisionable: {}",
+                ferroday_cage::ErrorChain::new(&err)
+            );
         }
         rootfs
     })
@@ -86,7 +91,7 @@ fn fixture_script() -> PathBuf {
 ///
 /// `provision` is [`fixture_rootfs`]'s.
 #[track_caller]
-pub fn scratch_rootfs<T, E: Display>(
+pub fn scratch_rootfs<T, E: Error + 'static>(
     name: &str,
     provision: impl FnOnce(&Path, &Path) -> Result<T, E>,
 ) -> Option<PathBuf> {
