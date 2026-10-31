@@ -305,13 +305,16 @@ therefore replaces the crate page with that line's metadata.
 - **Documentation is part of the change.** Public items carry rustdoc, and
   internal items carry it wherever the behavior is not obvious. Comments
   explain *why*, not *what*.
-- **`unsafe` is confined** to three modules, all in the library. They are the
-  launch mechanism, the network stack's tap layer, and the terminal relay's
-  signals. The relay's signals block the relayed set and open the descriptor
-  those signals arrive on. `fcage` has none.
-- **Every `unsafe` block states its invariant.** Both crates deny `unsafe` by
-  default. Each block that needs it carries a `SAFETY:` comment stating the
-  invariant it relies on, which `clippy::undocumented_unsafe_blocks` enforces.
+- **`unsafe` is confined** to three modules of shipped code, all in the
+  library. They are the launch mechanism, the network stack's tap layer, and
+  the terminal relay's signals. The relay's signals block the relayed set and
+  open the descriptor those signals arrive on. `fcage` has none. The only other
+  `unsafe` is in test code that drives the kernel directly: `tests/keyring.rs`,
+  `tests/relay.rs`, and the testkit's pseudoterminal harness.
+- **Every `unsafe` block states its invariant.** Every crate in the workspace
+  denies `unsafe` by default. Each block that needs it carries a `SAFETY:`
+  comment stating the invariant it relies on, which
+  `clippy::undocumented_unsafe_blocks` enforces.
   Every consumer of the *library* is safe Rust, and nothing in its public API
   requires a caller to write `unsafe`.
 - **The post-fork stages must not allocate, lock, panic, or call libc.** They
@@ -396,48 +399,94 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What can a configured absolute path contain? | `path::absolute_components` |
 | What can a path naming something inside a tree contain? | `path::tree_components` |
 | What can one path component contain? | `path::is_ordinary_component` |
-| Open a directory the kernel keeps inside a tree | `provision::containment::open_dir` |
+| Resolve a path the kernel keeps inside a tree, retrying a raced walk | `mechanism::resolve::openat2` |
+| Open a directory inside a tree being provisioned | `provision::containment::open_dir`, or `containment::open_dir_path` after a fork |
+| Create the missing directories of a chain inside a tree | `provision::containment::create_dirs` |
+| Write into an overlay upper where the mounted overlay would place it | `provision::containment::copy_up`, which the extractor and `Rooted::over` take over a base |
+| Is this entry an overlay whiteout, or this directory opaque? | `provision::containment::is_whiteout`, `containment::is_opaque` |
+| Open the regular file a walk just inspected, refusing whatever took its name | `provision::containment::open_typed_file` |
+| Open a named pipe just created, to set its metadata through a descriptor | `provision::containment::open_created_fifo` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
+| What occupies a name in such a tree, without following it? | `Rooted::stat` |
+| Read a file in such a tree, bounded, with absence as an answer | `Rooted::read`, `Rooted::read_if_present` |
+| Remove or empty a file in such a tree only where what holds the name is approved | `Rooted::remove_if`, `Rooted::truncate_if`, judged by `Rooted::is_file_with_content` or `Rooted::is_whiteout` |
+| Rewrite a file in place, keeping the owner and mode a script gave it | `Rooted::overwrite` |
+| Lay a host tree into a root | `provision::CopyIn`, or `extract::overlay_tree` between configure waves |
+| Remove a tree a sandbox wrote, however deep | `provision::remove_tree`, which `provision::Remove` reaches from outside the crate, over the walk in `mechanism::delete_tree` |
+| Take a lock file | `provision::lock_exclusive` |
+| Write a file beside its destination and publish it by rename | `provision::Staged`, or `provision::write_atomically` for bytes in hand |
+| Hold what an untrusted producer writes to a ceiling | `provision::LimitedWriter` |
 | How do two versions of a package format compare? | `provision::gentoo::version::compare`, `alpine::version::compare`, `debian::version::compare` |
 | Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `alpine::version::Constraint::satisfied_by`, `debian::version::Constraint::satisfied_by` |
 | What version does a `Provides`-style entry supply a name at? | `provision::alpine::version::Constraint::exact_version`, `debian::version::Constraint::exact_version` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
 | Which slot does a `slot/subslot` value name? | `provision::gentoo::installed::slot_of` |
+| Where does a Gentoo `name-version` end its name? | `provision::gentoo::version::version_hyphen` |
 | What did one resolution refuse, and how does it read? | `provision::gentoo::resolve::Refusals`, `debian::resolve::Refusals` |
 | What does a finished root not keep of the bootstrap that built it? | `provision::debian::bootstrap::clear_run_state`, `alpine::bootstrap::clear_run_state` |
+| Read or rewrite the days a bootstrap's account tools recorded in `/etc/shadow` | `provision::accounts` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
-| What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |
+| What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag`, `atom::use_flag` |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
-| Read or write a plan document | `provision::document` |
-| Which standard stream did a provisioner's in-cage output come from? | `provision::Stream` |
+| What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
+| Read or write a plan document, or read its header and its number fields | `provision::document`, `document::header`, `document::number` |
+| Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
+| Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
+| Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
+| Which compression does a stream begin with? | `provision::compress::Codec::of` |
+| Fill a buffer from a reader, short only at the end of its input | `provision::compress::read_fully` |
+| Which standard stream did a provisioner's in-sandbox output come from? | `provision::Stream` |
 | Take the first mirror that serves a resource, past those that do not | `provision::walk_mirrors` |
 | Fetch several resources at once, where the transport can | `provision::Fetch::fetch_all` |
 | Deliver one job of a batch: what it asked for, and where its body goes | `provision::FetchJob::parts` |
 | Join a mirror-relative path onto a mirror | `provision::mirror_url` |
 | Is this failure one to ask the next mirror about? | `provision::Failover` |
 | Name a local path as a `file://` URL | `provision::file_url` |
+| Decode a URL's percent escapes | `provision::fetch::percent_decode` |
+| Where does a run keep its downloads, and is that directory its own? | `provision::cache::PackageCache` |
+| Download into a package cache, checked before it is published there | `provision::cache::download`, or `cache::prefetch` for a batch |
+| Create a package cache, or open what it holds at a name | `provision::cache::create`, `cache::open_entry` |
+| What time is it, as a Unix timestamp? | `provision::now_epoch` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |
+| Name a filesystem entry no concurrent caller can collide with | `host::unique_hex` |
+| Fill a buffer from the kernel's randomness | `host::fill_random` |
 | Fork, exec, exit, or change signal state without libc | `mechanism::sys` |
 | Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |
+| Write a file that takes its content in one write, such as an identity map | `mechanism::frame::write_whole` |
 | Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending |
+| Retry one call a signal interrupted | `mechanism::frame::retry_on_intr!` |
+| Encode, decode, or read a helper child's outcome record | `mechanism::frame::encode_record`, `decode_record`, `read_record` |
 | Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd` |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
+| Resolve a range identity map into the extents a delegate writes, validated | `idmap::resolve_delegate`, through the configured delegate or the bundled chain |
+| Can a provisioner establish its range map, asked before it downloads anything? | `idmap::establishable` |
+| What does the single-identity map write? | `idmap::single_identity_lines` |
+| Validate the command a sandbox or a restriction executes | `spec::validate_command` |
+| Compose an overlay's mount options | `mechanism::overlay_options` |
+| What does a mount op bring to rest on its target, if anything? | `mechanism::MountAction::arrival`, or `Arrival::of_raw` for a raw mount's flags |
+| Does a launch bind the host's `resolv.conf`, or has a mount of the caller's claimed it? | `CageBuilder::get_resolv_conf` |
+| Does the network stack carry the guest's traffic to this destination? | `NetStack::forwards` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
 | Declare an enum together with the roster of its own variants | `roster::roster_enum!` |
-| State a `poll` deadline, or retire a `poll` slot | `poll::timeout`, `poll::slot` |
+| State a `poll` deadline | `poll::timeout` |
+| Stop watching a channel a `poll` loop has finished with | leave it out of the polled slice, as the `poll` module states |
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
 | Render an error with every cause beneath it | `ErrorChain` |
-| What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code` |
-| Make a scratch tree that clears itself | `scratch::Scratch`, or `common::scratch_dir` from a test suite |
+| What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |
+| Make a scratch tree that clears itself | `scratch::Scratch`, or from a test suite `common::scratch_dir`, and `common::ranged_scratch` for a tree of subordinate-owned entries |
 | What happens when a run's timeout runs out? | `relay::Escalation` |
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |
 | Parse an argument in an example | `examples/common` |
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
+| Skip a test the host cannot run, or fail it where a `REQUIRE` variable says it must run | `ferroday_cage_testkit::require` |
+| Play the user at a pseudoterminal in a test | `ferroday_cage_testkit::pty` |
+| Run a host process in a test, failing the test past a deadline | `ferroday_cage_testkit::process::run_bounded`, `finish_bounded` |
+| How much processor time has a process or a thread used? | `ferroday_cage_testkit::process::cpu_ticks`, `thread_ticks` |
 
 Two guards hold the table to the code, and each covers what the other cannot:
 
