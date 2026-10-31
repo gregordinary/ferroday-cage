@@ -1703,6 +1703,13 @@ pub ferroday_cage::NetStackError::NoProtocols
 pub ferroday_cage::NetStackError::PrefixInvalid::network: core::net::ip_addr::IpAddr
 pub ferroday_cage::NetStackError::PrefixInvalid::prefix_len: u8
 pub ferroday_cage::NetStackError::PrefixInvalid::reason: &'static str
+#[non_exhaustive] pub ferroday_cage::NetStackError::Publish
+pub ferroday_cage::NetStackError::Publish::host: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackError::Publish::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::NetStackError::PublishInvalid
+pub ferroday_cage::NetStackError::PublishInvalid::guest_port: u16
+pub ferroday_cage::NetStackError::PublishInvalid::host: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackError::PublishInvalid::reason: &'static str
 #[non_exhaustive] pub ferroday_cage::NetStackError::Pump
 pub ferroday_cage::NetStackError::Pump::op: &'static str
 pub ferroday_cage::NetStackError::Pump::source: core::option::Option<core::io::error::Error>
@@ -2294,12 +2301,14 @@ pub struct ferroday_cage::NetStackBuilder
 impl ferroday_cage::NetStackBuilder
 pub fn ferroday_cage::NetStackBuilder::build(self) -> core::result::Result<ferroday_cage::NetStack, ferroday_cage::NetStackError>
 pub fn ferroday_cage::NetStackBuilder::host_loopback(self, bool) -> Self
+pub fn ferroday_cage::NetStackBuilder::host_loopback_port(self, u16) -> Self
 pub fn ferroday_cage::NetStackBuilder::interface(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferroday_cage::NetStackBuilder::ipv4(self, bool) -> Self
 pub fn ferroday_cage::NetStackBuilder::ipv4_cidr(self, core::net::ip_addr::Ipv4Addr, u8) -> Self
 pub fn ferroday_cage::NetStackBuilder::ipv6(self, bool) -> Self
 pub fn ferroday_cage::NetStackBuilder::ipv6_cidr(self, core::net::ip_addr::Ipv6Addr, u8) -> Self
 pub fn ferroday_cage::NetStackBuilder::mtu(self, u16) -> Self
+pub fn ferroday_cage::NetStackBuilder::publish(self, core::net::socket_addr::SocketAddr, u16) -> Self
 impl core::default::Default for ferroday_cage::NetStackBuilder
 pub fn ferroday_cage::NetStackBuilder::default() -> Self
 impl core::marker::Freeze for ferroday_cage::NetStackBuilder
@@ -2312,6 +2321,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackBuilder
 pub struct ferroday_cage::NetStackHandle
 impl ferroday_cage::NetStackHandle
 pub fn ferroday_cage::NetStackHandle::is_running(&self) -> bool
+pub fn ferroday_cage::NetStackHandle::published(&self) -> &[core::net::socket_addr::SocketAddr]
 pub fn ferroday_cage::NetStackHandle::stop(self) -> core::result::Result<(), ferroday_cage::NetStackError>
 impl core::ops::drop::Drop for ferroday_cage::NetStackHandle
 pub fn ferroday_cage::NetStackHandle::drop(&mut self)

@@ -45,7 +45,7 @@ mod streams;
 mod terminal;
 
 use std::ffi::{OsStr, OsString};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1521,6 +1521,42 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--netstack-host-port",
+        section: Section::Networking,
+        placeholder: "PORT",
+        help: &[
+            "Map connections to the gateway address on PORT alone",
+            "onto the host's 127.0.0.1, the narrower form of",
+            "--netstack-host-loopback (repeatable; TCP and UDP)",
+        ],
+        take: Take::One(|options, flag, value| {
+            let port = parse_port(flag, &into_string(flag, value)?)?;
+            options.netstack_host_ports.push(port);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-publish",
+        section: Section::Networking,
+        placeholder: "HOST GUEST_PORT",
+        help: &[
+            "Listen on HOST, an ADDRESS:PORT or a bare PORT on",
+            "127.0.0.1, and carry each TCP connection to the",
+            "sandbox's GUEST_PORT (repeatable). HOST decides who",
+            "can connect: 0.0.0.0 admits the network. Port 0",
+            "picks a free port, which fcage reports on stderr",
+        ],
+        needs: "a host address and a guest port",
+        take: Take::Two(|options, flag, value, second| {
+            let host = parse_publish_host(&into_string(flag, value)?)?;
+            let guest_port = parse_port(flag, &into_string(flag, second)?)?;
+            options.netstack_publish.push((host, guest_port));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--restrict",
         section: Section::Hardening,
         help: &[
@@ -2102,6 +2138,8 @@ struct Options {
     netstack_interface: Option<String>,
     netstack_mtu: Option<u16>,
     netstack_host_loopback: bool,
+    netstack_host_ports: Vec<u16>,
+    netstack_publish: Vec<(SocketAddr, u16)>,
 }
 
 /// The capability posture requested on the command line.
@@ -2618,6 +2656,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack_interface: None,
         netstack_mtu: None,
         netstack_host_loopback: false,
+        netstack_host_ports: Vec::new(),
+        netstack_publish: Vec::new(),
     };
 
     while let Some(arg) = args.next() {
@@ -3307,6 +3347,26 @@ fn has_netstack_modifiers(options: &Options) -> bool {
         || options.netstack_interface.is_some()
         || options.netstack_mtu.is_some()
         || options.netstack_host_loopback
+        || !options.netstack_host_ports.is_empty()
+        || !options.netstack_publish.is_empty()
+}
+
+/// Parses the host half of `--netstack-publish`: an `ADDRESS:PORT`, with an
+/// IPv6 address in brackets, or a bare `PORT`, which listens on `127.0.0.1`.
+///
+/// The bare form is the loopback because a published port is reachable by
+/// whatever reaches its address, and the address that reaches least is the one
+/// to fall back on. Anything wider is spelled out.
+fn parse_publish_host(value: &str) -> Result<SocketAddr, String> {
+    if let Ok(port) = value.parse::<u16>() {
+        return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    }
+    value.parse::<SocketAddr>().map_err(|_| {
+        format!(
+            "--netstack-publish expects ADDRESS:PORT or a bare PORT for the host side, \
+             not {value:?}"
+        )
+    })
 }
 
 /// Parses an IPv4 `address/prefix` for `--netstack-cidr`.
@@ -4640,6 +4700,7 @@ fn run(options: Options) -> ExitCode {
         let code = run_with_netstack(
             builder,
             stack.expect("assembled above for exactly this branch"),
+            &options.netstack_publish,
             options.terminal,
             options.timeout,
             options.kill_after,
@@ -4733,6 +4794,12 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
         .ipv4(!options.netstack_no_ipv4)
         .ipv6(!options.netstack_no_ipv6)
         .host_loopback(options.netstack_host_loopback);
+    for port in &options.netstack_host_ports {
+        stack = stack.host_loopback_port(*port);
+    }
+    for (host, guest_port) in &options.netstack_publish {
+        stack = stack.publish(*host, *guest_port);
+    }
     if let Some((network, prefix_len)) = options.netstack_cidr {
         stack = stack.ipv4_cidr(network, prefix_len);
     }
@@ -4754,6 +4821,7 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
 fn run_with_netstack(
     builder: CageBuilder,
     stack: NetStack,
+    publications: &[(SocketAddr, u16)],
     terminal: bool,
     timeout: Option<Duration>,
     kill_after: Duration,
@@ -4805,6 +4873,14 @@ fn run_with_netstack(
             return ExitCode::from(125);
         }
     };
+    // A publication that left the port to the kernel is useless until the
+    // caller knows which one it got. Said before the command is released, and
+    // before a terminal session takes the caller's terminal into raw mode.
+    for ((requested, guest_port), bound) in publications.iter().zip(handle.published()) {
+        if requested.port() == 0 {
+            eprintln!("fcage: publishing the sandbox's port {guest_port} on {bound}");
+        }
+    }
     let running = match pending.proceed() {
         Ok(running) => running,
         Err(error) => {
@@ -7468,6 +7544,16 @@ mod tests {
             "--netstack-mtu",
             "1400",
             "--netstack-host-loopback",
+            "--netstack-host-port",
+            "5432",
+            "--netstack-host-port",
+            "6379",
+            "--netstack-publish",
+            "8080",
+            "80",
+            "--netstack-publish",
+            "[::1]:8443",
+            "443",
             "/bin/true",
         ])
         .expect("a valid command line");
@@ -7478,6 +7564,48 @@ mod tests {
         );
         assert_eq!(options.netstack_mtu, Some(1400));
         assert!(options.netstack_host_loopback);
+        assert_eq!(options.netstack_host_ports, [5432, 6379]);
+        assert_eq!(
+            options.netstack_publish,
+            [
+                ("127.0.0.1:8080".parse().unwrap(), 80),
+                ("[::1]:8443".parse().unwrap(), 443),
+            ],
+        );
+        netstack_from(&options).expect("the settings compose a stack");
+    }
+
+    #[test]
+    fn a_published_host_side_is_an_address_or_a_loopback_port() {
+        // A bare port stays on loopback, the address that reaches least; any
+        // wider exposure is written out.
+        assert_eq!(
+            parse_publish_host("8080").expect("a bare port"),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+        );
+        assert_eq!(
+            parse_publish_host("0.0.0.0:8080").expect("an explicit wildcard"),
+            "0.0.0.0:8080".parse::<SocketAddr>().unwrap(),
+        );
+        assert!(
+            parse_publish_host("::1:8080").is_err(),
+            "IPv6 needs brackets"
+        );
+        assert!(
+            parse_publish_host("localhost:8080").is_err(),
+            "no name lookup"
+        );
+        let err = parse_run(&[
+            "--rootfs",
+            "/r",
+            "--netstack",
+            "--netstack-publish",
+            "8080",
+            "/bin/true",
+        ])
+        .err()
+        .expect("the flag takes a host and a guest port");
+        assert!(err.contains("--netstack-publish"), "{err}");
     }
 
     #[test]

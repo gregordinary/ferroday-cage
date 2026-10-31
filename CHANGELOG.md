@@ -47,6 +47,17 @@ consumer upgrading can skip it.
   `SetupStep::ReplaceSessionKeyring`, the step that replaces it.
 - `SetupStep::AllocateTerminal` and `SetupStep::SendTerminal`, the steps a
   terminal launch's allocation now reports under.
+- `NetStackBuilder::host_loopback_port`, which maps connections to the gateway
+  address on one port onto host loopback, where `host_loopback(true)` maps every
+  port. The two combine. `fcage`: `--netstack-host-port PORT`.
+- `NetStackBuilder::publish`, which publishes a TCP port of the guest on a host
+  address: `attach` listens there and carries each accepted connection to the
+  guest. `NetStackHandle::published` reports the bound addresses, including a
+  port the kernel chose for port 0. `NetStackError::PublishInvalid` refuses a
+  publication at build, and `NetStackError::Publish` reports a listener that
+  could not bind. The profile keys are `host-loopback-ports` and `[[publish]]`
+  tables of `host` and `guest-port`. `fcage`: `--netstack-publish HOST
+  GUEST_PORT`, which reports a kernel-chosen port on standard error.
 
 ### Changed
 

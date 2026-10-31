@@ -304,6 +304,14 @@ flags = ["--netstack-interface"]
 name = "host_loopback"
 flags = ["--netstack-host-loopback"]
 
+[[builder.setting]]
+name = "host_loopback_port"
+flags = ["--netstack-host-port"]
+
+[[builder.setting]]
+name = "publish"
+flags = ["--netstack-publish"]
+
 # The Debian bootstrap.
 [[builder]]
 name = "DebianBuilder"

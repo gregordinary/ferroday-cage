@@ -146,7 +146,9 @@ pub(super) struct TcpFlow {
     pub(super) handle: SocketHandle,
     /// The guest endpoint, half of the flow's identity.
     pub(super) guest: IpEndpoint,
-    /// The destination the guest addressed, the other half.
+    /// The stack's end of the guest connection, the other half: the
+    /// destination the guest addressed for an outbound flow, and the gateway
+    /// endpoint the stack connects from for a published one.
     pub(super) destination: IpEndpoint,
     /// The host-side socket, nonblocking from creation. Dropped once both
     /// half-closes complete, so the descriptor is released the moment the host
@@ -198,25 +200,7 @@ impl TcpFlow {
             SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
             None,
         )?;
-        // Enable keep-alive so a host peer that dies without a FIN or RST on an
-        // otherwise idle flow is probed by the kernel and surfaced as a poll
-        // error, which reclaims the flow rather than holding its descriptor
-        // open indefinitely. Tuned to the same cadence as the guest-facing
-        // socket.
-        //
-        // Best-effort, and a refusal costs differently at each call. A refused
-        // tuning knob leaves the kernel's own, much longer cadence, so the flow
-        // is still reclaimed, late. A refused enable leaves no probing at all:
-        // the guest answers the probes its own side of the flow sends, so
-        // [`IDLE_TIMEOUT`] does not fire either, and the flow is held until the
-        // guest closes it or the sandbox ends, bounded only by [`MAX_FLOWS`].
-        // Neither is reachable through the kernel — every value here is a
-        // constant inside the range it accepts — and neither is a reason to
-        // refuse to forward the guest's traffic.
-        let _ = sockopt::set_socket_keepalive(&host, true);
-        let _ = sockopt::set_tcp_keepidle(&host, KEEP_ALIVE_INTERVAL);
-        let _ = sockopt::set_tcp_keepintvl(&host, KEEP_ALIVE_INTERVAL);
-        let _ = sockopt::set_tcp_keepcnt(&host, KEEP_ALIVE_COUNT);
+        tune_keep_alive(&host);
         let connected = match rustix::net::connect(&host, &target) {
             Ok(()) => true,
             Err(Errno::INPROGRESS) => false,
@@ -237,6 +221,38 @@ impl TcpFlow {
             stalled_since: None,
             dead: false,
         })
+    }
+
+    /// Starts a flow for a connection accepted on a published port: the host
+    /// side is already connected, and the guest-facing `handle` has just begun
+    /// connecting to the guest.
+    ///
+    /// Until the guest answers, the flow is unestablished exactly as an
+    /// outbound one is while its host connect runs, so the same
+    /// [`ESTABLISH_DEADLINE`] bounds a guest that never does.
+    pub(super) fn accepted(
+        handle: SocketHandle,
+        guest: IpEndpoint,
+        local: IpEndpoint,
+        host: OwnedFd,
+        now: Instant,
+    ) -> TcpFlow {
+        tune_keep_alive(&host);
+        TcpFlow {
+            handle,
+            guest,
+            destination: local,
+            host: Some(host),
+            connected: true,
+            events: PollFlags::empty(),
+            host_eof: false,
+            host_hangup: false,
+            host_shutdown: false,
+            guest_closed: false,
+            deadline: now + ESTABLISH_DEADLINE,
+            stalled_since: None,
+            dead: false,
+        }
     }
 
     /// The host descriptor, for the pump's poll set. `None` once both
@@ -573,6 +589,28 @@ impl TcpFlow {
         }
         progress
     }
+}
+
+/// Enables keep-alive on a flow's host socket, tuned to the cadence of the
+/// guest-facing side.
+///
+/// A host peer that dies without a FIN or RST on an otherwise idle flow is then
+/// probed by the kernel and surfaced as a poll error, which reclaims the flow
+/// rather than holding its descriptor open indefinitely.
+///
+/// Best-effort, and a refusal costs differently at each call. A refused tuning
+/// knob leaves the kernel's own, much longer cadence, so the flow is still
+/// reclaimed, late. A refused enable leaves no probing at all: the guest answers
+/// the probes its own side of the flow sends, so [`IDLE_TIMEOUT`] does not fire
+/// either, and the flow is held until the guest closes it or the sandbox ends,
+/// bounded only by [`MAX_FLOWS`]. Neither is reachable through the kernel, since
+/// every value here is a constant inside the range it accepts, and neither is a
+/// reason to refuse to forward the guest's traffic.
+fn tune_keep_alive(host: &OwnedFd) {
+    let _ = sockopt::set_socket_keepalive(host, true);
+    let _ = sockopt::set_tcp_keepidle(host, KEEP_ALIVE_INTERVAL);
+    let _ = sockopt::set_tcp_keepintvl(host, KEEP_ALIVE_INTERVAL);
+    let _ = sockopt::set_tcp_keepcnt(host, KEEP_ALIVE_COUNT);
 }
 
 #[cfg(test)]

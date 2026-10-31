@@ -632,3 +632,174 @@ fn stopping_after_the_sandbox_exits_is_clean() {
         .stop()
         .expect("the stack stops cleanly after the sandbox");
 }
+
+#[test]
+fn a_named_loopback_port_is_the_only_one_mapped() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    let (granted, _) = banner_listener(b"through the granted port\n");
+    let (withheld, withheld_received) = banner_listener(b"through the withheld port\n");
+
+    // Only `granted` maps onto the host's loopback. The guest tries both, and
+    // reports what each gave it.
+    let mut observer = Collect::default();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!(
+                "echo ping | /usr/bin/nc -w 3 10.0.2.2 {granted}; \
+                 /usr/bin/nc -w 3 10.0.2.2 {withheld} < /dev/null; true"
+            ),
+        ])
+        .build()
+        .expect("a valid sandbox configuration");
+    let pending = cage
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = NetStack::builder()
+        .host_loopback_port(granted)
+        .build()
+        .expect("a valid stack configuration")
+        .attach(&pending)
+        .expect("the stack attaches");
+    let mut running = pending.proceed().expect("the command is released");
+    running
+        .wait_timeout(Duration::from_secs(15))
+        .expect("the wait completes")
+        .expect("the command exits before the deadline");
+    handle.stop().expect("the stack stops cleanly");
+
+    let stdout = String::from_utf8_lossy(&observer.stdout);
+    assert!(
+        stdout.contains("through the granted port"),
+        "the named port reaches the host service: {stdout:?}",
+    );
+    assert!(
+        !stdout.contains("through the withheld port"),
+        "a port not named is refused: {stdout:?}",
+    );
+    assert!(
+        withheld_received
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "the withheld service never saw a connection",
+    );
+}
+
+/// Connects to a published port until the guest's server answers, returning
+/// the connected stream and the first line it sent.
+///
+/// The host listener accepts at once, but the guest's server may not be
+/// listening yet, and a connection the guest refuses is closed on the host side
+/// before anything arrives. So each attempt reads, and one that ends empty is
+/// retried.
+fn connect_published(address: std::net::SocketAddr) -> (std::net::TcpStream, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the guest's server never answered on {address}",
+        );
+        if let Ok(mut stream) = std::net::TcpStream::connect(address) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("the read timeout is set");
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while let Ok(1) = stream.read(&mut byte) {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            if !line.is_empty() {
+                return (stream, String::from_utf8_lossy(&line).into_owned());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_published_port_reaches_a_server_in_the_guest() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    // The guest serves one connection on its port 8000: it greets, then prints
+    // whatever it is sent. The host reaches it through a port the kernel picks.
+    let mut observer = Collect::default();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "echo hello from the guest | /usr/bin/nc -l -p 8000"])
+        .build()
+        .expect("a valid sandbox configuration");
+    let pending = cage
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = NetStack::builder()
+        .publish((Ipv4Addr::LOCALHOST, 0).into(), 8000)
+        .build()
+        .expect("a valid stack configuration")
+        .attach(&pending)
+        .expect("the stack attaches");
+    let address = handle.published()[0];
+    assert_ne!(
+        address.port(),
+        0,
+        "the handle reports the port the kernel chose"
+    );
+    let mut running = pending.proceed().expect("the command is released");
+
+    let (mut stream, greeting) = connect_published(address);
+    assert_eq!(greeting, "hello from the guest\n");
+    stream.write_all(b"ping\n").expect("the host writes");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("the host half-closes");
+    let status = running
+        .wait_timeout(Duration::from_secs(10))
+        .expect("the wait completes")
+        .expect("the command exits before the deadline");
+    handle.stop().expect("the stack stops cleanly");
+
+    assert!(status.success(), "the guest's server ran to completion");
+    assert_eq!(
+        String::from_utf8_lossy(&observer.stdout).trim(),
+        "ping",
+        "the host's line reached the guest",
+    );
+}
+
+#[test]
+fn a_published_port_already_in_use_is_refused_at_attach() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::tun_available() {
+        return;
+    }
+    let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    let address = taken.local_addr().expect("the listener has an address");
+    let cage = sleeper(rootfs);
+    let pending = cage.spawn_pending().expect("the pending sandbox launches");
+    let err = NetStack::builder()
+        .publish(address, 80)
+        .build()
+        .expect("a valid stack configuration")
+        .attach(&pending)
+        .expect_err("the address is held by another listener");
+    assert!(
+        matches!(&err, NetStackError::Publish { host, .. } if *host == address),
+        "{err:?}",
+    );
+}

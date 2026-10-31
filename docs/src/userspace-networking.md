@@ -89,7 +89,8 @@ network the stack always places the gateway at host 2 and the guest at host
 | IPv6 network | `fd00::/64` (guest `::15`, gateway `::2`) | [`ipv6_cidr`][`NetStackBuilder::ipv6_cidr`] |
 | MTU | 1500 | [`mtu`][`NetStackBuilder::mtu`] |
 | Interface name | `tap0` | [`interface`][`NetStackBuilder::interface`] |
-| Host-loopback mapping | off | [`host_loopback`][`NetStackBuilder::host_loopback`] |
+| Host-loopback mapping | off | [`host_loopback`][`NetStackBuilder::host_loopback`], [`host_loopback_port`][`NetStackBuilder::host_loopback_port`] |
+| Published ports | none | [`publish`][`NetStackBuilder::publish`] |
 
 With the `serde` feature the builder is also the stack's profile format: it
 serializes and deserializes as the stack specification, for embedding in a
@@ -188,12 +189,60 @@ gateway (`10.0.2.2` or `fd00::2` by default) is forwarded to the host's
 host-local service, granted explicitly rather than by opening the whole
 loopback range.
 
+[`host_loopback_port`][`NetStackBuilder::host_loopback_port`] grants the same
+mapping one port at a time. A command that needs the host's database and
+nothing else names that database's port, and every other port of the gateway
+stays refused. The two combine, so `host_loopback(true)` beside a named port
+maps every port. TCP and UDP are mapped alike.
+
 The mapping lands on that one address, so it reaches a host service only if the
 service is bound there. A service on another loopback address is not reached,
 and systemd-resolved's `127.0.0.53` stub is the case that catches people out:
 it is a loopback destination like any other, so the guest cannot address it
 directly, and the gateway mapping goes to `127.0.0.1` where the stub is not
 listening.
+
+### Publishing a port
+
+Everything above is the guest reaching out. [`publish`][`NetStackBuilder::publish`]
+runs a connection the other way, for a server inside the sandbox, such as a
+development web server. The stack listens on a host address, and carries each
+connection it accepts to a TCP port of the guest's:
+
+```rust,no_run
+# use ferroday_cage::{Cage, NetStack};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let cage = Cage::builder().rootfs("/srv/rootfs").command("/usr/bin/server").build()?;
+let stack = NetStack::builder()
+    .publish("127.0.0.1:8080".parse()?, 80)
+    .build()?;
+let pending = cage.spawn_pending()?;
+let handle = stack.attach(&pending)?;
+let mut running = pending.proceed()?;
+// http://127.0.0.1:8080/ on the host reaches port 80 in the sandbox.
+let status = running.wait()?;
+handle.stop()?;
+# let _ = status;
+# Ok(())
+# }
+```
+
+A published connection reaches the guest from the gateway address, on the
+guest's address of the listener's family. A guest with nothing listening on the
+port refuses it, and the stack closes the host side. Once both ends are up, a
+published connection is forwarded like any other flow. It shares the same
+half-closes, the same deadlines, and the same flow budget.
+
+The host address decides who can connect. `127.0.0.1` admits the host's own
+processes, and every local user's process is among them. `0.0.0.0` or `::`
+admits whatever reaches the host over the network. The stack listens where it is
+told and imposes nothing further.
+
+`attach` binds the listeners, so an address that something else holds fails
+there, as `NetStackError::Publish`. Port 0 has the kernel choose a free one, and
+[`NetStackHandle::published`] reports the address each listener is bound to.
+Publishing covers TCP. A UDP service inside the sandbox is not reachable from
+the host.
 
 ### One datagram, one packet
 
@@ -259,6 +308,13 @@ and `--netstack-host-loopback` maps the gateway address onto host `127.0.0.1`.
 `--netstack-no-ipv4` and `--netstack-no-ipv6` run one protocol alone, for a host
 or a workload where the other is unwanted; turning both off is refused, there
 being no stack left to attach.
+
+`--netstack-host-port PORT` maps one port of the gateway onto host loopback.
+`--netstack-publish HOST GUEST_PORT` publishes a guest port, where `HOST` is an
+`ADDRESS:PORT` or a bare port on `127.0.0.1`. A publication on port 0 has
+`fcage` report the port the kernel chose, on standard error, before the command
+starts.
+
 `--netstack` composes the sandbox's `resolv.conf` from the host's routable
 nameservers. A host offering only loopback resolvers composes nothing and warns:
 the sandbox keeps whatever `resolv.conf` its rootfs ships, which may name a
@@ -347,6 +403,9 @@ interface itself can start from the bare namespace of [`Network::None`].
 [`NetStackBuilder::mtu`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.mtu
 [`NetStackBuilder::interface`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.interface
 [`NetStackBuilder::host_loopback`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.host_loopback
+[`NetStackBuilder::host_loopback_port`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.host_loopback_port
+[`NetStackBuilder::publish`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.publish
+[`NetStackHandle::published`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.published
 [`NetStackHandle`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html
 [`NetStackHandle::stop`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.stop
 [`NetStackHandle::is_running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.is_running

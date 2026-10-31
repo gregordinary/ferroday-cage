@@ -16,8 +16,9 @@
 //! The stack forwards where the guest could plausibly reach on its own and
 //! nowhere surprising: multicast, broadcast, loopback, and link-local
 //! destinations are refused, with one deliberate exception —
-//! [`host_loopback`](NetStackBuilder::host_loopback) maps connections to
-//! the gateway address onto the host's loopback. A refused TCP connection is
+//! [`host_loopback`](NetStackBuilder::host_loopback) and
+//! [`host_loopback_port`](NetStackBuilder::host_loopback_port) map connections
+//! to the gateway address onto the host's loopback. A refused TCP connection is
 //! answered with a reset, with one exception: the guest's own subnet is
 //! on-link from the guest's point of view, so it resolves a hardware address
 //! before it sends a segment, and the stack answers address resolution only
@@ -26,6 +27,10 @@
 //! whether the guest also receives an ICMP port-unreachable depends on
 //! whether the stack happens to hold a socket on that port for some other
 //! destination, so a caller must not read anything into either outcome.
+//!
+//! Connections run the other way only where the caller publishes a port:
+//! [`publish`](NetStackBuilder::publish) has the stack listen on a host address
+//! and carry each connection it accepts to a TCP port of the guest's.
 //!
 //! Only TCP and UDP are forwarded. The stack answers ICMP echo for the
 //! gateway address and for nothing else, so a ping inside the guest tells the
@@ -44,9 +49,10 @@
 //! pump the same way and leaves the sandbox running — a sandbox without its
 //! stack merely loses connectivity.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -131,8 +137,44 @@ struct Plan {
     mtu: u16,
     /// The tap interface's name inside the sandbox.
     interface: String,
-    /// Whether connections to the gateway address map to host loopback.
-    host_loopback: bool,
+    /// Which ports of the gateway address map to host loopback.
+    host_loopback: HostLoopback,
+    /// The guest ports published on the host, in the order they were asked
+    /// for.
+    publish: Vec<Publication>,
+}
+
+/// Which connections to the gateway address the stack carries to the host's
+/// loopback, port preserved.
+#[derive(Debug, Clone, Default)]
+struct HostLoopback {
+    /// Every port, from [`NetStackBuilder::host_loopback`].
+    all: bool,
+    /// The ports named one at a time, from
+    /// [`NetStackBuilder::host_loopback_port`].
+    ports: BTreeSet<u16>,
+}
+
+impl HostLoopback {
+    /// Whether a connection to the gateway on `port` maps to host loopback.
+    fn admits(&self, port: u16) -> bool {
+        self.all || self.ports.contains(&port)
+    }
+}
+
+/// One guest port published on the host: the stack listens on `host` and
+/// carries each connection it accepts to `guest_port` on the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case", deny_unknown_fields)
+)]
+struct Publication {
+    /// The host address to listen on.
+    host: SocketAddr,
+    /// The guest port each accepted connection is carried to.
+    guest_port: u16,
 }
 
 /// The IPv4 half of the plan: the guest address the tap carries and the
@@ -195,6 +237,17 @@ impl NetStack {
     /// after launch, and the guest's first IPv6 connection may stall that
     /// long. IPv4 is never delayed.
     pub fn attach(&self, pending: &Pending<'_>) -> Result<NetStackHandle, NetStackError> {
+        // The published ports first, since a host address already in use is the
+        // failure a caller is likeliest to meet, and it is better met before a
+        // tap exists to be torn down again.
+        let listeners = self
+            .plan
+            .publish
+            .iter()
+            .map(listen)
+            .collect::<Result<Vec<_>, _>>()?;
+        let published = listeners.iter().map(|listener| listener.bound).collect();
+
         let pid = pending.netns_pid();
         let target = format!("/proc/{pid}/ns/net");
 
@@ -252,8 +305,9 @@ impl NetStack {
                 // Panics are converted into a failed exit and the running
                 // flag is cleared on every path, so the handle's view of the
                 // pump is always truthful and stop() never rethrows.
-                let exit =
-                    std::panic::catch_unwind(AssertUnwindSafe(|| pump::run(tap, stop_read, plan)));
+                let exit = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    pump::run(tap, stop_read, plan, listeners)
+                }));
                 running_pump.store(false, Ordering::SeqCst);
                 exit.unwrap_or(PumpExit::Failed {
                     op: "recovering from a panic",
@@ -266,8 +320,36 @@ impl NetStack {
             pump: Some(pump),
             stop: Some(stop_write),
             running,
+            published,
         })
     }
+}
+
+/// A host listener for one published port, bound and ready for the pump.
+pub(super) struct Listener {
+    /// The listening socket, nonblocking.
+    pub(super) socket: OwnedFd,
+    /// The address it is bound to, which names the port the kernel chose
+    /// where the publication asked for port 0.
+    pub(super) bound: SocketAddr,
+    /// The guest port each accepted connection is carried to.
+    pub(super) guest_port: u16,
+}
+
+/// Binds the host listener for one publication.
+fn listen(publication: &Publication) -> Result<Listener, NetStackError> {
+    let failed = |source| NetStackError::Publish {
+        host: publication.host,
+        source,
+    };
+    let listener = std::net::TcpListener::bind(publication.host).map_err(failed)?;
+    listener.set_nonblocking(true).map_err(failed)?;
+    let bound = listener.local_addr().map_err(failed)?;
+    Ok(Listener {
+        socket: listener.into(),
+        bound,
+        guest_port: publication.guest_port,
+    })
 }
 
 impl Default for NetStack {
@@ -307,9 +389,22 @@ pub struct NetStackHandle {
     stop: Option<OwnedFd>,
     /// Cleared by the pump on every exit path.
     running: Arc<AtomicBool>,
+    /// The host addresses the published ports listen on, in publication
+    /// order.
+    published: Vec<SocketAddr>,
 }
 
 impl NetStackHandle {
+    /// The host addresses the published ports listen on, in the order
+    /// [`publish`](NetStackBuilder::publish) named them.
+    ///
+    /// Each is the address the listener is bound to, so a publication that
+    /// asked for port 0 reports the port the kernel chose. Empty for a stack
+    /// that publishes nothing.
+    pub fn published(&self) -> &[SocketAddr] {
+        &self.published
+    }
+
     /// Stops the stack and reports how the pump fared.
     ///
     /// Signals the pump, waits for it to exit, and returns the first error
@@ -379,6 +474,11 @@ impl Drop for NetStackHandle {
 /// ipv6 = false
 /// mtu = 1500
 /// interface = "tap0"
+/// host-loopback-ports = [5432]
+///
+/// [[publish]]
+/// host = "127.0.0.1:8080"
+/// guest-port = 80
 /// ```
 #[derive(Debug, Clone)]
 #[cfg_attr(
@@ -396,6 +496,8 @@ pub struct NetStackBuilder {
     mtu: u16,
     interface: String,
     host_loopback: bool,
+    host_loopback_ports: Vec<u16>,
+    publish: Vec<Publication>,
 }
 
 impl Default for NetStackBuilder {
@@ -408,6 +510,8 @@ impl Default for NetStackBuilder {
             mtu: 1500,
             interface: "tap0".to_string(),
             host_loopback: false,
+            host_loopback_ports: Vec::new(),
+            publish: Vec::new(),
         }
     }
 }
@@ -465,8 +569,8 @@ impl NetStackBuilder {
         self
     }
 
-    /// Maps connections to the gateway address onto host loopback. Off by
-    /// default.
+    /// Maps connections to the gateway address onto host loopback, on every
+    /// port. Off by default.
     ///
     /// The stack never forwards guest traffic to the host's loopback
     /// addresses: `127.0.0.0/8` and `::1` destinations are refused
@@ -475,9 +579,50 @@ impl NetStackBuilder {
     /// `127.0.0.1` or `::1` on the host, port preserved — the conventional
     /// way to reach a host-local service from inside the sandbox, granted
     /// deliberately rather than by making the whole loopback range
-    /// reachable.
+    /// reachable. TCP and UDP are mapped alike.
+    ///
+    /// [`host_loopback_port`](Self::host_loopback_port) grants the same
+    /// mapping one port at a time, which is the narrower answer where the
+    /// command needs one host service rather than all of them.
     pub fn host_loopback(mut self, enabled: bool) -> Self {
         self.host_loopback = enabled;
+        self
+    }
+
+    /// Maps connections to the gateway address on `port` alone onto host
+    /// loopback. Repeatable; none by default.
+    ///
+    /// The mapping [`host_loopback`](Self::host_loopback) grants for every
+    /// port, granted for one: a connection to the gateway on `port` is
+    /// forwarded to `127.0.0.1` or `::1` on the host, port preserved, and a
+    /// connection to any other port of the gateway is refused. TCP and UDP are
+    /// mapped alike. The ports named here and `host_loopback(true)` combine,
+    /// so with both every port maps.
+    pub fn host_loopback_port(mut self, port: u16) -> Self {
+        self.host_loopback_ports.push(port);
+        self
+    }
+
+    /// Publishes a TCP port of the guest on the host. Repeatable; none by
+    /// default.
+    ///
+    /// [`attach`](NetStack::attach) listens on `host`, and each connection it
+    /// accepts there is carried to `guest_port` on the guest's address of the
+    /// same family, arriving from the gateway address. That is how a server
+    /// inside the sandbox, a development web server say, is reached from the
+    /// host. A connection the guest refuses, because nothing listens on the
+    /// port, is closed on the host side.
+    ///
+    /// `host` is the caller's to choose, and it decides who else can connect.
+    /// `127.0.0.1` admits the host's own processes, every local user's
+    /// included. `0.0.0.0` or `::` admits whatever reaches the host over the
+    /// network. Port 0 has the kernel choose a free port, which
+    /// [`NetStackHandle::published`] reports. The family of `host` has to be
+    /// enabled, since it decides which of the guest's addresses the
+    /// connection is carried to. Validated by [`build`](Self::build), and the
+    /// listener is bound by `attach`.
+    pub fn publish(mut self, host: SocketAddr, guest_port: u16) -> Self {
+        self.publish.push(Publication { host, guest_port });
         self
     }
 
@@ -556,13 +701,37 @@ impl NetStackBuilder {
                 name: self.interface,
             });
         }
+        for publication in &self.publish {
+            let refused = |reason| NetStackError::PublishInvalid {
+                host: publication.host,
+                guest_port: publication.guest_port,
+                reason,
+            };
+            if publication.guest_port == 0 {
+                return Err(refused("the guest port must not be 0"));
+            }
+            let family_enabled = match publication.host {
+                SocketAddr::V4(_) => v4.is_some(),
+                SocketAddr::V6(_) => v6.is_some(),
+            };
+            if !family_enabled {
+                return Err(refused(
+                    "the host address's family is disabled, so the guest has no address of it to \
+                     carry the connection to",
+                ));
+            }
+        }
         Ok(NetStack {
             plan: Plan {
                 v4,
                 v6,
                 mtu: self.mtu,
                 interface: self.interface,
-                host_loopback: self.host_loopback,
+                host_loopback: HostLoopback {
+                    all: self.host_loopback,
+                    ports: self.host_loopback_ports.into_iter().collect(),
+                },
+                publish: self.publish,
             },
         })
     }
@@ -617,6 +786,26 @@ pub enum NetStackError {
     },
     /// The configuration enables neither IPv4 nor IPv6.
     NoProtocols,
+    /// A published port cannot be carried to the guest as configured.
+    #[non_exhaustive]
+    PublishInvalid {
+        /// The host address the publication named.
+        host: SocketAddr,
+        /// The guest port the publication named.
+        guest_port: u16,
+        /// What makes the publication unusable.
+        reason: &'static str,
+    },
+    /// The host listener for a published port could not be established:
+    /// binding its address failed, most often because something else holds
+    /// it.
+    #[non_exhaustive]
+    Publish {
+        /// The host address the listener was to bind.
+        host: SocketAddr,
+        /// The underlying error.
+        source: io::Error,
+    },
     /// The sandbox shares the caller's network namespace, where a stack
     /// must not attach. Sandboxes built with
     /// [`Network::Host`](crate::Network::Host) are refused with this error.
@@ -711,6 +900,18 @@ impl fmt::Display for NetStackError {
             NetStackError::NoProtocols => {
                 f.write_str("the configuration enables neither IPv4 nor IPv6")
             }
+            NetStackError::PublishInvalid {
+                host,
+                guest_port,
+                reason,
+            } => write!(
+                f,
+                "cannot publish the guest's port {guest_port} on {host}: {reason}"
+            ),
+            NetStackError::Publish { host, source } => write!(
+                f,
+                "could not listen on {host} to publish a port of the sandbox: {source}"
+            ),
             NetStackError::SharedNamespace => f.write_str(
                 "the sandbox shares the caller's network namespace; a network stack \
                  attaches only to a private one",
@@ -765,8 +966,9 @@ impl std::error::Error for NetStackError {
     /// The OS failure underneath, where there is one.
     ///
     /// The configuration refusals — an unusable prefix, an MTU below the
-    /// minimum, an invalid interface name, no protocols, a shared namespace —
-    /// carry no inner error: nothing failed, the request was refused.
+    /// minimum, an invalid interface name, no protocols, an unusable
+    /// publication, a shared namespace — carry no inner error: nothing
+    /// failed, the request was refused.
     /// [`HelperLost`](Self::HelperLost) carries none either: the helper's
     /// silence is the failure.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -780,6 +982,7 @@ impl std::error::Error for NetStackError {
             | NetStackError::TapCreate { source, .. }
             | NetStackError::TapConfigure { source, .. }
             | NetStackError::TapHandoff { source }
+            | NetStackError::Publish { source, .. }
             | NetStackError::Spawn { source } => Some(source),
             _ => None,
         }
@@ -1005,6 +1208,30 @@ mod tests {
             .expect("a 15-byte name is the longest valid one");
     }
 
+    #[test]
+    fn a_publication_needs_a_guest_port_and_an_enabled_family() {
+        let err = NetStack::builder()
+            .publish("127.0.0.1:8080".parse().unwrap(), 0)
+            .build()
+            .expect_err("guest port 0 names nothing to connect to");
+        assert!(matches!(err, NetStackError::PublishInvalid { .. }), "{err}");
+
+        let err = NetStack::builder()
+            .ipv6(false)
+            .publish("[::1]:8080".parse().unwrap(), 80)
+            .build()
+            .expect_err("an IPv6 listener has no guest address to reach");
+        assert!(matches!(err, NetStackError::PublishInvalid { .. }), "{err}");
+
+        let stack = NetStack::builder()
+            .publish("127.0.0.1:0".parse().unwrap(), 80)
+            .publish("[::1]:0".parse().unwrap(), 443)
+            .build()
+            .expect("a publication in each enabled family");
+        assert_eq!(stack.plan.publish.len(), 2, "both are kept, in order");
+        assert_eq!(stack.plan.publish[1].guest_port, 443);
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn the_builder_round_trips_through_serde() {
@@ -1019,6 +1246,30 @@ mod tests {
         let reparsed: NetStackBuilder = toml::from_str(&serialized).expect("and round-trips");
         assert_eq!(reparsed.ipv4_cidr, builder.ipv4_cidr);
         assert_eq!(reparsed.ipv6_cidr, builder.ipv6_cidr);
+
+        // The two repeatable settings: a list of ports, and an array of
+        // publication tables, each with its own keys.
+        let toml = "host-loopback-ports = [5432, 6379]\n\n\
+                    [[publish]]\nhost = \"127.0.0.1:8080\"\nguest-port = 80\n";
+        let builder: NetStackBuilder = toml::from_str(toml).expect("the profile parses");
+        assert_eq!(builder.host_loopback_ports, [5432, 6379]);
+        assert_eq!(
+            builder.publish,
+            [Publication {
+                host: "127.0.0.1:8080".parse().unwrap(),
+                guest_port: 80,
+            }],
+        );
+        let serialized = toml::to_string(&builder).expect("the builder serializes");
+        let reparsed: NetStackBuilder = toml::from_str(&serialized).expect("and round-trips");
+        assert_eq!(reparsed.publish, builder.publish);
+        assert_eq!(reparsed.host_loopback_ports, builder.host_loopback_ports);
+
+        let err = toml::from_str::<NetStackBuilder>(
+            "[[publish]]\nhost = \"127.0.0.1:8080\"\nguest-port = 80\nexpose = true\n",
+        )
+        .expect_err("a publication's unknown keys are refused");
+        assert!(err.to_string().contains("expose"), "{err}");
 
         let err = toml::from_str::<NetStackBuilder>("ipv4-cidr = \"10.0.2.0\"")
             .expect_err("a CIDR without a length is refused");

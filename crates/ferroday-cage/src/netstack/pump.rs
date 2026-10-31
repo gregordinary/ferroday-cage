@@ -35,6 +35,13 @@
 //! Neighbor discovery needs no such rule: smoltcp answers a solicitation only
 //! for an address whose solicited-node multicast group the interface has
 //! joined, which `any_ip` does not widen.
+//!
+//! A published port runs the other way. Its host listener sits in the same
+//! poll, and each connection it accepts becomes a flow whose guest-facing
+//! socket *connects* to the guest, from the gateway address and a port of the
+//! stack's choosing, where an outbound flow's socket listens. From there the
+//! two kinds are one: the same splice, the same half-closes, the same
+//! deadlines, and the same [`MAX_FLOWS`](tcp::MAX_FLOWS) budget.
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
@@ -42,6 +49,7 @@ use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
+use rustix::net::SocketFlags;
 use rustix::rand::GetRandomFlags;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp as tcp_socket;
@@ -52,7 +60,7 @@ use super::device::TapDevice;
 use super::sniff::{self, Sniff};
 use super::tcp::{self, TcpFlow};
 use super::udp::UdpTables;
-use super::{GATEWAY_MAC, Plan, PumpExit};
+use super::{GATEWAY_MAC, Listener, Plan, PumpExit};
 
 /// The most frames ingested from the tap per loop iteration, so servicing
 /// and transmission interleave with heavy receive traffic.
@@ -63,13 +71,43 @@ const READ_BATCH: usize = 32;
 /// still returns to `poll` and the other descriptors.
 const SERVICE_ROUNDS: usize = 4;
 
+/// The most connections accepted from one published port per loop iteration,
+/// for the reason [`READ_BATCH`] bounds the tap.
+const ACCEPT_BATCH: usize = 32;
+
+/// How long a published port's listener sits out of the poll after an accept
+/// failed for a reason of the host's, descriptor exhaustion the likely one.
+///
+/// The connection that failed is still queued, so the listener stays readable,
+/// and polling it again at once would spin the pump at full CPU until the host
+/// recovers. Sitting it out bounds the retries to a few a second.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
+
+/// The ports a published connection's guest-facing socket connects from: the
+/// dynamic range, where no guest service is expected to listen.
+const LOCAL_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
+
 /// Runs the pump until stopped. The tap descriptor's lifetime is the
-/// attachment's: it closes when this returns.
-pub(super) fn run(tap: OwnedFd, stop: OwnedFd, plan: Plan) -> PumpExit {
-    match Engine::new(tap, plan) {
+/// attachment's: it closes when this returns, and so do the published ports'
+/// listeners.
+pub(super) fn run(tap: OwnedFd, stop: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> PumpExit {
+    match Engine::new(tap, plan, listeners) {
         Ok(mut engine) => engine.run(&stop),
         Err(exit) => exit,
     }
+}
+
+/// A published port as the pump serves it.
+struct Inbound {
+    /// The host listener.
+    socket: OwnedFd,
+    /// The guest endpoint each accepted connection is carried to.
+    guest: IpEndpoint,
+    /// The gateway address of the guest's family, which the connection
+    /// arrives from.
+    local: IpAddress,
+    /// When a listener that failed to accept may be polled again.
+    retry_at: Option<std::time::Instant>,
 }
 
 /// Who a poll slot belongs to.
@@ -84,6 +122,8 @@ enum SlotOwner {
     /// A UDP flow's host socket; a readable slot merely wakes the loop, so
     /// no index is needed.
     Udp,
+    /// A published port's listener, by index.
+    Listener(usize),
 }
 
 /// The engine state: the device, the interface terminating the guest's
@@ -94,6 +134,11 @@ struct Engine {
     sockets: SocketSet<'static>,
     flows: Vec<TcpFlow>,
     udp: UdpTables,
+    /// The published ports.
+    inbound: Vec<Inbound>,
+    /// Where the search for a free local port for the next published
+    /// connection starts, so successive connections spread over the range.
+    next_local_port: u16,
     plan: Plan,
     /// The monotonic epoch the interface's clock counts from; wall-clock
     /// jumps must not disturb the stack's timers.
@@ -103,7 +148,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(tap: OwnedFd, plan: Plan) -> Result<Engine, PumpExit> {
+    fn new(tap: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> Result<Engine, PumpExit> {
         // The guest is untrusted, so the TCP initial sequence numbers need
         // real entropy.
         let seed = random_seed().map_err(|errno| PumpExit::Failed {
@@ -143,6 +188,30 @@ impl Engine {
         // to see them.
         iface.set_any_ip(true);
 
+        // The build refused a publication whose family is disabled, so each
+        // listener finds its guest address here.
+        let inbound = listeners
+            .into_iter()
+            .filter_map(|listener| {
+                let (guest, local) = match listener.bound {
+                    SocketAddr::V4(_) => {
+                        let v4 = plan.v4.as_ref()?;
+                        (IpAddress::from(v4.guest), IpAddress::from(v4.gateway))
+                    }
+                    SocketAddr::V6(_) => {
+                        let v6 = plan.v6.as_ref()?;
+                        (IpAddress::from(v6.guest), IpAddress::from(v6.gateway))
+                    }
+                };
+                Some(Inbound {
+                    socket: listener.socket,
+                    guest: IpEndpoint::new(guest, listener.guest_port),
+                    local,
+                    retry_at: None,
+                })
+            })
+            .collect();
+
         let frame = device.frame_capacity();
         Ok(Engine {
             device,
@@ -150,6 +219,8 @@ impl Engine {
             sockets: SocketSet::new(Vec::new()),
             flows: Vec::new(),
             udp: UdpTables::new(plan.mtu),
+            inbound,
+            next_local_port: *LOCAL_PORTS.start(),
             plan,
             epoch: std::time::Instant::now(),
             read_buf: vec![0; frame],
@@ -163,6 +234,16 @@ impl Engine {
 
     fn run(&mut self, stop: &OwnedFd) -> PumpExit {
         loop {
+            // A listener whose backoff has run out is polled again, and stops
+            // counting toward the timeout: an elapsed backoff left in place
+            // would make every poll return at once.
+            let now_std = std::time::Instant::now();
+            for inbound in &mut self.inbound {
+                if inbound.retry_at.is_some_and(|at| at <= now_std) {
+                    inbound.retry_at = None;
+                }
+            }
+
             // Assemble the poll set: the stop pipe, the tap, and every
             // flow whose host socket has an interest right now. A flow
             // with nothing to wait for is left out entirely — its hangup
@@ -193,6 +274,14 @@ impl Engine {
                 owners.push(SlotOwner::Udp);
                 fds.push(PollFd::new(host, PollFlags::IN));
             }
+            // A listener sitting out its backoff is left out, which is what
+            // keeps a connection it cannot accept from waking the loop.
+            for (index, inbound) in self.inbound.iter().enumerate() {
+                if inbound.retry_at.is_none() {
+                    owners.push(SlotOwner::Listener(index));
+                    fds.push(PollFd::new(&inbound.socket, PollFlags::IN));
+                }
+            }
 
             match rustix::event::poll(&mut fds, timeout.as_ref()) {
                 Ok(_) => {}
@@ -211,6 +300,7 @@ impl Engine {
             drop(fds);
             let mut stop_requested = false;
             let mut tap_readable = false;
+            let mut accepting = Vec::new();
             for flow in &mut self.flows {
                 flow.events = PollFlags::empty();
             }
@@ -222,6 +312,8 @@ impl Engine {
                     // UDP draining is unconditional, so its wakeups need no
                     // per-flow bookkeeping.
                     SlotOwner::Udp => {}
+                    SlotOwner::Listener(index) if !revents.is_empty() => accepting.push(*index),
+                    SlotOwner::Listener(_) => {}
                 }
             }
             if stop_requested {
@@ -230,6 +322,9 @@ impl Engine {
 
             if tap_readable && let Err(exit) = self.ingest_tap() {
                 return exit;
+            }
+            for index in accepting {
+                self.accept(index);
             }
 
             // Let the interface process what arrived, then alternate
@@ -281,6 +376,11 @@ impl Engine {
         }
         if let Some(remaining) = self.udp.next_deadline(now_std) {
             tighten(remaining);
+        }
+        for inbound in &self.inbound {
+            if let Some(at) = inbound.retry_at {
+                tighten(at.saturating_duration_since(now_std));
+            }
         }
         limit.map(crate::poll::timeout)
     }
@@ -417,6 +517,78 @@ impl Engine {
         }
     }
 
+    /// Accepts the connections waiting on one published port, each becoming a
+    /// flow toward the guest.
+    ///
+    /// A connection past [`MAX_FLOWS`](tcp::MAX_FLOWS), or one no local port is
+    /// free for, is accepted and closed at once, which is how the host side
+    /// learns it was refused. A connection the peer abandoned before it was
+    /// accepted is passed over.
+    fn accept(&mut self, index: usize) {
+        for _ in 0..ACCEPT_BATCH {
+            let accepted = match rustix::net::accept_with(
+                &self.inbound[index].socket,
+                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            ) {
+                Ok(accepted) => accepted,
+                Err(Errno::AGAIN) => return,
+                Err(Errno::INTR | Errno::CONNABORTED) => continue,
+                Err(_) => {
+                    self.inbound[index].retry_at =
+                        std::time::Instant::now().checked_add(ACCEPT_BACKOFF);
+                    return;
+                }
+            };
+            if self.flows.len() >= tcp::MAX_FLOWS {
+                continue;
+            }
+            let (guest, local_addr) = (self.inbound[index].guest, self.inbound[index].local);
+            let Some(port) = self.free_local_port(guest, local_addr) else {
+                continue;
+            };
+            let local = IpEndpoint::new(local_addr, port);
+            let mut socket = tcp_socket::Socket::new(
+                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
+                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
+            );
+            // The same liveness watch an outbound flow's guest side carries.
+            socket.set_keep_alive(Some(tcp::KEEP_ALIVE_INTERVAL.into()));
+            socket.set_timeout(Some(tcp::IDLE_TIMEOUT.into()));
+            if socket.connect(self.iface.context(), guest, local).is_err() {
+                continue;
+            }
+            let handle = self.sockets.add(socket);
+            self.flows.push(TcpFlow::accepted(
+                handle,
+                guest,
+                local,
+                accepted,
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    /// A local port on `local` that no flow toward `guest` is using, searched
+    /// from where the last search stopped.
+    fn free_local_port(&mut self, guest: IpEndpoint, local: IpAddress) -> Option<u16> {
+        let span = usize::from(LOCAL_PORTS.end() - LOCAL_PORTS.start()) + 1;
+        for _ in 0..span {
+            let port = self.next_local_port;
+            self.next_local_port = if port == *LOCAL_PORTS.end() {
+                *LOCAL_PORTS.start()
+            } else {
+                port + 1
+            };
+            let taken = self.flows.iter().any(|flow| {
+                flow.guest == guest && flow.destination == IpEndpoint::new(local, port)
+            });
+            if !taken {
+                return Some(port);
+            }
+        }
+        None
+    }
+
     /// Admits a UDP datagram by binding a receive socket to its destination
     /// port, if policy allows the destination at all. The flow itself is
     /// created lazily when the datagram is drained.
@@ -499,9 +671,9 @@ impl Engine {
 /// (`0.0.0.0` or `::`): that service is reachable through the host's own
 /// routable IP, which is an ordinary accepted destination, and RFC 1918 LAN
 /// peers are reachable too. A caller that needs to bound egress must confine the
-/// destination itself. The gateway address is the one special case: with
-/// `host_loopback`, a connection to it maps to the host's loopback, port
-/// preserved.
+/// destination itself. The gateway address is the one special case: on a port
+/// `host_loopback` or `host_loopback_port` admits, a connection to it maps to
+/// the host's loopback, port preserved, and on any other port it is refused.
 pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
     match IpAddr::from(dst.addr) {
         IpAddr::V4(addr) => {
@@ -509,6 +681,7 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
             if addr == v4.gateway {
                 return plan
                     .host_loopback
+                    .admits(dst.port)
                     .then(|| SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, dst.port)));
             }
             let mask = u32::MAX << (32 - u32::from(v4.prefix_len));
@@ -532,6 +705,7 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
             if addr == v6.gateway {
                 return plan
                     .host_loopback
+                    .admits(dst.port)
                     .then(|| SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, dst.port)));
             }
             let mask = u128::MAX << (128 - u32::from(v6.prefix_len));
@@ -676,6 +850,49 @@ mod tests {
             host_target(v6("fd00::2", 8080), &open),
             Some("[::1]:8080".parse().unwrap()),
         );
+    }
+
+    #[test]
+    fn a_named_port_maps_alone() {
+        // The narrower grant: one host service, not the whole loopback. A
+        // neighbouring port of the gateway stays refused.
+        let plan = NetStack::builder()
+            .host_loopback_port(5432)
+            .build()
+            .expect("a valid configuration")
+            .plan;
+        assert_eq!(
+            host_target(v4(10, 0, 2, 2, 5432), &plan),
+            Some("127.0.0.1:5432".parse().unwrap()),
+        );
+        assert_eq!(
+            host_target(v6("fd00::2", 5432), &plan),
+            Some("[::1]:5432".parse().unwrap()),
+        );
+        assert_eq!(host_target(v4(10, 0, 2, 2, 5433), &plan), None);
+        assert_eq!(host_target(v6("fd00::2", 80), &plan), None);
+    }
+
+    #[test]
+    fn every_port_and_a_named_port_combine() {
+        // The two grants are a union, so neither order of the calls narrows
+        // what the other granted.
+        for plan in [
+            NetStack::builder()
+                .host_loopback(true)
+                .host_loopback_port(5432)
+                .build(),
+            NetStack::builder()
+                .host_loopback_port(5432)
+                .host_loopback(true)
+                .build(),
+        ] {
+            let plan = plan.expect("a valid configuration").plan;
+            assert_eq!(
+                host_target(v4(10, 0, 2, 2, 8080), &plan),
+                Some("127.0.0.1:8080".parse().unwrap()),
+            );
+        }
     }
 
     #[test]
