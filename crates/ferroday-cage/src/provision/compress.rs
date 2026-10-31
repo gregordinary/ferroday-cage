@@ -15,11 +15,9 @@
 //! a header far smaller than the allocation it asks for. A zstd frame declares
 //! the window the decoder buffers, and an xz block declares the dictionary the
 //! decoder allocates and zeroes; both are bounded here, at
-//! [`MAX_ZSTD_WINDOW`] and [`MAX_XZ_DICTIONARY`], and each decoder is told its
-//! bound and checks it against the header before allocating anything. `ruzstd`
-//! takes the cap as a constructor argument; `lzma-rust2` takes it on the
-//! sans-I/O decoder alone, which is why [`XzReader`] drives that one rather
-//! than the crate's own `Read` wrapper.
+//! [`MAX_ZSTD_WINDOW`] and [`MAX_XZ_DICTIONARY`]. Each decoder is given its
+//! bound at construction and checks it against the header before allocating
+//! anything.
 
 use std::io::{self, Read};
 
@@ -325,11 +323,11 @@ const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 /// The memory budget an xz decode runs under, in kibibytes.
 ///
 /// `lzma-rust2` checks a *memory* figure against this -- the block's dictionary
-/// rounded up, plus a constant for the decoder's own tables -- as it parses each
-/// block header, before allocating anything. The budget is therefore the
-/// dictionary cap plus slack for those tables: sized at the cap alone it would
-/// refuse a dictionary of exactly [`MAX_XZ_DICTIONARY`], which the tables push
-/// over.
+/// rounded up, plus the decoder's own tables and the buffer it reads a
+/// compressed chunk into -- as it parses each block header, before allocating
+/// anything. The budget is therefore the dictionary cap plus slack for those:
+/// sized at the cap alone it would refuse a dictionary of exactly
+/// [`MAX_XZ_DICTIONARY`], which they push over.
 ///
 /// One mebibyte of slack admits nothing a tighter figure would not. Dictionary
 /// sizes step in halvings and doublings, so the next one up from 128 MiB is
@@ -338,103 +336,47 @@ const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 /// an upstream change to that constant moves nothing here.
 const MAX_XZ_MEMORY_KB: u32 = (MAX_XZ_DICTIONARY / 1024) as u32 + 1024;
 
-/// The bytes of compressed input handed to the decoder at a time.
+/// The buffer compressed input is read through.
+///
+/// The decoder reads each LZMA2 chunk whole, but a header, an index, and the
+/// padding between streams a few bytes at a time. Buffering keeps those from
+/// becoming a read of the source each.
 const XZ_CHUNK: usize = 64 * 1024;
 
 /// An xz decoder bounded by [`MAX_XZ_DICTIONARY`].
 ///
-/// `lzma-rust2` offers the bound on its sans-I/O decoder and not on its
-/// `Read` one, so this drives the sans-I/O decoder and is the `Read` half:
-/// compressed bytes in from `source` a chunk at a time, decoded bytes out to
-/// the caller's buffer, and the memory limit set once at construction. The
-/// decoder checks it against each block header as it parses one, which is both
+/// `lzma-rust2`'s own reader, given [`MAX_XZ_MEMORY_KB`] at construction. It
+/// checks each block header against the budget as it parses one, which is both
 /// before the allocation and inside the parser that decides what to allocate --
-/// the two properties a bound applied from outside could not have.
+/// the two properties a bound applied from outside could not have. Concatenated
+/// streams are decoded as one, which several producers emit and the format
+/// permits.
 ///
-/// Concatenated streams are decoded as one, which several producers emit and
-/// the format permits.
-///
-/// # What this does not decode
-///
-/// A block whose filter chain holds more than one filter before LZMA2. The xz
-/// format allows up to four, and the sans-I/O decoder supports one; `xz` itself
-/// writes at most one (a BCJ or a delta), and no archive this crate reads
-/// carries two. Such a block is refused rather than mis-decoded, and the
-/// refusal names the decoder's own reason.
-struct XzReader<R> {
-    source: R,
-    stream: lzma_rust2::XzStream,
-    /// The buffer compressed bytes are read into.
-    input: Vec<u8>,
-    /// How much of `input` holds bytes read from `source`.
-    filled: usize,
-    /// How much of that the decoder has taken.
-    taken: usize,
-    /// Set once `source` has reported end of input.
-    drained: bool,
-    /// Set once the decoder has reported the end of the last stream.
-    finished: bool,
-}
+/// Two things are this type's rather than the decoder's. A refusal is rewritten
+/// to name the bound in force, by [`refused_memory`]. And an empty buffer is
+/// answered here, without reaching the decoder: it takes a read that produces
+/// nothing for the end of the block in progress, which is what a read into no
+/// space always produces.
+struct XzReader<R: Read>(lzma_rust2::XzReader<io::BufReader<R>>);
 
 impl<R: Read> XzReader<R> {
     /// Wraps `source`, positioned at the start of the first stream header.
     fn new(source: R) -> XzReader<R> {
-        XzReader {
-            source,
-            // `true`: several concatenated xz streams are one legal file.
-            stream: lzma_rust2::XzStream::new_mem_limit(true, MAX_XZ_MEMORY_KB),
-            input: vec![0; XZ_CHUNK],
-            filled: 0,
-            taken: 0,
-            drained: false,
-            finished: false,
-        }
+        XzReader(lzma_rust2::XzReader::new_mem_limit(
+            io::BufReader::with_capacity(XZ_CHUNK, source),
+            // Several concatenated xz streams are one legal file.
+            true,
+            MAX_XZ_MEMORY_KB,
+        ))
     }
 }
 
 impl<R: Read> Read for XzReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() || self.finished {
+        if buf.is_empty() {
             return Ok(0);
         }
-        loop {
-            // Both start at zero, so the first pass reads before it decodes.
-            if self.taken == self.filled && !self.drained {
-                self.filled = self.source.read(&mut self.input)?;
-                self.taken = 0;
-                self.drained = self.filled == 0;
-            }
-            let action = if self.drained {
-                lzma_rust2::Action::Finish
-            } else {
-                lzma_rust2::Action::Run
-            };
-            let result = self
-                .stream
-                .process(&self.input[self.taken..self.filled], buf, action)
-                .map_err(refused_memory)?;
-            self.taken += result.bytes_consumed;
-            if result.bytes_produced > 0 {
-                return Ok(result.bytes_produced);
-            }
-            if result.status == lzma_rust2::Status::StreamEnd {
-                self.finished = true;
-                return Ok(0);
-            }
-            // Neither output nor an ending, so the decoder wants more input. If
-            // the source has none left and the decoder took nothing either, no
-            // further call can make progress: return rather than spin. Reached
-            // only if the decoder stops short of both an ending and an error on
-            // a truncated stream, which it is not documented to do -- but a loop
-            // whose termination rests on a dependency's documentation is one
-            // this crate would rather not have.
-            if self.drained && result.bytes_consumed == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the xz stream ends mid-decode",
-                ));
-            }
-        }
+        self.0.read(buf).map_err(refused_memory)
     }
 }
 
@@ -939,11 +881,12 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_stream_ends_rather_than_spinning() {
-        // Every prefix of a real stream. Each is a decode that runs out of
-        // input, and what matters is that each *returns*: a decoder still asking
-        // for input a drained source cannot give would otherwise be called
-        // forever. What each prefix answers is the decoder's to decide.
+    fn a_truncated_stream_is_refused_rather_than_decoded_short() {
+        // Every prefix of a real stream long enough to be sniffed as xz. Each is
+        // a decode that runs out of input, and each must return and fail: a
+        // prefix decoded as though it were whole hands the tar reader a short
+        // archive, which it can accept without a terminator. None of them is a
+        // memory refusal.
         let bytes = xz_stream(
             Check::Crc32,
             &[
@@ -951,15 +894,32 @@ mod tests {
                 Block::new(8 * MIB, b"second block"),
             ],
         );
-        for cut in 0..bytes.len() {
-            if let Err(err) = decode_all(&bytes[..cut]) {
-                assert_ne!(
+        for cut in XZ_MAGIC.len()..bytes.len() {
+            match decode_all(&bytes[..cut]) {
+                Ok(decoded) => panic!("cut at {cut}: decoded {decoded:?}"),
+                Err(err) => assert_ne!(
                     err.kind(),
                     io::ErrorKind::OutOfMemory,
                     "cut at {cut}: a truncation is not a memory refusal",
-                );
+                ),
             }
         }
+    }
+
+    #[test]
+    fn an_empty_read_mid_block_loses_nothing() {
+        // A read into no space asks for nothing and must change nothing. The
+        // decoder beneath takes a read that produces nothing for the end of the
+        // block in progress, so the reader answers this one itself.
+        let bytes = xz_stream(Check::Crc32, &[Block::new(4096, b"one block of payload")]);
+        let head = sniff_head(&mut &bytes[..]).unwrap();
+        let mut reader = decompress(&head, &bytes[head.len()..]).expect("the wrapper is xz");
+        let mut first = [0u8; 4];
+        reader.read_exact(&mut first).expect("the block starts");
+        assert_eq!(reader.read(&mut []).expect("an empty read"), 0);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).expect("the block continues");
+        assert_eq!([&first[..], &rest].concat(), b"one block of payload");
     }
 
     #[test]
@@ -988,6 +948,23 @@ mod tests {
         let mut expected = first.clone();
         expected.extend_from_slice(&second);
         assert_eq!(decoded, expected, "both streams decoded");
+    }
+
+    #[test]
+    fn a_block_chaining_two_filters_before_lzma2_decodes() {
+        // The format allows up to three filters before LZMA2, where `xz` writes
+        // at most one. A chain of two, delta then x86, is decoded rather than
+        // refused.
+        let payload: Vec<u8> = (0..16 * 1024u32).flat_map(u32::to_le_bytes).collect();
+        let mut options = lzma_rust2::XzOptions::with_preset(1);
+        options.prepend_pre_filter(lzma_rust2::FilterType::BcjX86, 0);
+        options.prepend_pre_filter(lzma_rust2::FilterType::Delta, 4);
+        let mut out = Vec::new();
+        let mut writer = lzma_rust2::XzWriter::new(&mut out, options).expect("an xz writer");
+        std::io::Write::write_all(&mut writer, &payload).unwrap();
+        writer.finish().expect("the xz stream finishes");
+
+        assert_eq!(decode_all(&out).expect("the chain decodes"), payload);
     }
 
     /// Compresses `data` into a single zstd frame.

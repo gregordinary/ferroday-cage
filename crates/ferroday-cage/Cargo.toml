@@ -46,7 +46,7 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 # the OpenPGP dependency, not of this line, and it leaves the narrower
 # configurations on a backend that forbids unsafe outright.
 flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
-lzma-rust2 = { version = "0.20", optional = true, default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "0.21", optional = true, default-features = false, features = ["std", "xz"] }
 ruzstd = { version = "0.9", optional = true }
 # The Debian and Gentoo userland add-on: OpenPGP verification of the archive's
 # signed documents (pure Rust, no C backend), and the hashing their trust chains
@@ -307,7 +307,7 @@ toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"
 # The provisioning tests generate compressed fixtures.
-lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "xz", "encoder"] }
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz", "encoder"] }
 # The Debian tests build fixture repositories with correct digests.
 sha2 = "0.11"
 # The Debian signature tests generate a throwaway signing key and sign an

@@ -89,12 +89,22 @@ consumer upgrading can skip it.
   A program that asks for the machine id in a sandbox now finds none until
   `dbus-uuidgen --ensure=/etc/machine-id` runs in the root.
 
+### Fixed
+
+- An xz block that chains more than one filter before LZMA2 decodes. Since
+  0.4.2 such a block was refused. `xz` writes at most one such filter, so no
+  archive it produced was affected.
+
 ### Internal
 
 - `mechanism::frame::send_with_fd` and `recv_with_fd` pass a descriptor over a
   socket for every caller that does: the supervisor's pidfd, the network stack's
   tap, and a terminal launch's primary. The shared vocabulary in
   `CONTRIBUTING.md` records them.
+- `lzma-rust2` moves to 0.21, whose own reader accepts the memory limit. The xz
+  decode runs through that reader, and the reader this crate wrote over the
+  sans-I/O decoder to apply the limit is gone. The cap, and what an archive over
+  it does, are unchanged.
 
 ## [0.4.5] - 2026-09-26
 
