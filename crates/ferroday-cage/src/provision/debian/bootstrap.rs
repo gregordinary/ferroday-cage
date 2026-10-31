@@ -1314,6 +1314,38 @@ mod tests {
     }
 
     #[test]
+    fn a_named_pipe_at_the_machine_id_does_not_stall_the_cleanup() {
+        // The cleanup reads the machine id after every maintainer script has
+        // run, and a script can leave a named pipe there, which a plain open
+        // for reading waits on for a writer. The cleanup answers at once and
+        // leaves the pipe alone, as it leaves anything that is not an id.
+        let (staging, tree) = rooted_tree("machine-id-fifo");
+        let pipe = staging.join(MACHINE_ID);
+        fs::create_dir_all(pipe.parent().unwrap()).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &pipe,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer.send(clear_run_state(&tree).is_ok());
+        });
+        assert!(
+            answered
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the cleanup answers rather than waiting for a writer"),
+            "the cleanup succeeds",
+        );
+        use std::os::unix::fs::FileTypeExt;
+        assert!(fs::symlink_metadata(&pipe).unwrap().file_type().is_fifo());
+    }
+
+    #[test]
     fn a_link_in_the_base_cannot_leak_a_host_file_into_the_increment() {
         // The base of a layered build is a caller-supplied tree whose
         // statoverride is read and carried into the upper. A link there would

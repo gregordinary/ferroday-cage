@@ -25,6 +25,11 @@
 //! `O_NOFOLLOW`, so a link occupying a name is replaced rather than written
 //! through, which is what the extractor's leaves do.
 //!
+//! A script can as easily leave a named pipe where the host side expects a
+//! file, and opening one for reading waits for a writer that never comes. A
+//! read therefore opens without waiting and refuses whatever it opened that is
+//! not a regular file, so a tree can fail a read but cannot stall one.
+//!
 //! Paths are tree-relative and may be written with a leading `/`, since the
 //! tree is a root filesystem and its own files name themselves that way. A `..`
 //! component is refused outright rather than resolved: the kernel would contain
@@ -140,7 +145,8 @@ impl Rooted {
     ///
     /// `O_NOFOLLOW`: a symbolic link at the leaf fails the read rather than
     /// being followed, so a link planted where a file is expected cannot turn
-    /// this into a read of something else.
+    /// this into a read of something else. Anything else that is not a regular
+    /// file is refused as [`reader`](Self::reader) refuses it.
     pub(crate) fn read(&self, relative: impl AsRef<Path>) -> io::Result<Vec<u8>> {
         let mut contents = Vec::new();
         self.reader(relative)?.read_to_end(&mut contents)?;
@@ -154,14 +160,39 @@ impl Rooted {
     /// hold the whole file uses instead: a merged package's own database entry
     /// records a digest per installed file, and a hundred-megabyte binary is
     /// one of them.
+    ///
+    /// Only a regular file is opened. Anything else is refused without being
+    /// waited on, a named pipe included; see
+    /// [`open_regular`](Self::open_regular).
     pub(crate) fn reader(&self, relative: impl AsRef<Path>) -> io::Result<File> {
-        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Require)?;
+        self.open_regular(relative.as_ref(), OFlags::RDONLY)
+    }
+
+    /// Opens the regular file at `relative` for `access`, refusing anything
+    /// else without waiting on it.
+    ///
+    /// The open is `O_NONBLOCK`, so a named pipe at the leaf, which an ordinary
+    /// open would wait on until something opened its other end, returns at
+    /// once, and is then refused as a directory, a socket, or a device node is.
+    /// `O_NOCTTY` keeps a terminal from becoming the caller's controlling
+    /// terminal in the moment before its refusal. A regular file ignores
+    /// `O_NONBLOCK`, and the flag is cleared before the descriptor is handed
+    /// back all the same.
+    fn open_regular(&self, relative: &Path, access: OFlags) -> io::Result<File> {
+        let (parent, leaf) = self.parent_of(relative, Parents::Require)?;
         let fd = rustix::fs::openat(
             &parent,
             &leaf,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
+        if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", self.path(relative).display()),
+            ));
+        }
+        rustix::fs::fcntl_setfl(&fd, rustix::fs::fcntl_getfl(&fd)? - OFlags::NONBLOCK)?;
         Ok(File::from(fd))
     }
 
@@ -478,6 +509,50 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let rooted = Rooted::open(&root).unwrap();
         (scratch, rooted)
+    }
+
+    #[test]
+    fn a_named_pipe_is_refused_rather_than_waited_on() {
+        // Opening a FIFO for reading waits for a writer, and a script can leave
+        // one where the host side reads a file. The read answers at once. It
+        // runs on a thread of its own, so a regression fails here on the
+        // deadline rather than hanging the test run.
+        let (scratch, tree) = tree("fifo");
+        let pipe = scratch.join("tree/machine-id");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &pipe,
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer.send(tree.read("machine-id").map(|_| ()));
+        });
+        let outcome = answered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read answers rather than waiting for a writer");
+        let err = outcome.expect_err("a named pipe is not read");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn a_regular_file_reads_through_an_ordinary_descriptor() {
+        // The open is non-blocking so that a pipe cannot stall it; what is
+        // handed back for a regular file carries no trace of that.
+        let (_scratch, tree) = tree("regular");
+        tree.write("etc/os-release", b"ID=test\n").unwrap();
+        let file = tree.reader("etc/os-release").unwrap();
+        assert!(
+            !rustix::fs::fcntl_getfl(&file)
+                .unwrap()
+                .contains(OFlags::NONBLOCK)
+        );
+        assert_eq!(tree.read("etc/os-release").unwrap(), b"ID=test\n");
     }
 
     #[test]

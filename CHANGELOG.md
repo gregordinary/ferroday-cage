@@ -91,6 +91,10 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- A provisioner's host-side read of a file inside a tree no longer waits on a
+  named pipe left at that path. Opening one for reading waited for a writer that
+  never came, which stalled the bootstrap for good. It is now refused, as any
+  path that is not a regular file is.
 - An xz block that chains more than one filter before LZMA2 decodes. Since
   0.4.2 such a block was refused. `xz` writes at most one such filter, so no
   archive it produced was affected.
