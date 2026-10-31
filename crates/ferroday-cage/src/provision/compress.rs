@@ -898,6 +898,23 @@ mod tests {
     }
 
     #[test]
+    fn trailing_stream_padding_comes_in_whole_words() {
+        // Padding after the last stream is a multiple of four zero bytes. Two
+        // are neither padding nor the start of a stream, so the file is not a
+        // valid xz file and is refused rather than read as complete.
+        let stream = xz_stream(Check::Crc32, &[Block::new(4096, b"payload")]);
+        let mut aligned = stream.clone();
+        aligned.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            decode_all(&aligned).expect("whole-word padding decodes"),
+            b"payload"
+        );
+        let mut unaligned = stream;
+        unaligned.extend_from_slice(&[0; 2]);
+        decode_all(&unaligned).expect_err("two bytes of padding are refused");
+    }
+
+    #[test]
     fn a_block_declaring_no_compressed_size_is_bounded_too() {
         // `xz -T1 --block-size=...` writes headers without a compressed size,
         // and the next header is then findable only by decoding this block to

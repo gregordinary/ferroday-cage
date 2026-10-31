@@ -46,7 +46,7 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 # the OpenPGP dependency, not of this line, and it leaves the narrower
 # configurations on a backend that forbids unsafe outright.
 flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
-lzma-rust2 = { version = "0.23", optional = true, default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "0.24", optional = true, default-features = false, features = ["std", "xz"] }
 # `hash` is what computes a frame's content checksum while it decodes, which the
 # reader holds each frame to; named rather than left to the default features so
 # the comparison cannot lose its other half without this line moving. 0.9.1 is
@@ -316,7 +316,7 @@ toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"
 # The provisioning tests generate compressed fixtures.
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "encoder"] }
 # The Debian signature tests generate a throwaway signing key and sign an
 # InRelease with it, to exercise the verification path adversarially. rPGP is
 # already pulled in by the `debian` feature; this adds the RNG it needs.

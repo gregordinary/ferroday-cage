@@ -675,7 +675,7 @@ consumer upgrading can skip it.
 - `poll::slot` is gone. A `poll` loop leaves a finished channel out of the
   polled slice, as the `poll` module states.
 - `fcage` and the examples state their exit codes once each.
-- `lzma-rust2` moves to 0.23, whose own reader accepts the memory limit. The xz
+- `lzma-rust2` moves to 0.24, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the
   sans-I/O decoder to apply the limit is gone. The cap, and what an archive over
   it does, are unchanged.

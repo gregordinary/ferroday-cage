@@ -28,7 +28,7 @@ allow = [
 
 # The RUSTSEC advisory gate: `cargo deny check advisories` fails the build if a
 # dependency carries a known security advisory, so a vulnerable version cannot
-# enter the graph unnoticed. One advisory is analyzed and deliberately ignored.
+# enter the graph unnoticed. Two advisories are analyzed and deliberately ignored.
 [advisories]
 ignore = [
     # Marvin Attack: a timing sidechannel in the `rsa` crate. It enters the
@@ -41,6 +41,15 @@ ignore = [
     # sidechannel is unreachable under either feature. No fixed `rsa` release
     # exists yet; this is revisited when one does.
     { id = "RUSTSEC-2023-0071", reason = "verification-only; no RSA private key is ever used" },
+    # Timing variability in `crypto-bigint` operations meant to be constant
+    # time. Version 0.5 enters the graph only through `pgp`, under the `debian`
+    # and `gentoo` features, by way of `elliptic-curve` and `cx448`. The leak
+    # concerns secret integers, and this crate holds none: it verifies
+    # signatures against public keys it ships or the caller supplies, and never
+    # signs, decrypts, or derives a shared secret. The fix exists only in the
+    # 0.7 line, which arrives with the RustCrypto generation `pgp` has not yet
+    # moved to; this is revisited when it does.
+    { id = "RUSTSEC-2026-0387", reason = "verification-only; no secret integer is ever operated on" },
 ]
 
 # Where dependencies may come from: `cargo deny check sources` fails the build
