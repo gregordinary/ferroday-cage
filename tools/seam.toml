@@ -54,12 +54,6 @@ why = """\
 map before anything is downloaded. Nothing public answers the question."""
 
 [[layer.reach]]
-name = "mechanism"
-count = 1
-kind = "internal"
-why = "`mechanism::frame::write_full`, the short-write loop the workspace shares."
-
-[[layer.reach]]
 name = "failure"
 count = 1
 kind = "internal"

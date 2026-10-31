@@ -73,11 +73,9 @@ use std::path::{Path, PathBuf};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use rustix::fs::{FlockOperation, Mode, OFlags};
 
 use super::check_coordinate;
 use super::{DebianError, arch, deb, release, version};
-use crate::mechanism::frame;
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::document;
@@ -620,26 +618,18 @@ fn remove_signatures(suite_dir: &Path) -> Result<(), DebianError> {
 /// Takes the pool's exclusive publish lock, returning the descriptor that holds
 /// it; dropping the descriptor releases it, on the error paths as on success.
 ///
-/// `NOFOLLOW` so a symlink pre-planted at the lock path cannot redirect the
-/// lock, and with it the publish it serializes, elsewhere. The wait is
-/// unbounded: a publish is short, and a caller that meets contention wants the
-/// pool rather than an error.
+/// [`lock_exclusive`](crate::provision::lock_exclusive) is the lock, with what
+/// it guarantees: a symbolic link planted at the path redirects nothing, and a
+/// process spawned during the publish does not keep the pool locked after the
+/// publish returns. The wait is unbounded: a publish is short, and a caller
+/// that meets contention wants the pool rather than an error.
 fn lock_pool(pool_dir: &Path) -> Result<std::os::fd::OwnedFd, DebianError> {
     let lock_path = pool_dir.join(".lock");
-    let io = |source: std::io::Error| DebianError::Io {
+    crate::provision::lock_exclusive(&lock_path).map_err(|source| DebianError::Io {
         op: "locking the pool",
-        path: lock_path.clone(),
+        path: lock_path,
         source,
-    };
-    let lock = rustix::fs::open(
-        &lock_path,
-        OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
-    )
-    .map_err(|errno| io(errno.into()))?;
-    frame::retry_on_intr!(rustix::fs::flock(&lock, FlockOperation::LockExclusive))
-        .map_err(|errno| io(errno.into()))?;
-    Ok(lock)
+    })
 }
 
 /// Writes an index body under its own digest, the name a reader asks for when

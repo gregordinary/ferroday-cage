@@ -82,7 +82,7 @@ impl AsRef<std::path::Path> for Anchor {
 #[cfg(feature = "debian")]
 impl Drop for Anchor {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        common::force_remove_dir_all(&self.dir);
     }
 }
 

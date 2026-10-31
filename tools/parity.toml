@@ -567,6 +567,11 @@ why = "A mapper is a trait object."
 name = "remove_lock"
 flags = ["--keep-lock"]
 
+[[builder.setting]]
+name = "overlay_upper"
+kind = "library"
+why = "A second constructor rather than a setting: the removal of an overlay upper together with the work directory the library manages beside it. `fcage --remove-rootfs` removes one tree it is named; the removal mode would have to accept `--overlay-upper` to reach this."
+
 [[builder]]
 name = "Export"
 path = "ferroday_cage::provision::Export"

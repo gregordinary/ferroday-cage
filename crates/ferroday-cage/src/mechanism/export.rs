@@ -14,12 +14,14 @@
 //! The division of labor is deliberate. The child does only the privileged,
 //! must-be-in-map work — `statat`, `flistxattr`/`fgetxattr`, `readlinkat`, and
 //! reading file data — under the post-fork discipline this module enforces (no
-//! allocation, no locks, no panic, rustix syscalls only), and constant memory
-//! besides the tree's own depth. It never assembles a path, tracks hardlinks,
-//! or formats a tar header: those want a heap. It emits a flat stream of
-//! [frames](#frame-protocol) instead, and the parent — in ordinary `std`
-//! context, with an allocator — reassembles paths, coalesces hardlinks, and
-//! encodes the archive (see [`provision::export`](crate::provision)).
+//! allocation, no locks, no panic, rustix syscalls only). Its memory is a stack
+//! frame per level of the tree and two arenas its caller allocates before the
+//! fork, which hold the names of the directories it is inside while it sorts
+//! them. It never assembles a path, tracks hardlinks, or formats a tar header:
+//! those want a heap. It emits a flat stream of [frames](#frame-protocol)
+//! instead, and the parent — in ordinary `std` context, with an allocator —
+//! reassembles paths, coalesces hardlinks, and encodes the archive (see
+//! [`provision::export`](crate::provision)).
 //!
 //! # Frame protocol
 //!
@@ -32,8 +34,10 @@
 //!   rootfs root itself, named `.`, so the archive equals `tar -C rootfs .`:
 //!   every member is `./`-prefixed (see [`Walker::walk_root`]).
 //! - [`FRAME_LEAVE`]: the current directory is finished; the parent pops it.
-//! - [`FRAME_FILE`]: a regular file. Its metadata, xattrs, and then exactly
-//!   `size` bytes of data follow.
+//! - [`FRAME_FILE`]: a regular file. Its metadata, xattrs, exactly `size` bytes
+//!   of data, and a status byte follow. The status is zero when the file read
+//!   back exactly `size` bytes, and one when it grew or shrank while it was
+//!   read, the data then cut or zero-padded to keep the stream in step.
 //! - [`FRAME_SYMLINK`]: a symbolic link. Its metadata and link target follow.
 //! - [`FRAME_END`]: the walk finished cleanly.
 //! - [`FRAME_ERROR`]: a syscall failed; a step discriminant and errno follow,
@@ -58,6 +62,7 @@ use super::child::MapFailure;
 use super::frame;
 use super::sys::{self, Fork};
 use crate::idmap::IdMapError;
+use crate::provision::containment;
 use crate::wire::wire_enum;
 
 /// Frame tag: a directory is entered.
@@ -109,6 +114,11 @@ wire_enum! {
         Depth = 12 => "walking the exported tree, which nests too deeply",
         /// Streaming a frame to the parent failed; the parent is gone.
         Stream = 13 => "streaming the exported tree to the archiver",
+        /// The entry opened was not the regular file the walk had inspected:
+        /// another process changed the tree while it was being exported.
+        Changed = 16 => "reading an entry in the exported tree, which changed while it was being read",
+        /// A directory held more entries than the export can sort.
+        Crowded = 17 => "sorting a directory in the exported tree, which holds more entries than the export can order",
     }
 }
 
@@ -172,6 +182,12 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
     let (stream_read, stream_write) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(StartError::Spawn)?;
 
+    // The arenas the child sorts each directory's names in, allocated here
+    // because the child cannot allocate. Zeroed, so the pages are the kernel's
+    // own until the child writes to them, and this caller never does.
+    let mut names = vec![0u8; NAMES_ARENA];
+    let mut order = vec![0u32; ORDER_ARENA];
+
     // The gate exists only for a delegated map; a self-mapped child needs no
     // handshake.
     let gate = match map {
@@ -207,10 +223,16 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
                 drop(caller);
                 child
             });
-            export_child(stream_write.as_fd(), gate_child, rootfs, &map)
+            let arena = Arena {
+                names: &mut names,
+                order: &mut order,
+            };
+            export_child(stream_write.as_fd(), gate_child, rootfs, &map, arena)
         }
         Ok(Fork::ParentOf(pid)) => {
             drop(stream_write);
+            // The child has its own copy of the arenas; this side's is unused.
+            drop((names, order));
             if let (Some((caller, child_end)), ChildMap::Delegated { mapper, map }) = (gate, &map) {
                 drop(child_end);
                 let driven = super::drive_map_gate(caller.as_fd(), pid, *mapper, map);
@@ -257,6 +279,7 @@ fn export_child(
     gate: Option<OwnedFd>,
     rootfs: &CStr,
     map: &ChildMap<'_>,
+    arena: Arena<'_>,
 ) -> ! {
     let fail = |step: ExportStep, errno: Errno| -> ! {
         emit_error(stream, step, errno);
@@ -292,7 +315,7 @@ fn export_child(
     };
 
     let walker = Walker { stream };
-    match walker.walk_root(root.as_fd()) {
+    match walker.walk_root(root.as_fd(), arena) {
         Ok(()) => {
             emit_tag(stream, FRAME_END);
             sys::exit_group(0)
@@ -306,20 +329,39 @@ const DIRENTS_BUF: usize = 2048;
 /// The bound on an extended-attribute name list and on a single value, both
 /// capped by the kernel at 64 KiB.
 const XATTR_BUF: usize = 65536;
-/// How many successive names one scan of a directory collects.
+/// The bytes of entry names the walk can hold at once: those of every
+/// directory it is inside, since each is read whole and sorted before its
+/// entries are visited.
 ///
-/// A scan costs a full pass over the directory whatever it yields, so
-/// collecting a batch divides the number of scans by this factor: a directory
-/// of `n` entries costs `ceil(n / SUCCESSOR_BATCH)` scans rather than `n`. The
-/// bound is stack, not correctness — the batch is
-/// `SUCCESSOR_BATCH * (NAME_MAX + 1)` bytes live in every frame of a walk that
-/// may recurse to [`MAX_DEPTH`] — so it stays modest.
-const SUCCESSOR_BATCH: usize = 8;
+/// Each name costs its length and two bytes. Sixteen MiB holds several hundred
+/// thousand names of an ordinary length; a rootfs directory with five figures
+/// of entries uses a few percent of it.
+const NAMES_ARENA: usize = 16 << 20;
+/// How many entries the walk can hold at once, across the directories it is
+/// inside, and so the most one directory may have.
+const ORDER_ARENA: usize = 1 << 20;
+
+// A stored name's length is one byte.
+const _: () = assert!(NAME_MAX <= u8::MAX as usize);
+
+/// Where the walk keeps the names of the directories it is inside, for sorting.
+///
+/// Allocated by the caller before the fork, since the child cannot allocate,
+/// and split as the walk descends: a directory takes what its own names need
+/// from the front and hands the rest to the directories below it. A tree whose
+/// open directories together need more than the arenas hold fails the export
+/// with [`ExportStep::Crowded`] rather than being walked out of order.
+struct Arena<'a> {
+    /// Each name as a length byte, the name, and a NUL, back to back.
+    names: &'a mut [u8],
+    /// The offset in `names` of each entry, sorted in place by the name there.
+    order: &'a mut [u32],
+}
 
 /// Carries the frame stream through the recursive walk. Holds no growing
-/// state: the only per-level memory is the directory-iteration buffer, and the
-/// large metadata buffers live in the leaf helpers so they never span a
-/// recursive call.
+/// state: the per-level memory is the directory-iteration buffer and the part
+/// of the [`Arena`] the level's own names take, and the large metadata buffers
+/// live in the leaf helpers so they never span a recursive call.
 struct Walker<'a> {
     stream: BorrowedFd<'a>,
 }
@@ -335,10 +377,10 @@ impl Walker<'_> {
     /// stack starts empty, top-level entries get bare names (`boot`,
     /// `boot/vmlinuz`), and the tar diverges from the `tar -C rootfs .`
     /// convention consumers select members against.
-    fn walk_root(&self, root: BorrowedFd<'_>) -> Result<(), (ExportStep, Errno)> {
+    fn walk_root(&self, root: BorrowedFd<'_>, arena: Arena<'_>) -> Result<(), (ExportStep, Errno)> {
         let stat = fs::fstat(root).map_err(|e| (ExportStep::Stat, e))?;
         self.emit_meta(FRAME_DIR, c".", &stat, Some(root))?;
-        self.walk_dir(root, 0)?;
+        self.walk_dir(root, 0, arena)?;
         emit_tag_checked(self.stream, FRAME_LEAVE)
     }
 
@@ -348,94 +390,82 @@ impl Walker<'_> {
     /// current descriptor.
     ///
     /// The order is deterministic so the archive is byte-reproducible, and it is
-    /// produced without the heap the post-fork child cannot use (see the module
-    /// docs). Rather than read a directory into a buffer and sort it, the walk
-    /// visits entries by *successor scan*: it keeps the last name it emitted
-    /// and, each pass, rescans the directory for the next
-    /// [`SUCCESSOR_BATCH`] names strictly greater than it, in order. A
-    /// directory's names are unique, so this is a total order and every entry is
-    /// visited once.
-    ///
-    /// The cost is quadratic in a single directory's entry count — `n` entries
-    /// cost `ceil(n / SUCCESSOR_BATCH)` passes over all `n` — which the batch
-    /// reduces by a constant factor but does not remove. It is the price of a
-    /// sorted walk in constant memory. A rootfs directory holding five figures
-    /// of entries, such as a fully populated `/usr/share/man/man3`, is where it
-    /// is felt.
-    fn walk_dir(&self, dir: BorrowedFd<'_>, depth: u32) -> Result<(), (ExportStep, Errno)> {
+    /// produced without the heap the post-fork child cannot use. The directory
+    /// is read once, its names copied into the front of the [`Arena`], and their
+    /// offsets sorted in place by the name each one locates — an unstable sort
+    /// over a slice, which allocates nothing. A directory's names are unique,
+    /// so the order is total. The cost is a directory's size times its
+    /// logarithm, however large it is, until the arena runs out.
+    fn walk_dir(
+        &self,
+        dir: BorrowedFd<'_>,
+        depth: u32,
+        arena: Arena<'_>,
+    ) -> Result<(), (ExportStep, Errno)> {
         if depth as usize >= MAX_DEPTH {
             return Err((ExportStep::Depth, Errno::LOOP));
         }
+        let Arena { names, order } = arena;
+        let crowded = (ExportStep::Crowded, Errno::NOBUFS);
+        let mut used = 0;
+        let mut count = 0;
+        // From the first entry, whatever the descriptor has already read.
+        fs::seek(dir, fs::SeekFrom::Start(0)).map_err(|e| (ExportStep::ReadDir, e))?;
         let mut buf = [MaybeUninit::uninit(); DIRENTS_BUF];
-        // The last name emitted, and the batch of successors the current pass
-        // collects: fixed buffers, so the walk allocates nothing.
-        let mut last = [0u8; NAME_MAX + 1];
-        let mut last_len = 0;
-        let mut have_last = false;
-        let mut batch = [[0u8; NAME_MAX + 1]; SUCCESSOR_BATCH];
-        let mut lens = [0usize; SUCCESSOR_BATCH];
-        loop {
-            // Rewind, then scan for the smallest names strictly greater than
-            // the last one emitted, keeping the batch sorted as it fills.
-            let mut filled = 0;
-            fs::seek(dir, fs::SeekFrom::Start(0)).map_err(|e| (ExportStep::ReadDir, e))?;
-            let mut entries = RawDir::new(dir, &mut buf);
-            while let Some(entry) = entries.next() {
-                let entry = entry.map_err(|e| (ExportStep::ReadDir, e))?;
-                let name = entry.file_name().to_bytes();
-                if name == b"." || name == b".." {
-                    continue;
-                }
-                if name.len() > NAME_MAX {
-                    return Err((ExportStep::ReadDir, Errno::NAMETOOLONG));
-                }
-                if have_last && name <= &last[..last_len] {
-                    continue;
-                }
-                // Past the batch's largest, with the batch full: not a
-                // candidate for this pass.
-                if filled == SUCCESSOR_BATCH && name >= &batch[filled - 1][..lens[filled - 1]] {
-                    continue;
-                }
-                // Insertion sort into the batch. A full batch drops its
-                // largest, which a later pass collects.
-                let mut at = filled.min(SUCCESSOR_BATCH - 1);
-                while at > 0 && name < &batch[at - 1][..lens[at - 1]] {
-                    batch[at] = batch[at - 1];
-                    lens[at] = lens[at - 1];
-                    at -= 1;
-                }
-                batch[at][..name.len()].copy_from_slice(name);
-                lens[at] = name.len();
-                filled = (filled + 1).min(SUCCESSOR_BATCH);
+        let mut entries = RawDir::new(dir, &mut buf);
+        while let Some(entry) = entries.next() {
+            let entry = entry.map_err(|e| (ExportStep::ReadDir, e))?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
             }
-            if filled == 0 {
-                return Ok(());
+            if name.len() > NAME_MAX {
+                return Err((ExportStep::ReadDir, Errno::NAMETOOLONG));
             }
-            for slot in 0..filled {
-                let len = lens[slot];
-                // NUL-terminated for the `statat`/`openat` that follow.
-                batch[slot][len] = 0;
-                let name = CStr::from_bytes_with_nul(&batch[slot][..=len])
-                    .map_err(|_| (ExportStep::ReadDir, Errno::INVAL))?;
-                self.visit_entry(dir, name, depth)?;
+            let end = used + name.len() + 2;
+            if end > names.len() || count == order.len() {
+                return Err(crowded);
             }
-            // The batch's largest is the next pass's floor.
-            last_len = lens[filled - 1];
-            last[..last_len].copy_from_slice(&batch[filled - 1][..last_len]);
-            have_last = true;
+            names[used] = name.len() as u8;
+            names[used + 1..end - 1].copy_from_slice(name);
+            names[end - 1] = 0;
+            order[count] = u32::try_from(used).map_err(|_| crowded)?;
+            used = end;
+            count += 1;
         }
+
+        let (mine, names) = names.split_at_mut(used);
+        let (sorted, order) = order.split_at_mut(count);
+        let mine: &[u8] = mine;
+        sorted.sort_unstable_by(|a, b| stored_name(mine, *a).cmp(stored_name(mine, *b)));
+        for &at in sorted.iter() {
+            let name = stored_cstr(mine, at).ok_or((ExportStep::ReadDir, Errno::INVAL))?;
+            let below = Arena {
+                names: &mut *names,
+                order: &mut *order,
+            };
+            self.visit_entry(dir, name, depth, below)?;
+        }
+        Ok(())
     }
 
     /// Emits one entry: a directory, descending into it and closing with a
     /// leave; a regular file, followed by its data; or a symlink. Character and
     /// block devices, FIFOs, and sockets are dropped, as a deployed image's
     /// runtime provides its own.
+    ///
+    /// A regular file is opened through
+    /// [`containment::open_typed_file`](crate::provision::containment::open_typed_file):
+    /// without waiting, and checked against what was inspected before it is
+    /// read. A named pipe put in its place between the two would otherwise hold
+    /// the walk forever on a blocking open, and a different file would be read
+    /// under the first one's metadata.
     fn visit_entry(
         &self,
         dir: BorrowedFd<'_>,
         name: &CStr,
         depth: u32,
+        arena: Arena<'_>,
     ) -> Result<(), (ExportStep, Errno)> {
         let stat =
             fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| (ExportStep::Stat, e))?;
@@ -452,17 +482,16 @@ impl Walker<'_> {
                 // 64 KiB xattr buffers are freed on return, so they never
                 // overlap the recursion's stack.
                 self.emit_meta(FRAME_DIR, name, &stat, Some(child.as_fd()))?;
-                self.walk_dir(child.as_fd(), depth + 1)?;
+                self.walk_dir(child.as_fd(), depth + 1, arena)?;
                 emit_tag_checked(self.stream, FRAME_LEAVE)
             }
             FileType::RegularFile => {
-                let file = fs::openat(
-                    dir,
-                    name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|e| (ExportStep::Open, e))?;
+                let file = containment::open_typed_file(dir, name, &stat, OFlags::RDONLY).map_err(
+                    |e| match e {
+                        Errno::STALE => (ExportStep::Changed, e),
+                        e => (ExportStep::Open, e),
+                    },
+                )?;
                 self.emit_meta(FRAME_FILE, name, &stat, Some(file.as_fd()))?;
                 self.stream_data(file.as_fd(), stat.st_size as u64)
             }
@@ -593,37 +622,58 @@ impl Walker<'_> {
         put_bytes_u16(stream, &target[..len])
     }
 
-    /// Streams exactly `size` bytes of a file's data. A file that reads short
-    /// (a race against a live writer, which a quiesced rootfs is not) is
-    /// zero-padded to the declared size, so the parent's framing stays in
-    /// step.
+    /// Streams exactly `size` bytes of a file's data, then the status byte
+    /// saying whether the file still held exactly that many.
+    ///
+    /// A file that reads short — a race against a live writer, which a
+    /// quiesced rootfs is not — is zero-padded to the declared size, and one
+    /// that grew is cut at it, so the parent's framing stays in step either
+    /// way. The status is what keeps the parent from calling the result an
+    /// archive of the file: it reports the change for an entry it keeps, as a
+    /// copy into a rootfs does. One byte read past the declared size is how a
+    /// grown file is noticed; nothing of it is sent.
     fn stream_data(&self, fd: BorrowedFd<'_>, size: u64) -> Result<(), (ExportStep, Errno)> {
         let stream = self.stream;
         let mut buf = [0u8; DATA_BUF];
         let mut remaining = size;
+        let read = |buf: &mut [u8]| {
+            frame::retry_on_intr!(rustix::io::read(fd, &mut *buf))
+                .map_err(|e| (ExportStep::ReadData, e))
+        };
         while remaining > 0 {
             let want = remaining.min(DATA_BUF as u64) as usize;
-            let got = loop {
-                match rustix::io::read(fd, &mut buf[..want]) {
-                    Ok(got) => break got,
-                    Err(Errno::INTR) => continue,
-                    Err(e) => return Err((ExportStep::ReadData, e)),
-                }
-            };
+            let got = read(&mut buf[..want])?;
             if got == 0 {
                 break;
             }
             put(stream, &buf[..got])?;
             remaining -= got as u64;
         }
+        let changed = remaining > 0 || read(&mut buf[..1])? != 0;
         let zeros = [0u8; DATA_BUF];
         while remaining > 0 {
             let want = remaining.min(DATA_BUF as u64) as usize;
             put(stream, &zeros[..want])?;
             remaining -= want as u64;
         }
-        Ok(())
+        put(stream, &[u8::from(changed)])
     }
+}
+
+/// A name [`Walker::walk_dir`] stored at `at` in its arena: the bytes after
+/// the length byte, without the terminator.
+fn stored_name(names: &[u8], at: u32) -> &[u8] {
+    let at = at as usize;
+    let len = names.get(at).copied().unwrap_or(0) as usize;
+    names.get(at + 1..at + 1 + len).unwrap_or(&[])
+}
+
+/// A name [`Walker::walk_dir`] stored at `at`, with its terminator, for the
+/// `*at` calls that resolve it.
+fn stored_cstr(names: &[u8], at: u32) -> Option<&CStr> {
+    let at = at as usize;
+    let len = *names.get(at)? as usize;
+    CStr::from_bytes_with_nul(names.get(at + 1..=at + 1 + len)?).ok()
 }
 
 /// Writes `data` in full to the frame stream, retrying short writes and
@@ -723,6 +773,119 @@ mod tests {
     fn export_step_unknown_wire_value_is_rejected() {
         assert_eq!(ExportStep::from_wire(ExportStep::past_the_last()), None);
         assert_eq!(ExportStep::from_wire(u32::MAX), None);
+    }
+
+    /// A frame stream into a scratch file, which no reader has to drain.
+    fn stream_into(dir: &std::path::Path) -> OwnedFd {
+        fs::open(
+            dir.join("stream"),
+            OFlags::CREATE | OFlags::RDWR | OFlags::TRUNC | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("the stream file opens")
+    }
+
+    /// What was written to a stream from `stream_into`.
+    fn written(dir: &std::path::Path) -> Vec<u8> {
+        std::fs::read(dir.join("stream")).expect("the stream file reads")
+    }
+
+    /// A file streams exactly its declared size whatever it holds, and the
+    /// status byte after the data says whether that was all of it.
+    #[test]
+    fn a_file_that_changed_size_is_flagged_after_its_data() {
+        let dir = Scratch::new("export-status");
+        std::fs::write(dir.join("file"), b"12345").unwrap();
+        for (declared, data, status) in [
+            (5, &b"12345"[..], 0),
+            (8, b"12345\0\0\0", 1),
+            (3, b"123", 1),
+        ] {
+            let stream = stream_into(&dir);
+            let file = fs::open(
+                dir.join("file"),
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            Walker {
+                stream: stream.as_fd(),
+            }
+            .stream_data(file.as_fd(), declared)
+            .expect("the data streams");
+            let mut expected = data.to_vec();
+            expected.push(status);
+            assert_eq!(written(&dir), expected, "declared {declared}");
+        }
+    }
+
+    /// A directory with more entries than the arena holds is refused before
+    /// anything of it is emitted, rather than walked out of order.
+    #[test]
+    fn a_directory_the_arena_cannot_hold_is_refused() {
+        let dir = Scratch::new("export-crowded");
+        std::fs::create_dir(dir.join("tree")).unwrap();
+        // Created out of order, so neither the order a filesystem lists them
+        // in by creation nor its reverse is the sorted one.
+        for name in ["entry-c", "entry-a", "entry-e", "entry-b", "entry-d"] {
+            std::fs::write(dir.join("tree").join(name), b"x").unwrap();
+        }
+        let tree = fs::open(
+            dir.join("tree"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let stream = stream_into(&dir);
+        let walker = Walker {
+            stream: stream.as_fd(),
+        };
+
+        let (mut names, mut order) = (vec![0u8; 4096], vec![0u32; 4]);
+        let arena = Arena {
+            names: &mut names,
+            order: &mut order,
+        };
+        assert_eq!(
+            walker.walk_dir(tree.as_fd(), 0, arena),
+            Err((ExportStep::Crowded, Errno::NOBUFS)),
+        );
+        let (mut names, mut order) = (vec![0u8; 8], vec![0u32; 16]);
+        let arena = Arena {
+            names: &mut names,
+            order: &mut order,
+        };
+        assert_eq!(
+            walker.walk_dir(tree.as_fd(), 0, arena),
+            Err((ExportStep::Crowded, Errno::NOBUFS)),
+        );
+        assert!(
+            written(&dir).is_empty(),
+            "the walk emitted part of a directory"
+        );
+
+        // With room, the same directory walks, in name order.
+        let (mut names, mut order) = (vec![0u8; 4096], vec![0u32; 16]);
+        let arena = Arena {
+            names: &mut names,
+            order: &mut order,
+        };
+        walker
+            .walk_dir(tree.as_fd(), 0, arena)
+            .expect("the directory walks");
+        let frames = written(&dir);
+        let mut seen = Vec::new();
+        for name in ["entry-a", "entry-b", "entry-c", "entry-d", "entry-e"] {
+            let at = frames
+                .windows(name.len())
+                .position(|window| window == name.as_bytes())
+                .expect("every entry is emitted");
+            seen.push(at);
+        }
+        assert!(
+            seen.is_sorted(),
+            "the entries are not in name order: {seen:?}"
+        );
     }
 
     /// The export child closes every descriptor it inherited but its own two.

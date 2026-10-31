@@ -64,7 +64,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ferroday_cage::{Cage, Overlay};
+use ferroday_cage::provision;
+use ferroday_cage::{Cage, IdentityMap, Overlay};
 
 mod common;
 
@@ -235,8 +236,16 @@ fn storm(options: &Options, scratch: &Path, trial: u32) -> Result<Misses, String
     // The layers are laid out once and the upper is cheap to re-create.
     let upper = scratch.join(format!("upper-{}", trial % 2));
     let work = scratch.join(format!("work-{}", trial % 2));
-    let _ = std::fs::remove_dir_all(&upper);
-    let _ = std::fs::remove_dir_all(&work);
+    // What the trial two back left is a tree a sandbox wrote, mode-`0` work
+    // directory included, so it goes the way the library removes such a tree.
+    // The cage runs under its default single map, and neither directory is a
+    // published rootfs with a lock beside it.
+    for layer in [&upper, &work] {
+        let _ = provision::Remove::new(layer)
+            .map(IdentityMap::Single)
+            .remove_lock(false)
+            .run();
+    }
     copy_tree(&scratch.join("upper"), &upper).map_err(|err| format!("staging the upper: {err}"))?;
     std::fs::create_dir_all(&work).map_err(|err| format!("staging the work dir: {err}"))?;
 

@@ -170,9 +170,10 @@ let cage = Cage::builder()
 
 Keeping the upper instead of discarding it gives an incremental build root
 layered over the shared stage3 — the same base, one upper per line of work.
-Discard an upper with `provision::remove` rather than `rm -rf`: the kernel
-creates a mode-`0` directory in the overlay's work area that a plain recursive
-delete cannot descend into.
+Discard an upper with `provision::Remove::overlay_upper` rather than `rm -rf`,
+naming the identity map the build ran under. It removes the overlay's hidden
+work directory along with the upper, including the mode-`0` directory the kernel
+leaves there.
 
 The library models one prepared root per launch and leaves the choice of reuse
 or renewal to the consumer; the overlay is how the choice is expressed without

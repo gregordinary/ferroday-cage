@@ -418,6 +418,65 @@ fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
     let _ = provision::remove(&dir);
 }
 
+/// Two threads exporting to one path each publish a whole archive.
+///
+/// The staging file is named for the call rather than for the process. A name
+/// keyed to the process is shared by every thread in it, so the second export
+/// would clear the first's staging file to make room, the first would publish
+/// the second's file while it was still being written, and the second's own
+/// rename would then find nothing to publish.
+#[test]
+fn two_threads_exporting_to_one_path_each_publish_a_whole_archive() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("concurrent");
+    let root = dir.join("root");
+    std::fs::create_dir_all(root.join("etc")).unwrap();
+    std::fs::write(root.join("etc/hostname"), b"box\n").unwrap();
+    // Large enough that the two exports are writing at the same time.
+    std::fs::write(root.join("payload"), vec![b'x'; 4 << 20]).unwrap();
+    let archive = dir.join("rootfs.tar");
+
+    for round in 0..4 {
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let exports: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        provision::Export::new(&root)
+                            .map(IdentityMap::Single)
+                            .write_to_path(&archive)
+                    })
+                })
+                .collect();
+            exports
+                .into_iter()
+                .map(|export| export.join().unwrap())
+                .collect()
+        });
+        for result in results {
+            result.unwrap_or_else(|err| panic!("an export of round {round} failed: {err}"));
+        }
+        let entries = parse_tar(&std::fs::read(&archive).unwrap());
+        let paths: Vec<&[u8]> = entries.iter().map(|entry| entry.path.as_slice()).collect();
+        assert_eq!(
+            paths,
+            [&b"./"[..], b"./etc/", b"./etc/hostname", b"./payload"],
+            "round {round} published an incomplete archive",
+        );
+    }
+
+    let leftovers: Vec<_> = std::fs::read_dir(&*dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".partial"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging files left behind: {leftovers:?}"
+    );
+}
+
 #[test]
 fn an_archive_written_inside_the_tree_it_exports_is_refused() {
     if !userns_available() {
@@ -826,7 +885,8 @@ fn exports_are_reproducible_across_entry_order() {
 }
 
 /// A directory larger than a single `getdents` batch exports with every entry
-/// present and in sorted order, exercising the multi-pass successor scan.
+/// present and in sorted order, its names read across several calls and sorted
+/// together.
 #[test]
 fn exports_a_large_directory_in_sorted_order() {
     if !userns_available() {
@@ -879,7 +939,7 @@ fn a_launch_leaves_only_its_mount_points_in_the_exported_tree() {
     // The preconditions the assertions below are about: a rootfs that ships
     // none of the paths the managed profile mounts on, and no resolv.conf.
     for mount_point in ["dev", "proc", "tmp"] {
-        let _ = std::fs::remove_dir_all(root.join(mount_point));
+        common::force_remove_dir_all(&root.join(mount_point));
     }
     let _ = std::fs::remove_file(root.join("etc/resolv.conf"));
 
@@ -1280,12 +1340,13 @@ fn a_copy_the_child_refuses_reports_the_childs_own_step() {
     let dir = scratch("copyin-child-step");
     let source = dir.join("source");
     let rootfs = dir.join("rootfs");
-    std::fs::create_dir_all(source.join("a-dir")).unwrap();
-    std::fs::create_dir_all(&rootfs).unwrap();
-    // The destination holds a regular file where the source holds a directory,
-    // so the child's `openat` of the directory it just tried to create answers
-    // ENOTDIR and it exits at once.
-    std::fs::write(rootfs.join("a-dir"), b"not a directory\n").unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a-file"), b"a file\n").unwrap();
+    // The destination holds a directory with something in it where the source
+    // holds a file. A copy replaces a file, a link or a pipe at a file's name,
+    // never a directory, so the child's unlink answers EISDIR and it exits at
+    // once.
+    std::fs::create_dir_all(rootfs.join("a-file/occupied")).unwrap();
     // Sorted after the refused entry and larger than a pipe's 64 KiB buffer, so
     // the walk is still writing long after the child is gone and the parent
     // takes the broken pipe rather than reaching the end of the tree.
@@ -1298,16 +1359,203 @@ fn a_copy_the_child_refuses_reports_the_childs_own_step() {
             source: cause,
             ..
         }) => {
-            assert_eq!(op, "opening a directory just created");
+            assert_eq!(op, "creating a file");
             assert_eq!(path, rootfs);
             assert_eq!(
                 cause.raw_os_error(),
-                Some(rustix::io::Errno::NOTDIR.raw_os_error()),
+                Some(rustix::io::Errno::ISDIR.raw_os_error()),
                 "the child's errno is carried through: {cause}"
             );
         }
         other => panic!("expected the child's own step, got {other:?}"),
     }
+    let _ = provision::remove(&dir);
+}
+
+/// A copy adds to the directories a root already has without rewriting them.
+///
+/// The source here is staged the way a caller under umask 077 stages one, with
+/// every directory `0700`, and stamped with a time of its own. The root's own
+/// `/etc` and home directory keep their modes, and their modification times are
+/// the kernel's account of the entries added rather than the source's.
+#[test]
+fn a_copy_keeps_the_directories_the_root_already_has() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !userns_available() {
+        return;
+    }
+    let stamp = |path: &Path, seconds: i64| {
+        let time = rustix::fs::Timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        };
+        rustix::fs::utimensat(
+            rustix::fs::CWD,
+            path,
+            &rustix::fs::Timestamps {
+                last_access: time,
+                last_modification: time,
+            },
+            rustix::fs::AtFlags::empty(),
+        )
+        .expect("the time is settable");
+    };
+    const SOURCE_TIME: i64 = 1_200_000_000;
+
+    let dir = scratch("copyin-adopt");
+    let rootfs = dir.join("rootfs");
+    for (path, mode) in [("etc", 0o755), ("home", 0o755), ("home/alice", 0o750)] {
+        std::fs::create_dir_all(rootfs.join(path)).unwrap();
+        std::fs::set_permissions(rootfs.join(path), PermissionsExt::from_mode(mode)).unwrap();
+    }
+    let source = dir.join("source");
+    std::fs::create_dir_all(source.join("etc")).unwrap();
+    std::fs::create_dir_all(source.join("home/alice")).unwrap();
+    std::fs::write(source.join("etc/motd"), b"hello\n").unwrap();
+    std::fs::write(source.join("home/alice/.profile"), b"umask 022\n").unwrap();
+    for path in ["home/alice", "home", "etc"] {
+        std::fs::set_permissions(source.join(path), PermissionsExt::from_mode(0o700)).unwrap();
+        stamp(&source.join(path), SOURCE_TIME);
+    }
+
+    provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+
+    assert_eq!(std::fs::read(rootfs.join("etc/motd")).unwrap(), b"hello\n");
+    assert_eq!(
+        std::fs::read(rootfs.join("home/alice/.profile")).unwrap(),
+        b"umask 022\n",
+    );
+    for (path, mode) in [("etc", 0o755), ("home", 0o755), ("home/alice", 0o750)] {
+        let meta = std::fs::metadata(rootfs.join(path)).unwrap();
+        assert_eq!(meta.mode() & 0o7777, mode, "{path}'s mode was rewritten");
+        assert_ne!(
+            meta.mtime(),
+            SOURCE_TIME,
+            "{path}'s modification time was rewritten"
+        );
+    }
+    let _ = provision::remove(&dir);
+}
+
+/// A copy into a range-mapped root leaves the owner of a directory the root
+/// already has alone: a file under a user's home does not re-own the home.
+#[cfg(feature = "subid")]
+#[test]
+fn a_copy_does_not_re_own_a_directory_the_root_already_has() {
+    use ferroday_cage::Cage;
+
+    if !userns_available() {
+        return;
+    }
+    if ferroday_cage::host::range_map_blocker().is_some() {
+        assert!(
+            std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
+            "a range map is required but unavailable"
+        );
+        eprintln!("skipping: no delegate can establish a range map");
+        return;
+    }
+    let Some(fixture) = fixture_rootfs() else {
+        return;
+    };
+
+    let dir = scratch("copyin-home");
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(rootfs.join("home/alice")).unwrap();
+    // The home belongs to uid 1000 inside the root, which takes the map to set.
+    let cage = Cage::builder()
+        .rootfs(fixture)
+        .bind(&rootfs, "/work")
+        .command("/bin/sh")
+        .args(["-c", "chown 1000:1000 /work/home/alice"])
+        .identity_map(IdentityMap::Subordinate)
+        .build()
+        .expect("the sandbox should build");
+    assert!(
+        cage.run().expect("the sandbox should launch").success(),
+        "chown in the cage failed",
+    );
+
+    let source = dir.join("source");
+    std::fs::create_dir_all(source.join("home/alice")).unwrap();
+    std::fs::write(source.join("home/alice/.profile"), b"umask 022\n").unwrap();
+    provision::CopyIn::new(&source, &rootfs)
+        .map(IdentityMap::Subordinate)
+        .run()
+        .expect("the copy succeeds");
+
+    let mut out = Vec::new();
+    provision::export_tar(&rootfs, &mut out, IdentityMap::Subordinate)
+        .expect("the copied tree exports");
+    let entries = parse_tar(&out);
+    let owner = |path: &[u8]| {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| panic!("{} is in the archive", bstr(path)));
+        (entry.uid, entry.gid)
+    };
+    assert_eq!(
+        owner(b"./home/alice/"),
+        (1000, 1000),
+        "the home was re-owned"
+    );
+    // The file itself is the copy's, at the id the caller's own file maps to.
+    assert_eq!(owner(b"./home/alice/.profile"), (0, 0));
+
+    provision::remove(&dir).expect("the range-mapped tree should be removable");
+}
+
+/// A copy into a merged-usr root lands through the root's aliases.
+///
+/// Such a root ships `/bin`, `/sbin`, `/lib` and `/lib64` as symbolic links into
+/// `/usr`, and a source that carries any of them as a directory has to land in
+/// the directory the link names. Replacing the link with a real directory would
+/// orphan the dynamic linker; refusing it would refuse every such copy.
+#[test]
+fn a_copy_into_a_merged_usr_root_lands_through_its_aliases() {
+    if !userns_available() {
+        return;
+    }
+    let dir = scratch("copyin-usrmerge");
+    let rootfs = dir.join("rootfs");
+    let aliases = ["bin", "sbin", "lib", "lib64"];
+    for alias in aliases {
+        std::fs::create_dir_all(rootfs.join("usr").join(alias)).unwrap();
+        std::os::unix::fs::symlink(format!("usr/{alias}"), rootfs.join(alias)).unwrap();
+    }
+    let source = dir.join("source");
+    for alias in aliases {
+        std::fs::create_dir_all(source.join(alias)).unwrap();
+        std::fs::write(source.join(alias).join("probe"), alias.as_bytes()).unwrap();
+    }
+    // Two names for one file, both reached through an alias.
+    std::fs::hard_link(source.join("bin/probe"), source.join("sbin/probe-link")).unwrap();
+
+    provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+
+    for alias in aliases {
+        assert!(
+            std::fs::symlink_metadata(rootfs.join(alias))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "/{alias} was replaced by a directory",
+        );
+        assert_eq!(
+            std::fs::read(rootfs.join("usr").join(alias).join("probe")).unwrap(),
+            alias.as_bytes(),
+        );
+    }
+    let ino = |path: &str| {
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(rootfs.join(path)).unwrap())
+    };
+    assert_eq!(ino("usr/sbin/probe-link"), ino("usr/bin/probe"));
     let _ = provision::remove(&dir);
 }
 

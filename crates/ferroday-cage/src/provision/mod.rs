@@ -49,7 +49,7 @@ use crate::mechanism::frame;
 mod binfmt;
 #[cfg(feature = "tarball")]
 mod compress;
-mod containment;
+pub(crate) mod containment;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod coordinate;
 mod copyin;
@@ -572,20 +572,23 @@ which arises for the same reason.
         /// Why no delegate could establish the identity map.
         reason: String,
     },
-    /// A source file changed size while a [`CopyIn`] was reading it, so the
-    /// copy could not reproduce it.
+    /// A file changed while it was being read, so the result could not
+    /// reproduce it.
     ///
-    /// The copy commits a file's length before it reads the contents, and the
-    /// in-map writer reads exactly that many bytes. A file that grew or shrank
-    /// in between is therefore written truncated or zero-padded, and the run
-    /// reports this rather than presenting the result as a copy: a source tree
-    /// changing underneath a copy is something the caller would rather hear
-    /// about than discover in the rootfs later.
+    /// A [`CopyIn`] reports it for a file in its source, and an export for a
+    /// file in the tree it archives. Both commit a file's length before they
+    /// read its contents, and the far side of the walk counts exactly that many
+    /// bytes. A file that grew or shrank in between is therefore written
+    /// truncated or zero-padded, and the run reports this rather than
+    /// presenting the result as a copy. A copy also reports a name that stopped
+    /// naming the file it had inspected before it opened it. A tree changing
+    /// underneath a walk is something the caller would rather hear about than
+    /// discover later.
     #[non_exhaustive]
     SourceChanged {
-        /// The source file that changed.
+        /// The file that changed.
         path: PathBuf,
-        /// The length the copy recorded and wrote.
+        /// The length the walk recorded for it.
         recorded: u64,
     },
 }
@@ -682,8 +685,8 @@ impl fmt::Display for ProvisionError {
             ),
             ProvisionError::SourceChanged { path, recorded } => write!(
                 f,
-                "{} changed size while it was being copied: {recorded} bytes were recorded \
-                 and written, which is no longer what the file holds",
+                "{} changed while it was being read: {recorded} bytes were recorded for it, \
+                 which is no longer what it holds",
                 path.display(),
             ),
             #[cfg(feature = "tarball")]
@@ -841,19 +844,23 @@ impl<'obs> Provision<'obs> {
 /// ```
 pub struct Remove<'a> {
     dest: PathBuf,
+    /// The overlay work directory removed after `dest`, for a removal of an
+    /// overlay upper.
+    work: Option<PathBuf>,
     map: crate::IdentityMap,
     mapper: Option<&'a dyn crate::idmap::IdMapper>,
     remove_lock: bool,
 }
 
 impl fmt::Debug for Remove<'_> {
-    /// Renders the tree, the map it was written under, whether a
-    /// caller-supplied mapper was given, and whether the publication lock is
-    /// removed with the tree. The mapper renders by its presence rather than
-    /// its contents.
+    /// Renders the tree, the overlay work directory removed with it, the map
+    /// both were written under, whether a caller-supplied mapper was given, and
+    /// whether the publication lock is removed with the tree. The mapper
+    /// renders by its presence rather than its contents.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Remove")
             .field("dest", &self.dest)
+            .field("work", &self.work)
             .field("map", &self.map)
             .field(
                 "mapper",
@@ -877,9 +884,43 @@ impl<'a> Remove<'a> {
     pub fn new(dest: impl AsRef<Path>) -> Remove<'a> {
         Remove {
             dest: dest.as_ref().to_path_buf(),
+            work: None,
             map: crate::IdentityMap::Subordinate,
             mapper: None,
             remove_lock: true,
+        }
+    }
+
+    /// Returns a removal of the upper layer of an overlay root, together with
+    /// the work directory the library manages beside it.
+    ///
+    /// Discarding the upper is how a run on
+    /// [`overlay_rootfs`](crate::CageBuilder::overlay_rootfs) is reverted. The
+    /// overlay also needs a work directory on the upper's filesystem, which the
+    /// library creates as a hidden sibling of the upper and the kernel fills
+    /// with a directory of mode `0`. This removes both, so nothing the overlay
+    /// root created outlives it.
+    ///
+    /// Name the identity map the sandbox ran under with [`map`](Self::map): a
+    /// sandbox's own default is
+    /// [`IdentityMap::Single`](crate::IdentityMap::Single), while this
+    /// builder's is the subordinate map. The map decides how an entry the
+    /// calling user cannot remove is removed, so a tree a range-mapped sandbox
+    /// wrote needs its map, and a single-mapped one needs no subordinate ids.
+    ///
+    /// The publication lock is not removed: an upper is not a published rootfs,
+    /// so a `<upper>.lock` beside it is a path this removal has no claim to. An
+    /// overlay that names its own work directory through
+    /// [`Overlay::work`](crate::Overlay::work) removes that directory with a
+    /// [`Remove::new`] of its own, with the lock declined.
+    pub fn overlay_upper(upper: impl AsRef<Path>) -> Remove<'a> {
+        let upper = upper.as_ref();
+        Remove {
+            dest: upper.to_path_buf(),
+            work: crate::spec::overlay_work_dir(upper),
+            map: crate::IdentityMap::Subordinate,
+            mapper: None,
+            remove_lock: false,
         }
     }
 
@@ -919,18 +960,29 @@ impl<'a> Remove<'a> {
     ///
     /// The tree itself is removed identically either way; this governs the
     /// sibling file only.
+    ///
+    /// The lock is also what a removal holds while it runs. A removal that
+    /// takes the lock waits for a publication of the same destination to
+    /// finish, and a publication waits for the removal in turn, so neither
+    /// sees the other half done. A removal that declines the lock takes no part
+    /// in that exclusion.
     pub fn remove_lock(mut self, remove: bool) -> Remove<'a> {
         self.remove_lock = remove;
         self
     }
 
-    /// Removes the tree.
+    /// Removes the tree, and the overlay work directory beside it for an
+    /// [`overlay_upper`](Self::overlay_upper) removal.
     ///
     /// # Errors
     ///
     /// As [`remove`].
     pub fn run(self) -> Result<(), ProvisionError> {
-        remove_dest(&self.dest, &self.map, self.mapper, self.remove_lock)
+        remove_dest(&self.dest, &self.map, self.mapper, self.remove_lock)?;
+        match &self.work {
+            Some(work) => remove_dest(work, &self.map, self.mapper, false),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1017,22 +1069,10 @@ fn ensure_inner(
     };
     fs::create_dir_all(parent).map_err(|err| ProvisionError::io("creating", parent, err))?;
 
-    let mut lock_name = name.to_os_string();
-    lock_name.push(".lock");
-    let lock_path = parent.join(lock_name);
-    // NOFOLLOW so a symlink pre-planted at the lock path (in a world-writable
-    // parent) cannot redirect the lock, and with it a later write, elsewhere.
-    // CLOEXEC so the helpers a provisioning run executes — an identity-map
-    // delegate's `newuidmap`, say — do not inherit the descriptor and hold the
-    // lock open past their own lifetimes.
-    let lock = rustix::fs::open(
-        &lock_path,
-        OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
-    )
-    .map_err(|errno| ProvisionError::io("creating", &lock_path, errno.into()))?;
-    frame::retry_on_intr!(rustix::fs::flock(&lock, FlockOperation::LockExclusive))
-        .map_err(|errno| ProvisionError::io("locking", &lock_path, errno.into()))?;
+    let lock_path = parent.join(lock_name(name));
+    // Held until this function returns, on the failure paths as on success.
+    let _lock =
+        lock_exclusive(&lock_path).map_err(|err| ProvisionError::io("locking", &lock_path, err))?;
 
     // Re-check under the lock: another caller may have finished the work
     // while this one waited.
@@ -1054,16 +1094,13 @@ fn ensure_inner(
     // A leftover staging tree is a crashed prior run; the lock guarantees
     // no live owner. The removal escalates through the identity map, since
     // the crashed run may have been range-mapped and left subordinate-owned
-    // files. Inspect without following symlinks: a symlink pre-planted at the
-    // staging path (in a world-writable parent) is removed as a link, never
-    // followed into a removal of whatever it points at.
+    // files. The removal never follows a symlink at the staging path: one
+    // pre-planted there (in a world-writable parent) is removed as a link,
+    // never followed into a removal of whatever it points at.
     match fs::symlink_metadata(&staging) {
-        Ok(meta) if meta.is_symlink() => {
-            fs::remove_file(&staging)
-                .map_err(|err| ProvisionError::io("removing", &staging, err))?;
-        }
         Ok(_) => remove_tree(&staging, &crate::IdentityMap::Subordinate, None)?,
-        Err(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(ProvisionError::io("inspecting", &staging, err)),
     }
     fs::create_dir(&staging).map_err(|err| ProvisionError::io("creating", &staging, err))?;
 
@@ -1107,18 +1144,25 @@ fn ensure_inner(
 ///
 /// A sandbox under a [range identity map](crate::IdentityMap) writes real
 /// ownership: files it chowned to non-root ids are owned by subordinate ids
-/// on the host, which a plain `remove_dir_all` cannot delete. This removal
-/// starts plain and, when it is refused, re-enters the same map — a forked
-/// process unshares a user namespace, the bundled delegates establish the
-/// subordinate map for it, and the tree is deleted from inside, where the
-/// ids are the caller's own. The rootless container runtimes' `unshare rm`
-/// pattern, as a library call.
+/// on the host, which the calling user cannot delete. This removal starts as
+/// the calling user and, when ownership or a directory's own mode refuses it,
+/// re-enters the same map. A forked process unshares a user namespace, the
+/// bundled delegates establish the subordinate map for it, and the tree is
+/// deleted from inside, where the ids are the caller's own. The rootless
+/// container runtimes' `unshare rm` pattern, as a library call.
+///
+/// Both attempts walk the tree iteratively, holding a few descriptors and no
+/// stack per level, and never follow a symbolic link. A tree a sandbox nested
+/// arbitrarily deep therefore costs what a shallow one does, where a recursive
+/// removal would exhaust the descriptor table or the stack.
 ///
 /// Removing a path that does not exist is not an error, so the call is
 /// idempotent; a path that is not a directory is removed as the file it is.
 ///
 /// The `<name>.lock` file [`ensure`] leaves beside the destination goes with
-/// it, so create and destroy round-trip and nothing is left behind. A
+/// it, so create and destroy round-trip and nothing is left behind. The removal
+/// holds that lock while it runs, so it waits for a publication of the same
+/// destination in progress, and one that starts meanwhile waits for it. A
 /// destination that was never published through `ensure` has no lock to
 /// remove, and a removal of a destination whose provision failed clears the
 /// lock that was left beside no rootfs. A caller whose destination *contains*
@@ -1142,64 +1186,152 @@ pub fn remove(dest: impl AsRef<Path>) -> Result<(), ProvisionError> {
     remove_dest(dest.as_ref(), &crate::IdentityMap::Subordinate, None, true)
 }
 
-/// The shared body of [`remove`] and [`Remove::run`]: dispatch a non-directory
-/// or missing path, then remove a directory tree with the given resolution,
-/// and finally the publication lock [`ensure`] left beside it.
+/// The shared body of [`remove`] and [`Remove::run`]: take the publication lock
+/// [`ensure`] keeps beside `dest`, remove whatever is at `dest` with the given
+/// resolution, and delete the lock file while still holding it.
 ///
-/// `lock` says whether that last step runs. [`Remove::remove_lock`] clears it,
-/// for a `dest` that holds published trees rather than being one.
+/// `lock` says whether the lock takes part at all. [`Remove::remove_lock`]
+/// clears it, for a `dest` that holds published trees rather than being one.
+///
+/// The lock file is deleted after the tree, so a failure to delete the rootfs
+/// leaves the lock guarding it. Deleting it while it is held is what keeps a
+/// waiting publication honest: the publication is granted a lock on a file no
+/// longer at the path, notices, and takes the lock again on the file a later
+/// caller creates there, rather than proceeding beside it. A destination that
+/// was never published through [`ensure`] has no lock until this creates one
+/// to hold, which is not a way to tell a published destination from a
+/// containing one: that is why [`Remove::remove_lock`] is a caller-supplied
+/// flag rather than this probing for it.
 fn remove_dest(
     dest: &Path,
     map: &crate::IdentityMap,
     mapper: Option<&dyn crate::idmap::IdMapper>,
     lock: bool,
 ) -> Result<(), ProvisionError> {
+    let held = match lock_path(dest).filter(|_| lock) {
+        // Nothing at either path is nothing to remove and no lock to delete,
+        // so there is no publication to exclude, and no lock file to create in
+        // a directory that may not take one.
+        Some(path) if !occupied(dest)? && !occupied(&path)? => return Ok(()),
+        Some(path) => match lock_exclusive(&path) {
+            Ok(held) => Some((path, held)),
+            // The destination's directory went away in between, and with it
+            // anything to remove.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(ProvisionError::io("locking", &path, err)),
+        },
+        None => None,
+    };
+
     match fs::symlink_metadata(dest) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(ProvisionError::io("inspecting", dest, err)),
-        Ok(meta) if !meta.is_dir() => {
-            fs::remove_file(dest).map_err(|err| ProvisionError::io("removing", dest, err))?;
-        }
         Ok(_) => remove_tree(dest, map, mapper)?,
     }
-    if lock { remove_lock(dest) } else { Ok(()) }
+
+    if let Some((path, _held)) = held {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(ProvisionError::io("removing", &path, err)),
+        }
+    }
+    Ok(())
 }
 
-/// Removes the `<name>.lock` file [`ensure`] leaves beside a published rootfs,
-/// so create and destroy round-trip and a failed provision leaves no orphan.
-///
-/// Removed after the tree, so a failure to delete the rootfs leaves the lock
-/// guarding it. A destination that was never published through [`ensure`] has
-/// no lock, which is not an error — but neither is that a way to tell a
-/// published destination from a containing one, which is why
-/// [`Remove::remove_lock`] is a caller-supplied flag rather than this probing
-/// for it.
-///
-/// Removing the lock is safe only because a removal and a concurrent
-/// publication of the same destination are already mutually exclusive: a caller
-/// that deletes a rootfs another thread or process is provisioning has no
-/// defined outcome, lock or no lock.
-fn remove_lock(dest: &Path) -> Result<(), ProvisionError> {
-    let (Some(name), Some(parent)) = (dest.file_name(), dest.parent()) else {
-        return Ok(());
-    };
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    let mut lock_name = name.to_os_string();
-    lock_name.push(".lock");
-    let lock_path = parent.join(lock_name);
-    match fs::remove_file(&lock_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(ProvisionError::io("removing", &lock_path, err)),
+/// Whether anything is at `path`, a symbolic link included, without following
+/// one.
+fn occupied(path: &Path) -> Result<bool, ProvisionError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(ProvisionError::io("inspecting", path, err)),
     }
 }
 
-/// Removes a directory tree: plain removal first, escalated through the
-/// identity map when ownership refuses the plain path.
+/// The name of the publication lock [`ensure`] keeps beside a destination of
+/// this name: `<name>.lock`.
+fn lock_name(name: &std::ffi::OsStr) -> OsString {
+    let mut lock = name.to_os_string();
+    lock.push(".lock");
+    lock
+}
+
+/// The path of the publication lock beside `dest`, or `None` for a path with no
+/// final component, which [`ensure`] refuses to publish at.
+fn lock_path(dest: &Path) -> Option<PathBuf> {
+    let name = dest.file_name()?;
+    let parent = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Some(parent.join(lock_name(name)))
+}
+
+/// How many times [`lock_exclusive`] takes its lock again after the file it
+/// locked was removed from the path while it waited.
+///
+/// One retry answers an ordinary removal; each further one needs another
+/// removal to complete in the moment between an open and its lock. The bound
+/// exists for the reason the resolution retries have one: the lock file sits
+/// in a directory this crate does not control, and something deleting it in a
+/// loop must not be able to hold a caller in this one forever.
+const LOCK_ATTEMPTS: u32 = 16;
+
+/// Takes an exclusive `flock` on the lock file at `path`, creating it if
+/// absent, and returns the descriptor that holds it. Dropping the descriptor
+/// releases the lock.
+///
+/// The one answer to taking a lock file, which [`ensure`] serializes
+/// publications on and the Debian pool serializes its publishes on:
+///
+/// - `O_NOFOLLOW`, so a symbolic link pre-planted at the path cannot redirect
+///   the lock, and with it the work the lock serializes, elsewhere.
+/// - `O_CLOEXEC`, so a process the holder spawns does not inherit the
+///   descriptor. A `flock` belongs to the open file description, so an
+///   inherited copy keeps the lock held until that process exits as well,
+///   whenever the holder itself lets go.
+/// - Once the lock is granted, the path is checked to still name the file that
+///   was locked. A removal deletes a lock file while it holds it, and a caller
+///   that had opened the file before the deletion is granted a lock no later
+///   caller can see. It takes the lock again on the file now at the path.
+///
+/// The wait for the lock is unbounded, which is what a caller that meets
+/// contention wants: the work behind the lock rather than an error.
+pub(crate) fn lock_exclusive(path: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    for _ in 0..LOCK_ATTEMPTS {
+        let lock = rustix::fs::open(
+            path,
+            OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+        )?;
+        // The call `clippy.toml` sends every other site here for: this is
+        // that answer.
+        #[expect(clippy::disallowed_methods)]
+        let locked = frame::retry_on_intr!(rustix::fs::flock(&lock, FlockOperation::LockExclusive));
+        locked?;
+        let held = rustix::fs::fstat(&lock)?;
+        match rustix::fs::lstat(path) {
+            Ok(named) if named.st_dev == held.st_dev && named.st_ino == held.st_ino => {
+                return Ok(lock);
+            }
+            // Removed, or removed and created again, while this waited.
+            Ok(_) | Err(Errno::NOENT) => continue,
+            Err(errno) => return Err(errno.into()),
+        }
+    }
+    Err(Errno::AGAIN.into())
+}
+
+/// Removes whatever is at `dest` — a directory tree, a file, a symbolic link —
+/// as the calling user first, escalated through the identity map when
+/// ownership or a directory's own mode refuses that.
+///
+/// Both attempts take [`delete_tree`](crate::mechanism::delete_tree)'s walk:
+/// iterative, a few descriptors at any depth, never following a symbolic link.
+/// It is the answer to removing a tree untrusted code may have written, where
+/// `std::fs::remove_dir_all` recurses with a descriptor and a stack frame per
+/// level and a sandbox can nest a tree deep enough to exhaust either.
 ///
 /// The escalation re-enters `map`: a range map through `mapper` when one is
 /// supplied and the bundled delegate chain otherwise, and a single-identity
@@ -1207,23 +1339,27 @@ fn remove_lock(dest: &Path) -> Result<(), ProvisionError> {
 /// re-entering even though its ids are the caller's own already, because the
 /// child holds `CAP_DAC_OVERRIDE` and `CAP_FOWNER` over them there: a
 /// directory whose own mode denies the search or write the deletion needs
-/// refuses the plain path and yields to the mapped one.
+/// refuses the caller and yields to the mapped child.
+///
+/// Only those refusals, `EACCES` and `EPERM`, escalate. Every other failure is
+/// one the mapped child would meet in the same place — a read-only filesystem,
+/// a mount point in the tree — and is reported as the caller's own, rather than
+/// as an escalation that a host without a delegate could not attempt.
 ///
 /// Also used by [`ensure`]'s staging cleanup, so a crashed provisioning run
 /// cannot wedge the destination.
-fn remove_tree(
+pub(crate) fn remove_tree(
     dest: &Path,
     map: &crate::IdentityMap,
     mapper: Option<&dyn crate::idmap::IdMapper>,
 ) -> Result<(), ProvisionError> {
     use std::os::unix::ffi::OsStrExt;
 
-    let denied = match fs::remove_dir_all(dest) {
+    let (parent, leaf) = parent_and_leaf(dest)?;
+    let denied = match delete_in_process(parent, &leaf) {
         Ok(()) => return Ok(()),
-        // EACCES and EPERM are the ownership refusals; anything else is an
-        // ordinary failure with nothing to escalate.
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => err,
-        Err(err) => return Err(ProvisionError::io("removing", dest, err)),
+        Err(errno @ (Errno::ACCESS | Errno::PERM)) => io::Error::from(errno),
+        Err(errno) => return Err(ProvisionError::io("removing", dest, errno.into())),
     };
 
     let unprivileged = |source: io::Error, reason: String| ProvisionError::RemoveUnprivileged {
@@ -1239,26 +1375,15 @@ fn remove_tree(
         Err(reason) => return Err(unprivileged(denied, reason)),
     };
 
-    let parent = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let Some(leaf) = dest.file_name() else {
-        return Err(ProvisionError::DestUnusable {
-            path: dest.to_path_buf(),
-        });
-    };
-    let nul = |_| {
+    let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
         ProvisionError::io(
             "removing",
             dest,
             io::Error::from(io::ErrorKind::InvalidInput),
         )
-    };
-    let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(nul)?;
-    let leaf_c = std::ffi::CString::new(leaf.as_bytes()).map_err(nul)?;
+    })?;
 
-    crate::mechanism::remove_tree_mapped(&parent_c, &leaf_c, map_source.child_map()).map_err(
+    crate::mechanism::remove_tree_mapped(&parent_c, &leaf, map_source.child_map()).map_err(
         |failure| match failure {
             crate::mechanism::RemoveFailure::Step { step, errno } => {
                 ProvisionError::io(step.describe(), dest, io::Error::from_raw_os_error(errno))
@@ -1271,6 +1396,41 @@ fn remove_tree(
             ),
         },
     )
+}
+
+/// `dest`'s directory and final component, in the shapes the removal walk takes
+/// them: a path to open and a name to resolve against it.
+fn parent_and_leaf(dest: &Path) -> Result<(&Path, std::ffi::CString), ProvisionError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(leaf) = dest.file_name() else {
+        return Err(ProvisionError::DestUnusable {
+            path: dest.to_path_buf(),
+        });
+    };
+    let parent = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let leaf = std::ffi::CString::new(leaf.as_bytes()).map_err(|_| {
+        ProvisionError::io(
+            "removing",
+            dest,
+            io::Error::from(io::ErrorKind::InvalidInput),
+        )
+    })?;
+    Ok((parent, leaf))
+}
+
+/// Deletes `leaf` under the directory at `parent` as the calling user, through
+/// the walk every removal takes.
+fn delete_in_process(parent: &Path, leaf: &std::ffi::CStr) -> Result<(), Errno> {
+    let parent = rustix::fs::open(
+        parent,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    crate::mechanism::delete_tree(std::os::fd::AsFd::as_fd(&parent), leaf)
 }
 
 /// A writer that forwards to an inner writer until a byte ceiling is crossed,
@@ -1348,14 +1508,18 @@ pub(crate) fn now_epoch() -> Option<i64> {
 /// the call that asked for it.
 ///
 /// The name is unique so that concurrent writers of one destination — provisions
-/// sharing a package cache, publishers sharing a pool — each stage their own
-/// file and each publish it with a rename. A staging name shared between them
-/// would let one writer's rename consume the other's file, failing the second
-/// with `ENOENT`.
+/// sharing a package cache, publishers sharing a pool, two threads exporting to
+/// one archive — each stage their own file and each publish it with a rename. A
+/// staging name shared between them would let one writer's rename consume the
+/// other's file, publishing a file still being written and failing the second
+/// writer with `ENOENT`. A name keyed to the process alone is shared that way by
+/// every thread in it.
 ///
 /// The staging file is a sibling of the destination, so the rename that
-/// publishes it stays within one directory and one filesystem.
-#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+/// publishes it stays within one directory and one filesystem. A caller creates
+/// it exclusively, which is what establishes that the name is the caller's
+/// alone; nothing already at the name is ever removed to make room.
+#[cfg(feature = "tarball")]
 fn staging_path(dest: &Path) -> PathBuf {
     let dir = dest.parent().unwrap_or(Path::new("."));
     let name = dest.file_name().unwrap_or(dest.as_os_str());
@@ -1430,7 +1594,9 @@ impl PackageCache {
 impl Drop for PackageCache {
     fn drop(&mut self) {
         if self.owned {
-            let _ = std::fs::remove_dir_all(&self.path);
+            // Best effort, as a drop must be. The cache holds what the run
+            // downloaded, all of it the calling user's own.
+            let _ = remove_tree(&self.path, &crate::IdentityMap::Single, None);
         }
     }
 }
@@ -1509,6 +1675,26 @@ mod tests {
     fn remove_is_idempotent_on_a_missing_path() {
         let dir = Scratch::for_test("provision", "remove-missing");
         remove(dir.join("never-created")).expect("removing nothing is not an error");
+    }
+
+    #[test]
+    fn removing_nothing_creates_no_lock_and_needs_no_write() {
+        // The removal holds the publication lock only where there is something
+        // to remove or a lock to delete; with neither, it touches nothing, so a
+        // directory the caller cannot write is no obstacle to removing nothing.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = Scratch::for_test("provision", "remove-nothing");
+        let sealed = dir.join("sealed");
+        fs::create_dir(&sealed).unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+        remove(sealed.join("never-created")).expect("removing nothing is not an error");
+        assert_eq!(
+            fs::read_dir(&sealed).unwrap().count(),
+            0,
+            "the removal left a lock"
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -1608,6 +1794,228 @@ mod tests {
         // it still clears the orphan.
         remove(&dest).expect("removing an absent rootfs is not an error");
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_lock_is_not_inherited_by_a_process_its_holder_spawns() {
+        // A `flock` belongs to the open file description, so a child that
+        // inherited the descriptor would keep the lock held after the holder
+        // let go -- a publish that returned, with its destination still locked
+        // for as long as something it spawned lives on.
+        let dir = Scratch::for_test("provision", "lock-cloexec");
+        let path = dir.join("held.lock");
+        let held = lock_exclusive(&path).expect("the lock is taken");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a process is spawned while the lock is held");
+        drop(held);
+
+        let other = rustix::fs::open(&path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
+            .expect("the lock file opens");
+        // Probing the lock from outside the helper is the point of the test.
+        #[expect(clippy::disallowed_methods)]
+        let taken = rustix::fs::flock(&other, FlockOperation::NonBlockingLockExclusive);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(taken, Ok(()), "the spawned process kept the lock held");
+    }
+
+    #[test]
+    fn a_waiter_whose_lock_file_was_removed_takes_the_lock_again() {
+        // A removal deletes the lock file while it holds it. A caller already
+        // queued on that file is then granted a lock on a file no later caller
+        // can open, and must take the lock again on the one at the path, or two
+        // publications proceed at once.
+        use std::time::Duration;
+
+        let dir = Scratch::for_test("provision", "lock-replaced");
+        let path = dir.join("rootfs.lock");
+        let held = lock_exclusive(&path).expect("the lock is taken");
+        let waiter = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let lock = lock_exclusive(&path).expect("the waiter takes the lock");
+                let locked = rustix::fs::fstat(&lock).expect("the lock stats");
+                let named = rustix::fs::lstat(&path).expect("the path names a lock file");
+                (locked.st_ino, named.st_ino)
+            }
+        });
+        // Long enough for the waiter to have opened the file and queued on it.
+        std::thread::sleep(Duration::from_millis(200));
+        fs::remove_file(&path).expect("the lock file is removable");
+        drop(held);
+
+        let (locked, named) = waiter.join().expect("the waiter finishes");
+        assert_eq!(
+            locked, named,
+            "the waiter holds a lock on a file the path no longer names",
+        );
+    }
+
+    #[test]
+    fn a_removal_waits_for_a_publication_in_progress() {
+        // `Remove` holds the publication lock, so it cannot delete a rootfs
+        // out from under a provisioner still writing it, nor delete the lock
+        // file that provisioner's waiters are queued on.
+        use std::time::Duration;
+
+        let dir = Scratch::for_test("provision", "remove-waits");
+        let dest = dir.join("rootfs");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("marker"), b"x").unwrap();
+        let held = lock_exclusive(&dir.join("rootfs.lock")).expect("the lock is taken");
+        let remover = std::thread::spawn({
+            let dest = dest.clone();
+            move || remove(&dest)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            dest.join("marker").exists(),
+            "the removal ran while a publication held the lock",
+        );
+        drop(held);
+        remover
+            .join()
+            .expect("the removal finishes")
+            .expect("the removal succeeds once the lock is free");
+        assert!(!dest.exists());
+        assert!(!dir.join("rootfs.lock").exists(), "the lock goes with it");
+    }
+
+    /// The marker the deep-tree test's child process finds its tree by.
+    const DEEP_TREE: &str = "FERRODAY_CAGE_TEST_DEEP_TREE";
+
+    /// Lays out a chain of `depth` directories under `root`, each named
+    /// `level`, through relative descriptors: a chain this deep is longer than
+    /// `PATH_MAX` and cannot be spelled as one path. Returns the deepest.
+    fn deep_chain(root: &Path, depth: usize) -> std::os::fd::OwnedFd {
+        let mut deep = rustix::fs::open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("the root opens");
+        for _ in 0..depth {
+            rustix::fs::mkdirat(&deep, c"level", Mode::RWXU).expect("a level is creatable");
+            deep = rustix::fs::openat(
+                &deep,
+                c"level",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("a level opens");
+        }
+        deep
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_descriptor_limit_is_removed() {
+        // A recursive removal holds a descriptor per level, so a tree a sandbox
+        // nested deeper than the caller's descriptor limit could not be removed
+        // at all -- and with a limit high enough, the recursion overflows the
+        // stack instead. The removal runs in a child process of its own, so the
+        // limit it lowers is its own rather than every other test's.
+        if let Some(tree) = std::env::var_os(DEEP_TREE) {
+            let limit = rustix::process::Rlimit {
+                current: Some(32),
+                maximum: Some(32),
+            };
+            rustix::process::setrlimit(rustix::process::Resource::Nofile, limit)
+                .expect("the descriptor limit lowers");
+            remove(PathBuf::from(tree)).expect("the deep tree is removed");
+            return;
+        }
+
+        let dir = Scratch::for_test("provision", "deep-tree");
+        let tree = dir.join("tree");
+        fs::create_dir(&tree).unwrap();
+        let deepest = deep_chain(&tree, 3_000);
+        rustix::fs::symlinkat(c"/nowhere", &deepest, c"dangling").unwrap();
+        drop(deepest);
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "provision::tests::a_tree_deeper_than_the_descriptor_limit_is_removed",
+            "--test-threads=1",
+        ])
+        .env(DEEP_TREE, &tree)
+        .status()
+        .expect("the child test process runs");
+        assert!(
+            status.success(),
+            "the removal failed in the child: {status}"
+        );
+        assert!(!tree.exists(), "the tree survived removal");
+    }
+
+    #[test]
+    fn a_mode_locked_directory_deep_in_a_tree_yields_to_the_single_map() {
+        // The caller removes everything it can, down a chain longer than
+        // `PATH_MAX`, and then meets a directory whose own mode denies it the
+        // read the walk needs -- what an overlay leaves in its work area, with
+        // something inside it. The single-map escalation finishes the job.
+        if let Some(blocker) = crate::host::userns_blocker() {
+            eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
+            return;
+        }
+        let dir = Scratch::for_test("provision", "deep-sealed");
+        let tree = dir.join("tree");
+        fs::create_dir(&tree).unwrap();
+        let deepest = deep_chain(&tree, 2_000);
+        rustix::fs::symlinkat(c"/nowhere", &deepest, c"dangling").unwrap();
+        rustix::fs::mkdirat(&deepest, c"work", Mode::RWXU).unwrap();
+        let sealed = rustix::fs::openat(
+            &deepest,
+            c"work",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        drop(
+            rustix::fs::openat(
+                &sealed,
+                c"inner",
+                OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
+                Mode::RUSR,
+            )
+            .unwrap(),
+        );
+        rustix::fs::fchmod(&sealed, Mode::empty()).unwrap();
+        drop((sealed, deepest));
+
+        remove_tree(&tree, &crate::IdentityMap::Single, None).expect("the tree is removed");
+        assert!(!tree.exists(), "the tree survived removal");
+    }
+
+    #[test]
+    fn an_overlay_upper_goes_with_its_work_directory_and_leaves_the_lock() {
+        // The work directory is the library's own creation beside the upper,
+        // and goes with it, mode-`0` inner directory and all. A `.lock` beside
+        // the upper was never this removal's: an upper is not a published
+        // rootfs.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = Scratch::for_test("provision", "overlay-upper");
+        let upper = dir.join("upper");
+        fs::create_dir_all(upper.join("etc")).unwrap();
+        fs::write(upper.join("etc/hostname"), b"build\n").unwrap();
+        let work = crate::spec::overlay_work_dir(&upper).expect("the upper has a parent");
+        fs::create_dir_all(work.join("work")).unwrap();
+        fs::set_permissions(work.join("work"), fs::Permissions::from_mode(0o000)).unwrap();
+        let lock = dir.join("upper.lock");
+        fs::write(&lock, b"someone else's").unwrap();
+
+        Remove::overlay_upper(&upper)
+            .map(crate::IdentityMap::Single)
+            .run()
+            .expect("the upper is removed");
+        assert!(!upper.exists(), "the upper survived");
+        assert!(!work.exists(), "the work directory survived");
+        assert_eq!(fs::read(&lock).unwrap(), b"someone else's");
     }
 
     #[test]

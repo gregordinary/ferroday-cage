@@ -36,6 +36,15 @@
 //! steps an errno the operation's own error carries — so the errno-level
 //! algorithm is stated once and each caller says what its failures are.
 //!
+//! # Opening what a walk found or made
+//!
+//! A walk that inspects a name and then opens it can find something else
+//! there by the time it opens it. [`open_typed_file`] opens a regular file the
+//! caller has just looked at, and [`open_created_fifo`] a named pipe it has
+//! just made. Neither waits on whatever has taken the name, and each refuses
+//! anything but the entry the caller meant. Both allocate nothing, so the
+//! mechanism's post-fork walks use them as the host-side steps do.
+//!
 //! # A tree staged over a lower layer
 //!
 //! A layered build writes into an overlay upper, and the overlay shows that
@@ -124,20 +133,34 @@ fn joined<C: AsRef<[u8]>>(components: &[C]) -> Result<CString, Errno> {
 /// `EAGAIN` it kept receiving, which is the accurate answer — the resolution
 /// really was raced every time — and the caller reports it against whatever it
 /// was opening.
-pub(super) fn open_dir<C: AsRef<[u8]>>(
+pub(crate) fn open_dir<C: AsRef<[u8]>>(
     anchor: BorrowedFd<'_>,
     components: &[C],
     access: OFlags,
     containment: ResolveFlags,
 ) -> Result<OwnedFd, Errno> {
-    let path = joined(components)?;
+    open_dir_path(anchor, &joined(components)?, access, containment)
+}
+
+/// [`open_dir`] for a path already joined and terminated, with everything that
+/// function states.
+///
+/// The one form that allocates nothing, so the copy-in child calls it after
+/// the fork: it takes no lock and cannot panic either, and the child assembles
+/// the path from the destination's root in a fixed buffer of its own.
+pub(crate) fn open_dir_path(
+    anchor: BorrowedFd<'_>,
+    path: &CStr,
+    access: OFlags,
+    containment: ResolveFlags,
+) -> Result<OwnedFd, Errno> {
     for _ in 0..RESOLVE_ATTEMPTS {
         // The call `clippy.toml` sends every other site here for: this is that
         // answer.
         #[expect(clippy::disallowed_methods)]
         let opened = rustix::fs::openat2(
             anchor,
-            &path,
+            path,
             access | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
             containment | ResolveFlags::NO_MAGICLINKS,
@@ -632,6 +655,69 @@ mod layered {
         path.extend_from_slice(name);
         path
     }
+}
+
+/// Opens `name` under `dir` for `access` as the regular file `typed` describes,
+/// refusing whatever has taken the name since.
+///
+/// The one answer to opening a file a walk has just inspected. `typed` is the
+/// `stat` the caller took of the name, without following a link, to decide that
+/// it was a regular file worth opening. Between that and the open, anything can
+/// take the name. The open therefore waits on nothing: a named pipe put there
+/// would hold a blocking open until something opened its other end, and
+/// `O_NOCTTY` keeps a terminal from becoming the caller's. The descriptor is
+/// then checked against `typed` by kind, device, and inode, so what is read or
+/// written is the file the walk looked at. Anything else is `ESTALE`, which
+/// each caller reports as the tree having changed underneath it. A regular file
+/// ignores the `O_NONBLOCK` the descriptor keeps.
+///
+/// It allocates nothing, so the export's post-fork walk calls it as the
+/// copy-in's host-side walk and `rooted::Rooted` do.
+pub(crate) fn open_typed_file(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    typed: &Stat,
+    access: OFlags,
+) -> Result<OwnedFd, Errno> {
+    let file = rustix::fs::openat(
+        dir,
+        name,
+        access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let opened = rustix::fs::fstat(&file)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || opened.st_dev != typed.st_dev
+        || opened.st_ino != typed.st_ino
+    {
+        return Err(Errno::STALE);
+    }
+    Ok(file)
+}
+
+/// Opens the named pipe `name` the caller just created in `dir`, so its
+/// metadata can be applied through a descriptor rather than by name.
+///
+/// `O_RDONLY | O_NONBLOCK` opens a pipe at once, whether or not anything holds
+/// its other end. `O_NOFOLLOW` refuses a name a racer replaced with a symbolic
+/// link since the `mknodat`, and `O_NOCTTY` keeps a terminal put there from
+/// becoming the caller's controlling one before the check below refuses it.
+/// Anything that is not a pipe is `EEXIST`: the name no longer holds the entry
+/// the caller created.
+///
+/// It allocates nothing, so the copy-in child calls it after the fork as the
+/// extractor does in process.
+pub(crate) fn open_created_fifo(dir: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, Errno> {
+    let fifo = rustix::fs::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fifo)?.st_mode) != FileType::Fifo {
+        return Err(Errno::EXIST);
+    }
+    Ok(fifo)
 }
 
 /// Runs `create`, unlinking whatever occupies `leaf` in `parent` and trying

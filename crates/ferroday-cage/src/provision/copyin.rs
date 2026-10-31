@@ -22,11 +22,12 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{self, AtFlags, OFlags};
 
+use super::containment;
 use super::identity::compose_child_map;
 use super::{Delegate, ProvisionError};
 use crate::IdentityMap;
 use crate::idmap::{IdMapper, IdRange};
-use crate::mechanism::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH};
+use crate::mechanism::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
 use crate::mechanism::frame;
 use crate::mechanism::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_SYMLINK, ChildMap,
@@ -66,9 +67,13 @@ everything it can create — a named pipe included — and names the rest.
 /// into a rootfs by hand arrives owned by the caller's own host id, whatever the
 /// source intended — an id a range-mapped rootfs has no name for at all.
 ///
-/// The destination must already exist. Entries are added to it: a directory the
-/// rootfs already carries is kept and descended into, and a file, symlink, or
-/// named pipe is replaced.
+/// The destination must already exist, and entries are added to it. A directory
+/// the rootfs already carries is kept as it stands, and the copy descends into
+/// it without setting its owner, mode, or modification time. So is a symbolic
+/// link that resolves inside the rootfs to a directory, such as merged-usr's
+/// `bin -> usr/bin`: the copy lands through it, resolving it from the rootfs's
+/// root as the sandbox would. Anything else at a directory's name is replaced,
+/// and a file, symlink, or named pipe replaces whatever is at its own.
 ///
 /// Directories, regular files, symbolic links, and named pipes are copied.
 /// Several names for one file are copied as hard links, so a tree keeps the
@@ -119,6 +124,10 @@ impl fmt::Debug for CopyIn<'_> {
 impl<'a> CopyIn<'a> {
     /// Returns a copy of the tree at `source` into the rootfs at `rootfs`.
     ///
+    /// A symbolic link at `source` itself is followed, as one at any other
+    /// component of a caller's path is. No link inside the tree is
+    /// followed: each is copied as the link it is.
+    ///
     /// The identity map defaults to [`IdentityMap::Single`], under which the
     /// in-map child writes its own one-id map and every entry lands as root —
     /// what a single-mapped sandbox sees, and what such a sandbox could have
@@ -168,8 +177,9 @@ impl<'a> CopyIn<'a> {
     /// descends, a name or a link target longer than a frame holds, or an
     /// ownership the rootfs's identity map has no id for;
     /// [`ProvisionError::SourceChanged`] for a file that changed size while it
-    /// was being read; and [`ProvisionError::Io`] for a failure of the copy
-    /// machinery, of the walk, or of the in-map writer.
+    /// was being read, or whose name stopped holding it between the walk
+    /// inspecting it and opening it; and [`ProvisionError::Io`] for a failure of
+    /// the copy machinery, of the walk, or of the in-map writer.
     pub fn run(self) -> Result<CopyReport, ProvisionError> {
         copy_in_inner(&self.source, &self.rootfs, &self.map, self.mapper)
     }
@@ -256,13 +266,7 @@ fn copy_in_inner(
             io::Error::from(io::ErrorKind::InvalidInput),
         )
     })?;
-    if !source.is_dir() {
-        return Err(ProvisionError::io(
-            "copying",
-            source,
-            io::Error::from(io::ErrorKind::NotADirectory),
-        ));
-    }
+    let source_root = open_source(source)?;
 
     let map_source =
         compose_child_map(map, mapper).map_err(|reason| ProvisionError::CopyUnprivileged {
@@ -286,7 +290,7 @@ fn copy_in_inner(
     // child has already died — of a step this side cannot see, an id the map
     // refuses or an entry the destination will not take — so this side's broken
     // pipe would name the symptom and drop the cause.
-    let report = match walk(child.stream(), source, &translation) {
+    let report = match walk(child.stream(), source_root, source, &translation) {
         Ok(report) => report,
         Err(err) => {
             return Err(match child.abandon() {
@@ -319,14 +323,20 @@ fn failure(err: CopyFailure, rootfs: &Path) -> ProvisionError {
     }
 }
 
-/// Walks `source` and streams its contents as frames.
+/// Walks the source tree opened as `root` and streams its contents as frames.
 ///
 /// The source root itself is not emitted: its contents land directly in the
 /// destination, so a copy of `./overlay` into a rootfs puts `./overlay/etc` at
 /// `/etc`. That matches what a caller means by laying a tree in, and it means
 /// the destination's own mode and ownership are never rewritten by a copy.
+///
+/// The whole walk is relative to that descriptor: every step resolves a name
+/// against a directory the walk holds open rather than against a path, so what
+/// was typed is what is read. See `Walk::dir`. `source` names the tree in
+/// diagnostics and in the report.
 fn walk(
     stream: BorrowedFd<'_>,
+    root: OwnedFd,
     source: &Path,
     ids: &Translation,
 ) -> Result<CopyReport, ProvisionError> {
@@ -336,10 +346,6 @@ fn walk(
         prefix: Vec::new(),
         report: CopyReport::default(),
     };
-    // The whole walk is relative to a descriptor: every step below resolves a
-    // name against the directory this opened rather than against a path, so
-    // what was typed is what is read. See `Walk::dir`.
-    let root = open_dir(source, source)?;
     walk.dir(stream, root.as_fd(), source, 0)?;
     put(stream, &[COPY_END], source)?;
     Ok(walk.report)
@@ -378,8 +384,9 @@ impl Walk<'_> {
     /// and for the report, and names nothing this resolves.
     ///
     /// A symbolic link is therefore copied as a symbolic link and never
-    /// traversed, whatever it points at, and the child opens each destination
-    /// directory with `O_NOFOLLOW` for the same reason on its side.
+    /// traversed, whatever it points at. The child holds its own side to the
+    /// same rule: the one link it follows is a destination alias of a
+    /// directory, resolved from the destination's root.
     ///
     /// Entries are sorted by name, so a copy of one tree is one sequence of
     /// frames whatever order the filesystem hands them back — the same reason
@@ -413,7 +420,7 @@ impl Walk<'_> {
                     reason: "the entry name is not a single path component".to_string(),
                 });
             }
-            if name.len() > u16::from(u8::MAX) as usize {
+            if name.len() > NAME_MAX {
                 return Err(ProvisionError::EntryRefused {
                     path: entry,
                     reason: "the entry name is longer than NAME_MAX".to_string(),
@@ -444,7 +451,7 @@ impl Walk<'_> {
                 }
                 // Opened before the length is announced, so the descriptor the
                 // bytes come from is the file that was typed.
-                let file = openat_nofollow(dir, &leaf, OFlags::empty(), &entry)?;
+                let file = open_typed_file(dir, &leaf, &meta, &entry)?;
                 let size = meta.st_size as u64;
                 self.emit_named(stream, COPY_FILE, &name, &meta, &entry)?;
                 put(stream, &size.to_le_bytes(), &entry)?;
@@ -666,17 +673,42 @@ fn inside(extents: &[IdRange], host: u32, which: &str, path: &Path) -> Result<u3
     ))
 }
 
-/// Opens `path` as a directory, without following a symbolic link at it.
+/// Opens the source tree's root as the directory the walk reads from.
 ///
-/// The root of a walk: every directory below it is opened relative to its
-/// parent's descriptor instead. `subject` names the tree in a failure.
-fn open_dir(path: &Path, subject: &Path) -> Result<OwnedFd, ProvisionError> {
+/// The path is the caller's own, so a symbolic link at its final component is
+/// followed, as one at any earlier component is: a source named through a link
+/// copies the directory the link names. No link *inside* the tree is followed;
+/// every entry below is resolved against a directory the walk holds open.
+///
+/// The open is also the check that the source is a directory, made before
+/// anything is forked. It is one resolution, so the directory checked is the
+/// directory read.
+fn open_source(source: &Path) -> Result<OwnedFd, ProvisionError> {
     fs::open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        source,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         fs::Mode::empty(),
     )
-    .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))
+    .map_err(|errno| ProvisionError::io("copying", source, errno.into()))
+}
+
+/// Opens the regular file `name` under `dir` that the walk typed as `typed`,
+/// through [`containment::open_typed_file`]: without waiting, and refusing a
+/// name that no longer holds that file as a source that changed underneath the
+/// copy.
+fn open_typed_file(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    typed: &fs::Stat,
+    subject: &Path,
+) -> Result<OwnedFd, ProvisionError> {
+    containment::open_typed_file(dir, name, typed, OFlags::RDONLY).map_err(|errno| match errno {
+        rustix::io::Errno::STALE => ProvisionError::SourceChanged {
+            path: subject.to_path_buf(),
+            recorded: typed.st_size as u64,
+        },
+        errno => ProvisionError::io("reading", subject, errno.into()),
+    })
 }
 
 /// Opens `name` under `dir`, following no symbolic link at it.
@@ -842,7 +874,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("outside"), dir.join("source/as-dir")).unwrap();
         std::os::unix::fs::symlink(dir.join("outside/secret"), dir.join("source/as-file")).unwrap();
 
-        let source = open_dir(&dir.join("source"), &dir).expect("the source opens");
+        let source = open_source(&dir.join("source")).expect("the source opens");
         for (name, extra) in [
             (c"as-dir", OFlags::DIRECTORY),
             (c"as-file", OFlags::empty()),
@@ -873,6 +905,89 @@ mod tests {
             read_names(source.as_fd(), &dir).expect("the held directory still lists"),
             Vec::<Vec<u8>>::new(),
             "the descriptor lists the directory it opened, not the path's new target",
+        );
+    }
+
+    #[test]
+    fn the_source_root_is_followed_and_the_tree_below_it_is_not() {
+        // The source path is the caller's own, so a link naming it is followed
+        // to the directory it names; a file is refused at the same open, before
+        // anything is forked.
+        let dir = Scratch::new("copyin-source-root");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/entry"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("named-through")).unwrap();
+        std::fs::write(dir.join("a-file"), b"not a tree").unwrap();
+
+        let root = open_source(&dir.join("named-through")).expect("the link is followed");
+        assert_eq!(
+            read_names(root.as_fd(), &dir).expect("the source lists"),
+            [b"entry".to_vec()],
+        );
+        let err = open_source(&dir.join("a-file")).expect_err("a file is not a source tree");
+        assert!(
+            matches!(&err, ProvisionError::Io { source, .. }
+                if source.raw_os_error() == Some(rustix::io::Errno::NOTDIR.raw_os_error())),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn a_name_that_stopped_holding_the_file_typed_is_refused_without_waiting() {
+        // The walk types an entry, then opens it to stream it. A named pipe put
+        // at the name in between would hold a blocking open until something
+        // wrote to it, and another file would be streamed under the first one's
+        // metadata. Both are refused at once as a source that changed.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = Scratch::new("copyin-typed");
+        let source = open_source(&dir).expect("the scratch directory opens");
+        let typed = |name: &CStr| {
+            fs::statat(source.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW).expect("the entry stats")
+        };
+
+        std::fs::write(dir.join("intact"), b"x").unwrap();
+        let intact = typed(c"intact");
+        open_typed_file(source.as_fd(), c"intact", &intact, &dir).expect("the file opens");
+
+        std::fs::write(dir.join("piped"), b"x").unwrap();
+        let piped = typed(c"piped");
+        std::fs::remove_file(dir.join("piped")).unwrap();
+        fs::mknodat(
+            source.as_fd(),
+            c"piped",
+            fs::FileType::Fifo,
+            fs::Mode::RUSR,
+            0,
+        )
+        .unwrap();
+        let (sent, received) = mpsc::channel();
+        let pipe_dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let source = open_source(&pipe_dir).expect("the scratch directory opens");
+            let _ = sent.send(open_typed_file(source.as_fd(), c"piped", &piped, &pipe_dir));
+        });
+        let outcome = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the open waited on the named pipe");
+        assert!(
+            matches!(outcome, Err(ProvisionError::SourceChanged { .. })),
+            "{outcome:?}",
+        );
+
+        // The replacement exists before the original goes, so it cannot be
+        // given the original's freed inode number.
+        std::fs::write(dir.join("swapped"), b"x").unwrap();
+        let swapped = typed(c"swapped");
+        std::fs::write(dir.join("replacement"), b"another file").unwrap();
+        std::fs::rename(dir.join("replacement"), dir.join("swapped")).unwrap();
+        assert!(
+            matches!(
+                open_typed_file(source.as_fd(), c"swapped", &swapped, &dir),
+                Err(ProvisionError::SourceChanged { .. })
+            ),
+            "a different file was opened under the typed one's metadata",
         );
     }
 

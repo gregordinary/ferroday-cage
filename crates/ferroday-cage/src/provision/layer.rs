@@ -109,9 +109,11 @@ impl<'a> Rooting<'a> {
 /// Keep the handle alive for as long as the build root is in use, and drop it to
 /// dispose of the increment. The removal is best-effort at drop time — a drop
 /// cannot report an error — so a caller that must observe a disposal failure
-/// removes the upper directory explicitly through
-/// [`provision::remove`](crate::provision::remove) before dropping the handle,
-/// which then finds nothing to remove.
+/// removes the layer explicitly before dropping the handle, which then finds
+/// nothing to remove. That is
+/// [`Remove::overlay_upper`](crate::provision::Remove::overlay_upper) on
+/// [`path`](Self::path), with the identity map the layer was staged under:
+/// the drop's own removal.
 ///
 #[cfg_attr(
     feature = "debian",
@@ -130,27 +132,17 @@ pub struct BuildLayer {
     /// The overlay upper the increment was installed into: the build root's
     /// writable layer.
     upper: PathBuf,
-    /// The overlay work directory beside the upper. The kernel leaves a mode-`0`
-    /// directory here that a plain recursive delete cannot descend, so disposal
-    /// treats it specially.
-    work: PathBuf,
     /// The identity map the increment was configured under, which decides how the
-    /// upper and work directory are removed.
+    /// upper and the work directory beside it are removed.
     identity_map: IdentityMap,
 }
 
 impl BuildLayer {
-    /// Builds a layer handle over a staged `upper`, computing the sibling work
-    /// directory the overlay-rooted cage manages so disposal removes both.
+    /// Builds a layer handle over a staged `upper`, which disposal removes with
+    /// the work directory the overlay-rooted cage manages beside it.
     pub(crate) fn new(upper: &Path, identity_map: IdentityMap) -> BuildLayer {
-        // The work directory is the same sibling an overlay-rooted cage derives
-        // from this upper; a canonical upper always has a parent and file name,
-        // so the fallback to the upper itself is unreachable in practice and
-        // simply makes disposal a no-op rather than panicking.
-        let work = crate::spec::overlay_work_dir(upper).unwrap_or_else(|| upper.to_path_buf());
         BuildLayer {
             upper: upper.to_path_buf(),
-            work,
             identity_map,
         }
     }
@@ -166,33 +158,23 @@ impl BuildLayer {
 }
 
 impl Drop for BuildLayer {
+    /// Removes the upper and the overlay work directory beside it, through the
+    /// map the increment was staged under.
+    ///
+    /// That map rather than the subordinate default: an explicit range map
+    /// allocates ids the bundled chain would not, and a removal the calling
+    /// user is refused has to re-enter the map the tree's ownership was written
+    /// in. Under the single map the ids are the caller's own, and the
+    /// escalation is for the mode-`0` directory the overlay leaves in its work
+    /// area, should anything be left inside it.
+    ///
+    /// The publication lock is not touched: an upper is a directory a caller
+    /// named as a build layer, not a published rootfs, so `<upper>.lock` is a
+    /// path this never created and may not delete.
     fn drop(&mut self) {
-        // Under the single-identity map every entry is the caller's own, but the
-        // overlay leaves a mode-`0` work directory a plain delete cannot descend;
-        // a chmod-aware removal restores traversable permissions as it goes.
-        // Under a range map the increment and the work directory hold
-        // subordinate-owned entries the caller cannot chmod, so the removal
-        // escalates through the identity map, where root inside it owns them.
-        if matches!(self.identity_map, IdentityMap::Single) {
-            crate::host::force_remove_dir_all(&self.upper);
-            crate::host::force_remove_dir_all(&self.work);
-        } else {
-            // The map the increment was staged under, rather than the
-            // subordinate default: an explicit range map allocates ids the
-            // bundled chain would not, and the removal has to re-enter the map
-            // the tree's ownership was written in.
-            //
-            // And no lock: an upper is a directory a caller named as a build
-            // layer, not a published rootfs, so `<upper>.lock` is a path this
-            // never created and may not delete. The work directory is the
-            // layer's own and has no lock either.
-            for tree in [&self.upper, &self.work] {
-                let _ = crate::provision::Remove::new(tree)
-                    .map(self.identity_map.clone())
-                    .remove_lock(false)
-                    .run();
-            }
-        }
+        let _ = crate::provision::Remove::overlay_upper(&self.upper)
+            .map(self.identity_map.clone())
+            .run();
     }
 }
 

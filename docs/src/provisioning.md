@@ -145,6 +145,11 @@ It is the rootless container runtimes' `unshare rm` pattern as a library call.
 range-mapped provisioning run cannot wedge the destination. Removing a path that
 does not exist is not an error.
 
+Both attempts walk the tree iteratively and never follow a symbolic link. A walk
+holds a few descriptors whatever the depth, where a recursive removal holds one
+per level. A tree a sandbox nested deeper than the caller's descriptor limit is
+therefore removed like any other.
+
 `remove` escalates through the bundled delegate chain, which covers a tree
 written under the subordinate map or a bundled-delegate range map. Some trees
 need more. Where a site-specific delegate established the ownership, the tree is
@@ -206,6 +211,12 @@ directory with no `.lock` sibling today looks exactly like a published one whose
 lock was already cleared. The library cannot probe for the answer. The tree
 itself is removed identically either way, and the flag governs the sibling file
 alone.
+
+A removal that takes the lock also holds it while it runs. It waits for a
+publication of the same destination to finish, and a publication that starts
+meanwhile waits for the removal. The lock file is deleted while it is still
+held. A publication waiting on it finds that the path no longer names the file
+it locked, and locks the file there now instead.
 
 ## Exporting a rootfs
 
@@ -335,6 +346,12 @@ image's runtime provides its own. When no delegate can establish a range map the
 export fails with `ProvisionError::ExportUnprivileged`, naming what the host is
 missing.
 
+The attributes the host assigns rather than the tree carries are left out.
+Those are a security module's labels, such as `security.selinux`, the integrity
+subsystem's `security.ima` and `security.evm`, and overlayfs's own `overlay.*`
+bookkeeping. They describe the host the tree sat on, and they differ between two
+hosts holding the same tree.
+
 Member names match `tar -C rootfs .`. The archive leads with a `./` directory
 entry for the root and every other member is `./`-prefixed (`./etc/`,
 `./etc/hostname`). A consumer that selects a member by path or strips leading
@@ -349,6 +366,13 @@ epoch)`. That caps the wall-clock stamps a bootstrap writes while preserving any
 earlier time a package sets, and unset, the real time is recorded. A build that
 pins its inputs and clamps to a fixed epoch produces a byte-identical archive on
 any host.
+
+Each directory is read whole and sorted in memory the export sets aside before
+it starts. That holds several hundred thousand entries across the directories
+the walk is inside at once. A tree that needs more fails the export rather than
+being written out of order. A file that grows or shrinks while it is read
+fails the export with `ProvisionError::SourceChanged`, naming the file, rather
+than archiving it cut or padded.
 
 As with removal, a tree built under a `CageBuilder::id_mapper` delegate is
 exported through `Export::mapper`. That re-enters the map using the same
@@ -472,8 +496,16 @@ could have written itself. A source id no extent covers is refused, naming the
 path that carries it: the tree has no id for it.
 
 The destination must already exist, and entries are added to it. A directory the
-tree already carries is kept and descended into, while a file, symlink, or named
-pipe is replaced.
+tree already carries is kept as it stands: the copy does not set its owner,
+mode, or modification time. A source staged under a restrictive umask
+therefore leaves the tree's `/etc` as it was. Anything else at a directory's
+name is replaced, and a file, symlink, or named pipe replaces whatever is at
+its own.
+
+A symbolic link that resolves inside the tree to a directory counts as a
+directory. A copy into a merged-usr tree therefore lands through
+`/bin -> usr/bin` rather than replacing it. The link resolves from the tree's
+root, as it does inside the sandbox.
 
 Directories, regular files, symbolic links, and named pipes are copied, with
 their modes and modification times. A symbolic link's modification time is its
@@ -496,29 +528,27 @@ A source file that changes size while it is being read fails the run with
 `ProvisionError::SourceChanged`. The frame's length is committed before the data
 is read, so such a file is written padded or truncated. The copy finishes the
 frame to keep the stream in step and then refuses, rather than reporting success
-for a file it did not reproduce.
+for a file it did not reproduce. A name that stops holding the file the walk
+inspected, before the walk opens it, is refused the same way. A named pipe put
+there does not hold the copy waiting.
 
 Containment is structural rather than checked. Every frame the parent sends
 names its entry as a single path component, never a path. The child creates each
 entry relative to the directory it currently holds open. There is then no path
 for a `..` or a leading `/` to appear in.
 
-The one exception is a hard link's anchor, which is a path because the two names
-can sit in different directories. Containment there rests on three things
-together:
+Two steps resolve a path from the tree's root instead. One is an alias the copy
+lands through. The other is a hard link's anchor, a path because the two names
+can sit in different directories. Both resolve with `RESOLVE_IN_ROOT`, so no
+component, absolute or not, can take the resolution out of the tree. The link
+is made without following the anchor's final component. The child refuses an
+anchor that is absolute or holds a `.`, `..`, or empty component.
 
-- The child refuses an absolute anchor, and any `.`, `..`, or empty component in
-  one.
-- The link is made without following the final component.
-- Every directory along the anchor's path was created and opened `O_NOFOLLOW` by
-  that same walk. That is what keeps `linkat`'s resolution of the *intermediate*
-  components inside the tree.
-
-The residual is a concurrent writer inside the destination, which the whole copy
-shares. A symlink in the source is recreated as a symlink and never traversed.
-The walk does not descend through one, and the child opens each directory with
-`O_NOFOLLOW`. A link pointing out of the tree therefore lands inside the
-destination as a link, and nothing is written through it.
+A symlink in the source is recreated as a symlink and never traversed. The walk
+does not descend through one, and the child follows no link at a leaf. A link
+at the source path itself is followed, as the path is the caller's own. A link
+pointing out of the tree therefore lands inside the destination as a link, and
+nothing is written through it.
 
 ## The tarball provisioner
 
@@ -679,9 +709,31 @@ An unprivileged overlay needs Linux 5.11 or later, and an upper on a filesystem
 that records `user.*` extended attributes. An on-disk filesystem (ext4, xfs,
 btrfs) does, and a tmpfs upper needs Linux 6.6. A host that cannot establish one
 is refused at build time, naming what is missing, rather than silently falling
-back to writing into the base. The kernel creates a directory in the overlay's
-work area with mode `0`. Discard the upper with `provision::remove`, which
-restores traversable permissions as it descends, rather than a plain `rm -rf`.
+back to writing into the base.
+
+The overlay also needs a work directory beside the upper, which the library
+creates as a hidden sibling. The kernel creates a directory inside it with mode
+`0`, which a plain `rm -rf` cannot read into. Discard an upper with
+`Remove::overlay_upper`, which removes the work directory with it:
+
+```rust,no_run
+use ferroday_cage::IdentityMap;
+use ferroday_cage::provision::Remove;
+
+# fn main() -> Result<(), ferroday_cage::provision::ProvisionError> {
+Remove::overlay_upper("/var/cache/myapp/run-42")
+    .map(IdentityMap::Single)
+    .run()?;
+# Ok(())
+# }
+```
+
+Name the identity map the sandbox ran under. A sandbox's default is the single
+map, while a removal's default is the subordinate one. The removal starts as the
+calling user and escalates through the map only where it is refused. An upper is
+not a published root filesystem, so the removal leaves any `.lock` beside it in
+place. An overlay that names its own work directory removes it with a
+`Remove::new` of its own, with `remove_lock(false)`.
 
 Put the upper under a directory the calling user controls, not a world-writable
 one such as `/var/tmp`. That is the same requirement `rootfs` carries, for a

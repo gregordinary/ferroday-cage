@@ -32,10 +32,12 @@
 //! open, so there is no path for a `..` or a leading `/` to appear in.
 //!
 //! - [`COPY_DIR`]: enter a directory. Its name and metadata follow; the child
-//!   creates it, opens it with `O_NOFOLLOW`, and every later frame lands inside
-//!   it until the matching [`COPY_LEAVE`].
+//!   creates it, or adopts the directory or in-root alias of one the root
+//!   already has there, and every later frame lands inside it until the
+//!   matching [`COPY_LEAVE`].
 //! - [`COPY_LEAVE`]: the current directory is finished. The child applies its
-//!   deferred ownership, mode, and modification time and closes it.
+//!   deferred ownership, mode, and modification time if it created the
+//!   directory, and closes it.
 //! - [`COPY_FILE`]: a regular file. Its name, metadata, and then exactly `size`
 //!   bytes of data follow.
 //! - [`COPY_SYMLINK`]: a symbolic link. Its name, metadata, and target follow.
@@ -52,27 +54,24 @@
 //! [`COPY_LINK`] is the one frame that carries a path rather than a single
 //! component, because a hard link's two names may sit in different directories
 //! and only the parent's walk knows where the first one was. Containment there
-//! rests on three things together, and none of them suffices alone:
+//! rests on two things:
 //!
-//! 1. The child refuses an absolute anchor and any component that is empty,
-//!    `.`, or `..`, so the path cannot be written to climb.
+//! 1. The anchor's directory is resolved from the destination root with
+//!    `RESOLVE_IN_ROOT`, so whatever its components are — a merged-usr alias
+//!    the walk adopted, an absolute link, something a concurrent writer put
+//!    there — the resolution cannot leave the root.
 //! 2. The link is made without `AT_SYMLINK_FOLLOW`, so the *final* component is
 //!    never traversed.
-//! 3. `linkat` still resolves the anchor's *intermediate* components, and every
-//!    directory along that path was created and opened by this same walk with
-//!    `O_NOFOLLOW` — so none of them is a symlink, and the resolution cannot
-//!    leave the tree part way along.
 //!
-//! The third is the load-bearing one for intermediate components, and it is a
-//! property of the walk rather than of the frame: a change that let the child
-//! link against a path it did not itself create would lose it while the first
-//! two still appeared to hold.
+//! The child also refuses an absolute anchor and any component that is empty,
+//! `.`, or `..`. None of those is anything the walk records, so a frame naming
+//! one is a stream the child does not understand.
 //!
-//! What remains is a concurrent writer inside the destination: nothing stops a
-//! separate process replacing one of those directories with a symlink between
-//! the walk creating it and the link being made. The whole copy shares that
-//! exposure — the file path unlinks and recreates by name too — and it is
-//! bounded by the destination being a tree the caller owns and is building.
+//! A directory the root already has is resolved the same way when it is a
+//! symbolic link: an alias such as `bin -> usr/bin` is followed from the root
+//! with `RESOLVE_IN_ROOT`, and the walk lands through it. Every other step is
+//! an `*at` call on a single component, relative to a directory the walk holds
+//! open, and none follows a symbolic link at its leaf.
 //!
 //! The child reports its outcome as an 8-byte record on the gate — the step it
 //! failed at and the errno — exactly as the removal child does, rather than as
@@ -82,7 +81,7 @@
 use std::ffi::CStr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
-use rustix::fs::{self, AtFlags, Mode, OFlags, Timestamps};
+use rustix::fs::{self, AtFlags, Mode, OFlags, ResolveFlags, Timestamps};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, SocketFlags, SocketType};
 use rustix::process::{Pid, Signal};
@@ -94,6 +93,7 @@ use super::frame;
 use super::sys::{self, Fork};
 use crate::idmap::IdMapError;
 use crate::path;
+use crate::provision::containment;
 use crate::wire::wire_enum;
 
 /// Frame tag: enter a directory.
@@ -444,20 +444,23 @@ fn copy_child(
 /// Reads frames until end of input and creates what they name.
 ///
 /// The directory stack is the only state that grows, and it is bounded by
-/// [`MAX_DEPTH`]. Deferred metadata rides alongside each open directory: a
-/// directory's own mode is applied on the way out, because a mode denying write
-/// would otherwise stop its contents being created, and its modification time
-/// last of all, because creating those contents changes it.
+/// [`MAX_DEPTH`]. Deferred metadata rides alongside each open directory this
+/// walk created: a directory's own mode is applied on the way out, because a
+/// mode denying write would otherwise stop its contents being created, and its
+/// modification time last of all, because creating those contents changes it. A
+/// directory the root already had is left as it is; see [`enter_dir`].
 ///
 /// The root descriptor is duplicated before the walk begins. Every other
-/// descriptor moves onto the stack as the walk descends, but a [`COPY_LINK`]
-/// resolves its anchor from the root, so one copy has to stay put for the
-/// whole tree.
+/// descriptor moves onto the stack as the walk descends, but an alias and a
+/// [`COPY_LINK`] anchor both resolve from the root, so one copy has to stay put
+/// for the whole tree. The [`Trail`] is the current directory's path from it.
 fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno)> {
-    let anchor_root = rustix::io::dup(&root).map_err(|errno| (CopyStep::OpenRoot, errno))?;
+    let anchor_root =
+        rustix::io::fcntl_dupfd_cloexec(&root, 0).map_err(|errno| (CopyStep::OpenRoot, errno))?;
     let mut stack: [Option<Level>; MAX_DEPTH] = [const { None }; MAX_DEPTH];
     let mut depth: usize = 0;
     let mut current = root;
+    let mut trail = Trail::new();
 
     loop {
         let mut tag = [0u8; 1];
@@ -486,30 +489,14 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                     return Err((CopyStep::TooDeep, Errno::NAMETOOLONG));
                 }
                 let name = name.component()?;
-                // Created 0700 and widened on the way out: a directory whose
-                // final mode denies the owner write cannot have its contents
-                // created under it.
-                match fs::mkdirat(&current, name, Mode::from_bits_truncate(0o700)) {
-                    Ok(()) => {}
-                    // An entry the destination already carries is kept, as the
-                    // extraction path keeps one: the copy adds to a rootfs
-                    // rather than replacing it.
-                    Err(Errno::EXIST) => {}
-                    Err(errno) => return Err((CopyStep::Mkdir, errno)),
-                }
-                // O_NOFOLLOW is the containment: an existing symlink here is
-                // refused rather than followed out of the tree.
-                let opened = fs::openat(
-                    &current,
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|errno| (CopyStep::OpenDir, errno))?;
+                let (opened, created) = enter_dir(&anchor_root, &current, &mut trail, name)?;
                 stack[depth] = Some(Level {
                     parent: std::mem::replace(&mut current, opened),
                     meta,
+                    created,
+                    trail: trail.mark(),
                 });
+                trail.push(name);
                 depth += 1;
             }
             COPY_LEAVE => {
@@ -520,8 +507,11 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 let level = stack[depth]
                     .take()
                     .ok_or((CopyStep::ReadFrame, Errno::INVAL))?;
-                apply_meta(current.as_fd(), &level.meta)?;
+                if level.created {
+                    apply_meta(current.as_fd(), &level.meta)?;
+                }
                 current = level.parent;
+                trail.restore(level.trail);
             }
             COPY_FILE => {
                 let (name, meta) = read_named(stream)?;
@@ -595,7 +585,8 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 // Applied through a descriptor, as every other entry's is, so
                 // a source-chosen mode lands on this pipe and on nothing a
                 // racer put at the name since.
-                let fifo = open_created_fifo(&current, name)?;
+                let fifo = containment::open_created_fifo(current.as_fd(), name)
+                    .map_err(|errno| (CopyStep::Fifo, errno))?;
                 apply_meta(fifo.as_fd(), &meta)?;
             }
             COPY_LINK => {
@@ -603,35 +594,206 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 let mut raw = [0u8; LINK_BUF + 1];
                 let len = read_bytes_u16(stream, &mut raw[..LINK_BUF])?.len();
                 raw[len] = 0;
-                let anchor = contained_path(&raw[..=len])?;
+                contained_path(&raw[..=len])?;
                 let name = name.component()?;
                 match fs::unlinkat(&current, name, AtFlags::empty()) {
                     Ok(()) | Err(Errno::NOENT) => {}
                     Err(errno) => return Err((CopyStep::Link, errno)),
                 }
-                // No `AT_SYMLINK_FOLLOW`, so the final component is not
-                // traversed. The intermediate ones are, by `linkat` itself —
-                // they are safe because this same walk created each of those
-                // directories and opened it with `O_NOFOLLOW`, not because the
-                // anchor was checked. See the module doc.
-                //
                 // The link shares the anchor's inode, so it carries the
                 // ownership, mode, and modification time already applied to
                 // it — there is nothing further to set, which is the whole
                 // point of recording it as a link.
-                fs::linkat(&anchor_root, anchor, &current, name, AtFlags::empty())
-                    .map_err(|errno| (CopyStep::Link, errno))?;
+                link_to_anchor(&anchor_root, &mut raw[..=len], &current, name)?;
             }
             _ => return Err((CopyStep::ReadFrame, Errno::INVAL)),
         }
     }
 }
 
-/// One open directory on the stack: the parent it was opened from, and the
-/// metadata to apply when it is left.
+/// One open directory on the stack: the parent it was opened from, the
+/// metadata to apply when it is left, and what to restore on leaving it.
 struct Level {
     parent: OwnedFd,
     meta: Meta,
+    /// Whether this walk created the directory, and so owes it the metadata.
+    /// A directory the root already had is adopted as it stands.
+    created: bool,
+    /// The [`Trail`]'s length before the directory's name was pushed.
+    trail: Option<usize>,
+}
+
+/// Opens the directory `name` names under `current`, creating it where nothing
+/// is there, and reports whether this walk created it.
+///
+/// A copy adds to a root filesystem rather than rebuilding it, so an entry the
+/// root already has at the name is used as it stands where it can be:
+///
+/// - A directory is adopted, and its owner, mode and modification time are not
+///   set from the frame.
+///   The source's directory says where its contents go, not what the root's
+///   `/etc` should be: a source staged under umask 077 would otherwise leave the
+///   root's `/etc` at `0700`, and a file under a home directory would re-own the
+///   home.
+/// - A symbolic link that resolves inside the root to a directory is an alias,
+///   merged-usr's `bin -> usr/bin` among them, and is adopted the same way. The
+///   link is resolved from the root with `RESOLVE_IN_ROOT`, so an absolute
+///   target means the root's own path, as it does to the sandbox, and nothing
+///   resolves outside the root.
+/// - Anything else is replaced by a directory, as a file entry replaces what
+///   occupies its name.
+///
+/// `provision::extract::overlay_tree`, the other way a host tree is laid into
+/// a root, follows the same policy, and its documentation states where it
+/// differs and why.
+///
+/// A directory this walk creates is created `0700` and widened on the way out:
+/// one whose final mode denies the owner write cannot have its contents created
+/// under it. `O_NOFOLLOW` on each open is what keeps a symbolic link from being
+/// taken for a directory anywhere but the alias step.
+fn enter_dir(
+    root: &OwnedFd,
+    current: &OwnedFd,
+    trail: &mut Trail,
+    name: &CStr,
+) -> Result<(OwnedFd, bool), (CopyStep, Errno)> {
+    let open = || {
+        fs::openat(
+            current,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|errno| (CopyStep::OpenDir, errno))
+    };
+    let create = || {
+        fs::mkdirat(current, name, Mode::from_bits_truncate(0o700))
+            .map_err(|errno| (CopyStep::Mkdir, errno))
+    };
+    match create() {
+        Ok(()) => return Ok((open()?, true)),
+        Err((_, Errno::EXIST)) => {}
+        Err(err) => return Err(err),
+    }
+    match open() {
+        Ok(fd) => return Ok((fd, false)),
+        // A symbolic link answers ENOTDIR (ELOOP on older kernels), and so does
+        // anything else that is not a directory.
+        Err((_, Errno::NOTDIR | Errno::LOOP)) => {}
+        Err(err) => return Err(err),
+    }
+    let path = trail
+        .with(name)
+        .map_err(|errno| (CopyStep::OpenDir, errno))?;
+    match containment::open_dir_path(root.as_fd(), path, OFlags::RDONLY, ResolveFlags::IN_ROOT) {
+        Ok(fd) => return Ok((fd, false)),
+        // Dangling, a link to something that is not a directory, or a loop:
+        // not an alias, and replaced like any other entry in the way.
+        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => {}
+        Err(errno) => return Err((CopyStep::OpenDir, errno)),
+    }
+    fs::unlinkat(current, name, AtFlags::empty()).map_err(|errno| (CopyStep::Mkdir, errno))?;
+    create()?;
+    Ok((open()?, true))
+}
+
+/// Links `name` under `current` onto the file at `anchor`, a path from the
+/// destination root that [`contained_path`] has already admitted.
+///
+/// `anchor` is the path followed by its terminator. The directory part is
+/// resolved from the root with `RESOLVE_IN_ROOT`, so no component of it — an
+/// alias [`enter_dir`] adopted included — can take the resolution out of the
+/// root. The final component is linked without `AT_SYMLINK_FOLLOW`, so it is
+/// never traversed. The separator before it is overwritten with a terminator
+/// to split the two in place.
+fn link_to_anchor(
+    root: &OwnedFd,
+    anchor: &mut [u8],
+    current: &OwnedFd,
+    name: &CStr,
+) -> Result<(), (CopyStep, Errno)> {
+    let link = |dir: BorrowedFd<'_>, leaf: &CStr| {
+        fs::linkat(dir, leaf, current, name, AtFlags::empty())
+            .map_err(|errno| (CopyStep::Link, errno))
+    };
+    let malformed = |_| (CopyStep::BadName, Errno::INVAL);
+    let Some(split) = anchor.iter().rposition(|byte| *byte == b'/') else {
+        return link(
+            root.as_fd(),
+            CStr::from_bytes_with_nul(anchor).map_err(malformed)?,
+        );
+    };
+    anchor[split] = 0;
+    let (dir, leaf) = anchor.split_at(split + 1);
+    let dir = CStr::from_bytes_with_nul(dir).map_err(malformed)?;
+    let leaf = CStr::from_bytes_with_nul(leaf).map_err(malformed)?;
+    let dir = containment::open_dir_path(root.as_fd(), dir, OFlags::PATH, ResolveFlags::IN_ROOT)
+        .map_err(|errno| (CopyStep::Link, errno))?;
+    link(dir.as_fd(), leaf)
+}
+
+/// The path from the destination root to the directory the walk holds open,
+/// for the resolutions that start at the root rather than at that directory.
+///
+/// Held in a fixed buffer, since the child cannot allocate one, as each name
+/// followed by a separator. A path that outgrows the buffer is longer than
+/// `PATH_MAX`, which `openat2` refuses anyway, so it is recorded as lost rather
+/// than truncated, and a resolution that needs it fails with `ENAMETOOLONG`.
+/// The walk itself goes on: only an alias deeper than that cannot be resolved.
+struct Trail {
+    buf: [u8; LINK_BUF],
+    /// Bytes in use, or `None` once a push did not fit.
+    len: Option<usize>,
+}
+
+impl Trail {
+    /// The root's own trail: empty.
+    fn new() -> Trail {
+        Trail {
+            buf: [0; LINK_BUF],
+            len: Some(0),
+        }
+    }
+
+    /// The length to [`restore`](Self::restore) on leaving the directory about
+    /// to be entered.
+    fn mark(&self) -> Option<usize> {
+        self.len
+    }
+
+    /// Returns to a length [`mark`](Self::mark) recorded.
+    fn restore(&mut self, mark: Option<usize>) {
+        self.len = mark;
+    }
+
+    /// Appends a directory the walk has entered.
+    fn push(&mut self, name: &CStr) {
+        let Some(len) = self.len else {
+            return;
+        };
+        let name = name.to_bytes();
+        let end = len + name.len() + 1;
+        // Room is kept for the terminator `with` writes after the separator.
+        if end >= self.buf.len() {
+            self.len = None;
+            return;
+        }
+        self.buf[len..end - 1].copy_from_slice(name);
+        self.buf[end - 1] = b'/';
+        self.len = Some(end);
+    }
+
+    /// `name` in the current directory, as a terminated path from the root.
+    fn with(&mut self, name: &CStr) -> Result<&CStr, Errno> {
+        let len = self.len.ok_or(Errno::NAMETOOLONG)?;
+        let name = name.to_bytes_with_nul();
+        let end = len + name.len();
+        if end > self.buf.len() {
+            return Err(Errno::NAMETOOLONG);
+        }
+        self.buf[len..end].copy_from_slice(name);
+        CStr::from_bytes_with_nul(&self.buf[..end]).map_err(|_| Errno::INVAL)
+    }
 }
 
 /// An entry's ownership, mode, and modification time, as a frame carries them.
@@ -671,30 +833,6 @@ fn apply_meta(fd: BorrowedFd<'_>, meta: &Meta) -> Result<(), (CopyStep, Errno)> 
         },
     )
     .map_err(|errno| (CopyStep::Metadata, errno))
-}
-
-/// Opens the named pipe `name` this walk just created in `dir`, so its
-/// metadata can be applied through a descriptor.
-///
-/// `O_RDONLY | O_NONBLOCK` opens a pipe at once, whether or not anything holds
-/// its other end. `O_NOFOLLOW` refuses a name a racer replaced with a symbolic
-/// link since the `mknodat`, and `O_NOCTTY` keeps a terminal put there from
-/// becoming this process's controlling one before the check below refuses it.
-/// Anything that is not a pipe is `EEXIST`: the name no longer holds the entry
-/// this created.
-fn open_created_fifo(dir: &OwnedFd, name: &CStr) -> Result<OwnedFd, (CopyStep, Errno)> {
-    let fifo = fs::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| (CopyStep::Fifo, errno))?;
-    let stat = fs::fstat(&fifo).map_err(|errno| (CopyStep::Fifo, errno))?;
-    if fs::FileType::from_raw_mode(stat.st_mode) != fs::FileType::Fifo {
-        return Err((CopyStep::Fifo, Errno::EXIST));
-    }
-    Ok(fifo)
 }
 
 /// Applies a modification time to an entry named relative to an open directory,
@@ -804,23 +942,19 @@ impl Name {
 /// Turns a hardlink anchor's bytes into a `CStr`, refusing any path that is
 /// written to climb.
 ///
-/// One of the three premises the module doc sets out, and only one: it stops a
-/// path from *naming* somewhere outside the destination. An absolute path would
-/// restart at the host's root, so it is refused here rather than resolved, and
-/// every component must be an ordinary one — which refuses a `..` that would
-/// climb out, and an empty component, a `.`, and an embedded NUL besides. None
-/// of those is anything an anchor the walk records can be, so refusing them
-/// costs nothing and closes the shape.
+/// It stops a path from *naming* somewhere outside the destination. An
+/// absolute path is refused here rather than resolved, and every component must
+/// be an ordinary one — which refuses a `..`, an empty component, a `.`, and an
+/// embedded NUL. None of those is anything an anchor the walk records can be,
+/// so a frame carrying one is malformed, and refusing it costs nothing.
 ///
 /// The per-component rule is [`path::is_ordinary_component`], the one the
 /// walk's frames are held to; nothing is dropped or normalized on the way, so a
 /// path that merely *reduces* to something ordinary is refused too. An anchor
 /// is a path this walk itself emitted, and it emits neither.
 ///
-/// It does not by itself keep the *resolution* inside the tree, since `linkat`
-/// follows the anchor's intermediate components. What does is that this walk
-/// created every directory on that path and opened each with `O_NOFOLLOW`, so
-/// none is a symlink.
+/// It does not by itself keep the *resolution* inside the tree. What does is
+/// [`link_to_anchor`] resolving the anchor's directory with `RESOLVE_IN_ROOT`.
 ///
 /// `bytes` is the anchor followed by its null terminator.
 fn contained_path(bytes: &[u8]) -> Result<&CStr, (CopyStep, Errno)> {
@@ -1004,6 +1138,183 @@ mod tests {
         frame.extend_from_slice(&(target.len() as u16).to_le_bytes());
         frame.extend_from_slice(target);
         frame
+    }
+
+    /// One `COPY_FILE` frame holding `data`, owned by the caller.
+    fn file_frame(name: &[u8], mode: u32, data: &[u8]) -> Vec<u8> {
+        let mut frame = vec![COPY_FILE];
+        frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        frame.extend_from_slice(name);
+        frame.extend_from_slice(&mode.to_le_bytes());
+        frame.extend_from_slice(&rustix::process::getuid().as_raw().to_le_bytes());
+        frame.extend_from_slice(&rustix::process::getgid().as_raw().to_le_bytes());
+        frame.extend_from_slice(&0i64.to_le_bytes());
+        frame.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    /// One `COPY_LINK` frame: `name` as a second name for the file at `anchor`.
+    fn link_frame(name: &[u8], anchor: &[u8]) -> Vec<u8> {
+        let mut frame = vec![COPY_LINK];
+        frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        frame.extend_from_slice(name);
+        frame.extend_from_slice(&(anchor.len() as u16).to_le_bytes());
+        frame.extend_from_slice(anchor);
+        frame
+    }
+
+    /// The permission bits and modification time of `path`, without following
+    /// a symbolic link at it.
+    fn mode_and_mtime(path: &std::path::Path) -> (u32, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).expect("the entry exists");
+        (meta.mode() & 0o7777, meta.mtime())
+    }
+
+    /// A directory the root already has is adopted as it stands, and one the
+    /// copy creates takes the frame's metadata.
+    ///
+    /// The source's directory says where its contents go, not what the root's
+    /// own directory should be: a source staged under umask 077 would otherwise
+    /// leave the root's `/etc` at `0700`.
+    #[test]
+    fn a_directory_the_root_already_has_keeps_its_own_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = Scratch::new("copyin-adopt");
+        std::fs::create_dir(dir.join("etc")).unwrap();
+        std::fs::set_permissions(dir.join("etc"), PermissionsExt::from_mode(0o755)).unwrap();
+        let stamp = rustix::fs::Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        fs::utimensat(
+            fs::CWD,
+            dir.join("etc"),
+            &Timestamps {
+                last_access: stamp,
+                last_modification: stamp,
+            },
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        let mut frames = dir_frame(b"etc", 0o700);
+        frames.push(COPY_LEAVE);
+        frames.extend(dir_frame(b"new", 0o750));
+        frames.push(COPY_LEAVE);
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+
+        assert_eq!(
+            mode_and_mtime(&dir.join("etc")),
+            (0o755, 1_000_000_000),
+            "the root's own directory was rewritten",
+        );
+        assert_eq!(mode_and_mtime(&dir.join("new")), (0o750, 0));
+    }
+
+    /// A directory entry lands through a symbolic link the root has at its
+    /// name when the link resolves inside the root to a directory, and the link
+    /// stays a link.
+    ///
+    /// Merged-usr's `bin -> usr/bin` is the relative case. `var/run -> /run`
+    /// is the absolute one: it names the root's own `/run`, as it does to the
+    /// sandbox, and resolving it anywhere else would write outside the root.
+    #[test]
+    fn a_directory_lands_through_an_alias_the_root_resolves() {
+        let dir = Scratch::new("copyin-alias");
+        std::fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::create_dir_all(dir.join("var")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", dir.join("bin")).unwrap();
+        std::os::unix::fs::symlink("/run", dir.join("var/run")).unwrap();
+
+        let mut frames = dir_frame(b"bin", 0o755);
+        frames.extend(file_frame(b"tool", 0o755, b"#!/bin/sh\n"));
+        frames.push(COPY_LEAVE);
+        frames.extend(dir_frame(b"var", 0o755));
+        frames.extend(dir_frame(b"run", 0o755));
+        frames.extend(file_frame(b"marker", 0o644, b"in the root's /run\n"));
+        frames.push(COPY_LEAVE);
+        frames.push(COPY_LEAVE);
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+
+        assert_eq!(
+            std::fs::read(dir.join("usr/bin/tool")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("run/marker")).unwrap(),
+            b"in the root's /run\n",
+        );
+        for alias in ["bin", "var/run"] {
+            assert!(
+                std::fs::symlink_metadata(dir.join(alias))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{alias} was replaced rather than laid through",
+            );
+        }
+    }
+
+    /// A hard link's anchor resolves from the root, so a path through an
+    /// absolute alias names the root's own file rather than the host's.
+    #[test]
+    fn a_hardlink_anchor_resolves_inside_the_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = Scratch::new("copyin-anchor");
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::create_dir_all(dir.join("var")).unwrap();
+        std::os::unix::fs::symlink("/run", dir.join("var/run")).unwrap();
+
+        let mut frames = dir_frame(b"var", 0o755);
+        frames.extend(dir_frame(b"run", 0o755));
+        frames.extend(file_frame(b"first", 0o644, b"shared\n"));
+        frames.push(COPY_LEAVE);
+        frames.push(COPY_LEAVE);
+        frames.extend(link_frame(b"second", b"var/run/first"));
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+
+        let ino = |path: &str| std::fs::symlink_metadata(dir.join(path)).unwrap().ino();
+        assert_eq!(
+            ino("second"),
+            ino("run/first"),
+            "the link is not onto the root's file"
+        );
+    }
+
+    /// Anything else at a directory's name is replaced, as a file entry
+    /// replaces what occupies its own: a file, and a link that resolves to
+    /// nothing.
+    #[test]
+    fn a_non_directory_in_the_way_of_a_directory_is_replaced() {
+        let dir = Scratch::new("copyin-replace");
+        std::fs::write(dir.join("was-a-file"), b"in the way\n").unwrap();
+        std::os::unix::fs::symlink("nowhere", dir.join("was-dangling")).unwrap();
+
+        let mut frames = Vec::new();
+        for name in [&b"was-a-file"[..], b"was-dangling"] {
+            frames.extend(dir_frame(name, 0o755));
+            frames.push(COPY_LEAVE);
+        }
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+
+        for name in ["was-a-file", "was-dangling"] {
+            assert!(
+                std::fs::symlink_metadata(dir.join(name))
+                    .unwrap()
+                    .file_type()
+                    .is_dir(),
+                "{name} is not a directory",
+            );
+        }
     }
 
     /// Runs `frames` through the consuming walk against `dir`.

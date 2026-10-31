@@ -725,7 +725,10 @@ fn provision_remove_deletes_a_subordinate_owned_tree() {
         "ferroday-cage-identity-remove-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&scratch);
+    // A previous run's tree holds subordinate-owned entries too.
+    let _ = ferroday_cage::provision::Remove::new(&scratch)
+        .remove_lock(false)
+        .run();
     let tree = scratch.join("tree");
     std::fs::create_dir_all(&tree).expect("the scratch tree is created");
 
@@ -748,8 +751,10 @@ fn provision_remove_deletes_a_subordinate_owned_tree() {
     );
 
     // The plain caller is refused; the library's removal is not.
+    #[expect(clippy::disallowed_methods)]
+    let plain = std::fs::remove_dir_all(&scratch);
     assert!(
-        std::fs::remove_dir_all(&scratch).is_err(),
+        plain.is_err(),
         "a subordinate-owned tree resists plain removal"
     );
     ferroday_cage::provision::remove(&scratch).expect("the map-assisted removal succeeds");

@@ -22,7 +22,7 @@
 //! tar dependency.
 
 use std::collections::HashMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -52,8 +52,11 @@ use crate::{IdMapper, IdentityMap};
 /// everything but symlinks — ACLs and file capabilities included — since the
 /// kernel confines a symlink's attributes to the `security` and `trusted`
 /// namespaces, which an unprivileged export can neither read in full nor an
-/// unprivileged extraction restore. Character and block devices, FIFOs, and
-/// sockets are skipped, as a deployed image's runtime provides its own.
+/// unprivileged extraction restore. The attributes the host assigns rather than
+/// the tree carries are left out: security-module labels, integrity
+/// measurements, and overlayfs's own bookkeeping. Character and block devices,
+/// FIFOs, and sockets are skipped, as a deployed image's runtime provides its
+/// own.
 ///
 /// [`filter`](Self::filter) narrows that to a subset the caller names, so a
 /// tree that holds more than the artifact should — a build cache, a mount
@@ -63,7 +66,16 @@ use crate::{IdMapper, IdentityMap};
 /// Entries are emitted in sorted order — directory children by name, extended
 /// attributes by name — so the output does not depend on the order the source
 /// filesystem stores entries in. With [`clamp_mtime`](Self::clamp_mtime) set,
-/// the archive is byte-reproducible given the tree.
+/// the archive is byte-reproducible given the tree. A directory is sorted in
+/// memory the export sets aside before it starts reading, sized for several
+/// hundred thousand entries among the directories it is inside at once; a
+/// tree that needs more fails the export rather than being written out of
+/// order.
+///
+/// A file that grows or shrinks while it is read fails the export with
+/// [`ProvisionError::SourceChanged`], naming the file: the archive would
+/// otherwise carry it cut or zero-padded. A name that stops holding the file
+/// the walk inspected, before the walk opens it, fails the export too.
 ///
 /// [`write_to_path`](Self::write_to_path) names a file, which the archive is
 /// staged beside and renamed over, so the destination appears complete or not
@@ -247,8 +259,10 @@ impl<'a> Export<'a> {
     /// # Errors
     ///
     /// [`ProvisionError::ExportUnprivileged`] when the tree needs a range map
-    /// and no delegate can establish one; [`ProvisionError::Io`] for a failure
-    /// of the export machinery, of the in-map reader, or of `writer`.
+    /// and no delegate can establish one; [`ProvisionError::SourceChanged`] for
+    /// a file that grew or shrank while it was read; and
+    /// [`ProvisionError::Io`] for a failure of the export machinery, of the
+    /// in-map reader, or of `writer`.
     pub fn write_to<W: Write>(self, writer: W) -> Result<(), ProvisionError> {
         export_inner(
             &self.rootfs,
@@ -310,26 +324,10 @@ impl<'a> Export<'a> {
         };
         refuse_dest_inside(&self.rootfs, path, parent)?;
 
-        // Named for this process, so two exports to one destination stage
-        // separately and the later rename wins -- which is what two shell
-        // redirections to one path do. Composed as an `OsString` rather than
-        // formatted, so a destination whose name is not UTF-8 stages beside
-        // itself rather than under a lossy rendering of itself, which is how
-        // `ensure` names its own staging path.
-        let mut staging_name = OsString::from(".");
-        staging_name.push(path.file_name().unwrap_or_else(|| OsStr::new("export")));
-        staging_name.push(format!(".{}.partial", std::process::id()));
-        let staging = parent.join(staging_name);
-        // A leftover can only be a crashed prior run's, since the pid is this
-        // process's own and no live writer in it shares the name. Creating with
-        // `O_EXCL` afterwards is what makes that the only reading available: a
-        // staging path that reappears between the two is not this run's to
-        // overwrite.
-        match fs::remove_file(&staging) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(ProvisionError::io("removing", &staging, err)),
-        }
+        // Unique to this call, so two exports to one destination -- two
+        // threads of one process included -- stage separately and the later
+        // rename wins, which is what two shell redirections to one path do.
+        let staging = super::staging_path(path);
         let file = fs::File::options()
             .write(true)
             .create_new(true)
@@ -476,8 +474,10 @@ fn drive<W: Write>(
     filter: Option<&EntryPredicate<'_>>,
 ) -> Result<(), ProvisionError> {
     // The stream is duplicated so it can be owned by a buffered reader while the
-    // child retains its own descriptor for reaping.
-    let dup = rustix::io::dup(stream)
+    // child retains its own descriptor for reaping. Close-on-exec like the
+    // original, so a process the caller spawns while the export runs does not
+    // hold the stream open.
+    let dup = rustix::io::fcntl_dupfd_cloexec(stream, 0)
         .map_err(|errno| ProvisionError::io("exporting", rootfs, errno.into()))?;
     let mut reader = BufReader::new(std::fs::File::from(dup));
     let mut tar = TarWriter::new(BufWriter::new(writer), clamp_mtime, filter);
@@ -497,8 +497,20 @@ fn drive<W: Write>(
             }
             FRAME_FILE => {
                 let meta = read_meta(&mut reader, true).map_err(read_err)?;
-                tar.file(&meta, &mut reader)
+                let written = tar
+                    .file(&meta, &mut reader)
                     .map_err(|e| classify(e, read_err, write_err))?;
+                // The child's word on whether the file held what it recorded.
+                // It matters only for data that went into the archive: an
+                // excluded file, or a later name of one already written, adds
+                // none of what was read.
+                let changed = read_u8(&mut reader).map_err(read_err)? != 0;
+                if changed && written {
+                    return Err(ProvisionError::SourceChanged {
+                        path: tar.host_path(rootfs, &meta.name),
+                        recorded: meta.size,
+                    });
+                }
             }
             FRAME_SYMLINK => {
                 let meta = read_symlink(&mut reader).map_err(read_err)?;
@@ -799,9 +811,13 @@ impl<'f, W: Write> TarWriter<'f, W> {
     /// the child streams are copied to the archive for a regular file and
     /// discarded for a coalesced hardlink, so the stream stays in step either
     /// way.
-    fn file(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<(), CopyError> {
+    ///
+    /// Reports whether the data went into the archive, which is when a change
+    /// to the file while it was read matters.
+    fn file(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<bool, CopyError> {
         if self.pruned > 0 || !self.keeps(&meta.name, ExportKind::File, meta) {
-            return discard(reader, meta.size);
+            discard(reader, meta.size)?;
+            return Ok(false);
         }
         let path = self.child_path(&meta.name);
         if meta.nlink > 1 {
@@ -810,14 +826,27 @@ impl<'f, W: Write> TarWriter<'f, W> {
                 self.write_entry(&path, b'1', meta, 0, &first, &meta.xattrs)
                     .map_err(CopyError::Write)?;
                 discard(reader, meta.size)?;
-                return Ok(());
+                return Ok(false);
             }
             self.hardlinks.insert((meta.dev, meta.ino), path.clone());
         }
         self.write_entry(&path, b'0', meta, meta.size, &[], &meta.xattrs)
             .map_err(CopyError::Write)?;
         copy_data(reader, &mut self.out, meta.size)?;
-        pad(&mut self.out, meta.size).map_err(CopyError::Write)
+        pad(&mut self.out, meta.size).map_err(CopyError::Write)?;
+        Ok(true)
+    }
+
+    /// The host path of a child named `name` in the current directory, for an
+    /// error that names the file it is about.
+    fn host_path(&self, rootfs: &Path, name: &[u8]) -> PathBuf {
+        let mut path = rootfs.to_path_buf();
+        for component in self.stack.iter().map(Vec::as_slice).chain([name]) {
+            if component != b"." {
+                path.push(OsStr::from_bytes(component));
+            }
+        }
+        path
     }
 
     /// Emits a symlink entry.
@@ -1064,6 +1093,9 @@ fn read_bytes_u16(reader: &mut impl Read) -> io::Result<Vec<u8>> {
 /// Reads the xattr block — a count, then each name and its value — and sorts it
 /// by name so the emitted `SCHILY.xattr.*` records do not depend on the order
 /// the source filesystem lists attributes in.
+///
+/// An attribute the host assigns rather than the tree carries is read off the
+/// stream and dropped; see [`host_assigned`].
 fn read_xattrs(reader: &mut impl Read) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let count = read_u16(reader)? as usize;
     let mut xattrs = Vec::with_capacity(count);
@@ -1072,10 +1104,37 @@ fn read_xattrs(reader: &mut impl Read) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let value_len = read_u32(reader)? as usize;
         let mut value = vec![0u8; value_len];
         reader.read_exact(&mut value)?;
-        xattrs.push((name, value));
+        if !host_assigned(&name) {
+            xattrs.push((name, value));
+        }
     }
     xattrs.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(xattrs)
+}
+
+/// Whether an extended attribute is one the host holding the tree assigns,
+/// rather than one the tree carries.
+///
+/// A security module labels the files it sees: SELinux as `security.selinux`,
+/// Smack as `security.SMACK64` and its relatives, AppArmor as
+/// `security.apparmor`. The integrity subsystem records a measurement or a
+/// signature as `security.ima` and `security.evm`. Overlayfs keeps its own
+/// bookkeeping on an upper's files as `user.overlay.*` and `trusted.overlay.*`.
+/// None of it is the tree's. It describes the host the tree sat on and that
+/// host's policy, it differs between two hosts holding the same tree, and an
+/// image carrying it would bring the build host's labels to wherever it is
+/// deployed, which applies its own. The archive leaves it out, which is what
+/// keeps one tree's archive the same from any host.
+///
+/// An unprivileged sandbox cannot set any of these on a file, so a tree it
+/// built never carries one of its own.
+fn host_assigned(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"security.selinux" | b"security.apparmor" | b"security.ima" | b"security.evm"
+    ) || name.starts_with(b"security.SMACK64")
+        || name.starts_with(b"user.overlay.")
+        || name.starts_with(b"trusted.overlay.")
 }
 
 /// Reads a directory or file metadata frame (the tag already consumed).
@@ -1363,6 +1422,48 @@ mod tests {
     }
 
     #[test]
+    fn attributes_the_host_assigns_are_left_out() {
+        // A label, a measurement, and an overlay's bookkeeping describe the
+        // host the tree sat on; a capability and an ACL are the tree's own.
+        let mut frame = Vec::new();
+        let attributes: [(&[u8], &[u8]); 7] = [
+            (b"security.selinux", b"system_u:object_r:usr_t:s0"),
+            (b"security.SMACK64", b"_"),
+            (b"security.ima", b"\x04\x04"),
+            (b"user.overlay.origin", b"\x00\xfb"),
+            (b"security.capability", b"\x01\x00\x00\x02"),
+            (b"system.posix_acl_access", b"\x02\x00"),
+            (b"user.mime_type", b"text/plain"),
+        ];
+        frame.extend_from_slice(&(attributes.len() as u16).to_le_bytes());
+        for (name, value) in attributes {
+            frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            frame.extend_from_slice(name);
+            frame.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            frame.extend_from_slice(value);
+        }
+        // A trailing byte, so a drop that misread the stream shows up as one
+        // left unread.
+        frame.push(0xee);
+        let mut reader = &frame[..];
+        let xattrs = read_xattrs(&mut reader).unwrap();
+        let names: Vec<&[u8]> = xattrs.iter().map(|(n, _)| n.as_slice()).collect();
+        assert_eq!(
+            names,
+            [
+                &b"security.capability"[..],
+                b"system.posix_acl_access",
+                b"user.mime_type"
+            ]
+        );
+        assert_eq!(
+            reader,
+            [0xee],
+            "the dropped attributes were not read off the stream"
+        );
+    }
+
+    #[test]
     fn a_filter_drops_the_entries_it_refuses() {
         // The dropped file carries data, so this also pins that the frame
         // stream stays in step: the entry after it decodes correctly.
@@ -1605,6 +1706,74 @@ mod tests {
             tar.finish().unwrap();
         }
         assert!(TarReader::new(&buf[..]).next_entry().unwrap().is_none());
+    }
+
+    /// A metadata frame for a regular file named `name` holding `data`,
+    /// followed by the data and the child's status byte.
+    fn file_frame(name: &[u8], data: &[u8], status: u8) -> Vec<u8> {
+        let mut frame = vec![FRAME_FILE];
+        frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        frame.extend_from_slice(name);
+        frame.extend_from_slice(&0o100_644u32.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        frame.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&7u64.to_le_bytes());
+        frame.extend_from_slice(&99u64.to_le_bytes());
+        frame.extend_from_slice(&1u64.to_le_bytes());
+        frame.extend_from_slice(&0u16.to_le_bytes());
+        frame.extend_from_slice(data);
+        frame.push(status);
+        frame
+    }
+
+    /// Runs `frames`, opened by the root's own directory frame, through the
+    /// encoder as the child's stream.
+    fn drive_frames(
+        frames: &[u8],
+        filter: Option<&EntryPredicate<'_>>,
+    ) -> Result<(), ProvisionError> {
+        let mut stream = vec![FRAME_DIR];
+        stream.extend_from_slice(&1u16.to_le_bytes());
+        stream.push(b'.');
+        stream.extend_from_slice(&0o40_755u32.to_le_bytes());
+        stream.extend_from_slice(&[0; 8]);
+        stream.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        stream.extend_from_slice(&0u16.to_le_bytes());
+        stream.extend_from_slice(frames);
+        stream.push(FRAME_LEAVE);
+        stream.push(FRAME_END);
+        let (read, write) = rustix::pipe::pipe().expect("a pipe is creatable");
+        rustix::io::write(&write, &stream).expect("the frames fit the pipe");
+        drop(write);
+        drive(
+            std::os::fd::AsFd::as_fd(&read),
+            io::sink(),
+            Path::new("/srv/rootfs"),
+            None,
+            filter,
+        )
+    }
+
+    #[test]
+    fn a_file_the_child_saw_change_fails_the_export_naming_it() {
+        // The child streams the size it recorded whatever the file held, so the
+        // archive would carry a cut or padded file; its status byte is what
+        // says so, and the export reports the file rather than the archive.
+        drive_frames(&file_frame(b"intact", b"abc", 0), None).expect("an intact file exports");
+        match drive_frames(&file_frame(b"grew", b"abc", 1), None) {
+            Err(ProvisionError::SourceChanged { path, recorded }) => {
+                assert_eq!(path, Path::new("/srv/rootfs/grew"));
+                assert_eq!(recorded, 3);
+            }
+            other => panic!("expected a changed source, got {other:?}"),
+        }
+        // An excluded file adds nothing to the archive, so its change does not
+        // matter to it.
+        let keep = |entry: &ExportEntry<'_>| entry.path() != Path::new("/grew");
+        drive_frames(&file_frame(b"grew", b"abc", 1), Some(&keep))
+            .expect("an excluded file's change is not the archive's");
     }
 
     #[test]

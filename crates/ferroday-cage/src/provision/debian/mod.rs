@@ -734,7 +734,9 @@ impl<'a> Debian<'a> {
         bootstrap::configure_delta(&base, upper, &wave, config.overlay, observer).map_err(wrap)?;
 
         // The read-only archives bind left an empty mount point in the upper.
-        let _ = std::fs::remove_dir_all(upper.join(bootstrap::ARCHIVES.trim_start_matches('/')));
+        // Removed as the empty directory it is: anything else at the name is
+        // not the launch's to take.
+        let _ = std::fs::remove_dir(upper.join(bootstrap::ARCHIVES.trim_start_matches('/')));
 
         Ok(layer)
     }
@@ -1626,7 +1628,9 @@ fn bootstrap_suite(
         };
         bootstrap::configure(staging, &wave, repositories, overlay, observer).map_err(wrap)?;
         // The read-only bind mount left an empty mount point in the rootfs.
-        let _ = std::fs::remove_dir_all(staging.join(bootstrap::ARCHIVES.trim_start_matches('/')));
+        // Removed as the empty directory it is: anything else at the name is
+        // not the launch's to take.
+        let _ = std::fs::remove_dir(staging.join(bootstrap::ARCHIVES.trim_start_matches('/')));
     }
 
     Ok(())

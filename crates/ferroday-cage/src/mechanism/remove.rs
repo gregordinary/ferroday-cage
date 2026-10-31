@@ -8,7 +8,7 @@
 //! protocol the launch uses, the child writing a single map itself and
 //! holding at the gate for a range map the caller applies — and then removes
 //! the tree as root of the mapped namespace, where `CAP_FOWNER` and
-//! `CAP_DACL_OVERRIDE` cover every mapped id. Those capabilities are why even
+//! `CAP_DAC_OVERRIDE` cover every mapped id. Those capabilities are why even
 //! a single-identity map is worth re-entering: the ids are the caller's own
 //! either way, but a directory whose mode denies the search or write the
 //! deletion needs yields to them. No rootfs, no mounts, no `execve`: the
@@ -21,7 +21,9 @@
 //! directory is descended into, an emptied one is left by re-opening `..`
 //! and removed when its parent's next pass reaches it. Symlinks are never
 //! followed and descents refuse to cross them, so nothing the tree itself
-//! holds can redirect the walk out of it.
+//! holds can redirect the walk out of it. [`delete_tree`] is that walk, and
+//! the caller's own first attempt at a removal runs it too, in process, before
+//! anything here is forked.
 //!
 //! The ascent is the one step that does not open a name the pass just read: it
 //! re-opens `..` and stops at the directory the caller pointed it at, identified
@@ -29,10 +31,10 @@
 //! tree's own contents and against nothing else. A concurrent writer that
 //! renames a directory the walk is currently inside to somewhere outside the
 //! tree breaks the chain of `..` leading back to the start, and the ascent then
-//! climbs past where it should have stopped — as root of the mapped namespace,
-//! unlinking as it goes. The copy-in side carries the same exposure to a
-//! concurrent writer, and one bound covers both: the tree is one the caller owns
-//! and is finished with.
+//! climbs past where it should have stopped, unlinking as it goes with whatever
+//! privilege the walk holds: the calling user's in process, and root of the
+//! mapped namespace here. The bound is that the tree is one the caller owns and
+//! is finished with.
 
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
@@ -250,7 +252,13 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
         }
     }
 
-    match delete_tree(parent, leaf) {
+    let deleted = fs::open(
+        parent,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .and_then(|parent| delete_tree(parent.as_fd(), leaf));
+    match deleted {
         Ok(()) => {
             let _ = rustix::io::write(gate, &[0u8; 8]);
             sys::exit_group(0)
@@ -262,8 +270,8 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
     }
 }
 
-/// Deletes `leaf` under `parent`, holding one directory descriptor and
-/// constant memory.
+/// Deletes `leaf` under the directory `parent`, whatever kind of entry it is,
+/// holding at most three descriptors and constant memory.
 ///
 /// Each pass over a directory unlinks what it can; a non-empty
 /// subdirectory is descended into and the pass restarts there, and an
@@ -271,19 +279,27 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
 /// it with `AT_REMOVEDIR`. The walk therefore needs no name stack: the
 /// only state is the current descriptor and the identity of the starting
 /// directory, remembered by device and inode so the ascent knows where to
-/// stop.
-fn delete_tree(parent: &CStr, leaf: &CStr) -> Result<(), Errno> {
-    let parent_fd = fs::open(
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-
+/// stop. A tree nested a hundred thousand levels deep costs what a shallow
+/// one does, where a recursive removal holds a descriptor and a stack frame
+/// per level and runs out of one or the other.
+///
+/// It is the one walk every removal of a tree takes. The map-assisted child
+/// runs it under the post-fork discipline, which it meets: it allocates
+/// nothing, takes no lock, and cannot panic on what it reads. The caller's own
+/// first attempt runs it in process, as the calling user.
+///
+/// A symbolic link is never followed: one at `leaf` is removed as a link, and
+/// one inside the tree is unlinked like any other entry. An entry that is
+/// already gone — `leaf` itself, or a name another process removed while a
+/// pass was reading its directory — is the outcome asked for, not a failure.
+/// The ascent's one exposure, a concurrent writer that moves the walk's own
+/// directory out of the tree, is the module's to state.
+pub(crate) fn delete_tree(parent: BorrowedFd<'_>, leaf: &CStr) -> Result<(), Errno> {
     // A plain entry (file or symlink) needs no walk at all. Linux reports the
     // attempt to unlink a directory as EISDIR; POSIX permits EPERM, so accept
     // both as "this is a directory".
-    let refused = match fs::unlinkat(&parent_fd, leaf, AtFlags::empty()) {
-        Ok(()) => return Ok(()),
+    let refused = match fs::unlinkat(parent, leaf, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => return Ok(()),
         Err(errno @ (Errno::ISDIR | Errno::PERM)) => errno,
         Err(errno) => return Err(errno),
     };
@@ -291,19 +307,17 @@ fn delete_tree(parent: &CStr, leaf: &CStr) -> Result<(), Errno> {
     // EPERM is only a guess at "directory": an immutable file is refused the
     // same way. Where the open proves it was not one, the first refusal is the
     // honest diagnostic, not the ENOTDIR that disproved the guess.
-    let start = fs::openat(
-        &parent_fd,
+    let start = match fs::openat(
+        parent,
         leaf,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(|errno| {
-        if errno == Errno::NOTDIR {
-            refused
-        } else {
-            errno
-        }
-    })?;
+    ) {
+        Ok(start) => start,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::NOTDIR) => return Err(refused),
+        Err(errno) => return Err(errno),
+    };
     let start_stat = fs::fstat(&start)?;
     let mut current = start;
 
@@ -325,13 +339,19 @@ fn delete_tree(parent: &CStr, leaf: &CStr) -> Result<(), Errno> {
                 Ok(()) => {
                     removed = true;
                 }
+                // Something else removed it first; nothing is owed here.
+                Err(Errno::NOENT) => {}
                 // EISDIR on Linux, EPERM where POSIX allows it: a directory.
                 Err(refused @ (Errno::ISDIR | Errno::PERM)) => {
                     match fs::unlinkat(&current, name, AtFlags::REMOVEDIR) {
                         Ok(()) => {
                             removed = true;
                         }
-                        // Not empty: descend and restart the walk there.
+                        Err(Errno::NOENT) => {}
+                        // Not empty: descend and restart the walk there. Only a
+                        // directory proven non-empty is descended into, so the
+                        // parent's next pass removes it outright and no
+                        // directory is visited twice.
                         Err(Errno::NOTEMPTY | Errno::EXIST) => {
                             let child = fs::openat(
                                 &current,
@@ -366,8 +386,10 @@ fn delete_tree(parent: &CStr, leaf: &CStr) -> Result<(), Errno> {
         // parent's next pass to remove.
         let here = fs::fstat(&current)?;
         if here.st_dev == start_stat.st_dev && here.st_ino == start_stat.st_ino {
-            fs::unlinkat(&parent_fd, leaf, AtFlags::REMOVEDIR)?;
-            return Ok(());
+            return match fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR) {
+                Ok(()) | Err(Errno::NOENT) => Ok(()),
+                Err(errno) => Err(errno),
+            };
         }
         let up = fs::openat(
             &current,
@@ -535,6 +557,5 @@ mod tests {
             "the delegate's own error is the diagnostic: {result:?}"
         );
         assert!(dir.join("tree").is_dir(), "nothing was removed");
-        std::fs::remove_dir_all(&dir).expect("the scratch tree is removable");
     }
 }

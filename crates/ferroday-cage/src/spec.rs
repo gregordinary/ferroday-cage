@@ -912,9 +912,11 @@ impl Overlay {
     /// It carries the same parent-directory requirement the upper does — see
     /// [Where the upper lives](Overlay#where-the-upper-lives).
     ///
-    /// The work area holds a directory the kernel creates mode `0`, so a plain
-    /// recursive delete cannot descend into it: discard it with a removal that
-    /// restores traversable permissions as it descends.
+    /// The work area holds a directory the kernel creates mode `0`, which the
+    /// calling user cannot read into. Discard a work directory named here with
+    /// [`provision::Remove`](crate::provision::Remove) under the map the
+    /// sandbox ran under, declining the lock: a removal it refuses escalates
+    /// through that map.
     pub fn work(mut self, path: impl AsRef<Path>) -> Overlay {
         self.work = Some(path.as_ref().to_path_buf());
         self
@@ -1251,10 +1253,11 @@ impl CageBuilder {
     /// both should live under a directory the calling user controls rather than a
     /// world-writable one, for the reason `rootfs` gives and for the one in
     /// [Where the upper lives](Overlay#where-the-upper-lives). The
-    /// overlay's work area holds a directory the kernel creates mode `0`, so a
-    /// plain recursive delete cannot descend into it: discard the upper and its
-    /// work directory with a removal that restores traversable permissions as it
-    /// descends.
+    /// overlay's work area holds a directory the kernel creates mode `0`, which
+    /// the calling user cannot read into: discard the upper and its work
+    /// directory together with
+    /// [`provision::Remove::overlay_upper`](crate::provision::Remove::overlay_upper),
+    /// under the map the sandbox ran under.
     ///
     /// This is an unprivileged overlay mounted from inside the sandbox's user
     /// namespace, which the host must support: [`build`](Self::build) refuses a
@@ -3067,11 +3070,11 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
 /// requires it share with the upper. Returns `None` when `upper` has no parent or
 /// no file name.
 ///
-/// The layered-build layer's disposal finds the work directory through this,
-/// and the overlay-plan construction here names it through
-/// [`overlay_work_name`], so the directory an overlay-rooted sandbox creates and
-/// the one the build layer removes are the same.
-#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+/// [`Remove::overlay_upper`](crate::provision::Remove::overlay_upper), and so a
+/// layered build's disposal, finds the work directory through this, and the
+/// overlay-plan construction here names it through [`overlay_work_name`], so the
+/// directory an overlay-rooted sandbox creates and the one a removal of its
+/// upper takes are the same.
 pub(crate) fn overlay_work_dir(upper: &Path) -> Option<PathBuf> {
     let (parent, name) = (upper.parent()?, upper.file_name()?);
     Some(parent.join(overlay_work_name(name)))
@@ -5647,7 +5650,7 @@ mod tests {
         );
         let reset = || {
             for layer in [&upper, &middle, &base] {
-                let _ = std::fs::remove_dir_all(layer);
+                let _ = crate::provision::remove_tree(layer, &IdentityMap::Single, None);
                 std::fs::create_dir_all(layer.join("etc")).unwrap();
             }
             std::fs::write(base.join("etc/x"), b"shipped").unwrap();
@@ -5716,7 +5719,7 @@ mod tests {
             std::fs::create_dir_all(layer.join("usr/lib")).unwrap();
             std::os::unix::fs::symlink("usr/lib", layer.join("lib")).unwrap();
         }
-        std::fs::remove_dir_all(upper.join("usr")).unwrap();
+        crate::provision::remove_tree(&upper.join("usr"), &IdentityMap::Single, None).unwrap();
         std::fs::write(base.join("usr/lib/y"), b"").unwrap();
         let layers: Vec<Option<Rooted>> = [&upper, &middle, &base]
             .into_iter()
@@ -6874,7 +6877,7 @@ read-only = true
             .command("/bin/sh")
             .build();
         let leftover = elsewhere.exists();
-        let _ = std::fs::remove_dir_all(&elsewhere);
+        let _ = crate::provision::remove_tree(&elsewhere, &IdentityMap::Single, None);
         match built {
             Err(Error::Config(ConfigError::OverlayDirUnusable {
                 layer: OverlayLayer::Work,

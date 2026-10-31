@@ -242,6 +242,9 @@ fn duplicate_above(fd: std::os::fd::BorrowedFd<'_>, floor: RawFd) -> std::os::fd
     use std::os::fd::AsRawFd;
     let mut ladder = Vec::new();
     loop {
+        // `dup` rather than the close-on-exec duplicate the library takes:
+        // the flag left clear is the state this helper exists to produce.
+        #[expect(clippy::disallowed_methods)]
         let duplicate = rustix::io::dup(fd).expect("the descriptor duplicates");
         if duplicate.as_raw_fd() >= floor {
             return duplicate;

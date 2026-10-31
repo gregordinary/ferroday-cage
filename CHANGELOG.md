@@ -255,6 +255,11 @@ consumer upgrading can skip it.
   refused with `ProvisionError::EntryRefused`. Nothing is written outside the
   destination either way, and an entry whose own path is absolute or contains
   `..` is still `EntryUnsafe`.
+- An export leaves out the extended attributes the host assigns rather than the
+  tree carries: security-module labels (`security.selinux`, `security.SMACK64*`,
+  `security.apparmor`), integrity measurements (`security.ima`, `security.evm`),
+  and overlayfs bookkeeping (`user.overlay.*`, `trusted.overlay.*`). An archive
+  of one tree is then the same from any host.
 - An overlay layer path may hold a `:`, which is escaped in the mount options. A
   `,` is still refused with `ConfigError::OverlayPathInvalid`.
 - An Alpine install script runs with exactly the environment `apk` gives one:
@@ -328,6 +333,43 @@ consumer upgrading can skip it.
   entry that is not a directory is refused over a directory the base holds, and
   one beneath a base directory the calling user cannot search fails naming the
   entry.
+- `CopyIn` lays a source's `bin/`, `sbin/`, `lib/` and `lib64/` into a merged-usr
+  root through the root's aliases, resolving each from the root as the sandbox
+  would, and leaves the owner, mode, and modification time of a directory the
+  root already has as they are. It failed on every merged-usr root, and a source
+  staged under umask 077 left the root's `/etc` at `0700`. A file or dangling
+  link at a directory's name is replaced, as `overlay_tree` and the extractor
+  replace it.
+- `CopyIn` follows a symbolic link at the source path itself, as it does at any
+  other component of the caller's path. The pre-check followed it and the walk
+  then refused it.
+- An export fails with `ProvisionError::SourceChanged`, naming the file, when a
+  file grows or shrinks while it is read, as `CopyIn` does. It archived the file
+  cut or zero-padded and succeeded.
+- An export and a `CopyIn` no longer hang when a named pipe takes a regular
+  file's place between the walk inspecting the name and opening it, and neither
+  reads another file under the first one's metadata. A copy reports it as
+  `ProvisionError::SourceChanged`, and an export fails naming the step.
+- An export sorts each directory in memory set aside before it starts, so a
+  directory of a hundred thousand entries exports in under a second rather than
+  minutes. A tree whose open directories together hold more entries than that
+  memory, several hundred thousand, fails the export rather than being written
+  out of order.
+- Two threads exporting to the same path with `Export::write_to_path` each
+  publish a complete archive. They shared a staging file name, so one could
+  publish the other's archive while it was still being written.
+- Removing a tree no longer recurses. `provision::remove`, `Remove`, `ensure`'s
+  staging cleanup, and a `BuildLayer`'s disposal walk the tree iteratively with
+  a few descriptors at any depth. A tree a sandbox nested deeply could abort the
+  host process on a stack overflow, from `BuildLayer`'s drop, or fail with too
+  many open files and stay unremovable.
+- `provision::remove` and `Remove` hold the publication lock while they run, and
+  `ensure` checks after taking the lock that the lock file it holds is still the
+  one at the path. A removal running beside a publication of the same
+  destination could let two provisioners run at once.
+- The Debian package pool's publish lock is close-on-exec, so a process spawned
+  during a publish no longer keeps the pool locked after the publish returns.
+  The export's internal duplicate of its frame stream is close-on-exec as well.
 - A provisioner's host-side read of a file inside a tree no longer waits on a
   named pipe left at that path, or holds a file a script made arbitrarily large.
   Nothing but a regular file is opened, and each read refuses a file past a
@@ -392,6 +434,21 @@ consumer upgrading can skip it.
   socket for every caller that does: the supervisor's pidfd, the network stack's
   tap, and a terminal launch's primary. The shared vocabulary in
   `CONTRIBUTING.md` records them.
+- The host side's reading and writing of a tree is `provision::containment` and
+  `provision::rooted`. `containment::create_dirs` creates a chain of missing
+  directories for the extractor and `Rooted` alike, and `containment::copy_up`
+  is the layered walk both take over a base. `containment::is_whiteout` and
+  `is_opaque` are the one definition each of the overlay's markers, which the
+  launch's placeholder checks, the layered walk, the Gentoo database view and
+  both bootstraps ask. `containment::open_typed_file` opens a file a walk just
+  inspected for `Rooted`, the export child and `CopyIn`, and `open_created_fifo`
+  opens a named pipe just created for the extractor and the copy-in child.
+- `provision::lock_exclusive` takes every lock file, and `provision::remove_tree`
+  over `mechanism::delete_tree` removes every tree. `clippy.toml` refuses
+  `rustix::fs::flock`, `rustix::io::dup`, `std::fs::remove_dir_all`,
+  `rustix::fs::chmodat`, `rustix::fs::chmod`, and `rustix::rand::getrandom`,
+  each with the answer that replaces it. `host::fill_random` is the
+  `getrandom` answer.
 - `mechanism::overlay_options` composes an overlay's mount options for a build
   and for the host probe, `spec::validate_command` validates the command for both
   builders, and `MountAction::arrival` reads what a mount op brings to rest on

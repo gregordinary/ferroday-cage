@@ -3,6 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
+use ferroday_cage::IdentityMap;
+use ferroday_cage::provision::Remove;
+
 /// The fixture cache directory: `FERRODAY_CAGE_FIXTURE_DIR` when set, otherwise
 /// a directory inside `target` so `cargo clean` clears it.
 ///
@@ -51,30 +54,22 @@ pub fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Removes a directory tree, restoring traversable permissions as it descends.
+/// Removes a directory tree the way the library removes one, best effort.
 ///
-/// An overlay-rooted cage leaves a mode-`0` `work/work` directory in its work
-/// area, which a plain recursive removal cannot read into; a scratch directory
-/// that hosted one is otherwise unremovable on the next run. Every entry was
-/// created by the test process, so making each directory traversable first lets
-/// the removal complete.
+/// This is [`Remove`] under the single-identity map, declining the lock, which
+/// a scratch tree has none of. The calling user removes what it can. An
+/// overlay-rooted cage can leave a mode-`0` directory in its work area with
+/// something inside it, and the map's escalation clears that. The walk is the
+/// library's own, so a tree a test nested deep is removed like a shallow one.
+///
+/// A tree holding subordinate-owned entries resists this, as it resists any
+/// removal by the calling user; such a tree is removed through
+/// `provision::remove` with the map it was written under.
 pub fn force_remove_dir_all(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove_dir_all(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
+    let _ = Remove::new(path)
+        .map(IdentityMap::Single)
+        .remove_lock(false)
+        .run();
 }
 
 /// Whether `/dev/net/tun` is present and openable, the additional host

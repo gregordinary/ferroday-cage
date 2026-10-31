@@ -933,7 +933,7 @@ fn extract_fifo(
         &leaf,
     )?;
 
-    let pipe = open_created_fifo(&parent.dir, &leaf)
+    let pipe = containment::open_created_fifo(parent.dir.as_fd(), &leaf)
         .map_err(|errno| ProvisionError::io("opening", bytes_to_path(&entry.path), errno.into()))?;
     rustix::fs::fchmod(&pipe, Mode::from_raw_mode(entry.mode)).map_err(|errno| {
         ProvisionError::io(
@@ -950,27 +950,6 @@ fn extract_fifo(
         )
     })?;
     Ok(())
-}
-
-/// Opens the named pipe `leaf` of `parent` that the caller just created, so
-/// its metadata can be set through a descriptor.
-///
-/// `O_RDONLY | O_NONBLOCK` opens a pipe at once whether or not anything holds
-/// its other end; `O_NOCTTY` keeps a terminal swapped in from becoming the
-/// controlling one before the check below refuses it. Anything that is not a
-/// pipe is `EEXIST`: something other than the entry this created holds the
-/// name.
-fn open_created_fifo(parent: &OwnedFd, leaf: &CString) -> Result<OwnedFd, Errno> {
-    let pipe = rustix::fs::openat(
-        parent,
-        leaf,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    if FileType::from_raw_mode(rustix::fs::fstat(&pipe)?.st_mode) != FileType::Fifo {
-        return Err(Errno::EXIST);
-    }
-    Ok(pipe)
 }
 
 /// Runs `create`, replacing whatever occupies the name on `EEXIST`: the
@@ -1154,6 +1133,25 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// lays a caller's configuration into the root after the packages are unpacked
 /// and before their scripts run. Entry kinds that have no place in a
 /// configuration overlay — device nodes, FIFOs, sockets — are skipped.
+///
+/// It is the second answer to laying a host tree into a root, beside
+/// [`CopyIn`](super::CopyIn), and the two share one policy for what the root
+/// already holds. An existing directory is merged into, and neither sets its
+/// owner, mode, or modification time. A symbolic link resolving inside the root
+/// to a directory, an absolute one included, is merged through and never
+/// replaced. Anything else at a directory's name is replaced, as a file
+/// replaces what occupies its own name.
+///
+/// Where they differ, the job differs. This runs in the provisioner's own
+/// process between two dpkg or apk waves, writing as the calling user, whom the
+/// bootstrap's identity map already presents as root, so it needs no child
+/// re-entered into the map. It can lay into an upper over a base, which a
+/// `CopyIn` never writes into. It stamps what it writes with the time of
+/// writing, as the rest of a bootstrap does; an export's `clamp_mtime` is what
+/// makes the root reproducible, where a `CopyIn` carries the source's times
+/// because it mirrors an export. And it lays only what configuration for the
+/// scripts that run next consists of, with no report of the rest, where a
+/// `CopyIn` copies any tree and names what it leaves out.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 pub(crate) fn overlay_tree(
     root: &Path,
@@ -2037,7 +2035,8 @@ mod layered_tests {
                 fs::rename(entry.path(), moved).unwrap();
             }
         }
-        crate::host::force_remove_dir_all(&base.join("sbin"));
+        crate::provision::remove_tree(&base.join("sbin"), &crate::IdentityMap::Single, None)
+            .expect("the copied sbin is removable");
         symlink("usr/bin", base.join("sbin")).unwrap();
 
         let upper = scratch.join("upper");

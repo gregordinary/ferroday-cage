@@ -109,7 +109,7 @@ pub(crate) use export::{
 pub(crate) use overlay::{
     OverlayOptionsError, OverlayProbe, overlay_options, probe_overlay_mount, xattr_unsupported,
 };
-pub(crate) use remove::{RemoveFailure, remove_tree_mapped};
+pub(crate) use remove::{RemoveFailure, delete_tree, remove_tree_mapped};
 
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};

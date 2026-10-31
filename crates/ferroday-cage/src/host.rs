@@ -8,14 +8,13 @@
 //! uid/gid range maps, whose availability depends on the caller's privilege
 //! and, for the delegated tier, on the shadow suite's helpers.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fmt;
-use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, Mode, OFlags, RawDir, SeekFrom, XattrFlags};
+use rustix::fs::{AtFlags, Mode, OFlags, XattrFlags};
 use rustix::io::Errno;
 use rustix::rand::GetRandomFlags;
 
@@ -496,184 +495,11 @@ fn overlay_mount_refused(scratch_dir: &Path) -> bool {
     // unpredictably named.
     let base = scratch_dir.join(&name);
     let outcome = overlay_mount_probe(&base);
-    force_remove_dir_all(&base);
+    // The mount leaves a mode-`0` directory in its work area. Empty, it goes
+    // as the calling user; anything left inside it is what the single-map
+    // escalation clears. Best effort: the verdict does not depend on it.
+    let _ = crate::provision::remove_tree(&base, &crate::IdentityMap::Single, None);
     matches!(outcome, Some(crate::mechanism::OverlayProbe::MountFailed))
-}
-
-/// Removes a directory tree, restoring traversable permissions as it descends.
-///
-/// The overlay mount leaves a mode-`0` `work/work` directory in its work area,
-/// which a plain recursive removal cannot read into. When every entry was
-/// created by the caller — the overlay probe here, and a single-identity layered
-/// build's upper and work directories — making each directory traversable before
-/// descending into it lets the cleanup leave no residue. Best-effort throughout:
-/// a failure to remove is not surfaced, and the walk stops at the first entry it
-/// cannot remove rather than pressing on, so a caller whose verdict does not
-/// depend on cleanup can ignore the outcome. It is not for a range-mapped tree,
-/// whose subordinate-owned entries the caller cannot `chmod`; that removal
-/// escalates through [`crate::provision::remove`] instead.
-///
-/// The walk is iterative and holds one directory descriptor, so an unexpectedly
-/// deep tree costs no stack: each pass unlinks what it can, descends into a
-/// subdirectory that is not yet empty and restarts there, and leaves an emptied
-/// directory through `..` for its parent's next pass to remove. The only state is
-/// the current descriptor and the starting directory's identity, remembered by
-/// device and inode so the ascent knows where to stop. It is the same shape
-/// `mechanism::remove` uses post-fork, where the constant memory is a hard
-/// requirement rather than a convenience.
-pub(crate) fn force_remove_dir_all(path: &Path) {
-    let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
-        return;
-    };
-    // A bare file name — no parent component at all — is relative to the
-    // process's working directory.
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    let (Ok(parent_fd), Ok(leaf)) = (open_dir(parent), CString::new(leaf.as_bytes())) else {
-        return;
-    };
-    let leaf = leaf.as_c_str();
-
-    // A plain entry (file or symlink) needs no walk at all.
-    match rustix::fs::unlinkat(&parent_fd, leaf, AtFlags::empty()) {
-        // Linux reports the attempt to unlink a directory as EISDIR; POSIX
-        // permits EPERM, so accept both as "this is a directory".
-        Err(Errno::ISDIR | Errno::PERM) => {}
-        _ => return,
-    }
-
-    let Some(start) = open_removable_dir(&parent_fd, leaf) else {
-        return;
-    };
-    let Ok(start_stat) = rustix::fs::fstat(&start) else {
-        return;
-    };
-    let mut current = start;
-
-    'walk: loop {
-        // Rescan the current directory from the top; unlinking during getdents
-        // iteration is safe, but a fresh pass keeps the logic simple and the
-        // state constant.
-        if rustix::fs::seek(&current, SeekFrom::Start(0)).is_err() {
-            return;
-        }
-        let mut buf = [MaybeUninit::uninit(); 2048];
-        let mut entries = RawDir::new(&current, &mut buf);
-        let mut removed = false;
-        while let Some(entry) = entries.next() {
-            let Ok(entry) = entry else {
-                return;
-            };
-            let name = entry.file_name();
-            if name == c"." || name == c".." {
-                continue;
-            }
-            match rustix::fs::unlinkat(&current, name, AtFlags::empty()) {
-                Ok(()) => removed = true,
-                // Something else removed it first; nothing owed here.
-                Err(Errno::NOENT) => {}
-                Err(Errno::ISDIR | Errno::PERM) => {
-                    match rustix::fs::unlinkat(&current, name, AtFlags::REMOVEDIR) {
-                        Ok(()) => removed = true,
-                        Err(Errno::NOENT) => {}
-                        // Not empty: descend and restart the walk there. Only a
-                        // directory proven non-empty is descended into, so the
-                        // parent's next pass removes it outright and no
-                        // directory is ever visited twice.
-                        Err(Errno::NOTEMPTY | Errno::EXIST) => {
-                            let Some(child) = open_removable_dir(&current, name) else {
-                                return;
-                            };
-                            current = child;
-                            continue 'walk;
-                        }
-                        Err(_) => return,
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-
-        if removed {
-            // Something went; the directory may be empty now. Rescan.
-            continue;
-        }
-
-        // An empty directory. The start is removed from its parent and the walk
-        // is done; anything deeper is left through `..`, for its parent's next
-        // pass to remove.
-        let Ok(here) = rustix::fs::fstat(&current) else {
-            return;
-        };
-        if here.st_dev == start_stat.st_dev && here.st_ino == start_stat.st_ino {
-            let _ = rustix::fs::unlinkat(&parent_fd, leaf, AtFlags::REMOVEDIR);
-            return;
-        }
-        let Ok(up) = rustix::fs::openat(
-            &current,
-            c"..",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) else {
-            return;
-        };
-        current = up;
-    }
-}
-
-/// Opens `name` under `parent` as a directory, reinstating the owner's rights
-/// first when the open is refused for want of them.
-///
-/// The overlay mount leaves its work area's inner directory mode `0`, which
-/// cannot be read into at all, and a sandbox can leave one in its upper. The
-/// directory is held by an `O_PATH` descriptor, which needs no permission on
-/// the directory itself, with `O_NOFOLLOW` and `O_DIRECTORY` refusing a link or
-/// anything else at the name. Its owner's rights are restored through that
-/// descriptor, and it is reopened through it, so neither the mode nor the
-/// descent can be redirected by whatever replaces the name in between.
-fn open_removable_dir(parent: impl AsFd, name: &CStr) -> Option<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    match rustix::fs::openat(&parent, name, flags, Mode::empty()) {
-        Ok(fd) => Some(fd),
-        Err(Errno::ACCESS) => {
-            let held = rustix::fs::openat(
-                &parent,
-                name,
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .ok()?;
-            restore_owner_rights(&held).ok()?;
-            rustix::fs::openat(
-                &held,
-                c".",
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .ok()
-        }
-        Err(_) => None,
-    }
-}
-
-/// Gives the owner of the directory `held` read, write, and search on it,
-/// through the descriptor rather than by name.
-///
-/// `fchmod` refuses an `O_PATH` descriptor, and a directory whose mode denies
-/// its owner reading cannot be opened any other way. The mode is therefore set
-/// through the descriptor's own entry under `/proc/self/fd`, a link the kernel
-/// resolves to the inode the descriptor holds rather than to anything named in
-/// a tree. Where `/proc` is not mounted this fails, and the removal stops there
-/// as it stops at any entry it cannot remove.
-fn restore_owner_rights(held: &OwnedFd) -> rustix::io::Result<()> {
-    let path = format!("/proc/self/fd/{}", held.as_raw_fd());
-    // The magic link is what makes a path-wise chmod land on the descriptor's
-    // own inode; the descriptor-based chmod the ban names refuses `O_PATH`.
-    #[expect(clippy::disallowed_methods)]
-    rustix::fs::chmod(path.as_str(), Mode::RWXU)
 }
 
 /// Lays out the probe's lower, upper, work, and merged directories under `base`
@@ -1036,49 +862,6 @@ mod tests {
             rustix::fs::mkdirat(&parent, "link", Mode::RWXU),
             Err(rustix::io::Errno::EXIST),
         );
-    }
-
-    #[test]
-    fn force_remove_clears_a_deep_tree_with_an_unreadable_directory() {
-        // A tree deeper than a recursive walk would want to hold on the stack —
-        // and, at 2000 levels, longer than `PATH_MAX`, so it has to be laid out
-        // through relative descriptors rather than joined paths. At the bottom
-        // sits the mode-`0` directory an overlay work area leaves behind, with a
-        // file and a dangling symlink beside it.
-        let root = std::env::temp_dir().join(probe_name("fcage-force-remove-"));
-        std::fs::create_dir(&root).unwrap();
-        let descend = |dir: &OwnedFd, name: &str| {
-            rustix::fs::mkdirat(dir, name, Mode::RWXU).unwrap();
-            rustix::fs::openat(
-                dir,
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .unwrap()
-        };
-
-        let mut deep = open_dir(&root).unwrap();
-        for _ in 0..2_000 {
-            deep = descend(&deep, "level");
-        }
-        create_probe_file(&deep, "file").unwrap();
-        rustix::fs::symlinkat("/nowhere", &deep, "dangling").unwrap();
-        let sealed = descend(&deep, "work");
-        create_probe_file(&sealed, "inner").unwrap();
-        rustix::fs::fchmod(&sealed, Mode::empty()).unwrap();
-
-        force_remove_dir_all(&root);
-        assert!(
-            std::fs::symlink_metadata(&root).is_err(),
-            "the tree survived removal",
-        );
-    }
-
-    #[test]
-    fn force_remove_tolerates_a_missing_path() {
-        // Nothing to remove is not a failure, and there is no path to walk.
-        force_remove_dir_all(&std::env::temp_dir().join(probe_name("fcage-absent-")));
     }
 
     #[test]

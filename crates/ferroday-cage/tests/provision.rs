@@ -1085,7 +1085,7 @@ fn extraction_reports_entries_and_byte_progress() {
     assert_eq!(done, archive.len() as u64);
     assert_eq!(total, Some(archive.len() as u64));
 
-    fs::remove_dir_all(&dir).unwrap();
+    common::force_remove_dir_all(&dir);
 }
 
 #[test]
@@ -1129,7 +1129,7 @@ fn a_cancelled_extraction_leaves_no_destination() {
     assert!(!dest.exists());
     assert!(!dir.join(".rootfs.staging").exists());
 
-    fs::remove_dir_all(&dir).unwrap();
+    common::force_remove_dir_all(&dir);
 }
 
 #[test]
@@ -1153,7 +1153,7 @@ fn a_tarball_extracts_from_a_reader() {
     assert!(err.to_string().contains("consumed by an earlier"), "{err}");
     assert!(!dir.join("second").exists());
 
-    fs::remove_dir_all(&dir).unwrap();
+    common::force_remove_dir_all(&dir);
 }
 
 #[test]
@@ -1180,7 +1180,7 @@ fn a_reader_source_reports_progress_without_a_total() {
         "a reader's length is unknown, so no total is claimed"
     );
 
-    fs::remove_dir_all(&dir).unwrap();
+    common::force_remove_dir_all(&dir);
 }
 
 /// A single-identity map is worth re-entering too: the tree's ids are the
@@ -1211,11 +1211,15 @@ fn a_single_mapped_removal_clears_a_directory_its_own_mode_locks() {
     // unlinked, so the tree cannot be removed by its own owner.
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).expect("the mode is settable");
 
-    if fs::remove_dir_all(&tree).is_ok() {
+    // The plain recursive removal is the baseline: the test is about the case
+    // where the caller's own attempt is refused.
+    #[expect(clippy::disallowed_methods)]
+    let plain = fs::remove_dir_all(&tree);
+    if plain.is_ok() {
         // A privileged runner overrides the mode outright, leaving nothing for
         // the escalation to do.
         eprintln!("skipping: the caller can remove a mode-0500 directory's contents outright");
-        fs::remove_dir_all(&dir).unwrap();
+        common::force_remove_dir_all(&dir);
         return;
     }
 
@@ -1225,5 +1229,5 @@ fn a_single_mapped_removal_clears_a_directory_its_own_mode_locks() {
         .expect("the map-assisted removal succeeds");
     assert!(!tree.exists(), "the tree is gone");
 
-    fs::remove_dir_all(&dir).unwrap();
+    common::force_remove_dir_all(&dir);
 }

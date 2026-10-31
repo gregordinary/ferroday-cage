@@ -1327,6 +1327,7 @@ impl<'a> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::map(self, ferroday_cage::IdentityMap) -> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::mapper(self, &'a dyn ferroday_cage::IdMapper) -> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Remove<'a>
+pub fn ferroday_cage::provision::Remove<'a>::overlay_upper(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::remove_lock(self, bool) -> ferroday_cage::provision::Remove<'a>
 pub fn ferroday_cage::provision::Remove<'a>::run(self) -> core::result::Result<(), ferroday_cage::provision::ProvisionError>
 impl core::fmt::Debug for ferroday_cage::provision::Remove<'_>

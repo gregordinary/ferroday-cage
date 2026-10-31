@@ -81,14 +81,15 @@ impl std::fmt::Debug for Scratch {
 }
 
 impl Drop for Scratch {
-    /// Removes the tree, restoring traversable permissions as it descends: a
-    /// test that mounted an overlay here leaves a mode-`0` work directory that
-    /// a plain recursive removal cannot read into.
+    /// Removes the tree the way the library removes one, escalating through
+    /// the single-identity map where the calling user is refused: a test that
+    /// mounted an overlay here can leave a mode-`0` work directory with
+    /// something inside it.
     ///
     /// Best effort. A test that has already failed should report its own
     /// assertion rather than a cleanup failure raised while it unwinds.
     fn drop(&mut self) {
-        crate::host::force_remove_dir_all(&self.path);
+        let _ = crate::provision::remove_tree(&self.path, &crate::IdentityMap::Single, None);
     }
 }
 

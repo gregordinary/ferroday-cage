@@ -356,8 +356,9 @@ impl Rooted {
     /// either happens. An overlay whiteout is a file that is gone, and reads as
     /// absent. `relative` names the file in a refusal.
     ///
-    /// The open itself is `O_NONBLOCK` and `O_NOCTTY` all the same, and checks
-    /// the kind again, since the name can be replaced between the look and the
+    /// The open itself is [`containment::open_typed_file`]'s: `O_NONBLOCK` and
+    /// `O_NOCTTY` all the same, and refusing a name that no longer holds the
+    /// file looked at, since the name can be replaced between the look and the
     /// open. A regular file ignores `O_NONBLOCK`, and the flag is cleared before
     /// the descriptor is handed back all the same.
     fn open_regular(
@@ -367,28 +368,29 @@ impl Rooted {
         relative: &Path,
         access: OFlags,
     ) -> io::Result<File> {
-        let refused = || {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not a regular file", self.path(relative).display()),
-            )
-        };
         let stat = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)?;
         if containment::is_whiteout(&stat) {
             return Err(Errno::NOENT.into());
         }
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Err(refused());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", self.path(relative).display()),
+            ));
         }
-        let fd = rustix::fs::openat(
-            parent,
-            leaf,
-            access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
-            return Err(refused());
-        }
+        let fd =
+            containment::open_typed_file(parent.as_fd(), leaf, &stat, access).map_err(|errno| {
+                match errno {
+                    Errno::STALE => io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} was replaced while it was being opened",
+                            self.path(relative).display(),
+                        ),
+                    ),
+                    errno => errno.into(),
+                }
+            })?;
         rustix::fs::fcntl_setfl(&fd, rustix::fs::fcntl_getfl(&fd)? - OFlags::NONBLOCK)?;
         Ok(File::from(fd))
     }
