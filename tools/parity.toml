@@ -162,6 +162,7 @@ flags = [
     "--seccomp-deny",
     "--seccomp-allow-rule",
     "--seccomp-deny-rule",
+    "--seccomp-errno",
 ]
 
 [[builder.setting]]
@@ -171,6 +172,10 @@ flags = ["--landlock-ro", "--landlock-rw"]
 [[builder.setting]]
 name = "landlock_net"
 flags = ["--landlock-bind", "--landlock-connect"]
+
+[[builder.setting]]
+name = "landlock_scope"
+flags = ["--landlock-scope"]
 
 [[builder.setting]]
 name = "drop_all_capabilities"
@@ -250,6 +255,7 @@ flags = [
     "--seccomp-deny",
     "--seccomp-allow-rule",
     "--seccomp-deny-rule",
+    "--seccomp-errno",
 ]
 
 [[builder.setting]]
@@ -259,6 +265,10 @@ flags = ["--landlock-ro", "--landlock-rw"]
 [[builder.setting]]
 name = "landlock_net"
 flags = ["--landlock-bind", "--landlock-connect"]
+
+[[builder.setting]]
+name = "landlock_scope"
+flags = ["--landlock-scope"]
 
 [[builder.setting]]
 name = "stdin"

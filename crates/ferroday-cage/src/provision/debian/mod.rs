@@ -641,10 +641,10 @@ impl<'a> Debian<'a> {
         arch::preflight_foreign(&arch::host_architecture(), &self.architecture)
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
         if !matches!(self.identity_map, IdentityMap::Single)
-            && let Err(reason) = crate::idmap::resolve_default_chain(&self.identity_map)
+            && let Err(refusal) = crate::idmap::resolve_range_bundled(&self.identity_map)
         {
             return Err(wrap(DebianError::Config {
-                reason: format!("the requested identity map is unavailable: {reason}"),
+                reason: refusal.to_string(),
             }));
         }
 
@@ -1579,10 +1579,10 @@ fn bootstrap_suite(
         // an unavailable map is a configuration problem, and the identity
         // posture is never quietly downgraded to the single-identity form.
         if !matches!(identity_map, IdentityMap::Single)
-            && let Err(reason) = crate::idmap::resolve_default_chain(identity_map)
+            && let Err(refusal) = crate::idmap::resolve_range_bundled(identity_map)
         {
             return Err(wrap(DebianError::Config {
-                reason: format!("the requested identity map is unavailable: {reason}"),
+                reason: refusal.to_string(),
             }));
         }
     }

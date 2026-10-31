@@ -225,6 +225,7 @@ mod hardening {
     const _: () = assert_send_sync::<hardening::RestrictionBuilder>();
     const _: () = assert_send_sync::<hardening::Capability>();
     const _: () = assert_send_sync::<hardening::FsAccess>();
+    const _: () = assert_send_sync::<hardening::LandlockScope>();
     const _: () = assert_send_sync::<hardening::NetAccess>();
     const _: () = assert_send_sync::<hardening::SeccompAction>();
     const _: () = assert_send_sync::<hardening::SeccompArg>();
@@ -235,6 +236,7 @@ mod hardening {
     const _: () = assert_send_sync::<hardening::SockFilter>();
     const _: () = assert_send_sync::<hardening::ParseCapabilityError>();
     const _: () = assert_send_sync::<hardening::ParseFsAccessError>();
+    const _: () = assert_send_sync::<hardening::ParseLandlockScopeError>();
     const _: () = assert_send_sync::<hardening::ParseNetAccessError>();
 }
 

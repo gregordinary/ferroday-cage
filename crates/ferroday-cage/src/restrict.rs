@@ -27,23 +27,28 @@
 //! # Residual host surface
 //!
 //! Because a restriction runs a host process with no namespace or root-swap
-//! isolation, several host-reaching surfaces are governed only by whatever
-//! Landlock and seccomp the caller configured. A restriction always drops to
-//! the empty capability set, so no capability-gated reach remains; what is left
-//! is same-credential access that only a configured control closes:
+//! isolation, several host-reaching surfaces are governed only by the controls
+//! the restriction applies. A restriction always drops to the empty capability
+//! set, so no capability-gated reach remains; what is left is same-credential
+//! access:
 //!
-//! - **Abstract-socket services.** A Landlock network grant governs TCP alone,
-//!   so `AF_UNIX` sockets — including the abstract-namespace paths to D-Bus, the
-//!   X server, and the session bus — stay reachable. Denying them needs a
-//!   seccomp filter on the socket syscalls, or a cage's network namespace.
-//! - **Same-user `/proc`.** Under a seccomp-only restriction with no Landlock
-//!   filesystem grant, `/proc/<pid>/{environ,mem,maps}` of other host processes
-//!   sharing the caller's uid remain readable. A Landlock filesystem grant that
-//!   does not cover `/proc` closes this.
-//! - **Same-user `ptrace`.** Under a Landlock-only restriction (no seccomp),
-//!   `ptrace` of other same-uid host processes is possible where the host's
-//!   Yama policy permits it. The curated seccomp denylist blocks `ptrace`
-//!   outright.
+//! - **Signals.** The command shares the host's PID space and runs as the
+//!   calling user, so it can signal every process that user owns, and
+//!   `kill(-1, ..)` reaches all of them at once.
+//! - **Abstract-socket services.** An abstract `AF_UNIX` address belongs to the
+//!   network namespace, which a restriction shares, so the session bus and the
+//!   X server are reachable through theirs. A Landlock network grant governs TCP
+//!   alone, and a seccomp filter cannot read the address a connect names.
+//! - **Same-user `/proc` and `ptrace`.** A command with no Landlock domain can
+//!   `ptrace` the calling user's other processes, where the host's Yama policy
+//!   permits it, and read their `/proc/<pid>/{environ,mem,maps}`. Any Landlock
+//!   domain refuses both against a process outside it, whatever it grants.
+//! - **The user's keyrings.** The fresh session keyring every launch joins
+//!   ends possession of the caller's session keys, but the user keyring, the
+//!   user session keyring, and the persistent keyring belong to the user rather
+//!   than the session. The command is that user, so it can link them into its
+//!   own keyring and read every key they hold. See [The session
+//!   keyring](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#the-session-keyring).
 //! - **The caller's terminal.** A command holding a descriptor onto the
 //!   caller's terminal can read what is typed at it, change its settings, and —
 //!   where the terminal is the command's own controlling terminal — push input
@@ -56,12 +61,23 @@
 //!   `dev.tty.legacy_tiocsti` sysctl, which modern kernels default to off, or a
 //!   seccomp filter on `ioctl`, which the curated denylist provides.
 //!
-//! A cage closes the first three through its namespaces and swapped root; a
-//! restriction closes each of those only through the control that covers it.
+//! On a kernel with Landlock ABI 6 (Linux 6.12) or later a restriction closes
+//! the first three. Its default [`landlock_scope`](RestrictionBuilder::landlock_scope)
+//! confines signals and abstract-socket connections to the processes the
+//! command started, and the scopes give every restriction a Landlock domain,
+//! grants or none. On an older kernel the scopes are dropped, signals and
+//! abstract sockets stay open, and only a Landlock grant creates a domain; the
+//! curated seccomp denylist still blocks `ptrace` and `process_vm_*`. The
+//! curated denylist also blocks `keyctl`, which is what closes the keyrings.
+//!
+//! A default sandbox closes the first three through its PID and network
+//! namespaces. Its own user namespace gives it user keyrings of its own, so of
+//! the fourth only a key whose permissions grant its owner read stays
+//! reachable, by serial number.
 //!
 //! # The caller's terminal
 //!
-//! The fourth surface is not a namespace question, so a cage and a restriction
+//! The terminal is not a namespace question, so a sandbox and a restriction
 //! answer it the same way: **a sandboxed command reaches the caller's terminal
 //! exactly through the standard streams the caller handed it.** Closing it
 //! therefore takes all three streams, and each closes a different part.
@@ -123,7 +139,7 @@ use std::path::Path;
 use rustix::thread::UnshareFlags;
 
 use crate::error::{ConfigError, Error};
-use crate::hardening::{FsAccess, NetAccess, Request, SeccompPolicy};
+use crate::hardening::{FsAccess, LandlockScope, NetAccess, Request, SeccompPolicy};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, StdioPlan};
 use crate::observer::{Collect, Observer, Output};
@@ -327,7 +343,14 @@ impl Default for RestrictionBuilder {
             stderr: Stdio::default(),
             stop_with_caller: false,
             rlimits: BTreeMap::new(),
-            hardening: Request::default(),
+            hardening: {
+                // Every scope, which a restriction needs and a sandbox does not: it
+                // has no PID namespace and no network namespace to hide the
+                // calling user's other processes behind.
+                let mut hardening = Request::default();
+                hardening.set_scope(LandlockScope::ALL.iter().copied());
+                hardening
+            },
         }
     }
 }
@@ -481,7 +504,9 @@ impl RestrictionBuilder {
     /// host filesystem is denied. A runnable command therefore needs grants
     /// covering its own binary and libraries — commonly
     /// `FsAccess::READ | FsAccess::EXECUTE` on `/usr`, `/bin`, and `/lib` —
-    /// alongside the data paths it works on.
+    /// alongside the data paths it works on. A grant may name a single file or
+    /// device node as well as a directory; there it allows only the rights that
+    /// act on a file, since there are no entries to list, create, or remove.
     ///
     /// The ruleset is enforced on a kernel that offers Landlock, best-effort
     /// down to the kernel's supported ABI. A filesystem grant keeps its ABI-1
@@ -507,23 +532,51 @@ impl RestrictionBuilder {
     /// connect is denied. Because a restriction runs on the host, these grants
     /// govern the command's access to the host network.
     ///
-    /// Landlock confines TCP alone. UDP, raw sockets, and other socket
-    /// families — including `AF_UNIX`, so abstract-socket paths to host
-    /// services such as the session bus or the X server — are not restricted
-    /// by a network grant. A restriction that must deny those needs a seccomp
-    /// filter on the relevant socket syscalls, or a cage's network namespace.
+    /// Landlock's network rights confine TCP alone. UDP, raw sockets, and
+    /// other socket families are not restricted by a network grant, and a
+    /// restriction that must deny them needs a seccomp filter on the socket
+    /// syscalls. An abstract `AF_UNIX` socket, such as the session bus's or the
+    /// X server's, is the exception: the default
+    /// [`landlock_scope`](Self::landlock_scope) confines connections to one.
     ///
-    /// Network rights require Landlock ABI 4. On an older kernel that offers
-    /// Landlock they narrow away best-effort, as an unsupported filesystem
-    /// right does — except that a restriction whose only Landlock grant is a
-    /// network grant is refused at build, since nothing would then be
-    /// enforced. An empty `access` is refused at build for the same reason an
-    /// empty filesystem grant is: it would deny all TCP rather than nothing.
+    /// Network rights require Landlock ABI 4. A sandbox on an older kernel
+    /// narrows them away best-effort, but a restriction has no network
+    /// namespace behind the grant, so a restriction with any network grant is
+    /// refused at build on such a kernel, whatever filesystem grants it also
+    /// makes. The refusal is
+    /// [`ConfigError::RestrictionLandlockUnenforceable`](crate::ConfigError::RestrictionLandlockUnenforceable).
+    /// An empty `access` is refused at build for the same reason an empty
+    /// filesystem grant is: it would deny all TCP rather than nothing.
     ///
     /// [`NetAccess::BIND`]: crate::NetAccess::BIND
     /// [`NetAccess::CONNECT`]: crate::NetAccess::CONNECT
     pub fn landlock_net(mut self, access: NetAccess, port: u16) -> Self {
         self.hardening.grant_net(access, port);
+        self
+    }
+
+    /// Replaces the Landlock scopes the command is confined by (default:
+    /// every scope).
+    ///
+    /// A scope denies an interaction with a process outside the restriction's
+    /// Landlock domain: [`LandlockScope::Signal`] sending it a signal, and
+    /// [`LandlockScope::AbstractUnixSocket`] connecting to an abstract socket it
+    /// created. A restriction shares the host's PID space and network
+    /// namespace, so without them the command can signal every process of the
+    /// calling user and reach the session bus and the X server. Both are on by
+    /// default; name fewer only for a command that needs that reach.
+    ///
+    /// Scopes need Landlock ABI 6 (Linux 6.12). On a kernel without it,
+    /// Landlock LSM or not, the build drops them, which leaves those reaches
+    /// open; [`host::landlock_abi`](crate::host::landlock_abi) reports the
+    /// running ABI. Unlike a grant, a scope alone does not count as
+    /// confinement: a restriction with no grant and no seccomp policy is still
+    /// refused as [`ConfigError::RestrictionEmpty`](crate::ConfigError::RestrictionEmpty).
+    ///
+    /// [`LandlockScope::Signal`]: crate::LandlockScope::Signal
+    /// [`LandlockScope::AbstractUnixSocket`]: crate::LandlockScope::AbstractUnixSocket
+    pub fn landlock_scope<I: IntoIterator<Item = LandlockScope>>(mut self, scopes: I) -> Self {
+        self.hardening.set_scope(scopes);
         self
     }
 
@@ -573,6 +626,13 @@ impl RestrictionBuilder {
         // command would run unconfined; refuse rather than silently drop the
         // requested confinement.
         hardening.ensure_landlock_enforceable()?;
+        // The scopes are best-effort, since every restriction requests them
+        // unasked: a kernel that cannot enforce them drops them here, where a
+        // grant on such a kernel was refused above. Without this, a kernel
+        // with no Landlock LSM would fail a seccomp-only restriction at setup
+        // for want of a ruleset nobody asked for.
+        hardening.landlock_scoped &=
+            crate::hardening::scope_for_abi(crate::mechanism::probe_landlock_abi().unwrap_or(0));
         // Always drop to the empty capability set. A restriction runs on the
         // host with no user namespace, so a privileged caller (root, or one
         // holding file capabilities) would otherwise carry its full permitted

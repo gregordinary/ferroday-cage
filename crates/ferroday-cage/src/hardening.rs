@@ -219,6 +219,23 @@ pub(crate) mod fs_access {
         | REFER
         | TRUNCATE
         | IOCTL_DEV;
+
+    /// The rights that act on a file itself rather than on the entries of a
+    /// directory: the kernel's `ACCESS_FILE`.
+    ///
+    /// A rule whose target is not a directory may allow these and nothing else.
+    /// The kernel refuses the rule with `EINVAL` otherwise, so the command stage
+    /// narrows a grant on a file or a device node to this set before adding it.
+    pub(crate) const FILE: u64 = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
+}
+
+/// Kernel `LANDLOCK_SCOPE_*` flags: the IPC reaches a ruleset can confine to
+/// its own domain. Named here beside the access rights so the ABI contract
+/// lives in one place; re-verify against the kernel uapi when the Landlock ABI
+/// grows.
+pub(crate) mod scope {
+    pub(crate) const ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+    pub(crate) const SIGNAL: u64 = 1 << 1;
 }
 
 /// Kernel `LANDLOCK_ACCESS_NET_*` rights, keyed by TCP port rather than by
@@ -281,6 +298,22 @@ pub(crate) fn net_access_for_abi(abi: i32) -> u64 {
     // ABI 4 introduced BIND_TCP and CONNECT_TCP together. Later network rights
     // (the UDP rights of ABI 10) become additional gated additions here.
     if abi >= 4 { net_access::ALL } else { 0 }
+}
+
+/// Masks a scope set down to the scopes a Landlock ABI version defines, so a
+/// ruleset built for a newer ABI still enforces on an older kernel, narrowing
+/// what is enforced and never widening it.
+///
+/// Both scopes arrive together in ABI 6 (Linux 6.12). Below it the kernel
+/// defines no scope, and a ruleset carrying one is refused outright, so the
+/// command stage drops them there: the same best-effort downgrade
+/// [`fs_access_for_abi`] performs for a filesystem right.
+pub(crate) fn scope_for_abi(abi: i32) -> u64 {
+    if abi >= 6 {
+        scope::ABSTRACT_UNIX_SOCKET | scope::SIGNAL
+    } else {
+        0
+    }
 }
 
 /// Whether a requested filesystem grant carrying this handled mask falls
@@ -426,11 +459,12 @@ letter_set_text! {
 /// A set of Landlock network access rights, granted on a TCP port by
 /// [`CageBuilder::landlock_net`].
 ///
-/// Landlock's network control covers TCP alone: these rights govern TCP bind
-/// and connect and nothing else. UDP, raw sockets, and other socket families
-/// — `AF_UNIX` among them, including abstract sockets to host IPC — are
-/// outside a network grant's reach, and a restriction that must deny them
-/// needs a seccomp filter or a cage's network namespace instead.
+/// Landlock's network rights cover TCP alone: these govern TCP bind and
+/// connect and nothing else. UDP, raw sockets, and other socket families are
+/// outside a network grant's reach, and so is `AF_UNIX`. A connection to an
+/// abstract socket outside the sandbox is confined by
+/// [`LandlockScope::AbstractUnixSocket`] instead, or by a sandbox's network
+/// namespace.
 ///
 /// The kernel keys network rights by port, so these are the network
 /// counterpart of [`FsAccess`]: the two primitives — [`BIND`](Self::BIND) and
@@ -505,6 +539,120 @@ letter_set_text! {
     /// repeats one of them.
     ParseNetAccessError
 }
+
+roster_enum! {
+    /// A Landlock scope, for [`CageBuilder::landlock_scope`]: a reach the
+    /// kernel confines to the command's own Landlock domain.
+    ///
+    /// A scope is not a grant. It names an interaction with processes outside
+    /// the domain and denies it, while the same interaction between the
+    /// command and the processes it starts stays open. A scope needs Landlock
+    /// ABI 6 (Linux 6.12); on an older kernel that offers Landlock it narrows
+    /// away best-effort, as an unsupported filesystem right does.
+    ///
+    /// Each scope has a canonical kebab-case name (`abstract-unix-socket`),
+    /// printed by [`Display`](std::fmt::Display) and parsed by
+    /// [`FromStr`](std::str::FromStr), which also accepts the snake-case form in
+    /// any letter case. [`ALL`](Self::ALL) lists every variant.
+    ///
+    /// [`CageBuilder::landlock_scope`]: crate::CageBuilder::landlock_scope
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[non_exhaustive]
+    pub enum LandlockScope {
+        /// The kernel `LANDLOCK_SCOPE_*` flag this scope sets.
+        pub(crate) fn to_landlock -> u64;
+        /// The canonical kebab-case name.
+        fn as_str;
+
+        /// `LANDLOCK_SCOPE_SIGNAL`: the command cannot signal a process outside
+        /// its domain.
+        ///
+        /// Without it, a command that can see the calling user's other
+        /// processes can signal every one of them. A sandbox sees them under
+        /// [`pid_namespace(false)`](crate::CageBuilder::pid_namespace), and a
+        /// restriction always does.
+        Signal = scope::SIGNAL => "signal",
+        /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`: the command cannot connect to
+        /// an abstract `AF_UNIX` socket that a process outside its domain
+        /// created.
+        ///
+        /// Abstract sockets belong to a network namespace rather than to the
+        /// filesystem, so a Landlock filesystem grant does not reach them, and
+        /// seccomp cannot read the address a connect names. A sandbox reaches the
+        /// host's under [`Network::Host`](crate::Network::Host), and a
+        /// restriction always does: the session bus and the X server listen on
+        /// them.
+        AbstractUnixSocket = scope::ABSTRACT_UNIX_SOCKET => "abstract-unix-socket",
+    }
+}
+
+impl LandlockScope {
+    /// The kernel flags of a set of scopes, joined.
+    pub(crate) fn bits_of<I: IntoIterator<Item = LandlockScope>>(scopes: I) -> u64 {
+        scopes
+            .into_iter()
+            .fold(0, |bits, scope| bits | scope.to_landlock())
+    }
+}
+
+impl fmt::Display for LandlockScope {
+    /// Writes the canonical kebab-case name, such as `abstract-unix-socket`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LandlockScope {
+    type Err = ParseLandlockScopeError;
+
+    /// Parses a scope name, accepting the kebab or snake form in any letter
+    /// case.
+    fn from_str(s: &str) -> Result<LandlockScope, ParseLandlockScopeError> {
+        let normalized = s.to_ascii_lowercase().replace('_', "-");
+        LandlockScope::ALL
+            .iter()
+            .copied()
+            .find(|scope| scope.as_str() == normalized)
+            .ok_or_else(|| ParseLandlockScopeError {
+                text: s.to_string(),
+            })
+    }
+}
+
+/// The error from parsing an unrecognized [`LandlockScope`] name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseLandlockScopeError {
+    text: String,
+}
+
+impl ParseLandlockScopeError {
+    /// The unrecognized name, as it was given.
+    ///
+    /// Named `text` on every parse error in this crate, so a caller moving
+    /// between them does not have to check.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for ParseLandlockScopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown Landlock scope {:?}, expected one of ",
+            self.text
+        )?;
+        for (index, scope) in LandlockScope::ALL.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(scope.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ParseLandlockScopeError {}
 
 /// One Landlock filesystem grant, as configured on the builder.
 #[derive(Debug, Clone)]
@@ -584,6 +732,12 @@ const BPF_MAXINSNS: usize = 4096;
 #[non_exhaustive]
 pub enum SeccompArgLen {
     /// The low 32 bits of the argument.
+    ///
+    /// The reference value, and a [`MaskedEq`](SeccompCompare::MaskedEq) mask,
+    /// must fit in 32 bits as well: a wider one is refused at build with
+    /// [`ConfigError::SeccompInvalid`](crate::ConfigError::SeccompInvalid),
+    /// since its high bits could take no part in the comparison. A negative
+    /// `int` is written as its 32-bit two's complement, `(-1i32) as u32`.
     Dword,
     /// All 64 bits of the argument.
     Qword,
@@ -610,6 +764,14 @@ pub enum SeccompCompare {
     /// with the same bits: `(arg & mask) == (value & mask)`. Tests individual
     /// flag bits — for example, that `CLONE_NEWUSER` is clear in a `clone`
     /// flags argument, with `MaskedEq(CLONE_NEWUSER)` against a value of `0`.
+    ///
+    /// A filter sees a syscall's registers and nothing they point at. `clone3`
+    /// takes its flags in a structure in memory, so a condition on `clone`'s
+    /// flags says nothing about it, and a policy that gates on them has to
+    /// deny `clone3` outright. Denied with `EPERM`, `clone3` breaks thread
+    /// creation in glibc 2.34 and later. Answered `ENOSYS` instead, through
+    /// [`SeccompRules::errno_for`], the C library falls back to `clone`, which
+    /// the condition does see.
     MaskedEq(u64),
 }
 
@@ -730,8 +892,27 @@ impl SeccompArg {
     }
 
     /// Lowers the condition to the compiler backend's representation, mapping a
-    /// rejected argument index to a [`ConfigError`].
+    /// rejected argument index, and a `Dword` value or mask wider than the 32
+    /// bits it compares, to a [`ConfigError`].
     fn to_seccompiler(self) -> Result<seccompiler::SeccompCondition, ConfigError> {
+        if matches!(self.len, SeccompArgLen::Dword) {
+            let mask = match self.compare {
+                SeccompCompare::MaskedEq(mask) => mask,
+                _ => 0,
+            };
+            // The backend compares the low half and drops the rest, so a wider
+            // operand would be silently truncated: `masked_eq_dword(0, 1 << 32,
+            // 0)` would mask with zero and match every call.
+            if u32::try_from(self.value).is_err() || u32::try_from(mask).is_err() {
+                return Err(ConfigError::SeccompInvalid {
+                    reason: format!(
+                        "a dword condition on argument {} compares 32 bits, but its value \
+                         {:#x} or mask {mask:#x} is wider",
+                        self.index, self.value,
+                    ),
+                });
+            }
+        }
         let len = match self.len {
             SeccompArgLen::Dword => seccompiler::SeccompCmpArgLen::Dword,
             SeccompArgLen::Qword => seccompiler::SeccompCmpArgLen::Qword,
@@ -804,6 +985,9 @@ pub struct SeccompRules {
     default_action: SeccompAction,
     listed_action: SeccompAction,
     rules: Vec<SyscallRule>,
+    /// The syscalls answered with an errno of their own, ahead of the listed
+    /// and default actions.
+    errnos: BTreeMap<i64, u16>,
 }
 
 impl SeccompRules {
@@ -816,6 +1000,7 @@ impl SeccompRules {
                 .into_iter()
                 .map(SyscallRule::unconditional)
                 .collect(),
+            errnos: BTreeMap::new(),
         }
     }
 
@@ -829,6 +1014,7 @@ impl SeccompRules {
                 .into_iter()
                 .map(SyscallRule::unconditional)
                 .collect(),
+            errnos: BTreeMap::new(),
         }
     }
 
@@ -853,6 +1039,38 @@ impl SeccompRules {
         self
     }
 
+    /// Answers every call of `syscall` with `errno`, whatever the listed and
+    /// default actions say, replacing an errno given for it before.
+    ///
+    /// The listed action is one action for every listed syscall, and some
+    /// callers tell refusals apart by their errno. The case this exists for is
+    /// `clone3`: the C library takes `ENOSYS` from it to mean an older kernel
+    /// and falls back to `clone`, while any other refusal fails the thread or
+    /// process it was creating. A policy that conditions `clone`'s flags has
+    /// to answer `clone3` this way, since a filter cannot read the structure
+    /// `clone3` takes its flags in:
+    ///
+    /// ```
+    /// use ferroday_cage::{SeccompArg, SeccompRules};
+    ///
+    /// const CLONE_NEWUSER: u64 = 0x1000_0000;
+    /// // Refuse a new user namespace through clone, and send clone3's callers
+    /// // to clone.
+    /// let rules = SeccompRules::denying([])
+    ///     .rule(libc::SYS_clone, [SeccompArg::masked_eq_qword(0, CLONE_NEWUSER, CLONE_NEWUSER)])
+    ///     .errno_for(libc::SYS_clone3, libc::ENOSYS as u16);
+    /// # let _ = rules;
+    /// ```
+    ///
+    /// A syscall answered this way must not also be listed, with or without
+    /// conditions: one of the two would silently lose, so the build refuses
+    /// the policy with
+    /// [`ConfigError::SeccompInvalid`](crate::ConfigError::SeccompInvalid).
+    pub fn errno_for(mut self, syscall: i64, errno: u16) -> SeccompRules {
+        self.errnos.insert(syscall, errno);
+        self
+    }
+
     /// Sets the action for unlisted syscalls (the default is `Allow` for a
     /// denylist, `Errno(EPERM)` for an allowlist).
     pub fn default_action(mut self, action: SeccompAction) -> SeccompRules {
@@ -869,11 +1087,12 @@ impl SeccompRules {
     /// Whether the policy denies any syscall. A default-deny (allowlist)
     /// posture always restricts, since it denies every unlisted syscall; a
     /// default-allow (denylist) posture restricts only when it lists at least
-    /// one syscall under a denying action. An empty `denying([])` restricts
-    /// nothing.
+    /// one syscall under a denying action, or answers one with an errno of its
+    /// own. An empty `denying([])` restricts nothing.
     fn restricts(&self) -> bool {
         !self.default_action.is_permissive()
             || (!self.rules.is_empty() && !self.listed_action.is_permissive())
+            || !self.errnos.is_empty()
     }
 }
 
@@ -955,6 +1174,7 @@ fn curated_denylist() -> Vec<i64> {
         Sysno::mount_setattr,
         Sysno::move_mount,
         Sysno::open_tree,
+        Sysno::open_tree_attr,
         Sysno::fsopen,
         Sysno::fsconfig,
         Sysno::fsmount,
@@ -978,11 +1198,14 @@ fn curated_denylist() -> Vec<i64> {
         Sysno::request_key,
         Sysno::bpf,
         Sysno::ptrace,
-        // The natural complements to ptrace: cross-process memory access,
-        // reachable against another process of the same uid in a restriction
-        // (no PID namespace) where ptrace alone would not suffice.
+        // The natural complements to ptrace: cross-process memory access and
+        // descriptor theft, reachable against another process of the same uid
+        // in a restriction (no PID namespace) where ptrace alone would not
+        // suffice. `pidfd_getfd` copies a descriptor out of a process under
+        // the same ptrace check `process_vm_readv` makes.
         Sysno::process_vm_readv,
         Sysno::process_vm_writev,
+        Sysno::pidfd_getfd,
         Sysno::perf_event_open,
         // Handing page-fault resolution to userspace is a standard primitive
         // for widening a kernel race into a reliable exploit, and nothing a
@@ -1244,6 +1467,8 @@ enum CapabilityPosture {
 pub(crate) struct Request {
     landlock: Vec<Grant>,
     landlock_net: Vec<NetGrant>,
+    /// The `LANDLOCK_SCOPE_*` flags requested, joined.
+    scope: u64,
     seccomp: Option<SeccompPolicy>,
     capabilities: CapabilityPosture,
 }
@@ -1262,6 +1487,11 @@ impl Request {
         self.landlock_net.push(NetGrant { access, port });
     }
 
+    /// Replaces the Landlock scopes with `scopes`.
+    pub(crate) fn set_scope<I: IntoIterator<Item = LandlockScope>>(&mut self, scopes: I) {
+        self.scope = LandlockScope::bits_of(scopes);
+    }
+
     /// Sets the seccomp policy.
     pub(crate) fn set_seccomp(&mut self, policy: SeccompPolicy) {
         self.seccomp = Some(policy);
@@ -1273,7 +1503,9 @@ impl Request {
     /// restriction whose only "confinement" is a no-op filter is caught by the
     /// empty-restriction guard rather than run unconfined. The capability
     /// posture does not count — the restriction fallback, the check's consumer,
-    /// cannot express one.
+    /// cannot express one — and neither do the Landlock scopes, which a
+    /// restriction requests by default and which leave the filesystem and the
+    /// network as open as they found them.
     pub(crate) fn is_unrestricted(&self) -> bool {
         self.landlock.is_empty()
             && self.landlock_net.is_empty()
@@ -1293,6 +1525,7 @@ impl Request {
     pub(crate) fn has_no_hardening(&self) -> bool {
         self.landlock.is_empty()
             && self.landlock_net.is_empty()
+            && self.scope == 0
             && self.seccomp.is_none()
             && matches!(self.capabilities, CapabilityPosture::Keep)
     }
@@ -1318,15 +1551,23 @@ impl Request {
         // the launch at `execve` with nothing pointing at the cause — and an
         // empty network grant denies all TCP. Neither is what naming a path or
         // a port means, so both are refused here.
+        //
+        // Each grant also leaves a label behind, filesystem grants first and
+        // network grants after them, in the order the command stage adds the
+        // rules. A rule the kernel refuses is reported by its position in that
+        // order, which is what names the grant in the setup error.
+        let mut landlock_labels = Vec::with_capacity(self.landlock.len() + self.landlock_net.len());
         let landlock = self
             .landlock
             .iter()
             .map(|grant| {
+                let subject = grant.path.display();
                 if grant.access.is_empty() {
                     return Err(ConfigError::LandlockGrantEmpty {
-                        grant: grant.path.display().to_string(),
+                        grant: subject.to_string(),
                     });
                 }
+                landlock_labels.push(format!("{} on {subject}", grant.access));
                 Ok(LandlockRule {
                     path: grant_path_cstring(&grant.path)?,
                     access: grant.access.to_landlock(),
@@ -1338,11 +1579,11 @@ impl Request {
             .landlock_net
             .iter()
             .map(|grant| {
+                let subject = format!("tcp:{}", grant.port);
                 if grant.access.is_empty() {
-                    return Err(ConfigError::LandlockGrantEmpty {
-                        grant: format!("tcp:{}", grant.port),
-                    });
+                    return Err(ConfigError::LandlockGrantEmpty { grant: subject });
                 }
+                landlock_labels.push(format!("{} on {subject}", grant.access));
                 Ok(LandlockNetRule {
                     port: grant.port,
                     access: grant.access.to_landlock(),
@@ -1379,6 +1620,8 @@ impl Request {
             } else {
                 net_access::ALL
             },
+            landlock_scoped: self.scope,
+            landlock_labels,
             seccomp,
             keep_caps,
             // Whether the identity switch needs securebits is decided by
@@ -1413,11 +1656,19 @@ fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigErro
                 .map(SyscallRule::unconditional)
                 .chain(curated_ioctl_rules())
                 .collect();
-            compile_filter(SeccompAction::Allow, SeccompAction::Errno(EPERM), &rules)?
+            compile_filter(
+                SeccompAction::Allow,
+                SeccompAction::Errno(EPERM),
+                &rules,
+                &BTreeMap::new(),
+            )?
         }
-        SeccompPolicy::Rules(rules) => {
-            compile_filter(rules.default_action, rules.listed_action, &rules.rules)?
-        }
+        SeccompPolicy::Rules(rules) => compile_filter(
+            rules.default_action,
+            rules.listed_action,
+            &rules.rules,
+            &rules.errnos,
+        )?,
         SeccompPolicy::Program(program) => program.clone(),
     };
     // The kernel rejects a filter longer than BPF_MAXINSNS, but only if the
@@ -1434,8 +1685,9 @@ fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigErro
 }
 
 /// Classic-BPF opcodes and `seccomp_data` field offsets for the hand-emitted
-/// x32 guard. Named here rather than pulled from a binding so the one raw-BPF
-/// fragment in the crate is self-contained and reviewable.
+/// fragments: the x32 guard and the per-syscall errno prologue. Named here
+/// rather than pulled from a binding so the crate's raw BPF is self-contained
+/// and reviewable.
 mod bpf {
     /// `BPF_LD | BPF_W | BPF_ABS`: load a 32-bit word from a fixed offset in
     /// `seccomp_data` into the accumulator.
@@ -1445,6 +1697,8 @@ mod bpf {
     /// `BPF_JMP | BPF_JSET | BPF_K`: branch on the accumulator sharing any bit
     /// with `k`.
     pub(super) const JMP_JSET_K: u16 = 0x45;
+    /// `BPF_JMP | BPF_JA`: jump forward `k` instructions unconditionally.
+    pub(super) const JMP_JA: u16 = 0x05;
     /// `BPF_RET | BPF_K`: return `k` as the seccomp action.
     pub(super) const RET_K: u16 = 0x06;
 
@@ -1461,34 +1715,124 @@ mod bpf {
 /// the x32 numbers, so the guard this constant serves — [`x32_deny_prologue`] —
 /// is emitted for a permissive default alone, in [`compile_filter`].
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+/// `AUDIT_ARCH_AARCH64`.
+const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
+/// `AUDIT_ARCH_RISCV64`.
+const AUDIT_ARCH_RISCV64: u32 = 0xC000_00F3;
+
+/// The audit architecture a filter for `arch` gates on.
+///
+/// seccompiler gates its own program on the same value and keeps it private,
+/// so the fragments emitted ahead of that program state it here.
+fn audit_arch(arch: seccompiler::TargetArch) -> u32 {
+    match arch {
+        seccompiler::TargetArch::x86_64 => AUDIT_ARCH_X86_64,
+        seccompiler::TargetArch::aarch64 => AUDIT_ARCH_AARCH64,
+        seccompiler::TargetArch::riscv64 => AUDIT_ARCH_RISCV64,
+    }
+}
 
 /// `__X32_SYSCALL_BIT`: set on every syscall number issued through the x32 ABI.
 ///
 /// Adding it to a syscall number gives the x32 alias of the same call, which is
 /// what lets an x32 caller slip past a denylist that names only the 64-bit
 /// numbers; see [`AUDIT_ARCH_X86_64`].
+///
+/// It is also the ceiling on a syscall number a policy may name, on every
+/// architecture: no architecture's own table reaches it, and on x86_64 a number
+/// at or above it is an x32 alias, which [`x32_deny_prologue`] refuses
+/// wholesale and the crate does not otherwise support.
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 /// The raw `SECCOMP_RET_*` value a BPF `ret` returns for `action`.
 ///
-/// The x32 guard emits a `ret` directly, below seccompiler's compilation, so
-/// it needs the same encoding seccompiler produces from a
-/// [`seccompiler::SeccompAction`]. The action words are the kernel's, from
-/// `<linux/seccomp.h>`.
-fn seccomp_ret_value(action: SeccompAction) -> u32 {
-    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
-    const SECCOMP_RET_KILL_THREAD: u32 = 0x0000_0000;
-    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
-    const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
-    match action {
-        SeccompAction::Allow => SECCOMP_RET_ALLOW,
-        SeccompAction::Errno(errno) => SECCOMP_RET_ERRNO | (u32::from(errno) & SECCOMP_RET_DATA),
-        SeccompAction::Log => SECCOMP_RET_LOG,
-        SeccompAction::KillThread => SECCOMP_RET_KILL_THREAD,
-        SeccompAction::KillProcess => SECCOMP_RET_KILL_PROCESS,
+/// The fragments emitted ahead of seccompiler's program return an action
+/// directly, so they take the encoding seccompiler itself uses.
+fn ret_value(action: SeccompAction) -> u32 {
+    u32::from(action.to_seccompiler())
+}
+
+/// Refuses a syscall number no filter can name: a negative one, and one at or
+/// above [`X32_SYSCALL_BIT`].
+///
+/// The compiler backend narrows every number to the 32 bits a BPF comparison
+/// holds and would panic on one that does not fit, so this runs before it.
+fn check_syscall_number(syscall: i64) -> Result<(), ConfigError> {
+    if (0..i64::from(X32_SYSCALL_BIT)).contains(&syscall) {
+        return Ok(());
     }
+    Err(ConfigError::SeccompInvalid {
+        reason: format!(
+            "syscall number {syscall} is out of range: a filter names numbers from 0 \
+             below {X32_SYSCALL_BIT:#x}, where x86_64's x32 aliases begin"
+        ),
+    })
+}
+
+/// A classic-BPF prologue answering each syscall in `errnos` with its own
+/// errno, for prepending to seccompiler's program, whose one match action
+/// cannot give a single syscall an answer of its own.
+///
+/// The numbers are the host architecture's, so the prologue applies them only
+/// under that architecture's audit value and otherwise jumps past itself to
+/// seccompiler's program, which reloads the arch word and refuses a foreign
+/// one. The jump is a `ja` with a 32-bit offset, so no count of syscalls
+/// outgrows it; the kernel's instruction ceiling bounds the count instead.
+///
+/// ```text
+///   [0] A = seccomp_data.arch
+///   [1] if A == arch: skip [2]
+///   [2] jump past the prologue
+///   [3] A = seccomp_data.nr
+///   [4] if A != nr: skip [5]        one pair per syscall
+///   [5] return ERRNO(errno)
+/// ```
+///
+/// Every number was held to [`check_syscall_number`] first, so it fits the
+/// comparison's 32 bits.
+fn errno_prologue(arch: u32, errnos: &BTreeMap<i64, u16>) -> Vec<SockFilter> {
+    let pairs = errnos.len();
+    let past = u32::try_from(1 + 2 * pairs).unwrap_or(u32::MAX);
+    let mut program = Vec::with_capacity(4 + 2 * pairs);
+    program.push(SockFilter {
+        code: bpf::LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: bpf::OFF_ARCH,
+    });
+    program.push(SockFilter {
+        code: bpf::JMP_JEQ_K,
+        jt: 1,
+        jf: 0,
+        k: arch,
+    });
+    program.push(SockFilter {
+        code: bpf::JMP_JA,
+        jt: 0,
+        jf: 0,
+        k: past,
+    });
+    program.push(SockFilter {
+        code: bpf::LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: bpf::OFF_NR,
+    });
+    for (&syscall, &errno) in errnos {
+        program.push(SockFilter {
+            code: bpf::JMP_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: syscall as u32,
+        });
+        program.push(SockFilter {
+            code: bpf::RET_K,
+            jt: 0,
+            jf: 0,
+            k: ret_value(SeccompAction::Errno(errno)),
+        });
+    }
+    program
 }
 
 /// A five-instruction classic-BPF prologue applying `deny` to every syscall
@@ -1511,7 +1855,7 @@ fn seccomp_ret_value(action: SeccompAction) -> u32 {
 ///   [4] return `deny`
 /// ```
 fn x32_deny_prologue(deny: SeccompAction) -> [SockFilter; 5] {
-    let ret = seccomp_ret_value(deny);
+    let ret = ret_value(deny);
     [
         SockFilter {
             code: bpf::LD_W_ABS,
@@ -1548,18 +1892,43 @@ fn x32_deny_prologue(deny: SeccompAction) -> [SockFilter; 5] {
 
 /// Compiles a single-match-action filter: `listed_action` for the listed
 /// syscalls (subject to any argument conditions), `default_action` for the
-/// rest.
+/// rest, and each syscall in `errnos` answered with its own errno ahead of
+/// both.
 ///
 /// A syscall's argument conditions decide whether an invocation counts as
 /// matched; a matched invocation takes the `listed_action`, an unmatched one
 /// the `default_action`. So conditions refine which invocations of a listed
-/// syscall the listed action governs, without any per-syscall action.
+/// syscall the listed action governs. The one per-syscall action is the errno
+/// of `errnos`, which seccompiler cannot express and a prologue of its own
+/// carries; a syscall given one may not be listed as well.
 fn compile_filter(
     default_action: SeccompAction,
     listed_action: SeccompAction,
     rules: &[SyscallRule],
+    errnos: &BTreeMap<i64, u16>,
 ) -> Result<Vec<SockFilter>, ConfigError> {
     let arch = host_target_arch()?;
+    for &syscall in rules.iter().map(|rule| &rule.syscall).chain(errnos.keys()) {
+        check_syscall_number(syscall)?;
+    }
+    if let Some(rule) = rules.iter().find(|rule| errnos.contains_key(&rule.syscall)) {
+        return Err(ConfigError::SeccompInvalid {
+            reason: format!(
+                "syscall number {} is both listed and answered with an errno of its own; \
+                 one of the two would never apply",
+                rule.syscall
+            ),
+        });
+    }
+    // The prologue answers its syscalls first and falls through to the rest,
+    // and the whole program is held to the kernel's ceiling afterwards. A count
+    // that could not fit is refused here, before the prologue is built for it.
+    if 4 + 2 * errnos.len() > BPF_MAXINSNS {
+        return Err(ConfigError::SeccompProgramTooLong {
+            len: 4 + 2 * errnos.len(),
+            max: BPF_MAXINSNS,
+        });
+    }
     // An unconditional listing matches the syscall regardless of its
     // arguments and dominates any conditioned listing of the same syscall, so
     // the two are gathered separately before the map is built: unconditional
@@ -1630,14 +1999,14 @@ fn compile_filter(
     // ahead of seccompiler's program, which reloads the arch word itself.
     let needs_x32_guard =
         matches!(arch, seccompiler::TargetArch::x86_64) && default_action.is_permissive();
-    let program: Vec<SockFilter> = if needs_x32_guard {
-        x32_deny_prologue(listed_action)
-            .into_iter()
-            .chain(compiled)
-            .collect()
-    } else {
-        compiled.collect()
-    };
+    let guard = needs_x32_guard.then(|| x32_deny_prologue(listed_action));
+    let answers = (!errnos.is_empty()).then(|| errno_prologue(audit_arch(arch), errnos));
+    let program: Vec<SockFilter> = guard
+        .into_iter()
+        .flatten()
+        .chain(answers.into_iter().flatten())
+        .chain(compiled)
+        .collect();
     Ok(program)
 }
 
@@ -1672,6 +2041,7 @@ fn host_target_arch() -> Result<seccompiler::TargetArch, ConfigError> {
 /// ```toml
 /// [hardening]
 /// drop-caps = true                 # or: keep-caps = ["net-bind-service"]
+/// landlock-scope = ["signal"]      # or: ["signal", "abstract-unix-socket"]
 /// seccomp = "curated"              # or a [hardening.seccomp] deny/allow table
 ///
 /// [[hardening.landlock-fs]]
@@ -1685,11 +2055,13 @@ fn host_target_arch() -> Result<seccompiler::TargetArch, ConfigError> {
 ///
 /// A seccomp allow- or denylist may narrow a syscall by its arguments through
 /// an `allow-rule` or `deny-rule` array-of-tables, each naming a syscall and
-/// the argument conditions its listed action requires:
+/// the argument conditions its listed action requires, and may answer a
+/// syscall with an errno of its own through an `errno` table:
 ///
 /// ```toml
 /// [hardening.seccomp]
-/// allow = ["read", "write", "exit-group"]
+/// allow = ["execve", "read", "write", "exit_group"]
+/// errno = { clone3 = "ENOSYS" }
 ///
 /// [[hardening.seccomp.allow-rule]]
 /// syscall = "ioctl"
@@ -1707,6 +2079,7 @@ fn host_target_arch() -> Result<seccompiler::TargetArch, ConfigError> {
 /// serialization error, never a silent omission.
 #[cfg(feature = "serde")]
 pub(crate) mod serde_request {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use serde::de::Error as _;
@@ -1715,17 +2088,19 @@ pub(crate) mod serde_request {
     use syscalls::Sysno;
 
     use super::{
-        Capability, CapabilityPosture, EPERM, FsAccess, Grant, NetAccess, NetGrant, Request,
-        SeccompAction, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules,
+        Capability, CapabilityPosture, EPERM, FsAccess, Grant, LandlockScope, NetAccess, NetGrant,
+        Request, SeccompAction, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy,
+        SeccompRules,
     };
 
     /// The profile form of a hardening request: the `[hardening]` table.
     ///
-    /// The two capability keys and the seccomp key precede the `landlock-fs`
-    /// and `landlock-net` arrays so the serialized table is valid TOML in field
-    /// order — a bare key after an array-of-tables header would bind to the
-    /// wrong table, the same ordering constraint the top-level builder
-    /// observes.
+    /// The two capability keys, the scope list, and the seccomp key precede the
+    /// `landlock-fs` and `landlock-net` arrays so the serialized table is valid
+    /// TOML in field order — a bare key after an array-of-tables header would
+    /// bind to the wrong table, the same ordering constraint the top-level
+    /// builder observes. The scope list precedes the seccomp key for the same
+    /// reason, since that key may be a table of its own.
     #[derive(Serialize, Deserialize, Default)]
     #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
     struct HardeningProfile {
@@ -1737,6 +2112,9 @@ pub(crate) mod serde_request {
         /// read as a drop-all, which `drop-caps` expresses.
         #[serde(skip_serializing_if = "Option::is_none")]
         keep_caps: Option<Vec<String>>,
+        /// The Landlock scopes, by name.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        landlock_scope: Vec<String>,
         /// The seccomp policy, when one is configured.
         #[serde(skip_serializing_if = "Option::is_none")]
         seccomp: Option<SeccompProfile>,
@@ -1824,18 +2202,25 @@ pub(crate) mod serde_request {
     }
 
     /// The table form of a seccomp policy: bare syscall names in `allow` or
-    /// `deny`, and argument-conditioned entries in `allow-rule` or `deny-rule`.
-    /// The allow and deny sides are mutually exclusive; a table must set one
-    /// side.
+    /// `deny`, argument-conditioned entries in `allow-rule` or `deny-rule`, and
+    /// syscalls answered with an errno of their own in `errno`, a table of
+    /// syscall names to errno names. The allow and deny sides are mutually
+    /// exclusive; a table must set one side, and `errno` alone counts as the
+    /// deny side, since what it does is refuse.
+    ///
+    /// `errno` precedes the two rule arrays so the serialized table is valid
+    /// TOML in field order, as [`HardeningProfile`] keeps its own.
     #[derive(Serialize, Deserialize, Default)]
     #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
     struct SeccompLists {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         allow: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        allow_rule: Vec<RuleProfile>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
         deny: Vec<String>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        errno: BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        allow_rule: Vec<RuleProfile>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         deny_rule: Vec<RuleProfile>,
     }
@@ -1932,6 +2317,13 @@ pub(crate) mod serde_request {
                 (false, None) => CapabilityPosture::Keep,
             };
 
+            let scope = LandlockScope::bits_of(
+                self.landlock_scope
+                    .iter()
+                    .map(|name| name.parse::<LandlockScope>().map_err(|err| err.to_string()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+
             let seccomp = self.seccomp.map(SeccompProfile::into_policy).transpose()?;
 
             let landlock = self
@@ -1955,6 +2347,7 @@ pub(crate) mod serde_request {
             Ok(Request {
                 landlock,
                 landlock_net,
+                scope,
                 seccomp,
                 capabilities,
             })
@@ -1971,6 +2364,12 @@ pub(crate) mod serde_request {
                     Some(caps.iter().map(|cap| cap.to_string()).collect()),
                 ),
             };
+
+            let landlock_scope = LandlockScope::ALL
+                .iter()
+                .filter(|scope| request.scope & scope.to_landlock() != 0)
+                .map(|scope| scope.to_string())
+                .collect();
 
             let seccomp = request
                 .seccomp
@@ -1999,6 +2398,7 @@ pub(crate) mod serde_request {
             Ok(HardeningProfile {
                 drop_caps,
                 keep_caps,
+                landlock_scope,
                 seccomp,
                 landlock_fs,
                 landlock_net,
@@ -2047,16 +2447,18 @@ pub(crate) mod serde_request {
                         "a seccomp profile cannot set both an allow and a deny side".to_string()
                     );
                 }
-                (false, false) => {
+                (false, false) if self.errno.is_empty() => {
                     return Err("a seccomp table lists no syscalls; set allow, allow-rule, \
-                                deny, or deny-rule"
+                                deny, deny-rule, or errno"
                         .to_string());
                 }
                 (true, false) => (
                     SeccompRules::allowing(resolve_syscalls(&self.allow)?),
                     self.allow_rule,
                 ),
-                (false, true) => (
+                // The deny side, including a table whose only entries are
+                // errnos: what those do is refuse, and everything else runs.
+                (false, _) => (
                     SeccompRules::denying(resolve_syscalls(&self.deny)?),
                     self.deny_rule,
                 ),
@@ -2069,6 +2471,9 @@ pub(crate) mod serde_request {
                     .map(ArgProfile::to_arg)
                     .collect::<Result<Vec<_>, _>>()?;
                 rules = rules.rule(syscall, conditions);
+            }
+            for (syscall, errno) in &self.errno {
+                rules = rules.errno_for(resolve_syscall(syscall)?, resolve_errno(errno)?);
             }
             Ok(rules)
         }
@@ -2086,6 +2491,23 @@ pub(crate) mod serde_request {
         /// cannot express is a serialization error rather than a document that
         /// will not read back.
         fn from_rules(rules: &SeccompRules) -> Result<SeccompLists, String> {
+            let errno = rules
+                .errnos
+                .iter()
+                .map(|(&syscall, &errno)| Ok((name_syscall(syscall)?, name_errno(errno)?)))
+                .collect::<Result<BTreeMap<_, _>, String>>()?;
+            // A table that answers syscalls with an errno and lists none reads
+            // back as a denylist, so that one shape is representable.
+            if rules.rules.is_empty()
+                && !errno.is_empty()
+                && rules.default_action == SeccompAction::Allow
+                && rules.listed_action == SeccompAction::Errno(EPERM)
+            {
+                return Ok(SeccompLists {
+                    errno,
+                    ..SeccompLists::default()
+                });
+            }
             if rules.rules.is_empty() {
                 return Err(
                     "a seccomp policy listing no syscall cannot be represented in a \
@@ -2110,11 +2532,13 @@ pub(crate) mod serde_request {
                 (SeccompAction::Allow, SeccompAction::Errno(EPERM)) => Ok(SeccompLists {
                     deny: bare,
                     deny_rule: rule_profiles,
+                    errno,
                     ..SeccompLists::default()
                 }),
                 (SeccompAction::Errno(EPERM), SeccompAction::Allow) => Ok(SeccompLists {
                     allow: bare,
                     allow_rule: rule_profiles,
+                    errno,
                     ..SeccompLists::default()
                 }),
                 _ => Err(
@@ -2193,6 +2617,29 @@ pub(crate) mod serde_request {
         name.parse::<Sysno>()
             .map(|sysno| i64::from(sysno.id()))
             .map_err(|_| format!("unknown syscall {name:?}"))
+    }
+
+    /// Resolves an errno name, such as `ENOSYS`, to its number, in any letter
+    /// case.
+    ///
+    /// Through the `syscalls` crate's errno table, the source the syscall names
+    /// come from. Its numbers are the generic ones every architecture with
+    /// seccomp support here shares.
+    fn resolve_errno(name: &str) -> Result<u16, String> {
+        let wanted = name.to_ascii_uppercase();
+        (1..4096)
+            .map(syscalls::Errno::new)
+            .find(|errno| errno.name() == Some(wanted.as_str()))
+            .and_then(|errno| u16::try_from(errno.into_raw()).ok())
+            .ok_or_else(|| format!("unknown errno {name:?}"))
+    }
+
+    /// Names one errno, for serialization.
+    fn name_errno(errno: u16) -> Result<String, String> {
+        syscalls::Errno::new(i32::from(errno))
+            .name()
+            .map(str::to_string)
+            .ok_or_else(|| format!("errno {errno} has no name a profile can spell"))
     }
 
     /// Names one syscall number for the host architecture, for serialization.
@@ -2438,6 +2885,7 @@ mod tests {
             Sysno::fsmount,
             Sysno::fspick,
             Sysno::move_mount,
+            Sysno::open_tree_attr,
             Sysno::name_to_handle_at,
             Sysno::open_by_handle_at,
             // Kernel modules, the keyring, and the administrative surfaces.
@@ -2448,6 +2896,7 @@ mod tests {
             // them.
             Sysno::ptrace,
             Sysno::process_vm_readv,
+            Sysno::pidfd_getfd,
             Sysno::perf_event_open,
             Sysno::bpf,
             Sysno::userfaultfd,
@@ -2816,7 +3265,290 @@ mod tests {
         assert_eq!(plan.landlock_handled, 0);
         assert!(plan.landlock_net.is_empty());
         assert_eq!(plan.landlock_net_handled, 0);
+        assert_eq!(plan.landlock_scoped, 0);
+        assert!(plan.landlock_labels.is_empty());
         assert!(plan.seccomp.is_none());
         assert!(plan.keep_caps.is_none());
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn the_file_rights_are_the_kernels_access_file() {
+        // The kernel accepts these, and only these, on a rule whose target is
+        // not a directory. Every right besides them acts on a directory's
+        // entries.
+        assert_eq!(
+            fs_access::FILE,
+            fs_access::EXECUTE
+                | fs_access::WRITE_FILE
+                | fs_access::READ_FILE
+                | fs_access::TRUNCATE
+                | fs_access::IOCTL_DEV,
+        );
+        // Every grant keeps something on a file, so narrowing one never leaves
+        // a rule that permits nothing.
+        for access in [FsAccess::READ, FsAccess::WRITE, FsAccess::EXECUTE] {
+            assert_ne!(
+                access.to_landlock() & fs_access::FILE & fs_access_for_abi(1),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn rule_labels_name_filesystem_grants_then_network_grants() {
+        // The command stage numbers the rules in the order it adds them,
+        // filesystem first, and a reported position indexes these labels.
+        let mut request = Request::default();
+        request.grant_net(NetAccess::CONNECT, 443);
+        request.grant_fs(FsAccess::READ | FsAccess::EXECUTE, Path::new("/usr"));
+        request.grant_fs(FsAccess::READ | FsAccess::WRITE, Path::new("/dev/null"));
+        let plan = request.lower().unwrap();
+        assert_eq!(
+            plan.landlock_labels,
+            ["rx on /usr", "rw on /dev/null", "c on tcp:443"],
+        );
+    }
+
+    #[test]
+    fn scopes_arrive_together_in_abi_6() {
+        assert_eq!(scope_for_abi(5), 0);
+        assert_eq!(
+            scope_for_abi(6),
+            LandlockScope::bits_of(LandlockScope::ALL.iter().copied()),
+        );
+        assert_eq!(scope_for_abi(9), scope_for_abi(6));
+    }
+
+    #[test]
+    fn landlock_scopes_round_trip_by_name() {
+        for &scope in LandlockScope::ALL {
+            assert_eq!(scope.to_string().parse::<LandlockScope>(), Ok(scope));
+        }
+        assert_eq!(
+            "ABSTRACT_UNIX_SOCKET".parse::<LandlockScope>(),
+            Ok(LandlockScope::AbstractUnixSocket),
+        );
+        let err = "signals".parse::<LandlockScope>().unwrap_err();
+        assert_eq!(err.text(), "signals");
+        assert!(
+            err.to_string().contains("signal, abstract-unix-socket"),
+            "{err}"
+        );
+        // The kernel's own bits, distinct from each other.
+        assert_eq!(LandlockScope::AbstractUnixSocket.to_landlock(), 1);
+        assert_eq!(LandlockScope::Signal.to_landlock(), 2);
+        assert_eq!(
+            LandlockScope::bits_of([LandlockScope::Signal, LandlockScope::Signal]),
+            scope::SIGNAL,
+        );
+    }
+
+    #[test]
+    fn a_scope_alone_is_hardening_but_not_a_restriction() {
+        let mut request = Request::default();
+        request.set_scope([LandlockScope::Signal]);
+        // A restriction asks for scopes unasked, so they cannot be what saves
+        // one from the empty-restriction guard.
+        assert!(request.is_unrestricted());
+        let plan = request.lower().unwrap();
+        assert_eq!(plan.landlock_scoped, scope::SIGNAL);
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn a_syscall_number_no_filter_can_name_is_refused() {
+        // Below zero, past the 32 bits a comparison holds, and at the x32 bit
+        // where x86_64's aliases begin: refused, where the compiler backend
+        // would panic on the first two.
+        for number in [-1, i64::from(u32::MAX) + 1, i64::from(X32_SYSCALL_BIT)] {
+            for rules in [
+                SeccompRules::denying([number]),
+                SeccompRules::allowing([libc::SYS_read]).rule(number, []),
+                SeccompRules::denying([]).errno_for(number, 38),
+            ] {
+                assert!(
+                    matches!(
+                        compile_seccomp(&SeccompPolicy::Rules(rules)),
+                        Err(ConfigError::SeccompInvalid { .. })
+                    ),
+                    "{number} is refused",
+                );
+            }
+        }
+        // The last number below the ceiling is a legitimate one to name.
+        assert!(
+            compile_seccomp(&SeccompPolicy::Rules(SeccompRules::denying([i64::from(
+                X32_SYSCALL_BIT - 1
+            )])))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_dword_operand_wider_than_32_bits_is_refused() {
+        // A mask of `1 << 32` would truncate to zero and match every call.
+        for arg in [
+            SeccompArg::masked_eq_dword(0, 1 << 32, 0),
+            SeccompArg::eq_dword(0, 1 << 32),
+            SeccompArg::eq_dword(0, u64::MAX),
+        ] {
+            let rules = SeccompRules::denying([]).rule(libc::SYS_clone, [arg]);
+            assert!(
+                matches!(
+                    compile_seccomp(&SeccompPolicy::Rules(rules)),
+                    Err(ConfigError::SeccompInvalid { .. })
+                ),
+                "{arg:?} is refused",
+            );
+        }
+        // The widest 32-bit operands, and a wide one compared as a qword, are
+        // all fine.
+        for arg in [
+            SeccompArg::masked_eq_dword(0, u64::from(u32::MAX), u64::from(u32::MAX)),
+            SeccompArg::masked_eq_qword(0, 1 << 32, 0),
+        ] {
+            let rules = SeccompRules::denying([]).rule(libc::SYS_clone, [arg]);
+            assert!(compile_seccomp(&SeccompPolicy::Rules(rules)).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_return_values_are_the_kernels() {
+        // The fragments ahead of seccompiler's program return these directly,
+        // so they are pinned to `<linux/seccomp.h>`.
+        assert_eq!(ret_value(SeccompAction::Allow), 0x7fff_0000);
+        assert_eq!(ret_value(SeccompAction::Errno(38)), 0x0005_0026);
+        assert_eq!(ret_value(SeccompAction::Log), 0x7ffc_0000);
+        assert_eq!(ret_value(SeccompAction::KillThread), 0);
+        assert_eq!(ret_value(SeccompAction::KillProcess), 0x8000_0000);
+    }
+
+    #[test]
+    fn the_errno_prologue_emits_the_expected_instructions() {
+        // Hand-emitted like the x32 guard, so asserted exactly. From [1] a
+        // match skips [2]; [2] jumps 1 + 2 * 2 = 5 forward, to [8], the first
+        // instruction past the prologue; each comparison's false branch skips
+        // its own return.
+        let errnos = BTreeMap::from([(435, 38), (163, 1)]);
+        let prologue = errno_prologue(AUDIT_ARCH_AARCH64, &errnos);
+        let insn = |code, jt, jf, k| SockFilter { code, jt, jf, k };
+        assert_eq!(
+            prologue,
+            [
+                insn(0x20, 0, 0, 4),
+                insn(0x15, 1, 0, AUDIT_ARCH_AARCH64),
+                insn(0x05, 0, 0, 5),
+                insn(0x20, 0, 0, 0),
+                insn(0x15, 0, 1, 163),
+                insn(0x06, 0, 0, 0x0005_0001),
+                insn(0x15, 0, 1, 435),
+                insn(0x06, 0, 0, 0x0005_0026),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_errno_prologue_sits_between_the_x32_guard_and_the_filter() {
+        let rules = SeccompRules::denying([libc::SYS_acct]).errno_for(libc::SYS_clone3, 38);
+        let program = compile_seccomp(&SeccompPolicy::Rules(rules)).unwrap();
+        let arch = audit_arch(host_target_arch().unwrap());
+        let prologue = errno_prologue(arch, &BTreeMap::from([(libc::SYS_clone3, 38)]));
+        let guard = if cfg!(target_arch = "x86_64") { 5 } else { 0 };
+        assert_eq!(&program[guard..guard + prologue.len()], &prologue[..]);
+        // An errno alone is a restriction: it refuses the syscall it names.
+        assert!(
+            SeccompPolicy::Rules(SeccompRules::denying([]).errno_for(libc::SYS_clone3, 38))
+                .restricts()
+        );
+    }
+
+    #[test]
+    fn a_syscall_both_listed_and_given_an_errno_is_refused() {
+        for rules in [
+            SeccompRules::denying([libc::SYS_clone3]).errno_for(libc::SYS_clone3, 38),
+            SeccompRules::allowing([libc::SYS_read])
+                .rule(libc::SYS_clone3, [SeccompArg::eq_qword(1, 0)])
+                .errno_for(libc::SYS_clone3, 38),
+        ] {
+            assert!(matches!(
+                compile_seccomp(&SeccompPolicy::Rules(rules)),
+                Err(ConfigError::SeccompInvalid { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn the_curated_denylist_reaches_the_newer_mount_and_pidfd_calls() {
+        use syscalls::Sysno;
+        let list = curated_denylist();
+        for sysno in [Sysno::open_tree_attr, Sysno::pidfd_getfd] {
+            assert!(list.contains(&(sysno.id() as i64)), "{sysno} is denied");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use crate::CageBuilder;
+
+    #[test]
+    fn the_documented_hardening_table_parses_and_round_trips() {
+        // The example the profile adapter's documentation shows, with the keys
+        // a sandbox needs around it.
+        let profile = r#"
+rootfs = "/srv/rootfs"
+command = "/bin/sh"
+
+[hardening]
+drop-caps = true
+landlock-scope = ["signal"]
+
+[hardening.seccomp]
+allow = ["execve", "read", "write", "exit_group"]
+errno = { clone3 = "ENOSYS" }
+
+[[hardening.seccomp.allow-rule]]
+syscall = "ioctl"
+[[hardening.seccomp.allow-rule.arg]]
+index = 1
+len = "dword"
+op = "eq"
+value = 21523
+"#;
+        let builder: CageBuilder = toml::from_str(profile).expect("the example parses");
+        let written = toml::to_string(&builder).expect("the profile serializes");
+        assert!(
+            written.contains("landlock-scope = [\"signal\"]"),
+            "{written}"
+        );
+        assert!(written.contains("clone3 = \"ENOSYS\""), "{written}");
+        let reread: CageBuilder = toml::from_str(&written).expect("it reads back");
+        assert_eq!(toml::to_string(&reread).unwrap(), written);
+    }
+
+    #[test]
+    fn an_errno_table_alone_is_a_denylist() {
+        let profile = r#"
+rootfs = "/srv/rootfs"
+command = "/bin/sh"
+
+[hardening.seccomp]
+errno = { clone3 = "enosys" }
+"#;
+        let builder: CageBuilder = toml::from_str(profile).expect("an errno alone parses");
+        let written = toml::to_string(&builder).unwrap();
+        assert!(written.contains("clone3 = \"ENOSYS\""), "{written}");
+        assert!(!written.contains("allow"), "{written}");
+    }
+
+    #[test]
+    fn an_unknown_errno_or_scope_is_refused() {
+        for profile in [
+            "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening.seccomp]\nerrno = { clone3 = \"ENOPE\" }\n",
+            "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening]\nlandlock-scope = [\"signals\"]\n",
+        ] {
+            assert!(toml::from_str::<CageBuilder>(profile).is_err(), "{profile}");
+        }
     }
 }

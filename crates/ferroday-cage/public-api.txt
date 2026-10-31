@@ -19,6 +19,7 @@ pub ferroday_cage::host::RangeMapBlocker::HelperCannotMapRoot::path: std::path::
 pub ferroday_cage::host::RangeMapBlocker::HelperMissing::helper: &'static str
 #[non_exhaustive] pub ferroday_cage::host::RangeMapBlocker::HelperUnprivileged
 pub ferroday_cage::host::RangeMapBlocker::HelperUnprivileged::path: std::path::PathBuf
+pub ferroday_cage::host::RangeMapBlocker::NoNewPrivileges
 pub ferroday_cage::host::RangeMapBlocker::NoSubordinateAllocation
 pub ferroday_cage::host::RangeMapBlocker::SubidFeatureDisabled
 #[non_exhaustive] pub ferroday_cage::host::RangeMapBlocker::SubordinateAllocationUnknown
@@ -67,7 +68,7 @@ pub ferroday_cage::limits::Resource::Processes
 pub ferroday_cage::limits::Resource::Stack
 impl ferroday_cage::limits::Resource
 pub const ferroday_cage::limits::Resource::ALL: &'static [ferroday_cage::limits::Resource]
-pub fn ferroday_cage::limits::Resource::spelling(self) -> &'static str
+pub const fn ferroday_cage::limits::Resource::spelling(self) -> &'static str
 impl core::fmt::Display for ferroday_cage::limits::Resource
 pub fn ferroday_cage::limits::Resource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::limits::Resource
@@ -476,6 +477,8 @@ pub ferroday_cage::provision::debian::Priority::Important
 pub ferroday_cage::provision::debian::Priority::Optional
 pub ferroday_cage::provision::debian::Priority::Required
 pub ferroday_cage::provision::debian::Priority::Standard
+impl ferroday_cage::provision::debian::Priority
+pub const ferroday_cage::provision::debian::Priority::ALL: &'static [ferroday_cage::provision::debian::Priority]
 impl core::fmt::Display for ferroday_cage::provision::debian::Priority
 pub fn ferroday_cage::provision::debian::Priority::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for ferroday_cage::provision::debian::Priority
@@ -1611,8 +1614,10 @@ impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::ConfigError
 #[non_exhaustive] pub enum ferroday_cage::Error
 pub ferroday_cage::Error::Config(ferroday_cage::ConfigError)
 pub ferroday_cage::Error::IdentityMap(ferroday_cage::IdMapError)
-pub ferroday_cage::Error::KeyQuotaExhausted
-pub ferroday_cage::Error::NestedUsernsBudgetExhausted
+#[non_exhaustive] pub ferroday_cage::Error::KeyQuotaExhausted
+pub ferroday_cage::Error::KeyQuotaExhausted::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::Error::NestedUsernsBudgetExhausted
+pub ferroday_cage::Error::NestedUsernsBudgetExhausted::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::Setup
 pub ferroday_cage::Error::Setup::detail: core::option::Option<alloc::string::String>
 pub ferroday_cage::Error::Setup::source: core::io::error::Error
@@ -1626,7 +1631,8 @@ pub ferroday_cage::Error::StreamIsDirectory::stream: &'static str
 pub ferroday_cage::Error::SupervisorLost
 #[non_exhaustive] pub ferroday_cage::Error::Terminal
 pub ferroday_cage::Error::Terminal::source: core::io::error::Error
-pub ferroday_cage::Error::TerminalsExhausted
+#[non_exhaustive] pub ferroday_cage::Error::TerminalsExhausted
+pub ferroday_cage::Error::TerminalsExhausted::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::UsernsUnavailable
 pub ferroday_cage::Error::UsernsUnavailable::blocker: core::option::Option<ferroday_cage::host::UsernsBlocker>
 pub ferroday_cage::Error::UsernsUnavailable::source: core::io::error::Error
@@ -1694,6 +1700,23 @@ impl core::marker::Unpin for ferroday_cage::IdentityMap
 impl core::marker::UnsafeUnpin for ferroday_cage::IdentityMap
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::IdentityMap
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::IdentityMap
+#[non_exhaustive] pub enum ferroday_cage::LandlockScope
+pub ferroday_cage::LandlockScope::AbstractUnixSocket
+pub ferroday_cage::LandlockScope::Signal
+impl ferroday_cage::LandlockScope
+pub const ferroday_cage::LandlockScope::ALL: &'static [ferroday_cage::LandlockScope]
+impl core::fmt::Display for ferroday_cage::LandlockScope
+pub fn ferroday_cage::LandlockScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for ferroday_cage::LandlockScope
+pub type ferroday_cage::LandlockScope::Err = ferroday_cage::ParseLandlockScopeError
+pub fn ferroday_cage::LandlockScope::from_str(&str) -> core::result::Result<ferroday_cage::LandlockScope, ferroday_cage::ParseLandlockScopeError>
+impl core::marker::Freeze for ferroday_cage::LandlockScope
+impl core::marker::Send for ferroday_cage::LandlockScope
+impl core::marker::Sync for ferroday_cage::LandlockScope
+impl core::marker::Unpin for ferroday_cage::LandlockScope
+impl core::marker::UnsafeUnpin for ferroday_cage::LandlockScope
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::LandlockScope
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::LandlockScope
 #[non_exhaustive] pub enum ferroday_cage::Mount
 pub ferroday_cage::Mount::Bind(ferroday_cage::Bind)
 pub ferroday_cage::Mount::Raw(ferroday_cage::RawMount)
@@ -1795,6 +1818,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Progress
 pub ferroday_cage::ResolvedHardening::Applied::keep_capabilities: core::option::Option<u64>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_fs: alloc::vec::Vec<ferroday_cage::ResolvedLandlockFs>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_net: alloc::vec::Vec<ferroday_cage::ResolvedLandlockNet>
+pub ferroday_cage::ResolvedHardening::Applied::landlock_scope: u64
 pub ferroday_cage::ResolvedHardening::Applied::seccomp_instructions: core::option::Option<usize>
 pub ferroday_cage::ResolvedHardening::Unavailable
 impl core::marker::Freeze for ferroday_cage::ResolvedHardening
@@ -1888,7 +1912,7 @@ pub ferroday_cage::Resource::Processes
 pub ferroday_cage::Resource::Stack
 impl ferroday_cage::limits::Resource
 pub const ferroday_cage::limits::Resource::ALL: &'static [ferroday_cage::limits::Resource]
-pub fn ferroday_cage::limits::Resource::spelling(self) -> &'static str
+pub const fn ferroday_cage::limits::Resource::spelling(self) -> &'static str
 impl core::fmt::Display for ferroday_cage::limits::Resource
 pub fn ferroday_cage::limits::Resource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::limits::Resource
@@ -2134,6 +2158,7 @@ pub fn ferroday_cage::CageBuilder::drop_all_capabilities(self) -> Self
 pub fn ferroday_cage::CageBuilder::keep_capabilities<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::Capability>
 pub fn ferroday_cage::CageBuilder::landlock_fs(self, ferroday_cage::FsAccess, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::landlock_net(self, ferroday_cage::NetAccess, u16) -> Self
+pub fn ferroday_cage::CageBuilder::landlock_scope<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>
 pub fn ferroday_cage::CageBuilder::seccomp(self, ferroday_cage::SeccompPolicy) -> Self
 impl core::default::Default for ferroday_cage::CageBuilder
 pub fn ferroday_cage::CageBuilder::default() -> Self
@@ -2407,6 +2432,19 @@ impl core::marker::Unpin for ferroday_cage::ParseFsAccessError
 impl core::marker::UnsafeUnpin for ferroday_cage::ParseFsAccessError
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParseFsAccessError
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParseFsAccessError
+pub struct ferroday_cage::ParseLandlockScopeError
+impl ferroday_cage::ParseLandlockScopeError
+pub fn ferroday_cage::ParseLandlockScopeError::text(&self) -> &str
+impl core::error::Error for ferroday_cage::ParseLandlockScopeError
+impl core::fmt::Display for ferroday_cage::ParseLandlockScopeError
+pub fn ferroday_cage::ParseLandlockScopeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::ParseLandlockScopeError
+impl core::marker::Send for ferroday_cage::ParseLandlockScopeError
+impl core::marker::Sync for ferroday_cage::ParseLandlockScopeError
+impl core::marker::Unpin for ferroday_cage::ParseLandlockScopeError
+impl core::marker::UnsafeUnpin for ferroday_cage::ParseLandlockScopeError
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParseLandlockScopeError
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParseLandlockScopeError
 pub struct ferroday_cage::ParseNetAccessError
 impl ferroday_cage::ParseNetAccessError
 pub fn ferroday_cage::ParseNetAccessError::text(&self) -> &str
@@ -2603,6 +2641,7 @@ pub fn ferroday_cage::RestrictionBuilder::env(self, impl core::convert::AsRef<st
 pub fn ferroday_cage::RestrictionBuilder::envs<I, K, V>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = (K, V)>, K: core::convert::AsRef<std::ffi::os_str::OsStr>, V: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn ferroday_cage::RestrictionBuilder::landlock_fs(self, ferroday_cage::FsAccess, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::landlock_net(self, ferroday_cage::NetAccess, u16) -> Self
+pub fn ferroday_cage::RestrictionBuilder::landlock_scope<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>>(self, I) -> Self
 pub fn ferroday_cage::RestrictionBuilder::rlimit(self, ferroday_cage::limits::Resource, impl core::convert::Into<ferroday_cage::limits::Limit>, impl core::convert::Into<ferroday_cage::limits::Limit>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::seccomp(self, ferroday_cage::SeccompPolicy) -> Self
 pub fn ferroday_cage::RestrictionBuilder::stderr(self, ferroday_cage::Stdio) -> Self
@@ -2665,6 +2704,7 @@ impl ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::allowing<I: core::iter::traits::collect::IntoIterator<Item = i64>>(I) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::default_action(self, ferroday_cage::SeccompAction) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::denying<I: core::iter::traits::collect::IntoIterator<Item = i64>>(I) -> ferroday_cage::SeccompRules
+pub fn ferroday_cage::SeccompRules::errno_for(self, i64, u16) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::listed_action(self, ferroday_cage::SeccompAction) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::rule<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::SeccompArg>>(self, i64, I) -> ferroday_cage::SeccompRules
 impl core::marker::Freeze for ferroday_cage::SeccompRules

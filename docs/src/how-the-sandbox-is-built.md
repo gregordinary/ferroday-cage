@@ -4,11 +4,13 @@ A launch is a fork followed by a fixed setup sequence, ending in `execve`.
 Everything the setup needs is prepared and validated in the caller
 beforehand — the command line marshaled, the rootfs path resolved and
 checked — so the post-fork windows perform no allocation and no fallible
-preparation of their own. All syscalls are issued directly against the
-kernel through rustix, and the default build drives the whole sequence
-itself; the one opt-in exception — the `subid` feature's range-map
-delegation to the shadow suite's helpers — runs in the caller, outside the
-sandbox.
+preparation of their own. The stages issue their syscalls directly against the
+kernel, through rustix and the `syscalls` crate. The one call that passes
+through the C library is the `close` the standard library makes for a dropped
+descriptor, a single async-signal-safe syscall. The default build drives the
+whole sequence itself; the one opt-in exception — the `subid` feature's
+range-map delegation to the shadow suite's helpers — runs in the caller,
+outside the sandbox.
 
 The setup runs across a short chain of forked stages — the launch stage,
 the sandbox init, and the command process — because a process that unshares
@@ -178,23 +180,35 @@ host whose ceiling is four with three namespaces already live fails the same way
 
 ## The session keyring
 
-The kernel's keyrings belong to no namespace. A forked process inherits its
-parent's session keyring. A process also *possesses* every key reachable from
-that keyring, and possession is what the default key permissions grant reading
+A forked process inherits its parent's session keyring, and no namespace a
+launch creates changes that. A process *possesses* every key reachable from its
+session keyring, and possession is what the default key permissions grant reading
 to. A command holding the caller's session keyring can therefore read every key
 the caller's login session holds. That includes a Kerberos ticket cache, an
-fscrypt or eCryptfs key, and any secret a desktop cached there. No namespace,
-root swap, or descriptor sweep changes that.
+fscrypt or eCryptfs key, and any secret a desktop cached there.
 
 The launch stage joins a fresh, anonymous session keyring before it forks
 anything. Every process of the sandbox starts with that keyring, and none
-possesses the caller's. The restriction fallback does the same, since the
-reasoning does not depend on namespaces.
+possesses the caller's. The restriction fallback does the same.
+
+Possession is what the fresh keyring takes away, and it is not the only way to a
+key. A key's permissions can grant reading to its owner as well as to its
+possessor, and the sandbox's processes are that owner. Such a key stays readable
+from the sandbox by its serial number. The default permissions grant the owner
+only *view*, so a key keeps that exposure only where its permissions were
+widened.
+
+The user keyring, the user session keyring, and the persistent keyring belong to
+the user rather than to the session. A sandbox's user namespace gives its
+processes keyrings of their own in their place. A
+[restriction](restriction-fallback.md) has no user namespace, so its command can
+link the caller's into its own keyring and read every key they hold. The curated
+seccomp policy denies `keyctl`, which closes both reaches.
 
 The kernel still lists in `/proc/keys` every key whose permissions let its owner
 view it, and the sandbox's processes are that owner. A key's description
-therefore stays visible, as the mount table does. Its contents do not. See
-[What the sandbox does not hide](#what-the-sandbox-does-not-hide).
+therefore stays visible, as the mount table does. See [What the sandbox does not
+hide](#what-the-sandbox-does-not-hide).
 
 The fresh keyring counts against the calling user's key quota for as long as
 the sandbox runs. The quota is `kernel.keys.maxkeys` keys and
@@ -413,8 +427,9 @@ disclosure warrants.
 
 `/proc/keys` is a disclosure of the same kind. It lists the description of every
 key the calling user owns, wherever the key's permissions let its owner view it.
-The command possesses none of those keys and cannot read their contents. See
-[The session keyring](#the-session-keyring).
+The command possesses none of those keys. It reads the contents only of one whose
+permissions grant its owner reading. See [The session
+keyring](#the-session-keyring).
 
 It is called out because the rest of the crate leans the other way. A
 [`Terminal`](terminal.md) refuses to read the host's window size, `base_env`

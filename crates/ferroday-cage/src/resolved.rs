@@ -353,6 +353,14 @@ pub enum ResolvedHardening {
         landlock_fs: Vec<ResolvedLandlockFs>,
         /// The Landlock network grants, in the order they were declared.
         landlock_net: Vec<ResolvedLandlockNet>,
+        /// The `LANDLOCK_SCOPE_*` flags the ruleset scopes, as the kernel spells
+        /// them; zero when none applies.
+        ///
+        /// A sandbox reports what it asked for, before the command stage masks it
+        /// to the running kernel's ABI. A restriction requests every scope and
+        /// drops at build those the kernel cannot enforce, so it reports what
+        /// the build kept.
+        landlock_scope: u64,
         /// The installed seccomp filter's length in BPF instructions; `None`
         /// when no filter is installed.
         ///
@@ -380,8 +388,9 @@ pub struct ResolvedLandlockFs {
     /// The `LANDLOCK_ACCESS_FS_*` rights allowed beneath the path, as the
     /// kernel spells them.
     ///
-    /// This is what the ruleset receives, and it is reported unmasked, before
-    /// the command stage narrows it to the running kernel's ABI.
+    /// This is what the grant asks for, reported before the command stage
+    /// narrows it: to the running kernel's ABI, and, where the path names
+    /// something other than a directory, to the rights that act on a file.
     // Gated for the reason `ResolvedRoot::Host`'s second sentence is: the type
     // is reported whether or not the feature is compiled in, but the type it
     // contrasts with is not.
@@ -647,6 +656,7 @@ fn project_hardening(plan: &LaunchPlan) -> ResolvedHardening {
                     access: rule.access,
                 })
                 .collect(),
+            landlock_scope: plan.hardening.landlock_scoped,
             seccomp_instructions: plan.hardening.seccomp.as_ref().map(Vec::len),
             keep_capabilities: plan.hardening.keep_caps,
         }
@@ -833,7 +843,7 @@ mod serde_tests {
         // than on the configuration, which is the whole point of the field
         // being present either way.
         #[cfg(feature = "hardening")]
-        let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\n";
+        let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\nlandlock-scope = 0\n";
         #[cfg(not(feature = "hardening"))]
         let hardening = "[hardening]\nkind = \"unavailable\"\n";
         // TOML puts bare keys ahead of tables, so `no-new-privileges`,

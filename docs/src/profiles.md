@@ -264,6 +264,8 @@ configuration is versioned and reviewed alongside the rest of the sandbox.
 drop-caps = true                    # drop every capability...
 # keep-caps = ["net-bind-service"]  # ...or keep only these, dropping the rest
 
+landlock-scope = ["signal"]         # no signals to processes outside the sandbox
+
 seccomp = "curated"                 # the curated deny-list of dangerous syscalls
 
 [[hardening.landlock-fs]]
@@ -280,14 +282,18 @@ port = 8080
 ```
 
 `drop-caps` and `keep-caps` set the capability posture and are mutually
-exclusive; capabilities are named in kebab-case (`net-bind-service`). An empty
-`keep-caps` is rejected — `drop-caps = true` is how a profile drops every
-capability. An `[[hardening.landlock-fs]]` entry grants an `access` set — some
-combination of the `r`, `w`, and `x` letters — beneath a `path`; an
-`[[hardening.landlock-net]]` entry grants an `access` set — some combination of
-`b` (bind) and `c` (connect) — on a TCP `port`. Enrolling any grant denies every
-path, bind, and connect not granted; paths are sandbox paths, resolved after the
-pivot, and network rights require Landlock ABI 4.
+exclusive. Capabilities are named in kebab-case (`net-bind-service`). An empty
+`keep-caps` is rejected, since `drop-caps = true` is how a profile drops every
+capability.
+
+An `[[hardening.landlock-fs]]` entry grants an `access` set beneath a `path`, in
+the `r`, `w`, and `x` letters. An `[[hardening.landlock-net]]` entry grants an
+`access` set on a TCP `port`, in the `b` (bind) and `c` (connect) letters.
+Enrolling any grant denies every path, bind, and connect not granted. Paths are
+sandbox paths, resolved after the pivot, and network rights require Landlock ABI
+4. `landlock-scope` lists the scopes, `signal` and `abstract-unix-socket`, that
+confine those reaches to the sandbox's own processes. Scopes require Landlock
+ABI 6.
 
 `seccomp` is either the string `"curated"` or a table naming syscalls to
 filter — a deny-list, or an allow-list that must name every syscall the command
@@ -326,6 +332,15 @@ value = 21523                         # TIOCGWINSZ; ioctl allowed only for this 
 The width has no safe default — comparing the wrong one lets a value hide in the
 bits that are not checked — so a condition must state it. An `allow` and a `deny`
 side are mutually exclusive within one table.
+
+An `errno` table answers a syscall with an errno of its own, named as the C
+headers name it, ahead of either side. A table with `errno` alone is a deny-list
+of what it names:
+
+```toml
+[hardening.seccomp]
+errno = { clone3 = "ENOSYS" }         # the C library falls back to clone
+```
 
 Syscalls are named as the kernel names them (`exit_group`), resolved for the
 host architecture. The precompiled-program escape hatch
@@ -387,14 +402,15 @@ it:
   is on unless something says otherwise. A profile stating the key is that
   something, so `stop-with-caller = false` holds — the flag still overrides
   either way.
-- Hardening flags compose with a profile's `[hardening]` table:
-  `--landlock-ro`, `--landlock-rw`, `--landlock-bind`, and `--landlock-connect`
-  add grants to it, while the seccomp flags, `--drop-caps`, and `--keep-caps`
-  replace its seccomp policy or capability posture. The seccomp flags mirror the
-  profile's seccomp table: `--seccomp-allow` and `--seccomp-deny` take
-  comma-separated syscall names, and `--seccomp-allow-rule` and
-  `--seccomp-deny-rule` take a syscall name with `arg`/`len`/`op`/`value`/`mask`
-  conditions, so a rule reads the same on a flag as in the table.
+- Hardening flags compose with a profile's `[hardening]` table. `--landlock-ro`,
+  `--landlock-rw`, `--landlock-bind`, and `--landlock-connect` add grants to it.
+  `--landlock-scope`, the seccomp flags, `--drop-caps`, and `--keep-caps` replace
+  its scopes, seccomp policy, or capability posture. The seccomp flags mirror the
+  profile's seccomp table, so a rule reads the same on a flag as in the table.
+  `--seccomp-allow` and `--seccomp-deny` take comma-separated syscall names.
+  `--seccomp-allow-rule` and `--seccomp-deny-rule` take a syscall name with
+  `arg`/`len`/`op`/`value`/`mask` conditions, and `--seccomp-errno` takes
+  `SYSCALL=ERRNO`.
 
 ```sh
 # The profile's sandbox, its command replaced for one run:

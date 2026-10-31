@@ -12,7 +12,7 @@
 # than a call -- an `Instant` plus a `Duration`, a hand-split path -- clippy
 # cannot see it, and `tools/check-idioms.py` is what watches instead.
 disallowed-methods = [
-  { path = "rustix::fs::openat2", reason = "open a directory contained in a tree through provision::containment::open_dir, which folds in the flags every caller passes and the retry the kernel asks for when a rename races the walk" },
+  { path = "rustix::fs::openat2", reason = "resolve through mechanism::resolve::openat2, which retries the EAGAIN the kernel answers when a rename or a mount races a scoped walk; a directory in a tree being provisioned goes through provision::containment::open_dir (open_dir_path after a fork), which adds the flags every caller there passes" },
   { path = "rustix::fs::flock", reason = "take a lock file through provision::lock_exclusive, which opens it close-on-exec without following a symlink and re-checks that the path still names the file it locked" },
   { path = "rustix::io::dup", reason = "duplicate a descriptor with rustix::io::fcntl_dupfd_cloexec, so the copy is close-on-exec like every other descriptor the library holds and a spawned process does not inherit it" },
   { path = "std::fs::remove_dir_all", reason = "remove a tree through provision::remove_tree (or provision::Remove), whose walk never recurses: a tree a sandbox wrote can nest deep enough to exhaust the descriptors or the stack a recursive removal holds per level" },

@@ -52,13 +52,13 @@ process that appears sandboxed.
 grant — filesystem or network — enrolls the command in Landlock, so a
 restriction whose only grant is a network one denies every TCP bind and connect
 it did not name, and the filesystem stays open. It governs TCP alone: UDP, raw
-sockets, and other socket families, `AF_UNIX` among them, are untouched, which
-is why the abstract-socket surfaces below survive it.
+sockets, and other socket families, `AF_UNIX` among them, are untouched.
 
-Network rights need Landlock ABI 4, where filesystem rights need only ABI 1. On
-an older Landlock kernel a filesystem grant narrows away best-effort, but a
-restriction whose *only* grant is a network one would then enforce nothing at
-all, so it is refused at build with
+Network rights need Landlock ABI 4, where filesystem rights need only ABI 1. A
+sandbox narrows a network grant away on an older kernel, with its network
+namespace still behind it. A restriction has no such namespace, so a restriction
+with any network grant is refused at build on that kernel, whatever filesystem
+grants it also makes. The refusal is
 [`ConfigError::RestrictionLandlockUnenforceable`].
 
 The command starts in `/` (or the [`current_dir`]) with a deterministic base
@@ -79,12 +79,28 @@ restriction fallback — which would otherwise pass its full capability set to
 the command; when the caller is already unprivileged the drop is a no-op.
 
 Because a restriction runs a host process with no namespace or root-swap
-isolation, some host-reaching surfaces remain, governed only by the Landlock
-and seccomp the caller configured: abstract-socket services such as D-Bus and
-the X server (a Landlock network grant governs TCP alone), same-user `/proc`
-under a seccomp-only restriction, and same-user `ptrace` under a Landlock-only
-restriction (the curated seccomp policy blocks it). A cage closes these three
-through its namespaces and swapped root.
+isolation, some host-reaching surfaces remain:
+
+- **Signals.** The command shares the host's PID space as the calling user, so
+  it can signal every process that user owns.
+- **Abstract sockets.** It shares the host's network namespace, so it can reach
+  the session bus and the X server through their abstract sockets. A Landlock
+  network grant governs TCP alone, and seccomp cannot read a socket's address.
+- **Other processes' memory and environment.** Without a Landlock domain, it can
+  `ptrace` the calling user's other processes and read their
+  `/proc/<pid>/environ`.
+
+On a kernel with Landlock ABI 6 (Linux 6.12) or later, a restriction closes all
+three. Its default [`landlock_scope`] confines signals and abstract-socket
+connections to the processes the command started. The scopes also give every
+restriction a Landlock domain, and any domain refuses ptrace access to the
+processes outside it. Name fewer scopes only for a command that needs that
+reach.
+
+On an older kernel the scopes are dropped, and signals and abstract sockets stay
+open. A Landlock grant still creates a domain there, and the curated seccomp
+policy still denies `ptrace` and `process_vm_readv`. A default sandbox closes
+all three through its PID and network namespaces.
 
 The caller's terminal is not among them, because it is not a namespace question:
 a controlling terminal is reached through the session, so a cage and a
@@ -97,11 +113,15 @@ Independently of the session, the curated seccomp policy denies `ioctl` for the
 `TIOCSTI` and `TIOCLINUX` requests, the two that write to a terminal's input
 queue.
 
-The caller's session keyring is not among them either. The kernel's keyrings
-belong to no namespace, so a sandbox and a restriction are in the same position.
-Every launch of either gives the command a fresh session keyring in place of the
-one it inherited. The command therefore does not possess the keys the caller's
-login session holds, and cannot read them. See [The session
+Every launch of a sandbox or a restriction gives the command a fresh session
+keyring in place of the one it inherited. The command therefore does not possess
+the keys the caller's login session holds. A restriction leaves more of the
+user's keys in reach than a sandbox does, though. The user keyring, the user
+session keyring, and the persistent keyring belong to the user rather than to the
+session. A restricted command runs as that user, so it can link them into its own
+keyring and read every key they hold. That includes a Kerberos ticket cache kept
+in the persistent keyring. The curated seccomp policy denies `keyctl`, which
+closes this. See [The session
 keyring](how-the-sandbox-is-built.md#the-session-keyring).
 
 ## Falling back from a cage
@@ -153,10 +173,13 @@ command starts, so the confinement itself does extend to descendants.
 ## Host support
 
 Landlock enforcement follows the running kernel's ABI, best-effort downward,
-exactly as in the hardening layer; a kernel with no Landlock LSM fails a
-Landlock-bearing restriction as a setup error. A seccomp-only restriction
-runs there. [`host::landlock_abi`] and [`host::seccomp_available`] report
-what the kernel offers.
+exactly as in the hardening layer. A kernel with no Landlock LSM refuses a
+restriction with any Landlock grant at build, with
+[`ConfigError::RestrictionLandlockUnenforceable`]. A kernel below ABI 4 refuses
+one with a network grant the same way. A seccomp-only restriction runs on
+either, without the scopes a kernel below ABI 6 cannot enforce.
+[`host::landlock_abi`] and [`host::seccomp_available`] report what the kernel
+offers.
 
 ## On the command line
 
@@ -172,9 +195,10 @@ $ fcage --restrict \
     -- /usr/bin/sort /work/input
 ```
 
-Alongside the grant flags, `--setenv`, `--no-base-env`, `--chdir`, `--stdin`,
-`--rlimit`, `--timeout`, `--kill-after`, and `--stop-with-caller` behave as they
-do for a sandbox. [`rlimit`] matters more here than in a cage: without
+`--landlock-scope` replaces the default scopes, and an empty list turns them
+off. Alongside the grant flags, `--setenv`, `--no-base-env`, `--chdir`,
+`--stdin`, `--rlimit`, `--timeout`, `--kill-after`, and `--stop-with-caller`
+behave as they do for a sandbox. [`rlimit`] matters more here than in a cage: without
 namespaces, a resource limit is the only thing bounding what the command
 consumes.
 
@@ -182,6 +206,7 @@ consumes.
 [`landlock_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_fs
 [`landlock_net`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_net
 [`ConfigError::RestrictionLandlockUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
+[`landlock_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_scope
 [`seccomp`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.seccomp
 [`current_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.current_dir
 [`stdin`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.stdin

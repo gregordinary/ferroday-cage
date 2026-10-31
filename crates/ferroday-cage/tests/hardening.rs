@@ -10,7 +10,9 @@ mod common;
 
 use std::path::Path;
 
-use ferroday_cage::{Cage, Capability, FsAccess, NetAccess, SeccompPolicy, SeccompRules};
+use ferroday_cage::{
+    Cage, Capability, FsAccess, LandlockScope, NetAccess, SeccompPolicy, SeccompRules,
+};
 
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
 fn rootfs() -> Option<&'static Path> {
@@ -183,6 +185,135 @@ fn landlock_covers_a_tmpfs_mount_in_the_pivoted_view() {
         .run()
         .expect("the sandbox launches");
     assert!(status.success(), "a granted tmpfs must be writable");
+}
+
+#[test]
+fn landlock_grants_a_single_file_and_a_device_node() {
+    let Some(rootfs) = rootfs() else { return };
+    if !landlock_supported() {
+        return;
+    }
+    // A grant on a file and a grant on a device node, rather than on the
+    // directories that hold them. `READ` and `WRITE` each lower to rights that
+    // act on a directory's entries, which the kernel refuses on anything else;
+    // the grant narrows to the rights a file accepts instead. The command reads
+    // the one granted file, writes the one granted device, and is still denied
+    // the file's neighbour.
+    let output = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/busybox")
+        .args([
+            "sh",
+            "-c",
+            "cat /etc/passwd >/dev/null && echo written >/dev/null && ! cat /etc/group",
+        ])
+        .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/bin")
+        .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/lib")
+        .landlock_fs(FsAccess::READ, "/etc/passwd")
+        .landlock_fs(FsAccess::READ | FsAccess::WRITE, "/dev/null")
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox launches");
+    assert!(
+        output.status.success(),
+        "the granted file and device are reachable and nothing beside them is: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn a_landlock_rule_that_fails_names_its_grant() {
+    let Some(rootfs) = rootfs() else { return };
+    if !landlock_supported() {
+        return;
+    }
+    // The grant's path is a sandbox path, resolved only after the pivot, so a
+    // missing one fails the launch rather than the build. The failure names the
+    // grant, not merely the step.
+    let error = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/busybox")
+        .args(["true"])
+        .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/bin")
+        .landlock_fs(FsAccess::READ, "/no/such/grant")
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect_err("a grant on a missing path fails the launch");
+    match error {
+        ferroday_cage::Error::Setup {
+            step: ferroday_cage::SetupStep::LandlockAddRule,
+            detail,
+            source,
+            ..
+        } => {
+            assert_eq!(detail.as_deref(), Some("r on /no/such/grant"));
+            assert_eq!(source.raw_os_error(), Some(2), "{source}");
+        }
+        other => panic!("expected a Landlock rule failure, got {other:?}"),
+    }
+}
+
+/// Skips a Landlock scope test when the kernel's Landlock ABI predates scopes,
+/// which arrive in ABI 6.
+fn landlock_scope_supported() -> bool {
+    match ferroday_cage::host::landlock_abi() {
+        Some(abi) if abi >= 6 => true,
+        abi => {
+            assert!(
+                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE").is_none(),
+                "Landlock scopes are required but the kernel's ABI is {abi:?} (needs 6)",
+            );
+            eprintln!("skipping: Landlock ABI {abi:?} predates scopes (needs 6)");
+            false
+        }
+    }
+}
+
+#[test]
+fn the_signal_scope_confines_a_sandbox_sharing_the_host_pid_space() {
+    let Some(rootfs) = rootfs() else { return };
+    if !landlock_scope_supported() {
+        return;
+    }
+    // Without a PID namespace the command sees the calling user's processes,
+    // and as the same user outside the namespace it may signal them. The probe
+    // is signal 0, which asks the kernel for the permission check alone.
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a process to signal");
+    let probe = format!("kill -0 {}", victim.id());
+    let launch = |scoped: bool| {
+        let builder = Cage::builder()
+            .rootfs(rootfs)
+            .command("/bin/busybox")
+            .args(["sh", "-c", probe.as_str()])
+            .pid_namespace(false);
+        let builder = if scoped {
+            builder.landlock_scope([LandlockScope::Signal])
+        } else {
+            builder
+        };
+        builder
+            .build()
+            .expect("a valid sandbox configuration")
+            .run()
+            .expect("the sandbox launches")
+    };
+    let unscoped = launch(false);
+    let scoped = launch(true);
+    let _ = victim.kill();
+    let _ = victim.wait();
+    assert!(
+        unscoped.success(),
+        "an unscoped command reaches the caller's process"
+    );
+    assert!(
+        !scoped.success(),
+        "a scoped command cannot signal a process outside its domain"
+    );
 }
 
 #[test]

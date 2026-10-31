@@ -273,9 +273,6 @@ pub mod relay;
 mod resolved;
 #[cfg(feature = "hardening")]
 mod restrict;
-// The two enums declared through it are each behind a feature, so a build with
-// neither has no roster to declare.
-#[cfg(any(feature = "hardening", feature = "alpine"))]
 mod roster;
 mod running;
 #[cfg(test)]
@@ -288,8 +285,9 @@ mod wire;
 pub use error::{ConfigError, Error, OverlayLayer, SetupStep};
 #[cfg(feature = "hardening")]
 pub use hardening::{
-    Capability, FsAccess, NetAccess, ParseCapabilityError, ParseFsAccessError, ParseNetAccessError,
-    SeccompAction, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules,
+    Capability, FsAccess, LandlockScope, NetAccess, ParseCapabilityError, ParseFsAccessError,
+    ParseLandlockScopeError, ParseNetAccessError, SeccompAction, SeccompArg, SeccompArgLen,
+    SeccompCompare, SeccompPolicy, SeccompRules,
 };
 #[cfg(feature = "subid")]
 pub use idmap::SubidMapper;

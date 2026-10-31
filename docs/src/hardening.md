@@ -49,7 +49,10 @@ directories), `WRITE` (write files and create, remove, and rename entries), and
 `EXECUTE` (execute files). Paths are sandbox paths, resolved after the pivot, so
 a grant describes the mounted view — the rootfs, the bind mounts, and the
 `/proc`, `/dev`, and `/tmp` mounts alike. A read-write grant on the tmpfs `/tmp`
-governs exactly the files the sandbox mounts there.
+governs exactly the files the sandbox mounts there. A grant may also name a
+single file or device node, such as `/etc/hostname` or `/dev/null`. There it
+allows only the rights that act on a file, since there are no entries to list,
+create, or remove.
 
 The rules are enforced on any kernel that offers Landlock, best-effort down to
 the kernel's supported ABI: a rule referencing an access right a kernel does not
@@ -102,6 +105,40 @@ the sandbox's only network boundary: a host-network cage, and the restriction
 fallback. Both fail the build on a kernel that cannot enforce the grant. An
 isolated cage keeps its network namespace either way, which is why the same
 kernel is tolerated there.
+
+## Landlock scopes
+
+A sandbox's PID and network namespaces hide the calling user's other processes.
+With them go two reaches that no grant governs: signals, and connections to
+abstract `AF_UNIX` sockets. [`pid_namespace(false)`] gives the first back, and
+[`Network::Host`] the second. [`landlock_scope`] takes either away again,
+confining it to the processes the sandbox started:
+
+```rust,no_run
+# use ferroday_cage::{Cage, LandlockScope};
+# fn main() -> ferroday_cage::Result<()> {
+let status = Cage::builder()
+    .rootfs("/srv/rootfs/alpine")
+    .command("/usr/bin/build")
+    .pid_namespace(false)
+    .landlock_scope([LandlockScope::Signal])
+    .build()?
+    .run()?;
+# let _ = status;
+# Ok(())
+# }
+```
+
+[`LandlockScope`] has two values. `Signal` denies a signal to any process outside
+the sandbox's Landlock domain. `AbstractUnixSocket` denies a connection to an
+abstract socket such a process created. Both reaches stay open between the
+command and the processes it starts. A scope is not a grant, so it enrolls no
+path or port and leaves the filesystem and the network as the grants left them.
+
+Scopes need Landlock ABI 6 (Linux 6.12). On an older kernel that offers Landlock
+they narrow away best-effort, as an unsupported right does. The [restriction
+fallback](restriction-fallback.md), which has neither namespace, applies both
+scopes by default.
 
 ## Seccomp syscall filters
 
@@ -170,8 +207,41 @@ The width is a deliberate choice. The kernel presents every argument as a
 the `_qword` constructors compare all 64. Match the width to the argument's
 kernel type: `dword` for an `int` or a 32-bit flag set, `qword` for a pointer or
 a 64-bit value. Comparing the wrong width lets a value hide in the bits that are
-not checked. The `masked_eq_*` constructors test individual flag bits — for
-example, that `CLONE_NEWUSER` is clear in a `clone` flags argument.
+not checked. A `dword` value or mask wider than 32 bits is refused at build,
+since its high bits could take no part in the comparison. The `masked_eq_*`
+constructors test individual flag bits — for example, that `CLONE_NEWUSER` is
+clear in a `clone` flags argument.
+
+A filter sees a syscall's registers and nothing they point at. `clone3` takes its
+flags in a structure in memory, so a condition on `clone`'s flags does not reach
+it. Denying `clone3` with `EPERM` breaks thread creation in glibc 2.34 and later.
+[`SeccompRules::errno_for`] answers it with `ENOSYS` instead, and the C library
+then falls back to `clone`, where the condition applies:
+
+```rust,no_run
+# use ferroday_cage::{Cage, SeccompArg, SeccompPolicy, SeccompRules};
+# const CLONE_NEWUSER: u64 = 0x1000_0000;
+# fn main() -> ferroday_cage::Result<()> {
+// No new user namespace through clone or unshare, and clone3's callers sent
+// to clone.
+let new_user_namespace = [SeccompArg::masked_eq_qword(0, CLONE_NEWUSER, CLONE_NEWUSER)];
+let rules = SeccompRules::denying([])
+    .rule(libc::SYS_clone, new_user_namespace)
+    .rule(libc::SYS_unshare, new_user_namespace)
+    .errno_for(libc::SYS_clone3, libc::ENOSYS as u16);
+let status = Cage::builder()
+    .rootfs("/srv/rootfs/alpine")
+    .command("/usr/bin/build")
+    .seccomp(SeccompPolicy::Rules(rules))
+    .build()?
+    .run()?;
+# let _ = status;
+# Ok(())
+# }
+```
+
+A syscall answered this way cannot also be listed, since one of the two answers
+would never apply. The build refuses that policy.
 
 The filter binds the command and its descendants. Seccomp filtering is available
 on the `x86_64`, `aarch64`, and `riscv64` architectures; a policy on any other
@@ -385,13 +455,14 @@ switch, never governs the switch's own syscalls. Each restriction is inherited
 across `execve`, and none touches the sandbox init or the supervisor.
 
 On the command line, `--landlock-ro` and `--landlock-rw` add filesystem grants,
-`--landlock-bind` and `--landlock-connect` add network grants by port,
-`--seccomp curated` applies the curated profile, `--seccomp-allow` and
-`--seccomp-deny` filter syscalls by name, `--seccomp-allow-rule` and
-`--seccomp-deny-rule` add argument conditions in the profile's `arg`/`len`/`op`/
-`value` terms (for example `--seccomp-allow-rule 'ioctl arg=1 len=dword op=eq
-value=0x5413'`), `--drop-caps` and `--keep-caps` control capabilities, and
-`--deny-net` selects the denied network.
+`--landlock-bind` and `--landlock-connect` add network grants by port, and
+`--landlock-scope` names the scopes. `--seccomp curated` applies the curated
+profile, and `--seccomp-allow` and `--seccomp-deny` filter syscalls by name.
+`--seccomp-allow-rule` and `--seccomp-deny-rule` add argument conditions in the
+profile's `arg`/`len`/`op`/`value` terms, for example `--seccomp-allow-rule
+'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno clone3=ENOSYS`
+answers one syscall with an errno of its own. `--drop-caps` and `--keep-caps`
+control capabilities, and `--deny-net` selects the denied network.
 
 The Landlock and seccomp primitives also stand on their own: on hosts
 without unprivileged user namespaces, [the restriction
@@ -412,5 +483,10 @@ with no sandbox around it.
 [`keep_capabilities`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.keep_capabilities
 [`Capability`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Capability.html
 [`Network::None`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
+[`Network::Host`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
+[`pid_namespace(false)`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.pid_namespace
+[`landlock_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.landlock_scope
+[`LandlockScope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.LandlockScope.html
+[`SeccompRules::errno_for`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.errno_for
 [`host::landlock_abi`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_abi.html
 [`host::seccomp_available`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.seccomp_available.html

@@ -206,22 +206,18 @@ impl CopyChild {
         let CopyChild { pid, stream, gate } = self;
         drop(stream);
 
-        let mut record = [0u8; super::RECORD_LEN];
-        let read = loop {
-            match rustix::io::read(&gate, &mut record) {
-                Ok(n) => break n,
-                Err(Errno::INTR) => continue,
-                Err(errno) => {
-                    let _ = super::wait_for_exit(pid);
-                    return Err(CopyFailure::Step {
-                        step: CopyStep::Spawn,
-                        errno: errno.raw_os_error(),
-                    });
-                }
+        let read = match frame::read_record(gate.as_fd()) {
+            Ok(read) => read,
+            Err(errno) => {
+                let _ = super::wait_for_exit(pid);
+                return Err(CopyFailure::Step {
+                    step: CopyStep::Spawn,
+                    errno: errno.raw_os_error(),
+                });
             }
         };
         let outcome = super::wait_for_exit(pid);
-        if read != record.len() {
+        let Some(record) = read else {
             // The child died without reporting, or reported something that is
             // not a record. Its exit status is all there is to go on either
             // way: a clean exit here would mean it finished the tree and lost
@@ -236,7 +232,7 @@ impl CopyChild {
                 step: CopyStep::Spawn,
                 errno: Errno::PIPE.raw_os_error(),
             });
-        }
+        };
         decode_record(record)
     }
 
@@ -277,7 +273,7 @@ impl CopyChild {
 /// after a `COPY_END` frame, which a parent that is abandoning the copy never
 /// sent. It is reported as no outcome rather than treated as a case of its own.
 fn reported_outcome(gate: BorrowedFd<'_>) -> Option<CopyFailure> {
-    let mut record = [0u8; super::RECORD_LEN];
+    let mut record = [0u8; frame::RECORD_LEN];
     // `EAGAIN`: nothing is queued, so the child has reported nothing.
     let (received, _) = frame::retry_on_intr!(rustix::net::recv(
         gate,
@@ -291,12 +287,11 @@ fn reported_outcome(gate: BorrowedFd<'_>) -> Option<CopyFailure> {
     decode_record(record).err()
 }
 
-/// Reads an 8-byte outcome record: a step discriminant and an errno, with a
-/// zero step meaning success.
-fn decode_record(record: [u8; super::RECORD_LEN]) -> Result<(), CopyFailure> {
-    let wire = u32::from_le_bytes(record[0..4].try_into().expect("slice length is 4"));
-    let errno = i32::from_le_bytes(record[4..8].try_into().expect("slice length is 4"));
-    if wire == OUTCOME_OK {
+/// Reads the child's outcome record: the copy finished, or the step that
+/// failed and its errno.
+fn decode_record(record: [u8; frame::RECORD_LEN]) -> Result<(), CopyFailure> {
+    let (wire, errno) = frame::decode_record(record);
+    if wire == frame::RECORD_DONE {
         return Ok(());
     }
     let Some(step) = CopyStep::from_wire(wire) else {
@@ -304,10 +299,6 @@ fn decode_record(record: [u8; super::RECORD_LEN]) -> Result<(), CopyFailure> {
     };
     Err(CopyFailure::Step { step, errno })
 }
-
-/// The outcome discriminant that means the copy finished: distinct from every
-/// step's wire value, which start at zero.
-const OUTCOME_OK: u32 = u32::MAX;
 
 /// Forks the copy child into `map` and returns the handle to stream a tree to.
 ///
@@ -434,7 +425,7 @@ fn copy_child(
 
     match consume(stream, root) {
         Ok(()) => {
-            report(gate, OUTCOME_OK, 0);
+            report(gate, frame::RECORD_DONE, 0);
             sys::exit_group(0)
         }
         Err((step, errno)) => fail(step, errno),
@@ -1010,10 +1001,7 @@ fn cstr_in<'b>(buf: &'b mut [u8], bytes: &[u8]) -> Result<&'b CStr, (CopyStep, E
 
 /// Writes the outcome record to the gate, best effort.
 fn report(gate: BorrowedFd<'_>, wire: u32, errno: i32) {
-    let mut record = [0u8; super::RECORD_LEN];
-    record[0..4].copy_from_slice(&wire.to_le_bytes());
-    record[4..8].copy_from_slice(&errno.to_le_bytes());
-    let _ = rustix::io::write(gate, &record);
+    let _ = rustix::io::write(gate, &frame::encode_record(wire, errno));
 }
 
 #[cfg(test)]
@@ -1040,19 +1028,15 @@ mod tests {
     #[test]
     fn copy_step_unknown_wire_value_is_rejected() {
         assert_eq!(CopyStep::from_wire(CopyStep::past_the_last()), None);
-        assert_eq!(CopyStep::from_wire(OUTCOME_OK), None);
+        assert_eq!(CopyStep::from_wire(frame::RECORD_DONE), None);
     }
 
     /// A record naming no step at all is not read as a step: the success
     /// record decodes as success, and anything else as a malformed record.
     #[test]
     fn an_outcome_record_naming_no_step_is_malformed() {
-        let record = |wire: u32| {
-            let mut record = [0u8; crate::mechanism::RECORD_LEN];
-            record[0..4].copy_from_slice(&wire.to_le_bytes());
-            record
-        };
-        assert!(decode_record(record(OUTCOME_OK)).is_ok());
+        let record = |wire: u32| frame::encode_record(wire, 0);
+        assert!(decode_record(record(frame::RECORD_DONE)).is_ok());
         assert!(matches!(
             decode_record(record(CopyStep::ALL.len() as u32)),
             Err(CopyFailure::Malformed),

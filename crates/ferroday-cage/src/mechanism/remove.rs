@@ -47,6 +47,7 @@ use rustix::process::Pid;
 
 use super::ChildMap;
 use super::child::{MapDuty, MapFailure};
+use super::frame;
 use super::sys::{self, Fork};
 use crate::idmap::IdMapError;
 use crate::wire::wire_enum;
@@ -197,31 +198,18 @@ fn drive_removal(gate: OwnedFd, child: Pid, map: &ChildMap<'_>) -> Result<(), Re
         }
     }
 
-    let mut record = [0u8; super::RECORD_LEN];
-    let mut len = 0;
-    while len < record.len() {
-        match rustix::io::read(&gate, &mut record[len..]) {
-            Ok(0) => break,
-            Ok(n) => len += n,
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(io_failure(RemoveStep::Delete, errno)),
-        }
-    }
-    if len != record.len() {
-        return Err(io_failure(RemoveStep::Delete, Errno::PROTO));
-    }
-    if record == [0u8; super::RECORD_LEN] {
-        Ok(())
-    } else {
-        Err(decode_record(record))
+    let record = frame::read_record(gate.as_fd())
+        .map_err(|errno| io_failure(RemoveStep::Delete, errno))?
+        .ok_or_else(|| io_failure(RemoveStep::Delete, Errno::PROTO))?;
+    match frame::decode_record(record) {
+        (frame::RECORD_DONE, _) => Ok(()),
+        _ => Err(decode_record(record)),
     }
 }
 
-/// Decodes the child's 8-byte record: step discriminant then errno, both
-/// little-endian.
-fn decode_record(record: [u8; super::RECORD_LEN]) -> RemoveFailure {
-    let wire = u32::from_le_bytes(record[0..4].try_into().expect("slice length is 4"));
-    let errno = i32::from_le_bytes(record[4..8].try_into().expect("slice length is 4"));
+/// Names the failure the child's outcome record reports.
+fn decode_record(record: [u8; frame::RECORD_LEN]) -> RemoveFailure {
+    let (wire, errno) = frame::decode_record(record);
     match RemoveStep::from_wire(wire) {
         Some(step) => RemoveFailure::Step { step, errno },
         None => RemoveFailure::Malformed,
@@ -231,10 +219,7 @@ fn decode_record(record: [u8; super::RECORD_LEN]) -> RemoveFailure {
 /// The child: unshare, map, delete, report. Never returns.
 fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty<'_>) -> ! {
     let report = |wire: u32, errno: Errno| {
-        let mut record = [0u8; 8];
-        record[0..4].copy_from_slice(&wire.to_le_bytes());
-        record[4..8].copy_from_slice(&errno.raw_os_error().to_le_bytes());
-        let _ = rustix::io::write(gate, &record);
+        let _ = rustix::io::write(gate, &frame::encode_record(wire, errno.raw_os_error()));
     };
 
     // The gate is kept: the outcome record travels back on it.
@@ -260,7 +245,7 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
     .and_then(|parent| delete_tree(parent.as_fd(), leaf));
     match deleted {
         Ok(()) => {
-            let _ = rustix::io::write(gate, &[0u8; 8]);
+            let _ = rustix::io::write(gate, &frame::encode_record(frame::RECORD_DONE, 0));
             sys::exit_group(0)
         }
         Err(errno) => {
@@ -426,8 +411,8 @@ mod tests {
         }
     }
 
-    /// Zero is the success record, so no step may claim it; nothing past the
-    /// last step is a step either.
+    /// No step may claim `frame::RECORD_DONE`, the finished record's wire
+    /// value; zero and anything past the last step are not steps either.
     #[test]
     fn unknown_wire_values_are_rejected() {
         assert_eq!(RemoveStep::from_wire(0), None);

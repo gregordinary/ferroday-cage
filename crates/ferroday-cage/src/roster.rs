@@ -1,9 +1,10 @@
 //! Enums that are also a roster of themselves.
 //!
 //! Several enums here are a closed set a caller can be shown, parse a name
-//! against, or iterate: a capability keep-list, the script kinds an apk package
-//! can carry. Each needs the variants, a name per variant, sometimes a value
-//! per variant, and an `ALL` holding every one of them.
+//! against, or iterate: a capability keep-list, a resource limit, a Debian
+//! priority band, the script kinds an apk package can carry. Each needs the
+//! variants, a name per variant, sometimes a value per variant, and an `ALL`
+//! holding every one of them.
 //!
 //! Three of those four the compiler checks. A name or a value left out of its
 //! match is a non-exhaustive-patterns error. `ALL` is the one it cannot see: it

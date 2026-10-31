@@ -38,7 +38,7 @@
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::thread::{CapabilitiesSecureBits, CapabilitySet, CapabilitySets};
 use syscalls::Sysno;
@@ -46,10 +46,14 @@ use syscalls::Sysno;
 use super::HardeningPlan;
 use super::sys::errno;
 use crate::error::SetupStep;
-use crate::hardening::{fs_access_for_abi, net_access_for_abi};
+use crate::hardening::{fs_access, fs_access_for_abi, net_access_for_abi, scope_for_abi};
 
-/// A failed hardening step: the step and the errno.
-type Failure = (SetupStep, Errno);
+/// A failed hardening step: the step, the errno, and the 1-based position of
+/// the Landlock rule it was adding, zero when the step has no rule.
+///
+/// The position counts the filesystem rules first and the network rules after
+/// them, which is the order [`HardeningPlan::landlock_labels`] names them in.
+type Failure = (SetupStep, Errno, u32);
 
 /// Applies the hardening that precedes the identity switch: securebits,
 /// no-new-privileges, and Landlock.
@@ -75,21 +79,21 @@ pub(super) fn apply_pre_switch(plan: &HardeningPlan) -> Result<(), Failure> {
     // unlocked ones would go silently.
     if plan.set_securebits {
         let inherited = rustix::thread::capabilities_secure_bits()
-            .map_err(|errno| (SetupStep::SetSecurebits, errno))?;
+            .map_err(|errno| (SetupStep::SetSecurebits, errno, 0))?;
         rustix::thread::set_capabilities_secure_bits(
             inherited
                 | CapabilitiesSecureBits::NO_SETUID_FIXUP
                 | CapabilitiesSecureBits::NO_SETUID_FIXUP_LOCKED,
         )
-        .map_err(|errno| (SetupStep::SetSecurebits, errno))?;
+        .map_err(|errno| (SetupStep::SetSecurebits, errno, 0))?;
     }
 
     // No-new-privileges: required before Landlock enforcement and an
     // unprivileged seccomp filter, and desirable for a capability drop so a
     // set-user-ID file cannot regain privilege across the exec.
-    rustix::thread::set_no_new_privs(true).map_err(|errno| (SetupStep::SetNoNewPrivs, errno))?;
+    rustix::thread::set_no_new_privs(true).map_err(|errno| (SetupStep::SetNoNewPrivs, errno, 0))?;
 
-    if !plan.landlock.is_empty() || !plan.landlock_net.is_empty() {
+    if !plan.landlock.is_empty() || !plan.landlock_net.is_empty() || plan.landlock_scoped != 0 {
         apply_landlock(plan)?;
     }
 
@@ -109,14 +113,14 @@ pub(super) fn apply_post_switch(plan: &HardeningPlan) -> Result<(), Failure> {
     // same drop at the same privilege as always.
     if let Some(keep) = plan.keep_caps {
         drop_capabilities(CapabilitySet::from_bits_retain(keep))
-            .map_err(|errno| (SetupStep::DropCapabilities, errno))?;
+            .map_err(|errno| (SetupStep::DropCapabilities, errno, 0))?;
     }
 
     // Seccomp last: once installed the filter is active, so nothing but the
     // exec runs under it — the identity switch already happened outside its
     // governance.
     if let Some(program) = &plan.seccomp {
-        install_seccomp(program).map_err(|errno| (SetupStep::InstallSeccomp, errno))?;
+        install_seccomp(program).map_err(|errno| (SetupStep::InstallSeccomp, errno, 0))?;
     }
 
     Ok(())
@@ -192,19 +196,22 @@ const LANDLOCK_RULE_PATH_BENEATH: usize = 1;
 /// `LANDLOCK_RULE_NET_PORT`: a TCP-port rule.
 const LANDLOCK_RULE_NET_PORT: usize = 2;
 
-/// The kernel's `struct landlock_ruleset_attr`, through the ABI-4
-/// `handled_access_net` field.
+/// The kernel's `struct landlock_ruleset_attr`, through the ABI-6 `scoped`
+/// field.
 ///
-/// The kernel reads its own `sizeof` from the size passed alongside: an ABI-1
-/// through ABI-3 kernel expects only `handled_access_fs`, and accepts this
-/// larger struct because its trailing `handled_access_net` is zero there, the
-/// same forward-compatible extension the kernel uses across every Landlock
-/// version. Later fields (`scoped`, and the quiet-access masks) stay unmodeled
-/// and unread.
+/// The kernel reads its own `sizeof` from the size passed alongside, and
+/// accepts a larger struct from userspace as long as every byte past its own
+/// is zero: the forward-compatible extension it uses across every Landlock
+/// version. An ABI-1 through ABI-3 kernel expects only `handled_access_fs`,
+/// and an ABI-4 or ABI-5 kernel stops before `scoped`. Each field is masked to
+/// the running ABI before the call, so on those kernels the fields they do not
+/// know are zero. Later fields (the quiet-access masks) stay unmodeled and
+/// unread.
 #[repr(C)]
 struct LandlockRulesetAttr {
     handled_access_fs: u64,
     handled_access_net: u64,
+    scoped: u64,
 }
 
 /// The kernel's `struct landlock_path_beneath_attr`.
@@ -227,71 +234,92 @@ struct LandlockNetPortAttr {
 }
 
 // The layouts must match the kernel's, or a rule would be misissued.
-const _: () = assert!(size_of::<LandlockRulesetAttr>() == 16);
+const _: () = assert!(size_of::<LandlockRulesetAttr>() == 24);
 const _: () = assert!(size_of::<LandlockPathBeneathAttr>() >= 12);
 const _: () = assert!(size_of::<LandlockNetPortAttr>() == 16);
 
 /// Builds and enforces the Landlock ruleset over the frozen grants, filesystem
-/// and network alike. A single ruleset governs both access kinds; each rule's
-/// access is masked to the running kernel's ABI, and a rule that masks to
-/// nothing is skipped.
+/// and network alike, and the frozen scopes. A single ruleset governs every
+/// kind; each rule's access and the scopes are masked to the running kernel's
+/// ABI, and a rule that masks to nothing is skipped.
 fn apply_landlock(plan: &HardeningPlan) -> Result<(), Failure> {
     // Query the kernel's supported ABI. ENOSYS (or any error) here means the
     // Landlock LSM is unavailable; a requested restriction that cannot apply
     // is a setup failure, not a silent no-op.
-    let abi = landlock_abi().map_err(|errno| (SetupStep::LandlockCreateRuleset, errno))?;
+    let abi = landlock_abi().map_err(|errno| (SetupStep::LandlockCreateRuleset, errno, 0))?;
     let fs_mask = fs_access_for_abi(abi);
     let net_mask = net_access_for_abi(abi);
 
     let handled_fs = plan.landlock_handled & fs_mask;
     let handled_net = plan.landlock_net_handled & net_mask;
+    let scoped = plan.landlock_scoped & scope_for_abi(abi);
 
     // A kernel older than a requested right narrows it away best-effort. When
     // nothing modeled survives the mask, this kernel can enforce none of the
     // request and there is no ruleset to build — the same silent downgrade an
     // unsupported filesystem right receives. Filesystem grants keep their
-    // ABI-1 base rights, so an empty handled set arises only for a
-    // network-only request on a kernel below ABI 4.
+    // ABI-1 base rights, so an empty ruleset arises only for a request of
+    // network grants and scopes alone on a kernel too old for either.
     //
     // The two cases where that downgrade would leave the command genuinely
     // unconfined are refused at build time instead, before any fork: the
     // restriction fallback (`ensure_landlock_enforceable`) and a host-network
     // cage (`ensure_host_net_enforceable`). What reaches here is a cage whose
     // network namespace remains the boundary, which is why the drop is
-    // tolerated; `CageBuilder::landlock_net` states it for callers.
-    if handled_fs == 0 && handled_net == 0 {
+    // tolerated; `CageBuilder::landlock_net` states it for callers. A scope is
+    // additive in a sandbox and best-effort in a restriction, whose build drops it
+    // on a kernel that cannot enforce it.
+    if handled_fs == 0 && handled_net == 0 && scoped == 0 {
         return Ok(());
     }
 
     let attr = LandlockRulesetAttr {
         handled_access_fs: handled_fs,
         handled_access_net: handled_net,
+        scoped,
     };
     let ruleset =
-        create_ruleset(&attr).map_err(|errno| (SetupStep::LandlockCreateRuleset, errno))?;
+        create_ruleset(&attr).map_err(|errno| (SetupStep::LandlockCreateRuleset, errno, 0))?;
 
+    // The rules are numbered from one in the order they are added, filesystem
+    // rules first, which is the order the plan's labels name them in.
+    let mut position: u32 = 0;
     for rule in &plan.landlock {
-        let allowed = rule.access & fs_mask;
+        position = position.saturating_add(1);
+        let failed = |errno| (SetupStep::LandlockAddRule, errno, position);
+        let mut allowed = rule.access & fs_mask;
         if allowed == 0 {
             continue;
         }
         // Post-pivot the sandbox root is `/`, so the grant's absolute path
         // resolves within the sandbox. O_PATH opens the file or directory the
-        // rule is tied to; the kernel accepts either.
+        // rule is tied to, following a symbolic link to it.
         let target = rustix::fs::open(
             rule.path.as_c_str(),
             OFlags::PATH | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|errno| (SetupStep::LandlockAddRule, errno))?;
+        .map_err(failed)?;
+        // The kernel refuses a rule on anything but a directory that allows a
+        // right acting on a directory's entries: `READ` lowers to include
+        // listing one, and `WRITE` to creating and removing in one. Narrowed
+        // to the rights that act on the file itself, a grant on a file or a
+        // device node means what it says.
+        if !is_directory(target.as_fd()).map_err(failed)? {
+            allowed &= fs_access::FILE;
+            if allowed == 0 {
+                continue;
+            }
+        }
         let beneath = LandlockPathBeneathAttr {
             allowed_access: allowed,
             parent_fd: target.as_raw_fd(),
         };
-        add_rule(ruleset.as_fd(), &beneath).map_err(|errno| (SetupStep::LandlockAddRule, errno))?;
+        add_rule(ruleset.as_fd(), &beneath).map_err(failed)?;
     }
 
     for rule in &plan.landlock_net {
+        position = position.saturating_add(1);
         let allowed = rule.access & net_mask;
         if allowed == 0 {
             continue;
@@ -301,10 +329,19 @@ fn apply_landlock(plan: &HardeningPlan) -> Result<(), Failure> {
             port: u64::from(rule.port),
         };
         add_net_rule(ruleset.as_fd(), &net_port)
-            .map_err(|errno| (SetupStep::LandlockAddRule, errno))?;
+            .map_err(|errno| (SetupStep::LandlockAddRule, errno, position))?;
     }
 
-    restrict_self(ruleset.as_fd()).map_err(|errno| (SetupStep::LandlockRestrictSelf, errno))
+    restrict_self(ruleset.as_fd()).map_err(|errno| (SetupStep::LandlockRestrictSelf, errno, 0))
+}
+
+/// Whether `fd` refers to a directory.
+///
+/// `fstat` accepts an `O_PATH` descriptor, so the type is read from the very
+/// inode the rule will be tied to rather than by looking the path up again.
+fn is_directory(fd: BorrowedFd<'_>) -> Result<bool, Errno> {
+    let stat = rustix::fs::fstat(fd)?;
+    Ok(FileType::from_raw_mode(stat.st_mode) == FileType::Directory)
 }
 
 /// The supported Landlock ABI version, or `None` when the kernel offers no
@@ -331,8 +368,9 @@ fn landlock_abi() -> Result<i32, Errno> {
 
 /// Creates a Landlock ruleset from the attribute, returning its descriptor.
 fn create_ruleset(attr: &LandlockRulesetAttr) -> Result<OwnedFd, Errno> {
-    // SAFETY: the attr pointer and its size describe a valid ABI-1 ruleset
-    // attribute; the syscall returns a new owned descriptor on success.
+    // SAFETY: the attr pointer and its size describe a valid ruleset attribute,
+    // whose fields past the running ABI's are zero; the syscall returns a new
+    // owned descriptor on success.
     let fd = unsafe {
         syscalls::syscall!(
             Sysno::landlock_create_ruleset,

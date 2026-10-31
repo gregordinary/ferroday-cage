@@ -99,6 +99,9 @@ jobs:
           FERRODAY_CAGE_REQUIRE_TUN: '1'
           FERRODAY_CAGE_REQUIRE_LANDLOCK: '1'
           FERRODAY_CAGE_REQUIRE_SECCOMP: '1'
+          # FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE is not set: the scope tests
+          # need Landlock ABI 6 (Linux 6.12), which a hosted runner's kernel is
+          # not guaranteed to reach. Set it on a runner whose kernel does.
       - name: Test (serde without hardening)
         # A profile format built without the hardening layer must refuse a
         # profile that configures hardening; only this feature combination

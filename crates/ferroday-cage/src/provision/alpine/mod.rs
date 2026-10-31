@@ -1595,10 +1595,10 @@ fn preflight(alpine: &Alpine) -> Result<(), AlpineError> {
     // The identity posture is never quietly downgraded to the single-identity
     // form.
     if !matches!(alpine.identity_map, IdentityMap::Single)
-        && let Err(reason) = crate::idmap::resolve_default_chain(&alpine.identity_map)
+        && let Err(refusal) = crate::idmap::resolve_range_bundled(&alpine.identity_map)
     {
         return Err(AlpineError::Config {
-            reason: format!("the requested identity map is unavailable: {reason}"),
+            reason: refusal.to_string(),
         });
     }
     Ok(())

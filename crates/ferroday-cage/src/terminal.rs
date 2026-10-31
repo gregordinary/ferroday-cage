@@ -387,8 +387,7 @@ impl io::Write for Pty {
 pub(crate) fn allocate(terminal: &Terminal) -> Result<(OwnedFd, OwnedFd), Errno> {
     // Not `provision::containment::open_dir`: this opens one device node by an
     // absolute path, where that helper opens a directory contained in a tree.
-    #[expect(clippy::disallowed_methods)]
-    let primary = rustix::fs::openat2(
+    let primary = crate::mechanism::resolve::openat2(
         rustix::fs::CWD,
         c"/dev/ptmx",
         OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,

@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use crate::IdentityMap;
+use crate::error::ConfigError;
 use crate::idmap::{IdMapper, ResolvedMap};
 use crate::mechanism::ChildMap;
 
@@ -98,12 +99,8 @@ pub(super) fn compose_child_map<'a>(
 ) -> Result<ChildMapSource<'a>, String> {
     match map {
         IdentityMap::Single => {
-            let euid = rustix::process::geteuid().as_raw();
-            let egid = rustix::process::getegid().as_raw();
-            Ok(ChildMapSource::SelfMap {
-                uid_line: format!("0 {euid} 1\n").into_bytes(),
-                gid_line: format!("0 {egid} 1\n").into_bytes(),
-            })
+            let (uid_line, gid_line) = crate::idmap::single_identity_lines();
+            Ok(ChildMapSource::SelfMap { uid_line, gid_line })
         }
         IdentityMap::Ranges { .. } | IdentityMap::Subordinate => {
             resolve_delegate(map, mapper).map(ChildMapSource::Delegated)
@@ -116,24 +113,69 @@ pub(super) fn compose_child_map<'a>(
 ///
 /// The error is the reason no delegate could satisfy the request — for the
 /// bundled chain, every candidate's refusal in turn.
+///
+/// Both go through the step a build resolves its own range map with, so a
+/// malformed request, or a malformed map from the delegate, is refused here by
+/// name rather than reaching the kernel as an `EINVAL` at the write.
 fn resolve_delegate<'a>(
     map: &IdentityMap,
     mapper: Option<&'a dyn IdMapper>,
 ) -> Result<ResolvedDelegate<'a>, String> {
+    // The caller's own error already says no delegate could establish the map,
+    // so a refusal contributes its reason alone; an invalid map says so.
+    let reason = |err: ConfigError| match err {
+        ConfigError::IdentityMapUnavailable { reason, .. } => reason,
+        other => other.to_string(),
+    };
     match mapper {
-        Some(mapper) => {
-            let resolved = mapper.resolve(map).map_err(|err| err.to_string())?;
-            Ok(ResolvedDelegate {
-                source: Source::Caller(mapper),
-                map: resolved,
-            })
-        }
+        Some(mapper) => Ok(ResolvedDelegate {
+            source: Source::Caller(mapper),
+            map: crate::idmap::resolve_range(map, mapper).map_err(reason)?,
+        }),
         None => {
-            let (mapper, resolved) = crate::idmap::resolve_default_chain(map)?;
+            let (mapper, resolved) = crate::idmap::resolve_range_bundled(map).map_err(reason)?;
             Ok(ResolvedDelegate {
                 source: Source::Bundled(mapper),
                 map: resolved,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::idmap::{IdMapError, IdRange};
+
+    /// A delegate that would resolve any request to one valid map.
+    #[derive(Debug)]
+    struct Obliging;
+
+    impl IdMapper for Obliging {
+        fn resolve(&self, _request: &IdentityMap) -> Result<ResolvedMap, IdMapError> {
+            let root = IdRange {
+                inside: 0,
+                outside: 1000,
+                count: 1,
+            };
+            Ok(ResolvedMap::new(vec![root], vec![root]))
+        }
+
+        fn apply(&self, _pid: u32, _map: &ResolvedMap) -> Result<(), IdMapError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_provisioning_child_map_is_validated_as_a_build_is() {
+        // An export, a copy in, and a removal compose their map here, and a
+        // malformed request is refused by name before a delegate is asked,
+        // rather than reaching the kernel as an EINVAL at the write.
+        let malformed = IdentityMap::ranges(Vec::new(), Vec::new());
+        let reason = match compose_child_map(&malformed, Some(&Obliging)) {
+            Err(reason) => reason,
+            Ok(_) => panic!("a malformed request is refused"),
+        };
+        assert!(reason.contains("the identity map is invalid"), "{reason}");
     }
 }

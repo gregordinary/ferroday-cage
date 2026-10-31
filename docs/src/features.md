@@ -1,9 +1,9 @@
 # Cargo features
 
 The crate has **no default features**. A bare dependency gives the sandbox
-itself — namespaces, mounts, the root swap, identity maps, the process model,
-output streaming, and resource limits — and it is self-contained: pure Rust
-throughout, resting on the kernel alone.
+itself: namespaces, mounts, the root swap, identity maps, the process model,
+output streaming, and resource limits. It is self-contained, pure Rust
+throughout and resting on the kernel alone.
 
 Everything beyond that is opt-in, so a consumer that wants a sandbox and
 nothing else pays for a sandbox and nothing else.
@@ -29,8 +29,12 @@ cargo add ferroday-cage --features serde,tarball,hardening
 | [`netstack`](userspace-networking.md) | A native userspace TCP/IP stack giving the isolated network outbound IPv4 and IPv6, terminated in-process | `smoltcp` |
 | [`subid`](identity-maps.md) | The subordinate-id delegate: uid/gid range maps established through the shadow suite's `newuidmap`/`newgidmap` | nothing (see below) |
 
-Every dependency above is pure Rust with C backends and libc off, so enabling
-any combination keeps the build self-contained.
+Every dependency above is pure Rust, with any C backend it offers left off, so
+no combination needs a C compiler. Three link the `libc` crate's bindings to the
+C library the target already has. They are `seccompiler` under `hardening`, and
+the random number crates the signature checks of `debian`, `alpine`, and
+`gentoo` draw on. All three run in the calling process, and none is reached from
+the sandbox stages after the fork.
 
 `subid` is the one feature that changes that property in a different way: it
 adds no dependency, but it is the only feature under which the library executes

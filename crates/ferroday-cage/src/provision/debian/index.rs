@@ -17,6 +17,7 @@ use super::version::{self, Constraint};
 use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
 use crate::provision::fetch::percent_decode;
+use crate::roster::roster_enum;
 
 /// One package's metadata from a `Packages` index.
 #[derive(Debug, Clone)]
@@ -95,54 +96,48 @@ pub(crate) struct Provided {
     pub version: Option<String>,
 }
 
-/// A Debian package priority, the `Priority:` field of the archive's control
-/// data.
-///
-/// The archive assigns every package a priority. A bootstrap seeds its base
-/// system from the most essential bands, and
-/// [`base_priority`](super::DebianBuilder::base_priority) selects the least
-/// essential band the seed still reaches. The variants are ordered from most to
-/// least essential, so a smaller value is the higher priority: a floor of
-/// [`Important`](Self::Important) admits [`Required`](Self::Required) and
-/// [`Important`](Self::Important) packages but not [`Standard`](Self::Standard)
-/// ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub enum Priority {
-    /// Packages without which the system does not function or cannot be
-    /// installed. The base of every bootstrap.
-    Required,
-    /// Packages present on all but the most minimal systems, expected to be
-    /// installed.
-    Important,
-    /// The result of a standard, reasonably small character-mode install.
-    Standard,
-    /// Packages outside the base selection, the archive's bulk.
-    Optional,
-    /// A deprecated band the archive folds into [`Optional`](Self::Optional);
-    /// recognized for completeness.
-    Extra,
-}
+roster_enum! {
+    /// A Debian package priority, the `Priority:` field of the archive's control
+    /// data.
+    ///
+    /// The archive assigns every package a priority. A bootstrap seeds its base
+    /// system from the most essential bands, and
+    /// [`base_priority`](super::DebianBuilder::base_priority) selects the least
+    /// essential band the seed still reaches. The variants are ordered from most to
+    /// least essential, so a smaller value is the higher priority: a floor of
+    /// [`Important`](Self::Important) admits [`Required`](Self::Required) and
+    /// [`Important`](Self::Important) packages but not [`Standard`](Self::Standard)
+    /// ones.
+    ///
+    /// [`ALL`](Self::ALL) lists every band, most essential first.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[non_exhaustive]
+    pub enum Priority {
+        /// The archive's own spelling of the band, which
+        /// [`FromStr`](std::str::FromStr) reads back.
+        fn as_str;
 
-/// The priority names, in the order the variants declare them: the archive's
-/// own spelling of each band.
-const PRIORITY_NAMES: [(&str, Priority); 5] = [
-    ("required", Priority::Required),
-    ("important", Priority::Important),
-    ("standard", Priority::Standard),
-    ("optional", Priority::Optional),
-    ("extra", Priority::Extra),
-];
+        /// Packages without which the system does not function or cannot be
+        /// installed. The base of every bootstrap.
+        Required => "required",
+        /// Packages present on all but the most minimal systems, expected to be
+        /// installed.
+        Important => "important",
+        /// The result of a standard, reasonably small character-mode install.
+        Standard => "standard",
+        /// Packages outside the base selection, the archive's bulk.
+        Optional => "optional",
+        /// A deprecated band the archive folds into [`Optional`](Self::Optional);
+        /// recognized for completeness.
+        Extra => "extra",
+    }
+}
 
 impl fmt::Display for Priority {
     /// Writes the archive's own spelling, which is what
     /// [`FromStr`](std::str::FromStr) reads back.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (name, _) = PRIORITY_NAMES
-            .iter()
-            .find(|(_, priority)| priority == self)
-            .expect("every priority has a name");
-        f.write_str(name)
+        f.write_str(self.as_str())
     }
 }
 
@@ -155,10 +150,10 @@ impl std::str::FromStr for Priority {
     /// priority on a command line or in a profile writes whatever it likes, and
     /// one name means one band whichever way it is spelled.
     fn from_str(value: &str) -> Result<Priority, ParsePriorityError> {
-        PRIORITY_NAMES
+        Priority::ALL
             .iter()
-            .find(|(name, _)| value.eq_ignore_ascii_case(name))
-            .map(|(_, priority)| *priority)
+            .copied()
+            .find(|priority| value.eq_ignore_ascii_case(priority.as_str()))
             .ok_or_else(|| ParsePriorityError {
                 text: value.to_string(),
             })
@@ -183,11 +178,14 @@ impl ParsePriorityError {
 
 impl fmt::Display for ParsePriorityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "unknown priority {:?}: expected required, important, standard, optional, or extra",
-            self.text,
-        )
+        write!(f, "unknown priority {:?}: expected one of ", self.text)?;
+        for (index, priority) in Priority::ALL.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(priority.as_str())?;
+        }
+        Ok(())
     }
 }
 
@@ -957,7 +955,8 @@ Priority: standard
         assert_eq!("STANDARD".parse(), Ok(Priority::Standard));
         assert_eq!("optional".parse(), Ok(Priority::Optional));
         assert_eq!("extra".parse(), Ok(Priority::Extra));
-        for (name, priority) in PRIORITY_NAMES {
+        for &priority in Priority::ALL {
+            let name = priority.as_str();
             assert_eq!(priority.to_string(), name);
             assert_eq!(name.parse(), Ok(priority));
         }

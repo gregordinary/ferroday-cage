@@ -57,9 +57,9 @@ use ferroday_cage::provision::debian::{Priority, Repository};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ExitStatus, FsAccess, IdRange, Identity,
-    IdentityMap, Limit, Mount, NetAccess, NetStack, Network, Overlay, RawMount, Resource,
-    RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen,
-    SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
+    IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, Network, Overlay, RawMount,
+    Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg,
+    SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
 };
 use serde::Deserialize as _;
 
@@ -1716,6 +1716,23 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--landlock-scope",
+        section: Section::Hardening,
+        placeholder: "LIST",
+        help: &[
+            "Deny the command signals to, and abstract-socket",
+            "connections with, processes outside its Landlock",
+            "domain: LIST is comma-separated, from signal and",
+            "abstract-unix-socket, or empty for none. Default: none,",
+            "or both with --restrict. Needs Landlock ABI 6",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.landlock_scope = Some(parse_scopes(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--seccomp",
         section: Section::Hardening,
         placeholder: "curated",
@@ -1795,6 +1812,25 @@ const FLAGS: &[Flag] = &[
             options
                 .seccomp_deny_rules
                 .push(parse_seccomp_rule(flag, &value)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--seccomp-errno",
+        section: Section::Hardening,
+        placeholder: "SYSCALL=ERRNO",
+        help: &[
+            "Answer every call of SYSCALL with ERRNO, by name or",
+            "number, ahead of the other seccomp flags (repeatable;",
+            "e.g. clone3=ENOSYS, which the C library answers by",
+            "falling back to clone)",
+        ],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            options
+                .seccomp_errno
+                .push(parse_seccomp_errno(flag, &value)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -2023,11 +2059,12 @@ Each toggle has a counterpart to override a profile in the other direction:
 --managed-mounts, --base-env, --stop-with-caller, and --no-path-lookup.
 A profile's [hardening] table composes with the hardening flags:
 --landlock-ro, --landlock-rw, --landlock-bind, and --landlock-connect add
-grants to it, while the seccomp flags, --drop-caps, and --keep-caps replace
-its seccomp policy or capability posture. The seccomp flags are mutually
-constrained: --seccomp curated stands alone, and an allow side
-(--seccomp-allow, --seccomp-allow-rule) cannot be mixed with a deny side
-(--seccomp-deny, --seccomp-deny-rule).
+grants to it, while --landlock-scope, the seccomp flags, --drop-caps, and
+--keep-caps replace its scopes, seccomp policy, or capability posture. The
+seccomp flags are mutually constrained: --seccomp curated stands alone, and
+an allow side (--seccomp-allow, --seccomp-allow-rule) cannot be mixed with a
+deny side (--seccomp-deny, --seccomp-deny-rule). --seccomp-errno joins either
+side, or alone denies only what it names.
 
 The command path is interpreted inside the sandbox (with --restrict, on the
 host) and must be absolute; a command given on the command line replaces one
@@ -2198,6 +2235,7 @@ struct Options {
     stop_with_caller: Option<bool>,
     landlock: Vec<(PathBuf, bool)>,
     landlock_net: Vec<(u16, NetAccess)>,
+    landlock_scope: Option<Vec<LandlockScope>>,
     seccomp: Option<SeccompPolicy>,
     /// The seccomp flags as they were given, reconciled into
     /// [`seccomp`](Self::seccomp) once the whole command line has been read.
@@ -2212,6 +2250,7 @@ struct Options {
     seccomp_deny: Vec<i64>,
     seccomp_allow_rules: Vec<(i64, Vec<SeccompArg>)>,
     seccomp_deny_rules: Vec<(i64, Vec<SeccompArg>)>,
+    seccomp_errno: Vec<(i64, u16)>,
     caps: Option<CapsChoice>,
     restrict: bool,
     netstack: bool,
@@ -2726,12 +2765,14 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         stop_with_caller: None,
         landlock: Vec::new(),
         landlock_net: Vec::new(),
+        landlock_scope: None,
         seccomp: None,
         seccomp_curated: false,
         seccomp_allow: Vec::new(),
         seccomp_deny: Vec::new(),
         seccomp_allow_rules: Vec::new(),
         seccomp_deny_rules: Vec::new(),
+        seccomp_errno: Vec::new(),
         caps: None,
         restrict: false,
         netstack: false,
@@ -2783,6 +2824,10 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         std::mem::take(&mut options.seccomp_deny),
         std::mem::take(&mut options.seccomp_allow_rules),
         std::mem::take(&mut options.seccomp_deny_rules),
+    )?;
+    options.seccomp = answer_seccomp_errnos(
+        options.seccomp.take(),
+        std::mem::take(&mut options.seccomp_errno),
     )?;
 
     // --kill-after is the grace period before the SIGKILL that follows a
@@ -4283,6 +4328,70 @@ fn assemble_seccomp(
     Ok(Some(SeccompPolicy::Rules(policy)))
 }
 
+/// Answers each syscall in `errnos` with its errno, on the policy the other
+/// seccomp flags assembled.
+///
+/// An errno joins an allow side or a deny side alike, and with neither it
+/// makes a deny side of its own, refusing only what it names. The curated
+/// posture is a whole policy and takes none.
+fn answer_seccomp_errnos(
+    policy: Option<SeccompPolicy>,
+    errnos: Vec<(i64, u16)>,
+) -> Result<Option<SeccompPolicy>, String> {
+    if errnos.is_empty() {
+        return Ok(policy);
+    }
+    let rules = match policy {
+        None => SeccompRules::denying([]),
+        Some(SeccompPolicy::Rules(rules)) => rules,
+        Some(_) => {
+            return Err("--seccomp curated cannot be combined with --seccomp-errno".to_string());
+        }
+    };
+    let rules = errnos.into_iter().fold(rules, |rules, (syscall, errno)| {
+        rules.errno_for(syscall, errno)
+    });
+    Ok(Some(SeccompPolicy::Rules(rules)))
+}
+
+/// Parses one `--seccomp-errno` value, `SYSCALL=ERRNO`, into the syscall's
+/// number and the errno's.
+///
+/// The errno is a name such as `ENOSYS`, in any letter case, or a number. A
+/// name resolves through the `syscalls` crate's errno table, the one a
+/// profile's `errno` table resolves through, as [`resolve_syscall_name`] does
+/// for the syscall.
+fn parse_seccomp_errno(flag: &str, value: &str) -> Result<(i64, u16), String> {
+    let (name, errno) = value
+        .split_once('=')
+        .ok_or_else(|| format!("{flag} expects SYSCALL=ERRNO, not {value:?}"))?;
+    let syscall = resolve_syscall_name(flag, name.trim())?;
+    let errno = errno.trim();
+    let number = match errno.parse::<u16>() {
+        Ok(number) => Some(number),
+        Err(_) => {
+            let wanted = errno.to_ascii_uppercase();
+            (1..4096)
+                .map(syscalls::Errno::new)
+                .find(|candidate| candidate.name() == Some(wanted.as_str()))
+                .and_then(|found| u16::try_from(found.into_raw()).ok())
+        }
+    };
+    let number = number.ok_or_else(|| format!("{flag}: unknown errno {errno:?}"))?;
+    Ok((syscall, number))
+}
+
+/// Parses a comma-separated `--landlock-scope` list into scopes; an empty
+/// list is no scope at all.
+fn parse_scopes(value: &str) -> Result<Vec<LandlockScope>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.parse::<LandlockScope>().map_err(|err| err.to_string()))
+        .collect()
+}
+
 /// Parses a port number: a `--landlock-bind` or `--landlock-connect` grant's
 /// TCP port, a `--netstack-host-port` mapping's TCP and UDP port, or the guest
 /// side of a `--netstack-publish`.
@@ -4741,6 +4850,9 @@ fn run(options: Options) -> ExitCode {
     for (port, access) in options.landlock_net {
         builder = builder.landlock_net(access, port);
     }
+    if let Some(scopes) = options.landlock_scope {
+        builder = builder.landlock_scope(scopes);
+    }
     if let Some(policy) = options.seccomp {
         builder = builder.seccomp(policy);
     }
@@ -5139,6 +5251,9 @@ fn run_restricted(options: Options) -> ExitCode {
     }
     for (port, access) in options.landlock_net {
         builder = builder.landlock_net(access, port);
+    }
+    if let Some(scopes) = options.landlock_scope {
+        builder = builder.landlock_scope(scopes);
     }
     if let Some(policy) = options.seccomp {
         builder = builder.seccomp(policy);
@@ -7744,6 +7859,85 @@ mod tests {
             }
             _ => panic!("expected a run invocation"),
         }
+    }
+
+    #[test]
+    fn seccomp_errnos_join_a_policy_or_make_one() {
+        // By name in any case, or by number.
+        assert_eq!(
+            parse_seccomp_errno("--seccomp-errno", "clone3=enosys"),
+            Ok((sysno("clone3"), 38)),
+        );
+        assert_eq!(
+            parse_seccomp_errno("--seccomp-errno", "clone3=38"),
+            Ok((sysno("clone3"), 38)),
+        );
+        for bad in ["clone3", "clone3=ENOPE", "nosuchcall=ENOSYS"] {
+            assert!(
+                parse_seccomp_errno("--seccomp-errno", bad).is_err(),
+                "{bad}"
+            );
+        }
+
+        // Alone, an errno makes a deny side of its own; beside a side, it joins
+        // it; beside the curated posture, it is refused.
+        let alone = run_options(&[
+            "--restrict",
+            "--seccomp-errno",
+            "clone3=ENOSYS",
+            "/bin/true",
+        ]);
+        assert!(matches!(alone.seccomp, Some(SeccompPolicy::Rules(_))));
+        let joined = run_options(&[
+            "--rootfs",
+            "/srv/rootfs",
+            "--seccomp-allow",
+            "read",
+            "--seccomp-errno",
+            "clone3=ENOSYS",
+            "/bin/true",
+        ]);
+        assert!(matches!(joined.seccomp, Some(SeccompPolicy::Rules(_))));
+        assert!(
+            parse_error(&[
+                "--restrict",
+                "--seccomp",
+                "curated",
+                "--seccomp-errno",
+                "clone3=ENOSYS",
+                "/bin/true"
+            ])
+            .contains("--seccomp-errno")
+        );
+    }
+
+    #[test]
+    fn landlock_scopes_parse_as_a_list() {
+        let options = run_options(&[
+            "--rootfs",
+            "/srv/rootfs",
+            "--landlock-scope",
+            "signal,abstract-unix-socket",
+            "/bin/true",
+        ]);
+        assert_eq!(
+            options.landlock_scope,
+            Some(vec![
+                LandlockScope::Signal,
+                LandlockScope::AbstractUnixSocket
+            ]),
+        );
+        // An empty list is no scope, which a restriction needs to opt out.
+        let options = run_options(&[
+            "--restrict",
+            "--seccomp",
+            "curated",
+            "--landlock-scope",
+            "",
+            "/bin/true",
+        ]);
+        assert_eq!(options.landlock_scope, Some(Vec::new()));
+        assert!(parse_error(&["--landlock-scope", "signals", "/bin/true"]).contains("signals"));
     }
 
     /// Parses a command line, expecting a run invocation.

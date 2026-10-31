@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use rustix::io::Errno;
 use rustix::mount::{self, MountFlags, MountPropagationFlags};
-use rustix::process::{self, WaitStatus};
+use rustix::process::WaitStatus;
 use rustix::thread::{self, UnshareFlags};
 
 use super::sys::{self, Fork};
@@ -58,11 +58,9 @@ const EXIT_SETUP_FAILED: i32 = 2;
 /// there is no pivot here, only the mount, undone when the child's mount
 /// namespace is torn down at exit.
 pub(crate) fn probe_overlay_mount(merged: &CStr, options: &CStr) -> OverlayProbe {
-    // The single-identity map lines, formatted before the fork where geteuid
-    // still answers with the caller's id — the same constraint the launch
-    // marshals its map lines under.
-    let uid_line = format!("0 {} 1\n", process::geteuid().as_raw()).into_bytes();
-    let gid_line = format!("0 {} 1\n", process::getegid().as_raw()).into_bytes();
+    // The single-identity map lines, formatted before the fork as the launch
+    // formats its own.
+    let (uid_line, gid_line) = crate::idmap::single_identity_lines();
 
     // SAFETY: the child branch runs only raw syscalls over the data frozen
     // above — no allocation, no locking, no libc — and never returns: it

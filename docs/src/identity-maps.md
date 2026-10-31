@@ -111,7 +111,9 @@ consults them in order when none is configured:
   its own user namespace: running as root, or running inside another
   range-mapped namespace. The second case matters more than it may appear —
   a cage nested inside a range-mapped cage, or inside a rootless container,
-  establishes its range map this way, entirely on its own.
+  establishes its range map this way, entirely on its own. A map whose outside
+  ids include uid 0 also needs `CAP_SETFCAP`, which Linux 5.12 added to the
+  kernel's rule, and `resolve` refuses one the caller cannot write.
 - **`SubidMapper`**, behind the `subid` feature, executes the shadow suite's
   privileged `newuidmap` and `newgidmap` helpers — the standard
   subordinate-id mechanism every rootless container runtime uses, and the
@@ -191,11 +193,18 @@ package differs by distribution:
 The helpers are not always setuid: several distributions grant them file
 capabilities instead, which works equally well, and
 [`host::range_map_blocker`] probes for a *working* helper rather than a mode
-bit. The probe names whichever condition blocks a range map — a missing
-helper (commonly a container runtime installed without its recommended
-packages), a helper stripped of its privilege, a file-capability helper too
-old to map uid 0 (shadow before 4.11.1), a symlinked subordinate file, or an
-absent allocation — with the remedy in the message. `Subordinate` on a build
+bit. The probe names whichever condition blocks a range map, with the remedy
+in the message:
+
+- A caller running under `no_new_privs`, under which no helper gains its
+  privilege.
+- A missing helper, commonly a container runtime installed without its
+  recommended packages.
+- A helper stripped of its privilege, or a file-capability helper too old to
+  map uid 0 (shadow before 4.11.1).
+- A symlinked subordinate file, or an absent allocation.
+
+ `Subordinate` on a build
 without the `subid` feature is refused the same way, at `build` for code and
 at load time for a profile.
 

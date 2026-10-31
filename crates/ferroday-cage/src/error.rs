@@ -378,13 +378,12 @@ pub enum ConfigError {
     RestrictionEmpty,
     /// A restriction's Landlock grants cannot be enforced on this host.
     ///
-    /// A restriction is confined only by what the running kernel enforces.
-    /// When its Landlock grants all fall outside the supported Landlock ABI —
-    /// a network grant on a kernel below ABI 4 — or the Landlock LSM is
-    /// absent, no ruleset applies and the command would run unconfined, so the
-    /// build is refused rather than silently dropping the requested
-    /// confinement. A cage in the same case keeps its namespace isolation, so
-    /// this is specific to the restriction fallback.
+    /// A restriction is confined only by what the running kernel enforces, so
+    /// its build refuses a grant the kernel would drop rather than launch
+    /// without it. That is every Landlock grant where the Landlock LSM is
+    /// absent, and every network grant on a kernel below ABI 4, whatever
+    /// filesystem grants accompany it. A sandbox in the same case keeps its
+    /// namespace isolation, so this is specific to the restriction fallback.
     #[non_exhaustive]
     RestrictionLandlockUnenforceable {
         /// The kernel's supported Landlock ABI, or `None` when the LSM is
@@ -743,8 +742,8 @@ impl fmt::Display for ConfigError {
             ConfigError::RestrictionLandlockUnenforceable { abi } => match abi {
                 Some(abi) => write!(
                     f,
-                    "the restriction's Landlock grants fall outside the kernel's supported \
-                     Landlock ABI ({abi}); a network grant needs ABI 4"
+                    "the restriction's Landlock network grant needs Landlock ABI 4, and the \
+                     kernel supports ABI {abi}"
                 ),
                 None => f.write_str(
                     "the restriction requests Landlock confinement, but the kernel offers no \
@@ -925,7 +924,11 @@ pub enum Error {
     /// Distinct from [`UsernsUnavailable`](Self::UsernsUnavailable), which is a
     /// host that permits no user namespace at all: here the sandbox was built
     /// and only the second namespace was refused.
-    NestedUsernsBudgetExhausted,
+    #[non_exhaustive]
+    NestedUsernsBudgetExhausted {
+        /// The error the kernel returned for the nested namespace, `ENOSPC`.
+        source: io::Error,
+    },
     /// The calling user's kernel key quota is exhausted, so the sandbox could
     /// not be given a session keyring of its own.
     ///
@@ -936,7 +939,11 @@ pub enum Error {
     /// `kernel.keys.maxbytes` bytes per user, 200 and 20000 by default, shared
     /// with every other key the user holds. A host running that many sandboxes
     /// at once as one user reports this rather than a bare `EDQUOT`.
-    KeyQuotaExhausted,
+    #[non_exhaustive]
+    KeyQuotaExhausted {
+        /// The error the kernel returned for the new keyring, `EDQUOT`.
+        source: io::Error,
+    },
     /// A sandbox setup step failed in the child process.
     #[non_exhaustive]
     Setup {
@@ -1013,7 +1020,12 @@ pub enum Error {
     /// [`Setup`](Self::Setup) because it is the one allocation failure that says
     /// nothing is wrong with the request: the same launch succeeds once something
     /// releases a terminal.
-    TerminalsExhausted,
+    #[non_exhaustive]
+    TerminalsExhausted {
+        /// The error the sandbox's `devpts` instance returned for the
+        /// multiplexer, `ENOSPC`.
+        source: io::Error,
+    },
     /// A launch would have handed the command a directory as one of its standard
     /// streams, and refused before creating anything.
     ///
@@ -1109,13 +1121,13 @@ impl fmt::Display for Error {
                  policy may be blocking unprivileged user namespaces",
                 source,
             ),
-            Error::NestedUsernsBudgetExhausted => f.write_str(
+            Error::NestedUsernsBudgetExhausted { .. } => f.write_str(
                 "the sandbox could not enter its nested user namespace: the host's user \
                  namespace budget is exhausted. Every launch holds two user namespaces; \
                  raise user.max_user_namespaces, or reduce the number of namespaces already \
                  live",
             ),
-            Error::KeyQuotaExhausted => f.write_str(
+            Error::KeyQuotaExhausted { .. } => f.write_str(
                 "the sandbox could not be given a session keyring of its own: the calling \
                  user's kernel key quota is exhausted. Every running sandbox holds one keyring; \
                  raise kernel.keys.maxkeys and kernel.keys.maxbytes, or run fewer sandboxes \
@@ -1153,7 +1165,7 @@ impl fmt::Display for Error {
             Error::Terminal { source } => {
                 write!(f, "a pseudoterminal operation failed: {}", source,)
             }
-            Error::TerminalsExhausted => f.write_str(
+            Error::TerminalsExhausted { .. } => f.write_str(
                 "the host has no free pseudoterminal to allocate; /proc/sys/kernel/pty/max \
                  states the ceiling, less /proc/sys/kernel/pty/reserve for a sandbox's own",
             ),
@@ -1170,24 +1182,25 @@ impl std::error::Error for Error {
     /// The failure underneath, where there is one.
     ///
     /// Every OS failure this type carries is an [`io::Error`], so every one of
-    /// them is returned here. The variants that answer `None` carry nothing:
-    /// [`NestedUsernsBudgetExhausted`](Self::NestedUsernsBudgetExhausted),
-    /// [`KeyQuotaExhausted`](Self::KeyQuotaExhausted),
-    /// [`SupervisorLost`](Self::SupervisorLost),
-    /// [`TerminalsExhausted`](Self::TerminalsExhausted), and
-    /// [`StreamIsDirectory`](Self::StreamIsDirectory) are conditions the
-    /// library recognized rather than syscalls that failed.
+    /// them is returned here, including the syscall a recognized exhaustion
+    /// came from. The two variants that answer `None` carry nothing, since no
+    /// syscall failed: [`SupervisorLost`](Self::SupervisorLost) is an absence
+    /// the library noticed, and [`StreamIsDirectory`](Self::StreamIsDirectory)
+    /// a refusal it made before it made any.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Config(err) => Some(err),
             Error::IdentityMap(err) => Some(err),
             Error::UsernsUnavailable { source, .. }
+            | Error::NestedUsernsBudgetExhausted { source }
+            | Error::KeyQuotaExhausted { source }
             | Error::Setup { source, .. }
             | Error::Spawn { source }
             | Error::Wait { source }
             | Error::Signal { source }
-            | Error::Terminal { source } => Some(source),
-            _ => None,
+            | Error::Terminal { source }
+            | Error::TerminalsExhausted { source } => Some(source),
+            Error::SupervisorLost | Error::StreamIsDirectory { .. } => None,
         }
     }
 }

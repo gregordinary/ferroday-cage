@@ -53,6 +53,22 @@ pub(crate) fn write_full(fd: BorrowedFd<'_>, data: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Writes `data` in one `write`, for a file that takes its content whole or not
+/// at all, retrying `EINTR`.
+///
+/// An identity-map file is one: the kernel parses the map from a single write
+/// and refuses a second, so the partial progress [`write_full`] would resume
+/// from cannot exist. A write that reports fewer bytes than `data` holds is
+/// therefore not an errno the kernel gave, and `EMSGSIZE` is the one that says
+/// what happened: the write did not carry the whole content. `EIO` would send a
+/// reader looking for a device fault.
+pub(crate) fn write_whole(fd: BorrowedFd<'_>, data: &[u8]) -> Result<(), Errno> {
+    match retry_on_intr!(rustix::io::write(fd, data))? {
+        written if written == data.len() => Ok(()),
+        _ => Err(Errno::MSGSIZE),
+    }
+}
+
 /// Fills `buf`, retrying `EINTR`, and treats end of input as a truncated frame.
 ///
 /// The peer committed to the bytes when it wrote the frame that declared them,
@@ -82,6 +98,55 @@ pub(crate) fn read_full_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<boo
         }
     }
     Ok(true)
+}
+
+/// The length of a helper child's outcome record: a step's wire value then an
+/// errno, both little-endian.
+///
+/// The copy-in, export, and removal children each report how their work ended
+/// in one. The launch stages' own report carries a detail index besides, and
+/// is a record of its own.
+pub(crate) const RECORD_LEN: usize = 8;
+
+/// The wire value a record carries for a child that finished: above every
+/// step's, which [`wire_enum`](crate::wire::wire_enum) numbers from zero
+/// upward and so never reaches it.
+pub(crate) const RECORD_DONE: u32 = u32::MAX;
+
+/// Encodes an outcome record: `wire`, the failed step's wire value or
+/// [`RECORD_DONE`], then `errno`.
+pub(crate) fn encode_record(wire: u32, errno: i32) -> [u8; RECORD_LEN] {
+    let mut record = [0u8; RECORD_LEN];
+    record[0..4].copy_from_slice(&wire.to_le_bytes());
+    record[4..8].copy_from_slice(&errno.to_le_bytes());
+    record
+}
+
+/// Decodes an outcome record into the wire value and the errno it carries.
+///
+/// The wire value is the caller's to name a step from, since only the caller
+/// knows which helper's steps it numbers.
+pub(crate) fn decode_record(record: [u8; RECORD_LEN]) -> (u32, i32) {
+    let [w0, w1, w2, w3, e0, e1, e2, e3] = record;
+    (
+        u32::from_le_bytes([w0, w1, w2, w3]),
+        i32::from_le_bytes([e0, e1, e2, e3]),
+    )
+}
+
+/// Reads one outcome record from a helper child's seqpacket gate, retrying
+/// `EINTR`.
+///
+/// One read is one message on a seqpacket, so a record arrives whole or not at
+/// all, and `None` is a message of any other length, end of input included:
+/// what a child that exited without reporting leaves behind. A short message is
+/// delivered whole, so reading it into the buffer and decoding would name a
+/// step from the zeros after it. A reader that filled the buffer across reads
+/// would instead join two messages into one record.
+pub(crate) fn read_record(gate: BorrowedFd<'_>) -> Result<Option<[u8; RECORD_LEN]>, Errno> {
+    let mut record = [0u8; RECORD_LEN];
+    let received = retry_on_intr!(rustix::io::read(gate, &mut record))?;
+    Ok((received == RECORD_LEN).then_some(record))
 }
 
 /// Writes a `u16` length prefix and the bytes it counts.

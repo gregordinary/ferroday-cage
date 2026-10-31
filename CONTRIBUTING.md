@@ -64,6 +64,7 @@ CI asserts the security-property suites actually ran:
 | `FERRODAY_CAGE_REQUIRE_SUBID` | No delegate can establish a range map |
 | `FERRODAY_CAGE_REQUIRE_TUN` | `/dev/net/tun` unavailable |
 | `FERRODAY_CAGE_REQUIRE_LANDLOCK` | The kernel offers no Landlock LSM |
+| `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE` | The kernel's Landlock ABI predates scopes (ABI 6, Linux 6.12) |
 | `FERRODAY_CAGE_REQUIRE_SECCOMP` | The kernel offers no seccomp |
 | `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` | A network suite was not opted into |
 

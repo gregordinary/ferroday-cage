@@ -7,14 +7,22 @@
 //! sweep — each with its invariant documented at the call site, and
 //! everything after the fork runs in a child process under the constraints
 //! documented in [`child`].
-//! Every syscall is issued with inline assembly, through rustix's `linux_raw`
-//! backend or, for the calls rustix keeps to its runtime module and those it
-//! does not wrap, the `syscalls` crate: [`sys`] holds the process-level ones.
-//! Neither touches the libc `errno` slot, the allocator, or a lock, which is
-//! what keeps the post-fork window async-signal-safe. rustix selects that
-//! backend by target and build configuration, not by the mere fact of
-//! depending on rustix, so a compile-time guard (below) fails the build on any
-//! configuration where rustix would fall back to its libc backend instead.
+//! Every syscall the stages make themselves is issued with inline assembly,
+//! through rustix's `linux_raw` backend or, for the calls rustix keeps to its
+//! runtime module and those it does not wrap, the `syscalls` crate: [`sys`]
+//! holds the process-level ones. Neither touches the libc `errno` slot, the
+//! allocator, or a lock, which is what keeps the post-fork window
+//! async-signal-safe. rustix selects that backend by target and build
+//! configuration, not by the mere fact of depending on rustix, so a
+//! compile-time guard (below) fails the build on any configuration where rustix
+//! would fall back to its libc backend instead.
+//!
+//! One libc call remains, and it is the standard library's rather than the
+//! stages': dropping an [`OwnedFd`] closes it through libc's `close`, which a
+//! debug build precedes with an `fcntl` checking that the descriptor is open.
+//! Both are async-signal-safe wrappers of a single syscall. Neither allocates
+//! or takes a lock, and the `errno` either may write belongs to the one thread
+//! the copy holds.
 //!
 //! A launch forks a short-lived stage that creates the namespaces and forks
 //! the sandbox's long-lived processes (see [`child`] for the full process
@@ -87,6 +95,7 @@ pub(crate) mod frame;
 mod harden;
 mod overlay;
 mod remove;
+pub(crate) mod resolve;
 pub(crate) mod sys;
 
 #[cfg(feature = "hardening")]
@@ -642,6 +651,16 @@ pub(crate) struct HardeningPlan {
     /// set, masked to the kernel ABI in the child. Zero when no network grant
     /// applies.
     pub(crate) landlock_net_handled: u64,
+    /// The `LANDLOCK_SCOPE_*` flags the ruleset scopes, masked to the kernel
+    /// ABI in the child. Zero when no scope applies. A ruleset is built when it
+    /// is non-zero even with no grant at all, since a scope needs a domain to
+    /// confine its reach to.
+    pub(crate) landlock_scoped: u64,
+    /// Caller-side labels naming each Landlock rule in a setup error:
+    /// [`landlock`](Self::landlock)'s grants first, then
+    /// [`landlock_net`](Self::landlock_net)'s, in the order the command stage
+    /// adds them. Never touched by the sandbox stages.
+    pub(crate) landlock_labels: Vec<String>,
     /// The compiled seccomp program, installed verbatim when present.
     pub(crate) seccomp: Option<Vec<SockFilter>>,
     /// The capability bits to retain across the drop; `None` leaves the
@@ -664,6 +683,7 @@ impl HardeningPlan {
     pub(crate) fn is_empty(&self) -> bool {
         self.landlock.is_empty()
             && self.landlock_net.is_empty()
+            && self.landlock_scoped == 0
             && self.seccomp.is_none()
             && self.keep_caps.is_none()
             && !self.set_securebits
@@ -1036,9 +1056,7 @@ pub(super) const MAP_READY_BYTE: u8 = b'R';
 /// the signal.
 pub(super) const MAP_GO_BYTE: u8 = b'M';
 
-/// The length of a helper child's failure record: a step's wire value then an
-/// errno, both little-endian.
-pub(super) const RECORD_LEN: usize = 8;
+use frame::RECORD_LEN;
 
 /// How driving a map gate ended.
 pub(super) enum Gated {
@@ -1177,17 +1195,11 @@ fn fork_launch(
     envp.extend(plan.env.iter().map(|entry| entry.as_ptr().cast::<u8>()));
     envp.push(std::ptr::null());
 
-    // The single-identity map lines: root inside is the calling user
-    // outside. The kernel requires the mapped outer id to be the writer's
-    // effective id, so the lines are formatted from the current euid/egid —
-    // captured here, before any fork or unshare, where geteuid still
-    // answers with the caller's id. A range-mapped launch writes no lines;
-    // its map goes through the delegate against the gated stage.
+    // The single-identity map lines, formatted here where the euid and egid
+    // are still the caller's. A range-mapped launch writes no lines; its map
+    // goes through the delegate against the gated stage.
     let (uid_line, gid_line) = match &plan.identity {
-        IdentityPlan::Single => (
-            format!("0 {} 1\n", process::geteuid().as_raw()).into_bytes(),
-            format!("0 {} 1\n", process::getegid().as_raw()).into_bytes(),
-        ),
+        IdentityPlan::Single => crate::idmap::single_identity_lines(),
         IdentityPlan::Ranged { .. } => (Vec::new(), Vec::new()),
     };
 
@@ -1407,31 +1419,28 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
     };
 
     let mut byte = [0u8; 1];
-    loop {
-        match rustix::io::read(gate, &mut byte) {
-            // Stage A is unshared and waiting; the namespace exists.
-            Ok(n) if n > 0 => break,
-            // End-of-file: stage A died before reaching the gate. The
-            // report pipe holds the step that failed.
-            Ok(_) => {
-                let report = read_report(&parent.report_read);
-                let _ = wait_for_exit(parent.stage_a);
-                return Err(match report {
-                    Ok(Report::SetupFailed {
-                        step,
-                        errno,
-                        detail,
-                    }) => setup_error(step, errno, detail, Labels::of(plan)),
-                    Ok(Report::ExecSucceeded) => Error::SupervisorLost,
-                    Err(err) => err,
-                });
-            }
-            Err(Errno::INTR) => continue,
-            Err(errno) => {
-                let _ = process::kill_process(parent.stage_a, Signal::KILL);
-                let _ = wait_for_exit(parent.stage_a);
-                return Err(wait_syscall_error(errno));
-            }
+    match frame::retry_on_intr!(rustix::io::read(gate, &mut byte)) {
+        // Stage A is unshared and waiting; the namespace exists.
+        Ok(n) if n > 0 => {}
+        // End-of-file: stage A died before reaching the gate. The
+        // report pipe holds the step that failed.
+        Ok(_) => {
+            let report = read_report(&parent.report_read);
+            let _ = wait_for_exit(parent.stage_a);
+            return Err(match report {
+                Ok(Report::SetupFailed {
+                    step,
+                    errno,
+                    detail,
+                }) => setup_error(step, errno, detail, Labels::of(plan)),
+                Ok(Report::ExecSucceeded) => Error::SupervisorLost,
+                Err(err) => err,
+            });
+        }
+        Err(errno) => {
+            let _ = process::kill_process(parent.stage_a, Signal::KILL);
+            let _ = wait_for_exit(parent.stage_a);
+            return Err(wait_syscall_error(errno));
         }
     }
 
@@ -1442,7 +1451,7 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
         Ok(()) => {
             // Release the stage. A failed write means it died; the caller's
             // next read on the report or control path reports the outcome.
-            let _ = rustix::io::write(gate, &[MAP_GO_BYTE]);
+            let _ = frame::retry_on_intr!(rustix::io::write(gate, &[MAP_GO_BYTE]));
             Ok(())
         }
         Err(err) => {
@@ -1636,6 +1645,10 @@ pub(crate) struct PendingLaunch {
     /// The resource-limit labels, for naming an rlimit step that fails after
     /// release.
     rlimit_labels: Vec<String>,
+    /// The Landlock rule labels, for naming a rule the command stage fails to
+    /// add after release.
+    #[cfg(feature = "hardening")]
+    landlock_labels: Vec<String>,
 }
 
 /// Launches the sandbox but holds the command at the gate before `execve`,
@@ -1713,6 +1726,8 @@ pub(crate) fn spawn_pending(
                     op_labels: plan.op_labels.clone(),
                     exec_label: plan.exec_label.clone(),
                     rlimit_labels: plan.rlimit_labels.clone(),
+                    #[cfg(feature = "hardening")]
+                    landlock_labels: plan.hardening.landlock_labels.clone(),
                 },
                 primary,
             ))
@@ -1748,7 +1763,7 @@ impl PendingLaunch {
         // Release the command: any byte is the go signal. A failed write means
         // the command process is already gone; the report read below reports
         // the true outcome.
-        let _ = rustix::io::write(&self.proceed_write, &[PROCEED_BYTE]);
+        let _ = frame::retry_on_intr!(rustix::io::write(&self.proceed_write, &[PROCEED_BYTE]));
         drop(self.proceed_write);
 
         match read_report(&self.report_read) {
@@ -1784,6 +1799,8 @@ impl PendingLaunch {
                         ops: &self.op_labels,
                         exec: &self.exec_label,
                         rlimits: &self.rlimit_labels,
+                        #[cfg(feature = "hardening")]
+                        landlock: &self.landlock_labels,
                     },
                 ))
             }
@@ -1811,14 +1828,16 @@ impl PendingLaunch {
 ///
 /// The report record's detail index selects within whichever list the failed
 /// step belongs to — the mount ops for a mount step, the resource limits for
-/// the rlimit step — and the exec step has a single subject rather than a
-/// list. The sandbox stages never see any of this; it exists so a reported
-/// step carries the thing it was operating on.
+/// the rlimit step, the Landlock rules for adding one — and the exec step has a
+/// single subject rather than a list. The sandbox stages never see any of this;
+/// it exists so a reported step carries the thing it was operating on.
 #[derive(Clone, Copy)]
 struct Labels<'a> {
     ops: &'a [String],
     exec: &'a str,
     rlimits: &'a [String],
+    #[cfg(feature = "hardening")]
+    landlock: &'a [String],
 }
 
 impl<'a> Labels<'a> {
@@ -1828,6 +1847,8 @@ impl<'a> Labels<'a> {
             ops: &plan.op_labels,
             exec: &plan.exec_label,
             rlimits: &plan.rlimit_labels,
+            #[cfg(feature = "hardening")]
+            landlock: &plan.hardening.landlock_labels,
         }
     }
 }
@@ -1862,19 +1883,25 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     // reports it — so the error names the sysctl rather than leaving a reader
     // with "No space left on device" against a step that touched no filesystem.
     if step == SetupStep::NestedUnshare && errno == Errno::NOSPC.raw_os_error() {
-        return Error::NestedUsernsBudgetExhausted;
+        return Error::NestedUsernsBudgetExhausted {
+            source: std::io::Error::from_raw_os_error(errno),
+        };
     }
     // The fresh session keyring is charged against the calling user's key
     // quota, and `EDQUOT` from creating it is that quota and nothing else, so
     // the error names the sysctls rather than a disk quota the step never
     // touched.
     if step == SetupStep::ReplaceSessionKeyring && errno == Errno::DQUOT.raw_os_error() {
-        return Error::KeyQuotaExhausted;
+        return Error::KeyQuotaExhausted {
+            source: std::io::Error::from_raw_os_error(errno),
+        };
     }
     // A `devpts` instance answers an open of its multiplexer with `ENOSPC` when
     // the host's pseudoterminals are spent, and has no other meaning for it.
     if step == SetupStep::AllocateTerminal && errno == Errno::NOSPC.raw_os_error() {
-        return Error::TerminalsExhausted;
+        return Error::TerminalsExhausted {
+            source: std::io::Error::from_raw_os_error(errno),
+        };
     }
     // The exec step carries no detail index — there is one command, not a list
     // — so its subject comes from the plan's own label. Every other step with a
@@ -1882,6 +1909,8 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     let detail = match step {
         SetupStep::Exec => Some(labels.exec.to_string()),
         SetupStep::SetRlimit => index_label(detail, labels.rlimits),
+        #[cfg(feature = "hardening")]
+        SetupStep::LandlockAddRule => index_label(detail, labels.landlock),
         _ => index_label(detail, labels.ops),
     };
     Error::Setup {
@@ -1914,7 +1943,8 @@ enum Report {
     /// running.
     ExecSucceeded,
     /// A stage reported a failed setup step and exited. `detail` is the
-    /// 1-based index of the mount op the step belonged to, or zero.
+    /// 1-based index of the step's subject within its own list, or zero; see
+    /// [`Labels`].
     SetupFailed {
         step: SetupStep,
         errno: i32,
@@ -2005,6 +2035,62 @@ mod tests {
         let signaled = decode_status(record(STATUS_SIGNALED, 9)).expect("a written kind decodes");
         assert_eq!(signaled.code(), None);
         assert_eq!(signaled.signal(), Some(9));
+    }
+
+    /// Labels with nothing in them but the Landlock rules given.
+    fn labels_with_rules(rules: &[String]) -> Labels<'_> {
+        #[cfg(not(feature = "hardening"))]
+        let _ = rules;
+        Labels {
+            ops: &[],
+            exec: "",
+            rlimits: &[],
+            #[cfg(feature = "hardening")]
+            landlock: rules,
+        }
+    }
+
+    #[test]
+    fn a_recognized_exhaustion_keeps_the_errno_it_came_from() {
+        use std::error::Error as _;
+
+        for (step, errno) in [
+            (SetupStep::NestedUnshare, Errno::NOSPC),
+            (SetupStep::ReplaceSessionKeyring, Errno::DQUOT),
+            (SetupStep::AllocateTerminal, Errno::NOSPC),
+        ] {
+            let error = setup_error(step, errno.raw_os_error(), 0, labels_with_rules(&[]));
+            assert!(
+                matches!(
+                    error,
+                    Error::NestedUsernsBudgetExhausted { .. }
+                        | Error::KeyQuotaExhausted { .. }
+                        | Error::TerminalsExhausted { .. }
+                ),
+                "{step:?} is recognized: {error:?}",
+            );
+            let source = error
+                .source()
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .expect("the syscall's error is the source");
+            assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()));
+        }
+    }
+
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_failed_landlock_rule_is_named_by_its_position() {
+        let rules = ["rx on /usr".to_string(), "r on /etc/hostname".to_string()];
+        let error = setup_error(
+            SetupStep::LandlockAddRule,
+            Errno::INVAL.raw_os_error(),
+            2,
+            labels_with_rules(&rules),
+        );
+        assert!(
+            matches!(&error, Error::Setup { detail: Some(detail), .. } if detail == "r on /etc/hostname"),
+            "{error:?}",
+        );
     }
 
     #[test]

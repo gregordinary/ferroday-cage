@@ -63,22 +63,14 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags, Stat};
 use rustix::io::Errno;
 
+use crate::mechanism::resolve;
+
 /// How many times a create is retried when something already occupies the name.
 ///
 /// One replacement always suffices; the bound exists so a pathological
 /// filesystem state — an entry something else keeps putting back — cannot loop
 /// forever.
 const REPLACE_ATTEMPTS: u32 = 3;
-
-/// How many times a resolution is retried when a rename raced it.
-///
-/// Each attempt re-resolves from the anchor, so a genuine race is lost once and
-/// won next; consecutive losses are what a tree being rewritten underneath the
-/// walk produces, and sixteen of them is far past anything an ordinary one
-/// reaches. The bound exists for the same reason [`REPLACE_ATTEMPTS`] does:
-/// neither half of provisioning walks a tree this crate trusts, and a
-/// pathological state must not be able to loop forever.
-const RESOLVE_ATTEMPTS: u32 = 16;
 
 /// The mode a directory is created with before its caller states the one it
 /// keeps.
@@ -123,16 +115,10 @@ fn joined<C: AsRef<[u8]>>(components: &[C]) -> Result<CString, Errno> {
 /// reason — a `/proc/*/fd/*` entry re-opens whatever it names, from anywhere on
 /// the host, and no path in a tree being provisioned has a use for one.
 ///
-/// `EAGAIN` is retried rather than returned, up to [`RESOLVE_ATTEMPTS`] times.
-/// The kernel answers with it when a rename raced the walk, meaning "ask
-/// again", and a caller that took it for a failure would report a rootfs as
-/// unwritable because something moved underneath it. The bound is the same
-/// reasoning [`replacing`] applies to its own retry: a tree being provisioned
-/// is not one this crate trusts, and something renaming components in a loop
-/// must not be able to spin the walk forever. An exhausted retry returns the
-/// `EAGAIN` it kept receiving, which is the accurate answer — the resolution
-/// really was raced every time — and the caller reports it against whatever it
-/// was opening.
+/// The lookup goes through [`resolve::openat2`], so the `EAGAIN` the kernel
+/// answers when a rename raced the walk is retried rather than reported. A
+/// caller that took it for a failure would report a root filesystem as unwritable
+/// because something moved underneath it.
 pub(crate) fn open_dir<C: AsRef<[u8]>>(
     anchor: BorrowedFd<'_>,
     components: &[C],
@@ -154,23 +140,13 @@ pub(crate) fn open_dir_path(
     access: OFlags,
     containment: ResolveFlags,
 ) -> Result<OwnedFd, Errno> {
-    for _ in 0..RESOLVE_ATTEMPTS {
-        // The call `clippy.toml` sends every other site here for: this is that
-        // answer.
-        #[expect(clippy::disallowed_methods)]
-        let opened = rustix::fs::openat2(
-            anchor,
-            path,
-            access | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            containment | ResolveFlags::NO_MAGICLINKS,
-        );
-        match opened {
-            Err(Errno::AGAIN) => continue,
-            result => return result,
-        }
-    }
-    Err(Errno::AGAIN)
+    resolve::openat2(
+        anchor,
+        path,
+        access | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        containment | ResolveFlags::NO_MAGICLINKS,
+    )
 }
 
 /// A directory a chain walk made, handed to the caller so it can state the

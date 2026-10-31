@@ -35,8 +35,22 @@ consumer upgrading can skip it.
 - Every launch, of a sandbox or a restriction, gives the command a fresh session
   keyring in place of the caller's. A sandboxed command previously inherited the
   caller's session keyring, so it possessed, and could read through `keyctl`,
-  every key the caller's login session held. Key descriptions stay listed in
-  `/proc/keys`; their contents are no longer reachable.
+  every key the caller's login session held. It possesses none of them now. Two
+  reaches remain. A key whose permissions grant its owner read stays readable,
+  since the command runs as that owner. A restricted command can also link the
+  calling user's user, user session, and persistent keyrings into its own and
+  read their keys, which a sandbox's own user namespace prevents. The curated
+  seccomp policy, which denies `keyctl`, closes both. Key descriptions stay
+  listed in `/proc/keys`.
+- **Breaking.** A restriction confines its command's signals, and its
+  connections to abstract sockets, to the processes it started, on a kernel
+  with Landlock ABI 6 (Linux 6.12) or later. A restricted command could
+  previously signal every process of the calling user, and reach the session
+  bus and the X server through their abstract sockets. On such a kernel every
+  restriction also has a Landlock domain, which refuses it ptrace access to
+  processes outside it, `/proc/<pid>/environ` among them. A caller whose
+  command needs either reach names fewer scopes through
+  `RestrictionBuilder::landlock_scope`, or `fcage --landlock-scope`.
 - `fcage`: a standard stream that is a regular file or a block device is relayed
   through a pipe rather than handed to the command. A command could previously
   reopen such a file through `/proc/self/fd` with more access than the stream
@@ -55,6 +69,13 @@ consumer upgrading can skip it.
   mounted as `upx`, and the sandbox's writes landed in a directory other than
   the one whose ownership the build had checked. Layer paths are escaped in the
   mount options.
+- A seccomp `Dword` condition whose value or mask is wider than 32 bits is
+  refused at `build` with `ConfigError::SeccompInvalid`. It was truncated, so
+  `masked_eq_dword(0, 1 << 32, 0)` masked with zero and matched every call, a
+  filter more permissive than the one configured.
+- The curated seccomp policy denies `open_tree_attr`, the mount API's newest
+  call, and `pidfd_getfd`, which copies a descriptor out of another process
+  under the same check `process_vm_readv` makes.
 - The network stack refuses AWS's IPv6 instance-service block, `fd00:ec2::/32`,
   whose metadata service at `fd00:ec2::254` serves the instance role's
   credentials. The IPv4 metadata service was already refused as link-local.
@@ -136,10 +157,21 @@ consumer upgrading can skip it.
 ### Added
 
 - `Error::KeyQuotaExhausted`, reported when the calling user's kernel key quota
-  leaves no room for the sandbox's session keyring, and
-  `SetupStep::ReplaceSessionKeyring`, the step that replaces it.
+  leaves no room for the sandbox's session keyring, with the `EDQUOT` as its
+  source, and `SetupStep::ReplaceSessionKeyring`, the step that replaces it.
 - `SetupStep::AllocateTerminal` and `SetupStep::SendTerminal`, the steps a
   terminal launch's allocation now reports under.
+- `LandlockScope`, `ParseLandlockScopeError`, `CageBuilder::landlock_scope`, and
+  `RestrictionBuilder::landlock_scope`, which confine a command's signals or
+  abstract-socket connections to the processes of its own Landlock domain. A
+  sandbox takes none by default and needs one only where `pid_namespace(false)`
+  or `Network::Host` exposes the host's processes. Profile key
+  `landlock-scope`; `fcage`: `--landlock-scope LIST`.
+- `SeccompRules::errno_for`, which answers one syscall with an errno of its own
+  ahead of the policy's actions. Answering `clone3` with `ENOSYS` lets a policy
+  that conditions `clone`'s flags keep threads working, since the C library then
+  falls back to `clone`. Profile: an `errno` table in `[hardening.seccomp]`;
+  `fcage`: `--seccomp-errno SYSCALL=ERRNO`.
 - `CageBuilder::mount` and `CageBuilder::mounts`, which add a `Mount` of either
   kind to the one mount sequence, so a sequence read back through `get_mounts`
   carries over to another builder whole.
@@ -148,6 +180,8 @@ consumer upgrading can skip it.
   string short, and the remainder could mount a different work directory.
 - `ConfigError::IdentityMapUnavailable::source`, the configured identity-map
   delegate's own error, which `source()` now returns.
+- `RangeMapBlocker::NoNewPrivileges`, which `host::range_map_blocker` reports for
+  a caller running under `no_new_privs`.
 - `ExitStatus::exited` and `ExitStatus::signaled`, which build the status a
   command would report, for a caller that reports an outcome of its own in the
   same convention.
@@ -182,6 +216,7 @@ consumer upgrading can skip it.
 - `DebianError::Cancelled`, which `Debian::observe(..).resolve()` and
   `.available()` return when the observer cancels. They stop at each mirror the
   release and index walks ask, and a bootstrap also stops before each dpkg wave.
+- `debian::Priority::ALL`, every Debian priority band, most essential first.
 
 ### Changed
 
@@ -242,6 +277,9 @@ consumer upgrading can skip it.
   `ConfigError::MountFlagsInvalid` names the raw mount's target. A NUL in an
   environment variable's name is `EnvNameInvalid`, and a NUL in the hostname is
   `HostnameInvalid`.
+- **Breaking.** `Error::NestedUsernsBudgetExhausted` and
+  `Error::TerminalsExhausted` carry the kernel's error as `source`, returned from
+  `Error::source`. Match them with `{ .. }`.
 - **Breaking.** The struct variants of `ResolvedRoot`, `ResolvedIdentity`,
   `ResolvedHardening`, `ResolvedMount`, and both `UnheldReason`s are
   `#[non_exhaustive]`, as every other struct variant is. A pattern naming their
@@ -262,6 +300,9 @@ consumer upgrading can skip it.
   of one tree is then the same from any host.
 - An overlay layer path may hold a `:`, which is escaped in the mount options. A
   `,` is still refused with `ConfigError::OverlayPathInvalid`.
+- A Landlock rule the kernel refuses at launch, such as a grant on a path the
+  sandbox does not have, is reported with the grant it came from in
+  `Error::Setup`'s detail, as a failed mount or resource limit is.
 - An Alpine install script runs with exactly the environment `apk` gives one:
   `PATH`, `APK_SCRIPT` and `APK_PACKAGE`, plus `SOURCE_DATE_EPOCH` where one is
   set. It also received `HOME=/root`.
@@ -279,6 +320,26 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- A launch no longer fails now and then with `SetupStep::OpenMountTarget` and
+  `EAGAIN` when a rename or a mount elsewhere on the host races the lookup of a
+  mount target reached through a `..` symbolic link, such as `etc/resolv.conf ->
+  ../run/systemd/resolve/stub-resolv.conf`. The kernel's request to retry such a
+  lookup is honored wherever the crate resolves a path inside a tree.
+- A Landlock grant on a file or a device node, such as `--landlock-ro
+  /etc/hostname` or `--landlock-rw /dev/null`, no longer fails every launch with
+  `EINVAL`. The grant is narrowed to the rights that act on a file, which are
+  the only ones the kernel accepts there.
+- A seccomp policy naming a syscall number below zero, or at or above
+  `0x4000_0000`, is refused at `build` with `ConfigError::SeccompInvalid`. A
+  number past 32 bits panicked inside `build`.
+- A range identity map the bundled delegates cannot write is refused at `build`
+  rather than failing every launch with `EPERM`. `DirectMapper` refuses a uid map
+  naming outside uid 0 without `CAP_SETFCAP`, and `SubidMapper` refuses any map
+  while the caller runs under `no_new_privs`, which strips the helpers of their
+  privilege.
+- An export, a copy in, or a removal given a malformed range identity map, or a
+  delegate that resolves one, refuses it by name, as `build` does. It reached
+  the kernel and failed with `EINVAL` at the write.
 - A file bind onto a path an overlay's upper had deleted, or that lies in a
   directory the upper made opaque, no longer leaves an empty file in the upper
   after the run. The target was judged present because a lower held it, so the
@@ -430,10 +491,20 @@ consumer upgrading can skip it.
 
 ### Internal
 
+- `mechanism::resolve::openat2` is the one `openat2` call, retrying a raced walk
+  for every caller, the post-fork stages included, up to 64 times.
+  `provision::containment::open_dir` is built on it, and `open_dir_path` is its
+  allocation-free form for the copy-in child.
 - `mechanism::frame::send_with_fd` and `recv_with_fd` pass a descriptor over a
   socket for every caller that does: the supervisor's pidfd, the network stack's
-  tap, and a terminal launch's primary. The shared vocabulary in
-  `CONTRIBUTING.md` records them.
+  tap, and a terminal launch's primary.
+- `mechanism::frame` holds the rest of the helper children's wire as well:
+  `write_whole` for a file that takes its content in one write, `retry_on_intr!`
+  for every single interrupted call, and `encode_record`, `decode_record` and
+  `read_record` for the outcome record every helper child sends.
+  `idmap::single_identity_lines` formats the single-identity map's two lines
+  before a fork. A short identity-map write in a sandbox stage reports
+  `EMSGSIZE`, as the host side already did.
 - The host side's reading and writing of a tree is `provision::containment` and
   `provision::rooted`. `containment::create_dirs` creates a chain of missing
   directories for the extractor and `Rooted` alike, and `containment::copy_up`
@@ -456,6 +527,8 @@ consumer upgrading can skip it.
 - The Gentoo layer checks a path component with `path::is_ordinary_component`,
   and splits a name from its version through one `version::version_hyphen` that
   the package-name rule shares.
+- `limits::Resource` and Debian's `Priority` are declared through
+  `roster_enum!`, and the `roster` module is unconditional.
 - `fcage` and the examples state their exit codes once each.
 - `lzma-rust2` moves to 0.23, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the

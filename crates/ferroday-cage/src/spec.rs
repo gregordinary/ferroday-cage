@@ -2202,12 +2202,18 @@ impl CageBuilder {
         // identity against the ranges that result — so an identity the map
         // cannot represent is a configuration error here, not a launch
         // failure.
-        idmap::validate_request(&self.identity_map)?;
         let identity = match &self.identity_map {
             IdentityMap::Single => IdentityPlan::Single,
             request => {
-                let (mapper, map) = resolve_mapper(self.id_mapper.clone(), request)?;
-                idmap::validate_resolved(&map)?;
+                // A configured delegate is the whole chain: its refusal is
+                // final. Without one, the bundled delegates are tried in turn.
+                let (mapper, map) = match &self.id_mapper {
+                    Some(mapper) => (
+                        Arc::clone(mapper),
+                        idmap::resolve_range(request, mapper.as_ref())?,
+                    ),
+                    None => idmap::resolve_range_bundled(request)?,
+                };
                 IdentityPlan::Ranged { mapper, map }
             }
         };
@@ -2536,37 +2542,6 @@ impl CageBuilder {
     }
 }
 
-/// Resolves a range request through the configured delegate, or the bundled
-/// fallback chain: [`DirectMapper`](crate::DirectMapper) first, then the
-/// subordinate delegate when the `subid` feature is enabled. Each refusal is
-/// collected, and the host probe's diagnosis appended, so the error names
-/// what to fix.
-fn resolve_mapper(
-    configured: Option<Arc<dyn IdMapper>>,
-    request: &IdentityMap,
-) -> Result<(Arc<dyn IdMapper>, idmap::ResolvedMap), Error> {
-    // A configured delegate is the whole chain: its refusal is final, and is
-    // carried whole rather than as its text alone.
-    if let Some(mapper) = configured {
-        return match mapper.resolve(request) {
-            Ok(map) => Ok((mapper, map)),
-            Err(err) => Err(ConfigError::IdentityMapUnavailable {
-                reason: err.to_string(),
-                source: Some(err),
-            }
-            .into()),
-        };
-    }
-
-    idmap::resolve_default_chain(request).map_err(|reason| {
-        ConfigError::IdentityMapUnavailable {
-            reason,
-            source: None,
-        }
-        .into()
-    })
-}
-
 /// Validates a run-as identity against the identity plan and freezes it.
 ///
 /// Every id must be contained in the map that will exist at launch, and
@@ -2788,9 +2763,9 @@ fn covers(mount: &CStr, covered: &CStr) -> bool {
 }
 
 /// Builder methods for the opt-in hardening layer: Landlock filesystem and
-/// network rules, seccomp syscall filters, and capability drops. See
-/// [`crate::FsAccess`], [`crate::NetAccess`], [`crate::SeccompPolicy`], and
-/// [`crate::Capability`].
+/// network rules and scopes, seccomp syscall filters, and capability drops. See
+/// [`crate::FsAccess`], [`crate::NetAccess`], [`crate::LandlockScope`],
+/// [`crate::SeccompPolicy`], and [`crate::Capability`].
 #[cfg(feature = "hardening")]
 impl CageBuilder {
     /// Grants `access` beneath `path` under a Landlock ruleset.
@@ -2799,7 +2774,10 @@ impl CageBuilder {
     /// then reach a path only where a grant allows it, and everything else on
     /// the filesystem is denied. `path` is a sandbox path (absolute, resolved
     /// after the pivot), so grants describe the mounted view — the rootfs, the
-    /// binds, and the `/proc`, `/dev`, and `/tmp` mounts alike.
+    /// binds, and the `/proc`, `/dev`, and `/tmp` mounts alike. A grant may name
+    /// a single file or device node as well as a directory; there it allows only
+    /// the rights that act on a file, since there are no entries to list,
+    /// create, or remove.
     ///
     /// The ruleset is enforced on a kernel that offers Landlock, best-effort
     /// down to the kernel's supported ABI; a kernel without the Landlock LSM
@@ -2857,6 +2835,37 @@ impl CageBuilder {
     /// [`NetAccess::CONNECT`]: crate::NetAccess::CONNECT
     pub fn landlock_net(mut self, access: crate::hardening::NetAccess, port: u16) -> Self {
         self.hardening.grant_net(access, port);
+        self
+    }
+
+    /// Confines the command's reach to processes outside its Landlock domain,
+    /// for each of `scopes`, replacing any scopes set before.
+    ///
+    /// A scope denies an interaction with a process the sandbox did not start,
+    /// and leaves it open between the command and its own descendants:
+    /// [`LandlockScope::Signal`] denies sending a signal, and
+    /// [`LandlockScope::AbstractUnixSocket`] denies connecting to an abstract
+    /// socket. A default sandbox needs neither, because its PID and network
+    /// namespaces already hide those processes. They matter under
+    /// [`pid_namespace(false)`](Self::pid_namespace), where the command can see
+    /// and signal the calling user's other processes, and under
+    /// [`Network::Host`], where it can reach the host's abstract sockets. The
+    /// default is no scope.
+    ///
+    /// A scope needs Landlock ABI 6 (Linux 6.12). On an older kernel that
+    /// offers Landlock it narrows away best-effort, as an unsupported
+    /// filesystem right does. On a kernel without the Landlock LSM it is a
+    /// setup error, as a grant is. A scope is not a grant: it enrolls no path
+    /// and no port, so the filesystem and the network stay as open as the
+    /// grants leave them.
+    ///
+    /// [`LandlockScope::Signal`]: crate::LandlockScope::Signal
+    /// [`LandlockScope::AbstractUnixSocket`]: crate::LandlockScope::AbstractUnixSocket
+    pub fn landlock_scope<I>(mut self, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = crate::hardening::LandlockScope>,
+    {
+        self.hardening.set_scope(scopes);
         self
     }
 
@@ -6009,6 +6018,7 @@ data = "mode=0777"
 [hardening]
 seccomp = "curated"
 keep-caps = ["net-bind-service"]
+landlock-scope = ["signal"]
 
 [[hardening.landlock-fs]]
 path = "/usr"
@@ -6021,7 +6031,7 @@ access = "c"
 
     /// The keys the exhaustive profile above renders, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 60] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 61] = [
         "args",
         "base-env",
         "command",
@@ -6035,6 +6045,7 @@ access = "c"
         "hardening.landlock-net",
         "hardening.landlock-net[].access",
         "hardening.landlock-net[].port",
+        "hardening.landlock-scope",
         "hardening.seccomp",
         "hostname",
         "identity-map",

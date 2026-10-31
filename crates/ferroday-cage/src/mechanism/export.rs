@@ -710,13 +710,13 @@ fn early_report(stream: BorrowedFd<'_>) -> Option<StartError> {
     // The descriptor belongs to a `start_export` that is on its way to
     // returning an error, so it is dropped rather than restored to blocking.
     fs::fcntl_setfl(stream, OFlags::NONBLOCK).ok()?;
-    let mut record = [0u8; 9];
-    let read = frame::retry_on_intr!(rustix::io::read(stream, &mut record)).ok()?;
-    if read != record.len() || record[0] != FRAME_ERROR {
+    let mut error = [0u8; 1 + frame::RECORD_LEN];
+    let read = frame::retry_on_intr!(rustix::io::read(stream, &mut error)).ok()?;
+    let [tag, record @ ..] = error;
+    if read != error.len() || tag != FRAME_ERROR {
         return None;
     }
-    let wire = u32::from_le_bytes(record[1..5].try_into().expect("slice length is 4"));
-    let errno = i32::from_le_bytes(record[5..9].try_into().expect("slice length is 4"));
+    let (wire, errno) = frame::decode_record(record);
     Some(StartError::Reported {
         step: ExportStep::from_wire(wire)?,
         errno: Errno::from_raw_os_error(errno),
@@ -729,13 +729,13 @@ fn emit_tag(stream: BorrowedFd<'_>, tag: u8) {
     let _ = frame::write_full(stream, &[tag]);
 }
 
-/// Emits an error frame: the tag, the step discriminant, and the errno.
+/// Emits an error frame: the tag, then the outcome record naming the step and
+/// the errno.
 fn emit_error(stream: BorrowedFd<'_>, step: ExportStep, errno: Errno) {
-    let mut record = [0u8; 9];
-    record[0] = FRAME_ERROR;
-    record[1..5].copy_from_slice(&step.wire().to_le_bytes());
-    record[5..9].copy_from_slice(&errno.raw_os_error().to_le_bytes());
-    let _ = frame::write_full(stream, &record);
+    let mut error = [0u8; 1 + frame::RECORD_LEN];
+    error[0] = FRAME_ERROR;
+    error[1..].copy_from_slice(&frame::encode_record(step.wire(), errno.raw_os_error()));
+    let _ = frame::write_full(stream, &error);
 }
 
 /// Sends a signal to the export child, used to tear it down when the parent
@@ -917,10 +917,7 @@ mod tests {
         let (bystander_read, bystander_write) =
             rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).expect("a pipe is creatable");
 
-        let euid = rustix::process::geteuid().as_raw();
-        let egid = rustix::process::getegid().as_raw();
-        let uid_line = format!("0 {euid} 1\n").into_bytes();
-        let gid_line = format!("0 {egid} 1\n").into_bytes();
+        let (uid_line, gid_line) = crate::idmap::single_identity_lines();
         let child = start_export(
             &rootfs,
             ChildMap::SelfMap {

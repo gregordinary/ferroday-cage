@@ -41,6 +41,8 @@ The restriction fallback carries the same knob as
 
 use std::fmt;
 
+use crate::roster::roster_enum;
+
 /// The spelling both the profile format and the command line use for
 /// [`Limit::UNLIMITED`].
 const UNLIMITED_NAME: &str = "unlimited";
@@ -177,121 +179,78 @@ impl serde::de::Visitor<'_> for LimitVisitor {
     }
 }
 
-/// A per-process resource whose limit the launch sets on the command.
-///
-/// Each variant names the kernel's `RLIMIT_*` resource it sets and the unit
-/// its values are counted in. Two carry sandbox-specific caveats:
-///
-/// - [`Processes`](Self::Processes) is the kernel's `RLIMIT_NPROC`, which
-///   counts processes per *real user id* across the whole system, not per
-///   namespace or per sandbox. Under the single-identity map the command's
-///   real uid outside the sandbox is the calling user's, so the limit counts
-///   the caller's other processes too, and the cap is a ceiling on the pair
-///   rather than on the sandbox alone. A range identity map gives the sandbox
-///   distinct host ids, so the count is the sandbox's own.
-/// - [`AddressSpace`](Self::AddressSpace) counts mapped address space, not
-///   resident memory, so a command that maps far more than it touches — many
-///   runtimes and allocators do — hits it long before its real memory use
-///   approaches the value.
-///
-/// The kebab-case spelling of each variant is the name a profile's `[rlimit]`
-/// table and the command line's `--rlimit` flag both use: `address-space`,
-/// `cpu-time`, `open-files`, and so on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "kebab-case")
-)]
-#[non_exhaustive]
-pub enum Resource {
-    /// `RLIMIT_AS`: the total mapped address space, in bytes.
-    AddressSpace,
-    /// `RLIMIT_CORE`: the size of a core dump, in bytes.
-    CoreDump,
-    /// `RLIMIT_CPU`: CPU time consumed, in seconds. Exceeding the soft limit
-    /// raises `SIGXCPU`; exceeding the hard limit is fatal.
-    CpuTime,
-    /// `RLIMIT_DATA`: the data segment — the heap and anonymous mappings — in
-    /// bytes.
-    Data,
-    /// `RLIMIT_FSIZE`: the largest file the command may create, in bytes. A
-    /// write beyond it raises `SIGXFSZ`.
-    FileSize,
-    /// `RLIMIT_MEMLOCK`: memory that may be locked into RAM, in bytes.
-    LockedMemory,
-    /// `RLIMIT_NOFILE`: one greater than the highest file descriptor the
-    /// command may open.
-    OpenFiles,
-    /// `RLIMIT_SIGPENDING`: signals that may be queued for the command's real
-    /// user id.
-    PendingSignals,
-    /// `RLIMIT_NPROC`: processes and threads for the command's real user id.
-    /// The fork-bomb ceiling; see the caveat above.
-    Processes,
-    /// `RLIMIT_STACK`: the main thread's stack, in bytes.
-    Stack,
+roster_enum! {
+    /// A per-process resource whose limit the launch sets on the command.
+    ///
+    /// Each variant names the kernel's `RLIMIT_*` resource it sets and the unit
+    /// its values are counted in. Two carry sandbox-specific caveats:
+    ///
+    /// - [`Processes`](Self::Processes) is the kernel's `RLIMIT_NPROC`, which
+    ///   counts processes per *real user id* across the whole system, not per
+    ///   namespace or per sandbox. Under the single-identity map the command's
+    ///   real uid outside the sandbox is the calling user's, so the limit counts
+    ///   the caller's other processes too, and the cap is a ceiling on the pair
+    ///   rather than on the sandbox alone. A range identity map gives the sandbox
+    ///   distinct host ids, so the count is the sandbox's own.
+    /// - [`AddressSpace`](Self::AddressSpace) counts mapped address space, not
+    ///   resident memory, so a command that maps far more than it touches — many
+    ///   runtimes and allocators do — hits it long before its real memory use
+    ///   approaches the value.
+    ///
+    /// The kebab-case spelling of each variant is the name a profile's `[rlimit]`
+    /// table and the command line's `--rlimit` flag both use: `address-space`,
+    /// `cpu-time`, `open-files`, and so on. [`ALL`](Self::ALL) lists every
+    /// resource in the order they are documented, and grows as the kernel's
+    /// roster does, so a consumer presenting them picks up an addition without
+    /// a change.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[cfg_attr(
+        feature = "serde",
+        derive(serde::Serialize, serde::Deserialize),
+        serde(rename_all = "kebab-case")
+    )]
+    #[non_exhaustive]
+    pub enum Resource {
+        /// The kernel resource this names.
+        pub(crate) fn to_kernel -> rustix::process::Resource;
+        /// The name a profile's `[rlimit]` table and the `--rlimit` flag spell
+        /// this resource with: the kebab-case form of the variant.
+        ///
+        /// Distinct from [`Display`](std::fmt::Display), which renders the
+        /// kernel's own `RLIMIT_*` name because that is what an error about the
+        /// kernel's refusal should say.
+        pub fn spelling;
+
+        /// `RLIMIT_AS`: the total mapped address space, in bytes.
+        AddressSpace = rustix::process::Resource::As => "address-space",
+        /// `RLIMIT_CORE`: the size of a core dump, in bytes.
+        CoreDump = rustix::process::Resource::Core => "core-dump",
+        /// `RLIMIT_CPU`: CPU time consumed, in seconds. Exceeding the soft limit
+        /// raises `SIGXCPU`; exceeding the hard limit is fatal.
+        CpuTime = rustix::process::Resource::Cpu => "cpu-time",
+        /// `RLIMIT_DATA`: the data segment — the heap and anonymous mappings — in
+        /// bytes.
+        Data = rustix::process::Resource::Data => "data",
+        /// `RLIMIT_FSIZE`: the largest file the command may create, in bytes. A
+        /// write beyond it raises `SIGXFSZ`.
+        FileSize = rustix::process::Resource::Fsize => "file-size",
+        /// `RLIMIT_MEMLOCK`: memory that may be locked into RAM, in bytes.
+        LockedMemory = rustix::process::Resource::Memlock => "locked-memory",
+        /// `RLIMIT_NOFILE`: one greater than the highest file descriptor the
+        /// command may open.
+        OpenFiles = rustix::process::Resource::Nofile => "open-files",
+        /// `RLIMIT_SIGPENDING`: signals that may be queued for the command's real
+        /// user id.
+        PendingSignals = rustix::process::Resource::Sigpending => "pending-signals",
+        /// `RLIMIT_NPROC`: processes and threads for the command's real user id.
+        /// The fork-bomb ceiling; see the caveat above.
+        Processes = rustix::process::Resource::Nproc => "processes",
+        /// `RLIMIT_STACK`: the main thread's stack, in bytes.
+        Stack = rustix::process::Resource::Stack => "stack",
+    }
 }
 
 impl Resource {
-    /// Every resource a limit can be set on, in the order they are documented.
-    ///
-    /// The roster grows as the kernel's does, so this is a slice rather than a
-    /// fixed-length array: a consumer that presents the resources — a help
-    /// text, a form, a completion script — picks up an addition without a
-    /// change. Pair it with [`spelling`](Self::spelling) for the names a
-    /// profile and the command line accept.
-    pub const ALL: &'static [Resource] = &[
-        Resource::AddressSpace,
-        Resource::CoreDump,
-        Resource::CpuTime,
-        Resource::Data,
-        Resource::FileSize,
-        Resource::LockedMemory,
-        Resource::OpenFiles,
-        Resource::PendingSignals,
-        Resource::Processes,
-        Resource::Stack,
-    ];
-
-    /// The name a profile's `[rlimit]` table and the `--rlimit` flag spell this
-    /// resource with: the kebab-case form of the variant.
-    ///
-    /// Distinct from [`Display`](std::fmt::Display), which renders the kernel's
-    /// own `RLIMIT_*` name because that is what an error about the kernel's
-    /// refusal should say.
-    pub fn spelling(self) -> &'static str {
-        match self {
-            Resource::AddressSpace => "address-space",
-            Resource::CoreDump => "core-dump",
-            Resource::CpuTime => "cpu-time",
-            Resource::Data => "data",
-            Resource::FileSize => "file-size",
-            Resource::LockedMemory => "locked-memory",
-            Resource::OpenFiles => "open-files",
-            Resource::PendingSignals => "pending-signals",
-            Resource::Processes => "processes",
-            Resource::Stack => "stack",
-        }
-    }
-
-    /// The kernel resource this names.
-    pub(crate) fn to_kernel(self) -> rustix::process::Resource {
-        use rustix::process::Resource as Kernel;
-        match self {
-            Resource::AddressSpace => Kernel::As,
-            Resource::CoreDump => Kernel::Core,
-            Resource::CpuTime => Kernel::Cpu,
-            Resource::Data => Kernel::Data,
-            Resource::FileSize => Kernel::Fsize,
-            Resource::LockedMemory => Kernel::Memlock,
-            Resource::OpenFiles => Kernel::Nofile,
-            Resource::PendingSignals => Kernel::Sigpending,
-            Resource::Processes => Kernel::Nproc,
-            Resource::Stack => Kernel::Stack,
-        }
-    }
-
     /// The kernel's own name for the resource, for error messages.
     pub(crate) fn kernel_name(self) -> &'static str {
         match self {
@@ -477,48 +436,10 @@ mod tests {
         assert_eq!(Limit::UNLIMITED.to_string(), "unlimited");
     }
 
-    /// The resource each one is documented after, or `None` for the last.
-    ///
-    /// A chain rather than a list, and that is the whole point: the match has no
-    /// wildcard, so a resource added to the enum stops this compiling until it
-    /// is linked in, and linking it in puts it in the chain the test below holds
-    /// [`Resource::ALL`] to. A test that merely walked `ALL` could never notice
-    /// a variant `ALL` does not hold.
-    fn successor(resource: Resource) -> Option<Resource> {
-        match resource {
-            Resource::AddressSpace => Some(Resource::CoreDump),
-            Resource::CoreDump => Some(Resource::CpuTime),
-            Resource::CpuTime => Some(Resource::Data),
-            Resource::Data => Some(Resource::FileSize),
-            Resource::FileSize => Some(Resource::LockedMemory),
-            Resource::LockedMemory => Some(Resource::OpenFiles),
-            Resource::OpenFiles => Some(Resource::PendingSignals),
-            Resource::PendingSignals => Some(Resource::Processes),
-            Resource::Processes => Some(Resource::Stack),
-            Resource::Stack => None,
-        }
-    }
-
-    /// `ALL` is the roster, and it holds every resource.
-    ///
-    /// The omission this catches would be quiet rather than loud: `ALL` is what
-    /// `fcage` offers under `--help` and searches to parse a `--rlimit`, so a
-    /// variant left out of it is a limit the command line cannot name and the
-    /// help does not list, refused nowhere and reported nowhere.
-    #[test]
-    fn the_roster_holds_every_resource_in_the_documented_order() {
-        let mut chain = vec![Resource::AddressSpace];
-        while let Some(next) = successor(*chain.last().expect("the chain starts somewhere")) {
-            chain.push(next);
-        }
-        assert_eq!(Resource::ALL, chain);
-    }
-
     /// Every resource's `spelling` is the name the configuration formats
     /// accept, which is serde's kebab-case rename of the variant. The two are
-    /// written out separately, so this proves they agree, over the roster
-    /// [`the_roster_holds_every_resource_in_the_documented_order`] proves is
-    /// complete.
+    /// written out separately, so this proves they agree, over the roster the
+    /// declaration makes complete.
     #[cfg(feature = "serde")]
     #[test]
     fn every_resources_spelling_is_the_name_a_profile_accepts() {

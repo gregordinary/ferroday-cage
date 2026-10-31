@@ -153,6 +153,16 @@ pub enum RangeMapBlocker {
     /// which requires `CAP_SETUID` and `CAP_SETGID` — running as root, or
     /// inside an already range-mapped namespace.
     SubidFeatureDisabled,
+    /// The calling process runs under `no_new_privs`, so the shadow suite's
+    /// helpers run without their privilege.
+    ///
+    /// A helper holds its privilege as a setuid bit or a file capability, and
+    /// an exec under `no_new_privs` honours neither, so every map it is asked to
+    /// write fails with `EPERM`. The flag is inherited and cannot be cleared:
+    /// a process started under a service manager's `NoNewPrivileges=` setting,
+    /// or by a launcher that set it, has it for good. The remedy is to start
+    /// the caller without it.
+    NoNewPrivileges,
     /// A shadow suite helper is not on `PATH`.
     ///
     /// The commonest cause is a container runtime installed without its
@@ -222,6 +232,11 @@ impl fmt::Display for RangeMapBlocker {
                 "the caller holds no CAP_SETUID/CAP_SETGID over its user namespace, and the \
                  library was built without the `subid` feature, so no delegate can establish \
                  a range map; enable the feature, or run with those capabilities",
+            ),
+            RangeMapBlocker::NoNewPrivileges => f.write_str(
+                "the calling process runs under no_new_privs, so newuidmap and newgidmap run \
+                 without the setuid bit or file capability that is their privilege; start the \
+                 caller without the flag",
             ),
             RangeMapBlocker::HelperMissing { helper } => write!(
                 f,
@@ -538,7 +553,9 @@ fn overlay_mount_probe(base: &Path) -> Option<crate::mechanism::OverlayProbe> {
 /// the kernel's map write both require the capabilities effective and do not
 /// raise them from the permitted set, so a caller that has parked them in
 /// `permitted` — after a privilege-lowering wrapper, say — reads as needing
-/// the delegate until it raises them into effective itself. The probe is
+/// the delegate until it raises them into effective itself. A map whose
+/// outside ids include uid 0 needs `CAP_SETFCAP` as well; that is a property
+/// of the request, which the probe does not know, so the build judges it. The probe is
 /// best-effort and read-only; `None` is an absence of known blockers, not a
 /// guarantee.
 pub fn range_map_blocker() -> Option<RangeMapBlocker> {
@@ -567,11 +584,17 @@ pub fn range_map_blocker() -> Option<RangeMapBlocker> {
     }
 }
 
-/// The delegated-tier checks behind [`range_map_blocker`]: helper presence
-/// and privilege, the subordinate files, and the allocation.
+/// The delegated-tier checks behind [`range_map_blocker`]: the caller's own
+/// `no_new_privs`, helper presence and privilege, the subordinate files, and
+/// the allocation.
 #[cfg(feature = "subid")]
 fn delegated_blocker() -> Option<RangeMapBlocker> {
     use rustix::thread::CapabilitySet;
+
+    // First, since it defeats every helper whatever the helper's own state.
+    if crate::idmap::no_new_privs() {
+        return Some(RangeMapBlocker::NoNewPrivileges);
+    }
 
     for (helper, capability) in [
         ("newuidmap", CapabilitySet::SETUID),

@@ -14,8 +14,8 @@ mod common;
 
 use common::scratch_dir as scratch;
 use ferroday_cage::{
-    Error, FsAccess, NetAccess, Restriction, RestrictionBuilder, SeccompAction, SeccompArg,
-    SeccompPolicy, SeccompRules, SetupStep, Stdio, Terminal,
+    Error, FsAccess, LandlockScope, NetAccess, Restriction, RestrictionBuilder, SeccompAction,
+    SeccompArg, SeccompPolicy, SeccompRules, SetupStep, Stdio, Terminal,
 };
 
 /// Skips a Landlock test when the kernel offers no Landlock LSM.
@@ -510,6 +510,240 @@ fn the_handle_kills_a_running_command() {
     running.kill().expect("the kill is delivered");
     let status = running.wait().expect("the outcome is collected");
     assert_eq!(status.signal(), Some(libc::SIGKILL));
+}
+
+#[test]
+fn landlock_grants_a_single_file_and_a_device_node() {
+    if !landlock_supported() {
+        return;
+    }
+    // A grant on a file and a grant on a device node, rather than on the
+    // directories that hold them: `--landlock-ro` on one file and
+    // `--landlock-rw /dev/null`. Each lowers to rights that act on a
+    // directory's entries as well, which the kernel refuses on anything else,
+    // so the grant narrows to the rights a file accepts.
+    let dir = scratch("restrict-file-grant");
+    let (granted, neighbour) = (dir.join("granted"), dir.join("neighbour"));
+    std::fs::write(&granted, "granted contents\n").unwrap();
+    std::fs::write(&neighbour, "neighbour contents\n").unwrap();
+    let output = grant_system_trees(Restriction::builder())
+        .command("/bin/sh")
+        .args([
+            "-c",
+            r#"cat "$1" && echo written >/dev/null && ! cat "$2" 2>/dev/null"#,
+            "sh",
+        ])
+        .arg(&granted)
+        .arg(&neighbour)
+        .landlock_fs(FsAccess::READ, &granted)
+        .landlock_fs(FsAccess::READ | FsAccess::WRITE, "/dev/null")
+        .build()
+        .expect("a valid restriction configuration")
+        .output()
+        .expect("the restriction launches");
+    assert!(
+        output.status.success(),
+        "the granted file and device are reachable and nothing beside them is: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.stdout, b"granted contents\n");
+}
+
+#[test]
+fn a_landlock_rule_that_fails_names_its_grant() {
+    if !landlock_supported() {
+        return;
+    }
+    // Nothing checks a grant's path at build, so a missing one fails the launch.
+    // The failure names the grant rather than only the step that refused it.
+    let result = grant_system_trees(Restriction::builder())
+        .command("/bin/true")
+        .landlock_fs(
+            FsAccess::READ | FsAccess::WRITE,
+            "/ferroday-cage/no/such/grant",
+        )
+        .build()
+        .expect("a valid restriction configuration")
+        .run();
+    match result {
+        Err(Error::Setup {
+            step: SetupStep::LandlockAddRule,
+            detail,
+            source,
+            ..
+        }) => {
+            assert_eq!(
+                detail.as_deref(),
+                Some("rw on /ferroday-cage/no/such/grant")
+            );
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+        }
+        other => panic!("expected a Landlock rule failure, got {other:?}"),
+    }
+}
+
+/// Skips a Landlock scope test when the kernel's Landlock ABI predates scopes,
+/// which arrive in ABI 6.
+fn landlock_scope_supported() -> bool {
+    match ferroday_cage::host::landlock_abi() {
+        Some(abi) if abi >= 6 => true,
+        abi => {
+            assert!(
+                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE").is_none(),
+                "Landlock scopes are required but the kernel's ABI is {abi:?} (needs 6)",
+            );
+            eprintln!("skipping: Landlock ABI {abi:?} predates scopes (needs 6)");
+            false
+        }
+    }
+}
+
+/// Runs `script` under `/bin/sh` in a restriction confined by the curated
+/// seccomp policy alone, with `scopes` in place of the default, and reports
+/// whether it succeeded.
+///
+/// No Landlock grant is made, so any Landlock domain the command runs in is the
+/// one its scopes alone create.
+fn run_scoped(script: &str, scopes: Option<&[LandlockScope]>) -> bool {
+    let builder = Restriction::builder()
+        .command("/bin/sh")
+        .args(["-c", script])
+        .seccomp(SeccompPolicy::Curated);
+    let builder = match scopes {
+        Some(scopes) => builder.landlock_scope(scopes.iter().copied()),
+        None => builder,
+    };
+    builder
+        .build()
+        .expect("a valid restriction configuration")
+        .run()
+        .expect("the restriction launches")
+        .success()
+}
+
+#[test]
+fn a_restriction_cannot_signal_a_process_outside_it() {
+    if !seccomp_supported() || !landlock_scope_supported() {
+        return;
+    }
+    // A restriction shares the host's PID space and runs as the calling user,
+    // so without the signal scope it may signal every process that user owns.
+    // The probe is signal 0, which asks the kernel for the permission check
+    // alone.
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a process to signal");
+    let probe = format!("kill -0 {}", victim.id());
+    let by_default = run_scoped(&probe, None);
+    let unscoped = run_scoped(&probe, Some(&[]));
+    let _ = victim.kill();
+    let _ = victim.wait();
+    assert!(
+        !by_default,
+        "the default scopes deny signalling the caller's process"
+    );
+    assert!(unscoped, "without the scope the same probe reaches it");
+}
+
+#[test]
+fn a_restriction_cannot_reach_an_abstract_socket_outside_it() {
+    if !seccomp_supported() || !landlock_scope_supported() {
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("skipping: no python3 on this host to make the connection with");
+        return;
+    };
+    // An abstract socket belongs to the network namespace, not the filesystem,
+    // and a restriction shares the caller's. The listener is this test's, so it
+    // is outside the restriction's domain.
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("ferroday-cage-scope-{}", std::process::id());
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+        .expect("an abstract address");
+    let _listener =
+        std::os::unix::net::UnixListener::bind_addr(&address).expect("an abstract listener");
+    let probe = format!(
+        "{python} -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"\\0{name}\")'"
+    );
+    assert!(
+        !run_scoped(&probe, None),
+        "the default scopes deny connecting to the caller's abstract socket"
+    );
+    assert!(
+        run_scoped(&probe, Some(&[])),
+        "without the scope the same connect reaches it"
+    );
+}
+
+#[test]
+fn a_scoped_restriction_cannot_read_an_outside_process_environment() {
+    if !seccomp_supported() || !landlock_scope_supported() {
+        return;
+    }
+    // Any Landlock domain refuses the ptrace access checks on a process outside
+    // it, and reading another process's environment is one. On a kernel with
+    // scopes, a restriction always has a domain, even when it makes no grant.
+    let probe = format!("cat /proc/{}/environ >/dev/null", std::process::id());
+    assert!(
+        !run_scoped(&probe, None),
+        "the scoped restriction is refused the caller's environment"
+    );
+    assert!(
+        run_scoped(&probe, Some(&[])),
+        "a restriction with no Landlock domain reads it"
+    );
+}
+
+#[test]
+fn a_syscall_answered_with_its_own_errno_reports_it() {
+    if !seccomp_supported() {
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("skipping: no python3 on this host to make the calls with");
+        return;
+    };
+    // `clone3` answered `ENOSYS` beside a denylist whose listed action is
+    // `EPERM`. Each call is made raw and reports the errno it got: `clone3`
+    // with no arguments would be `EINVAL` from the kernel itself, so `ENOSYS`
+    // can only be the filter's. A thread then starts all the same, because the
+    // C library reads `ENOSYS` from `clone3` as an older kernel and falls back
+    // to `clone`.
+    let script = format!(
+        "import ctypes, threading; libc = ctypes.CDLL(None, use_errno=True); \
+         libc.syscall({clone3}, 0, 0); print(ctypes.get_errno()); \
+         libc.syscall({acct}, 0); print(ctypes.get_errno()); \
+         t = threading.Thread(target=int); t.start(); t.join(); print('thread')",
+        clone3 = libc::SYS_clone3,
+        acct = libc::SYS_acct,
+    );
+    let rules =
+        SeccompRules::denying([libc::SYS_acct]).errno_for(libc::SYS_clone3, libc::ENOSYS as u16);
+    let output = Restriction::builder()
+        .command(python)
+        .args(["-c", &script])
+        .seccomp(SeccompPolicy::Rules(rules))
+        .build()
+        .expect("a valid restriction configuration")
+        .output()
+        .expect("the restriction launches");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{}\n{}\nthread\n", libc::ENOSYS, libc::EPERM),
+    );
 }
 
 #[test]

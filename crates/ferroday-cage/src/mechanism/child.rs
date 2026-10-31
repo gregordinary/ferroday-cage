@@ -48,7 +48,10 @@
 //!   copy.
 //!
 //! Every operation below is a raw syscall, through rustix or [`sys`], over
-//! data frozen by the caller before the fork.
+//! data frozen by the caller before the fork. The exception is a dropped
+//! [`OwnedFd`], which the standard library closes through libc's `close`, an
+//! async-signal-safe wrapper of the one syscall; the [`mechanism`](super)
+//! documentation states why that is safe here.
 //!
 //! Mount targets are resolved against the new-root descriptor with
 //! `openat2` and `RESOLVE_IN_ROOT`, so an absolute symlink inside the
@@ -75,6 +78,7 @@ use rustix::thread;
 use syscalls::Sysno;
 
 use super::frame;
+use super::resolve;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
     IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdioPlan,
@@ -138,7 +142,8 @@ pub(super) struct Context<'a> {
 }
 
 /// A failed setup step: the step, the errno, and the 1-based index of the
-/// mount op it belonged to (zero when the step has no op).
+/// subject it was operating on within its own list — the mount op, the resource
+/// limit, the Landlock rule — or zero when the step has no subject.
 type Failure = (SetupStep, Errno, u32);
 
 /// Stage A: the launch stage, forked directly from the caller.
@@ -491,7 +496,7 @@ fn stage_init(context: &Context<'_>) -> ! {
 /// is lost by ending it here.
 fn abandon_command(command: Pid) {
     let _ = process::kill_process(command, Signal::KILL);
-    while let Err(Errno::INTR) = process::waitpid(Some(command), WaitOptions::empty()) {}
+    let _ = frame::retry_on_intr!(process::waitpid(Some(command), WaitOptions::empty()));
 }
 
 /// Stage command without a PID namespace: setup and exec in one process,
@@ -612,8 +617,8 @@ fn exec_command(
     // preserved CAP_SETPCAP. Without the `hardening` feature only the
     // switch exists.
     #[cfg(feature = "hardening")]
-    if let Err((step, errno)) = super::harden::apply_pre_switch(&context.plan.hardening) {
-        report(context.report_fd, step, errno, 0);
+    if let Err((step, errno, detail)) = super::harden::apply_pre_switch(&context.plan.hardening) {
+        report(context.report_fd, step, errno, detail);
         sys::exit_group(127)
     }
 
@@ -623,8 +628,8 @@ fn exec_command(
     }
 
     #[cfg(feature = "hardening")]
-    if let Err((step, errno)) = super::harden::apply_post_switch(&context.plan.hardening) {
-        report(context.report_fd, step, errno, 0);
+    if let Err((step, errno, detail)) = super::harden::apply_post_switch(&context.plan.hardening) {
+        report(context.report_fd, step, errno, detail);
         sys::exit_group(127)
     }
 
@@ -1325,7 +1330,7 @@ fn write_map_file(procfs: BorrowedFd<'_>, pid: u32, file: &[u8], data: &[u8]) ->
         OFlags::WRONLY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    write_all_at_once(&fd, data)
+    frame::write_whole(fd.as_fd(), data)
 }
 
 /// The [`SetupStep`] a launch reports for a shared map step.
@@ -1814,19 +1819,24 @@ const KEY_SPEC_SESSION_KEYRING: i32 = -3;
 /// Gives this process, and every process it forks, a session keyring of its
 /// own in place of the one it inherited.
 ///
-/// The kernel's keyrings are not partitioned by any namespace a launch
-/// creates. A forked process inherits its parent's session keyring, and a
-/// process *possesses* every key reachable from it, which is the one standing
-/// the default key permissions grant reading and searching to. Left alone, a
-/// command in a fully isolated sandbox could still read, through `keyctl`,
-/// every key the caller's login session holds: a Kerberos ticket cache, an
-/// fscrypt or eCryptfs key, a secret a desktop cached there. Joining a fresh
-/// anonymous keyring ends the possession, and with it that reach.
+/// The session keyring is not partitioned by any namespace a launch creates.
+/// A forked process inherits its parent's, and a process *possesses* every key
+/// reachable from it, which is the one standing the default key permissions
+/// grant reading and searching to. Left alone, a command in a fully isolated
+/// sandbox could still read, through `keyctl`, every key the caller's login
+/// session holds: a Kerberos ticket cache, an fscrypt or eCryptfs key, a secret
+/// a desktop cached there. Joining a fresh anonymous keyring ends the
+/// possession, and with it that reach.
 ///
-/// What remains is what the kernel shows any process of the same user. A key
-/// whose permissions grant its owner *view* is still listed in `/proc/keys`,
-/// description and all, much as the mount table stays readable; its contents
-/// are not.
+/// What remains is what the kernel grants the key's owner, whom every sandbox
+/// process is. A key whose permissions grant its owner *view* is still listed
+/// in `/proc/keys`, description and all, much as the mount table stays
+/// readable. One whose permissions grant its owner *read*, which the defaults
+/// do not, stays readable by serial number. The user, user session, and
+/// persistent keyrings belong to the user rather than the session: a sandbox's
+/// user namespace gives it its own, while a restriction's command reaches the
+/// caller's and can link them back in. The curated seccomp denylist, which
+/// denies `keyctl`, closes what this does not.
 ///
 /// A process that cannot call `keyctl` at all has nothing to replace, and
 /// neither has anything it forks: a seccomp filter is inherited, and so is a
@@ -1835,7 +1845,10 @@ const KEY_SPEC_SESSION_KEYRING: i32 = -3;
 /// established by asking rather than read into the errno: a refused join is
 /// excused only when a read-only query of the inherited keyring is refused the
 /// same way, so a refusal aimed at the join alone, which would leave the old
-/// keyring in place and readable, still fails the launch.
+/// keyring in place and readable, still fails the launch. The query stands in
+/// for every `keyctl` operation. A filter that refused the join and the query
+/// while allowing `KEYCTL_READ` would be excused all the same; a filter written
+/// to deny the call does not discriminate between its operations that way.
 ///
 /// Post-fork safe: raw syscalls only.
 fn replace_session_keyring() -> Result<(), Errno> {
@@ -2062,17 +2075,7 @@ fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errn
 /// this falls back to a top-level remount, which covers the bind itself but
 /// leaves any submounts with their own flags.
 fn remount_read_only(root: BorrowedFd<'_>, target: &CStr) -> Result<(), Errno> {
-    // Not `provision::containment::open_dir`: this runs post-fork, and a bind
-    // target is whatever the caller named — a file as readily as a directory —
-    // so the `O_DIRECTORY` that helper folds in would refuse half of them.
-    #[expect(clippy::disallowed_methods)]
-    let target = fs::openat2(
-        root,
-        target,
-        OFlags::PATH | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::IN_ROOT,
-    )?;
+    let target = open_in_root(root, target, OFlags::PATH)?;
     match mount_setattr_recursive(target.as_fd(), MOUNT_ATTR_RDONLY) {
         Ok(()) => Ok(()),
         Err(Errno::NOSYS) => remount_top(target.as_fd(), MountFlags::RDONLY),
@@ -2210,17 +2213,19 @@ fn open_in_root(root: BorrowedFd<'_>, path: &CStr, oflags: OFlags) -> Result<Own
 /// [`open_in_root`] with an explicit creation mode.
 ///
 /// The post-fork stage's own opener, rather than
-/// `provision::containment::open_dir`: it opens whatever a mount target is,
-/// creates where asked to, and runs where a helper that loops on the kernel's
-/// retry has no caller to answer to.
+/// `provision::containment::open_dir`: a mount target is whatever the caller
+/// named, a file as readily as a directory, and the stage creates where asked
+/// to, so the `O_DIRECTORY` that helper folds in would refuse half of them. The
+/// lookup goes through [`resolve::openat2`] all the same, so a rename or a mount
+/// elsewhere on the host racing a `..` step of the walk is retried rather than
+/// failing the launch.
 fn open_in_root_with(
     root: BorrowedFd<'_>,
     path: &CStr,
     oflags: OFlags,
     mode: Mode,
 ) -> Result<OwnedFd, Errno> {
-    #[expect(clippy::disallowed_methods)]
-    fs::openat2(root, path, oflags, mode, ResolveFlags::IN_ROOT)
+    resolve::openat2(root, path, oflags, mode, ResolveFlags::IN_ROOT)
 }
 
 /// A path assembled into a stack buffer, for the post-fork stages that cannot
@@ -2362,23 +2367,11 @@ fn bring_up_loopback() -> Result<(), Errno> {
     Ok(())
 }
 
-/// Opens `path` and writes `data` in a single `write`.
-///
-/// The identity-map files under `/proc` accept the whole map in one write
-/// and nothing else; a short write is reported as an I/O error, not retried.
+/// Opens `path` and writes `data` in a single `write`, on the terms
+/// [`frame::write_whole`] states for the identity-map files under `/proc`.
 pub(super) fn write_file(path: &CStr, data: &[u8]) -> Result<(), Errno> {
     let fd = rustix::fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())?;
-    write_all_at_once(&fd, data)
-}
-
-/// Writes `data` in a single `write`, on the terms the identity-map files
-/// impose: the whole content or nothing.
-fn write_all_at_once<Fd: AsFd>(fd: &Fd, data: &[u8]) -> Result<(), Errno> {
-    match rustix::io::write(fd.as_fd(), data) {
-        Ok(n) if n == data.len() => Ok(()),
-        Ok(_) => Err(Errno::IO),
-        Err(errno) => Err(errno),
-    }
+    frame::write_whole(fd.as_fd(), data)
 }
 
 /// Writes the 12-byte failure record: the step discriminant, the errno, and

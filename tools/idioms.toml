@@ -28,15 +28,31 @@ without a bound, and two of the three learned it the hard way."""
 name = "the kernel's retry-the-walk answer"
 pattern = 'Errno::AGAIN\) => continue'
 answer = """\
-`provision::containment::open_dir`, which loops on it once for every caller. \
-`openat2` answers `EAGAIN` when a rename raced the walk, meaning "ask again"; \
-a caller that takes it for a failure reports a tree as unusable because \
-something moved underneath it."""
+`mechanism::resolve::openat2`, which loops on it once for every caller, post-fork \
+included. A scoped `openat2` answers `EAGAIN` when a rename or a mount raced \
+the walk, meaning "ask again"; a caller that takes it for a failure reports a \
+tree as unusable, or fails a launch, because something moved underneath it."""
 
 [[idiom.site]]
-path = "crates/ferroday-cage/src/provision/containment.rs"
+path = "crates/ferroday-cage/src/mechanism/resolve.rs"
 count = 1
 why = "The answer."
+
+[[idiom]]
+name = "an openat2 that does not go through the retry"
+pattern = '(?<!resolve::)(?<!fn )\bopenat2\('
+answer = """\
+`mechanism::resolve::openat2`, or `provision::containment::open_dir` for a \
+directory in a tree being provisioned. `clippy.toml` refuses the direct call, \
+and this counts the sites that silence it: a direct call under \
+`RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` fails whenever a rename or a mount \
+anywhere on the host races a `..` step of the walk, which a launch with a \
+mount target such as `etc/resolv.conf -> ../run/...` meets in ordinary use."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/mechanism/resolve.rs"
+count = 1
+why = "The answer: the one direct call, inside the retry."
 
 [[idiom]]
 name = "a file:// URL built from a path"

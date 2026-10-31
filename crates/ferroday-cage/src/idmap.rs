@@ -33,6 +33,7 @@
 
 use std::fmt;
 use std::io;
+use std::os::fd::AsFd;
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
@@ -504,7 +505,7 @@ fn check_overlap(
 /// Single and subordinate maps carry no ranges to validate; explicit ranges
 /// are checked against the kernel's rules so a map the kernel would refuse
 /// is a typed configuration error instead of a launch failure.
-pub(crate) fn validate_request(map: &IdentityMap) -> Result<(), ConfigError> {
+fn validate_request(map: &IdentityMap) -> Result<(), ConfigError> {
     match map {
         IdentityMap::Single | IdentityMap::Subordinate => Ok(()),
         IdentityMap::Ranges { uid, gid } => {
@@ -522,13 +523,100 @@ pub(crate) fn validate_request(map: &IdentityMap) -> Result<(), ConfigError> {
 ///
 /// A delegate is caller-supplied code; a malformed resolution is reported as
 /// the delegate's defect rather than passed to the kernel.
-pub(crate) fn validate_resolved(map: &ResolvedMap) -> Result<(), ConfigError> {
+fn validate_resolved(map: &ResolvedMap) -> Result<(), ConfigError> {
     for (which, ranges) in [("uid", map.uid()), ("gid", map.gid())] {
         validate_ranges(which, ranges).map_err(|reason| ConfigError::IdentityMapInvalid {
             reason: format!("the identity-map delegate resolved an invalid map: {reason}"),
         })?;
     }
     Ok(())
+}
+
+/// Resolves a range request through the caller's own delegate, whose refusal
+/// is final.
+///
+/// One of the two entry points of the step every range map passes through,
+/// with [`resolve_range_bundled`]: a build, an export, a copy in, and a
+/// map-assisted removal alike. The request is validated before any delegate
+/// sees it and the delegate's answer after, so a malformed map is a typed
+/// refusal naming its defect rather than an `EINVAL` from the kernel at the
+/// write.
+pub(crate) fn resolve_range(
+    request: &IdentityMap,
+    mapper: &dyn IdMapper,
+) -> Result<ResolvedMap, ConfigError> {
+    // The delegate's refusal is carried whole, as the error's source, as well as
+    // read into its reason.
+    checked(request, || {
+        mapper
+            .resolve(request)
+            .map(|map| ((), map))
+            .map_err(|err| (err.to_string(), Some(err)))
+    })
+    .map(|((), map)| map)
+}
+
+/// Resolves a range request through the bundled delegates, returning the one
+/// that accepted it with the map it resolved.
+///
+/// The other entry point of [`resolve_range`]'s step, for a caller that
+/// configured no delegate of its own.
+pub(crate) fn resolve_range_bundled(
+    request: &IdentityMap,
+) -> Result<(std::sync::Arc<dyn IdMapper>, ResolvedMap), ConfigError> {
+    // The chain's reason collects a refusal from each delegate, so there is no
+    // one error to carry as the source.
+    checked(request, || {
+        resolve_default_chain(request).map_err(|reason| (reason, None))
+    })
+}
+
+/// The validation both entry points share: the request before `resolve` runs,
+/// and the map it resolved after.
+///
+/// A refusal is the reason text and, where one delegate's error is the whole
+/// story, that error.
+fn checked<T>(
+    request: &IdentityMap,
+    resolve: impl FnOnce() -> Result<(T, ResolvedMap), (String, Option<IdMapError>)>,
+) -> Result<(T, ResolvedMap), ConfigError> {
+    validate_request(request)?;
+    let (delegate, map) = resolve()
+        .map_err(|(reason, source)| ConfigError::IdentityMapUnavailable { reason, source })?;
+    validate_resolved(&map)?;
+    Ok((delegate, map))
+}
+
+/// Whether the calling thread runs under `no_new_privs`, which an exec cannot
+/// raise privilege across: what the subordinate delegate and the host probe
+/// both ask before relying on a setuid or file-capability helper. An
+/// unreadable flag answers `false`, leaving the helpers themselves as the
+/// arbiter.
+#[cfg(feature = "subid")]
+pub(crate) fn no_new_privs() -> bool {
+    rustix::thread::no_new_privs().unwrap_or(false)
+}
+
+/// The single-identity map's `uid_map` and `gid_map` contents, in that order:
+/// root inside as the caller's effective uid and gid outside.
+///
+/// The kernel's one-id exception admits exactly this map, naming the writer's
+/// own effective ids. A child that writes it has unshared by then, and its
+/// `geteuid` answers inside the new namespace, so the lines are formatted
+/// before the fork, where the ids are still the caller's, and the child only
+/// writes them.
+pub(crate) fn single_identity_lines() -> (Vec<u8>, Vec<u8>) {
+    let line = |outside| {
+        format_map(&[IdRange {
+            inside: 0,
+            outside,
+            count: 1,
+        }])
+    };
+    (
+        line(rustix::process::geteuid().as_raw()),
+        line(rustix::process::getegid().as_raw()),
+    )
 }
 
 /// Formats an extent list as the kernel map-file text: one `inside outside
@@ -568,21 +656,14 @@ pub(crate) fn reflect_inside(ranges: &[IdRange]) -> Vec<IdRange> {
 }
 
 /// Opens `path` and writes `data` in a single `write`, as the map files
-/// require: they accept the whole map in one write and nothing else.
+/// require: they accept the whole map in one write and nothing else. The write
+/// is [`frame::write_whole`](crate::mechanism::frame::write_whole), the one the
+/// post-fork stages make for the same files.
 fn write_map_file(path: &str, which: &'static str, data: &[u8]) -> Result<(), IdMapError> {
     let map_write = |errno: Errno| IdMapError::map_write(which, errno.into());
     let fd = rustix::fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(map_write)?;
-    match rustix::io::write(&fd, data) {
-        Ok(n) if n == data.len() => Ok(()),
-        // The kernel takes a map file's contents whole or not at all, so a
-        // short write is not an errno the kernel reported. Fabricating one
-        // would render as "Input/output error" and send a reader looking for a
-        // device fault; `EMSGSIZE` says what happened — the write did not
-        // carry the whole map.
-        Ok(_) => Err(map_write(Errno::MSGSIZE)),
-        Err(errno) => Err(map_write(errno)),
-    }
+    crate::mechanism::frame::write_whole(fd.as_fd(), data).map_err(map_write)
 }
 
 /// The in-process delegate: the caller writes the sandbox's map itself.
@@ -631,16 +712,8 @@ impl IdMapper for DirectMapper {
         let effective = rustix::thread::capabilities(None)
             .map(|sets| sets.effective)
             .unwrap_or_else(|_| rustix::thread::CapabilitySet::empty());
-        for (capability, name) in [
-            (rustix::thread::CapabilitySet::SETUID, "CAP_SETUID"),
-            (rustix::thread::CapabilitySet::SETGID, "CAP_SETGID"),
-        ] {
-            if !effective.contains(capability) {
-                return Err(IdMapError::unsatisfiable(format!(
-                    "writing a range map directly requires {name} over the current user \
-                         namespace, which the caller does not hold",
-                )));
-            }
+        if let Some(reason) = direct_write_refusal(&uid, effective) {
+            return Err(IdMapError::unsatisfiable(reason));
         }
 
         // Where the caller's own map is readable, require the requested
@@ -688,6 +761,42 @@ impl IdMapper for DirectMapper {
             &format_map(map.gid()),
         )
     }
+}
+
+/// Why a caller holding `effective` cannot write a map with these uid extents
+/// directly, or `None` when it can.
+///
+/// The map files need `CAP_SETUID` and `CAP_SETGID` over the parent namespace.
+/// Since Linux 5.12 a `uid_map` naming the parent's uid 0 among its outside ids
+/// also needs `CAP_SETFCAP`: without it, a root that had shed the capability
+/// could hand the new namespace file capabilities the parent honours. The rule
+/// is about the outside id alone, so `0 1 1` needs no `CAP_SETFCAP` and `5 0 1`
+/// does.
+fn direct_write_refusal(
+    uid: &[IdRange],
+    effective: rustix::thread::CapabilitySet,
+) -> Option<String> {
+    use rustix::thread::CapabilitySet;
+
+    for (capability, name) in [
+        (CapabilitySet::SETUID, "CAP_SETUID"),
+        (CapabilitySet::SETGID, "CAP_SETGID"),
+    ] {
+        if !effective.contains(capability) {
+            return Some(format!(
+                "writing a range map directly requires {name} over the current user \
+                 namespace, which the caller does not hold",
+            ));
+        }
+    }
+    if uid.iter().any(|range| range.outside == 0) && !effective.contains(CapabilitySet::SETFCAP) {
+        return Some(
+            "the uid map names outside uid 0, which a direct write may map only while \
+             holding CAP_SETFCAP over the current user namespace, and the caller does not"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Reads an identity-map file into `(inside, count)` pairs, or `None` when
@@ -826,6 +935,16 @@ mod subid {
 
     impl IdMapper for SubidMapper {
         fn resolve(&self, request: &IdentityMap) -> Result<ResolvedMap, IdMapError> {
+            // The helpers hold their privilege as a setuid bit or a file
+            // capability, both of which an exec under no_new_privs ignores, so
+            // every map they were asked to write would fail with EPERM.
+            if !matches!(request, IdentityMap::Single) && super::no_new_privs() {
+                return Err(IdMapError::unsatisfiable(
+                    "the calling process runs under no_new_privs, so newuidmap and newgidmap \
+                     would run without the privilege they gain at exec"
+                        .to_string(),
+                ));
+            }
             match request {
                 IdentityMap::Single => Err(IdMapError::unsatisfiable(
                     "the single-identity map is established in process and needs no \
@@ -1294,10 +1413,8 @@ mod subid {
 /// feature is enabled. On failure the reason collects each delegate's
 /// refusal and the host probe's diagnosis, so the error names what to fix.
 ///
-/// Shared by [`CageBuilder::build`](crate::CageBuilder::build) (when no
-/// mapper is configured) and by the map-assisted removal in
-/// [`provision::remove`](crate::provision::remove).
-pub(crate) fn resolve_default_chain(
+/// Reached only through [`resolve_range_bundled`], which validates around it.
+fn resolve_default_chain(
     request: &IdentityMap,
 ) -> Result<(std::sync::Arc<dyn IdMapper>, ResolvedMap), String> {
     let mut reasons: Vec<String> = Vec::new();
@@ -1633,5 +1750,112 @@ mod tests {
         assert_eq!(identity.uid, 250);
         assert_eq!(identity.gid, 250);
         assert_eq!(identity.groups, [250, 100]);
+    }
+
+    #[test]
+    fn a_direct_write_naming_outside_uid_0_needs_cap_setfcap() {
+        use rustix::thread::CapabilitySet;
+
+        // The kernel's rule, measured: `0 0 1` and `5 0 1` are refused to a
+        // writer without CAP_SETFCAP, and `0 1 1` is written.
+        let setid = CapabilitySet::SETUID | CapabilitySet::SETGID;
+        let names_root = [range(0, 0, 1)];
+        let names_root_elsewhere = [range(0, 1, 1), range(5, 0, 1)];
+        let spares_root = [range(0, 1, 1), range(1, 100_000, 65_536)];
+        for uid in [&names_root[..], &names_root_elsewhere[..]] {
+            let reason = direct_write_refusal(uid, setid).expect("refused without CAP_SETFCAP");
+            assert!(reason.contains("CAP_SETFCAP"), "{reason}");
+            assert_eq!(
+                direct_write_refusal(uid, setid | CapabilitySet::SETFCAP),
+                None
+            );
+        }
+        assert_eq!(direct_write_refusal(&spares_root, setid), None);
+        // The id-setting capabilities come first, whatever the map.
+        let reason = direct_write_refusal(&spares_root, CapabilitySet::SETGID).unwrap();
+        assert!(reason.contains("CAP_SETUID"), "{reason}");
+    }
+
+    /// A delegate that resolves whatever it is given, verbatim, or a map of its
+    /// own choosing.
+    #[derive(Debug)]
+    struct Verbatim(Option<ResolvedMap>);
+
+    impl IdMapper for Verbatim {
+        fn resolve(&self, request: &IdentityMap) -> Result<ResolvedMap, IdMapError> {
+            match (&self.0, request) {
+                (Some(map), _) => Ok(map.clone()),
+                (None, IdentityMap::Ranges { uid, gid }) => {
+                    Ok(ResolvedMap::new(uid.clone(), gid.clone()))
+                }
+                (None, _) => Err(IdMapError::unsatisfiable("ranges only")),
+            }
+        }
+
+        fn apply(&self, _pid: u32, _map: &ResolvedMap) -> Result<(), IdMapError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_range_request_is_validated_whichever_delegate_resolves_it() {
+        // A delegate that would answer anything does not let a malformed request
+        // through: the request is held to the kernel's rules before it is
+        // asked, even by a delegate whose answer would be a valid map.
+        let valid = ResolvedMap::new(vec![range(0, 1000, 1)], vec![range(0, 1000, 1)]);
+        let empty_uid = ranges_map(vec![], vec![range(0, 1000, 1)]);
+        let err = resolve_range(&empty_uid, &Verbatim(Some(valid))).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::IdentityMapInvalid { reason } if reason.contains("uid range list is empty")),
+            "{err}",
+        );
+
+        // Nor does a delegate's own malformed answer reach the kernel.
+        let no_root = ResolvedMap::new(vec![range(1, 1000, 1)], vec![range(0, 1000, 1)]);
+        let request = ranges_map(vec![range(0, 1000, 1)], vec![range(0, 1000, 1)]);
+        let err = resolve_range(&request, &Verbatim(Some(no_root))).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::IdentityMapInvalid { reason } if reason.contains("delegate resolved an invalid map")),
+            "{err}",
+        );
+
+        // A refusal is the delegate's, reported as unavailability.
+        let err = resolve_range(&IdentityMap::Subordinate, &Verbatim(None)).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::IdentityMapUnavailable { reason, .. } if reason == "ranges only"),
+            "{err}",
+        );
+
+        // And a well-formed request through a willing delegate resolves.
+        assert_eq!(
+            resolve_range(&request, &Verbatim(None)).unwrap().uid(),
+            [range(0, 1000, 1)],
+        );
+    }
+
+    #[cfg(feature = "subid")]
+    #[test]
+    fn no_new_privs_defeats_the_subordinate_delegate_and_the_probe_says_so() {
+        // The flag is a property of the thread, and setting it cannot be undone,
+        // so it is set on a thread of the test's own that ends with the test.
+        std::thread::spawn(|| {
+            rustix::thread::set_no_new_privs(true).expect("no_new_privs can be set");
+            let err = SubidMapper::new()
+                .resolve(&IdentityMap::Subordinate)
+                .unwrap_err();
+            assert!(err.to_string().contains("no_new_privs"), "{err}");
+            // A caller holding CAP_SETUID and CAP_SETGID writes maps directly,
+            // and the flag is no obstacle to that; this test process holds
+            // neither unless it runs as root.
+            let effective = rustix::thread::capabilities(None).unwrap().effective;
+            if !effective.contains(rustix::thread::CapabilitySet::SETUID) {
+                assert_eq!(
+                    crate::host::range_map_blocker(),
+                    Some(crate::host::RangeMapBlocker::NoNewPrivileges),
+                );
+            }
+        })
+        .join()
+        .expect("the no_new_privs thread asserts");
     }
 }

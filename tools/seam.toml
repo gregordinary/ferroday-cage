@@ -50,14 +50,21 @@ name = "idmap"
 count = 2
 kind = "internal"
 why = """\
-`idmap::resolve_default_chain`, the preflight that refuses an unavailable range \
-map before anything is downloaded. Nothing public answers the question."""
+`idmap::resolve_range_bundled`, the preflight that refuses an unavailable or \
+malformed range map before anything is downloaded. Nothing public answers the \
+question."""
 
 [[layer.reach]]
 name = "failure"
 count = 1
 kind = "internal"
 why = "`failure::path_io_error!`, which declares the layer's `io` and `at` constructors."
+
+[[layer.reach]]
+name = "roster"
+count = 1
+kind = "internal"
+why = "`roster::roster_enum!`, which declares `Priority` and its roster."
 
 [[layer]]
 name = "alpine"
@@ -90,7 +97,7 @@ why = "`host::overlay_blocker`, the preflight a layered build makes."
 name = "idmap"
 count = 1
 kind = "internal"
-why = "`idmap::resolve_default_chain`, as in the Debian layer."
+why = "`idmap::resolve_range_bundled`, as in the Debian layer."
 
 [[layer.reach]]
 name = "failure"
