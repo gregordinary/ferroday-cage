@@ -22,8 +22,8 @@ orchestrator run net-dev -- curl https://example.com
 Because a profile is a `CageBuilder`, the orchestrator composes by
 deserializing the group profile and then layering builder calls onto it:
 
-- **List overrides extend.** `bind`, `bind_ro`, and `env` add to whatever the
-  profile already carries.
+- **List overrides extend.** `bind`, `bind_ro`, `mount`, and `env` add to
+  whatever the profile already carries.
 - **Scalar overrides replace.** The network posture, working directory, or
   root filesystem given at the prompt replaces the profile's value.
 - **The command replaces as a unit.** A group may carry a default command; a

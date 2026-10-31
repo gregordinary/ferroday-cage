@@ -20,13 +20,29 @@ enum Kind {
 }
 
 impl ExitStatus {
-    /// A status for a command that exited normally with `code`.
-    pub(crate) fn exited(code: i32) -> ExitStatus {
+    /// The status of a command that exited normally with `code`.
+    ///
+    /// A launch reports the status it collected, so a caller has no need of
+    /// this to read one. It is for a caller that reports an outcome of its own
+    /// in the same terms, and through [`shell_code`](Self::shell_code) in the
+    /// same convention, as a status the library collected.
+    pub fn exited(code: i32) -> ExitStatus {
         ExitStatus(Kind::Exited(code))
     }
 
-    /// A status for a command terminated by signal number `signal`.
-    pub(crate) fn signaled(signal: i32) -> ExitStatus {
+    /// The status of a command that signal number `signal` terminated.
+    ///
+    /// For the caller [`exited`](Self::exited) describes. A writer that finds
+    /// its reader gone reports the code a process killed by `SIGPIPE` exits
+    /// with, which is what a shell expects of a pipeline's early end:
+    ///
+    /// ```
+    /// use ferroday_cage::ExitStatus;
+    ///
+    /// // SIGPIPE is signal 13 on every Linux architecture.
+    /// assert_eq!(ExitStatus::signaled(13).shell_code(), 141);
+    /// ```
+    pub fn signaled(signal: i32) -> ExitStatus {
         ExitStatus(Kind::Signaled(signal))
     }
 

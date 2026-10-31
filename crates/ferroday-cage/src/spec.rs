@@ -214,6 +214,19 @@ pub enum Network {
 /// reaches the same pipe, and a socket cannot be reopened at all. A terminal is
 /// the subject of the section above.
 ///
+/// # A stream that is a directory
+///
+/// A directory descriptor reaches further than the directory. `/proc/self/fd/N`
+/// and `openat(N, "..")` walk from it through the host's filesystem, past the
+/// root the sandbox swapped in, so a command handed one could read and write
+/// whatever the caller can. Every launch therefore refuses a directory on any
+/// stream it hands over, with [`Error::StreamIsDirectory`](crate::Error::StreamIsDirectory),
+/// before it creates anything. The rule covers [`Inherit`](Self::Inherit),
+/// which hands over the caller's own descriptor as it stands at the launch,
+/// and [`Fd`](Self::Fd) alike. A stream the launch replaces is not handed over
+/// and is not examined: [`Null`](Self::Null), the output pair of a capturing
+/// launch, and all three streams of a terminal launch.
+///
 /// # Job control
 ///
 /// Job control has two senses, and the disposition decides where each happens.
@@ -246,7 +259,9 @@ pub enum Stdio {
     /// This is the default for all three.
     ///
     /// On standard input it also keeps the command in the caller's session,
-    /// and with it the caller's controlling terminal.
+    /// and with it the caller's controlling terminal. A launch refuses a
+    /// caller's stream that is a directory; see
+    /// [A stream that is a directory](#a-stream-that-is-a-directory).
     #[default]
     Inherit,
     /// The stream is wired to `/dev/null`: immediate end-of-file on standard
@@ -271,7 +286,9 @@ impl Stdio {
     /// after the pivot and survives `execve`; the caller's own copy is
     /// unaffected. What serves follows from the position: anything readable on
     /// standard input — the read end of a pipe the caller writes, an open file,
-    /// a pseudoterminal replica — and anything writable on the output pair.
+    /// a pseudoterminal replica — and anything writable on the output pair. A
+    /// directory serves on neither, and a launch refuses one; see
+    /// [A stream that is a directory](Stdio#a-stream-that-is-a-directory).
     ///
     /// The descriptor is *shared*, not consumed: a [`Cage`] is a frozen plan
     /// that can launch repeatedly, and every launch wires the same descriptor.
@@ -716,7 +733,8 @@ impl Bind {
     ///
     /// [`CageBuilder::bind`] and [`CageBuilder::bind_ro`] are the ordinary way
     /// to add one. This constructor is for a consumer assembling a
-    /// [`Mount`] sequence directly.
+    /// [`Mount`] sequence directly, which [`CageBuilder::mount`] and
+    /// [`CageBuilder::mounts`] add.
     pub fn new(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Bind {
         Bind {
             source: source.as_ref().to_path_buf(),
@@ -755,8 +773,9 @@ impl Bind {
 /// interleaved, which a bind-then-raw arrangement cannot express.
 ///
 /// Added with [`CageBuilder::bind`], [`CageBuilder::bind_ro`], and
-/// [`CageBuilder::raw_mount`], or as a `[[mount]]` table in a profile, and
-/// read back through [`CageBuilder::get_mounts`].
+/// [`CageBuilder::raw_mount`], whole with [`CageBuilder::mount`] and
+/// [`CageBuilder::mounts`], or as a `[[mount]]` table in a profile, and read
+/// back through [`CageBuilder::get_mounts`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -1603,6 +1622,31 @@ impl CageBuilder {
         self
     }
 
+    /// Adds a mount of either kind, applied in declaration order with the rest.
+    ///
+    /// The counterpart of [`get_mounts`](Self::get_mounts), for a caller that
+    /// holds a [`Mount`] rather than its parts: one read back from another
+    /// builder, or one assembled with [`Bind::new`]. A [`Mount::Bind`] is the
+    /// [`bind`](Self::bind) or [`bind_ro`](Self::bind_ro) its read-only flag
+    /// names, and a [`Mount::Raw`] is a [`raw_mount`](Self::raw_mount).
+    pub fn mount(mut self, mount: Mount) -> Self {
+        self.mounts.push(mount);
+        self
+    }
+
+    /// Adds mounts of either kind, in iteration order, after those already
+    /// configured.
+    ///
+    /// Repeated [`mount`](Self::mount) calls, so a sequence read back through
+    /// [`get_mounts`](Self::get_mounts) carries over whole, its order intact.
+    pub fn mounts<I>(mut self, mounts: I) -> Self
+    where
+        I: IntoIterator<Item = Mount>,
+    {
+        self.mounts.extend(mounts);
+        self
+    }
+
     /// Sets a resource limit on the command.
     ///
     /// The namespaces bound what the command can reach; a limit bounds what it
@@ -1752,12 +1796,12 @@ impl CageBuilder {
     /// (default `true`).
     ///
     /// Set to `false`, the sandbox carries exactly the mounts the caller
-    /// declared through [`bind`](Self::bind), [`bind_ro`](Self::bind_ro), and
-    /// [`raw_mount`](Self::raw_mount), and nothing else — no `/proc`, no
-    /// `/dev`, no `/tmp`, no `resolv.conf`. **A managed mount introduced in a
-    /// later release is suppressed too**, which is the point: the individual
-    /// toggles can only turn off the mounts that exist today, so they cannot
-    /// protect a consumer from one added tomorrow.
+    /// declared through [`bind`](Self::bind), [`bind_ro`](Self::bind_ro),
+    /// [`raw_mount`](Self::raw_mount), and [`mount`](Self::mount), and nothing
+    /// else — no `/proc`, no `/dev`, no `/tmp`, no `resolv.conf`. **A managed
+    /// mount introduced in a later release is suppressed too**, which is the
+    /// point: the individual toggles can only turn off the mounts that exist
+    /// today, so they cannot protect a consumer from one added tomorrow.
     ///
     /// That makes this the mount-side counterpart of
     /// [`base_env`](Self::base_env), and the setting for a consumer whose

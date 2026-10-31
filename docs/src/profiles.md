@@ -171,7 +171,8 @@ for bind in builder.get_binds() {
     );
 }
 // Or `get_mounts` for every mount in the order it will be applied, which is
-// what a reviewer needs when one mount covers another.
+// what a reviewer needs when one mount covers another. `mounts` takes the
+// sequence back, so a reviewed one carries over to another builder whole.
 for mount in builder.get_mounts() {
     println!("mounts at {}", mount.get_target().display());
 }

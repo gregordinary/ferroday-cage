@@ -56,6 +56,16 @@ name = "raw_mount"
 flags = ["--raw-mount"]
 
 [[builder.setting]]
+name = "mount"
+flags = ["--bind", "--ro-bind", "--raw-mount"]
+why = "A `Mount` of either kind, which the three mount flags spell one kind each; fcage collects them in command-line order and hands the sequence to `mounts`."
+
+[[builder.setting]]
+name = "mounts"
+flags = ["--bind", "--ro-bind", "--raw-mount"]
+why = "The sequence the three mount flags build, in the order they appear."
+
+[[builder.setting]]
 name = "managed_mounts"
 flags = ["--managed-mounts", "--no-managed-mounts"]
 

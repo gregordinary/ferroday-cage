@@ -520,6 +520,38 @@ fn a_directed_output_stream_refuses_a_capturing_launch() {
 }
 
 #[test]
+fn a_directory_on_a_standard_stream_is_refused_before_the_launch() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // A directory descriptor walks the host's filesystem by path, past the
+    // pivoted root, so a command handed one as a stream could reach anything
+    // the caller can. The launch refuses it on whichever stream it would land.
+    let dir = common::scratch_dir("stream-directory");
+    for expected in ["standard input", "standard output", "standard error"] {
+        let directory = Stdio::from_fd(
+            std::fs::File::open(&dir)
+                .expect("the scratch directory opens")
+                .into(),
+        );
+        let builder = Cage::builder().rootfs(rootfs).command("/bin/true");
+        let cage = match expected {
+            "standard input" => builder.stdin(directory),
+            "standard output" => builder.stdout(directory),
+            _ => builder.stderr(directory),
+        }
+        .build()
+        .expect("a stream is judged at the launch, not at build");
+        match cage.run() {
+            Err(ferroday_cage::Error::StreamIsDirectory { stream, .. }) => {
+                assert_eq!(stream, expected);
+            }
+            other => panic!("a directory on the {expected} was not refused: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn the_resolved_record_reports_each_stream_by_kind() {
     use ferroday_cage::ResolvedStdio;
 

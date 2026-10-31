@@ -47,7 +47,7 @@ external binary.
 | `debian` | Bootstrap a Debian suite and architecture straight from the archive — a `debootstrap` replacement that verifies the release signature, resolves the dependency closure itself, and configures the root in a sandbox |
 | `alpine` | Bootstrap an Alpine root from an apk repository — verifying each index signature, resolving the dependency closure itself, and running the install scripts in a sandbox. Serves postmarketOS's repositories too |
 | `gentoo` | Provision a Gentoo root from a signed stage3 and install prebuilt packages into it from the archive's binary-package host — the archive's own enumeration verified against a vendored keyring, the tarball held to a SHA-512 a signed document records, and each package held to the cleartext-signed `Manifest` inside it |
-| `netstack` | A native userspace TCP/IP stack giving the isolated network outbound IPv4 and IPv6, terminated in-process and forwarded over ordinary host sockets |
+| `netstack` | A native userspace TCP/IP stack giving the isolated network IPv4 and IPv6, outbound and through published ports, terminated in-process and forwarded over ordinary host sockets |
 | `serde` | The sandbox specification round-trips through profile files, including a restricted mode for profiles from an untrusted source |
 | `subid` | uid/gid range maps through the shadow suite's `newuidmap`/`newgidmap`, so a userland needing more than one identity works inside |
 

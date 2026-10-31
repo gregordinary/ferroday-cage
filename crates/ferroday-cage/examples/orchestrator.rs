@@ -52,7 +52,7 @@ use ferroday_cage::{Cage, CageBuilder, ConfigError, Error, Network};
 
 mod common;
 
-use common::{flag_value, into_string, usage_error, value_for};
+use common::{failure, flag_value, into_string, usage_error, value_for};
 
 const USAGE: &str = "\
 Run commands inside named, group-based sandbox profiles.
@@ -291,11 +291,10 @@ fn run_list(dir: &Path) -> ExitCode {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
-            eprintln!(
-                "orchestrator: cannot read profile directory {}: {err}",
-                dir.display()
+            return failure(
+                "orchestrator",
+                &format!("cannot read profile directory {}: {err}", dir.display()),
             );
-            return ExitCode::from(125);
         }
     };
 
@@ -340,8 +339,7 @@ fn run_group(
     let mut builder = match load_group(&path) {
         Ok(builder) => builder,
         Err(message) => {
-            eprintln!("orchestrator: {message}");
-            return ExitCode::from(125);
+            return failure("orchestrator", &message);
         }
     };
 

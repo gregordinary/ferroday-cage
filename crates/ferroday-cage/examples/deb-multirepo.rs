@@ -73,7 +73,7 @@ use ferroday_cage::{Cage, ConfigError, Error};
 
 mod common;
 
-use common::{flag_value, into_string, string_value, usage_error, value_for};
+use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
 
 /// The suite bootstrapped when `--suite` is not given.
 const DEFAULT_SUITE: &str = "trixie";
@@ -237,8 +237,10 @@ fn run(config: Config) -> ExitCode {
     let mut debian = match compose(&config) {
         Ok(debian) => debian,
         Err(error) => {
-            eprintln!("deb-multirepo: cannot configure the bootstrap: {error}");
-            return ExitCode::from(125);
+            return failure(
+                "deb-multirepo",
+                &format!("cannot configure the bootstrap: {error}"),
+            );
         }
     };
 
@@ -254,10 +256,10 @@ fn run(config: Config) -> ExitCode {
                 }
                 ExitCode::SUCCESS
             }
-            Err(error) => {
-                eprintln!("deb-multirepo: cannot resolve the plan: {error}");
-                ExitCode::from(125)
-            }
+            Err(error) => failure(
+                "deb-multirepo",
+                &format!("cannot resolve the plan: {error}"),
+            ),
         };
     }
 
@@ -269,8 +271,10 @@ fn run(config: Config) -> ExitCode {
             eprintln!("deb-multirepo: reusing {}", config.rootfs.display());
         }
         Err(error) => {
-            eprintln!("deb-multirepo: cannot provision the root: {error}");
-            return ExitCode::from(125);
+            return failure(
+                "deb-multirepo",
+                &format!("cannot provision the root: {error}"),
+            );
         }
     }
 

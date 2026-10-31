@@ -1014,6 +1014,21 @@ pub enum Error {
     /// nothing is wrong with the request: the same launch succeeds once something
     /// releases a terminal.
     TerminalsExhausted,
+    /// A launch would have handed the command a directory as one of its standard
+    /// streams, and refused before creating anything.
+    ///
+    /// A directory descriptor is a path as well as a stream. `/proc/self/fd/N`
+    /// and `openat(N, "..")` walk from it through the host's filesystem, past
+    /// the root the sandbox swapped in. The rule covers every stream a launch
+    /// hands over, whether [`Stdio::from_fd`](crate::Stdio::from_fd) supplied
+    /// it or [`Stdio::Inherit`](crate::Stdio::Inherit) passes on the caller's
+    /// own. See [`Stdio`](crate::Stdio).
+    #[non_exhaustive]
+    StreamIsDirectory {
+        /// The stream, as a short phrase: `"standard input"`,
+        /// `"standard output"`, or `"standard error"`.
+        stream: &'static str,
+    },
 }
 
 impl Error {
@@ -1142,6 +1157,11 @@ impl fmt::Display for Error {
                 "the host has no free pseudoterminal to allocate; /proc/sys/kernel/pty/max \
                  states the ceiling, less /proc/sys/kernel/pty/reserve for a sandbox's own",
             ),
+            Error::StreamIsDirectory { stream } => write!(
+                f,
+                "the command's {stream} would be a directory, which reaches the host's \
+                 filesystem by path; a launch hands no directory to the command"
+            ),
         }
     }
 }
@@ -1153,8 +1173,9 @@ impl std::error::Error for Error {
     /// them is returned here. The variants that answer `None` carry nothing:
     /// [`NestedUsernsBudgetExhausted`](Self::NestedUsernsBudgetExhausted),
     /// [`KeyQuotaExhausted`](Self::KeyQuotaExhausted),
-    /// [`SupervisorLost`](Self::SupervisorLost), and
-    /// [`TerminalsExhausted`](Self::TerminalsExhausted) are conditions the
+    /// [`SupervisorLost`](Self::SupervisorLost),
+    /// [`TerminalsExhausted`](Self::TerminalsExhausted), and
+    /// [`StreamIsDirectory`](Self::StreamIsDirectory) are conditions the
     /// library recognized rather than syscalls that failed.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

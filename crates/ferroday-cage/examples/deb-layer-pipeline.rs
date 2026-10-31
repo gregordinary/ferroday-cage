@@ -71,7 +71,7 @@ use ferroday_cage::{Cage, Network};
 
 mod common;
 
-use common::{flag_value, into_string, string_value, value_for};
+use common::{flag_value, into_string, string_value, usage_error, value_for};
 
 /// The suite bootstrapped when `--suite` is not given.
 const DEFAULT_SUITE: &str = "trixie";
@@ -180,11 +180,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Err(message) => {
-            eprintln!("deb-layer-pipeline: {message}");
-            eprintln!("Try 'deb-layer-pipeline --help' for usage.");
-            ExitCode::from(2)
-        }
+        Err(message) => usage_error("deb-layer-pipeline", &message),
     }
 }
 

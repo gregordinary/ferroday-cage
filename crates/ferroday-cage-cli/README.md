@@ -78,9 +78,16 @@ is never handed to the command. The command gets a pipe instead, and `fcage` cop
 the pipe and the file. Without that, the command could reopen the file through
 `/proc/self/fd` with more access than the stream carried, and rewrite it.
 
+A relayed stream behaves as a pipe does: the command cannot seek it or read the file's size.
+Input the command leaves unread stays in the file for the next reader, so
+`while read -r line; do fcage ...; done < list` reads the whole list. A pipe, a socket, or a
+character device such as a terminal is handed over as it is. Any other kind of stream, a
+directory among them, is refused before anything starts.
+
 The isolated network is loopback-only by default. `--netstack` attaches a native userspace
-TCP/IP stack for outbound IPv4 and IPv6 with no helper binary. `--share-net` gives the
-command the host's network instead.
+TCP/IP stack for IPv4 and IPv6 with no helper binary, outbound and to any port
+`--netstack-publish` opens on the host. `--share-net` gives the command the host's network
+instead.
 
 Other flags cover mounts and overlays, uid/gid range maps, resource limits, a pseudoterminal
 of the sandbox's own (`--terminal`), timeouts, and the environment. `fcage --help` lists
@@ -106,9 +113,10 @@ in both directions.
 | the command's own | the command ran and exited |
 | 128 + signal | the command was terminated by a signal |
 | 124 | `--timeout` expired |
-| 125 | the sandbox could not be built or launched |
+| 125 | the sandbox could not be built or launched, a standard stream was refused, or a relayed stream could not be read or delivered |
 | 126 | the command exists but could not be executed |
 | 127 | the command does not exist |
+| 141 | an export or a listing found its reader gone |
 | 2 | usage error |
 
 ## Requirements

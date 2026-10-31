@@ -79,7 +79,7 @@ use ferroday_cage::{Cage, ConfigError, Error, Network, SeccompPolicy};
 
 mod common;
 
-use common::{flag_value, into_string, string_value, usage_error, value_for};
+use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
 
 /// The suite bootstrapped when `--suite` is not given.
 const DEFAULT_SUITE: &str = "trixie";
@@ -362,38 +362,42 @@ fn report_interpreter(architecture: &str) -> Result<(), ExitCode> {
         // Either the host runs this architecture natively, in which case the
         // example demonstrates nothing, or no handler is registered for it.
         let host = provision::debian::host_architecture();
-        if host == architecture {
-            eprintln!(
-                "cross-arch-test: {architecture} is this host's own architecture, so nothing \
-                 here would be emulated; pass --architecture with a foreign one"
-            );
+        let reason = if host == architecture {
+            format!(
+                "{architecture} is this host's own architecture, so nothing here would be \
+                 emulated; pass --architecture with a foreign one"
+            )
         } else {
-            eprintln!(
-                "cross-arch-test: no qemu-user binfmt handler is registered for {architecture}; \
-                 install qemu-user-static and binfmt-support"
-            );
-        }
-        return Err(ExitCode::from(125));
+            format!(
+                "no qemu-user binfmt handler is registered for {architecture}; install \
+                 qemu-user-static and binfmt-support"
+            )
+        };
+        return Err(failure("cross-arch-test", &reason));
     };
     if !interpreter.enabled {
-        eprintln!(
-            "cross-arch-test: the qemu-{} binfmt handler is registered but disabled; enable it \
-             by writing 1 to /proc/sys/fs/binfmt_misc/qemu-{}",
-            interpreter.name, interpreter.name,
-        );
-        return Err(ExitCode::from(125));
+        return Err(failure(
+            "cross-arch-test",
+            &format!(
+                "the qemu-{} binfmt handler is registered but disabled; enable it by writing 1 \
+                 to /proc/sys/fs/binfmt_misc/qemu-{}",
+                interpreter.name, interpreter.name,
+            ),
+        ));
     }
     // The fix-binary flag makes the kernel hold the interpreter open from
     // registration, which is what keeps it working after the cage pivots into a
     // root where the interpreter's own path does not exist.
     if !interpreter.flags.contains('F') {
-        eprintln!(
-            "cross-arch-test: the qemu-{} binfmt handler lacks the fix-binary (F) flag, and its \
-             flags are {:?}; without F the interpreter is looked up inside the sandbox root, \
-             where it does not exist",
-            interpreter.name, interpreter.flags,
-        );
-        return Err(ExitCode::from(125));
+        return Err(failure(
+            "cross-arch-test",
+            &format!(
+                "the qemu-{} binfmt handler lacks the fix-binary (F) flag, and its flags are \
+                 {:?}; without F the interpreter is looked up inside the sandbox root, where it \
+                 does not exist",
+                interpreter.name, interpreter.flags,
+            ),
+        ));
     }
     eprintln!(
         "cross-arch-test: {architecture} runs through {} (flags {})",
@@ -439,8 +443,10 @@ fn provision(config: &Config) -> Result<(), ExitCode> {
         builder = builder.cache_dir(cache);
     }
     let mut debian = builder.build().map_err(|error| {
-        eprintln!("cross-arch-test: cannot configure the bootstrap: {error}");
-        ExitCode::from(125)
+        failure(
+            "cross-arch-test",
+            &format!("cannot configure the bootstrap: {error}"),
+        )
     })?;
     let mut progress = print_progress;
     match provision::ensure(&config.rootfs, &mut debian.observe(&mut progress)) {
@@ -455,10 +461,10 @@ fn provision(config: &Config) -> Result<(), ExitCode> {
         // A published root is reused silently, so the flags stay in an
         // invocation permanently at no cost after the first run.
         Ok(_) => Ok(()),
-        Err(error) => {
-            eprintln!("cross-arch-test: cannot provision the root: {error}");
-            Err(ExitCode::from(125))
-        }
+        Err(error) => Err(failure(
+            "cross-arch-test",
+            &format!("cannot provision the root: {error}"),
+        )),
     }
 }
 

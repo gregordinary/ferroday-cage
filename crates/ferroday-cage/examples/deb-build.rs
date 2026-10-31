@@ -79,7 +79,7 @@ use ferroday_cage::{Cage, ConfigError, Error, Network};
 
 mod common;
 
-use common::{flag_value, into_string, string_value, usage_error, value_for};
+use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
 
 /// The suite bootstrapped when `--suite` is not given.
 const DEFAULT_SUITE: &str = "trixie";
@@ -353,8 +353,10 @@ fn provision(config: &Config, control: &Path) -> Result<(), ExitCode> {
     }
 
     let mut debian = builder.build().map_err(|error| {
-        eprintln!("deb-build: cannot configure the bootstrap: {error}");
-        ExitCode::from(125)
+        failure(
+            "deb-build",
+            &format!("cannot configure the bootstrap: {error}"),
+        )
     })?;
     let mut progress = print_progress;
     match provision::ensure(&config.rootfs, &mut debian.observe(&mut progress)) {
@@ -365,10 +367,10 @@ fn provision(config: &Config, control: &Path) -> Result<(), ExitCode> {
         // A published root is reused silently, so the flags stay in an
         // invocation permanently at no cost after the first run.
         Ok(_) => Ok(()),
-        Err(error) => {
-            eprintln!("deb-build: cannot provision the build root: {error}");
-            Err(ExitCode::from(125))
-        }
+        Err(error) => Err(failure(
+            "deb-build",
+            &format!("cannot provision the build root: {error}"),
+        )),
     }
 }
 

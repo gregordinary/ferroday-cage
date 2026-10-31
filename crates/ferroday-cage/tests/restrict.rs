@@ -66,6 +66,28 @@ fn grant_system_trees(mut builder: RestrictionBuilder) -> RestrictionBuilder {
 }
 
 #[test]
+fn a_directory_on_a_standard_stream_is_refused() {
+    if !seccomp_supported() {
+        return;
+    }
+    // A restriction swaps no root, but a directory descriptor still hands the
+    // command a directory it could list whatever Landlock grants, so every
+    // launch refuses one, as a sandbox's does.
+    let dir = scratch("restrict-stream-directory");
+    let directory = std::fs::File::open(&dir).expect("the scratch directory opens");
+    let restriction = Restriction::builder()
+        .command("/bin/true")
+        .seccomp(SeccompPolicy::Curated)
+        .stdin(Stdio::from_fd(directory.into()))
+        .build()
+        .expect("a stream is judged at the launch, not at build");
+    match restriction.run() {
+        Err(Error::StreamIsDirectory { stream, .. }) => assert_eq!(stream, "standard input"),
+        other => panic!("a directory on standard input was not refused: {other:?}"),
+    }
+}
+
+#[test]
 fn landlock_allows_a_granted_path_and_denies_the_rest() {
     if !landlock_supported() {
         return;

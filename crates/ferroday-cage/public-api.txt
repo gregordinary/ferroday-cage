@@ -1620,6 +1620,8 @@ pub ferroday_cage::Error::Setup::step: ferroday_cage::SetupStep
 pub ferroday_cage::Error::Signal::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::Spawn
 pub ferroday_cage::Error::Spawn::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::Error::StreamIsDirectory
+pub ferroday_cage::Error::StreamIsDirectory::stream: &'static str
 pub ferroday_cage::Error::SupervisorLost
 #[non_exhaustive] pub ferroday_cage::Error::Terminal
 pub ferroday_cage::Error::Terminal::source: core::io::error::Error
@@ -2107,9 +2109,11 @@ pub fn ferroday_cage::CageBuilder::hostname(self, impl core::convert::AsRef<std:
 pub fn ferroday_cage::CageBuilder::id_mapper(self, impl ferroday_cage::IdMapper + 'static) -> Self
 pub fn ferroday_cage::CageBuilder::identity_map(self, ferroday_cage::IdentityMap) -> Self
 pub fn ferroday_cage::CageBuilder::managed_mounts(self, bool) -> Self
+pub fn ferroday_cage::CageBuilder::mount(self, ferroday_cage::Mount) -> Self
 pub fn ferroday_cage::CageBuilder::mount_dev(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::mount_proc(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::mount_tmp(self, bool) -> Self
+pub fn ferroday_cage::CageBuilder::mounts<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::Mount>
 pub fn ferroday_cage::CageBuilder::network(self, ferroday_cage::Network) -> Self
 pub fn ferroday_cage::CageBuilder::overlay(self, ferroday_cage::Overlay) -> Self
 pub fn ferroday_cage::CageBuilder::overlay_rootfs(self, impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> Self
@@ -2155,8 +2159,10 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::DirectMapper
 pub struct ferroday_cage::ExitStatus(_)
 impl ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::code(&self) -> core::option::Option<i32>
+pub fn ferroday_cage::ExitStatus::exited(i32) -> ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::shell_code(&self) -> u8
 pub fn ferroday_cage::ExitStatus::signal(&self) -> core::option::Option<i32>
+pub fn ferroday_cage::ExitStatus::signaled(i32) -> ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::success(&self) -> bool
 impl core::fmt::Display for ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

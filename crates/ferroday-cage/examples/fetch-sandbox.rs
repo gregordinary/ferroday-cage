@@ -44,7 +44,7 @@ use ferroday_cage::{Cage, Error, NetStack, NetStackError};
 
 mod common;
 
-use common::value_for;
+use common::{failure, usage_error, value_for};
 
 /// The fetch tool, addressed by absolute path: the cage does not resolve the
 /// command against `PATH`.
@@ -86,17 +86,15 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Err(message) => {
-            eprintln!("fetch-sandbox: {message}");
-            eprintln!("Try 'fetch-sandbox --help' for usage.");
-            return ExitCode::from(2);
-        }
+        Err(message) => return usage_error("fetch-sandbox", &message),
     };
 
     // Provision the Alpine root from the tarball if it is not already there.
     if let Err(error) = provision::ensure(&options.rootfs, &mut Tarball::new(&options.tarball)) {
-        eprintln!("fetch-sandbox: provisioning the rootfs failed: {error}");
-        return ExitCode::from(125);
+        return failure(
+            "fetch-sandbox",
+            &format!("provisioning the rootfs failed: {error}"),
+        );
     }
 
     match fetch(&options) {
@@ -110,10 +108,10 @@ fn main() -> ExitCode {
             eprintln!("fetch-sandbox: {error}");
             ExitCode::from(error.shell_code())
         }
-        Err(FetchFailure::Stack(error)) => {
-            eprintln!("fetch-sandbox: the network stack could not be attached: {error}");
-            ExitCode::from(125)
-        }
+        Err(FetchFailure::Stack(error)) => failure(
+            "fetch-sandbox",
+            &format!("the network stack could not be attached: {error}"),
+        ),
     }
 }
 

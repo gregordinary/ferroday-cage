@@ -77,7 +77,7 @@ use ferroday_cage::{Cage, ConfigError, Error, IdentityMap, Network};
 
 mod common;
 
-use common::{flag_value, into_string, string_value, usage_error, value_for};
+use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
 
 /// Where the host portage tree is bound, read-only, inside the sandbox.
 const REPO_DEST: &str = "/var/db/repos/gentoo";
@@ -323,8 +323,7 @@ fn run(config: Config) -> ExitCode {
             match builder.build() {
                 Ok(gentoo) => Some(Source::Archive(Box::new(gentoo), variant.clone())),
                 Err(error) => {
-                    eprintln!("ebuild-sandbox: {error}");
-                    return ExitCode::from(125);
+                    return failure("ebuild-sandbox", &error.to_string());
                 }
             }
         }
@@ -358,8 +357,10 @@ fn run(config: Config) -> ExitCode {
             // invocation permanently at no cost after the first run.
             Ok(_) => {}
             Err(error) => {
-                eprintln!("ebuild-sandbox: cannot provision the stage3: {error}");
-                return ExitCode::from(125);
+                return failure(
+                    "ebuild-sandbox",
+                    &format!("cannot provision the stage3: {error}"),
+                );
             }
         }
     } else if !config.rootfs.is_dir() {

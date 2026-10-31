@@ -27,6 +27,11 @@ consumer upgrading can skip it.
 
 ### Security
 
+- Every launch, of a sandbox or a restriction, refuses a directory on a standard
+  stream it hands to the command, with the new `Error::StreamIsDirectory`. A
+  directory descriptor, inherited or given through `Stdio::from_fd`, let the
+  command walk the host's filesystem from it by path, past the sandbox's root.
+  The launch refuses one before it creates anything.
 - Every launch, of a sandbox or a restriction, gives the command a fresh session
   keyring in place of the caller's. A sandboxed command previously inherited the
   caller's session keyring, so it possessed, and could read through `keyctl`,
@@ -36,9 +41,15 @@ consumer upgrading can skip it.
   through a pipe rather than handed to the command. A command could previously
   reopen such a file through `/proc/self/fd` with more access than the stream
   carried: rewrite a file given as standard input, or read back and truncate a
-  log opened for appending. A relayed standard input puts the command in a
-  session of its own, as `--stdin null` does, and a relay that cannot deliver
-  the command's output exits 125.
+  log opened for appending. Input the command does not read is returned to the
+  file, so the next reader starts where the command stopped, and two output
+  streams on one file keep the order the command wrote in. A relayed standard
+  input puts the command in a session of its own, as `--stdin null` does. A
+  stream that is neither a pipe, a socket, a character device, nor a file, such
+  as a directory, is refused. A refused stream, and a relay that cannot read the
+  input or deliver the output, exit 125. `fcage` is not dumpable during a
+  restricted run, so a restricted command cannot reopen the file through
+  `fcage`'s own descriptors.
 - An overlay layer path holding a `\` names the directory it names. Overlayfs
   unescapes every layer path it is given, so an upper written `up\x` was
   mounted as `upx`, and the sandbox's writes landed in a directory other than
@@ -122,22 +133,31 @@ consumer upgrading can skip it.
   `SetupStep::ReplaceSessionKeyring`, the step that replaces it.
 - `SetupStep::AllocateTerminal` and `SetupStep::SendTerminal`, the steps a
   terminal launch's allocation now reports under.
+- `CageBuilder::mount` and `CageBuilder::mounts`, which add a `Mount` of either
+  kind to the one mount sequence, so a sequence read back through `get_mounts`
+  carries over to another builder whole.
 - `ConfigError::OverlayOptionsTooLong`, refusing an overlay whose mount options
   exceed the 4095 bytes `mount(2)` passes on whole. The kernel cut a longer
   string short, and the remainder could mount a different work directory.
 - `ConfigError::IdentityMapUnavailable::source`, the configured identity-map
   delegate's own error, which `source()` now returns.
+- `ExitStatus::exited` and `ExitStatus::signaled`, which build the status a
+  command would report, for a caller that reports an outcome of its own in the
+  same convention.
 - `NetStackBuilder::host_loopback_port`, which maps connections to the gateway
   address on one port onto host loopback, where `host_loopback(true)` maps every
   port. The two combine. `fcage`: `--netstack-host-port PORT`.
 - `NetStackBuilder::publish`, which publishes a TCP port of the guest on a host
   address: `attach` listens there and carries each accepted connection to the
-  guest. `NetStackHandle::published` reports the bound addresses, including a
-  port the kernel chose for port 0. `NetStackError::PublishInvalid` refuses a
-  publication at build, and `NetStackError::Publish` reports a listener that
-  could not bind. The profile keys are `host-loopback-ports` and `[[publish]]`
-  tables of `host` and `guest-port`. `fcage`: `--netstack-publish HOST
-  GUEST_PORT`, which reports a kernel-chosen port on standard error.
+  guest. Published connections count against a budget of their own, 128 at
+  once, so a peer holding them open cannot exhaust the guest's outbound
+  connections. `NetStackHandle::published` reports the bound addresses,
+  including a port the kernel chose for port 0. `NetStackError::PublishInvalid`
+  refuses a publication at build, and `NetStackError::Publish` reports a
+  listener that could not bind. The profile keys are `host-loopback-ports` and
+  `[[publish]]` tables of `host` and `guest-port`. `fcage`: `--netstack-publish
+  HOST GUEST_PORT`, which reports a kernel-chosen port on standard error and
+  refuses a guest port of 0 as a usage error.
 - `DebianBuilder::source_date_epoch`, which gives every maintainer script
   `SOURCE_DATE_EPOCH`, so the accounts a bootstrap creates record the epoch's
   day in `/etc/shadow` rather than the day it ran. A negative epoch is refused
@@ -146,8 +166,10 @@ consumer upgrading can skip it.
   `SOURCE_DATE_EPOCH` and dates the accounts a bootstrap creates by the epoch's
   day. busybox's `adduser` reads the clock whatever the environment says, so the
   days the run wrote into `/etc/shadow` and `/etc/shadow-` are rewritten once
-  the scripts have run. A negative epoch is refused at `build`. `fcage`:
-  `--alpine-source-date-epoch EPOCH`.
+  the scripts have run. An epoch in the first day of 1970 records no day, as
+  `useradd` does. A negative epoch is refused at `build`. `fcage`:
+  `--alpine-source-date-epoch EPOCH`, which refuses a negative epoch as a usage
+  error.
 - `debian::PlannedPackage::size` records the length of the `.deb`, written as
   `Size` in a plan document. Installing a plan holds each download to it.
 - `DebianError::Cancelled`, which `Debian::observe(..).resolve()` and
@@ -271,6 +293,13 @@ consumer upgrading can skip it.
 - `NetStackBuilder::build` refuses an interface name holding a vertical tab or
   the byte `0xA0`, which the kernel refuses, rather than failing at `attach` as
   `TapCreate`.
+- `fcage --export-rootfs` and `--export-to` refuse a value spelled as another
+  flag, as every other flag does. `--export-to --clamp-mtime=0` wrote an archive
+  named `--clamp-mtime=0`, without the clamp, and exited 0.
+- `fcage` no longer suggests a joined `--flag=VALUE` form for `--bind`,
+  `--ro-bind`, or `--setenv`, which take two values and have none.
+- `fcage --timeout` and `--kill-after` refuse a number of seconds too small to
+  be a nanosecond, which rounded to no time at all.
 - A provisioner's host-side read of a file inside a tree no longer waits on a
   named pipe left at that path. Opening one for reading waited for a writer that
   never came, which stalled the bootstrap for good. It is now refused, as any
@@ -341,6 +370,7 @@ consumer upgrading can skip it.
 - The Gentoo layer checks a path component with `path::is_ordinary_component`,
   and splits a name from its version through one `version::version_hyphen` that
   the package-name rule shares.
+- `fcage` and the examples state their exit codes once each.
 - `lzma-rust2` moves to 0.23, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the
   sans-I/O decoder to apply the limit is gone. The cap, and what an archive over

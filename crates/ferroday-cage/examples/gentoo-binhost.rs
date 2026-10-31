@@ -104,7 +104,7 @@ use ferroday_cage::provision::{Provision, ProvisionEvent};
 use ferroday_cage::{Cage, Error};
 
 mod common;
-use common::{flag_value, into_string, string_value, usage_error, value_for};
+use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
 
 /// The program name in diagnostics and usage.
 const PROGRAM: &str = "gentoo-binhost";
@@ -130,10 +130,7 @@ fn main() -> ExitCode {
     };
     match run(options) {
         Ok(code) => code,
-        Err(message) => {
-            eprintln!("{PROGRAM}: {message}");
-            ExitCode::from(125)
-        }
+        Err(message) => failure(PROGRAM, &message),
     }
 }
 

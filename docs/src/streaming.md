@@ -205,7 +205,8 @@ Each of the three standard streams has a disposition of its own, set with
 - **`Stdio::Null`** — `/dev/null`: immediate end-of-file on standard input, for
   a batch run that must not compete with the caller for input, and a discard on
   the output pair.
-- **[`Stdio::from_fd`]** — a descriptor the caller supplies.
+- **[`Stdio::from_fd`]** — a descriptor the caller supplies. A directory is
+  refused, as [below](#a-stream-that-is-a-directory) explains.
 
 `Inherit` states no *destination*. It is the absence of a choice rather than a
 choice of the caller's descriptors, which is what lets a capturing launch supply
@@ -301,12 +302,29 @@ swapped root changes that.
 A Landlock grant closes it. The reopened file lies outside every grant, so the
 kernel refuses the open. Without Landlock, a caller that means only a file's
 bytes to cross hands the command a pipe instead. It then copies between the pipe
-and the file itself. `fcage` does exactly that for a standard stream that is a
-regular file or a block device.
+and the file itself.
+
+`fcage` does exactly that for a standard stream that is a regular file or a
+block device. It returns the input the command did not read to the file, so the
+next reader starts where the command stopped.
 
 A pipe, a socket, and `/dev/null` carry no such reach. Reopening a pipe reaches
 the same pipe, and a socket cannot be reopened at all. A terminal is the subject
 of [the section above](#the-dispositions-and-the-callers-terminal).
+
+### A stream that is a directory
+
+A directory descriptor reaches further than the directory. `/proc/self/fd/N`
+and `openat(N, "..")` walk from it through the host's filesystem, past the
+sandbox's root. So every launch, of a sandbox or a restriction, refuses a
+directory on any stream it hands over. It fails with `Error::StreamIsDirectory`,
+which names the stream, before it creates anything.
+
+The rule covers `Stdio::Inherit` and `Stdio::from_fd` alike. `Inherit` hands
+over whatever the caller's own descriptor names when the launch runs, so the
+check runs then rather than at `build`. A stream the launch replaces is not
+examined: `Stdio::Null`, the output pair of a capturing launch, and all three
+streams of a terminal launch.
 
 ### Feeding the command input
 

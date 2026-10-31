@@ -1231,6 +1231,39 @@ fn a_builder_reads_back_what_it_was_given() {
 }
 
 #[test]
+fn a_mount_sequence_carries_over_to_another_builder_whole() {
+    // `get_mounts` reads the mounts back as one sequence and `mounts` takes
+    // one, so a sequence a consumer reviewed moves to another builder with its
+    // order, and each bind's read-only flag, intact.
+    let reviewed = Cage::builder()
+        .bind("/home/user/project", "/build")
+        .raw_mount(RawMount::new("/sys").fstype("sysfs").flags(0xE))
+        .bind_ro("/home/user/cache", "/cache");
+    let copied = Cage::builder()
+        .mount(ferroday_cage::Mount::Raw(
+            RawMount::new("/scratch").fstype("tmpfs"),
+        ))
+        .mounts(reviewed.get_mounts().iter().cloned());
+
+    let targets: Vec<_> = copied
+        .get_mounts()
+        .iter()
+        .map(|mount| mount.get_target())
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            Path::new("/scratch"),
+            Path::new("/build"),
+            Path::new("/sys"),
+            Path::new("/cache"),
+        ],
+    );
+    let read_only: Vec<bool> = copied.get_binds().map(|bind| bind.is_read_only()).collect();
+    assert_eq!(read_only, [false, true]);
+}
+
+#[test]
 fn an_overlay_root_reads_back_through_the_overlay_accessor() {
     let builder = Cage::builder()
         .overlay_rootfs("/srv/base", "/srv/scratch/run-1")

@@ -40,9 +40,12 @@ serde = "1.0"
 syscalls = { version = "0.8", default-features = false }
 # The two ambient readings `--terminal` makes of the terminal `fcage` was
 # started from: whether it is one, and what size it reports. The relay itself is
-# the library's, and needs nothing here. `event` is the poll the stream relays
-# wait in, for a standard stream that is a file.
-rustix = { version = "1.1.4", features = ["stdio", "termios", "event"] }
+# the library's, and needs nothing here. The rest serve the relay for a standard
+# stream that is a file: `fs` judges a stream's kind and `stdio` names the
+# streams, `event` is the poll the relays wait in, `pipe` bounds the input
+# relay's read-ahead, and `process` makes `fcage` non-dumpable for a restricted
+# launch. The library enables every one of them, so none adds to the build.
+rustix = { version = "1.1.4", features = ["stdio", "termios", "event", "fs", "pipe", "process"] }
 
 [dev-dependencies]
 # The workspace's shared test fixtures. The relay's tests need the rootfs and a

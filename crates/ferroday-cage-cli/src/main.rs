@@ -58,10 +58,42 @@ use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ExitStatus, FsAccess, IdRange, Identity,
     IdentityMap, Limit, Mount, NetAccess, NetStack, Network, Overlay, RawMount, Resource,
-    RestrictedProfile, Restriction, Running, SeccompArg, SeccompArgLen, SeccompCompare,
-    SeccompPolicy, SeccompRules, Stdio,
+    RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen,
+    SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
 };
 use serde::Deserialize as _;
+
+/// The exit code of a command line `fcage` cannot understand.
+const USAGE: u8 = 2;
+
+/// `timeout(1)`'s exit code for an expired `--timeout`, whatever became of the
+/// command afterwards.
+const TIMED_OUT: u8 = 124;
+
+/// The exit code of a failure of `fcage`'s own: a sandbox it could not build or
+/// launch, a root filesystem it could not provision, a stream it refused or
+/// could not relay.
+///
+/// [`Error::shell_code`] answers 125 for every launch failure but the exec
+/// step's. This is the same code for the failures that are not an [`Error`], so
+/// a script reads one code for "`fcage` failed" whatever part of it failed.
+const FAILED: u8 = 125;
+
+/// Reports a failure of `fcage`'s own on standard error, and returns
+/// [`FAILED`].
+fn fail(message: impl std::fmt::Display) -> ExitCode {
+    eprintln!("fcage: {message}");
+    ExitCode::from(FAILED)
+}
+
+/// The exit code of a writer whose reader went away: what a process `SIGPIPE`
+/// killed exits with, which is what a shell expects of a pipeline's early end.
+///
+/// Rust ignores `SIGPIPE`, so the write fails with `EPIPE` instead of the
+/// process dying of the signal, and the code is reported for it.
+fn broken_pipe() -> u8 {
+    ExitStatus::signaled(rustix::process::Signal::PIPE.as_raw()).shell_code()
+}
 
 /// What follows a flag's name on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,9 +102,9 @@ enum Arity {
     Bare,
     /// One value, written `--flag VALUE` or `--flag=VALUE`.
     One,
-    /// Two, written `--flag FIRST SECOND`. Only the mount and environment
-    /// flags take a pair, and none of them has a joined form: `--bind=A B`
-    /// would put one of the two on the wrong side of the `=`.
+    /// Two, written `--flag FIRST SECOND`. Only the bind, environment, and
+    /// publication flags take a pair, and none of them has a joined form:
+    /// `--bind=A B` would put one of the two on the wrong side of the `=`.
     Two,
 }
 
@@ -504,7 +536,8 @@ const FLAGS: &[Flag] = &[
             "the day the bootstrap ran",
         ],
         take: Take::One(|options, flag, value| {
-            options.debian_source_date_epoch = Some(parse_epoch(flag, &into_string(flag, value)?)?);
+            options.debian_source_date_epoch =
+                Some(parse_source_date_epoch(flag, &into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -757,7 +790,8 @@ const FLAGS: &[Flag] = &[
             "day the bootstrap ran",
         ],
         take: Take::One(|options, flag, value| {
-            options.alpine_source_date_epoch = Some(parse_epoch(flag, &into_string(flag, value)?)?);
+            options.alpine_source_date_epoch =
+                Some(parse_source_date_epoch(flag, &into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -1441,9 +1475,10 @@ const FLAGS: &[Flag] = &[
         long: "--netstack",
         section: Section::Networking,
         help: &[
-            "Attach the native userspace network stack: outbound",
-            "IPv4 and IPv6 for the isolated network, forwarded over",
-            "host sockets with no external helper. Composes the",
+            "Attach the native userspace network stack: IPv4 and",
+            "IPv6 for the isolated network, outbound and to any",
+            "--netstack-publish port, carried over host sockets",
+            "with no external helper. Composes the",
             "sandbox's resolv.conf from the host's routable",
             "nameservers unless --no-resolv-conf or",
             "--no-managed-mounts is given; a host with only loopback",
@@ -1542,10 +1577,11 @@ const FLAGS: &[Flag] = &[
         section: Section::Networking,
         help: &[
             "Map connections to the gateway address onto the host's",
-            "127.0.0.1, port preserved, to reach a service bound",
-            "there (off by default; every other loopback destination",
-            "stays blocked, including a resolver on another loopback",
-            "address such as systemd-resolved's 127.0.0.53 stub)",
+            "loopback, 127.0.0.1 or ::1, port preserved, to reach a",
+            "service bound there (off by default; every other loopback",
+            "destination stays blocked, including a resolver on",
+            "another loopback address such as systemd-resolved's",
+            "127.0.0.53 stub)",
         ],
         take: Take::Bare(|options| {
             options.netstack_host_loopback = true;
@@ -1558,7 +1594,7 @@ const FLAGS: &[Flag] = &[
         placeholder: "PORT",
         help: &[
             "Map connections to the gateway address on PORT alone",
-            "onto the host's 127.0.0.1, the narrower form of",
+            "onto the host's loopback, the narrower form of",
             "--netstack-host-loopback (repeatable; TCP and UDP)",
         ],
         take: Take::One(|options, flag, value| {
@@ -1583,6 +1619,15 @@ const FLAGS: &[Flag] = &[
         take: Take::Two(|options, flag, value, second| {
             let host = parse_publish_host(&into_string(flag, value)?)?;
             let guest_port = parse_port(flag, &into_string(flag, second)?)?;
+            // The library refuses it at build; refused here, it is the usage
+            // error it is. Port 0 on the host side asks the kernel for a free
+            // port, and the guest side has no such meaning.
+            if guest_port == 0 {
+                return Err(format!(
+                    "{flag}: the guest port must not be 0; it names the port the \
+                     sandbox's service listens on"
+                ));
+            }
             options.netstack_publish.push((host, guest_port));
             Ok(())
         }),
@@ -1994,15 +2039,20 @@ no sandbox root for HOME to name. --no-base-env drops the base either way.
 A standard stream that is a regular file or a block device is not handed
 to the command. It gets a pipe instead, and fcage copies between the pipe
 and the file, so the command cannot reopen the file through /proc/self/fd
-with more access than the stream carried. A relayed standard input also
-puts the command in a session of its own, as --stdin null does.
+with more access than the stream carried. The command cannot seek such a
+stream or read its size. Input it does not read stays in the file for the
+next reader, and a relayed standard input puts the command in a session
+of its own, as --stdin null does. A pipe, a socket, or a character device
+is handed over as it is, and any other kind of stream, such as a
+directory, is refused.
 
 Exit status: the command's own exit code, or 128 plus the signal number
 when it is terminated by a signal, or 124 when --timeout expires. fcage
-itself exits 125 when the sandbox cannot be built or launched, or when a
-relayed stream could not be delivered, 126 when the command exists but
-cannot be executed, 127 when the command does not exist, and 2 on usage
-errors.
+itself exits 125 when the sandbox cannot be built or launched, when a
+standard stream is refused, or when a relayed stream could not be read or
+delivered; 126 when the command exists but cannot be executed; 127 when
+the command does not exist; 141 when an export or a listing finds its
+reader gone; and 2 on usage errors.
 ";
 
 /// A parsed command line.
@@ -2493,13 +2543,13 @@ fn apply_flag(
         Take::One(set) => {
             let value = match joined {
                 Some(value) => value,
-                None => value_for(flag.long, flag.needs, args)?,
+                None => value_for(flag.long, flag.needs, Arity::One, args)?,
             };
             set(options, flag.long, value)
         }
         Take::Two(set) => {
-            let first = value_for(flag.long, flag.needs, args)?;
-            let second = value_for(flag.long, flag.needs, args)?;
+            let first = value_for(flag.long, flag.needs, Arity::Two, args)?;
+            let second = value_for(flag.long, flag.needs, Arity::Two, args)?;
             set(options, flag.long, first, second)
         }
         // A flag of another mode, written before the command of a launch. The
@@ -2566,7 +2616,7 @@ fn main() -> ExitCode {
         Err(message) => {
             eprintln!("fcage: {message}");
             eprintln!("Try 'fcage --help' for usage.");
-            ExitCode::from(2)
+            ExitCode::from(USAGE)
         }
     }
 }
@@ -3014,6 +3064,7 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
             dest = Some(PathBuf::from(value_for(
                 "--remove-rootfs",
                 "a value",
+                Arity::One,
                 &mut args,
             )?));
         } else if let Some(value) = flag_value(&arg, b"--remove-rootfs=") {
@@ -3211,6 +3262,7 @@ fn parse_gentoo_installed(args: Vec<OsString>) -> Result<Invocation, String> {
             root = Some(PathBuf::from(value_for(
                 "--gentoo-installed",
                 "a value",
+                Arity::One,
                 &mut args,
             )?));
         } else if let Some(value) = flag_value(&arg, b"--gentoo-installed=") {
@@ -3251,17 +3303,21 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
 
     while let Some(arg) = args.next() {
         if arg == "--export-rootfs" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--export-rootfs requires a value".to_string())?;
-            source = Some(PathBuf::from(value));
+            source = Some(PathBuf::from(value_for(
+                "--export-rootfs",
+                "a value",
+                Arity::One,
+                &mut args,
+            )?));
         } else if let Some(value) = flag_value(&arg, b"--export-rootfs=") {
             source = Some(PathBuf::from(value));
         } else if arg == "--export-to" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--export-to requires a value".to_string())?;
-            dest = Some(PathBuf::from(value));
+            dest = Some(PathBuf::from(value_for(
+                "--export-to",
+                "a value",
+                Arity::One,
+                &mut args,
+            )?));
         } else if let Some(value) = flag_value(&arg, b"--export-to=") {
             dest = Some(PathBuf::from(value));
         } else if arg == "--identity-map" {
@@ -3307,17 +3363,33 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
 }
 
 /// Parses the Unix timestamp in seconds that `flag` takes: `--clamp-mtime`'s
-/// ceiling, or the date `--debian-source-date-epoch` and
-/// `--alpine-source-date-epoch` give a bootstrap.
+/// ceiling, or the date a bootstrap's `--*-source-date-epoch` gives it.
 ///
 /// Signed, because the ceiling is a plain timestamp rather than a duration and
-/// a tree may legitimately be pinned to an instant before the epoch. Each
-/// bootstrap refuses a negative date when it is built, with the library's
-/// reason, so the three flags share this parse and differ only there.
+/// a tree may legitimately be pinned to an instant before the epoch.
 fn parse_epoch(flag: &str, value: &str) -> Result<i64, String> {
     value
         .parse::<i64>()
         .map_err(|_| format!("{flag}: {value:?} is not a Unix timestamp in whole seconds"))
+}
+
+/// Parses the date a `--debian-source-date-epoch` or `--alpine-source-date-epoch`
+/// gives a bootstrap: a timestamp, as [`parse_epoch`] reads one, that is not
+/// negative.
+///
+/// Each bootstrap refuses a negative date when it is built, because the account
+/// tools read `SOURCE_DATE_EPOCH` as an unsigned count. Refused here too, so the
+/// mistake is the usage error it is rather than a bootstrap that cannot be
+/// built.
+fn parse_source_date_epoch(flag: &str, value: &str) -> Result<i64, String> {
+    let epoch = parse_epoch(flag, value)?;
+    if epoch < 0 {
+        return Err(format!(
+            "{flag}: {epoch} is before 1970, and the tools that read SOURCE_DATE_EPOCH \
+             take it as an unsigned count of seconds"
+        ));
+    }
+    Ok(epoch)
 }
 
 /// Whether any `--debian-*` modifier flag was given.
@@ -3939,20 +4011,29 @@ fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
 /// dash is still the caller's: `--gentoo-prefer-use -systemd` states a
 /// preference against a flag and means what it looks like. A value that
 /// genuinely is a flag's spelling is written joined, as `--export-to=--odd`.
+/// `arity` decides whether the refusal offers that: a flag taking two values
+/// has no joined form, so its refusal does not suggest one.
 fn value_for(
     name: &str,
     needs: &str,
+    arity: Arity,
     args: &mut dyn Iterator<Item = OsString>,
 ) -> Result<OsString, String> {
     let value = args
         .next()
         .ok_or_else(|| format!("{name} requires {needs}"))?;
     if named(&value).is_some() {
-        return Err(format!(
-            "{name} requires {needs}, and {} names a flag; write it joined as \
-             {name}=VALUE where it is the value",
-            value.to_string_lossy(),
-        ));
+        let value = value.to_string_lossy();
+        return Err(match arity {
+            Arity::Two => format!(
+                "{name} requires {needs}, and {value} names a flag; {name} has no joined \
+                 form, so neither of its values can be spelled as a flag"
+            ),
+            Arity::Bare | Arity::One => format!(
+                "{name} requires {needs}, and {value} names a flag; write it joined as \
+                 {name}=VALUE where it is the value"
+            ),
+        });
     }
     Ok(value)
 }
@@ -3965,7 +4046,7 @@ fn value_for(
 /// argument-parsing functions would mean publishing a crate for them. Each side
 /// owns the wording of its own diagnostics.
 fn string_value(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<String, String> {
-    into_string(name, value_for(name, "a value", args)?)
+    into_string(name, value_for(name, "a value", Arity::One, args)?)
 }
 
 /// Converts a flag value to a `String`, requiring UTF-8.
@@ -4202,14 +4283,17 @@ fn assemble_seccomp(
     Ok(Some(SeccompPolicy::Rules(policy)))
 }
 
-/// Parses a TCP port for a `--landlock-bind` or `--landlock-connect` grant.
+/// Parses a port number: a `--landlock-bind` or `--landlock-connect` grant's
+/// TCP port, a `--netstack-host-port` mapping's TCP and UDP port, or the guest
+/// side of a `--netstack-publish`.
 ///
-/// The value is a decimal port in `0..=65535`; port 0 with `--landlock-bind`
-/// permits binding to a kernel-assigned ephemeral port.
+/// The value is a decimal port in `0..=65535`. What port 0 means is each flag's
+/// own: with `--landlock-bind` it permits binding to a kernel-assigned
+/// ephemeral port.
 fn parse_port(flag: &str, value: &str) -> Result<u16, String> {
     value
         .parse::<u16>()
-        .map_err(|_| format!("{flag} requires a TCP port in 0..=65535, not {value:?}"))
+        .map_err(|_| format!("{flag} requires a port in 0..=65535, not {value:?}"))
 }
 
 /// Parses a comma-separated `--keep-caps` list into capabilities.
@@ -4235,7 +4319,14 @@ fn parse_seconds(name: &str, value: &OsStr) -> Result<Duration, String> {
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err(format!("{name} requires a positive number of seconds"));
     }
-    Duration::try_from_secs_f64(seconds).map_err(|_| format!("{name} is too large"))
+    let duration =
+        Duration::try_from_secs_f64(seconds).map_err(|_| format!("{name} is too large"))?;
+    // A positive number below a nanosecond rounds to no time at all, which
+    // would expire before the command started.
+    if duration.is_zero() {
+        return Err(format!("{name} requires at least a nanosecond"));
+    }
+    Ok(duration)
 }
 
 /// What the CLI needs to know about a loaded profile beyond the builder itself.
@@ -4359,10 +4450,7 @@ fn remove_rootfs(dest: &Path, map: IdentityMap, remove_lock: bool) -> ExitCode {
         .run()
     {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            ExitCode::from(125)
-        }
+        Err(error) => fail(error),
     }
 }
 
@@ -4397,22 +4485,18 @@ fn export_rootfs(
     if dest.is_none() && std::io::stdout().is_terminal() {
         eprintln!("fcage: refusing to write an archive to the terminal");
         eprintln!("Try '--export-to FILE', or pipe the output into a compressor.");
-        return ExitCode::from(2);
+        return ExitCode::from(USAGE);
     }
 
     match std::fs::metadata(source) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
-            eprintln!(
-                "fcage: cannot export {}: it is not a directory",
+            return fail(format_args!(
+                "cannot export {}: it is not a directory",
                 source.display(),
-            );
-            return ExitCode::from(125);
+            ));
         }
-        Err(error) => {
-            eprintln!("fcage: cannot export {}: {error}", source.display());
-            return ExitCode::from(125);
-        }
+        Err(error) => return fail(format_args!("cannot export {}: {error}", source.display())),
     }
     // Only a directory standing where the archive goes is refused here. Every
     // other destination failure belongs to the publish step, which stages beside
@@ -4422,11 +4506,10 @@ fn export_rootfs(
     if let Some(path) = dest
         && std::fs::metadata(path).is_ok_and(|meta| meta.is_dir())
     {
-        eprintln!(
-            "fcage: cannot write the archive to {}: it is a directory",
+        return fail(format_args!(
+            "cannot write the archive to {}: it is a directory",
             path.display(),
-        );
-        return ExitCode::from(125);
+        ));
     }
 
     let mut export = ferroday_cage::provision::Export::new(source).map(map);
@@ -4452,12 +4535,9 @@ fn export_rootfs(
         Err(ferroday_cage::provision::ProvisionError::Io { source, .. })
             if dest.is_none() && source.kind() == std::io::ErrorKind::BrokenPipe =>
         {
-            ExitCode::from(141)
+            ExitCode::from(broken_pipe())
         }
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            ExitCode::from(125)
-        }
+        Err(error) => fail(error),
     }
 }
 
@@ -4478,10 +4558,7 @@ fn run(options: Options) -> ExitCode {
         let mut provisioner = ferroday_cage::provision::Tarball::new(tarball);
         match ferroday_cage::provision::ensure(rootfs, &mut provisioner) {
             Ok(outcome) => provisioned = Some(outcome),
-            Err(error) => {
-                eprintln!("fcage: {error}");
-                return ExitCode::from(125);
-            }
+            Err(error) => return fail(error),
         }
     }
     if let Some(suite) = &options.provision_debian {
@@ -4532,10 +4609,7 @@ fn run(options: Options) -> ExitCode {
     let stack = if options.netstack {
         match netstack_from(&options) {
             Ok(stack) => Some(stack),
-            Err(error) => {
-                eprintln!("fcage: {error}");
-                return ExitCode::from(125);
-            }
+            Err(error) => return fail(error),
         }
     } else {
         None
@@ -4556,10 +4630,7 @@ fn run(options: Options) -> ExitCode {
                 profile_sets_stop_with_caller = meta.sets_stop_with_caller;
                 builder
             }
-            Err(message) => {
-                eprintln!("fcage: {message}");
-                return ExitCode::from(125);
-            }
+            Err(message) => return fail(message),
         },
         None => Cage::builder(),
     };
@@ -4571,7 +4642,7 @@ fn run(options: Options) -> ExitCode {
     if options.netstack && options.network.is_none() && profile_network_host {
         eprintln!("fcage: --netstack cannot be used with a profile that sets network = \"host\"");
         eprintln!("Try 'fcage --help' for usage.");
-        return ExitCode::from(2);
+        return ExitCode::from(USAGE);
     }
 
     if let Some(rootfs) = options.rootfs {
@@ -4611,27 +4682,9 @@ fn run(options: Options) -> ExitCode {
         env.push((OsString::from("TERM"), term));
     }
     builder = builder.envs(env);
-    // One pass, so a `--raw-mount` written between two `--bind` flags is
+    // One sequence, so a `--raw-mount` written between two `--bind` flags is
     // applied between them.
-    for mount in options.mounts {
-        builder = match mount {
-            Mount::Bind(bind) => {
-                if bind.is_read_only() {
-                    builder.bind_ro(bind.get_source(), bind.get_target())
-                } else {
-                    builder.bind(bind.get_source(), bind.get_target())
-                }
-            }
-            Mount::Raw(raw) => builder.raw_mount(raw),
-            // `Mount` is non-exhaustive. A kind this build cannot apply must
-            // not be dropped in silence: a sandbox missing a mount it was
-            // asked for is not the sandbox that was asked for.
-            other => {
-                eprintln!("fcage: unsupported mount kind: {other:?}");
-                return ExitCode::from(125);
-            }
-        };
-    }
+    builder = builder.mounts(options.mounts);
     for (resource, soft, hard) in options.rlimits {
         builder = builder.rlimit(resource, soft, hard);
     }
@@ -4701,36 +4754,27 @@ fn run(options: Options) -> ExitCode {
         return run_on_a_terminal(builder, options.timeout, options.kill_after);
     }
 
-    // Every launch below hands the sandbox `fcage`'s own standard streams, so
-    // any of them that is a file is relayed rather than handed over. The
-    // builder is asked rather than the flags, so a profile's stream settings
-    // count exactly as `--stdin` does.
-    let mut relay = None;
-    if !options.terminal {
-        let inherited = [
+    // Every launch below hands the sandbox `fcage`'s own standard streams,
+    // unless a terminal replaces all three, so each is judged and any that is a
+    // file is relayed rather than handed over. The builder is asked rather than
+    // the flags, so a profile's stream settings count exactly as `--stdin` does.
+    let inherited = if options.terminal {
+        [false; 3]
+    } else {
+        [
             matches!(builder.get_stdin(), Stdio::Inherit),
             matches!(builder.get_stdout(), Stdio::Inherit),
             matches!(builder.get_stderr(), Stdio::Inherit),
-        ];
-        let mut started = match streams::StreamRelay::start(inherited) {
-            Ok(started) => started,
-            Err(error) => {
-                eprintln!("fcage: cannot relay the standard streams: {error}");
-                return ExitCode::from(125);
-            }
-        };
-        let [stdin, stdout, stderr] = started.take_replacements();
-        if let Some(stdin) = stdin {
-            builder = builder.stdin(stdin);
-        }
-        if let Some(stdout) = stdout {
-            builder = builder.stdout(stdout);
-        }
-        if let Some(stderr) = stderr {
-            builder = builder.stderr(stderr);
-        }
-        relay = Some(started);
-    }
+        ]
+    };
+    let (mut builder, relay) = match relay_streams(
+        builder,
+        inherited,
+        [CageBuilder::stdin, CageBuilder::stdout, CageBuilder::stderr],
+    ) {
+        Ok(relayed) => relayed,
+        Err(code) => return code,
+    };
 
     if options.netstack {
         // The native stack composes the sandbox's DNS from the host's routable
@@ -4745,42 +4789,77 @@ fn run(options: Options) -> ExitCode {
         if builder.get_resolv_conf() {
             builder = compose_netstack_resolv_conf(builder);
         }
-        let code = run_with_netstack(
+        return run_with_netstack(
             builder,
             stack.expect("assembled above for exactly this branch"),
             &options.netstack_publish,
             options.terminal,
             options.timeout,
             options.kill_after,
+            relay,
         );
-        return finish_relay(relay, code);
     }
 
     let outcome = builder
         .build()
         .and_then(|cage| cage.spawn())
         .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
-    finish_relay(relay, conclude(outcome))
+    finish(relay, outcome.map_err(Failure::from))
 }
 
-/// Waits for the stream relays to deliver what the command wrote, and settles
-/// the exit status.
+/// Judges `fcage`'s standard streams for a launch, and routes each one that is
+/// a file through a relay.
 ///
-/// A relay that failed lost output the command believed delivered, which is a
-/// failure of `fcage` rather than of the command, so it is reported and the run
-/// exits 125 whatever the command's own status was.
-fn finish_relay(relay: Option<streams::StreamRelay>, code: ExitCode) -> ExitCode {
-    let Some(relay) = relay else {
-        return code;
-    };
-    let failures = relay.finish();
-    for (stream, error) in &failures {
-        eprintln!("fcage: relaying the command's {stream}: {error}");
+/// `inherited` says, in stream order, whether the launch would hand the stream
+/// over as `fcage` holds it, and `set` is the builder's setter for each.
+/// [`CageBuilder`] and [`RestrictionBuilder`] spell the three alike, so one
+/// wiring serves both. A refused stream, or a relay that cannot start, is
+/// reported here and ends the run with [`FAILED`] before anything is launched.
+fn relay_streams<B>(
+    builder: B,
+    inherited: [bool; 3],
+    set: [fn(B, Stdio) -> B; 3],
+) -> Result<(B, streams::StreamRelay), ExitCode> {
+    let mut relay = streams::StreamRelay::start(inherited).map_err(fail)?;
+    let mut builder = builder;
+    for (replacement, set) in relay.take_replacements().into_iter().zip(set) {
+        if let Some(stdio) = replacement {
+            builder = set(builder, stdio);
+        }
     }
-    if failures.is_empty() {
+    Ok((builder, relay))
+}
+
+/// Settles a run that relayed its streams: the relays first, then the outcome.
+fn finish(relay: streams::StreamRelay, outcome: Result<Option<ExitStatus>, Failure>) -> ExitCode {
+    let delivered = settle(relay);
+    report(outcome, delivered)
+}
+
+/// Stops the stream relays, and reports each one that failed. Returns whether
+/// every relay delivered.
+///
+/// Called before `fcage` prints anything about how the run ended, so that its
+/// own words land after the command's last bytes in a relayed file. A relay
+/// that failed lost output the command believed delivered, or could not return
+/// the input the command did not read, which is a failure of `fcage` rather
+/// than of the command.
+fn settle(relay: streams::StreamRelay) -> bool {
+    let failures = relay.finish();
+    for (streams, error) in &failures {
+        eprintln!("fcage: relaying the command's {streams}: {error}");
+    }
+    failures.is_empty()
+}
+
+/// Maps a settled run onto the process exit status: the outcome's own, or
+/// [`FAILED`] where a relay failed, whatever the command's status was.
+fn report(outcome: Result<Option<ExitStatus>, Failure>, delivered: bool) -> ExitCode {
+    let code = conclude(outcome);
+    if delivered {
         code
     } else {
-        ExitCode::from(125)
+        ExitCode::from(FAILED)
     }
 }
 
@@ -4798,35 +4877,16 @@ fn run_on_a_terminal(
 ) -> ExitCode {
     let signals = match Signals::install() {
         Ok(signals) => signals,
-        Err(error) => return conclude_relay(Err(error)),
+        Err(error) => return conclude(Err(error.into())),
     };
     let launched = builder
         .build()
         .and_then(|cage| cage.spawn_terminal(&terminal::terminal_for_caller()));
     let (running, pty) = match launched {
         Ok(launched) => launched,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(error.shell_code());
-        }
+        Err(error) => return conclude(Err(error.into())),
     };
-    conclude_relay(terminal::relay(running, pty, signals, timeout, kill_after))
-}
-
-/// Maps a relay's outcome onto the process exit status.
-///
-/// The library's own failures go through [`conclude`], so a launch that fails
-/// the same way with and without a terminal exits the same way. The relay's own
-/// plumbing failing is a `fcage` failure, which is 125.
-fn conclude_relay(outcome: Result<Option<ExitStatus>, RelayError>) -> ExitCode {
-    match outcome {
-        Ok(outcome) => conclude(Ok(outcome)),
-        Err(RelayError::Cage(error)) => conclude(Err(error)),
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            ExitCode::from(125)
-        }
-    }
+    conclude(terminal::relay(running, pty, signals, timeout, kill_after).map_err(Failure::from))
 }
 
 /// Assembles the native network stack the `--netstack-*` flags describe.
@@ -4873,6 +4933,7 @@ fn run_with_netstack(
     terminal: bool,
     timeout: Option<Duration>,
     kill_after: Duration,
+    relay: streams::StreamRelay,
 ) -> ExitCode {
     // Blocked before the stack's own thread exists, so that thread inherits the
     // mask and no process-directed signal can be delivered behind the relay's
@@ -4880,17 +4941,14 @@ fn run_with_netstack(
     let signals = if terminal {
         match Signals::install() {
             Ok(signals) => Some(signals),
-            Err(error) => return conclude_relay(Err(error)),
+            Err(error) => return finish(relay, Err(error.into())),
         }
     } else {
         None
     };
     let cage = match builder.build() {
         Ok(cage) => cage,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(error.shell_code());
-        }
+        Err(error) => return finish(relay, Err(error.into())),
     };
 
     // Hold the command at the gate, attach the stack to the sandbox's
@@ -4909,17 +4967,11 @@ fn run_with_netstack(
     };
     let (pending, pty) = match held {
         Ok(held) => held,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(error.shell_code());
-        }
+        Err(error) => return finish(relay, Err(error.into())),
     };
     let handle = match stack.attach(&pending) {
         Ok(handle) => handle,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
-        }
+        Err(error) => return finish(relay, Err(Failure::Fcage(error.to_string()))),
     };
     // A publication that left the port to the kernel is useless until the
     // caller knows which one it got. Said before the command is released, and
@@ -4931,25 +4983,28 @@ fn run_with_netstack(
     }
     let running = match pending.proceed() {
         Ok(running) => running,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(error.shell_code());
-        }
+        Err(error) => return finish(relay, Err(error.into())),
     };
 
     // The relay when a terminal was allocated, the plain wait otherwise. Both
     // return the same outcome; only the driving differs.
     let outcome = match (pty, signals) {
-        (Some(pty), Some(signals)) => terminal::relay(running, pty, signals, timeout, kill_after),
-        _ => wait_with_deadline(running, timeout, kill_after).map_err(Into::into),
+        (Some(pty), Some(signals)) => {
+            terminal::relay(running, pty, signals, timeout, kill_after).map_err(Failure::from)
+        }
+        _ => wait_with_deadline(running, timeout, kill_after).map_err(Failure::from),
     };
-    // The stack is torn down after the command; a failure here loses no
-    // data, so it is a warning, not the run's outcome. Printed after the relay
-    // has restored the caller's terminal, so it is not stair-stepped.
-    if let Err(error) = handle.stop() {
+    let stopped = handle.stop();
+    let delivered = settle(relay);
+    // The stack is torn down after the command; a failure here loses no data,
+    // so it is a warning, not the run's outcome. Printed after the stream
+    // relays have delivered the command's output, so it lands after that
+    // output, and after the terminal relay has restored the caller's terminal,
+    // so it is not stair-stepped.
+    if let Err(error) = stopped {
         eprintln!("fcage: the network stack did not stop cleanly: {error}");
     }
-    conclude_relay(outcome)
+    report(outcome, delivered)
 }
 
 /// Whether one of the caller's own mounts targets the sandbox's
@@ -5046,6 +5101,9 @@ fn resolv_conf_has_routable_nameserver(contents: &str) -> bool {
 /// Builds and runs a restriction — the --restrict mode — mapping the outcome
 /// onto the exit status exactly as the sandbox path does.
 fn run_restricted(options: Options) -> ExitCode {
+    if let Err(code) = withhold_from_restricted_command() {
+        return code;
+    }
     let mut builder = Restriction::builder();
     let mut command_line = options.command_line.into_iter();
     if let Some(command) = command_line.next() {
@@ -5092,53 +5150,73 @@ fn run_restricted(options: Options) -> ExitCode {
         // story a cage does.
         let signals = match Signals::install() {
             Ok(signals) => signals,
-            Err(error) => return conclude_relay(Err(error)),
+            Err(error) => return conclude(Err(error.into())),
         };
         let launched = builder
             .build()
             .and_then(|restriction| restriction.spawn_terminal(&terminal::terminal_for_caller()));
         let (running, pty) = match launched {
             Ok(launched) => launched,
-            Err(error) => {
-                eprintln!("fcage: {error}");
-                return ExitCode::from(error.shell_code());
-            }
+            Err(error) => return conclude(Err(error.into())),
         };
-        return conclude_relay(terminal::relay(
-            running,
-            pty,
-            signals,
-            options.timeout,
-            options.kill_after,
-        ));
+        return conclude(
+            terminal::relay(running, pty, signals, options.timeout, options.kill_after)
+                .map_err(Failure::from),
+        );
     }
 
-    // As for a cage: a stream that is a file is relayed rather than handed over.
-    // A restriction's output pair has no flag, so only standard input can have
-    // been sent elsewhere.
-    let mut relay = match streams::StreamRelay::start([stdin_inherited, true, true]) {
-        Ok(relay) => relay,
-        Err(error) => {
-            eprintln!("fcage: cannot relay the standard streams: {error}");
-            return ExitCode::from(125);
-        }
+    // As for a sandbox: each stream is judged, and one that is a file is relayed
+    // rather than handed over. A restriction's output pair has no flag, so only
+    // standard input can have been sent elsewhere.
+    let (builder, relay) = match relay_streams(
+        builder,
+        [stdin_inherited, true, true],
+        [
+            RestrictionBuilder::stdin,
+            RestrictionBuilder::stdout,
+            RestrictionBuilder::stderr,
+        ],
+    ) {
+        Ok(relayed) => relayed,
+        Err(code) => return code,
     };
-    let [stdin, stdout, stderr] = relay.take_replacements();
-    if let Some(stdin) = stdin {
-        builder = builder.stdin(stdin);
-    }
-    if let Some(stdout) = stdout {
-        builder = builder.stdout(stdout);
-    }
-    if let Some(stderr) = stderr {
-        builder = builder.stderr(stderr);
-    }
-
     let outcome = builder
         .build()
         .and_then(|restriction| restriction.spawn())
         .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
-    finish_relay(Some(relay), conclude(outcome))
+    finish(relay, outcome.map_err(Failure::from))
+}
+
+/// Makes `fcage` non-dumpable for the rest of its life, ahead of a restricted
+/// launch.
+///
+/// A restricted command runs beside `fcage`, as the same user and in the
+/// host's user and PID namespaces. Reading another process's descriptors
+/// through `/proc/<pid>/fd` is a ptrace read, which the kernel grants such a
+/// process over a dumpable one, so the command could reopen whatever `fcage`
+/// holds: the file a relayed stream copies, or the terminal a `--terminal` run
+/// relays. A Landlock domain refuses that read on its own, and a seccomp-only
+/// restriction does not. A non-dumpable process answers it only to a holder of
+/// `CAP_SYS_PTRACE`.
+///
+/// The launch's own processes fork from `fcage` after this and inherit the
+/// flag, which covers their copies of `fcage`'s descriptors as well. The
+/// command's `execve` sets its own flag afresh.
+///
+/// A sandbox needs none of this, and its launch could not survive it. The
+/// sandbox's command runs in a user namespace below `fcage`'s, and a ptrace read
+/// of a process outside that namespace takes `CAP_SYS_PTRACE` in the target's.
+/// And a non-dumpable process's identity map files belong to root, which
+/// neither the launch stage writing its own map nor a `newuidmap` holding only
+/// `CAP_SETUID` can open.
+fn withhold_from_restricted_command() -> Result<(), ExitCode> {
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).map_err(
+        |errno| {
+            fail(format_args!(
+                "cannot withhold fcage's descriptors from a restricted command: {errno}"
+            ))
+        },
+    )
 }
 
 /// The Landlock access set a --landlock-ro or --landlock-rw grant confers.
@@ -5175,17 +5253,54 @@ fn wait_with_deadline(
     Ok(escalation.outcome(status))
 }
 
-/// Maps a launch outcome onto the process exit status.
-fn conclude(outcome: Result<Option<ExitStatus>, Error>) -> ExitCode {
+/// Why a run ended with no status of the command's to report.
+enum Failure {
+    /// The library failed, and its error says which exit code that is.
+    Cage(Error),
+    /// A part of `fcage`'s own failed, such as the network stack or the
+    /// terminal relay's plumbing, which exits [`FAILED`].
+    Fcage(String),
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Failure {
+        Failure::Cage(error)
+    }
+}
+
+impl From<RelayError> for Failure {
+    /// The sandbox failing under the terminal relay is the library's failure,
+    /// so a launch that fails the same way with and without a terminal exits
+    /// the same way. The relay's own plumbing failing is `fcage`'s.
+    fn from(error: RelayError) -> Failure {
+        match error {
+            RelayError::Cage(error) => Failure::Cage(error),
+            other => Failure::Fcage(other.to_string()),
+        }
+    }
+}
+
+impl Failure {
+    /// Reports the failure on standard error and returns its exit code.
+    fn report(self) -> ExitCode {
+        match self {
+            Failure::Cage(error) => {
+                eprintln!("fcage: {error}");
+                ExitCode::from(error.shell_code())
+            }
+            Failure::Fcage(message) => fail(message),
+        }
+    }
+}
+
+/// Maps a run's outcome onto the process exit status.
+fn conclude(outcome: Result<Option<ExitStatus>, Failure>) -> ExitCode {
     match outcome {
         // The timeout(1) convention: 124 announces an expired timeout,
         // whatever became of the command afterwards.
-        Ok(None) => ExitCode::from(124),
+        Ok(None) => ExitCode::from(TIMED_OUT),
         Ok(Some(status)) => ExitCode::from(status.shell_code()),
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            ExitCode::from(error.shell_code())
-        }
+        Err(failure) => failure.report(),
     }
 }
 
@@ -5201,14 +5316,9 @@ fn plan_from<P, E: std::fmt::Display>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<P, E>,
 ) -> Result<P, ExitCode> {
-    let document = std::fs::read_to_string(path).map_err(|error| {
-        eprintln!("fcage: reading {}: {error}", path.display());
-        ExitCode::from(125)
-    })?;
-    parse(&document).map_err(|error| {
-        eprintln!("fcage: {}: {error}", path.display());
-        ExitCode::from(125)
-    })
+    let document = std::fs::read_to_string(path)
+        .map_err(|error| fail(format_args!("reading {}: {error}", path.display())))?;
+    parse(&document).map_err(|error| fail(format_args!("{}: {error}", path.display())))
 }
 
 /// Bootstraps a Debian rootfs from the archive, printing progress to stderr.
@@ -5274,15 +5384,9 @@ fn provision_debian(
         builder = builder.repository(repository.clone());
     }
 
-    let mut debian = builder.build().map_err(|error| {
-        eprintln!("fcage: {error}");
-        ExitCode::from(125)
-    })?;
+    let mut debian = builder.build().map_err(fail)?;
     let mut progress = print_debian_event;
-    ferroday_cage::provision::ensure(rootfs, &mut debian.observe(&mut progress)).map_err(|error| {
-        eprintln!("fcage: {error}");
-        ExitCode::from(125)
-    })
+    ferroday_cage::provision::ensure(rootfs, &mut debian.observe(&mut progress)).map_err(fail)
 }
 
 /// Prints a Debian bootstrap progress event to stderr.
@@ -5330,20 +5434,8 @@ fn provision_alpine(
 
     let usage = |message: String| {
         eprintln!("fcage: {message}");
-        ExitCode::from(2)
+        ExitCode::from(USAGE)
     };
-    // Reading a key set is not spelling: the selector was checked when the
-    // command line was parsed, so what is left is whether this machine can
-    // supply the keys — an unreadable directory, a file that is not a PEM key,
-    // a bundle holding none for the architecture. Those are what 125 means, and
-    // what the library reports for the same failures when it resolves the keys
-    // itself. A script telling "fix my command line" from "fix my machine" reads
-    // the two codes.
-    let environment = |message: String| {
-        eprintln!("fcage: {message}");
-        ExitCode::from(125)
-    };
-
     // The architecture the key sets are chosen by: the one named, or the host's,
     // which is what the builder would default to.
     let architecture = options
@@ -5378,9 +5470,15 @@ fn provision_alpine(
     if let Some(cache) = &options.alpine_cache {
         builder = builder.cache_dir(cache);
     }
+    // Reading a key set is not spelling: the selector was checked when the
+    // command line was parsed, so what is left is whether this machine can
+    // supply the keys — an unreadable directory, a file that is not a PEM key,
+    // a bundle holding none for the architecture. Those fail, as the library
+    // reports the same failures when it resolves the keys itself, where a
+    // repository spelled wrong is a usage error. A script telling "fix my
+    // command line" from "fix my machine" reads the two codes.
     if let Some(keys) = &options.alpine_keys {
-        builder = builder
-            .keys(alpine_key_set("--alpine-keys", keys, &architecture).map_err(environment)?);
+        builder = builder.keys(alpine_key_set("--alpine-keys", keys, &architecture).map_err(fail)?);
     }
     if let Some(overlay) = &options.alpine_pre_configure_overlay {
         builder = builder.pre_configure_overlay(overlay);
@@ -5392,10 +5490,8 @@ fn provision_alpine(
         builder = builder.source_date_epoch(epoch);
     }
     for spec in &options.alpine_repositories {
-        let mut repository = Repository::builder(&spec.release).keys(
-            alpine_key_set("--alpine-repository", &spec.keys, &architecture)
-                .map_err(environment)?,
-        );
+        let mut repository = Repository::builder(&spec.release)
+            .keys(alpine_key_set("--alpine-repository", &spec.keys, &architecture).map_err(fail)?);
         if let Some(primary) = &spec.mirror {
             repository = repository.mirror(primary);
         }
@@ -5412,15 +5508,9 @@ fn provision_alpine(
         );
     }
 
-    let mut alpine = builder.build().map_err(|error| {
-        eprintln!("fcage: {error}");
-        ExitCode::from(125)
-    })?;
+    let mut alpine = builder.build().map_err(fail)?;
     let mut progress = print_alpine_event;
-    ferroday_cage::provision::ensure(rootfs, &mut alpine.observe(&mut progress)).map_err(|error| {
-        eprintln!("fcage: {error}");
-        ExitCode::from(125)
-    })
+    ferroday_cage::provision::ensure(rootfs, &mut alpine.observe(&mut progress)).map_err(fail)
 }
 
 /// Bootstraps a Gentoo rootfs from a signed stage3, printing progress to
@@ -5471,10 +5561,7 @@ fn provision_gentoo(
         builder = builder.max_pointer_age(age.map(days));
     }
 
-    let mut gentoo = builder.build().map_err(|error| {
-        eprintln!("fcage: {error}");
-        ExitCode::from(125)
-    })?;
+    let mut gentoo = builder.build().map_err(fail)?;
     let mut progress = |event: ProvisionEvent<'_>| {
         if let ProvisionEvent::Gentoo(event) = event {
             print_gentoo_event(event);
@@ -5483,10 +5570,7 @@ fn provision_gentoo(
     ferroday_cage::provision::Provision::new(rootfs)
         .observe(&mut progress)
         .run(&mut gentoo)
-        .map_err(|error| {
-            eprintln!("fcage: {error}");
-            ExitCode::from(125)
-        })
+        .map_err(fail)
 }
 
 /// A count of days as a duration.
@@ -5586,17 +5670,11 @@ fn gentoo_variants(
     }
     let mut gentoo = match builder.build() {
         Ok(gentoo) => gentoo,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
-        }
+        Err(error) => return fail(error),
     };
     let available = match gentoo.available() {
         Ok(available) => available,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
-        }
+        Err(error) => return fail(error),
     };
     // The build id belongs beside the variant rather than in a heading: a
     // sub-architecture is built on its own cadence, so one document routinely
@@ -5643,10 +5721,10 @@ fn print_listing(
 fn listing_status(subject: &str, written: std::io::Result<()>) -> u8 {
     match written {
         Ok(()) => 0,
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => 141,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => broken_pipe(),
         Err(error) => {
             eprintln!("fcage: cannot write {subject}: {error}");
-            125
+            FAILED
         }
     }
 }
@@ -5675,17 +5753,11 @@ fn gentoo_packages(
     }
     let mut gentoo = match builder.build() {
         Ok(gentoo) => gentoo,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
-        }
+        Err(error) => return fail(error),
     };
     let catalogue = match gentoo.packages() {
         Ok(catalogue) => catalogue,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
-        }
+        Err(error) => return fail(error),
     };
     // One line per package, its versions after it: a name is what a caller
     // writes in an atom, and the versions are what tells them whether the one
@@ -5711,10 +5783,7 @@ fn gentoo_packages(
 fn gentoo_installed(root: &Path) -> ExitCode {
     let installed = match ferroday_cage::provision::gentoo::installed(root) {
         Ok(installed) => installed,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
-        }
+        Err(error) => return fail(error),
     };
     if installed.is_empty() {
         eprintln!(
@@ -5747,10 +5816,7 @@ fn gentoo_keyring_horizon() -> ExitCode {
     // listing reads no archive, so any well-formed one names the same keyring.
     let gentoo = match Gentoo::builder("amd64").build() {
         Ok(gentoo) => gentoo,
-        Err(error) => {
-            eprintln!("fcage: {error}");
-            return ExitCode::from(125);
-        }
+        Err(error) => return fail(error),
     };
     let horizon = gentoo.keyring_horizon();
     print_listing("the keyring horizon", |out| {
@@ -6993,11 +7059,57 @@ mod tests {
             ["--rootfs", "--share-net", "/bin/true"].as_slice(),
             ["--bind", "--rootfs", "/target", "/r", "/bin/true"].as_slice(),
             ["--gentoo-variants", "--gentoo-mirror"].as_slice(),
+            // An export's own two paths: `--export-to --clamp-mtime=0` wrote an
+            // archive named `--clamp-mtime=0`, unclamped, and exited 0.
+            [
+                "--export-rootfs",
+                "/roots/a",
+                "--export-to",
+                "--clamp-mtime=0",
+            ]
+            .as_slice(),
+            ["--export-rootfs", "--export-to", "/tmp/out.tar"].as_slice(),
         ] {
             let error = parse_error(args);
             assert!(
                 error.contains("names a flag"),
                 "expected a refusal for {args:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_value_suggests_only_the_form_its_flag_accepts() {
+        // A one-value flag has a joined form, which is how a value spelled as
+        // a flag is written; a two-value flag has none, so suggesting one sends
+        // the caller to a spelling the parser then refuses.
+        let error = parse_error(&["--remove-rootfs", "--identity-map=single"]);
+        assert!(error.contains("--remove-rootfs=VALUE"), "{error}");
+        for args in [
+            [
+                "--rootfs",
+                "/r",
+                "--bind",
+                "--rootfs",
+                "/target",
+                "/bin/true",
+            ]
+            .as_slice(),
+            [
+                "--rootfs",
+                "/r",
+                "--setenv",
+                "NAME",
+                "--share-net",
+                "/bin/true",
+            ]
+            .as_slice(),
+        ] {
+            let error = parse_error(args);
+            assert!(error.contains("names a flag"), "{error}");
+            assert!(
+                !error.contains("=VALUE") && error.contains("no joined form"),
+                "{error}"
             );
         }
     }
@@ -7184,6 +7296,22 @@ mod tests {
             error.contains("--debian-source-date-epoch") && !error.contains("--clamp-mtime"),
             "{error}",
         );
+    }
+
+    #[test]
+    fn a_source_date_epoch_before_1970_is_a_usage_error() {
+        // The bootstraps refuse a negative date when they are built, which made
+        // a mistyped flag a bootstrap that could not be built, exit 125. A
+        // ceiling for --clamp-mtime stays a plain instant.
+        for (provisioner, flag) in [
+            ("--provision-debian", "--debian-source-date-epoch"),
+            ("--provision-alpine", "--alpine-source-date-epoch"),
+        ] {
+            let error = parse_error(&["--rootfs", "/roots/r", provisioner, "x", flag, "-1"]);
+            assert!(error.contains(flag) && error.contains("1970"), "{error}");
+            let joined = format!("{flag}=0");
+            assert!(parse_args(&["--rootfs", "/roots/r", provisioner, "x", &joined]).is_ok());
+        }
     }
 
     #[test]
@@ -7426,7 +7554,8 @@ mod tests {
     fn seconds_reject_bad_values() {
         // Includes values that are finite and positive but too large for a
         // Duration; these must be a usage error, not a panic.
-        for bad in ["", "abc", "0", "-1", "nan", "inf", "1e300"] {
+        // A positive value below a nanosecond rounds to no time at all.
+        for bad in ["", "abc", "0", "-1", "nan", "inf", "1e300", "1e-10"] {
             assert!(
                 parse_seconds("--timeout", OsStr::new(bad)).is_err(),
                 "{bad:?} must be rejected"
@@ -7718,6 +7847,36 @@ mod tests {
         .err()
         .expect("the flag takes a host and a guest port");
         assert!(err.contains("--netstack-publish"), "{err}");
+        // Port 0 asks the kernel for a free port on the host side, and means
+        // nothing on the guest's: refused here, it is a usage error rather than
+        // a stack that cannot be built.
+        let err = parse_run(&[
+            "--rootfs",
+            "/r",
+            "--netstack",
+            "--netstack-publish",
+            "0",
+            "0",
+            "/bin/true",
+        ])
+        .err()
+        .expect("a guest port of 0 is refused");
+        assert!(
+            err.contains("--netstack-publish") && err.contains("guest port"),
+            "{err}"
+        );
+        assert!(
+            parse_run(&[
+                "--rootfs",
+                "/r",
+                "--netstack",
+                "--netstack-publish",
+                "0",
+                "80",
+                "/bin/true"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

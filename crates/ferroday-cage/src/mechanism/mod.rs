@@ -315,6 +315,59 @@ impl StdioPlan {
     }
 }
 
+/// Refuses a launch that would hand the command a directory as a standard
+/// stream.
+///
+/// A directory descriptor is a path as well as a stream: `/proc/self/fd/N` and
+/// `openat(N, "..")` walk from it through the host's filesystem, past any root
+/// the sandbox swapped in, and nothing in the default posture stands in the
+/// way. No program reads its input from a directory or writes its output to
+/// one, so the refusal takes nothing a command could use.
+///
+/// Checked at the launch rather than at build, because
+/// [`Inherit`](StdioPlan::Inherit) hands over whatever the caller's own
+/// descriptor names at the moment of the fork. A stream the launch replaces is
+/// not examined: a terminal launch replaces all three, and capture replaces the
+/// output pair.
+fn refuse_directory_streams(plan: &LaunchPlan, observe: bool, terminal: bool) -> Result<(), Error> {
+    if terminal {
+        return Ok(());
+    }
+    refuse_directory("standard input", &plan.stdin, rustix::stdio::stdin())?;
+    if !observe {
+        refuse_directory("standard output", &plan.stdout, rustix::stdio::stdout())?;
+        refuse_directory("standard error", &plan.stderr, rustix::stdio::stderr())?;
+    }
+    Ok(())
+}
+
+/// One stream's half of [`refuse_directory_streams`]. `own` is the caller's
+/// descriptor at the stream's number, which [`Inherit`](StdioPlan::Inherit)
+/// hands over.
+///
+/// A closed descriptor hands the command nothing, so it passes.
+fn refuse_directory(
+    stream: &'static str,
+    disposition: &StdioPlan,
+    own: BorrowedFd<'_>,
+) -> Result<(), Error> {
+    let handed = match disposition {
+        StdioPlan::Null => return Ok(()),
+        StdioPlan::Inherit => own,
+        StdioPlan::Fd(fd) => fd.as_fd(),
+    };
+    match rustix::fs::fstat(handed) {
+        Ok(stat)
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                == rustix::fs::FileType::Directory =>
+        {
+            Err(Error::StreamIsDirectory { stream })
+        }
+        Ok(_) | Err(Errno::BADF) => Ok(()),
+        Err(errno) => Err(spawn_error(errno)),
+    }
+}
+
 /// One frozen resource limit, in the kernel's own terms.
 ///
 /// Validated and translated at build time, so the command stage only replays
@@ -1110,6 +1163,8 @@ fn fork_launch(
     gated: bool,
     terminal: Option<&Terminal>,
 ) -> Result<ParentSide, Error> {
+    refuse_directory_streams(plan, observe, terminal.is_some())?;
+
     // Pre-fork marshaling, caller side. The pointer arrays and identity-map
     // lines are the last pieces the sandbox stages need; they are assembled
     // here, where allocation is still permitted, and only read after the
@@ -1950,6 +2005,48 @@ mod tests {
         let signaled = decode_status(record(STATUS_SIGNALED, 9)).expect("a written kind decodes");
         assert_eq!(signaled.code(), None);
         assert_eq!(signaled.signal(), Some(9));
+    }
+
+    #[test]
+    fn a_directory_is_refused_on_every_stream_that_hands_one_over() {
+        let dir = crate::scratch::Scratch::new("stream-directory");
+        let directory = || -> OwnedFd {
+            std::fs::File::open(&*dir)
+                .expect("the scratch directory opens")
+                .into()
+        };
+        let file = || -> OwnedFd {
+            let path = dir.join("file");
+            std::fs::write(&path, b"").expect("the scratch file is writable");
+            std::fs::File::open(path)
+                .expect("the scratch file opens")
+                .into()
+        };
+
+        // Inherited, the caller's own descriptor at the stream's number is what
+        // the command receives; supplied, the descriptor given.
+        let own = directory();
+        assert!(matches!(
+            refuse_directory("standard input", &StdioPlan::Inherit, own.as_fd()),
+            Err(Error::StreamIsDirectory {
+                stream: "standard input"
+            })
+        ));
+        let supplied = StdioPlan::Fd(Arc::new(directory()));
+        let unrelated = file();
+        assert!(matches!(
+            refuse_directory("standard output", &supplied, unrelated.as_fd()),
+            Err(Error::StreamIsDirectory {
+                stream: "standard output"
+            })
+        ));
+
+        // A null stream hands nothing over, whatever the caller holds, and a
+        // file is a stream like any other.
+        assert!(refuse_directory("standard error", &StdioPlan::Null, own.as_fd()).is_ok());
+        assert!(refuse_directory("standard input", &StdioPlan::Inherit, unrelated.as_fd()).is_ok());
+        let file = StdioPlan::Fd(Arc::new(file()));
+        assert!(refuse_directory("standard error", &file, own.as_fd()).is_ok());
     }
 
     #[test]
