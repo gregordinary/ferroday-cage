@@ -1655,15 +1655,22 @@ impl Gentoo {
 
         let cache = PackageCache::beside(root, self.cache_dir.as_deref(), PACKAGE_CACHE);
         let directory = index::directory(&self.architecture, &plan.binhost);
-        let rooted = Rooted::open(root).map_err(GentooError::at("opening the root", root))?;
+        // A layered build's database entries are written into the upper over
+        // the base, so a directory one creates never hides a link the base
+        // holds.
+        let below = over
+            .map(|base| Rooted::open(base).map_err(GentooError::at("opening the base", base)))
+            .transpose()?;
+        let rooted = Rooted::open(root)
+            .and_then(|rooted| rooted.over(below.as_ref()))
+            .map_err(GentooError::at("opening the root", root))?;
         // The merge ordinal continues the root's own sequence, and for a
         // layered build that sequence is the base's: an increment that started
         // again at one would give two packages the same ordinal, and the
         // database could no longer say which was merged first.
         let mut counter = vdb::counter_of(root, &rooted)?;
-        if let Some(base) = over {
-            let below = Rooted::open(base).map_err(GentooError::at("opening the base", base))?;
-            counter = counter.max(vdb::counter_of(base, &below)?);
+        if let (Some(base), Some(below)) = (over, &below) {
+            counter = counter.max(vdb::counter_of(base, below)?);
         }
         // Every ordinal the wave stamps, settled before anything is merged. The
         // counter is read out of a root this crate does not own, so it can
@@ -1721,7 +1728,7 @@ impl Gentoo {
                 package: &planned.name,
                 version: &planned.version,
             });
-            vdb::merge(root, &rooted, cached, &package, planned, ordinal)?;
+            vdb::merge(root, over, &rooted, cached, &package, planned, ordinal)?;
         }
         Ok(())
     }
@@ -4117,5 +4124,97 @@ mod tests {
             std::fs::read_to_string(last.join("var/db/pkg/sys-libs/zlib-1.3.2/COUNTER")).unwrap(),
             u64::MAX.to_string(),
         );
+    }
+
+    #[test]
+    fn an_increment_staged_over_a_merged_usr_base_keeps_the_bases_links() {
+        // The layered path end to end, from a plan: a base whose `lib64` and
+        // `sbin` are links into `usr`, as a stage3's are, and a package that
+        // ships under both, as the binhost's lvm2 does. Merged into a bare
+        // upper those paths become directories, which the overlay shows over
+        // the base's links, and the merged `/lib64` loses the loader.
+        let scratch = Scratch::new("gentoo-stage-layer");
+        let base = scratch.join("base");
+        for dir in ["usr/lib64", "usr/bin", "var/cache/edb"] {
+            std::fs::create_dir_all(base.join(dir)).expect("the base is laid out");
+        }
+        std::os::unix::fs::symlink("usr/lib64", base.join("lib64")).expect("a link");
+        std::os::unix::fs::symlink("usr/bin", base.join("sbin")).expect("a link");
+        std::fs::write(base.join("usr/lib64/ld-linux-x86-64.so.2"), b"loader").expect("written");
+        std::fs::write(base.join("var/cache/edb/counter"), b"391").expect("written");
+
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let container = scratch.join("zlib.gpkg.tar");
+        gpkg::fixture::Built {
+            aliased: true,
+            ..gpkg::fixture::Built::ordinary()
+        }
+        .write(&container, &key);
+        let bytes = std::fs::read(&container).expect("the container reads");
+        let path = "sys-libs/zlib/zlib-1.3.2-1.gpkg.tar";
+        let plan = Plan::parse_document(&format!(
+            "Format: ferroday-cage-gentoo-plan 1\nArchitecture: {ARCH}\nBinhost: {BINHOST}\n\n\
+             Package: sys-libs/zlib\nVersion: 1.3.2\nBuild-Id: 1\nPath: {path}\nSize: {}\n\
+             MD5: {}\n",
+            bytes.len(),
+            Algorithm::Md5.hex_of(&bytes),
+        ))
+        .expect("a fixture plan");
+        let served = HashMap::from([(binhost_url(path), bytes)]);
+        let mut gentoo = provisioner(&key, Box::new(Canned::new(served)));
+        gentoo.plan = Some(plan);
+        gentoo.base_layer = Some(base.clone());
+        let upper = scratch.join("upper");
+
+        let layer = gentoo.stage_layer(&upper).expect("the increment stages");
+
+        // The files landed where the base's links point, in the upper, and the
+        // links the merge passed through are the upper's too.
+        assert_eq!(
+            std::fs::read(upper.join("usr/lib64/libz.so.1")).expect("the library is merged"),
+            b"ELF\n",
+        );
+        assert_eq!(
+            std::fs::read(upper.join("usr/bin/zpipe")).expect("the tool is merged"),
+            b"ELF\n",
+        );
+        for (link, target) in [("lib64", "usr/lib64"), ("sbin", "usr/bin")] {
+            assert_eq!(
+                std::fs::read_link(upper.join(link)).expect("the base's link is kept"),
+                Path::new(target),
+            );
+        }
+        // The database records each path as the image spells it, with the
+        // digest of what is on disk, read through the same link.
+        let entry = upper.join("var/db/pkg/sys-libs/zlib-1.3.2");
+        let contents = std::fs::read_to_string(entry.join("CONTENTS")).expect("CONTENTS");
+        for line in [
+            "dir /lib64",
+            "obj /lib64/libz.so.1 c80b8c1c189e1d042d2eb8fce52af5f0 1700000000",
+            "dir /sbin",
+            "obj /sbin/zpipe c80b8c1c189e1d042d2eb8fce52af5f0 1700000000",
+        ] {
+            assert!(
+                contents.lines().any(|found| found == line),
+                "{line} in {contents}",
+            );
+        }
+        // The ordinal continues the base's, and the merged view holds the
+        // increment's package.
+        assert_eq!(
+            std::fs::read_to_string(entry.join("COUNTER")).expect("COUNTER"),
+            "392"
+        );
+        let merged = installed::merged(&base, &upper).expect("the merged view reads");
+        assert!(
+            merged
+                .packages()
+                .any(|package| package.name() == "sys-libs/zlib"),
+            "the increment's package is in the merged view",
+        );
+        // The base was only read.
+        assert!(!base.join("var/db/pkg").exists());
+        assert!(!base.join("usr/lib64/libz.so.1").exists());
+        drop(layer);
     }
 }

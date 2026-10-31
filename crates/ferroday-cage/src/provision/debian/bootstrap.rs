@@ -150,8 +150,22 @@ const RUN_RECORDS: [&str; 3] = [
 /// decision rather than the bootstrap's.
 const MACHINE_ID: &str = "etc/machine-id";
 
-/// The mode `systemd-machine-id-setup` gives [`MACHINE_ID`].
-const MACHINE_ID_MODE: u32 = 0o444;
+/// The most of the dpkg status database a host-side step reads.
+///
+/// The database records a stanza of about a kilobyte per installed package:
+/// a desktop's two thousand packages come to under three megabytes. This is far
+/// past a root holding every package an archive publishes, and it is what a
+/// maintainer script that grew the file without writing to it meets first.
+const MAX_STATUS: u64 = 256 * 1024 * 1024;
+
+/// The most of a statoverride database a host-side step reads: a line of a few
+/// dozen bytes per overridden path, for a few paths a root.
+const MAX_STATOVERRIDE: u64 = 16 * 1024 * 1024;
+
+/// The most of one package's dpkg file list a host-side step reads: a line per
+/// path the package installed, which for the largest packages is tens of
+/// thousands of lines and a few megabytes.
+const MAX_FILE_LIST: u64 = 64 * 1024 * 1024;
 
 /// D-Bus's own copy of the machine id, which its configuration copies from
 /// [`MACHINE_ID`] or generates. Removed rather than emptied, as `mmdebstrap`
@@ -369,7 +383,8 @@ pub(crate) fn configure(
     // wave instead would leave the files for dpkg to treat as conffile
     // conflicts; placing it after configuration would be too late to steer it.
     if let Some(overlay) = overlay {
-        super::super::extract::overlay_tree(staging, overlay).map_err(DebianError::Overlay)?;
+        super::super::extract::overlay_tree(staging, overlay, None)
+            .map_err(DebianError::Overlay)?;
     }
 
     run_dpkg(
@@ -450,8 +465,11 @@ pub(crate) fn configure_delta(
     let single = matches!(identity_map, IdentityMap::Single);
 
     // The increment's own tree, which every host-side step below is anchored
-    // to; the base is opened where it is read.
-    let tree = open_tree(upper)?;
+    // to, over the base so a directory a step creates never hides a link the
+    // base holds; the base is otherwise opened where it is read.
+    let tree = open_tree(upper)?
+        .over(Some(&open_tree(lower)?))
+        .map_err(DebianError::at("opening the tree", upper))?;
 
     // Suppress daemon startup and, under the single-identity map, neutralize
     // direct chown/chgrp and seed the merged statoverride, before any maintainer
@@ -482,7 +500,8 @@ pub(crate) fn configure_delta(
     // just-unpacked files — a shipped conffile among them — and before configure
     // so the maintainer scripts read the injected values.
     if let Some(source) = overlay_source {
-        super::super::extract::overlay_tree(upper, source).map_err(DebianError::Overlay)?;
+        super::super::extract::overlay_tree(upper, source, Some(lower))
+            .map_err(DebianError::Overlay)?;
     }
 
     run_dpkg(
@@ -552,10 +571,7 @@ fn install_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
 fn restore_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
         let path = format!("usr/bin/{tool}");
-        if upper
-            .read(&path)
-            .is_ok_and(|body| body == OWNERSHIP_STUB.as_bytes())
-        {
+        if is_ownership_stub(upper, &path) {
             remove_if_present(upper, &path)?;
         }
     }
@@ -582,9 +598,8 @@ fn write_delta_statoverride(
     // an arbitrary host-file read whose contents are written into the tree the
     // caller goes on to export.
     let base_tree = open_tree(lower)?;
-    let base = match read_text(&base_tree, STATOVERRIDE) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+    let base = match read_text_if_present(&base_tree, STATOVERRIDE, MAX_STATOVERRIDE) {
+        Ok(text) => text.unwrap_or_default(),
         Err(source) => {
             return Err(DebianError::io(
                 "reading the base statoverride",
@@ -794,8 +809,11 @@ fn run_dpkg(
 /// The packages the tree's dpkg status database records as `install ok
 /// installed`.
 fn installed_packages(tree: &Rooted) -> Result<HashSet<String>, DebianError> {
-    let text =
-        read_text(tree, STATUS).map_err(at("reading the dpkg status database", tree, STATUS))?;
+    let text = read_text(tree, STATUS, MAX_STATUS).map_err(at(
+        "reading the dpkg status database",
+        tree,
+        STATUS,
+    ))?;
     let mut installed = HashSet::new();
     for stanza in document::parse(&text) {
         if let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status"))
@@ -827,19 +845,29 @@ fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianErro
 /// than to the root: the [run records](RUN_RECORDS) and the machine identity a
 /// maintainer script generated.
 ///
-/// The machine id is emptied only where a script wrote one. A root without
-/// `systemd` carries no file, and creating one would add state no package asked
-/// for. A file the read refuses to follow, a symbolic link among them, is left
-/// alone, since a link is not an id this run generated.
+/// Each step looks at what holds the path before it acts, without following
+/// it. A record is removed whatever it is, a symbolic link as the name it is,
+/// except for an overlay whiteout: in a layered build's upper that is the run
+/// having deleted the base's copy, and removing it would bring the base's copy
+/// back.
+///
+/// The machine id is emptied only where a script wrote one: a regular file
+/// with something in it, emptied in place, so the owner and mode the script
+/// gave it are the ones it keeps. A root without `systemd` carries no file, and
+/// creating one would add state no package asked for. An empty file, a
+/// symbolic link, and a whiteout are none of them an id this run generated,
+/// and are left as they are.
+///
+/// The mechanism is Alpine's `clear_run_state` and the policy is not: an
+/// Alpine root boots without `systemd`, and removes the id where this one
+/// empties it.
 fn clear_run_state(tree: &Rooted) -> Result<(), DebianError> {
     for path in RUN_RECORDS.into_iter().chain([DBUS_MACHINE_ID]) {
-        remove_if_present(tree, path)?;
+        tree.remove_if(path, |stat| !Rooted::is_whiteout(stat))
+            .map_err(at("removing", tree, path))?;
     }
-    if tree.read(MACHINE_ID).is_ok_and(|id| !id.is_empty()) {
-        tree.write_mode(MACHINE_ID, b"", MACHINE_ID_MODE)
-            .map_err(at("emptying", tree, MACHINE_ID))?;
-    }
-    Ok(())
+    tree.truncate_if(MACHINE_ID, Rooted::is_file_with_content)
+        .map_err(at("emptying", tree, MACHINE_ID))
 }
 
 /// Writes `/usr/sbin/policy-rc.d` returning 101, so package installation does
@@ -896,14 +924,22 @@ fn restore_ownership_stubs(tree: &Rooted) -> Result<(), DebianError> {
         {
             tree.rename(&saved, &path)
                 .map_err(at("restoring", tree, &path))?;
-        } else if tree
-            .read(&path)
-            .is_ok_and(|body| body == OWNERSHIP_STUB.as_bytes())
-        {
+        } else if is_ownership_stub(tree, &path) {
             remove_if_present(tree, &path)?;
         }
     }
     Ok(())
+}
+
+/// Whether the file at `path` still holds the ownership stub's body.
+///
+/// Read no further than the stub's own length: a file longer than that is not
+/// the stub, whatever it holds, and the read refuses it rather than holding it.
+/// Anything the read refuses, a symbolic link at the path among them, is not
+/// the stub either.
+fn is_ownership_stub(tree: &Rooted, path: &str) -> bool {
+    tree.read(path, OWNERSHIP_STUB.len() as u64)
+        .is_ok_and(|body| body == OWNERSHIP_STUB.as_bytes())
 }
 
 /// Points `/usr/bin/awk` at mawk for the core install, so the base packages'
@@ -1002,9 +1038,9 @@ fn ships_archive_keyring(tree: &Rooted) -> Result<bool, DebianError> {
         return Ok(false);
     }
     let list = format!("var/lib/dpkg/info/{ARCHIVE_KEYRING_PACKAGE}.list");
-    let files = match read_text(tree, &list) {
-        Ok(files) => files,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+    let files = match read_text_if_present(tree, &list, MAX_FILE_LIST) {
+        Ok(Some(files)) => files,
+        Ok(None) => return Ok(false),
         Err(source) => return Err(at("reading the package's file list", tree, &list)(source)),
     };
     let keyring = keyring_path(PACKAGE_KEYRING_STEM);
@@ -1058,7 +1094,7 @@ fn remove_if_present(tree: &Rooted, rootfs_path: &str) -> Result<(), DebianError
 /// The failure is the raw one, so the layered build can tell an absent database
 /// — which it reports as a misconfigured base — from a read that failed.
 pub(super) fn read_base_status(base: &Path) -> io::Result<String> {
-    read_text(&Rooted::open(base)?, STATUS)
+    read_text(&Rooted::open(base)?, STATUS, MAX_STATUS)
 }
 
 /// Opens a tree for the host-side steps that read and write inside it.
@@ -1067,9 +1103,27 @@ fn open_tree(root: &Path) -> Result<Rooted, DebianError> {
 }
 
 /// Reads a file of the tree as text, as [`std::fs::read_to_string`] would:
-/// invalid UTF-8 is an `InvalidData` failure rather than lossily decoded.
-fn read_text(tree: &Rooted, rootfs_path: &str) -> io::Result<String> {
-    let bytes = tree.read(rootfs_path)?;
+/// invalid UTF-8 is an `InvalidData` failure rather than lossily decoded. A
+/// file past `limit` bytes is refused, as [`Rooted::read`] refuses it.
+fn read_text(tree: &Rooted, rootfs_path: &str, limit: u64) -> io::Result<String> {
+    text(tree.read(rootfs_path, limit)?)
+}
+
+/// [`read_text`], with `None` where the tree holds no file at the path, as
+/// [`Rooted::read_if_present`] answers it.
+fn read_text_if_present(
+    tree: &Rooted,
+    rootfs_path: &str,
+    limit: u64,
+) -> io::Result<Option<String>> {
+    tree.read_if_present(rootfs_path, limit)?
+        .map(text)
+        .transpose()
+}
+
+/// `bytes` as text, refusing invalid UTF-8 as [`std::fs::read_to_string`]
+/// does.
+fn text(bytes: Vec<u8>) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1511,6 +1565,7 @@ mod tests {
         }
         tree.write(DBUS_MACHINE_ID, id).unwrap();
         tree.write_mode(MACHINE_ID, id, 0o444).unwrap();
+        let written = fs::metadata(staging.join(MACHINE_ID)).unwrap();
 
         clear_run_state(&tree).expect("the run state is cleared");
 
@@ -1520,15 +1575,75 @@ mod tests {
                 "{path} is removed",
             );
         }
-        // The system's id is kept as a file, empty, at the mode systemd gives
-        // it, so the machine the root is deployed to generates its own.
+        // The system's id is kept as a file, empty, so the machine the root is
+        // deployed to generates its own. It is the file the script wrote,
+        // emptied in place: read-only, as `systemd` writes it, and the same
+        // inode, so its owner and group are the ones the script left.
         let machine_id = staging.join(MACHINE_ID);
         assert_eq!(fs::read(&machine_id).unwrap(), b"");
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let emptied = fs::metadata(&machine_id).unwrap();
+        assert_eq!(emptied.permissions().mode() & 0o7777, 0o444);
+        assert_eq!(emptied.ino(), written.ino());
+    }
+
+    #[test]
+    fn a_machine_id_grown_without_writing_is_emptied_without_being_read() {
+        // A script can make the id enormous for nothing, since a sparse file
+        // takes no space. Emptying asks the file's size, never its contents.
+        let (staging, tree) = rooted_tree("machine-id-sparse");
+        tree.write_mode(MACHINE_ID, b"", 0o444).unwrap();
+        let machine_id = staging.join(MACHINE_ID);
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            fs::metadata(&machine_id).unwrap().permissions().mode() & 0o7777,
-            MACHINE_ID_MODE,
-        );
+        fs::set_permissions(&machine_id, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&machine_id)
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+
+        clear_run_state(&tree).expect("the run state is cleared");
+
+        assert_eq!(fs::metadata(&machine_id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_layered_upper_keeps_the_whiteouts_its_run_left() {
+        // In an overlay upper, a whiteout is the run having deleted the base's
+        // copy. Removing it, or emptying through it, would bring the base's
+        // copy back through the overlay.
+        let (staging, tree) = rooted_tree("run-state-whiteouts");
+        let mut whiteouts = Vec::new();
+        for path in RUN_RECORDS.into_iter().chain([DBUS_MACHINE_ID, MACHINE_ID]) {
+            let at = staging.join(path);
+            fs::create_dir_all(at.parent().unwrap()).unwrap();
+            match rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &at,
+                rustix::fs::FileType::CharacterDevice,
+                rustix::fs::Mode::empty(),
+                0,
+            ) {
+                Ok(()) => whiteouts.push(at),
+                Err(rustix::io::Errno::PERM) => {
+                    eprintln!("skipping: this kernel refuses an unprivileged whiteout");
+                    return;
+                }
+                Err(errno) => panic!("making a whiteout: {errno}"),
+            }
+        }
+
+        clear_run_state(&tree).expect("the run state is cleared");
+
+        for at in whiteouts {
+            let kept = fs::symlink_metadata(&at).expect("the whiteout is kept");
+            assert!(
+                std::os::unix::fs::FileTypeExt::is_char_device(&kept.file_type()),
+                "{}",
+                at.display(),
+            );
+        }
     }
 
     #[test]

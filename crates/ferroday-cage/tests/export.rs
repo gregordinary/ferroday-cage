@@ -1400,7 +1400,9 @@ fn a_copy_creates_a_named_pipe() {
         eprintln!("skipping: this filesystem will not hold a named pipe");
         return;
     }
-    std::fs::set_permissions(&fifo, PermissionsExt::from_mode(0o600)).unwrap();
+    // A mode the copy does not create the pipe at, so it is the one the copy
+    // applies afterwards that the assertion reads.
+    std::fs::set_permissions(&fifo, PermissionsExt::from_mode(0o640)).unwrap();
     let rootfs = dir.join("rootfs");
     std::fs::create_dir_all(&rootfs).unwrap();
 
@@ -1411,7 +1413,7 @@ fn a_copy_creates_a_named_pipe() {
 
     let meta = std::fs::symlink_metadata(rootfs.join("initctl")).expect("the pipe was created");
     assert!(meta.file_type().is_fifo(), "{meta:?}");
-    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
 }
 
 /// An entry the copy cannot create is named in the report rather than dropped

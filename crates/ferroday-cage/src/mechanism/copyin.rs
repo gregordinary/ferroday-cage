@@ -42,8 +42,8 @@
 //!   The child applies the ownership and the modification time; the mode goes
 //!   unused, since the kernel fixes a symlink's own at 0777.
 //! - [`COPY_FIFO`]: a named pipe. Its name and metadata follow, and the child
-//!   applies them through the name rather than through a descriptor: opening a
-//!   FIFO waits for a peer that a copy has no reason to expect.
+//!   applies them through a descriptor for the pipe it created, opened without
+//!   waiting for a peer that a copy has no reason to expect.
 //! - [`COPY_LINK`]: a second or later name for a file already created. Its own
 //!   name and the first name's path, relative to the destination root, follow.
 //!   Metadata is the inode's and is already applied, so none is sent.
@@ -592,10 +592,11 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                     0,
                 )
                 .map_err(|errno| (CopyStep::Fifo, errno))?;
-                // Applied through the name rather than a descriptor: opening a
-                // FIFO waits for a peer at the other end, and a copy has no
-                // reason to expect one.
-                apply_meta_at(&current, name, &meta)?;
+                // Applied through a descriptor, as every other entry's is, so
+                // a source-chosen mode lands on this pipe and on nothing a
+                // racer put at the name since.
+                let fifo = open_created_fifo(&current, name)?;
+                apply_meta(fifo.as_fd(), &meta)?;
             }
             COPY_LINK => {
                 let name = read_bare_name(stream)?;
@@ -672,31 +673,28 @@ fn apply_meta(fd: BorrowedFd<'_>, meta: &Meta) -> Result<(), (CopyStep, Errno)> 
     .map_err(|errno| (CopyStep::Metadata, errno))
 }
 
-/// Applies ownership, then mode, then modification time to an entry named
-/// relative to an open directory.
+/// Opens the named pipe `name` this walk just created in `dir`, so its
+/// metadata can be applied through a descriptor.
 ///
-/// The descriptor-based [`apply_meta`] is preferred wherever the entry is
-/// already open, since a name can be replaced between the create and the
-/// change while a descriptor cannot. A FIFO is the exception: opening one
-/// blocks for a peer. Every call resolves without following a symlink, and the
-/// name was created by this same walk a syscall earlier.
-fn apply_meta_at(dir: &OwnedFd, name: &CStr, meta: &Meta) -> Result<(), (CopyStep, Errno)> {
-    fs::chownat(
+/// `O_RDONLY | O_NONBLOCK` opens a pipe at once, whether or not anything holds
+/// its other end. `O_NOFOLLOW` refuses a name a racer replaced with a symbolic
+/// link since the `mknodat`, and `O_NOCTTY` keeps a terminal put there from
+/// becoming this process's controlling one before the check below refuses it.
+/// Anything that is not a pipe is `EEXIST`: the name no longer holds the entry
+/// this created.
+fn open_created_fifo(dir: &OwnedFd, name: &CStr) -> Result<OwnedFd, (CopyStep, Errno)> {
+    let fifo = fs::openat(
         dir,
         name,
-        Some(rustix::fs::Uid::from_raw(meta.uid)),
-        Some(rustix::fs::Gid::from_raw(meta.gid)),
-        AtFlags::SYMLINK_NOFOLLOW,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
     )
-    .map_err(|errno| (CopyStep::Chown, errno))?;
-    fs::chmodat(
-        dir,
-        name,
-        Mode::from_bits_truncate(meta.mode & 0o7777),
-        AtFlags::empty(),
-    )
-    .map_err(|errno| (CopyStep::Metadata, errno))?;
-    set_times_at(dir, name, meta.mtime)
+    .map_err(|errno| (CopyStep::Fifo, errno))?;
+    let stat = fs::fstat(&fifo).map_err(|errno| (CopyStep::Fifo, errno))?;
+    if fs::FileType::from_raw_mode(stat.st_mode) != fs::FileType::Fifo {
+        return Err((CopyStep::Fifo, Errno::EXIST));
+    }
+    Ok(fifo)
 }
 
 /// Applies a modification time to an entry named relative to an open directory,

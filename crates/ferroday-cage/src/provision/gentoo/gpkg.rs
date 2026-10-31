@@ -806,14 +806,19 @@ pub(super) mod fixture {
     }
 
     /// The image archive a container carries: one directory, one file, one
-    /// symbolic link, and a named pipe where `fifo` asks for one.
+    /// symbolic link, a named pipe where `fifo` asks for one, and a file under
+    /// each of `lib64/` and `sbin/` where `aliased` does.
     ///
     /// The fifo is optional because it is what a package ships rarely and the
     /// merge has to answer for anyway: the layer records portage's own `fif`
     /// line for it and never opens it, where reading it as an ordinary file
     /// would block until something opened the write end -- and inside a
     /// provisioning run nothing will.
-    fn image(fifo: bool) -> Vec<u8> {
+    ///
+    /// The aliased paths are the ones a merged-usr root holds as links into
+    /// `usr`, which the binhost's own packages still ship (lvm2's
+    /// `lib64/libdevmapper.so.1.02` and `sbin/dmsetup`).
+    fn image(fifo: bool, aliased: bool) -> Vec<u8> {
         let mut out = Vec::new();
         let mut entries: Vec<(&str, &str, u32, u64, u8)> = vec![
             ("image/", "", 0o755, 0u64, b'5'),
@@ -824,6 +829,14 @@ pub(super) mod fixture {
         ];
         if fifo {
             entries.push(("image/usr/lib/zlib.pipe", "", 0o644, 0, b'6'));
+        }
+        if aliased {
+            entries.extend([
+                ("image/lib64/", "", 0o755, 0, b'5'),
+                ("image/lib64/libz.so.1", "", 0o755, 4, b'0'),
+                ("image/sbin/", "", 0o755, 0, b'5'),
+                ("image/sbin/zpipe", "", 0o755, 4, b'0'),
+            ]);
         }
         for (name, target, mode, size, typeflag) in entries {
             out.extend_from_slice(
@@ -866,6 +879,8 @@ pub(super) mod fixture {
         pub corrupt: Option<&'static str>,
         /// Whether the image ships a named pipe beside its ordinary files.
         pub fifo: bool,
+        /// Whether the image ships paths under `lib64/` and `sbin/` too.
+        pub aliased: bool,
         /// Members added after the ordinary ones and before the Manifest, each
         /// a name and its bytes, listed in the Manifest unless `unlisted`
         /// names them.
@@ -885,6 +900,7 @@ pub(super) mod fixture {
                 marked: true,
                 corrupt: None,
                 fifo: false,
+                aliased: false,
                 extra: Vec::new(),
                 uppercase: false,
             }
@@ -898,7 +914,7 @@ pub(super) mod fixture {
             }
             members.push(("metadata.tar".to_string(), self.metadata));
             members.push(("metadata.tar.sig".to_string(), b"not read\n".to_vec()));
-            members.push(("image.tar".to_string(), image(self.fifo)));
+            members.push(("image.tar".to_string(), image(self.fifo, self.aliased)));
             members.push(("image.tar.sig".to_string(), b"not read\n".to_vec()));
             for (name, body) in self.extra {
                 members.push((name.to_string(), body));

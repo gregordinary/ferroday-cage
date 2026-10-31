@@ -13,5 +13,7 @@
 # cannot see it, and `tools/check-idioms.py` is what watches instead.
 disallowed-methods = [
   { path = "rustix::fs::openat2", reason = "open a directory contained in a tree through provision::containment::open_dir, which folds in the flags every caller passes and the retry the kernel asks for when a rename races the walk" },
+  { path = "rustix::fs::chmodat", reason = "a chmod by name follows a symbolic link at the leaf, and cannot be told not to: open the entry with O_NOFOLLOW (O_DIRECTORY for a directory, O_NONBLOCK for a named pipe) and fchmod the descriptor, as mechanism::child's create_mount_dir does; a chain of new directories is provision::containment::create_dirs" },
+  { path = "rustix::fs::chmod", reason = "a chmod by path follows every symbolic link on it: open the entry with O_NOFOLLOW and fchmod the descriptor, as mechanism::child's create_mount_dir does" },
   { path = "rustix::rand::getrandom", reason = "fill a buffer through host::fill_random, which resumes a short read and cannot spin on an empty one; the caller keeps its own policy for a failure" },
 ]

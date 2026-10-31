@@ -11,7 +11,7 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -628,19 +628,52 @@ pub(crate) fn force_remove_dir_all(path: &Path) {
 /// first when the open is refused for want of them.
 ///
 /// The overlay mount leaves its work area's inner directory mode `0`, which
-/// cannot be read into at all. A `chmod` restores traversal; the re-open stays
-/// `O_NOFOLLOW`, so an entry that became a symlink in between is refused rather
-/// than descended through.
+/// cannot be read into at all, and a sandbox can leave one in its upper. The
+/// directory is held by an `O_PATH` descriptor, which needs no permission on
+/// the directory itself, with `O_NOFOLLOW` and `O_DIRECTORY` refusing a link or
+/// anything else at the name. Its owner's rights are restored through that
+/// descriptor, and it is reopened through it, so neither the mode nor the
+/// descent can be redirected by whatever replaces the name in between.
 fn open_removable_dir(parent: impl AsFd, name: &CStr) -> Option<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     match rustix::fs::openat(&parent, name, flags, Mode::empty()) {
         Ok(fd) => Some(fd),
         Err(Errno::ACCESS) => {
-            rustix::fs::chmodat(&parent, name, Mode::RWXU, AtFlags::empty()).ok()?;
-            rustix::fs::openat(&parent, name, flags, Mode::empty()).ok()
+            let held = rustix::fs::openat(
+                &parent,
+                name,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .ok()?;
+            restore_owner_rights(&held).ok()?;
+            rustix::fs::openat(
+                &held,
+                c".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .ok()
         }
         Err(_) => None,
     }
+}
+
+/// Gives the owner of the directory `held` read, write, and search on it,
+/// through the descriptor rather than by name.
+///
+/// `fchmod` refuses an `O_PATH` descriptor, and a directory whose mode denies
+/// its owner reading cannot be opened any other way. The mode is therefore set
+/// through the descriptor's own entry under `/proc/self/fd`, a link the kernel
+/// resolves to the inode the descriptor holds rather than to anything named in
+/// a tree. Where `/proc` is not mounted this fails, and the removal stops there
+/// as it stops at any entry it cannot remove.
+fn restore_owner_rights(held: &OwnedFd) -> rustix::io::Result<()> {
+    let path = format!("/proc/self/fd/{}", held.as_raw_fd());
+    // The magic link is what makes a path-wise chmod land on the descriptor's
+    // own inode; the descriptor-based chmod the ban names refuses `O_PATH`.
+    #[expect(clippy::disallowed_methods)]
+    rustix::fs::chmod(path.as_str(), Mode::RWXU)
 }
 
 /// Lays out the probe's lower, upper, work, and merged directories under `base`

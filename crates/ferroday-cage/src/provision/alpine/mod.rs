@@ -1730,12 +1730,19 @@ fn install(
 
     let order = install_order(&acquired);
     let carried = base.map(layer::Base::carried).unwrap_or_default();
-    let (database, subjects) = lay_down(into, carried, &mut acquired, &order, observer)?;
+    let (database, subjects) = lay_down(
+        into,
+        base.map(layer::Base::path),
+        carried,
+        &mut acquired,
+        &order,
+        observer,
+    )?;
 
     // After every package's files are down, so this overwrites what they
     // shipped, and before any script runs, so a script reads what was injected.
     if let Some(overlay) = &alpine.overlay {
-        super::extract::overlay_tree(into, overlay)?;
+        super::extract::overlay_tree(into, overlay, base.map(layer::Base::path))?;
     }
 
     if alpine.extract_only {
@@ -2197,14 +2204,22 @@ fn install_order(acquired: &[Acquired]) -> Vec<usize> {
 /// the first established that the bytes are the package, and this one decodes
 /// the file tree it already digested. It is the same open file both times, which
 /// is what makes "already digested" true of the bytes this reads.
+///
+/// `over` is the base a layered build's staging tree is an overlay upper over,
+/// which the extraction places every entry through ([`Extraction::over`]), so a
+/// link the base holds is never hidden by a directory of the increment's. The
+/// database records each path as the package spells it, as `apk` does.
 fn lay_down(
     staging: &Path,
+    over: Option<&Path>,
     carried: Carried,
     acquired: &mut [Acquired],
     order: &[usize],
     observer: &mut dyn AlpineObserver,
 ) -> Result<(Database, Vec<ScriptSubject>), ProvisionError> {
-    let mut extraction = Extraction::new(staging)?.root_mode(ROOTFS_ROOT_MODE);
+    let mut extraction = Extraction::new(staging)?
+        .root_mode(ROOTFS_ROOT_MODE)
+        .over(over)?;
     let mut database = Database::carrying(carried);
     let mut subjects = Vec::with_capacity(order.len());
 
@@ -3523,6 +3538,7 @@ mod tests {
         let order: Vec<usize> = (0..acquired.len()).collect();
         let (database, subjects) = lay_down(
             &staging,
+            None,
             Carried::default(),
             &mut acquired,
             &order,
@@ -4702,5 +4718,98 @@ mod tests {
         assert!(rendering.contains("v3.23"), "{rendering}");
         assert!(rendering.contains(fixtures::ALPINE_KEY_NAME), "{rendering}");
         assert!(!rendering.contains("BEGIN PUBLIC KEY"), "{rendering}");
+    }
+
+    /// A base recording busybox, laid out merged-usr: its `lib`, the
+    /// database's directory among it, is a link to `usr/lib`.
+    fn merged_usr_base(scratch: &Scratch) -> PathBuf {
+        let base = base_recording(scratch, "base", &[("busybox", "1.37.0-r30", "p:/bin/sh")]);
+        std::fs::create_dir(base.join("usr")).expect("the base is laid out");
+        std::fs::rename(base.join("lib"), base.join("usr/lib")).expect("the base is laid out");
+        std::os::unix::fs::symlink("usr/lib", base.join("lib")).expect("a link");
+        base
+    }
+
+    #[test]
+    fn an_increment_over_a_merged_usr_base_keeps_the_bases_links() {
+        // musl ships `lib/ld-musl-x86_64.so.1`. Over a base whose `lib` is a
+        // link to `usr/lib`, as a merged-usr root's is, the loader belongs at
+        // `usr/lib` in the upper, and so does the database `apk` reads at
+        // `lib/apk/db`; a real `lib` directory in the upper would hide the
+        // base's link, and everything else the base keeps under `usr/lib`,
+        // from the merged view.
+        let scratch = Scratch::new("alpine-layered-merged-usr");
+        let mirror = published(&scratch, &[("musl-1.2.5-r23.apk", fixtures::MUSL)]);
+        let base = merged_usr_base(&scratch);
+        let upper = scratch.join("upper");
+
+        let layer = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .base_layer(&base)
+            .include(["musl"])
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures")
+            .stage_layer(&upper)
+            .expect("the increment stages");
+
+        assert_eq!(
+            std::fs::read_link(upper.join("lib")).expect("the base's link is kept"),
+            Path::new("usr/lib"),
+        );
+        assert!(upper.join("usr/lib/ld-musl-x86_64.so.1").is_file());
+        assert_eq!(
+            std::fs::read_link(upper.join("usr/lib/libc.musl-x86_64.so.1"))
+                .expect("musl's own link"),
+            Path::new("ld-musl-x86_64.so.1"),
+        );
+        // The database records the path as the package spells it, and is
+        // written where the merged view reads it.
+        let installed = std::fs::read_to_string(upper.join("usr/lib/apk/db/installed"))
+            .expect("the merged database is written through the link");
+        assert!(installed.contains("\nP:musl\n"), "{installed}");
+        assert!(
+            installed.contains("\nF:lib\nR:ld-musl-x86_64.so.1\n"),
+            "{installed}"
+        );
+        assert!(installed.contains("P:busybox\n"), "{installed}");
+        // The base was only read.
+        assert!(!base.join("usr/lib/ld-musl-x86_64.so.1").exists());
+        drop(layer);
+    }
+
+    #[test]
+    fn an_increment_that_ships_nothing_under_lib_writes_its_database_through_the_link() {
+        // alpine-keys ships under `etc` and `usr/share` alone, so no entry of
+        // the increment's carries the base's `lib` link up. The database
+        // written afterwards still goes where the merged view reads it.
+        let scratch = Scratch::new("alpine-layered-database");
+        let mirror = published(
+            &scratch,
+            &[("alpine-keys-2.6-r0.apk", fixtures::ALPINE_KEYS)],
+        );
+        let base = merged_usr_base(&scratch);
+        let upper = scratch.join("upper");
+
+        let layer = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .base_layer(&base)
+            .include(["alpine-keys"])
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures")
+            .stage_layer(&upper)
+            .expect("the increment stages");
+
+        assert_eq!(
+            std::fs::read_link(upper.join("lib")).expect("the base's link is kept"),
+            Path::new("usr/lib"),
+        );
+        let installed = std::fs::read_to_string(upper.join("usr/lib/apk/db/installed"))
+            .expect("the merged database is written through the link");
+        assert!(installed.contains("\nP:alpine-keys\n"), "{installed}");
+        drop(layer);
     }
 }

@@ -39,7 +39,6 @@
 //! so a symbolic link at `var/db/pkg` is a thing that can be there. Resolved
 //! this way it names something inside the tree or nothing at all.
 
-use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
@@ -49,7 +48,7 @@ use rustix::io::Errno;
 
 use super::atom::{self, Atom, Candidate, Dependency};
 use super::version;
-use super::{DB_DIR, GentooError};
+use super::{DB_DIR, GentooError, MAX_METADATA_BYTES};
 use crate::provision::containment;
 use crate::provision::rooted::Rooted;
 
@@ -374,12 +373,14 @@ fn read_entry(
         ));
     };
     let name = format!("{category}/{package}");
+    // Each file of an entry is one of a binary package's metadata files, which
+    // a container holds to `MAX_METADATA_BYTES` together; one past that alone
+    // is not one portage wrote.
     let field = |file: &str| -> Result<Option<String>, GentooError> {
-        match rooted.read(format!("{dir}/{file}")) {
-            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).trim().to_string())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(GentooError::io("reading a package database entry", at, err)),
-        }
+        rooted
+            .read_if_present(format!("{dir}/{file}"), MAX_METADATA_BYTES)
+            .map(|bytes| bytes.map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string()))
+            .map_err(|err| GentooError::io("reading a package database entry", at, err))
     };
     // A missing `SLOT` is what tells an entry directory from something else
     // that happens to be shaped like one: portage writes the file for every
@@ -478,10 +479,6 @@ struct Upper {
     fd: OwnedFd,
 }
 
-/// The attribute that marks an upper directory opaque, in the `user.`
-/// namespace the overlays this crate mounts read their metadata from.
-const OPAQUE_XATTR: &str = "user.overlay.opaque";
-
 impl Upper {
     /// Opens the upper at `path`.
     fn open(path: &Path) -> io::Result<Upper> {
@@ -503,18 +500,17 @@ impl Upper {
     /// device overlayfs leaves where something of the lower was removed, hides
     /// it. So does any other non-directory, since only a directory merges with
     /// what lies beneath it. An opaque directory hides everything beneath it.
+    ///
+    /// The rule the layered walk (`containment::copy_up`) reads each name by,
+    /// and one marker answer, `containment::is_opaque`. Where that walk resolves
+    /// a path through a link, this asks about the path as spelled, since a
+    /// database entry is named rather than resolved, so a link here hides.
     fn hides(&self, path: &str) -> io::Result<bool> {
-        let mut prefix = String::new();
-        for component in path.split('/') {
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(component);
-            let walked = CString::new(prefix.as_bytes())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let components: Vec<&str> = path.split('/').collect();
+        for depth in 1..=components.len() {
             let dir = match containment::open_dir(
                 self.fd.as_fd(),
-                &walked,
+                &components[..depth],
                 OFlags::RDONLY | OFlags::NOFOLLOW,
                 ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
             ) {
@@ -525,25 +521,11 @@ impl Upper {
                 Err(Errno::NOTDIR | Errno::LOOP) => return Ok(true),
                 Err(errno) => return Err(errno.into()),
             };
-            if is_opaque(&dir)? {
+            if containment::is_opaque(dir.as_fd())? {
                 return Ok(true);
             }
         }
         Ok(false)
-    }
-}
-
-/// Whether `dir` carries overlayfs's opaque marker.
-///
-/// The marker is the value `y`. Overlayfs gives the attribute one other value,
-/// `x`, which says a directory holds whiteouts of another form and is not
-/// opaque. A filesystem without `user.` attributes carries no marker at all.
-fn is_opaque(dir: &OwnedFd) -> io::Result<bool> {
-    let mut value = [0u8; 1];
-    match rustix::fs::fgetxattr(dir, OPAQUE_XATTR, &mut value) {
-        Ok(read) => Ok(value[..read] == *b"y"),
-        Err(Errno::NODATA | Errno::NOTSUP | Errno::RANGE) => Ok(false),
-        Err(errno) => Err(errno.into()),
     }
 }
 
@@ -838,8 +820,12 @@ mod tests {
         // which some filesystems cannot hold.
         let crypt = upper.join(DB_DIR).join("app-crypt");
         std::fs::create_dir_all(&crypt).unwrap();
-        let marked =
-            rustix::fs::setxattr(&crypt, OPAQUE_XATTR, b"x", rustix::fs::XattrFlags::empty());
+        let marked = rustix::fs::setxattr(
+            &crypt,
+            containment::OPAQUE,
+            b"x",
+            rustix::fs::XattrFlags::empty(),
+        );
         if let Err(errno) = marked {
             eprintln!(
                 "skipping the opaque cases: this filesystem refuses user attributes ({errno})"
@@ -852,8 +838,13 @@ mod tests {
             names(&merged(&lower, &upper).expect("the merged view is read"))
                 .contains(&"app-crypt/pinentry")
         );
-        rustix::fs::setxattr(&crypt, OPAQUE_XATTR, b"y", rustix::fs::XattrFlags::empty())
-            .expect("the marker is set");
+        rustix::fs::setxattr(
+            &crypt,
+            containment::OPAQUE,
+            b"y",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .expect("the marker is set");
         assert_eq!(
             names(&merged(&lower, &upper).expect("the merged view is read")),
             ["sys-apps/util-linux"],

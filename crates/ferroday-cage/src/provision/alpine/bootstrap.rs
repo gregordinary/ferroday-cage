@@ -89,6 +89,13 @@ const SHADOW: [&str; 2] = ["etc/shadow", "etc/shadow-"];
 /// The seconds in the unit `/etc/shadow` counts in, a day.
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
+/// The most of a [`SHADOW`] file a host-side step reads.
+///
+/// An account is one line of about a hundred bytes, so this is past a hundred
+/// thousand of them. A script can make the file any length it likes without
+/// writing to it, and this is what such a file meets.
+const MAX_SHADOW: u64 = 16 * 1024 * 1024;
+
 /// The state a finished root hands back to `apk`, beside its database.
 ///
 /// One value because a layered build supplies a different one of each: its
@@ -153,7 +160,7 @@ pub(super) fn configure(
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
     let staging = site.staging;
-    let tree = Rooted::open(staging).map_err(AlpineError::at("opening the tree", staging))?;
+    let tree = open_tree(staging, state)?;
     write_state(&tree, database, state)?;
     // What the accounts' dates were before any script ran, so that afterwards
     // the ones the run wrote can be told from the ones it found.
@@ -243,7 +250,7 @@ impl Accounts {
             None => Ok(Accounts::Absent),
             Some(stat) if Rooted::is_whiteout(&stat) => Ok(Accounts::Removed),
             Some(_) => tree
-                .read(path)
+                .read(path, MAX_SHADOW)
                 .map(Accounts::Held)
                 .map_err(AlpineError::at("reading the accounts", tree.path(path))),
         }
@@ -522,8 +529,16 @@ pub(super) fn register(
     database: &Database,
     state: &State<'_>,
 ) -> Result<(), AlpineError> {
-    let tree = Rooted::open(staging).map_err(AlpineError::at("opening the tree", staging))?;
-    write_state(&tree, database, state)
+    write_state(&open_tree(staging, state)?, database, state)
+}
+
+/// Opens the tree a run writes, over the base beneath it in a layered build,
+/// so a directory a write creates in the upper never hides a link the base
+/// holds ([`Rooted::over`]).
+fn open_tree(staging: &Path, state: &State<'_>) -> Result<Rooted, AlpineError> {
+    Rooted::open(staging)
+        .and_then(|tree| tree.over(state.beneath))
+        .map_err(AlpineError::at("opening the tree", staging))
 }
 
 /// Writes the database and the `/etc/apk` state.
@@ -1210,7 +1225,7 @@ mod tests {
             .unwrap();
         date_accounts(&upper, &before, 1_700_000_000).expect("the accounts are dated");
         assert_eq!(
-            upper.read("etc/shadow").unwrap(),
+            upper.read("etc/shadow", MAX_SHADOW).unwrap(),
             b"klogd:!:19675:0:99999:7:::\n"
         );
     }

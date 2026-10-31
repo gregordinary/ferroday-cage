@@ -27,8 +27,12 @@
 //!
 //! A script can as easily leave a named pipe where the host side expects a
 //! file, and opening one for reading waits for a writer that never comes. A
-//! read therefore opens without waiting and refuses whatever it opened that is
-//! not a regular file, so a tree can fail a read but cannot stall one.
+//! read therefore looks at what holds the name before opening it, opens only a
+//! regular file, and opens that without waiting, so a tree can fail a read but
+//! cannot stall one. Nor can it make one exhaust the host: a file costs a
+//! script nothing to make enormous, since `truncate -s 1T` writes no data and
+//! takes no space, so every read states the most it will hold and refuses a
+//! file past it.
 //!
 //! Paths are tree-relative and may be written with a leading `/`, since the
 //! tree is a root filesystem and its own files name themselves that way. A `..`
@@ -42,13 +46,16 @@
 //! target that is not UTF-8 is unusual but not invalid, and it must not be the
 //! one path that skips the containment.
 
-// Most of this module serves the Debian bootstrap's host-side steps; a build
-// without that feature reaches it only through `remove_if`, for the launch
-// teardown's mount-point placeholders. The rest is dead code there, and saying
-// so once is clearer than gating a dozen methods one by one.
+// Every provisioner's host-side steps go through this module, and the Debian
+// bootstrap's use nearly all of it. A build without that feature reaches only
+// the part Alpine's or Gentoo's steps use, and a build with no provisioner only
+// `remove_if`, for the launch teardown's mount-point placeholders. The rest is
+// dead code there, and saying so once is clearer than gating each method on
+// the combination of features that reaches it. The few that Debian does not
+// reach carry their own allowance.
 #![cfg_attr(not(feature = "debian"), allow(dead_code))]
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -62,11 +69,11 @@ use crate::path::{self, LeadingSlash};
 
 use super::containment;
 
-/// The mode an intermediate directory is created with.
+/// The mode an intermediate directory is left at.
 ///
-/// `mkdirat` honours the umask, so the mode is applied explicitly afterward:
-/// a rootfs whose directory modes followed the caller's umask would differ
-/// between two runs of the same build.
+/// Applied through the descriptor of the directory just made rather than left
+/// to `mkdirat`, which narrows it by the umask: a rootfs whose directory modes
+/// followed the caller's umask would differ between two runs of the same build.
 const DIR_MODE: u32 = 0o755;
 
 /// The mode a file is left at where the caller states none — the mode
@@ -80,6 +87,10 @@ pub(crate) struct Rooted {
     /// The tree's root. `O_PATH`: it is only ever the anchor of an `openat2`,
     /// so it needs no read access to the directory itself.
     fd: OwnedFd,
+    /// The base the tree is an overlay upper over, where it is one: read, and
+    /// never written. See [`over`](Self::over).
+    #[cfg(feature = "tarball")]
+    lower: Option<OwnedFd>,
     /// The tree's host path, for error reporting only.
     root: PathBuf,
 }
@@ -94,8 +105,31 @@ impl Rooted {
         )?;
         Ok(Rooted {
             fd,
+            #[cfg(feature = "tarball")]
+            lower: None,
             root: root.to_path_buf(),
         })
+    }
+
+    /// Treats the tree as an overlay upper over `lower`, where one is given.
+    ///
+    /// A layered build's host-side steps write into the upper, and a directory
+    /// one creates there where the base holds a link to a directory hides the
+    /// link in the merged view, exactly as an extraction's would. Over a base,
+    /// the parents a write creates are first walked through the merged view,
+    /// with the upper made to hold what the view holds along them
+    /// ([`containment::copy_up`]). `lib/apk/db/installed`, over a base whose
+    /// `lib` is `usr/lib`, then lands in the upper's `usr/lib` beside a copy
+    /// of the link. A directory carried up from the base keeps the base's mode.
+    ///
+    /// Only creation consults the base. Every read, and every write to a path
+    /// whose parents are already there, is the upper's own, as it always was.
+    #[cfg(feature = "tarball")]
+    pub(crate) fn over(mut self, lower: Option<&Rooted>) -> io::Result<Rooted> {
+        if let Some(lower) = lower {
+            self.lower = Some(rustix::io::fcntl_dupfd_cloexec(&lower.fd, 0)?);
+        }
+        Ok(self)
     }
 
     /// The host path `relative` names, for an error message. Nothing resolves
@@ -153,16 +187,60 @@ impl Rooted {
         Ok(())
     }
 
-    /// Reads the file at `relative`.
+    /// Reads the file at `relative`, refusing one that holds more than `limit`
+    /// bytes.
+    ///
+    /// The ceiling is the caller's, since only the caller knows what it is
+    /// reading: a counter is a few digits, and a package database is megabytes.
+    /// A file past it fails the read with an error naming the path and the
+    /// ceiling, whatever its size claims, since the bound is on what is read
+    /// rather than on what a `stat` said a moment earlier.
     ///
     /// `O_NOFOLLOW`: a symbolic link at the leaf fails the read rather than
     /// being followed, so a link planted where a file is expected cannot turn
     /// this into a read of something else. Anything else that is not a regular
     /// file is refused as [`reader`](Self::reader) refuses it.
-    pub(crate) fn read(&self, relative: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    pub(crate) fn read(&self, relative: impl AsRef<Path>, limit: u64) -> io::Result<Vec<u8>> {
+        let relative = relative.as_ref();
         let mut contents = Vec::new();
-        self.reader(relative)?.read_to_end(&mut contents)?;
+        self.reader(relative)?
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!(
+                    "{} holds more than the {limit} bytes accepted for it",
+                    self.path(relative).display(),
+                ),
+            ));
+        }
         Ok(contents)
+    }
+
+    /// Reads the file at `relative` as [`read`](Self::read) does, answering
+    /// `None` where there is none.
+    ///
+    /// None is the name being free — an absent leaf, a parent that is absent or
+    /// is not a directory, or an overlay whiteout, which is how a layered
+    /// build's upper says the file is gone. Anything else that is not a regular
+    /// file is still refused: a directory or a named pipe at the path is not a
+    /// file that is missing.
+    pub(crate) fn read_if_present(
+        &self,
+        relative: impl AsRef<Path>,
+        limit: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        match self.read(relative, limit) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    || err.raw_os_error() == Some(Errno::NOTDIR.raw_os_error()) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Opens the file at `relative` for reading, contained as every path here
@@ -174,10 +252,12 @@ impl Rooted {
     /// one of them.
     ///
     /// Only a regular file is opened. Anything else is refused without being
-    /// waited on, a named pipe included; see
+    /// opened at all, a named pipe included; see
     /// [`open_regular`](Self::open_regular).
     pub(crate) fn reader(&self, relative: impl AsRef<Path>) -> io::Result<File> {
-        self.open_regular(relative.as_ref(), OFlags::RDONLY)
+        let relative = relative.as_ref();
+        let (parent, leaf) = self.parent_of(relative, Parents::Require)?;
+        self.open_regular(&parent, &leaf, relative, OFlags::RDONLY)
     }
 
     /// Replaces the contents of the regular file at `relative` in place.
@@ -190,34 +270,124 @@ impl Rooted {
     /// [`reader`](Self::reader) refuses it, before anything is truncated.
     #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub(crate) fn overwrite(&self, relative: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
-        let mut file = self.open_regular(relative.as_ref(), OFlags::WRONLY)?;
+        let relative = relative.as_ref();
+        let (parent, leaf) = self.parent_of(relative, Parents::Require)?;
+        let mut file = self.open_in_place(&parent, &leaf, relative)?;
         file.set_len(0)?;
         file.write_all(contents)
     }
 
-    /// Opens the regular file at `relative` for `access`, refusing anything
-    /// else without waiting on it.
+    /// Empties the regular file at `relative` in place if it exists and
+    /// `accept` approves what is there, leaving it alone otherwise.
     ///
-    /// The open is `O_NONBLOCK`, so a named pipe at the leaf, which an ordinary
-    /// open would wait on until something opened its other end, returns at
-    /// once, and is then refused as a directory, a socket, or a device node is.
-    /// `O_NOCTTY` keeps a terminal from becoming the caller's controlling
-    /// terminal in the moment before its refusal. A regular file ignores
-    /// `O_NONBLOCK`, and the flag is cleared before the descriptor is handed
-    /// back all the same.
-    fn open_regular(&self, relative: &Path, access: OFlags) -> io::Result<File> {
-        let (parent, leaf) = self.parent_of(relative, Parents::Require)?;
+    /// The stat-gated counterpart of [`remove_if`](Self::remove_if), for a
+    /// file a root keeps but should not keep the contents of. The predicate
+    /// sees the leaf's own `stat`, taken without following it, and nothing is
+    /// opened until it has approved; anything that is not a regular file is
+    /// left alone whatever it says, so a link, a named pipe, or a layered
+    /// build's whiteout is never emptied through.
+    ///
+    /// In place, as [`overwrite`](Self::overwrite) rewrites: the inode, owner,
+    /// group, and mode stay the ones a script gave the file. An absent leaf,
+    /// or an absent parent, is already done.
+    pub(crate) fn truncate_if(
+        &self,
+        relative: impl AsRef<Path>,
+        accept: impl FnOnce(&Stat) -> bool,
+    ) -> io::Result<()> {
+        let relative = relative.as_ref();
+        let (parent, leaf) = match self.parent_of(relative, Parents::Require) {
+            Ok(found) => found,
+            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(()),
+            Err(errno) => return Err(errno.into()),
+        };
+        match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat)
+                if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                    && accept(&stat) => {}
+            Ok(_) | Err(Errno::NOENT | Errno::NOTDIR) => return Ok(()),
+            Err(errno) => return Err(errno.into()),
+        }
+        self.open_in_place(&parent, &leaf, relative)?.set_len(0)
+    }
+
+    /// Opens the regular file `leaf` of `parent` for rewriting in place.
+    ///
+    /// A file whose mode denies its owner writing is still the owner's to
+    /// rewrite, since the owner may change its mode: `systemd` writes the
+    /// machine id `0444`. Such a file is held open for reading, given its
+    /// owner's write bit through that descriptor for as long as the open for
+    /// writing takes, and given its own mode back before anything is written,
+    /// since a descriptor keeps the access it was opened with. The two opens
+    /// must reach one file, or nothing is written: the name is not trusted to
+    /// hold still between them.
+    fn open_in_place(&self, parent: &OwnedFd, leaf: &CString, relative: &Path) -> io::Result<File> {
+        match self.open_regular(parent, leaf, relative, OFlags::WRONLY) {
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
+            opened => return opened,
+        }
+        let held = self.open_regular(parent, leaf, relative, OFlags::RDONLY)?;
+        let before = rustix::fs::fstat(&held)?;
+        let mode = Mode::from_raw_mode(before.st_mode & 0o7777);
+        rustix::fs::fchmod(&held, mode | Mode::WUSR)?;
+        let opened = self.open_regular(parent, leaf, relative, OFlags::WRONLY);
+        rustix::fs::fchmod(&held, mode)?;
+        let file = opened?;
+        let after = rustix::fs::fstat(&file)?;
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} was replaced while it was being opened",
+                    self.path(relative).display(),
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Opens the regular file `leaf` of `parent` for `access`, refusing
+    /// anything else without opening it.
+    ///
+    /// What holds the name is looked at first, without following it, so
+    /// nothing but a regular file is ever opened: a named pipe, which an
+    /// ordinary open would wait on until something opened its other end, and
+    /// a device node, whose open can act on the device, are refused before
+    /// either happens. An overlay whiteout is a file that is gone, and reads as
+    /// absent. `relative` names the file in a refusal.
+    ///
+    /// The open itself is `O_NONBLOCK` and `O_NOCTTY` all the same, and checks
+    /// the kind again, since the name can be replaced between the look and the
+    /// open. A regular file ignores `O_NONBLOCK`, and the flag is cleared before
+    /// the descriptor is handed back all the same.
+    fn open_regular(
+        &self,
+        parent: &OwnedFd,
+        leaf: &CString,
+        relative: &Path,
+        access: OFlags,
+    ) -> io::Result<File> {
+        let refused = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", self.path(relative).display()),
+            )
+        };
+        let stat = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)?;
+        if containment::is_whiteout(&stat) {
+            return Err(Errno::NOENT.into());
+        }
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(refused());
+        }
         let fd = rustix::fs::openat(
-            &parent,
-            &leaf,
+            parent,
+            leaf,
             access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
         if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not a regular file", self.path(relative).display()),
-            ));
+            return Err(refused());
         }
         rustix::fs::fcntl_setfl(&fd, rustix::fs::fcntl_getfl(&fd)? - OFlags::NONBLOCK)?;
         Ok(File::from(fd))
@@ -309,28 +479,19 @@ impl Rooted {
         }
     }
 
-    /// The value of the extended attribute `name` on the directory at
-    /// `relative`, or `None` when the directory does not carry it.
+    /// Whether the directory at `relative` carries the overlay's opaque marker,
+    /// so a tree that is an overlay's upper shows nothing of the layers beneath
+    /// it there.
     ///
-    /// Read through a descriptor for the directory, since an `O_PATH` one
-    /// cannot be asked for an attribute. A directory is the one kind opened, so
-    /// nothing here can wait on a named pipe.
-    pub(crate) fn directory_xattr(
-        &self,
-        relative: impl AsRef<Path>,
-        name: &CStr,
-    ) -> io::Result<Option<Vec<u8>>> {
+    /// [`containment::is_opaque`] is the answer; this resolves the directory as
+    /// every path here is resolved and asks it through a descriptor opened for
+    /// reading, since an `O_PATH` one cannot be asked for an attribute. A
+    /// directory is the one kind opened, so nothing here can wait on a named
+    /// pipe.
+    pub(crate) fn is_opaque(&self, relative: impl AsRef<Path>) -> io::Result<bool> {
         let components = components(relative.as_ref())?;
         let dir = self.open_read_dir(&components)?;
-        let size = match rustix::fs::fgetxattr(&dir, name, &mut [0u8; 0][..]) {
-            Ok(size) => size,
-            Err(Errno::NODATA) => return Ok(None),
-            Err(errno) => return Err(errno.into()),
-        };
-        let mut value = vec![0; size];
-        let read = rustix::fs::fgetxattr(&dir, name, &mut value)?;
-        value.truncate(read);
-        Ok(Some(value))
+        Ok(containment::is_opaque(dir.as_fd())?)
     }
 
     /// Creates an overlay whiteout at `relative`: a character device numbered
@@ -355,9 +516,12 @@ impl Rooted {
     /// leaving it alone otherwise.
     ///
     /// The predicate sees the leaf's own `stat`, taken with `AT_SYMLINK_NOFOLLOW`
-    /// against the same directory descriptor the unlink uses, so the entry
-    /// inspected and the entry removed are one and the same and neither follows
-    /// a link out of the tree.
+    /// against the same directory descriptor the unlink uses, so neither call
+    /// follows a link, out of the tree or anywhere else. They are two calls on
+    /// one name, though, not one on one entry: something that renames another
+    /// entry onto the name between them has that entry removed in its place.
+    /// The predicate tells what the tree is expected to hold from what it is
+    /// not; it does not hold the name still against a process racing it.
     ///
     /// This is what a launch's teardown removes its mount-point placeholders
     /// through: a placeholder is an empty regular file for its whole life, so
@@ -394,7 +558,6 @@ impl Rooted {
     /// Whether `stat` describes a regular file with something in it — the
     /// shape an identifier a script generated has, as against an empty file, a
     /// symbolic link, or an overlay whiteout.
-    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub(crate) fn is_file_with_content(stat: &Stat) -> bool {
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_size > 0
     }
@@ -405,9 +568,11 @@ impl Rooted {
     ///
     /// A whiteout in a tree that is an overlay's upper is an absent entry to
     /// every reader of the merged root. Opening one for reading fails with
-    /// `ENXIO`, since no driver backs the device.
+    /// `ENXIO`, since no driver backs the device. The predicate form of
+    /// [`containment::is_whiteout`], which is the definition, for the callers
+    /// that hold a `Stat` from [`stat`](Self::stat) or [`remove_if`](Self::remove_if).
     pub(crate) fn is_whiteout(stat: &Stat) -> bool {
-        FileType::from_raw_mode(stat.st_mode) == FileType::CharacterDevice && stat.st_rdev == 0
+        containment::is_whiteout(stat)
     }
 
     /// Renames `from` to `to` within the tree, replacing whatever occupies the
@@ -476,13 +641,12 @@ impl Rooted {
     /// the tree is. `O_PATH`: the descriptor is only ever the anchor of an
     /// `*at` call.
     fn open_dir(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
-        let path = if components.is_empty() {
-            CString::new(&b"."[..])
-        } else {
-            CString::new(components.join(&b'/'))
-        }
-        .map_err(|_| Errno::INVAL)?;
-        containment::open_dir(self.fd.as_fd(), &path, OFlags::PATH, ResolveFlags::IN_ROOT)
+        containment::open_dir(
+            self.fd.as_fd(),
+            components,
+            OFlags::PATH,
+            ResolveFlags::IN_ROOT,
+        )
     }
 
     /// Resolves `components` inside the tree as a directory that will be read.
@@ -491,58 +655,41 @@ impl Rooted {
     /// `O_PATH` descriptor anchors an `*at` call and cannot be handed to
     /// `getdents` or asked for an extended attribute.
     fn open_read_dir(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
-        let path = if components.is_empty() {
-            CString::new(&b"."[..])
-        } else {
-            CString::new(components.join(&b'/'))
-        }
-        .map_err(|_| Errno::INVAL)?;
         containment::open_dir(
             self.fd.as_fd(),
-            &path,
+            components,
             OFlags::RDONLY,
             ResolveFlags::IN_ROOT,
         )
     }
 
     /// Opens `components` as a directory, creating the missing links of the
-    /// chain.
+    /// chain at [`DIR_MODE`].
     ///
-    /// Each prefix is resolved from the root rather than descended into, so an
-    /// in-tree symbolic link mid-path — a merged-usr alias — keeps working, and
-    /// each `mkdirat` is anchored to the descriptor the previous resolve
-    /// returned.
+    /// [`containment::create_dirs`] is the walk, preceded over a base by
+    /// [`containment::copy_up`]; what is here is the mode this side leaves a
+    /// directory at, applied through the descriptor of the one just made.
     fn create_dirs(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
-        match self.open_dir(components) {
-            Ok(fd) => return Ok(fd),
-            Err(Errno::NOENT) => {}
-            Err(errno) => return Err(errno),
+        let mut made = |made: containment::Made<'_>| {
+            let mode = made.copied.map_or(DIR_MODE, |below| below.st_mode & 0o7777);
+            rustix::fs::fchmod(made.dir, Mode::from_raw_mode(mode))
+        };
+        #[cfg(feature = "tarball")]
+        if let Some(lower) = &self.lower {
+            containment::copy_up(
+                self.fd.as_fd(),
+                lower.as_fd(),
+                components,
+                ResolveFlags::IN_ROOT,
+                &mut made,
+            )?;
         }
-        for depth in 1..=components.len() {
-            match self.open_dir(&components[..depth]) {
-                Ok(_) => continue,
-                Err(Errno::NOENT) => {}
-                Err(errno) => return Err(errno),
-            }
-            let above = self.open_dir(&components[..depth - 1])?;
-            let leaf = CString::new(components[depth - 1]).map_err(|_| Errno::INVAL)?;
-            match rustix::fs::mkdirat(&above, &leaf, Mode::from_raw_mode(DIR_MODE)) {
-                // `mkdirat` honours the umask, so the mode is stated again.
-                Ok(()) => rustix::fs::chmodat(
-                    &above,
-                    &leaf,
-                    Mode::from_raw_mode(DIR_MODE),
-                    AtFlags::empty(),
-                )?,
-                // Something is already at the name. If it is a directory, or an
-                // in-tree link to one, the resolve at the top of the next round
-                // finds it; if it is not, that resolve fails with `ENOTDIR` and
-                // says so.
-                Err(Errno::EXIST) => {}
-                Err(errno) => return Err(errno),
-            }
-        }
-        self.open_dir(components)
+        containment::create_dirs(
+            self.fd.as_fd(),
+            components,
+            ResolveFlags::IN_ROOT,
+            &mut made,
+        )
     }
 }
 
@@ -608,7 +755,7 @@ mod tests {
 
         let (answer, answered) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = answer.send(tree.read("machine-id").map(|_| ()));
+            let _ = answer.send(tree.read("machine-id", 64).map(|_| ()));
         });
         let outcome = answered
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -630,7 +777,7 @@ mod tests {
                 .unwrap()
                 .contains(OFlags::NONBLOCK)
         );
-        assert_eq!(tree.read("etc/os-release").unwrap(), b"ID=test\n");
+        assert_eq!(tree.read("etc/os-release", 64).unwrap(), b"ID=test\n");
     }
 
     #[test]
@@ -815,12 +962,12 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("var/lib/dpkg/status")).unwrap();
 
         assert!(
-            tree.read("var/lib/dpkg/status").is_err(),
+            tree.read("var/lib/dpkg/status", 64).is_err(),
             "a link at the leaf must not be read through",
         );
         tree.write("var/lib/dpkg/status", b"Package: x\n").unwrap();
         assert_eq!(
-            tree.read("var/lib/dpkg/status").unwrap(),
+            tree.read("var/lib/dpkg/status", 64).unwrap(),
             b"Package: x\n".to_vec(),
         );
     }
@@ -876,6 +1023,150 @@ mod tests {
                 tree.write(path, b"x").is_err(),
                 "{path} should not be writable",
             );
+        }
+    }
+
+    /// Makes an overlay whiteout at `path`, or answers `false` on a kernel that
+    /// refuses an unprivileged one (they are allowed from Linux 5.8).
+    fn whiteout(path: &Path) -> bool {
+        match rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            FileType::CharacterDevice,
+            Mode::empty(),
+            0,
+        ) {
+            Ok(()) => true,
+            Err(Errno::PERM) => {
+                eprintln!("skipping the whiteout case: this kernel refuses an unprivileged one");
+                false
+            }
+            Err(errno) => panic!("making a whiteout: {errno}"),
+        }
+    }
+
+    #[test]
+    fn a_read_past_its_ceiling_is_refused_naming_the_path_and_the_ceiling() {
+        // A script makes a file enormous for nothing: the length is a number in
+        // an inode, and a sparse file takes no space. What the read holds is
+        // bounded by the caller's ceiling, not by what the file claims.
+        let (scratch, tree) = tree("ceiling");
+        tree.write("etc/machine-id", b"0123456789abcdef\n").unwrap();
+        assert_eq!(
+            tree.read("etc/machine-id", 17).unwrap(),
+            b"0123456789abcdef\n",
+            "a file of exactly the ceiling is read whole",
+        );
+        let err = tree
+            .read("etc/machine-id", 16)
+            .expect_err("one byte over is refused");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        let message = err.to_string();
+        assert!(message.contains("etc/machine-id"), "{message}");
+        assert!(message.contains("16 bytes"), "{message}");
+
+        let sparse = std::fs::File::options()
+            .write(true)
+            .open(scratch.join("tree/etc/machine-id"))
+            .unwrap();
+        sparse.set_len(1 << 36).unwrap();
+        let err = tree
+            .read("etc/machine-id", 4096)
+            .expect_err("a sparse file the size of a disk is refused");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+    }
+
+    #[test]
+    fn a_name_that_holds_no_file_reads_as_none() {
+        // Absent is a leaf that is not there, a parent that is not there or is
+        // not a directory, and a whiteout, which is how a layered build's upper
+        // records a file its run deleted.
+        let (scratch, tree) = tree("if-present");
+        tree.write("etc/shadow", b"root:*:1:0:::::\n").unwrap();
+        assert_eq!(
+            tree.read_if_present("etc/shadow", 64).unwrap().as_deref(),
+            Some(&b"root:*:1:0:::::\n"[..]),
+        );
+        for absent in ["etc/absent", "absent/shadow", "etc/shadow/below"] {
+            assert_eq!(tree.read_if_present(absent, 64).unwrap(), None, "{absent}");
+        }
+        if whiteout(&scratch.join("tree/etc/gone")) {
+            assert_eq!(tree.read_if_present("etc/gone", 64).unwrap(), None);
+        }
+        // Something that is there and is not a file is not a missing file.
+        std::fs::create_dir(scratch.join("tree/etc/dir")).unwrap();
+        assert!(tree.read_if_present("etc/dir", 64).is_err());
+        // And the ceiling holds here as well.
+        assert!(tree.read_if_present("etc/shadow", 4).is_err());
+    }
+
+    #[test]
+    fn a_truncation_empties_only_an_approved_file_and_keeps_it() {
+        use std::os::unix::fs::MetadataExt;
+        let (scratch, tree) = tree("truncate");
+        let root = scratch.join("tree");
+
+        // `systemd` writes the machine id read-only. It is emptied all the
+        // same, in place: the inode, and with it the owner and the mode, are
+        // the ones the script left.
+        tree.write_mode("etc/machine-id", b"0123456789abcdef\n", 0o444)
+            .unwrap();
+        let before = std::fs::metadata(root.join("etc/machine-id")).unwrap();
+        tree.truncate_if("etc/machine-id", Rooted::is_file_with_content)
+            .unwrap();
+        let after = std::fs::metadata(root.join("etc/machine-id")).unwrap();
+        assert_eq!(after.len(), 0);
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.permissions().mode() & 0o7777, 0o444);
+
+        // A file the predicate turns down keeps its contents.
+        tree.write("etc/hostname", b"kept\n").unwrap();
+        tree.truncate_if("etc/hostname", |_| false).unwrap();
+        assert_eq!(std::fs::read(root.join("etc/hostname")).unwrap(), b"kept\n");
+
+        // Nothing that is not a regular file is emptied, whatever the
+        // predicate says: not through a link, and not a named pipe, which is
+        // never opened.
+        let outside = scratch.join("outside");
+        std::fs::write(&outside, b"host contents\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("etc/link")).unwrap();
+        tree.truncate_if("etc/link", |_| true).unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"host contents\n");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            root.join("etc/pipe"),
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        tree.truncate_if("etc/pipe", |_| true).unwrap();
+        if whiteout(&root.join("etc/gone")) {
+            tree.truncate_if("etc/gone", |_| true).unwrap();
+            assert!(std::fs::symlink_metadata(root.join("etc/gone")).is_ok());
+        }
+
+        // An absent file, or an absent parent, is already done.
+        tree.truncate_if("etc/absent", |_| true).unwrap();
+        tree.truncate_if("absent/file", |_| true).unwrap();
+    }
+
+    #[test]
+    fn a_removal_can_leave_a_whiteout_in_place() {
+        // A layered build's upper records a file its run deleted as a whiteout,
+        // and removing that would bring the base's copy back through the
+        // overlay.
+        let (scratch, tree) = tree("whiteout");
+        let root = scratch.join("tree");
+        std::fs::create_dir(root.join("log")).unwrap();
+        tree.write("log/dpkg.log", b"recorded\n").unwrap();
+        tree.remove_if("log/dpkg.log", |stat| !Rooted::is_whiteout(stat))
+            .unwrap();
+        assert!(std::fs::symlink_metadata(root.join("log/dpkg.log")).is_err());
+        if whiteout(&root.join("log/alternatives.log")) {
+            tree.remove_if("log/alternatives.log", |stat| !Rooted::is_whiteout(stat))
+                .unwrap();
+            assert!(std::fs::symlink_metadata(root.join("log/alternatives.log")).is_ok());
         }
     }
 }

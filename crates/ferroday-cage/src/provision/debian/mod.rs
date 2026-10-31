@@ -716,6 +716,7 @@ impl<'a> Debian<'a> {
         let installing = private.as_ref().unwrap_or(&archives).path();
         let statoverride = extract_packages(
             upper,
+            Some(&base),
             config.architecture,
             &installables,
             installing,
@@ -2546,8 +2547,14 @@ fn stage_extract(
     archives_host: &Path,
     observer: &mut dyn DebianObserver,
 ) -> Result<StatOverride, ProvisionError> {
-    let statoverride =
-        extract_packages(staging, architecture, installables, archives_host, observer)?;
+    let statoverride = extract_packages(
+        staging,
+        None,
+        architecture,
+        installables,
+        archives_host,
+        observer,
+    )?;
     init_dpkg_database(staging)?;
     Ok(statoverride)
 }
@@ -2560,9 +2567,13 @@ fn stage_extract(
 /// overlay upper: the merged-usr symlinks are created there so a package
 /// shipping a legacy top-level path resolves into `usr`, exactly as for a full
 /// bootstrap, while the base's own dpkg database — seen through the overlay —
-/// is left untouched, so no empty database is written over it.
+/// is left untouched, so no empty database is written over it. `over` is that
+/// base, which the extraction places every entry through
+/// ([`Extraction::over`]), so a link the base holds is never hidden by a
+/// directory of the increment's.
 fn extract_packages(
     staging: &Path,
+    over: Option<&Path>,
     architecture: &str,
     installables: &[Installable],
     archives_host: &Path,
@@ -2575,7 +2586,9 @@ fn extract_packages(
     // happened to be extracted last. A rootfs root is `0755`, the mode
     // `base-files` itself ships, and stating it keeps the published directory
     // independent of both the package set and the caller's umask.
-    let mut extraction = Extraction::new(staging)?.root_mode(ROOTFS_ROOT_MODE);
+    let mut extraction = Extraction::new(staging)?
+        .root_mode(ROOTFS_ROOT_MODE)
+        .over(over)?;
     let mut statoverride = StatOverride::default();
     // A statoverride record is one newline-terminated line; a path component
     // carrying an embedded newline would split into a second, forged record
@@ -4325,7 +4338,7 @@ mod tests {
         ]));
         let install = installables(&archives, &[("first", first), ("second", second)]);
 
-        let overrides = extract_packages(&staging, "amd64", &install, &archives, &mut Silent)
+        let overrides = extract_packages(&staging, None, "amd64", &install, &archives, &mut Silent)
             .expect("both packages extract");
 
         // One record per path, each carrying the mode of the file that survived
@@ -4356,7 +4369,7 @@ mod tests {
             ("./usr/bin/x", 0o755, 0, 0),
         ]));
         let install = installables(&archives, &[("closed", closed)]);
-        extract_packages(&staging, "amd64", &install, &archives, &mut Silent)
+        extract_packages(&staging, None, "amd64", &install, &archives, &mut Silent)
             .expect("the package extracts");
 
         let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o7777;

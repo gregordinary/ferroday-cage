@@ -499,6 +499,12 @@ An increment resolving against its own empty upper would ask the archive for
 everything the base already has. It would then fail on the packages the binhost
 does not publish.
 
+The merge writes the merged view too. A stage3 is merged-usr: `lib64` and
+`sbin` are links into `usr`. A package that still ships `lib64/` or `sbin/`
+lands in the upper's `usr`, beside a copy of the base's link. The merged
+`/lib64` stays a link, and the loader stays reachable through it. `CONTENTS`
+records each path as the package ships it, as portage does.
+
 ## Trust
 
 The stage3 chain has three links, and the first is not fetched at all:

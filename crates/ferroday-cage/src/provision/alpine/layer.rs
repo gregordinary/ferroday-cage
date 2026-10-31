@@ -48,13 +48,25 @@ const SCRIPTS: &str = "scripts.tar";
 /// base is read from either.
 const SCRIPTS_GZ: &str = "scripts.tar.gz";
 
-/// The ceiling on a base's archived scripts once decompressed.
+/// The ceiling on a base's archived scripts, plain or once decompressed.
 ///
-/// Only the compressed form needs a bound at all, and it needs one because gzip
-/// is a compression format. Alpine's minirootfs archives 15 KB of shell; this is
-/// generous by three orders of magnitude and still the reason a base cannot
-/// expand without end.
+/// Alpine's minirootfs archives 15 KB of shell; this is generous by three
+/// orders of magnitude and still the reason a base cannot expand without end,
+/// whether through gzip's ratio or through a file grown without being written.
 const MAX_SCRIPTS: u64 = 64 * 1024 * 1024;
+
+/// The most of a base's installed database this reads.
+///
+/// `apk` records a few hundred bytes per package and about a hundred and forty
+/// per file it installed: Alpine's own minirootfs, sixteen packages and a
+/// hundred and ten files, comes to fifteen kilobytes. A root of a hundred
+/// thousand files is some fifteen megabytes, and this is far past that.
+const MAX_DATABASE: u64 = 256 * 1024 * 1024;
+
+/// The most of any other file of a base's this reads: its triggers, and the
+/// one-line-per-entry files under `/etc/apk`, each a few hundred bytes in a
+/// real root.
+const MAX_STATE: u64 = 16 * 1024 * 1024;
 
 /// What a base layer already carries.
 ///
@@ -99,9 +111,9 @@ impl Base {
         };
 
         let database = format!("{DB_DIR}/{INSTALLED}");
-        let recorded = match tree.read(&database) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        let recorded = match tree.read_if_present(&database, MAX_DATABASE) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
                 return Err(refuse(
                     "it records no installed packages; a base layer is a provisioned Alpine root, \
                      and this tree has no apk database"
@@ -128,7 +140,7 @@ impl Base {
         // The architecture the base was built for, where it states one. An
         // increment's packages are laid over the base's files, so two
         // architectures in one root is a build root that cannot run.
-        if let Some(built_for) = optional_text(&tree, ARCH, path)?
+        if let Some(built_for) = optional_text(&tree, ARCH, path, MAX_STATE)?
             && built_for.trim() != architecture
         {
             return Err(refuse(format!(
@@ -139,10 +151,10 @@ impl Base {
 
         Ok(Base {
             packages,
-            triggers: optional_bytes(&tree, &format!("{DB_DIR}/{TRIGGERS}"), path)?,
+            triggers: optional_bytes(&tree, &format!("{DB_DIR}/{TRIGGERS}"), path, MAX_STATE)?,
             scripts: read_scripts(&tree, path)?,
-            world: lines(optional_text(&tree, WORLD, path)?),
-            repositories: lines(optional_text(&tree, REPOSITORIES, path)?),
+            world: lines(optional_text(&tree, WORLD, path, MAX_STATE)?),
+            repositories: lines(optional_text(&tree, REPOSITORIES, path, MAX_STATE)?),
             path: path.to_path_buf(),
         })
     }
@@ -290,11 +302,14 @@ fn is_trigger_of(member: &str, record: &Record) -> bool {
 /// `scripts.tar` holding both — which `apk` finds first, and which spares this
 /// layer a compressor it would carry for one file.
 fn read_scripts(tree: &Rooted, base: &Path) -> Result<Vec<u8>, AlpineError> {
-    let plain = optional_bytes(tree, &format!("{DB_DIR}/{SCRIPTS}"), base)?;
+    // Either form is held to the decompressed ceiling: the plain archive is
+    // what the ceiling describes, and a compressed one is smaller than what it
+    // inflates to.
+    let plain = optional_bytes(tree, &format!("{DB_DIR}/{SCRIPTS}"), base, MAX_SCRIPTS)?;
     if !plain.is_empty() {
         return Ok(plain);
     }
-    let compressed = optional_bytes(tree, &format!("{DB_DIR}/{SCRIPTS_GZ}"), base)?;
+    let compressed = optional_bytes(tree, &format!("{DB_DIR}/{SCRIPTS_GZ}"), base, MAX_SCRIPTS)?;
     if compressed.is_empty() {
         return Ok(Vec::new());
     }
@@ -318,22 +333,21 @@ fn read_scripts(tree: &Rooted, base: &Path) -> Result<Vec<u8>, AlpineError> {
 }
 
 /// Reads a file of the base that need not be there, an absent one reading as
-/// empty.
+/// empty, and one past `limit` bytes refused.
 ///
 /// The database is what says a tree is a provisioned root; everything else here
 /// is state a root may not have been given. An `apk` root with no
 /// `etc/apk/repositories` is one that was never told where to fetch from, which
 /// is a fine base to build over.
-fn optional_bytes(tree: &Rooted, relative: &str, base: &Path) -> Result<Vec<u8>, AlpineError> {
-    match tree.read(relative) {
-        Ok(bytes) => Ok(bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(source) => Err(AlpineError::io(
-            "reading the base layer",
-            base.join(relative),
-            source,
-        )),
-    }
+fn optional_bytes(
+    tree: &Rooted,
+    relative: &str,
+    base: &Path,
+    limit: u64,
+) -> Result<Vec<u8>, AlpineError> {
+    tree.read_if_present(relative, limit)
+        .map(Option::unwrap_or_default)
+        .map_err(|source| AlpineError::io("reading the base layer", base.join(relative), source))
 }
 
 /// The same, for a file whose contents are text.
@@ -341,8 +355,9 @@ fn optional_text(
     tree: &Rooted,
     relative: &str,
     base: &Path,
+    limit: u64,
 ) -> Result<Option<String>, AlpineError> {
-    let bytes = optional_bytes(tree, relative, base)?;
+    let bytes = optional_bytes(tree, relative, base, limit)?;
     if bytes.is_empty() {
         return Ok(None);
     }

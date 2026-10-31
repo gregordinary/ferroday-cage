@@ -28,6 +28,12 @@
 //! without privilege — character and block devices — are skipped, as the
 //! sandbox assembles its own `/dev`. (A tar archive has no socket entry
 //! type; GNU volume labels, archive metadata, are skipped too.)
+//!
+//! A layered build extracts into an overlay upper over a base it never
+//! writes, and [`Extraction::over`] names that base: every entry is then
+//! placed as it would be in the mounted overlay, so a directory of the
+//! increment's never hides a link of the base's. [`overlay_tree`] takes the
+//! base the same way.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -46,7 +52,7 @@ use rustix::io::Errno;
 use crate::path::{self, LeadingSlash, Refused};
 
 use super::ProvisionError;
-use super::containment;
+use super::containment::{self, Made, Reached};
 use super::tar::{Entry, TarReader};
 
 /// The mode of a directory the extraction implies but no entry names.
@@ -55,6 +61,13 @@ use super::tar::{Entry, TarReader};
 /// the mode of that directory unstated; the conventional `0755` is the only
 /// answer available, and it is the one every other extractor gives.
 const IMPLIED_DIR_MODE: u32 = 0o755;
+
+/// The mode a named pipe is created with, before the one its entry states.
+///
+/// Owner-only, so the pipe never sits at a permissive mode in the window before
+/// its own, and readable by its owner, since its mode is applied through a
+/// descriptor that opening it for reading gives.
+const FIFO_CREATION_MODE: u32 = 0o600;
 
 /// The per-entry hook the extractor calls before writing each entry.
 ///
@@ -90,6 +103,16 @@ struct DirMeta {
     mtime: Option<i64>,
 }
 
+/// The tree entries are written into: the extraction root, and the base it is
+/// an overlay upper over, where it is one.
+#[derive(Clone, Copy)]
+struct Tree<'a> {
+    /// The extraction root; every write resolves beneath it.
+    root: BorrowedFd<'a>,
+    /// The base, read and never written. See [`Extraction::over`].
+    lower: Option<BorrowedFd<'a>>,
+}
+
 /// An extraction into one root directory, across one or more archives.
 ///
 /// A single [`Extraction`] holds the extraction root and the deferred
@@ -102,6 +125,8 @@ struct DirMeta {
 pub(crate) struct Extraction {
     /// The extraction root, opened once; every operation resolves beneath it.
     root_fd: OwnedFd,
+    /// The base the root is an overlay upper over, where it is one.
+    lower_fd: Option<OwnedFd>,
     /// Deferred directory metadata, keyed by slash-joined path. Implied
     /// directories (created for a child before their own entry appears, or
     /// never described at all) default to 0755 with their creation time. A
@@ -122,19 +147,50 @@ pub(crate) struct Extraction {
 impl Extraction {
     /// Opens `root` for extraction.
     pub(crate) fn new(root: &Path) -> Result<Extraction, ProvisionError> {
-        let root_fd = rustix::fs::open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| ProvisionError::io("opening", root, errno.into()))?;
         Ok(Extraction {
-            root_fd,
+            root_fd: open_root(root)?,
+            lower_fd: None,
             dir_meta: HashMap::new(),
             root_meta: None,
             root_mode_fixed: false,
             under: None,
         })
+    }
+
+    /// Treats the extraction root as an overlay upper over `lower`, where one
+    /// is named.
+    ///
+    /// A layered build writes its increment into an upper the kernel shows
+    /// over the base, and the kernel merges a directory only with a directory.
+    /// An entry under `lib64/`, extracted into a bare upper, would make
+    /// `lib64` a real directory there, and over a base whose `lib64` is a link
+    /// to `usr/lib64` that directory hides the link: the merged `/lib64` holds
+    /// the increment's files and nothing else, the dynamic linker among what
+    /// it lost. So each entry's chain is first walked through the merged view,
+    /// with the upper made to hold what the view holds along it
+    /// ([`containment::copy_up`]), and the entry lands where it would in the
+    /// mounted overlay: at `usr/lib64` in the upper, beside the upper's copy
+    /// of the base's link.
+    ///
+    /// The rules are the ones a whole root is extracted by, applied to the
+    /// merged view. A link to a directory satisfies a directory entry, a link
+    /// the containment refuses is refused, and a later entry supersedes what
+    /// holds its name. The base is never written, so a directory of its own is
+    /// one an entry that is not a directory cannot supersede, and such an entry
+    /// is refused. A directory the base holds and the archive only implies
+    /// keeps the base's mode and modification time, as the overlay's own copy
+    /// carries them up.
+    ///
+    /// What the per-entry hook sees is unchanged: the entry's path as the
+    /// archive spells it, which is the path a package database records —
+    /// portage's `CONTENTS` and apk's `installed` alike name `/lib64/x`, and
+    /// the root resolves it.
+    #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+    pub(crate) fn over(mut self, lower: Option<&Path>) -> Result<Extraction, ProvisionError> {
+        if let Some(lower) = lower {
+            self.lower_fd = Some(open_root(lower)?);
+        }
+        Ok(self)
     }
 
     /// Fixes the extraction root's own mode, in place of taking it from a `./`
@@ -193,7 +249,10 @@ impl Extraction {
         archive: &mut TarReader<R>,
         on_entry: &mut OnEntry<'_>,
     ) -> Result<(), ProvisionError> {
-        let root = self.root_fd.as_fd();
+        let tree = Tree {
+            root: self.root_fd.as_fd(),
+            lower: self.lower_fd.as_ref().map(AsFd::as_fd),
+        };
         while let Some(mut entry) = archive.next_entry()? {
             match entry.typeflag {
                 // Unextractable without privilege; the sandbox provides its
@@ -269,13 +328,13 @@ impl Extraction {
             }
 
             match entry.typeflag {
-                b'5' => extract_dir(root, &entry, &components, &mut self.dir_meta)?,
-                b'2' => extract_symlink(root, &entry, &components, &mut self.dir_meta)?,
-                b'1' => extract_hardlink(root, &entry, &components, &mut self.dir_meta)?,
-                b'6' => extract_fifo(root, &entry, &components, &mut self.dir_meta)?,
+                b'5' => extract_dir(tree, &entry, &components, &mut self.dir_meta)?,
+                b'2' => extract_symlink(tree, &entry, &components, &mut self.dir_meta)?,
+                b'1' => extract_hardlink(tree, &entry, &components, &mut self.dir_meta)?,
+                b'6' => extract_fifo(tree, &entry, &components, &mut self.dir_meta)?,
                 // Regular files, and unknown typeflags, which POSIX says to
                 // treat as regular files.
-                _ => extract_file(root, archive, &entry, &components, &mut self.dir_meta)?,
+                _ => extract_file(tree, archive, &entry, &components, &mut self.dir_meta)?,
             }
         }
         Ok(())
@@ -304,6 +363,17 @@ pub(crate) fn extract_archive<R: Read>(
     let mut extraction = Extraction::new(root)?;
     extraction.extract(archive, on_entry)?;
     extraction.finalize(root)
+}
+
+/// Opens the directory at `path`, a tree an extraction writes into or reads
+/// as a base, as the anchor every resolve beneath it starts from.
+fn open_root(path: &Path) -> Result<OwnedFd, ProvisionError> {
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| ProvisionError::io("opening", path, errno.into()))
 }
 
 /// The part of `path` below `prefix`, or `None` where it is not under it.
@@ -349,103 +419,231 @@ fn validate_path(raw: &[u8], context: &[u8], noun: &str) -> Result<Vec<Vec<u8>>,
     }
 }
 
-/// Opens an entry's parent directory beneath `root`, creating missing
+/// An entry's parent directory, opened beneath the extraction root.
+struct Parent {
+    /// The directory itself, in the extraction root.
+    dir: OwnedFd,
+    /// The base's own directory at the same path, where the extraction is
+    /// layered and the overlay shows the base there. What an entry that is not
+    /// a directory consults before superseding the name; see
+    /// [`refuse_superseding_a_base_directory`].
+    lower: Option<OwnedFd>,
+}
+
+/// Opens an entry's parent directory beneath the root, creating missing
 /// intermediate directories.
 ///
-/// Resolution is kernel-scoped to `root` (`RESOLVE_BENEATH`); a parent
+/// Resolution is kernel-scoped to the root (`RESOLVE_BENEATH`); a parent
 /// path that escapes — through `..` in a symlink, an absolute symlink
-/// target, or any other route — is refused.
+/// target, or any other route — is refused. Where the tree is layered, the
+/// chain is first walked through the merged view with the root made to hold
+/// what that view holds along it ([`containment::copy_up`]), so the kernel's
+/// resolution then goes where the mounted overlay would.
 ///
 /// A directory created here is a parent the archive implied but never named,
-/// and gets the conventional `0755`. `dir_meta` is the deferred-metadata map of
-/// a caller that applies directory modes in a later pass, which records the
-/// mode rather than applying it: an implied parent's contents are still to be
-/// created, and it is created `0700` until they are. A caller with no such pass
-/// passes `None` and has the mode applied at once, so an implied parent is
-/// never left at the creation mode.
+/// and gets the conventional `0755`, or, where it stands in for one of the
+/// base's, the base's own mode and modification time. `dir_meta` is the
+/// deferred-metadata map of a caller that applies directory modes in a later
+/// pass, which records the metadata rather than applying it: an implied
+/// parent's contents are still to be created, and it is created `0700` until
+/// they are. A caller with no such pass passes `None` and has the mode applied
+/// at once, through the descriptor of the directory just made, so an implied
+/// parent is never left at the creation mode.
 fn open_parent(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     components: &[Vec<u8>],
     entry_path: &[u8],
     mut dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
-) -> Result<OwnedFd, ProvisionError> {
+) -> Result<Parent, ProvisionError> {
     let parent = &components[..components.len() - 1];
-    match open_dir_at(root, parent) {
-        Ok(fd) => return Ok(fd),
-        Err(Errno::NOENT) => {}
-        Err(errno) => return Err(resolve_error(errno, entry_path)),
-    }
-
-    // Create the missing links of the chain, resolving each prefix from
-    // the root so in-tree symlinks keep working mid-path.
-    for depth in 1..=parent.len() {
-        match open_dir_at(root, &parent[..depth]) {
-            Ok(_) => continue,
-            Err(Errno::NOENT) => {}
-            Err(errno) => return Err(resolve_error(errno, entry_path)),
-        }
-        let above = open_dir_at(root, &parent[..depth - 1])
-            .map_err(|errno| resolve_error(errno, entry_path))?;
-        let leaf = component_cstr(&parent[depth - 1], entry_path)?;
-        match rustix::fs::mkdirat(&above, &leaf, Mode::from_raw_mode(0o700)) {
-            Ok(()) => match dir_meta.as_deref_mut() {
-                Some(dir_meta) => {
-                    dir_meta.entry(join(&parent[..depth])).or_insert(DirMeta {
-                        mode: IMPLIED_DIR_MODE,
-                        mtime: None,
-                    });
-                }
-                None => {
-                    rustix::fs::chmodat(
-                        &above,
-                        &leaf,
-                        Mode::from_raw_mode(IMPLIED_DIR_MODE),
-                        AtFlags::empty(),
-                    )
-                    .map_err(|errno| {
-                        ProvisionError::io(
-                            "setting the mode of a parent directory for",
-                            bytes_to_path(entry_path),
-                            errno.into(),
-                        )
-                    })?;
-                }
-            },
-            // A concurrent creation cannot happen (the staging tree is
-            // private); EEXIST here means a dangling symlink or another
-            // non-directory in the way, which the re-resolve below turns
-            // into a typed error.
-            Err(Errno::EXIST) => {}
-            Err(errno) => {
-                return Err(ProvisionError::io(
-                    "creating a parent directory for",
-                    bytes_to_path(entry_path),
-                    errno.into(),
-                ));
-            }
-        }
-        if open_dir_at(root, &parent[..depth]).is_err() {
-            return Err(entry_refused(
-                entry_path,
-                "a parent component is not a directory",
-            ));
+    let mut lower = None;
+    if let Some(base) = tree.lower {
+        let walked = containment::copy_up(
+            tree.root,
+            base,
+            parent,
+            ResolveFlags::BENEATH,
+            &mut |made| place_made(made, dir_meta.as_deref_mut()),
+        );
+        match walked {
+            Ok(Reached::Directory(found)) => lower = found,
+            Ok(Reached::Short) => {}
+            Err(errno) => return Err(parent_error(errno, entry_path)),
         }
     }
-
-    open_dir_at(root, parent).map_err(|errno| resolve_error(errno, entry_path))
+    let dir = containment::create_dirs(tree.root, parent, ResolveFlags::BENEATH, &mut |made| {
+        place_made(made, dir_meta.as_deref_mut())
+    })
+    .map_err(|errno| parent_error(errno, entry_path))?;
+    Ok(Parent { dir, lower })
 }
 
-/// Resolves `components` beneath `root` as a directory, without following
-/// magic links and without leaving `root`.
+/// States the mode of a directory a chain walk made: recorded for the
+/// deferred pass where the caller keeps one, applied through the directory's
+/// own descriptor at once where it does not.
+///
+/// An implied directory gets [`IMPLIED_DIR_MODE`]. One carried up from a
+/// layered extraction's base keeps the base's mode and modification time,
+/// which is what the merged view showed before the root held it; only the
+/// deferred pass restores the time, since a directory's time moves as its
+/// contents are written.
+fn place_made(
+    made: Made<'_>,
+    dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
+) -> Result<(), Errno> {
+    let meta = match made.copied {
+        Some(stat) => DirMeta {
+            mode: stat.st_mode & 0o7777,
+            mtime: Some(containment::modified(stat).tv_sec),
+        },
+        None => DirMeta {
+            mode: IMPLIED_DIR_MODE,
+            mtime: None,
+        },
+    };
+    match dir_meta {
+        Some(dir_meta) => {
+            dir_meta.entry(made.path.to_vec()).or_insert(meta);
+            Ok(())
+        }
+        None => rustix::fs::fchmod(made.dir, Mode::from_raw_mode(meta.mode)),
+    }
+}
+
+/// Maps a failure to open or create an entry's parent chain onto the typed
+/// error surface.
+///
+/// [`resolve_error`]'s mapping, with every other errno reported as the
+/// creation it interrupted: the chain is resolved, created, and given its
+/// modes in one walk, and what the caller can act on is the entry whose
+/// parents could not be made.
+fn parent_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
+    match errno {
+        Errno::XDEV | Errno::LOOP | Errno::NOTDIR => resolve_error(errno, entry_path),
+        errno => ProvisionError::io(
+            "creating the parent directories of",
+            bytes_to_path(entry_path),
+            errno.into(),
+        ),
+    }
+}
+
+/// Resolves `components` beneath the root as a directory, without following
+/// magic links and without leaving the root.
 ///
 /// `O_PATH`: the descriptor is only ever the anchor of a later `*at` call.
 fn open_dir_at(root: BorrowedFd<'_>, components: &[Vec<u8>]) -> Result<OwnedFd, Errno> {
-    let path = if components.is_empty() {
-        CString::new(".").expect("no NUL")
-    } else {
-        CString::new(join(components)).map_err(|_| Errno::INVAL)?
+    containment::open_dir(root, components, OFlags::PATH, ResolveFlags::BENEATH)
+}
+
+/// Prepares a layered extraction to write the directory `components` names.
+///
+/// Where the tree is layered, the whole chain, the directory's own name
+/// included, is walked through the merged view first, so the root holds what
+/// the view holds there and the classification that follows sees it: a link
+/// of the base's to a directory is an alias exactly as one of the root's own
+/// is. A name the view holds as something else is the classification's to
+/// replace, so a walk that ends there is not a failure here; one that ends
+/// above it already failed the parent's own walk.
+fn prepare_dir(
+    tree: Tree<'_>,
+    components: &[Vec<u8>],
+    entry_path: &[u8],
+    mut dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
+) -> Result<(), ProvisionError> {
+    let Some(base) = tree.lower else {
+        return Ok(());
     };
-    containment::open_dir(root, &path, OFlags::PATH, ResolveFlags::BENEATH)
+    match containment::copy_up(
+        tree.root,
+        base,
+        components,
+        ResolveFlags::BENEATH,
+        &mut |made| place_made(made, dir_meta.as_deref_mut()),
+    ) {
+        Ok(_) | Err(Errno::NOTDIR) => Ok(()),
+        Err(errno) => Err(parent_error(errno, entry_path)),
+    }
+}
+
+/// Creates the directory `leaf` in `parent` where something else held the
+/// name, which the caller has just removed.
+///
+/// In a layered extraction the new directory is marked opaque. The name held
+/// something other than a directory in the merged view, so the directory
+/// starts empty there; without the marker the overlay would merge it with a
+/// directory of the base's that the removed entry had been hiding.
+fn make_replacement_dir(
+    tree: Tree<'_>,
+    parent: &OwnedFd,
+    leaf: &CString,
+    entry_path: &[u8],
+) -> Result<(), ProvisionError> {
+    let creating =
+        |errno: Errno| ProvisionError::io("creating", bytes_to_path(entry_path), errno.into());
+    rustix::fs::mkdirat(parent, leaf, Mode::from_raw_mode(0o700)).map_err(creating)?;
+    if tree.lower.is_some() {
+        let dir = rustix::fs::openat(
+            parent,
+            leaf,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(creating)?;
+        containment::mark_opaque(dir.as_fd()).map_err(creating)?;
+    }
+    Ok(())
+}
+
+/// Refuses an entry that is not a directory where a layered extraction's base
+/// holds a directory at its name that the overlay would show.
+///
+/// A later entry supersedes what holds its name, and in a whole root that
+/// stops at a directory with something in it, which cannot be removed to make
+/// room. A base's directory cannot be removed at all, since the base is never
+/// written; an entry laid over it would hide the base's whole directory
+/// instead, and the files the base's own database records there with it. A
+/// name the root already holds as something other than a directory, or as an
+/// opaque directory, hides the base's entry already, and is the root's to
+/// replace as it stands.
+fn refuse_superseding_a_base_directory(
+    parent: &Parent,
+    leaf: &CString,
+    entry_path: &[u8],
+) -> Result<(), ProvisionError> {
+    let Some(below) = &parent.lower else {
+        return Ok(());
+    };
+    let inspecting =
+        |errno: Errno| ProvisionError::io("inspecting", bytes_to_path(entry_path), errno.into());
+    match rustix::fs::statat(&parent.dir, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) != FileType::Directory => return Ok(()),
+        Ok(_) => {
+            let own = rustix::fs::openat(
+                &parent.dir,
+                leaf,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(inspecting)?;
+            if containment::is_opaque(own.as_fd()).map_err(inspecting)? {
+                return Ok(());
+            }
+        }
+        Err(Errno::NOENT) => {}
+        Err(errno) => return Err(inspecting(errno)),
+    }
+    match rustix::fs::statat(below, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
+            Err(entry_refused(
+                entry_path,
+                "the base layer holds a directory at this path, which an entry that is not a \
+                 directory cannot replace",
+            ))
+        }
+        Ok(_) | Err(Errno::NOENT) => Ok(()),
+        Err(errno) => Err(inspecting(errno)),
+    }
 }
 
 /// What already occupies a name where a directory is about to be created.
@@ -519,26 +717,27 @@ fn resolve_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
 
 /// Extracts a regular file, streaming its data from the archive.
 fn extract_file<R: Read>(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     archive: &mut TarReader<R>,
     entry: &Entry,
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
+    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
     let fd = create_replacing(
         &entry.path,
         || {
             rustix::fs::openat(
-                &parent,
+                &parent.dir,
                 &leaf,
                 OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::from_raw_mode(0o600),
             )
         },
-        &parent,
+        &parent.dir,
         &leaf,
     )?;
 
@@ -573,33 +772,30 @@ fn extract_file<R: Read>(
 /// Extracts a directory entry; its mode and mtime are recorded for the
 /// deferred pass.
 fn extract_dir(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
+    prepare_dir(tree, components, &entry.path, Some(dir_meta))?;
 
-    match rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)) {
+    match rustix::fs::mkdirat(&parent.dir, &leaf, Mode::from_raw_mode(0o700)) {
         Ok(()) => {}
         Err(Errno::EXIST) => {
             // A directory already in place (created implied, or a duplicate
             // entry) is kept; a merged-usr alias is left untouched, its
             // directory already present through the symlink; anything else is
             // replaced.
-            match classify_existing_dir(root, &parent, &leaf, components, &entry.path)? {
+            match classify_existing_dir(tree.root, &parent.dir, &leaf, components, &entry.path)? {
                 DirClash::Directory => {}
                 // No metadata is recorded for an alias: the deferred pass opens
                 // no-follow and would drop it, and the target owns its own.
                 DirClash::AliasedDirectory => return Ok(()),
                 DirClash::Replace => {
-                    remove_at(&parent, &leaf, &entry.path)?;
-                    rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)).map_err(
-                        |errno| {
-                            ProvisionError::io("creating", bytes_to_path(&entry.path), errno.into())
-                        },
-                    )?;
+                    remove_at(&parent.dir, &leaf, &entry.path)?;
+                    make_replacement_dir(tree, &parent.dir, &leaf, &entry.path)?;
                 }
             }
         }
@@ -624,7 +820,7 @@ fn extract_dir(
 
 /// Extracts a symlink; the target is stored verbatim and never resolved.
 fn extract_symlink(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
@@ -634,18 +830,19 @@ fn extract_symlink(
     }
     let target = CString::new(entry.link_target.clone())
         .map_err(|_| entry_unsafe(&entry.path, "the symlink target contains a NUL byte"))?;
-    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
+    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
     create_replacing(
         &entry.path,
-        || rustix::fs::symlinkat(&target, &parent, &leaf),
-        &parent,
+        || rustix::fs::symlinkat(&target, &parent.dir, &leaf),
+        &parent.dir,
         &leaf,
     )?;
 
     rustix::fs::utimensat(
-        &parent,
+        &parent.dir,
         &leaf,
         &timestamps(entry.mtime),
         AtFlags::SYMLINK_NOFOLLOW,
@@ -662,8 +859,11 @@ fn extract_symlink(
 
 /// Extracts a hardlink to an already-extracted entry. The link target is
 /// validated and resolved under the same containment as entry paths.
+///
+/// The target is an entry this extraction wrote, so in a layered one its chain
+/// is already in the root: its own entry put it there.
 fn extract_hardlink(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
@@ -674,12 +874,13 @@ fn extract_hardlink(
     if target_components.is_empty() {
         return Err(entry_unsafe(&entry.path, "the hardlink target is empty"));
     }
-    let target_parent = open_dir_at(root, &target_components[..target_components.len() - 1])
+    let target_parent = open_dir_at(tree.root, &target_components[..target_components.len() - 1])
         .map_err(|errno| resolve_error(errno, &entry.path))?;
     let target_leaf = component_cstr(target_components.last().expect("non-empty"), &entry.path)?;
 
-    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
+    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
     create_replacing(
         &entry.path,
@@ -687,63 +888,61 @@ fn extract_hardlink(
             rustix::fs::linkat(
                 &target_parent,
                 &target_leaf,
-                &parent,
+                &parent.dir,
                 &leaf,
                 AtFlags::empty(),
             )
         },
-        &parent,
+        &parent.dir,
         &leaf,
     )?;
     Ok(())
 }
 
-/// Extracts a FIFO. `mknodat` honors the umask, so the mode is corrected
-/// afterward.
+/// Extracts a FIFO.
+///
+/// Created at [`FIFO_CREATION_MODE`], since `mknodat` narrows a mode by the
+/// umask, and then given its entry's mode and time through a descriptor for
+/// the pipe itself. Opening a pipe for reading with `O_NONBLOCK` returns at
+/// once, with no writer needed; `O_NOFOLLOW` refuses a leaf a racer replaced
+/// with a link since the `mknodat`, and the kind is checked again on what
+/// opened, so the mode an archive states lands on the pipe this created and on
+/// nothing else.
 fn extract_fifo(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(root, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
+    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
     create_replacing(
         &entry.path,
         || {
             rustix::fs::mknodat(
-                &parent,
+                &parent.dir,
                 &leaf,
                 FileType::Fifo,
-                Mode::from_raw_mode(entry.mode),
+                Mode::from_raw_mode(FIFO_CREATION_MODE),
                 0,
             )
         },
-        &parent,
+        &parent.dir,
         &leaf,
     )?;
 
-    rustix::fs::chmodat(
-        &parent,
-        &leaf,
-        Mode::from_raw_mode(entry.mode),
-        AtFlags::empty(),
-    )
-    .map_err(|errno| {
+    let pipe = open_created_fifo(&parent.dir, &leaf)
+        .map_err(|errno| ProvisionError::io("opening", bytes_to_path(&entry.path), errno.into()))?;
+    rustix::fs::fchmod(&pipe, Mode::from_raw_mode(entry.mode)).map_err(|errno| {
         ProvisionError::io(
             "setting the mode of",
             bytes_to_path(&entry.path),
             errno.into(),
         )
     })?;
-    rustix::fs::utimensat(
-        &parent,
-        &leaf,
-        &timestamps(entry.mtime),
-        AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(|errno| {
+    rustix::fs::futimens(&pipe, &timestamps(entry.mtime)).map_err(|errno| {
         ProvisionError::io(
             "setting the times of",
             bytes_to_path(&entry.path),
@@ -751,6 +950,27 @@ fn extract_fifo(
         )
     })?;
     Ok(())
+}
+
+/// Opens the named pipe `leaf` of `parent` that the caller just created, so
+/// its metadata can be set through a descriptor.
+///
+/// `O_RDONLY | O_NONBLOCK` opens a pipe at once whether or not anything holds
+/// its other end; `O_NOCTTY` keeps a terminal swapped in from becoming the
+/// controlling one before the check below refuses it. Anything that is not a
+/// pipe is `EEXIST`: something other than the entry this created holds the
+/// name.
+fn open_created_fifo(parent: &OwnedFd, leaf: &CString) -> Result<OwnedFd, Errno> {
+    let pipe = rustix::fs::openat(
+        parent,
+        leaf,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&pipe)?.st_mode) != FileType::Fifo {
+        return Err(Errno::EXIST);
+    }
+    Ok(pipe)
 }
 
 /// Runs `create`, replacing whatever occupies the name on `EEXIST`: the
@@ -801,7 +1021,7 @@ fn apply_dir_meta(
     let mut entries: Vec<(Vec<u8>, DirMeta)> = dir_meta.into_iter().collect();
     entries.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
     for (path, meta) in entries {
-        let components: Vec<Vec<u8>> = path.split(|b| *b == b'/').map(<[u8]>::to_vec).collect();
+        let components: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
         let fd = match open_dir_meta_fd(root, &components) {
             Ok(fd) => fd,
             // The directory was removed by a later entry (NOENT), replaced by a
@@ -835,11 +1055,10 @@ fn apply_dir_meta(
 /// would apply this directory's archive mode and mtime to whatever the symlink
 /// names, so the leaf must be the directory itself or the metadata is dropped.
 /// This matches the `O_NOFOLLOW` discipline the extraction leaves use.
-fn open_dir_meta_fd(root: BorrowedFd<'_>, components: &[Vec<u8>]) -> Result<OwnedFd, Errno> {
-    let path = CString::new(join(components)).map_err(|_| Errno::INVAL)?;
+fn open_dir_meta_fd(root: BorrowedFd<'_>, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
     containment::open_dir(
         root,
-        &path,
+        components,
         OFlags::RDONLY | OFlags::NOFOLLOW,
         ResolveFlags::BENEATH,
     )
@@ -924,21 +1143,28 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// are written by the calling user, whom the sandbox's identity map presents as
 /// root inside.
 ///
-/// This backs the Debian provisioner's pre-configure overlay, which lays a
-/// caller's configuration into the rootfs after the packages are unpacked and
-/// before their maintainer scripts run. Directory kinds it cannot create
-/// unprivileged, and that have no place in a configuration overlay — device
-/// nodes, FIFOs, sockets — are skipped, as archive extraction skips device
-/// nodes.
+/// `over` is the base `root` is an overlay upper over, in a layered build, and
+/// is consulted as [`Extraction::over`] consults it: an overlay directory where
+/// the base links to a directory merges through the link rather than hiding
+/// it.
+///
+/// This backs the Debian and Alpine provisioners' pre-configure overlay, which
+/// lays a caller's configuration into the root after the packages are unpacked
+/// and before their scripts run. Entry kinds that have no place in a
+/// configuration overlay — device nodes, FIFOs, sockets — are skipped.
 #[cfg(any(feature = "debian", feature = "alpine"))]
-pub(crate) fn overlay_tree(root: &Path, source: &Path) -> Result<(), ProvisionError> {
-    let root_fd = rustix::fs::open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| ProvisionError::io("opening", root, errno.into()))?;
-    overlay_dir(root_fd.as_fd(), source)
+pub(crate) fn overlay_tree(
+    root: &Path,
+    source: &Path,
+    over: Option<&Path>,
+) -> Result<(), ProvisionError> {
+    let root_fd = open_root(root)?;
+    let lower_fd = over.map(open_root).transpose()?;
+    let tree = Tree {
+        root: root_fd.as_fd(),
+        lower: lower_fd.as_ref().map(AsFd::as_fd),
+    };
+    overlay_dir(tree, source)
 }
 
 /// One item of the overlay walk's stack.
@@ -951,7 +1177,7 @@ enum OverlayStep {
     Leave,
 }
 
-/// Copies the entries of `source_dir` into `root`.
+/// Copies the entries of `source_dir` into the tree.
 ///
 /// A directory is created before it is descended into, so a parent is always
 /// in place when a child beneath it is written, and the deferred-metadata pass
@@ -964,7 +1190,7 @@ enum OverlayStep {
 /// pushes a [`OverlayStep::Leave`] marker beneath its children, which pops that
 /// name back off once they are all done.
 #[cfg(any(feature = "debian", feature = "alpine"))]
-fn overlay_dir(root: BorrowedFd<'_>, source_dir: &Path) -> Result<(), ProvisionError> {
+fn overlay_dir(tree: Tree<'_>, source_dir: &Path) -> Result<(), ProvisionError> {
     let mut components: Vec<Vec<u8>> = Vec::new();
     let mut pending = Vec::new();
     push_children(source_dir, &mut pending)?;
@@ -983,16 +1209,16 @@ fn overlay_dir(root: BorrowedFd<'_>, source_dir: &Path) -> Result<(), ProvisionE
         let name = source_path.file_name().expect("an entry of a directory");
         components.push(name.as_bytes().to_vec());
         if kind.is_symlink() {
-            overlay_symlink(root, &source_path, &components)?;
+            overlay_symlink(tree, &source_path, &components)?;
         } else if kind.is_dir() {
-            overlay_mkdir(root, &source_path, &components)?;
+            overlay_mkdir(tree, &source_path, &components)?;
             // The marker goes on first, so it resurfaces only once every child
             // pushed above it has been visited.
             pending.push(OverlayStep::Leave);
             push_children(&source_path, &mut pending)?;
             continue;
         } else if kind.is_file() {
-            overlay_file(root, &source_path, &components)?;
+            overlay_file(tree, &source_path, &components)?;
         }
         components.pop();
     }
@@ -1020,14 +1246,15 @@ fn push_children(dir: &Path, pending: &mut Vec<OverlayStep>) -> Result<(), Provi
 /// already present, replacing a non-directory in the way.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_mkdir(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     source_path: &Path,
     components: &[Vec<u8>],
 ) -> Result<(), ProvisionError> {
     let path = join(components);
-    let parent = open_parent(root, components, &path, None)?;
+    let parent = open_parent(tree, components, &path, None)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
     let mode = source_mode(source_path)?;
+    prepare_dir(tree, components, &path, None)?;
 
     // A newly created directory gets its mode set explicitly, since mkdirat
     // honors the umask; an existing directory is merged into and keeps its own
@@ -1036,16 +1263,14 @@ fn overlay_mkdir(
     // usr/lib`) is treated as an existing directory too — merged through,
     // never replaced — so an overlay directory cannot orphan the linker any
     // more than a package entry can.
-    let created = match rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)) {
+    let created = match rustix::fs::mkdirat(&parent.dir, &leaf, Mode::from_raw_mode(0o700)) {
         Ok(()) => true,
         Err(Errno::EXIST) => {
-            match classify_existing_dir(root, &parent, &leaf, components, &path)? {
+            match classify_existing_dir(tree.root, &parent.dir, &leaf, components, &path)? {
                 DirClash::Directory | DirClash::AliasedDirectory => false,
                 DirClash::Replace => {
-                    remove_at(&parent, &leaf, &path)?;
-                    rustix::fs::mkdirat(&parent, &leaf, Mode::from_raw_mode(0o700)).map_err(
-                        |errno| ProvisionError::io("creating", bytes_to_path(&path), errno.into()),
-                    )?;
+                    remove_at(&parent.dir, &leaf, &path)?;
+                    make_replacement_dir(tree, &parent.dir, &leaf, &path)?;
                     true
                 }
             }
@@ -1059,9 +1284,19 @@ fn overlay_mkdir(
         }
     };
     if created {
-        rustix::fs::chmodat(&parent, &leaf, Mode::from_raw_mode(mode), AtFlags::empty()).map_err(
-            |errno| ProvisionError::io("setting the mode of", bytes_to_path(&path), errno.into()),
-        )?;
+        // Through a descriptor for the directory just made: `O_NOFOLLOW` and
+        // `O_DIRECTORY` refuse whatever a racer put at the name since.
+        let setting = |errno: Errno| {
+            ProvisionError::io("setting the mode of", bytes_to_path(&path), errno.into())
+        };
+        let dir = rustix::fs::openat(
+            &parent.dir,
+            &leaf,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(setting)?;
+        rustix::fs::fchmod(&dir, Mode::from_raw_mode(mode)).map_err(setting)?;
     }
     Ok(())
 }
@@ -1071,26 +1306,27 @@ fn overlay_mkdir(
 /// replaced rather than written through.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_file(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     source_path: &Path,
     components: &[Vec<u8>],
 ) -> Result<(), ProvisionError> {
     let path = join(components);
-    let parent = open_parent(root, components, &path, None)?;
+    let parent = open_parent(tree, components, &path, None)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
     let mode = source_mode(source_path)?;
+    refuse_superseding_a_base_directory(&parent, &leaf, &path)?;
 
     let fd = create_replacing(
         &path,
         || {
             rustix::fs::openat(
-                &parent,
+                &parent.dir,
                 &leaf,
                 OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::from_raw_mode(0o600),
             )
         },
-        &parent,
+        &parent.dir,
         &leaf,
     )?;
 
@@ -1109,7 +1345,7 @@ fn overlay_file(
 /// verbatim and never resolved, replacing whatever occupies the name.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_symlink(
-    root: BorrowedFd<'_>,
+    tree: Tree<'_>,
     source_path: &Path,
     components: &[Vec<u8>],
 ) -> Result<(), ProvisionError> {
@@ -1118,13 +1354,14 @@ fn overlay_symlink(
         .map_err(|err| ProvisionError::io("reading the overlay symlink", source_path, err))?;
     let target = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| entry_unsafe(&path, "the symlink target contains a NUL byte"))?;
-    let parent = open_parent(root, components, &path, None)?;
+    let parent = open_parent(tree, components, &path, None)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
+    refuse_superseding_a_base_directory(&parent, &leaf, &path)?;
 
     create_replacing(
         &path,
-        || rustix::fs::symlinkat(&target, &parent, &leaf),
-        &parent,
+        || rustix::fs::symlinkat(&target, &parent.dir, &leaf),
+        &parent.dir,
         &leaf,
     )?;
     Ok(())
@@ -1159,7 +1396,7 @@ mod tests {
         fs::write(&guard, b"board=x\n").unwrap();
         fs::set_permissions(&guard, fs::Permissions::from_mode(0o640)).unwrap();
 
-        overlay_tree(&root, &source).expect("the overlay applies");
+        overlay_tree(&root, &source, None).expect("the overlay applies");
 
         assert_eq!(
             fs::read(root.join("etc/locale.gen")).unwrap(),
@@ -1198,7 +1435,11 @@ mod tests {
             .iter()
             .map(|name| name.to_vec())
             .collect();
-        open_parent(fd.as_fd(), &components, b"usr/lib/file", None)
+        let tree = Tree {
+            root: fd.as_fd(),
+            lower: None,
+        };
+        open_parent(tree, &components, b"usr/lib/file", None)
             .expect("the implied parents are created");
 
         for path in ["usr", "usr/lib"] {
@@ -1223,7 +1464,7 @@ mod tests {
         fs::create_dir_all(source.join("etc/default")).unwrap();
         fs::write(source.join("etc/default/keyboard"), b"XKBLAYOUT=de\n").unwrap();
 
-        overlay_tree(&root, &source).expect("the overlay applies");
+        overlay_tree(&root, &source, None).expect("the overlay applies");
 
         assert_eq!(
             fs::read(root.join("etc/default/keyboard")).unwrap(),
@@ -1245,7 +1486,7 @@ mod tests {
         let escape = base.join("escape-target");
         std::os::unix::fs::symlink(&escape, source.join("etc/escape")).unwrap();
 
-        overlay_tree(&root, &source).expect("the overlay applies");
+        overlay_tree(&root, &source, None).expect("the overlay applies");
 
         assert!(
             fs::symlink_metadata(root.join("etc/localtime"))
@@ -1284,7 +1525,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("passwd"), b"overlaid\n").unwrap();
 
-        overlay_tree(&root, &source).expect("the overlay applies");
+        overlay_tree(&root, &source, None).expect("the overlay applies");
 
         assert_eq!(fs::read(root.join("passwd")).unwrap(), b"overlaid\n");
         assert!(
@@ -1371,5 +1612,410 @@ mod prefix_tests {
                 assert_eq!(strip_prefix(outside, prefix), None, "{outside:?}");
             }
         }
+    }
+}
+
+// The entry kinds whose mode is set after they are created, which every build
+// with an extractor writes.
+#[cfg(test)]
+mod mode_tests {
+    use super::{Placement, TarReader, extract_archive};
+    use crate::scratch::Scratch;
+    use ferroday_cage_testkit::tar::Tar;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    #[test]
+    fn a_named_pipe_takes_its_entrys_mode_even_one_its_owner_cannot_read() {
+        // The pipe is created owner-only and given its own mode through a
+        // descriptor opened for reading, without waiting for a writer, so a
+        // mode that denies its owner reading still lands on it, and a mode
+        // wider than the creation mode does too.
+        let root = Scratch::for_test("extract", "fifo-modes");
+        let mut tar = Tar::new();
+        tar.entry("write-only", b'6', 0o220, 0, 0, "", b"")
+            .entry("shared", b'6', 0o666, 0, 0, "", b"");
+        extract_archive(
+            &mut TarReader::new(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect("the pipes extract");
+
+        for (name, mode) in [("write-only", 0o220), ("shared", 0o666)] {
+            let found = std::fs::symlink_metadata(root.join(name)).expect("the pipe is laid");
+            assert!(found.file_type().is_fifo(), "{name}");
+            assert_eq!(found.permissions().mode() & 0o7777, mode, "{name}");
+        }
+    }
+}
+
+// A layered extraction is what the Debian, Alpine and Gentoo layers stage an
+// increment with, and `Extraction::over` exists only where one of them does.
+#[cfg(all(test, any(feature = "debian", feature = "alpine", feature = "gentoo")))]
+mod layered_tests {
+    use super::{Extraction, Placement, TarReader};
+    use crate::scratch::Scratch;
+    use ferroday_cage_testkit::tar::Tar;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::Path;
+
+    /// Extracts `archive` into `upper` as an overlay upper over `base`,
+    /// returning every path the hook was shown.
+    fn extract_over(
+        upper: &Path,
+        base: &Path,
+        archive: &[u8],
+    ) -> Result<Vec<String>, crate::provision::ProvisionError> {
+        let mut seen = Vec::new();
+        let mut extraction = Extraction::new(upper)?.over(Some(base))?;
+        extraction.extract(&mut TarReader::new(archive), &mut |_, components| {
+            seen.push(String::from_utf8(components.join(&b'/')).unwrap());
+            Ok(Placement::Write)
+        })?;
+        extraction.finalize(upper)?;
+        Ok(seen)
+    }
+
+    /// A merged-usr base, as a Gentoo stage3 lays it out: `lib64` and `sbin`
+    /// are links into `usr`, and `usr/sbin` is a link beside `usr/bin`.
+    fn merged_usr_base(scratch: &Scratch) -> std::path::PathBuf {
+        let base = scratch.join("base");
+        fs::create_dir_all(base.join("usr/lib64")).unwrap();
+        fs::create_dir_all(base.join("usr/bin")).unwrap();
+        fs::write(base.join("usr/lib64/ld-linux-x86-64.so.2"), b"loader").unwrap();
+        fs::write(base.join("usr/bin/sh"), b"shell").unwrap();
+        symlink("usr/lib64", base.join("lib64")).unwrap();
+        symlink("usr/bin", base.join("sbin")).unwrap();
+        symlink("bin", base.join("usr/sbin")).unwrap();
+        fs::set_permissions(base.join("usr/lib64"), fs::Permissions::from_mode(0o750)).unwrap();
+        base
+    }
+
+    /// The paths under `dir`, recursively, without following a link.
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(at) = pending.pop() {
+            for entry in fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                found.push(path.strip_prefix(dir).unwrap().display().to_string());
+                if fs::symlink_metadata(&path).unwrap().is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn an_increment_lands_through_the_bases_merged_usr_links() {
+        // The binhost's lvm2 ships `lib64/libdevmapper.so.1.02` and
+        // `sbin/dmsetup`. In a bare upper those become real directories, and
+        // the overlay shows a real directory over the base's link, so the
+        // merged `/lib64` would hold libdevmapper and lose the loader.
+        let scratch = Scratch::for_test("extract-layered", "merged-usr");
+        let base = merged_usr_base(&scratch);
+        let before = listing(&base);
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+
+        let mut tar = Tar::new();
+        tar.dir("lib64/", 0o755)
+            .file("lib64/libdevmapper.so.1.02", 0o755, b"library")
+            .symlink("lib64/libdevmapper.so", "libdevmapper.so.1.02")
+            .dir("sbin/", 0o755)
+            .file("sbin/dmsetup", 0o755, b"tool")
+            .file("usr/sbin/lvm", 0o755, b"lvm");
+        let seen = extract_over(&upper, &base, &tar.finish()).expect("the increment extracts");
+
+        // Each entry landed where the base's links point, inside the upper.
+        assert_eq!(
+            fs::read(upper.join("usr/lib64/libdevmapper.so.1.02")).unwrap(),
+            b"library"
+        );
+        assert_eq!(
+            fs::read_link(upper.join("usr/lib64/libdevmapper.so")).unwrap(),
+            Path::new("libdevmapper.so.1.02"),
+        );
+        assert_eq!(fs::read(upper.join("usr/bin/dmsetup")).unwrap(), b"tool");
+        assert_eq!(fs::read(upper.join("usr/bin/lvm")).unwrap(), b"lvm");
+        // The links the walk passed through are the upper's now too, as the
+        // base spells them, so the merged view keeps them links.
+        for (link, target) in [
+            ("lib64", "usr/lib64"),
+            ("sbin", "usr/bin"),
+            ("usr/sbin", "bin"),
+        ] {
+            assert_eq!(
+                fs::read_link(upper.join(link)).unwrap(),
+                Path::new(target),
+                "{link}",
+            );
+        }
+        // A directory carried up from the base keeps the base's mode.
+        assert_eq!(
+            fs::metadata(upper.join("usr/lib64")).unwrap().mode() & 0o7777,
+            0o750,
+        );
+        // What a package database records is the archive's own path.
+        assert_eq!(
+            seen,
+            [
+                "lib64",
+                "lib64/libdevmapper.so.1.02",
+                "lib64/libdevmapper.so",
+                "sbin",
+                "sbin/dmsetup",
+                "usr/sbin/lvm",
+            ],
+        );
+        // And the base was only read.
+        assert_eq!(listing(&base), before);
+    }
+
+    #[test]
+    fn a_link_the_increment_ships_over_the_bases_own_is_the_increments() {
+        // The increment's own entry supersedes the base's at the name, and
+        // what it ships beneath resolves through the increment's link.
+        let scratch = Scratch::for_test("extract-layered", "own-link");
+        let base = merged_usr_base(&scratch);
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+
+        let mut tar = Tar::new();
+        tar.symlink("lib64", "usr/lib64")
+            .file("lib64/libz.so.1", 0o755, b"zlib");
+        extract_over(&upper, &base, &tar.finish()).expect("the increment extracts");
+
+        assert_eq!(
+            fs::read_link(upper.join("lib64")).unwrap(),
+            Path::new("usr/lib64")
+        );
+        assert_eq!(
+            fs::read(upper.join("usr/lib64/libz.so.1")).unwrap(),
+            b"zlib"
+        );
+    }
+
+    #[test]
+    fn a_base_link_out_of_the_tree_is_refused_as_one_in_the_root_is() {
+        // An absolute link, and one that climbs out, are what a whole root's
+        // extraction refuses to write through. The base's are refused the same
+        // way, and never followed to write anywhere.
+        let scratch = Scratch::for_test("extract-layered", "escape");
+        let base = scratch.join("base");
+        let outside = scratch.join("outside");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, base.join("absolute")).unwrap();
+        symlink("../outside", base.join("climbing")).unwrap();
+
+        for name in ["absolute", "climbing"] {
+            let upper = scratch.join(format!("upper-{name}"));
+            fs::create_dir(&upper).unwrap();
+            let mut tar = Tar::new();
+            tar.file(&format!("{name}/payload"), 0o644, b"x");
+            let err = extract_over(&upper, &base, &tar.finish())
+                .expect_err("a link out of the tree is not written through");
+            assert!(
+                matches!(err, crate::provision::ProvisionError::EntryUnsafe { .. }),
+                "{name}: {err:?}",
+            );
+        }
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn an_entry_that_is_not_a_directory_cannot_replace_one_of_the_bases() {
+        // The base is never written, so its directory cannot be removed to make
+        // room; a file over it would hide the base's whole directory instead.
+        let scratch = Scratch::for_test("extract-layered", "file-over-dir");
+        let base = scratch.join("base");
+        fs::create_dir_all(base.join("etc/conf.d")).unwrap();
+        fs::write(base.join("etc/conf.d/net"), b"base").unwrap();
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+
+        let mut tar = Tar::new();
+        tar.file("etc/conf.d", 0o644, b"a file");
+        let err = extract_over(&upper, &base, &tar.finish())
+            .expect_err("the base's directory is not superseded");
+        assert!(
+            matches!(err, crate::provision::ProvisionError::EntryRefused { .. }),
+            "{err:?}",
+        );
+    }
+
+    /// Whether this filesystem holds the `user.` attributes an overlay upper
+    /// needs, so the opaque cases can run; a skip says so.
+    fn holds_user_xattrs(dir: &Path) -> bool {
+        let probe = dir.join("xattr-probe");
+        fs::create_dir(&probe).unwrap();
+        let opened = fs::File::open(&probe).unwrap();
+        let held =
+            rustix::fs::fsetxattr(&opened, "user.probe", b"1", rustix::fs::XattrFlags::empty())
+                .is_ok();
+        fs::remove_dir(&probe).unwrap();
+        if !held {
+            eprintln!("skipping: this filesystem holds no user. attributes");
+        }
+        held
+    }
+
+    /// Makes an overlay whiteout at `path`, or answers `false` where the
+    /// kernel refuses an unprivileged one.
+    fn whiteout(path: &Path) -> bool {
+        match rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::CharacterDevice,
+            rustix::fs::Mode::empty(),
+            0,
+        ) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::PERM) => {
+                eprintln!("skipping: this kernel refuses an unprivileged whiteout");
+                false
+            }
+            Err(errno) => panic!("making a whiteout: {errno}"),
+        }
+    }
+
+    /// The opaque marker on `dir`, if any.
+    fn opaque(dir: &Path) -> bool {
+        let opened = fs::File::open(dir).unwrap();
+        let mut value = [0u8; 2];
+        matches!(
+            rustix::fs::fgetxattr(&opened, "user.overlay.opaque", &mut value),
+            Ok(1) if value[0] == b'y'
+        )
+    }
+
+    #[test]
+    fn the_overlays_own_markers_decide_what_the_base_shows() {
+        let scratch = Scratch::for_test("extract-layered", "markers");
+        if !holds_user_xattrs(&scratch) {
+            return;
+        }
+        let base = scratch.join("base");
+        let upper = scratch.join("upper");
+        fs::create_dir_all(base.join("usr/share/doc/base-files")).unwrap();
+        fs::create_dir_all(base.join("opt/vendor")).unwrap();
+        symlink("vendor", base.join("opt/current")).unwrap();
+        fs::create_dir_all(upper.join("usr/share")).unwrap();
+        fs::create_dir_all(upper.join("opt")).unwrap();
+
+        // A whiteout in the upper is a deletion the merged view shows: the
+        // directory a later entry needs there starts empty, so it is marked
+        // opaque rather than merged with the base's again.
+        if !whiteout(&upper.join("usr/share/doc")) {
+            return;
+        }
+        // An opaque directory hides the base beneath it, links included.
+        rustix::fs::fsetxattr(
+            fs::File::open(upper.join("opt")).unwrap(),
+            "user.overlay.opaque",
+            b"y",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        // A whiteout in the base is nothing at all.
+        if !whiteout(&base.join("srv")) {
+            return;
+        }
+
+        let mut tar = Tar::new();
+        tar.file("usr/share/doc/fresh/README", 0o644, b"new")
+            .file("opt/current/tool", 0o755, b"tool")
+            .file("srv/www/index", 0o644, b"index");
+        extract_over(&upper, &base, &tar.finish()).expect("the increment extracts");
+
+        let doc = upper.join("usr/share/doc");
+        assert!(fs::symlink_metadata(&doc).unwrap().is_dir());
+        assert!(opaque(&doc), "the replaced whiteout starts empty");
+        assert_eq!(fs::read(doc.join("fresh/README")).unwrap(), b"new");
+
+        let current = upper.join("opt/current");
+        assert!(
+            fs::symlink_metadata(&current).unwrap().is_dir(),
+            "the base's link beneath an opaque directory is not shown, so not copied",
+        );
+        assert!(!upper.join("opt/vendor").exists());
+
+        assert!(fs::symlink_metadata(upper.join("srv")).unwrap().is_dir());
+        assert_eq!(fs::read(upper.join("srv/www/index")).unwrap(), b"index");
+    }
+
+    #[test]
+    fn the_merged_view_keeps_the_bases_links_and_shows_the_increment_through_them() {
+        // The proof the kernel gives: the base and the upper mounted as the
+        // overlay a build sandbox is rooted on.
+        let Some(fixture) = ferroday_cage_testkit::fixture::fixture_rootfs() else {
+            return;
+        };
+        let scratch = Scratch::for_test("extract-layered", "merged-view");
+        if let Some(blocker) = crate::host::overlay_blocker(&scratch) {
+            eprintln!("skipping: overlay-rooted sandboxes are unavailable: {blocker}");
+            return;
+        }
+        // The pinned minirootfs, made merged-usr where a stage3 is: `lib64`
+        // into `usr/lib64`, and `sbin`'s contents moved into `usr/bin` with
+        // `sbin` a link to it.
+        let base = scratch.join("base");
+        let copied = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(fixture)
+            .arg(&base)
+            .status()
+            .expect("cp runs");
+        assert!(copied.success());
+        fs::create_dir(base.join("usr/lib64")).unwrap();
+        fs::write(base.join("usr/lib64/marker"), b"the base's own\n").unwrap();
+        symlink("usr/lib64", base.join("lib64")).unwrap();
+        for entry in fs::read_dir(base.join("sbin")).unwrap() {
+            let entry = entry.unwrap();
+            let moved = base.join("usr/bin").join(entry.file_name());
+            if fs::symlink_metadata(&moved).is_err() {
+                fs::rename(entry.path(), moved).unwrap();
+            }
+        }
+        crate::host::force_remove_dir_all(&base.join("sbin"));
+        symlink("usr/bin", base.join("sbin")).unwrap();
+
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+        let mut tar = Tar::new();
+        tar.dir("lib64/", 0o755)
+            .file("lib64/libdevmapper.so.1.02", 0o644, b"library\n")
+            .dir("sbin/", 0o755)
+            .file("sbin/dmsetup", 0o755, b"#!/bin/sh\necho dmsetup\n");
+        extract_over(&upper, &base, &tar.finish()).expect("the increment extracts");
+
+        let output = crate::Cage::builder()
+            .overlay_rootfs(&base, &upper)
+            .command("/bin/sh")
+            .args([
+                "-c",
+                "test -L /lib64 && test \"$(readlink /lib64)\" = usr/lib64 \
+                 && test -L /sbin && test \"$(readlink /sbin)\" = usr/bin \
+                 && cat /lib64/marker /usr/lib64/libdevmapper.so.1.02 \
+                 && test -x /sbin/apk && /sbin/dmsetup",
+            ])
+            .build()
+            .expect("the sandbox configuration is valid")
+            .output()
+            .expect("the sandbox runs");
+        assert!(
+            output.status.success(),
+            "the merged view: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "the base's own\nlibrary\ndmsetup\n",
+        );
     }
 }

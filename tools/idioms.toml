@@ -67,6 +67,15 @@ count = 1
 why = "The answer."
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/provision/containment.rs"
+count = 1
+why = """\
+A symbolic link's target, which `copy_up` resolves through an overlay's merged \
+view the way the kernel resolves one: `..` climbs and a leading `/` restarts at \
+the root, where `tree_components` refuses both, since a name a caller hands in \
+has no business holding them and a link's target routinely does."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/src/mechanism/copyin.rs"
 count = 1
 why = """\

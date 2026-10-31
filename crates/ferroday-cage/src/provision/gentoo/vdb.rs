@@ -72,6 +72,13 @@ use crate::provision::rooted::Rooted;
 /// Where portage keeps the ordinal it stamps each merge with.
 const COUNTER_FILE: &str = "var/cache/edb/counter";
 
+/// The most of [`COUNTER_FILE`] this reads.
+///
+/// The ordinal is a `u64`, twenty digits at most; a file longer than this is
+/// not a counter, and a root whose counter has been grown without being
+/// written to is refused here rather than read into memory.
+const MAX_COUNTER_BYTES: u64 = 64;
+
 /// The three files a merge writes that the container does not carry.
 const CONTENTS_FILE: &str = "CONTENTS";
 const COUNTER_ENTRY: &str = "COUNTER";
@@ -107,8 +114,13 @@ enum Laid {
 
 /// Merges `package` into the root and registers its database entry.
 ///
-/// Returns the paths it laid down, which is what the entry's `CONTENTS`
-/// records.
+/// `over` is the base a layered build's root is an overlay upper over, which
+/// the image is placed through ([`Extraction::over`]): an entry under `lib64/`,
+/// over a base whose `lib64` is a link to `usr/lib64`, lands at `usr/lib64` in
+/// the upper beside a copy of the link, rather than becoming a directory that
+/// hides it. `CONTENTS` records each path as the image spells it, as portage
+/// records a path it merged through a link to a directory, and the digest of
+/// each file is read through the same link.
 ///
 /// # Errors
 ///
@@ -117,6 +129,7 @@ enum Laid {
 /// whatever the extractor reports for an image archive it will not unpack.
 pub(super) fn merge(
     root: &Path,
+    over: Option<&Path>,
     rooted: &Rooted,
     container: &Path,
     package: &Package,
@@ -124,7 +137,7 @@ pub(super) fn merge(
     counter: u64,
 ) -> Result<(), ProvisionError> {
     let entry = entry_dir(planned);
-    let laid = extract_image(root, container, package)?;
+    let laid = extract_image(root, over, container, package)?;
     let contents = render_contents(root, rooted, &laid)?;
 
     // The metadata files first, then the three portage computes. Written after
@@ -202,12 +215,15 @@ fn entry_dir(planned: &PlannedPackage) -> String {
 /// Extracts the container's image into the root, recording what it laid down.
 fn extract_image(
     root: &Path,
+    over: Option<&Path>,
     container: &Path,
     package: &Package,
 ) -> Result<Vec<Laid>, ProvisionError> {
     let mut image = package.image(container)?;
     let mut laid: Vec<Laid> = Vec::new();
-    let mut extraction = Extraction::new(root)?.under(IMAGE_DIR.as_bytes());
+    let mut extraction = Extraction::new(root)?
+        .over(over)?
+        .under(IMAGE_DIR.as_bytes());
     extraction.extract(&mut image, &mut |entry, components| {
         if laid.len() >= MAX_CONTENTS_ENTRIES {
             // The extraction stops here rather than at the end: a container
@@ -293,13 +309,15 @@ fn render_contents(root: &Path, rooted: &Rooted, laid: &[Laid]) -> Result<String
 /// first.
 ///
 /// A layered build therefore asks this of the base as well as of the upper and
-/// takes the greater, which is the merged view's answer. An unreadable value is
-/// read as zero rather than refused: it is a bookkeeping ordinal, and a root
-/// whose counter a caller has damaged is better continued from than refused.
+/// takes the greater, which is the merged view's answer. A value that does not
+/// parse is read as zero rather than refused: it is a bookkeeping ordinal, and
+/// a root whose counter a caller has damaged is better continued from than
+/// refused. A file past [`MAX_COUNTER_BYTES`] is refused, since that is not a
+/// value at all.
 pub(super) fn counter_of(root: &Path, rooted: &Rooted) -> Result<u64, GentooError> {
-    match rooted.read(COUNTER_FILE) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).trim().parse().unwrap_or(0)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+    match rooted.read_if_present(COUNTER_FILE, MAX_COUNTER_BYTES) {
+        Ok(Some(bytes)) => Ok(String::from_utf8_lossy(&bytes).trim().parse().unwrap_or(0)),
+        Ok(None) => Ok(0),
         Err(err) => Err(GentooError::io("reading the merge counter", root, err)),
     }
 }
@@ -328,7 +346,10 @@ mod tests {
         let planned = planned(CPV, 1);
         let package = Package::open(&container, &planned, &fixture::keyring(&key))
             .expect("the container opens");
-        merge(&root, &rooted, &container, &package, &planned, counter).expect("the package merges");
+        merge(
+            &root, None, &rooted, &container, &package, &planned, counter,
+        )
+        .expect("the package merges");
         dir
     }
 

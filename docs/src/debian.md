@@ -1103,10 +1103,13 @@ epoch:
 
 The list matches what `mmdebstrap` removes by default, less the apt logs a
 bootstrap that drives dpkg directly never writes. A layered build removes the
-same files from its upper.
+same files from its upper. Where the increment's run deleted the base's copy,
+the upper records that deletion, and the record is kept so the base's copy stays
+hidden.
 
 Where a package wrote `/etc/machine-id`, as `systemd`'s configuration does, the
-file is kept and emptied. The id `systemd` writes is random, and every machine
+file is kept and emptied. It is emptied in place, keeping the owner and mode the
+package gave it. The id `systemd` writes is random, and every machine
 deployed from the root would otherwise share it. An empty file is one of the two
 states `machine-id(5)` gives a generic image. From it, `systemd` generates a
 fresh id at boot without treating that boot as a first boot. A deployment that
@@ -1246,7 +1249,9 @@ the pinned install below.
 [`BuildLayer`]. Root a sandbox on [`overlay_rootfs`] with the base as the
 read-only lower and the layer's `path()` as the writable upper. The build then
 sees the merged view, every write lands in the upper, and the base is never
-mutated.
+mutated. The increment's files land in the upper where the mounted overlay
+would place them. A directory of the increment's never hides a link the base
+holds.
 
 Dropping the `BuildLayer` removes the upper, and the overlay work directory
 beside it, reverting the increment and leaving the base ready for the next

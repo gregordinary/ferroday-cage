@@ -125,6 +125,13 @@ consumer upgrading can skip it.
   refused at `build`. It is written verbatim into the finished root's
   `sources.list`, where a space split the line and a newline added a source of
   its own.
+- Laying a tree down sets no mode by name. A chmod by name follows a symbolic
+  link at the entry, so a process racing the tree between an entry's creation
+  and its mode could have the mode applied to a file of its choosing.
+  Extraction, the pre-configure overlay, the host-side writes into a provisioned
+  root, and overlay layer creation set each mode through a descriptor for the
+  entry they created. `CopyIn` applies the source tree's modes from inside the
+  identity map, and removing a tree sets none.
 
 ### Added
 
@@ -192,10 +199,12 @@ consumer upgrading can skip it.
 - **Breaking.** A Debian bootstrap, and a layered build's increment, keeps no
   record of its run. Once its last configure wave has run it removes
   `/var/log/dpkg.log`, `/var/log/alternatives.log`,
-  `/var/cache/ldconfig/aux-cache`, and `/var/lib/dbus/machine-id`, and empties
-  an `/etc/machine-id` a package wrote. A program that asks for the machine id
-  in a sandbox, with no boot to generate one, now finds none until
-  `systemd-machine-id-setup` or `dbus-uuidgen --ensure` runs in the root.
+  `/var/cache/ldconfig/aux-cache`, and `/var/lib/dbus/machine-id`, and empties,
+  in place, an `/etc/machine-id` a package wrote, keeping the owner and mode the
+  package gave it. In a layered build's upper, a record the run deleted from the
+  base stays deleted rather than reappearing from the base. A program that asks
+  for the machine id in a sandbox, with no boot to generate one, now finds none
+  until `systemd-machine-id-setup` or `dbus-uuidgen --ensure` runs in the root.
 - **Breaking.** An Alpine bootstrap, and a layered build's increment, removes
   the `/etc/machine-id` its scripts generated once the last trigger has run.
   `dbus`'s service generates a fresh id from the missing file before it starts.
@@ -300,10 +309,22 @@ consumer upgrading can skip it.
   `--ro-bind`, or `--setenv`, which take two values and have none.
 - `fcage --timeout` and `--kill-after` refuse a number of seconds too small to
   be a nanosecond, which rounded to no time at all.
+- A layered build no longer hides the links its base holds to directories. A
+  package shipping `lib64/` or `sbin/` over a merged-usr base, as the Gentoo
+  binhost's lvm2 does over a stage3, made real directories in the upper that hid
+  the base's `lib64 -> usr/lib64` and `sbin -> usr/bin`, and the merged root
+  lost its dynamic loader. Every entry an increment extracts, and every file the
+  layer writes into the upper, is placed where the mounted overlay would place
+  it, in all three layers and in the pre-configure overlay. A Debian increment
+  lays no merged-usr links of its own, since the base decides the layout. An
+  entry that is not a directory is refused over a directory the base holds, and
+  one beneath a base directory the calling user cannot search fails naming the
+  entry.
 - A provisioner's host-side read of a file inside a tree no longer waits on a
-  named pipe left at that path. Opening one for reading waited for a writer that
-  never came, which stalled the bootstrap for good. It is now refused, as any
-  path that is not a regular file is.
+  named pipe left at that path, or holds a file a script made arbitrarily large.
+  Nothing but a regular file is opened, and each read refuses a file past a
+  ceiling suited to what it reads, so `truncate -s 1T /etc/shadow` in a
+  maintainer script fails the step rather than exhausting the host's memory.
 - A Debian or Gentoo cache entry that does not verify is downloaded again in the
   same run, as an Alpine one already was. A corrupt `.deb` the batched prefetch
   did not deliver was kept, and every later run failed extracting it; a Gentoo

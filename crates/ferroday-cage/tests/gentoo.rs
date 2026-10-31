@@ -392,3 +392,82 @@ fn an_atom_the_binhost_cannot_satisfy_says_which_wall_it_hit() {
         "the refusal names the atom and the wall: {message}",
     );
 }
+
+/// An increment staged over a stage3 leaves the base's merged-usr links in
+/// place, in the merged view a build sandbox is rooted on.
+///
+/// A stage3 holds `lib64` and `sbin` as links into `usr`, and the binhost's
+/// lvm2 ships `lib64/libdevmapper.so.1.02` and `sbin/dmsetup`. Merged into a
+/// bare upper those become directories, which the overlay shows over the
+/// links: the merged `/lib64` then holds libdevmapper alone, and no dynamically
+/// linked program finds its loader.
+#[test]
+fn an_increment_over_a_stage3_keeps_its_merged_usr_links() {
+    if !network_enabled() {
+        return;
+    }
+    // The merged view is read through a sandbox, which needs user namespaces;
+    // the fixture probe reports the skip.
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    let scratch = common::scratch_dir("gentoo-layered");
+    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&scratch) {
+        eprintln!("skipping: overlay-rooted sandboxes are unavailable: {blocker}");
+        return;
+    }
+    let base = scratch.join("base");
+    let mut stage3 = Gentoo::builder(ARCHITECTURE)
+        .variant(VARIANT)
+        .cache_dir(common::download_cache("gentoo"))
+        .build()
+        .expect("the builder accepts an ordinary configuration");
+    provision::ensure(&base, &mut stage3).expect("the stage3 verifies and extracts");
+    for link in ["lib64", "sbin"] {
+        assert!(
+            base.join(link)
+                .symlink_metadata()
+                .expect("the stage3 holds it")
+                .is_symlink(),
+            "the stage3 is merged-usr at {link}",
+        );
+    }
+
+    let upper = scratch.join("upper");
+    let mut increment = Gentoo::builder(ARCHITECTURE)
+        .binhost(BINHOST)
+        .install(["sys-fs/lvm2"])
+        .base_layer(&base)
+        .cache_dir(common::download_cache("gentoo"))
+        .build()
+        .expect("the builder accepts an ordinary configuration");
+    let layer = increment
+        .stage_layer(&upper)
+        .expect("lvm2 stages over the stage3");
+
+    // Whatever lvm2 ships under `lib64/` and `sbin/` went through the links:
+    // the upper holds no directory at either name.
+    for name in ["lib64", "sbin"] {
+        if let Ok(found) = upper.join(name).symlink_metadata() {
+            assert!(!found.is_dir(), "the upper hides the base's {name}");
+        }
+    }
+    // And the merged view agrees, read by the shell the stage3 ships, which
+    // itself execs only while `/lib64` reaches the loader.
+    let status = ferroday_cage::Cage::builder()
+        .overlay_rootfs(&base, layer.path())
+        .command("/bin/bash")
+        .args([
+            "-c",
+            "test -L /lib64 && test -L /sbin && test -e /lib64/libdevmapper.so.1.02 \
+             && test -x /sbin/dmsetup",
+        ])
+        .build()
+        .expect("the build sandbox is valid")
+        .run()
+        .expect("the build sandbox runs");
+    assert!(status.success(), "the merged view keeps the base's links");
+
+    drop(layer);
+    provision::remove(&base).expect("the base removes");
+}

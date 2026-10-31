@@ -3189,16 +3189,21 @@ fn create_layer_dir(
         // `umask 077` would otherwise leave a `0700` upper for whatever consumes
         // it next. Only the directory this call just created is chmod-ed, so an
         // adopted one keeps the mode its owner gave it — the same rule the
-        // sandbox stage follows for a mount point it creates.
+        // sandbox stage follows for a mount point it creates, and set the same
+        // way, through a descriptor: `O_NOFOLLOW` and `O_DIRECTORY` refuse
+        // whatever replaced the name since the `mkdir`, where a chmod by name
+        // would follow a link put there to the file it names.
         Ok(()) => {
             created.record(path.clone());
-            rustix::fs::chmodat(
+            let made = rustix::fs::openat(
                 &dirfd,
                 &at.name,
-                Mode::from_raw_mode(OVERLAY_DIR_MODE),
-                AtFlags::empty(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
             )
             .map_err(|errno| overlay_errno(layer, &path, errno))?;
+            rustix::fs::fchmod(&made, Mode::from_raw_mode(OVERLAY_DIR_MODE))
+                .map_err(|errno| overlay_errno(layer, &path, errno))?;
         }
         Err(Errno::EXIST) => {
             let stat = rustix::fs::statat(&dirfd, &at.name, AtFlags::SYMLINK_NOFOLLOW)
@@ -3685,11 +3690,6 @@ fn layer_presence(layer: Option<&Rooted>, relative: &Path) -> Presence {
     }
 }
 
-/// The extended attribute an unprivileged overlay marks an opaque directory
-/// with. The library mounts every overlay with `userxattr`, which is what makes
-/// overlayfs read its markers from the `user.` namespace.
-const OVERLAY_OPAQUE: &CStr = c"user.overlay.opaque";
-
 /// Whether the merged view of an overlay shows an entry at `relative`.
 ///
 /// `layers` is in the order overlayfs consults them: the upper, then the lowers
@@ -3738,9 +3738,9 @@ fn merged_presence(layers: &[Option<Rooted>], relative: &Path) -> Presence {
                 Err(_) => return Presence::Unknown,
             };
             match FileType::from_raw_mode(stat.st_mode) {
-                FileType::Directory => match layer.directory_xattr(ancestor, OVERLAY_OPAQUE) {
-                    Ok(Some(value)) if value == b"y" => return Presence::Absent,
-                    Ok(_) => {}
+                FileType::Directory => match layer.is_opaque(ancestor) {
+                    Ok(true) => return Presence::Absent,
+                    Ok(false) => {}
                     Err(_) => return Presence::Unknown,
                 },
                 FileType::Symlink => break,
@@ -5623,9 +5623,15 @@ mod tests {
     }
 
     /// Marks the directory at `path` opaque, as an unprivileged overlay does,
-    /// or says why the filesystem cannot.
+    /// or says why the filesystem cannot. The attribute is the overlay's own,
+    /// which `Rooted::is_opaque` reads.
     fn mark_opaque(path: &Path, value: &[u8]) -> Result<(), Errno> {
-        rustix::fs::setxattr(path, OVERLAY_OPAQUE, value, rustix::fs::XattrFlags::empty())
+        rustix::fs::setxattr(
+            path,
+            c"user.overlay.opaque",
+            value,
+            rustix::fs::XattrFlags::empty(),
+        )
     }
 
     #[test]

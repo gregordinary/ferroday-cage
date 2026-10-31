@@ -379,10 +379,14 @@ records, not merely at its names, because apk spells a soname
 is reported as the upgrade it would be, naming both versions and the entry that
 forced it: an increment installs over a base rather than replacing part of one.
 
-A file the increment ships over one the base owns simply wins in the merged view,
-since the base is read-only and the shadow lives in the disposable upper. A
-collision *within* the increment is refused exactly as a full bootstrap refuses
-one.
+A file the increment ships over one the base owns simply wins in the merged view.
+The base is read-only, and the shadow lives in the disposable upper. A collision
+*within* the increment is refused exactly as a full bootstrap refuses one.
+
+Files land where the merged view puts them. Where the base links a directory
+elsewhere, as `/var/run` to `../run`, the increment's files land at the link's
+target. The link stays the base's. A merged-usr base keeps its `/lib` this way,
+and the database is written through it.
 
 ## Trust
 
