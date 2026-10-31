@@ -83,6 +83,11 @@ consumer upgrading can skip it.
   an `/etc/machine-id` a package wrote. A program that asks for the machine id
   in a sandbox, with no boot to generate one, now finds none until
   `systemd-machine-id-setup` or `dbus-uuidgen --ensure` runs in the root.
+- **Breaking.** An Alpine bootstrap, and a layered build's increment, removes
+  the `/etc/machine-id` its scripts generated once the last trigger has run.
+  `dbus`'s service generates a fresh id from the missing file before it starts.
+  A program that asks for the machine id in a sandbox now finds none until
+  `dbus-uuidgen --ensure=/etc/machine-id` runs in the root.
 
 ### Internal
 

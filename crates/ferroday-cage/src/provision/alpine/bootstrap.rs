@@ -69,6 +69,13 @@ const KEYS_DIR: &str = "etc/apk/keys";
 /// than of the machine the bootstrap ran on.
 const SCRIPT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// The system's machine id.
+///
+/// `dbus`'s `.post-install` runs `dbus-uuidgen --ensure=/etc/machine-id`,
+/// which writes a random id that every machine deployed from the root would
+/// then share.
+const MACHINE_ID: &str = "etc/machine-id";
+
 /// The state a finished root hands back to `apk`, beside its database.
 ///
 /// One value because a layered build supplies a different one of each: its
@@ -115,6 +122,10 @@ pub(super) struct Site<'a> {
 /// directories this wave created exactly as the closure's own do, because a
 /// trigger belongs to the installed root rather than to the transaction that ran
 /// it.
+///
+/// Once the last trigger has run, the machine identity the scripts generated is
+/// [cleared](clear_run_state), so the finished root carries none. A layered
+/// build clears it from the upper.
 pub(super) fn configure(
     site: Site<'_>,
     database: &Database,
@@ -151,7 +162,32 @@ pub(super) fn configure(
         }
     }
 
-    fire_triggers(site, &tree, database, order, carried, observer)
+    fire_triggers(site, &tree, database, order, carried, observer)?;
+    clear_run_state(&tree)
+}
+
+/// Removes what the scripts leave that belongs to their run rather than to the
+/// root: the [machine id](MACHINE_ID) a script generated.
+///
+/// Removed, where the Debian layer empties the same file, because the two roots
+/// boot differently. `machine-id(5)` gives a generic image two states, missing
+/// and empty, and `systemd` generates a fresh id from either. Alpine boots
+/// OpenRC, and what generates the id there is `dbus`'s own service, whose
+/// `start_pre` runs `dbus-uuidgen --ensure=/etc/machine-id`, and OpenRC's
+/// `machine-id` service. Both generate an id where the file is missing, while
+/// `dbus-uuidgen` refuses an empty file and fails, so an emptied id would stop
+/// the system bus from starting.
+///
+/// Only a regular file with content is removed, since that is the shape an id
+/// `dbus-uuidgen` writes has. An empty file, a symbolic link, and a layered
+/// build's whiteout are none of them an id this run generated, and removing a
+/// whiteout would reveal the base's id through the overlay.
+fn clear_run_state(tree: &Rooted) -> Result<(), AlpineError> {
+    tree.remove_if(MACHINE_ID, Rooted::is_file_with_content)
+        .map_err(AlpineError::at(
+            "removing the machine id",
+            tree.path(MACHINE_ID),
+        ))
 }
 
 /// Runs the `.trigger` script of every package whose watched paths the finished
@@ -597,6 +633,7 @@ pub(super) use super::apk::ScriptKind;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     #[test]
     fn a_pattern_matches_the_way_fnmatch_with_pathname_does() {
@@ -734,5 +771,66 @@ mod tests {
         let once = order(&packages);
         let again = order(&packages);
         assert_eq!(once, again);
+    }
+
+    /// A scratch tree, and the same tree opened as the scripts' host side
+    /// opens it.
+    fn rooted_tree(tag: &str) -> (Scratch, Rooted) {
+        let scratch = Scratch::for_test("alpine-bootstrap", tag);
+        let tree = Rooted::open(&scratch).expect("the scratch tree opens");
+        (scratch, tree)
+    }
+
+    #[test]
+    fn a_generated_machine_id_is_removed() {
+        // What `dbus-uuidgen --ensure` leaves: 32 hex digits and a newline.
+        let (staging, tree) = rooted_tree("machine-id");
+        tree.write_mode(MACHINE_ID, b"bab73fe9c7e4506ef70334906ab8378f\n", 0o444)
+            .unwrap();
+
+        clear_run_state(&tree).expect("the run state is cleared");
+
+        assert!(std::fs::symlink_metadata(staging.join(MACHINE_ID)).is_err());
+    }
+
+    #[test]
+    fn a_machine_id_the_run_did_not_generate_is_left_alone() {
+        // No id: nothing is created, since dbus's service generates one from
+        // the missing file at boot.
+        let (staging, tree) = rooted_tree("no-machine-id");
+        clear_run_state(&tree).expect("an absent id clears");
+        assert!(std::fs::symlink_metadata(staging.join(MACHINE_ID)).is_err());
+
+        // An empty file is not what `dbus-uuidgen` writes.
+        tree.write(MACHINE_ID, b"").unwrap();
+        clear_run_state(&tree).expect("an empty id clears");
+        assert_eq!(std::fs::read(staging.join(MACHINE_ID)).unwrap(), b"");
+
+        // Nor is anything that is not a regular file. A directory would fail
+        // the unlink outright if it were attempted.
+        std::fs::remove_file(staging.join(MACHINE_ID)).unwrap();
+        std::fs::create_dir(staging.join(MACHINE_ID)).unwrap();
+        clear_run_state(&tree).expect("a directory is left alone");
+        assert!(staging.join(MACHINE_ID).is_dir());
+    }
+
+    #[test]
+    fn a_link_at_the_machine_id_is_neither_removed_nor_followed() {
+        // The cleanup runs after every script, so a script can leave a link
+        // there. It is not an id the run generated, and the file it names is
+        // not inspected through it.
+        let (staging, tree) = rooted_tree("machine-id-link");
+        let victim = staging.join("victim");
+        std::fs::write(&victim, b"host contents\n").unwrap();
+        std::fs::create_dir_all(staging.join("etc")).unwrap();
+        std::os::unix::fs::symlink(&victim, staging.join(MACHINE_ID)).unwrap();
+
+        clear_run_state(&tree).expect("the run state is cleared");
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"host contents\n");
+        assert_eq!(
+            std::fs::read_link(staging.join(MACHINE_ID)).unwrap(),
+            victim
+        );
     }
 }

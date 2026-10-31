@@ -289,6 +289,14 @@ impl Rooted {
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_size == 0
     }
 
+    /// Whether `stat` describes a regular file with something in it — the
+    /// shape an identifier a script generated has, as against an empty file, a
+    /// symbolic link, or an overlay whiteout.
+    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+    pub(crate) fn is_file_with_content(stat: &Stat) -> bool {
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_size > 0
+    }
+
     /// Renames `from` to `to` within the tree, replacing whatever occupies the
     /// destination. Both paths resolve against the tree's root.
     pub(crate) fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {

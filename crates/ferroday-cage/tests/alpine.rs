@@ -148,6 +148,67 @@ fn full_bootstrap_configures_a_runnable_alpine() {
     );
 }
 
+/// A root keeps no machine id its scripts generated, and still gets one the way
+/// an Alpine machine does.
+///
+/// `dbus`'s install script generates an id, which every machine deployed from
+/// the root would share. What regenerates one on an Alpine machine is the
+/// command `dbus`'s service runs before each start, so that command is the
+/// proof that the state left behind is the right one: it generates an id where
+/// the file is missing, and refuses an empty one.
+#[test]
+fn a_bootstrap_keeps_no_machine_id_and_dbus_generates_one() {
+    if !network_enabled() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        // The scripts run inside a cage, which needs user namespaces.
+        return;
+    };
+    let rootfs = common::scratch_dir("alpine-machine-id").join("rootfs");
+    let ran: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    {
+        let mut sink = |event: AlpineEvent<'_>| {
+            if let AlpineEvent::Script {
+                package, script, ..
+            } = event
+            {
+                ran.borrow_mut().push(format!("{package} {script}"));
+            }
+        };
+        let mut alpine = Alpine::builder(RELEASE)
+            .include(["dbus"])
+            .cache_dir(common::download_cache("alpine"))
+            .build()
+            .expect("the builder validates");
+        provision::ensure(&rootfs, &mut alpine.observe(&mut sink)).expect("the bootstrap runs");
+    }
+
+    // The script that generates an id ran, and the id did not survive it.
+    assert!(
+        ran.borrow().iter().any(|one| one == "dbus post-install"),
+        "{:?}",
+        ran.borrow(),
+    );
+    let machine_id = rootfs.join("etc/machine-id");
+    assert!(
+        std::fs::symlink_metadata(&machine_id).is_err(),
+        "the generated id is removed",
+    );
+
+    let status = ferroday_cage::Cage::builder()
+        .rootfs(&rootfs)
+        .command("/usr/bin/dbus-uuidgen")
+        .args(["--ensure=/etc/machine-id"])
+        .build()
+        .expect("the cage builds")
+        .run()
+        .expect("dbus-uuidgen runs in the finished rootfs");
+    assert!(status.success(), "an id is generated from the missing file");
+    let id = std::fs::read_to_string(&machine_id).expect("the id is written");
+    assert_eq!(id.trim_end().len(), 32, "{id}");
+}
+
 /// A root provisioned from Alpine's `main` and postmarketOS's repository at
 /// once.
 ///

@@ -331,7 +331,7 @@ Each row is a question the workspace answers once. Before writing something that
 answers one of them, reach for the answer. Before adding a row, check that the
 question is not already here under different words.
 
-Four rows below name one answer per package format rather than one answer
+Five rows below name one answer per package format rather than one answer
 outright. Three of them are deliberate for one reason. Each format defines its
 own version ordering, so a shared comparator would have to be told which set of
 rules to apply. That is the format's identity rather than a parameter. The rows
@@ -353,6 +353,11 @@ Debian meaning, so a shared type would carry collections that are always empty
 on one side. Alpine reports one refusal at a time and has no such type yet. When
 it grows one, it is this row it extends.
 
+The fifth, what a bootstrap clears of its own run, is split because each
+format's root boots differently. `systemd` generates a machine id from an empty
+file, while the D-Bus service that generates one on Alpine refuses an empty
+file. The Gentoo layer runs no package script, so it has nothing to clear.
+
 | The question | The answer |
 | --- | --- |
 | What can a configured absolute path contain? | `path::absolute_components` |
@@ -366,6 +371,7 @@ it grows one, it is this row it extends.
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
 | Which slot does a `slot/subslot` value name? | `provision::gentoo::installed::slot_of` |
 | What did one resolution refuse, and how does it read? | `provision::gentoo::resolve::Refusals`, `debian::resolve::Refusals` |
+| What does a finished root not keep of the bootstrap that built it? | `provision::debian::bootstrap::clear_run_state`, `alpine::bootstrap::clear_run_state` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag_byte`, `atom::use_flag` |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |

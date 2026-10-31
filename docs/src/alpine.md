@@ -51,7 +51,9 @@ A bootstrap runs in stages:
    runs the install scripts in a second, both in dependency order, then fires the
    triggers whose watched directories the install changed. The scripts run inside
    a cage rooted at the staging tree, so they need no privilege on the host. When
-   they have run, the rootfs is published.
+   they have run, the bootstrap removes the machine id a script generated, as [A
+   reproducible root](#a-reproducible-root) describes, and publishes the root
+   filesystem.
 
 The finished root carries `/lib/apk/db/installed`, `/etc/apk/world`,
 `/etc/apk/repositories`, `/etc/apk/arch` and the repositories' trusted keys, so
@@ -256,6 +258,32 @@ The rest behaves as the Debian document does, and for the same reasons: a field 
 reader does not know is carried and re-emitted after the ones it does, both lists
 are already ordered so two renderings are byte-identical, and no line ends in
 whitespace.
+
+## A reproducible root
+
+A plan fixes which packages a bootstrap installs. Two bootstraps of one plan on
+the same day produce the same root, even at different paths. Their exports are
+byte-identical when [`Export::clamp_mtime`] caps the modification times.
+
+A bootstrap keeps no machine id its scripts generated. `dbus`'s install script
+writes a random `/etc/machine-id`, which every machine deployed from the root
+would share. The bootstrap removes it once the scripts and triggers have run,
+and a layered build removes it from its upper.
+
+The [Debian layer](debian.md#what-a-bootstrap-does-not-keep) empties the same
+file instead, and the init system is the reason. `systemd` generates an id from
+an empty file. On Alpine the id comes from `dbus`'s service, which runs
+`dbus-uuidgen --ensure=/etc/machine-id` before it starts, and from OpenRC's
+`machine-id` service. Both generate an id where the file is missing. An empty
+file makes `dbus-uuidgen` fail, and the system bus with it.
+
+A sandbox has no boot, so a program that asks for the machine id inside one finds
+none until `dbus-uuidgen --ensure=/etc/machine-id` runs in the root.
+
+The date a bootstrap runs on is not fixed. Alpine's scripts create accounts with
+busybox's `adduser`, which records the day it ran as each account's last
+password change in `/etc/shadow`. It reads no `SOURCE_DATE_EPOCH`, so two
+bootstraps of one plan on different days differ in those lines.
 
 ## Layered build roots
 
@@ -522,3 +550,4 @@ $ fcage --rootfs ./pmos --provision-alpine v3.23 \
 [`KeySet::alpine`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.KeySet.html#method.alpine
 [`KeySet::insert`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.KeySet.html#method.insert
 [`overlay_rootfs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_rootfs
+[`Export::clamp_mtime`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/struct.Export.html#method.clamp_mtime
