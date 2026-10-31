@@ -247,6 +247,14 @@ consumer upgrading can skip it.
   `#[non_exhaustive]`, as every other struct variant is. A pattern naming their
   fields needs `..`, and they cannot be constructed outside the crate.
   `ResolvedHardening::Applied` gains `landlock_scope`.
+- Extraction resolves a symbolic link in the tree as the root filesystem does:
+  an absolute link re-anchors at the destination, so `var/run -> /run` carries
+  an entry beneath it to the root's own `run/`, and the pre-configure overlay
+  merges through such a link rather than replacing it. A link naming a path the
+  root does not hold no longer reads as an escape: an entry beneath it is
+  refused with `ProvisionError::EntryRefused`. Nothing is written outside the
+  destination either way, and an entry whose own path is absolute or contains
+  `..` is still `EntryUnsafe`.
 - An overlay layer path may hold a `:`, which is escaped in the mount options. A
   `,` is still refused with `ConfigError::OverlayPathInvalid`.
 - An Alpine install script runs with exactly the environment `apk` gives one:

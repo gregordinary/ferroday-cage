@@ -597,14 +597,14 @@ Extraction is unprivileged and designed for archives that describe a root
 filesystem:
 
 - **Containment is kernel-enforced.** Entry paths and hardlink targets
-  resolve through `openat2` strictly beneath the destination. In-tree
-  relative symlinks resolve normally, so a merged-usr archive whose `bin`
-  is a symlink to `usr/bin` extracts correctly. An entry that reaches
-  outside through `..`, an absolute path, or a symlink chain fails with
+  resolve through `openat2` inside the destination. A symbolic link resolves
+  as the root filesystem resolves it, so a merged-usr `bin -> usr/bin` and an
+  absolute `var/run -> /run` both lead inside the destination. An entry whose
+  own path is absolute or climbs with `..` fails with
   `ProvisionError::EntryUnsafe` before anything is written. That error
-  means an escape and nothing else. An entry refused for another reason is a
-  `ProvisionError::EntryRefused`: a path component that is not a directory,
-  or a symbolic link with no target.
+  means an escape attempt and nothing else. An entry refused for another
+  reason is a `ProvisionError::EntryRefused`: a path component that is not a
+  directory, or a symbolic link with no target.
 - **Ownership maps to the calling user.** Every extracted entry belongs to the
   calling user, whom the sandbox's identity map presents as root, so
   extracted files appear root-owned inside the sandbox. Ownership recorded

@@ -431,10 +431,13 @@ pub enum ProvisionError {
     },
     /// An archive entry attempted to reach outside the extraction root.
     ///
-    /// The entry's path or link target is absolute, contains `..`, carries a
-    /// NUL byte that would truncate it, or resolves through a symlink to a
-    /// location outside the rootfs being extracted. Containment is enforced by
-    /// the kernel during path resolution, not by inspecting the path text.
+    /// The entry's path or hardlink target is absolute, contains `..`, or
+    /// carries a NUL byte that would truncate it, or its path resolves through
+    /// a magic link or a symlink loop. A symbolic link in the tree resolves
+    /// inside the rootfs being extracted, as it does for the root itself, so it
+    /// carries no entry outside: one naming a host path names the rootfs's own
+    /// path of that name. Containment is enforced by the kernel during path
+    /// resolution, not by inspecting the path text.
     ///
     /// This variant asserts a containment failure and nothing else. An entry
     /// refused for any other reason is [`EntryRefused`](Self::EntryRefused).

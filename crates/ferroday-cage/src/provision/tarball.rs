@@ -79,10 +79,11 @@ enum Source {
 /// # Extraction semantics
 ///
 /// Extraction is unprivileged and containment is kernel-enforced: entry
-/// paths and hardlink targets resolve strictly beneath the destination
-/// (in-tree relative symlinks included), and an entry that reaches outside
-/// it — absolute paths, `..`, a symlink chain leading out — fails with
-/// [`ProvisionError::EntryUnsafe`] rather than being written.
+/// paths and hardlink targets resolve inside the destination, and an entry
+/// whose own path or hardlink target is absolute or climbs with `..` fails
+/// with [`ProvisionError::EntryUnsafe`] rather than being written. A symbolic
+/// link in the tree resolves as the root filesystem resolves it, an absolute
+/// one re-anchored at the destination, so no link carries an entry outside.
 ///
 /// - Every extracted entry is owned by the calling user; ownership
 ///   recorded in the archive is not applied. Inside a sandbox the calling

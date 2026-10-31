@@ -65,9 +65,9 @@ The rootfs must sit under a directory the calling user controls — not a
 world-writable one such as a shared `/tmp`, and not one whose path passes
 through a directory another local user can write to.
 
-Inside the sandbox, containment is kernel-enforced: mount targets resolve with
-`RESOLVE_IN_ROOT` and extraction with `RESOLVE_BENEATH`, so nothing the sandbox
-or an archive contains can reach past the root. What those guarantees rest on is
+Inside the sandbox, containment is kernel-enforced: mount targets and
+extraction both resolve with `RESOLVE_IN_ROOT`, so nothing the sandbox or an
+archive contains can reach past the root. What those guarantees rest on is
 the host path naming that root. The launch resolves it twice — once to mount it,
 and again inside the new mount namespace to anchor the mount targets and the
 pivot — because a descriptor opened before `unshare` cannot anchor a mount in

@@ -2559,18 +2559,18 @@ fn stage_extract(
     Ok(statoverride)
 }
 
-/// Lays out the merged-usr farm and every package's files into `staging`,
-/// returning the derived [`StatOverride`].
+/// Lays every package's files into `staging`, returning the derived
+/// [`StatOverride`]. A whole root gets the merged-usr farm first.
 ///
 /// The extraction half of [`stage_extract`], without the dpkg database
 /// initialization. A layered build reuses it to extract an increment into an
-/// overlay upper: the merged-usr symlinks are created there so a package
-/// shipping a legacy top-level path resolves into `usr`, exactly as for a full
-/// bootstrap, while the base's own dpkg database — seen through the overlay —
+/// overlay upper, where the base's own dpkg database, seen through the overlay,
 /// is left untouched, so no empty database is written over it. `over` is that
-/// base, which the extraction places every entry through
-/// ([`Extraction::over`]), so a link the base holds is never hidden by a
-/// directory of the increment's.
+/// base, and the base decides the layout: every entry is placed through it
+/// ([`Extraction::over`]), so a package shipping a legacy top-level path lands
+/// in `usr` exactly where the base's merged-usr links send it, and no farm is
+/// laid into the upper. A farm there would shadow whatever the base holds at
+/// those names, a base that keeps `/bin` a directory included.
 fn extract_packages(
     staging: &Path,
     over: Option<&Path>,
@@ -2579,7 +2579,9 @@ fn extract_packages(
     archives_host: &Path,
     observer: &mut dyn DebianObserver,
 ) -> Result<StatOverride, ProvisionError> {
-    create_merged_usr(staging, architecture)?;
+    if over.is_none() {
+        create_merged_usr(staging, architecture)?;
+    }
 
     // Every `.deb` ships a `./` entry, so the tree being assembled would
     // otherwise take the mode and modification time of whichever package
@@ -4347,6 +4349,67 @@ mod tests {
             overrides.render(),
             "root root 755 /usr/bin/tool\nroot root 4755 /usr/sbin/helper\n",
         );
+    }
+
+    #[test]
+    fn an_increment_takes_its_layout_from_the_base_it_is_staged_over() {
+        // A whole root is given the merged-usr farm; an increment is not, since
+        // its base already decides what `/bin` is. Over a merged-usr base the
+        // package's `bin/` entry goes through the base's link, carried up into
+        // the upper. Over a base that keeps `/bin` a directory, it merges with
+        // that directory, where a farm in the upper would have hidden it behind
+        // a link.
+        let dir = Scratch::new("layered-layout");
+        let archives = dir.join("archives");
+        let tool = deb_of(&data_tar(&[("./bin/tool", 0o755, 0, 0)]));
+        let install = installables(&archives, &[("tool", tool)]);
+
+        let merged = dir.join("merged-base");
+        std::fs::create_dir_all(merged.join("usr/bin")).expect("the base is laid out");
+        std::os::unix::fs::symlink("usr/bin", merged.join("bin")).expect("a link");
+        let upper = dir.join("upper-merged");
+        std::fs::create_dir_all(&upper).expect("the upper is creatable");
+        extract_packages(
+            &upper,
+            Some(&merged),
+            "amd64",
+            &install,
+            &archives,
+            &mut Silent,
+        )
+        .expect("the increment extracts");
+        assert!(upper.join("usr/bin/tool").is_file());
+        assert_eq!(
+            std::fs::read_link(upper.join("bin")).expect("the base's link is carried up"),
+            Path::new("usr/bin"),
+        );
+        assert!(
+            std::fs::symlink_metadata(upper.join("lib")).is_err(),
+            "no farm is laid into the upper",
+        );
+
+        let split = dir.join("split-base");
+        std::fs::create_dir_all(split.join("bin")).expect("the base is laid out");
+        std::fs::create_dir_all(split.join("usr/bin")).expect("the base is laid out");
+        let upper = dir.join("upper-split");
+        std::fs::create_dir_all(&upper).expect("the upper is creatable");
+        extract_packages(
+            &upper,
+            Some(&split),
+            "amd64",
+            &install,
+            &archives,
+            &mut Silent,
+        )
+        .expect("the increment extracts");
+        assert!(
+            std::fs::symlink_metadata(upper.join("bin"))
+                .expect("the upper holds the directory")
+                .is_dir(),
+            "a directory that merges with the base's own",
+        );
+        assert!(upper.join("bin/tool").is_file());
+        assert!(!upper.join("usr/bin/tool").exists());
     }
 
     #[test]

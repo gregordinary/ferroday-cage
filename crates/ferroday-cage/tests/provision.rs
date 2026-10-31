@@ -750,12 +750,17 @@ fn a_v7_entry_is_held_to_the_same_containment_rules() {
     let escapee = dest.parent().unwrap().join("escapee-v7");
     assert!(!escapee.exists(), "the dotdot entry escaped to {escapee:?}");
 
+    // A link resolves inside the root as the root resolves it, so one climbing
+    // out names the root's own `outside`, which this archive never made: the
+    // entry beneath it is refused as one beneath any dangling link is, and
+    // nothing lands outside.
     let mut escape = TarBuilder::v7();
     escape
         .symlink("esc", "../../outside")
         .file("esc/pwn", 0o644, b"escaped");
-    let err = provision_err("attack-v7-symlink", &escape.finish());
-    assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
+    let (err, dest) = provision_err_at("attack-v7-symlink", &escape.finish());
+    assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+    assert!(!dest.parent().unwrap().join("outside").exists());
 }
 
 #[test]
@@ -903,20 +908,32 @@ fn absolute_paths_are_rejected() {
 }
 
 #[test]
-fn writes_through_escaping_symlinks_are_rejected() {
-    // The classic: plant a symlink pointing out of the tree, then write
-    // a file through it. The symlink itself extracts (it is data); the
-    // write through it must be stopped by the kernel.
+fn writes_through_links_naming_host_paths_stay_in_the_root() {
+    // The classic: plant a symlink pointing out of the tree, then write a file
+    // through it. The symlink itself extracts (it is data). It resolves as the
+    // root filesystem resolves it, inside the root, so the write lands in the
+    // root's own path of that name, or is refused where the root holds none.
     for (name, target) in [("relative", "../../outside"), ("absolute", "/tmp")] {
         let mut tar = TarBuilder::new();
         tar.symlink("esc", target)
             .file("esc/pwn", 0o644, b"escaped");
-        let err = provision_err(&format!("attack-symlink-{name}"), &tar.finish());
+        let (err, dest) = provision_err_at(&format!("attack-symlink-{name}"), &tar.finish());
         assert!(
-            matches!(err, ProvisionError::EntryUnsafe { .. }),
+            matches!(err, ProvisionError::EntryRefused { .. }),
             "{name}: {err}"
         );
+        assert!(!dest.parent().unwrap().join("outside").exists(), "{name}");
     }
+    assert!(!Path::new("/tmp/pwn").exists());
+
+    // An absolute link to a directory the root holds is a link of the root,
+    // and the write goes where the root itself would put it.
+    let mut tar = TarBuilder::new();
+    tar.dir("tmp", 0o1777)
+        .symlink("esc", "/tmp")
+        .file("esc/pwn", 0o644, b"in the root");
+    let rootfs = provision("symlink-absolute-in-root", &tar.finish());
+    assert_eq!(fs::read(rootfs.join("tmp/pwn")).unwrap(), b"in the root");
     assert!(!Path::new("/tmp/pwn").exists());
 }
 
@@ -934,13 +951,26 @@ fn escaping_hardlink_targets_are_rejected() {
 }
 
 #[test]
-fn hardlinks_resolved_through_escaping_symlinks_are_rejected() {
-    // A hardlink whose target path passes through an out-of-tree symlink:
-    // the target resolution itself must be contained.
+fn hardlinks_resolved_through_links_to_host_paths_stay_in_the_root() {
+    // A hardlink whose target path passes through a link naming a host path:
+    // the target resolves inside the root, so it names the root's own
+    // `etc/passwd`, never the host's. An archive that never made one has
+    // nothing there to link to.
     let mut tar = TarBuilder::new();
     tar.symlink("esc", "/etc").hardlink("grab", "esc/passwd");
-    let err = provision_err("attack-hardlink-symlink", &tar.finish());
-    assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
+    provision_err("attack-hardlink-symlink", &tar.finish());
+
+    let mut tar = TarBuilder::new();
+    tar.dir("etc", 0o755)
+        .file("etc/passwd", 0o644, b"root:x:0:0::/root:/bin/sh\n")
+        .symlink("esc", "/etc")
+        .hardlink("grab", "esc/passwd");
+    let rootfs = provision("hardlink-symlink-in-root", &tar.finish());
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        fs::metadata(rootfs.join("grab")).unwrap().ino(),
+        fs::metadata(rootfs.join("etc/passwd")).unwrap().ino(),
+    );
 }
 
 #[test]

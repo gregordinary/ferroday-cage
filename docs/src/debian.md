@@ -1251,7 +1251,8 @@ read-only lower and the layer's `path()` as the writable upper. The build then
 sees the merged view, every write lands in the upper, and the base is never
 mutated. The increment's files land in the upper where the mounted overlay
 would place them. A directory of the increment's never hides a link the base
-holds.
+holds. The base decides the layout: no merged-usr links are laid into the
+upper, and a package's `/bin` entry goes wherever the base's own `/bin` leads.
 
 Dropping the `BuildLayer` removes the upper, and the overlay work directory
 beside it, reverting the increment and leaving the base ready for the next

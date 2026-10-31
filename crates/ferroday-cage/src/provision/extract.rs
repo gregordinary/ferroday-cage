@@ -1,26 +1,21 @@
 //! Hardened extraction of a tar stream into a directory.
 //!
-//! Containment is enforced by the kernel, not by inspecting path text:
-//! every parent directory is resolved with `openat2` and
-//! `RESOLVE_BENEATH`, so an entry whose path or link chain escapes the
-//! extraction root is refused by the kernel no matter how it is spelled.
-//! In-tree relative symlinks resolve normally — a merged-usr archive
-//! whose `bin` is a symlink to `usr/bin` extracts correctly — while
-//! dotdot components, absolute paths, and symlinks leading outside the
-//! root are rejected.
+//! Containment is enforced by the kernel, not by inspecting path text: every
+//! parent directory is resolved with `openat2` and `RESOLVE_IN_ROOT`, anchored
+//! at the extraction root, so no entry is written outside it however its path
+//! or a link chain is spelled. An entry's own path is held to more than that:
+//! one that is absolute, or climbs with `..`, is refused outright as an escape
+//! attempt, since a name an archive gives has no business being either.
 //!
-//! `RESOLVE_BENEATH` refuses every absolute symlink, including one whose
-//! target would land back inside the tree; `RESOLVE_IN_ROOT` would accept
-//! it by re-anchoring the target at the extraction root. The stricter
-//! flag is deliberate: the sandbox's mount setup resolves inside a rootfs
-//! it is about to pivot into, where in-root re-anchoring is the correct
-//! reading of an absolute link, but extraction writes to a plain host
-//! directory that nothing ever re-roots, so an absolute link is treated
-//! as pointing at the host and refused. The practical cost is that an
-//! archive using the absolute form of a merged-usr link (`bin ->
-//! /usr/bin`) and shipping entries through it does not extract; real
-//! rootfs archives use the relative form and place entries under the
-//! link's target.
+//! A symbolic link in the tree is a link of the root filesystem the tree is,
+//! and resolves as that root resolves it once it is in use. A relative link
+//! resolves normally, so a merged-usr archive whose `bin` is a link to
+//! `usr/bin` extracts correctly. An absolute one re-anchors at the extraction
+//! root: `var/run -> /run`, which Debian's `base-files` ships, carries an entry
+//! under `var/run/` to the tree's own `run/`, which is where `dpkg` or `apk`
+//! inside the finished sandbox would put it. A `..` in a link's target stops at
+//! the root, as it does there. Nothing resolves outside the tree, and a magic
+//! link is refused.
 //!
 //! Extraction is unprivileged by design: entries become owned by the
 //! calling user (whom the sandbox's identity map presents as root),
@@ -54,6 +49,12 @@ use crate::path::{self, LeadingSlash, Refused};
 use super::ProvisionError;
 use super::containment::{self, Made, Reached};
 use super::tar::{Entry, TarReader};
+
+/// How every path an extraction writes through is resolved: inside the root,
+/// with an absolute link re-anchored there, as the root filesystem resolves it
+/// once it is in use. `RESOLVE_NO_MAGICLINKS` comes with every resolve
+/// [`containment::open_dir`] makes.
+const CONTAINMENT: ResolveFlags = ResolveFlags::IN_ROOT;
 
 /// The mode of a directory the extraction implies but no entry names.
 ///
@@ -173,9 +174,10 @@ impl Extraction {
     /// of the base's link.
     ///
     /// The rules are the ones a whole root is extracted by, applied to the
-    /// merged view. A link to a directory satisfies a directory entry, a link
-    /// the containment refuses is refused, and a later entry supersedes what
-    /// holds its name. The base is never written, so a directory of its own is
+    /// merged view. A link to a directory satisfies a directory entry, an
+    /// absolute link of the base's resolves inside the root as the root
+    /// resolves it, and a later entry supersedes what holds its name. The base
+    /// is never written, so a directory of its own is
     /// one an entry that is not a directory cannot supersede, and such an entry
     /// is refused. A directory the base holds and the archive only implies
     /// keeps the base's mode and modification time, as the overlay's own copy
@@ -396,10 +398,12 @@ fn strip_prefix<'p>(path: &'p [u8], prefix: &[u8]) -> Option<&'p [u8]> {
 /// Splits and validates an entry path: relative, no `..`, no NUL.
 ///
 /// [`path::tree_components`] is the split, with an absolute path refused rather
-/// than read as naming the destination's own root: the destination is a plain
-/// host directory that nothing re-roots, so a leading `/` names the host.
-/// `.` components and empty segments are dropped, so `./` normalizes to an
-/// empty list, which is the entry describing the extraction root.
+/// than read as naming the destination's own root. A link in the tree is the
+/// root's to resolve as the root resolves it, but an archive names its own
+/// entries relative to the root it describes, and one that names a path from
+/// `/` is aiming at the host whatever the resolution would make of it. `.`
+/// components and empty segments are dropped, so `./` normalizes to an empty
+/// list, which is the entry describing the extraction root.
 ///
 /// `context` names the entry in errors (for a hardlink target, the entry it
 /// belongs to) and `noun` names which of the two the refusal is about, so the
@@ -433,9 +437,9 @@ struct Parent {
 /// Opens an entry's parent directory beneath the root, creating missing
 /// intermediate directories.
 ///
-/// Resolution is kernel-scoped to the root (`RESOLVE_BENEATH`); a parent
-/// path that escapes — through `..` in a symlink, an absolute symlink
-/// target, or any other route — is refused. Where the tree is layered, the
+/// Resolution is kernel-scoped to the root ([`CONTAINMENT`]): a link in the
+/// chain, absolute or climbing with `..`, resolves inside the root as the root
+/// itself resolves it, and nothing resolves outside. Where the tree is layered, the
 /// chain is first walked through the merged view with the root made to hold
 /// what that view holds along it ([`containment::copy_up`]), so the kernel's
 /// resolution then goes where the mounted overlay would.
@@ -458,20 +462,16 @@ fn open_parent(
     let parent = &components[..components.len() - 1];
     let mut lower = None;
     if let Some(base) = tree.lower {
-        let walked = containment::copy_up(
-            tree.root,
-            base,
-            parent,
-            ResolveFlags::BENEATH,
-            &mut |made| place_made(made, dir_meta.as_deref_mut()),
-        );
+        let walked = containment::copy_up(tree.root, base, parent, CONTAINMENT, &mut |made| {
+            place_made(made, dir_meta.as_deref_mut())
+        });
         match walked {
             Ok(Reached::Directory(found)) => lower = found,
             Ok(Reached::Short) => {}
             Err(errno) => return Err(parent_error(errno, entry_path)),
         }
     }
-    let dir = containment::create_dirs(tree.root, parent, ResolveFlags::BENEATH, &mut |made| {
+    let dir = containment::create_dirs(tree.root, parent, CONTAINMENT, &mut |made| {
         place_made(made, dir_meta.as_deref_mut())
     })
     .map_err(|errno| parent_error(errno, entry_path))?;
@@ -533,7 +533,7 @@ fn parent_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
 ///
 /// `O_PATH`: the descriptor is only ever the anchor of a later `*at` call.
 fn open_dir_at(root: BorrowedFd<'_>, components: &[Vec<u8>]) -> Result<OwnedFd, Errno> {
-    containment::open_dir(root, components, OFlags::PATH, ResolveFlags::BENEATH)
+    containment::open_dir(root, components, OFlags::PATH, CONTAINMENT)
 }
 
 /// Prepares a layered extraction to write the directory `components` names.
@@ -554,13 +554,9 @@ fn prepare_dir(
     let Some(base) = tree.lower else {
         return Ok(());
     };
-    match containment::copy_up(
-        tree.root,
-        base,
-        components,
-        ResolveFlags::BENEATH,
-        &mut |made| place_made(made, dir_meta.as_deref_mut()),
-    ) {
+    match containment::copy_up(tree.root, base, components, CONTAINMENT, &mut |made| {
+        place_made(made, dir_meta.as_deref_mut())
+    }) {
         Ok(_) | Err(Errno::NOTDIR) => Ok(()),
         Err(errno) => Err(parent_error(errno, entry_path)),
     }
@@ -673,7 +669,8 @@ enum DirClash {
 /// stops resolving as `/lib/ld-linux-*` and nothing dynamically linked can run.
 /// `dpkg` applies the same aliasing. The rule is general — a symlink resolving
 /// to a directory is satisfied — so it covers every aliased path without naming
-/// any. `root` anchors the `RESOLVE_BENEATH` follow that recognizes the alias.
+/// any. `root` anchors the contained follow that recognizes the alias, and an
+/// absolute alias (`bin -> /usr/bin`) is one as much as a relative one.
 fn classify_existing_dir(
     root: BorrowedFd<'_>,
     parent: &OwnedFd,
@@ -697,9 +694,12 @@ fn classify_existing_dir(
 
 /// Maps a parent-resolution failure onto the typed error surface.
 ///
-/// `EXDEV` and `ELOOP` are the kernel refusing to leave the root — the second
-/// covers a magic link as well as a loop, and the errno does not distinguish
-/// them — so both are containment failures. `ENOTDIR` is not: an archive that
+/// `EXDEV` and `ELOOP` are the kernel refusing a resolution: the first is a
+/// rename racing the walk out of the root, the second a magic link or a loop,
+/// and the errno does not distinguish those two. Both are containment
+/// failures. A link naming a place outside the tree is not one, since it
+/// resolves inside the root, and a link to nothing there is `ENOTDIR` from the
+/// creation that found its name taken. `ENOTDIR` is not either: an archive that
 /// ships `foo` as a file and `foo/bar` after it is an ordinary malformed
 /// archive, and calling that an escape attempt would tell a caller something
 /// untrue about their input.
@@ -1051,7 +1051,7 @@ fn apply_dir_meta(
 /// still hold their writable creation mode at this point.
 ///
 /// `O_NOFOLLOW` refuses a leaf that a later archive entry turned into a
-/// symlink: `RESOLVE_BENEATH` would keep the follow in-tree, but following it
+/// symlink: the containment would keep the follow in-tree, but following it
 /// would apply this directory's archive mode and mtime to whatever the symlink
 /// names, so the leaf must be the directory itself or the metadata is dropped.
 /// This matches the `O_NOFOLLOW` discipline the extraction leaves use.
@@ -1060,7 +1060,7 @@ fn open_dir_meta_fd(root: BorrowedFd<'_>, components: &[&[u8]]) -> Result<OwnedF
         root,
         components,
         OFlags::RDONLY | OFlags::NOFOLLOW,
-        ResolveFlags::BENEATH,
+        CONTAINMENT,
     )
 }
 
@@ -1132,7 +1132,7 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// Copies the directory tree at `source` into the directory at `root`, with the
 /// same kernel-enforced containment as archive extraction.
 ///
-/// Every parent is resolved beneath `root` with `openat2`/`RESOLVE_BENEATH`,
+/// Every parent is resolved inside `root` with `openat2` and [`CONTAINMENT`],
 /// and every leaf is created `O_NOFOLLOW`, so nothing in `source` — nor a
 /// symlink already in `root` — can cause a write outside `root`. The contents
 /// of `source` are laid at the root: `source/etc/hosts` becomes
@@ -1141,7 +1141,9 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// overlay overrides a file a package already unpacked; directories merge.
 /// File modes are preserved and symlink targets are stored verbatim; entries
 /// are written by the calling user, whom the sandbox's identity map presents as
-/// root inside.
+/// root inside. A link the root already holds is followed as the root follows
+/// it, an absolute one included: an overlay's `var/run/` lands in `run/` where
+/// the root links `var/run` to `/run`, and the link stays a link.
 ///
 /// `over` is the base `root` is an overlay upper over, in a layered build, and
 /// is consulted as [`Extraction::over`] consults it: an overlay directory where
@@ -1450,6 +1452,29 @@ mod tests {
                 & 0o7777;
             assert_eq!(mode, 0o755, "{path} kept its creation mode");
         }
+    }
+
+    #[test]
+    fn an_overlay_directory_merges_through_an_absolute_link_the_root_holds() {
+        // The root links `var/run` to `/run`, as Debian's base-files does. An
+        // overlay that carries `var/run/` merges into the root's `run`, and the
+        // link stays a link rather than being replaced by a directory.
+        let base = Scratch::for_test("overlay", "absolute-link");
+        let root = base.join("root");
+        let source = base.join("source");
+        fs::create_dir_all(root.join("run")).unwrap();
+        fs::create_dir_all(root.join("var")).unwrap();
+        std::os::unix::fs::symlink("/run", root.join("var/run")).unwrap();
+        fs::create_dir_all(source.join("var/run/app")).unwrap();
+        fs::write(source.join("var/run/app/state"), b"ready\n").unwrap();
+
+        overlay_tree(&root, &source, None).expect("the overlay applies");
+
+        assert_eq!(
+            fs::read_link(root.join("var/run")).unwrap(),
+            Path::new("/run")
+        );
+        assert_eq!(fs::read(root.join("run/app/state")).unwrap(), b"ready\n");
     }
 
     #[test]
@@ -1800,11 +1825,42 @@ mod layered_tests {
     }
 
     #[test]
-    fn a_base_link_out_of_the_tree_is_refused_as_one_in_the_root_is() {
-        // An absolute link, and one that climbs out, are what a whole root's
-        // extraction refuses to write through. The base's are refused the same
-        // way, and never followed to write anywhere.
-        let scratch = Scratch::for_test("extract-layered", "escape");
+    fn an_absolute_link_of_the_bases_resolves_inside_the_root() {
+        // Debian's base-files ships `var/run -> /run`, and an Alpine root
+        // carries `etc/ssl1.1/certs -> /etc/ssl/certs`. Inside the finished
+        // sandbox each names the root's own directory, and that is where an
+        // entry beneath one lands: in the upper's `run`, with the base's link
+        // copied up beside it.
+        let scratch = Scratch::for_test("extract-layered", "absolute");
+        let base = scratch.join("base");
+        fs::create_dir_all(base.join("run")).unwrap();
+        fs::create_dir_all(base.join("var")).unwrap();
+        symlink("/run", base.join("var/run")).unwrap();
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+
+        let mut tar = Tar::new();
+        tar.dir("var/run/", 0o755)
+            .file("var/run/daemon/pid", 0o644, b"1\n");
+        let seen = extract_over(&upper, &base, &tar.finish()).expect("the increment extracts");
+
+        assert_eq!(fs::read(upper.join("run/daemon/pid")).unwrap(), b"1\n");
+        assert_eq!(
+            fs::read_link(upper.join("var/run")).unwrap(),
+            Path::new("/run"),
+            "the base's link stays a link in the merged view",
+        );
+        assert_eq!(seen, ["var/run", "var/run/daemon/pid"]);
+        assert!(!base.join("run/daemon").exists(), "the base is only read");
+    }
+
+    #[test]
+    fn a_base_link_naming_a_host_path_is_never_followed_out() {
+        // A link naming a path outside the tree, absolutely or by climbing,
+        // names the root's own path of that name. Where the root holds nothing
+        // there the link dangles, and an entry beneath it is refused as one
+        // beneath any dangling link is; nothing is written outside.
+        let scratch = Scratch::for_test("extract-layered", "host-path");
         let base = scratch.join("base");
         let outside = scratch.join("outside");
         fs::create_dir_all(&base).unwrap();
@@ -1818,9 +1874,9 @@ mod layered_tests {
             let mut tar = Tar::new();
             tar.file(&format!("{name}/payload"), 0o644, b"x");
             let err = extract_over(&upper, &base, &tar.finish())
-                .expect_err("a link out of the tree is not written through");
+                .expect_err("an entry beneath a dangling link is refused");
             assert!(
-                matches!(err, crate::provision::ProvisionError::EntryUnsafe { .. }),
+                matches!(err, crate::provision::ProvisionError::EntryRefused { .. }),
                 "{name}: {err:?}",
             );
         }

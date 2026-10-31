@@ -18,11 +18,10 @@
 //! which is what such a link means to a tree that is a root filesystem: `/lib
 //! -> /usr/lib` inside a rootfs names the rootfs's own `/usr/lib`, both to the
 //! sandbox that pivots into it and to the host-side step writing to it
-//! beforehand. `RESOLVE_BENEATH` refuses every absolute link instead, including
-//! one whose target would land back inside the tree, and is what a caller uses
-//! when the tree is a plain host directory that nothing ever re-roots — an
-//! extraction destination, where an absolute link points at the host and
-//! honouring it would write there.
+//! beforehand. Every tree provisioning writes is one, so the extractor and the
+//! host-side steps both resolve this way. `RESOLVE_BENEATH` refuses every
+//! absolute link instead, including one whose target would land back inside
+//! the tree; it suits a walk that follows no link at all, where the two agree.
 //!
 //! Either way the walk cannot leave the tree. The flags differ only in what
 //! they do with a link that names a path from a root.
@@ -105,9 +104,9 @@ fn joined<C: AsRef<[u8]>>(components: &[C]) -> Result<CString, Errno> {
 /// anchor of a later `*at` call, and `O_RDONLY` where something is done to the
 /// directory itself — an `O_PATH` descriptor does not accept `fchmod`. A caller
 /// that must not follow a symbolic link at the final component adds
-/// `O_NOFOLLOW`, which the containment flag does not cover: `RESOLVE_BENEATH`
-/// keeps a follow inside the tree, and staying inside the tree is not the same
-/// as landing on the entry that was named.
+/// `O_NOFOLLOW`, which the containment flag does not cover: either flag keeps
+/// a follow inside the tree, and staying inside the tree is not the same as
+/// landing on the entry that was named.
 ///
 /// `O_DIRECTORY` and `O_CLOEXEC` are unconditional: every caller wants a
 /// directory, and a descriptor that outlived an exec would be one the sandbox
