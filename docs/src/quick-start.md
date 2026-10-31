@@ -92,6 +92,36 @@ has to be configured for that to hold — see [A read-only bind is a
 boundary](how-the-sandbox-is-built.md#a-read-only-bind-is-a-boundary) for the
 mechanism.
 
+A read-write bind hands the command everything beneath it, and a project holds
+files the host runs later. A repository's `.git` directory is the sharpest case.
+Git on the host runs the hooks a repository holds, and most `git` commands start
+the program its `core.fsmonitor` setting names. A command that can write `.git`
+can therefore run code on the host the next time anyone uses the repository.
+Binding `.git` read-only over the project keeps that directory out of reach:
+
+```rust,no_run
+use ferroday_cage::Cage;
+
+# fn main() -> ferroday_cage::Result<()> {
+let cage = Cage::builder()
+    .rootfs("alpine-root")
+    .bind("/home/user/project", "/build")
+    .bind_ro("/home/user/project/.git", "/build/.git")
+    .current_dir("/build")
+    .command("/usr/bin/make")
+    .build()?;
+# let _ = cage;
+# Ok(())
+# }
+```
+
+Mounts apply in the order they are configured, so the read-only bind covers that
+one path of the writable one. It does not make the rest of the tree safe to run.
+A build can still edit a `Makefile` or a script, or create a subdirectory
+holding a repository of its own, with hooks. Review what a run changed before
+running anything from the tree on the host. `fcage` spells the same pair as
+`--bind` followed by `--ro-bind`.
+
 ## Using the command line
 
 The `fcage` binary offers the same sandbox at a shell prompt:
