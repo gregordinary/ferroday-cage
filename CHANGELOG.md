@@ -681,7 +681,9 @@ consumer upgrading can skip it.
   it does, are unchanged.
 - Dependencies refreshed within their ranges. The manifest states why a
   `debian` or `gentoo` build carries two `sha2` lines: `lzma-rust2` selects 0.11,
-  and `pgp` still depends on 0.10.
+  and `pgp` still depends on 0.10. The `alpine` feature no longer enables
+  `rsa`'s `std` feature, so an Alpine-only build carries neither `getrandom` nor
+  `libc`.
 - `tools/rust_source.py` is the one reading of a source file the census tools
   take: every comment and every test-only item removed. `tools/check-seam.py`
   expands grouped imports and resolves `super::` paths, and finds 38 reaches

@@ -73,7 +73,7 @@ sha2 = { version = "0.11", optional = true }
 #
 # `sha1`'s `oid` feature is not on by default and is required: the digest type
 # reaches `Pkcs1v15Sign::new` for its DER prefix, not to hash.
-rsa = { version = "0.9.10", optional = true, default-features = false, features = ["std", "pem"] }
+rsa = { version = "0.9.10", optional = true, default-features = false, features = ["pem"] }
 sha1 = { version = "0.10", optional = true, features = ["oid"] }
 # The Gentoo binary-package add-on: the MD5 portage writes into its own package
 # database -- an installed package's `CONTENTS` records one per file so portage
