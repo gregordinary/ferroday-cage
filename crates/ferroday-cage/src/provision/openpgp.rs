@@ -1255,6 +1255,8 @@ mod tests {
     use super::*;
     use pgp::types::{Duration, Timestamp};
 
+    // The real archive keyring is the Debian layer's.
+    #[cfg(feature = "debian")]
     #[test]
     fn embedded_keys_are_valid_and_unrevoked() {
         // The vendored keyring parses to a non-empty set of unrevoked keys,
@@ -1941,6 +1943,8 @@ mod tests {
         );
     }
 
+    // The real archive keyring is the Debian layer's.
+    #[cfg(feature = "debian")]
     #[test]
     fn a_real_subkey_signed_debian_release_verifies() {
         // A frozen, real Debian `forky` InRelease verifies against the embedded
@@ -2010,6 +2014,8 @@ mod tests {
         );
     }
 
+    // The real archive keyring is the Debian layer's.
+    #[cfg(feature = "debian")]
     #[test]
     fn the_embedded_keyring_exposes_verifiable_signing_subkeys() {
         // Debian's archive automatic signing keys sign with a dedicated signing

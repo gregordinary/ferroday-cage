@@ -21,8 +21,10 @@
 #   library    A capability `fcage` does not offer at all. The reason says what
 #              the tool would have to grow first.
 #
-# Accessors (`get_*`), `build`, and the trait impls are not settings and are not
-# recorded; the checker skips them.
+# A setting is a method that takes its builder by value and returns it. A
+# constructor, a terminal such as `build`, an accessor, and a trait impl have
+# other shapes and are not recorded. Every public type with a setting is a
+# builder, and the checker fails on one this file does not name.
 
 # The launch builder. This is the surface the documentation's parity claim is
 # about, and every setting on it is spelled here.
@@ -560,6 +562,9 @@ why = "As the Debian builder's."
 # are here because `Remove::remove_lock` was a public boolean with no flag and
 # nothing recorded that it had none, which is the gap this file exists to close.
 
+# `Remove::overlay_upper` is a second constructor rather than a setting, so it
+# is not recorded: `fcage --remove-overlay-upper` selects it in place of
+# `--remove-rootfs`.
 [[builder]]
 name = "Remove"
 path = "ferroday_cage::provision::Remove"
@@ -576,11 +581,6 @@ why = "A mapper is a trait object."
 [[builder.setting]]
 name = "remove_lock"
 flags = ["--keep-lock"]
-
-[[builder.setting]]
-name = "overlay_upper"
-flags = ["--remove-overlay-upper"]
-why = "A second constructor rather than a setting: the removal of an overlay upper together with the work directory the library manages beside it, which the removal mode selects in place of `--remove-rootfs`."
 
 [[builder]]
 name = "Export"
@@ -624,3 +624,254 @@ why = "A mapper is a trait object."
 [[builder]]
 name = "Tarball"
 path = "ferroday_cage::provision::Tarball"
+
+# The values the launch builder takes. Each is configured by settings of its
+# own before it is handed over, and `fcage` spells those inside the flag that
+# hands it over.
+[[builder]]
+name = "Overlay"
+path = "ferroday_cage::Overlay"
+
+[[builder.setting]]
+name = "lower"
+flags = ["--overlay-lower"]
+
+[[builder.setting]]
+name = "upper"
+flags = ["--overlay-upper"]
+
+[[builder.setting]]
+name = "work"
+flags = ["--overlay-work"]
+
+[[builder]]
+name = "Bind"
+path = "ferroday_cage::Bind"
+
+[[builder.setting]]
+name = "read_only"
+flags = ["--bind", "--ro-bind"]
+why = "Each flag is one of the two values."
+
+[[builder]]
+name = "RawMount"
+path = "ferroday_cage::RawMount"
+
+[[builder.setting]]
+name = "source"
+flags = ["--raw-mount"]
+why = "The `source=` field of the flag's specification."
+
+[[builder.setting]]
+name = "fstype"
+flags = ["--raw-mount"]
+why = "The `fstype=` field of the flag's specification."
+
+[[builder.setting]]
+name = "flags"
+flags = ["--raw-mount"]
+why = "The `flags=` field of the flag's specification."
+
+[[builder.setting]]
+name = "data"
+flags = ["--raw-mount"]
+why = "The `data=` field of the flag's specification."
+
+[[builder]]
+name = "Identity"
+path = "ferroday_cage::Identity"
+
+[[builder.setting]]
+name = "groups"
+flags = ["--run-as"]
+why = "The supplementary groups after the second colon of `UID:GID[:G,...]`."
+
+[[builder]]
+name = "SeccompRules"
+path = "ferroday_cage::SeccompRules"
+
+[[builder.setting]]
+name = "rule"
+flags = ["--seccomp-allow-rule", "--seccomp-deny-rule"]
+
+[[builder.setting]]
+name = "errno_for"
+flags = ["--seccomp-errno"]
+
+[[builder.setting]]
+name = "default_action"
+kind = "library"
+why = "`fcage` builds each policy with its posture's own actions: an allowlist refuses what it does not name, and a denylist what it names, each with `EPERM`. A flag naming an action, such as killing the command instead, would have to come first."
+
+[[builder.setting]]
+name = "listed_action"
+kind = "library"
+why = "As `default_action`: the listed syscalls take the posture's own action."
+
+[[builder]]
+name = "Terminal"
+path = "ferroday_cage::Terminal"
+
+[[builder.setting]]
+name = "size"
+kind = "positional"
+why = "Read from the terminal `fcage` runs in when `--terminal` asks for one, which is where a shell keeps it."
+
+[[builder]]
+name = "Relay"
+path = "ferroday_cage::relay::Relay"
+
+[[builder.setting]]
+name = "escalation"
+flags = ["--timeout", "--kill-after"]
+why = "The two flags are the escalation's deadline and its grace period."
+
+[[builder.setting]]
+name = "raw"
+kind = "positional"
+why = "Raw mode follows whether `fcage`'s own standard input is a terminal, which the shell decides."
+
+# The provisioners' own collaborators.
+[[builder]]
+name = "debian::RepositoryBuilder"
+path = "ferroday_cage::provision::debian::RepositoryBuilder"
+
+[[builder.setting]]
+name = "mirror"
+flags = ["--debian-repository"]
+why = "The `mirror=` field of the flag's specification."
+
+[[builder.setting]]
+name = "mirror_fallback"
+flags = ["--debian-repository"]
+why = "The `mirror-fallback=` field, repeatable."
+
+[[builder.setting]]
+name = "components"
+flags = ["--debian-repository"]
+why = "The `components=` field."
+
+[[builder.setting]]
+name = "keyring"
+flags = ["--debian-repository"]
+why = "The `keyring=` field."
+
+[[builder.setting]]
+name = "name"
+flags = ["--debian-repository"]
+why = "The `name=` field."
+
+[[builder.setting]]
+name = "trust_unsigned"
+flags = ["--debian-repository"]
+why = "The bare `trust-unsigned` field."
+
+[[builder.setting]]
+name = "allow_stale_release"
+flags = ["--debian-repository"]
+why = "The bare `allow-stale-release` field."
+
+[[builder]]
+name = "alpine::RepositoryBuilder"
+path = "ferroday_cage::provision::alpine::RepositoryBuilder"
+
+[[builder.setting]]
+name = "mirror"
+flags = ["--alpine-repository"]
+why = "The `mirror=` field of the flag's specification."
+
+[[builder.setting]]
+name = "mirror_fallback"
+flags = ["--alpine-repository"]
+why = "The `mirror-fallback=` field, repeatable."
+
+[[builder.setting]]
+name = "components"
+flags = ["--alpine-repository"]
+why = "The `components=` field."
+
+[[builder.setting]]
+name = "keys"
+flags = ["--alpine-repository"]
+why = "The `keys=` field."
+
+[[builder]]
+name = "Pool"
+path = "ferroday_cage::provision::debian::Pool"
+
+[[builder.setting]]
+name = "suite"
+kind = "library"
+why = "`fcage` writes no local repository. A pool is published by a program that builds packages, and the tool would need a command that publishes `.deb` files first."
+
+[[builder.setting]]
+name = "component"
+kind = "library"
+why = "As `suite`."
+
+[[builder.setting]]
+name = "architecture"
+kind = "library"
+why = "As `suite`."
+
+[[builder.setting]]
+name = "origin"
+kind = "library"
+why = "As `suite`."
+
+[[builder.setting]]
+name = "label"
+kind = "library"
+why = "As `suite`."
+
+[[builder.setting]]
+name = "description"
+kind = "library"
+why = "As `suite`."
+
+[[builder.setting]]
+name = "date"
+kind = "library"
+why = "As `suite`."
+
+[[builder]]
+name = "HttpFetch"
+path = "ferroday_cage::provision::HttpFetch"
+
+[[builder.setting]]
+name = "concurrency"
+kind = "library"
+why = "Each provisioner fetches through its default transport. Tuning the transport would need flags of its own first, shared by the three provisioners."
+
+[[builder.setting]]
+name = "cross_host_redirects"
+kind = "library"
+why = "As `concurrency`."
+
+[[builder.setting]]
+name = "request_timeout"
+kind = "library"
+why = "As `concurrency`."
+
+[[builder.setting]]
+name = "timeouts"
+kind = "library"
+why = "As `concurrency`."
+
+[[builder]]
+name = "FetchRequest"
+path = "ferroday_cage::provision::FetchRequest"
+
+[[builder.setting]]
+name = "sized"
+kind = "code"
+why = "A request is built by a provisioner and handed to a `Fetch` implementation, which is code. No command line constructs one."
+
+[[builder]]
+name = "Provision"
+path = "ferroday_cage::provision::Provision"
+
+[[builder.setting]]
+name = "observe"
+kind = "code"
+why = "An observer is a trait object."

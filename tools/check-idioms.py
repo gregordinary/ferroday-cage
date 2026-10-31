@@ -23,9 +23,10 @@ consumer's code exactly as one in `src` would, and it is the tree a reviewer is
 least likely to read twice. Integration tests are not scanned: a test's numbers
 and paths are its own literals rather than a caller's, so the shapes these
 idioms name are usually not the hazard they name, and the test conventions
-belong to `CONTRIBUTING.md`. Within a file only code counts: a trailing
-`#[cfg(test)]` module and every comment line are cut first, so a test
-constructing the shape under test and a comment naming it are not sites.
+belong to `CONTRIBUTING.md`. Within a file only code counts: every test-only
+item and every comment are cut first, so a test constructing the shape under
+test and a comment naming it are not sites. `tools/rust_source.py` is that
+reading, shared with `tools/check-seam.py`.
 
 Usage:
 
@@ -41,18 +42,12 @@ import sys
 import tomllib
 from pathlib import Path
 
+# The shared reader sits beside this script; a run leaves no bytecode behind it.
+sys.dont_write_bytecode = True
+from rust_source import code  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 INVENTORY = REPO / "tools" / "idioms.toml"
-
-
-def code(path: Path) -> str:
-    """The file's own code: no trailing test module, no comment lines."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    for index, line in enumerate(lines):
-        if line.startswith(("#[cfg(test)]", "#[cfg(all(test")):
-            lines = lines[:index]
-            break
-    return "\n".join(line for line in lines if not line.lstrip().startswith("//"))
 
 
 TREES = ("src", "examples")

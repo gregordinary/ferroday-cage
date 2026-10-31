@@ -7,6 +7,14 @@
 //! no delegate is available, as the network-stack tests do for
 //! `/dev/net/tun`; the nested direct-tier test additionally needs a host
 //! `unshare` that can establish a subordinate-backed namespace to nest in.
+//!
+//! Every range-map skip here goes through `require::SUBID`, whatever its
+//! cause: no delegate at all, an allocation the files do not state, one too
+//! small to carry the map a test needs, or a util-linux without `--map-users`.
+//! `FERRODAY_CAGE_REQUIRE_SUBID` turns each of them into a failure, not only
+//! the first: a runner whose allocation is a single 65536-id block satisfies
+//! the delegate check and still cannot nest, so gating only that one would let
+//! tests quietly stop running while the guarded run stayed green.
 
 mod common;
 
@@ -21,38 +29,6 @@ use ferroday_cage::{IdRange, Identity, IdentityMap};
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
 fn rootfs() -> Option<&'static Path> {
     common::fixture_rootfs()
-}
-
-/// Reports an explicit skip on stderr, or fails when the environment demands
-/// the test runs.
-///
-/// Every skip in this file is a property of the host's subordinate-id setup or
-/// of its `unshare(1)`: no delegate at all, an allocation the files do not
-/// state, one too small to carry the map a test needs, or a util-linux without
-/// `--map-users`. `FERRODAY_CAGE_REQUIRE_SUBID` turns each of them into a
-/// failure, not only the first: a runner whose allocation is a single
-/// 65536-id block satisfies the delegate check and still cannot nest, so
-/// gating only that one would let tests quietly stop running while the
-/// guarded run stayed green.
-#[cfg(feature = "subid")]
-fn skip(reason: &str) {
-    assert!(
-        std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
-        "range maps are required but this test cannot run here: {reason}"
-    );
-    eprintln!("skipping: {reason}");
-}
-
-/// Skips a range-map test when no delegate can establish one on this host.
-#[cfg(feature = "subid")]
-fn range_map_available() -> bool {
-    match ferroday_cage::host::range_map_blocker() {
-        None => true,
-        Some(blocker) => {
-            skip(&format!("no delegate can establish a range map: {blocker}"));
-            false
-        }
-    }
 }
 
 /// The size of the caller's subordinate uid allocation, when `/etc/subuid`
@@ -131,7 +107,7 @@ fn the_single_map_cannot_chown_to_another_id() {
 #[test]
 fn a_range_map_makes_chown_to_a_nonroot_id_real() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -160,7 +136,7 @@ fn a_range_map_makes_chown_to_a_nonroot_id_real() {
 #[test]
 fn ids_outside_the_allocation_stay_unrepresentable() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -185,7 +161,7 @@ fn ids_outside_the_allocation_stay_unrepresentable() {
 #[test]
 fn run_as_is_the_identity_the_command_observes() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -217,7 +193,7 @@ fn run_as_is_the_identity_the_command_observes() {
 #[test]
 fn a_delegated_nested_map_reflects_the_sandbox_map() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -263,7 +239,7 @@ fn a_delegated_nested_map_reflects_the_sandbox_map() {
 #[test]
 fn a_delegated_nested_map_locks_a_read_only_bind() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let host_dir = common::scratch_dir("ro-bind-locked-ranged");
@@ -296,7 +272,7 @@ fn a_delegated_nested_map_locks_a_read_only_bind() {
 #[test]
 fn a_delegated_nested_map_works_without_a_pid_namespace() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -334,7 +310,7 @@ fn a_set_user_id_binary_in_the_rootfs_confers_nothing() {
     let Some(rootfs) = common::scratch_rootfs("nosuid-rootfs") else {
         return;
     };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     // The binary is owned by a mapped non-root id, which only a process inside
@@ -403,7 +379,9 @@ fn a_command_that_dies_before_the_gate_does_not_hang_the_delegate() {
         .maximum
         .unwrap_or(u64::MAX);
     if hard == u64::MAX {
-        eprintln!("skipping: the caller's file-descriptor hard limit is already unlimited");
+        common::require::premise_unmet(
+            "the caller's file-descriptor hard limit is already unlimited",
+        );
         return;
     }
     let err = Cage::builder()
@@ -436,7 +414,7 @@ fn a_command_that_dies_before_the_gate_does_not_hang_the_delegate() {
 #[test]
 fn run_as_cannot_write_what_root_owns() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -466,7 +444,7 @@ fn run_as_cannot_write_what_root_owns() {
 #[test]
 fn run_as_without_kept_caps_holds_no_capabilities() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -504,7 +482,7 @@ fn run_as_without_kept_caps_holds_no_capabilities() {
 #[test]
 fn run_as_alone_sets_no_new_privileges() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -559,7 +537,7 @@ fn a_kept_capability_survives_the_identity_switch() {
     use ferroday_cage::Capability;
 
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let cage = Cage::builder()
@@ -605,21 +583,21 @@ fn a_kept_capability_survives_the_identity_switch() {
 #[test]
 fn an_explicit_range_request_launches() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let (Some((uid_start, uid_count)), Some((gid_start, gid_count))) = (
         subordinate_allocation("/etc/subuid"),
         subordinate_allocation("/etc/subgid"),
     ) else {
-        skip("the subordinate allocation is not stated in the files");
+        common::require::SUBID.skip("the subordinate allocation is not stated in the files");
         return;
     };
     // Inside id 0 is the caller, as every map must have; inside 1 onward covers
     // the allocation, far enough to hold the id the chown below names.
     let span = 1_000.min(uid_count).min(gid_count);
     if span <= 250 {
-        skip("the subordinate allocation is too small to map id 250");
+        common::require::SUBID.skip("the subordinate allocation is too small to map id 250");
         return;
     }
     let uid = vec![
@@ -669,7 +647,7 @@ fn an_explicit_range_request_launches() {
 #[test]
 fn an_out_of_allocation_range_request_is_refused() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     // The top of the id space: no subordinate allocation reaches it, and no
@@ -716,19 +694,12 @@ fn an_out_of_allocation_range_request_is_refused() {
 #[test]
 fn provision_remove_deletes_a_subordinate_owned_tree() {
     let Some(rootfs) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
 
     // A host directory the sandbox fills with subordinate-owned content.
-    let scratch = std::env::temp_dir().join(format!(
-        "ferroday-cage-identity-remove-{}",
-        std::process::id()
-    ));
-    // A previous run's tree holds subordinate-owned entries too.
-    let _ = ferroday_cage::provision::Remove::new(&scratch)
-        .remove_lock(false)
-        .run();
+    let scratch = common::ranged_scratch("identity-remove");
     let tree = scratch.join("tree");
     std::fs::create_dir_all(&tree).expect("the scratch tree is created");
 
@@ -752,12 +723,12 @@ fn provision_remove_deletes_a_subordinate_owned_tree() {
 
     // The plain caller is refused; the library's removal is not.
     #[expect(clippy::disallowed_methods)]
-    let plain = std::fs::remove_dir_all(&scratch);
+    let plain = std::fs::remove_dir_all(&*scratch);
     assert!(
         plain.is_err(),
         "a subordinate-owned tree resists plain removal"
     );
-    ferroday_cage::provision::remove(&scratch).expect("the map-assisted removal succeeds");
+    ferroday_cage::provision::remove(&*scratch).expect("the map-assisted removal succeeds");
     assert!(!scratch.exists());
 }
 
@@ -811,7 +782,7 @@ fn a_nested_cage_writes_its_own_range_map() {
     }
 
     let Some(_) = rootfs() else { return };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
 
@@ -827,7 +798,8 @@ fn a_nested_cage_writes_its_own_range_map() {
     // The inner run maps 65535 ids above root, so an allocation known to be
     // smaller cannot carry it and the test says so rather than failing.
     if subordinate_uid_count().is_some_and(|count| count < 65536) {
-        skip("the caller's subordinate allocation is too small to nest inside");
+        common::require::SUBID
+            .skip("the caller's subordinate allocation is too small to nest inside");
         return;
     }
     let exe = std::env::current_exe().expect("the test binary path");
@@ -847,7 +819,7 @@ fn a_nested_cage_writes_its_own_range_map() {
     let output = match output {
         Ok(output) => output,
         Err(err) => {
-            skip(&format!("the host unshare could not run: {err}"));
+            common::require::SUBID.skip(format!("the host unshare could not run: {err}"));
             return;
         }
     };
@@ -856,7 +828,7 @@ fn a_nested_cage_writes_its_own_range_map() {
         // An old util-linux without --map-users is a skip; an assertion
         // failure inside the nested run is a real failure.
         if stderr.contains("unrecognized option") || stderr.contains("bad usage") {
-            skip("the host unshare does not support --map-users");
+            common::require::SUBID.skip("the host unshare does not support --map-users");
             return;
         }
         panic!(

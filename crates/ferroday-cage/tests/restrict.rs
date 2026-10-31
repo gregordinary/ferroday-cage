@@ -18,41 +18,6 @@ use ferroday_cage::{
     SeccompArg, SeccompPolicy, SeccompRules, SetupStep, Stdio, Terminal,
 };
 
-/// Skips a Landlock test when the kernel offers no Landlock LSM.
-///
-/// The skip is explicit, and `FERRODAY_CAGE_REQUIRE_LANDLOCK` turns it into a
-/// failure so CI can assert the Landlock enforcement tests actually ran.
-fn landlock_supported() -> bool {
-    match ferroday_cage::host::landlock_abi() {
-        Some(_) => true,
-        None => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
-                "Landlock is required but the kernel offers none",
-            );
-            eprintln!("skipping: the kernel offers no Landlock support");
-            false
-        }
-    }
-}
-
-/// Skips a seccomp test when the kernel offers no seccomp filtering.
-///
-/// The skip is explicit, and `FERRODAY_CAGE_REQUIRE_SECCOMP` turns it into a
-/// failure so CI can assert the seccomp enforcement tests actually ran.
-fn seccomp_supported() -> bool {
-    if ferroday_cage::host::seccomp_available() {
-        true
-    } else {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_SECCOMP").is_none(),
-            "seccomp is required but the kernel offers none",
-        );
-        eprintln!("skipping: the kernel offers no seccomp support");
-        false
-    }
-}
-
 /// Adds the grants that make a dynamically linked host binary runnable:
 /// read and execute beneath the standard system trees, granting only the
 /// ones this host has.
@@ -67,7 +32,7 @@ fn grant_system_trees(mut builder: RestrictionBuilder) -> RestrictionBuilder {
 
 #[test]
 fn a_directory_on_a_standard_stream_is_refused() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // A restriction swaps no root, but a directory descriptor still hands the
@@ -89,7 +54,7 @@ fn a_directory_on_a_standard_stream_is_refused() {
 
 #[test]
 fn landlock_allows_a_granted_path_and_denies_the_rest() {
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     let granted = scratch("restrict-granted");
@@ -129,25 +94,9 @@ fn landlock_allows_a_granted_path_and_denies_the_rest() {
     );
 }
 
-/// Skips a Landlock network test when the kernel's ABI predates network
-/// rights, which arrived in ABI 4.
-fn landlock_net_supported() -> bool {
-    match ferroday_cage::host::landlock_abi() {
-        Some(abi) if abi >= 4 => true,
-        _ => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK_NET").is_none(),
-                "Landlock network rights are required but the kernel offers none",
-            );
-            eprintln!("skipping: the kernel's Landlock ABI predates network rights");
-            false
-        }
-    }
-}
-
 #[test]
 fn landlock_net_gates_a_tcp_connection() {
-    if !landlock_supported() || !landlock_net_supported() {
+    if !common::landlock_net() {
         return;
     }
     // A host listener the command is asked to reach. The port is granted in
@@ -164,7 +113,7 @@ fn landlock_net_gates_a_tcp_connection() {
         .into_iter()
         .find(|path| Path::new(path).exists())
     else {
-        eprintln!("skipping: no nc on this host to make the connection with");
+        common::require::LANDLOCK.skip("no nc on this host to make the connection with");
         return;
     };
 
@@ -229,7 +178,7 @@ fn an_empty_landlock_grant_is_refused() {
 
 #[test]
 fn landlock_write_grant_gates_file_creation() {
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     let writable = scratch("restrict-writable");
@@ -270,7 +219,7 @@ fn landlock_write_grant_gates_file_creation() {
 
 #[test]
 fn curated_seccomp_allows_an_ordinary_command() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let status = Restriction::builder()
@@ -288,7 +237,7 @@ fn curated_seccomp_allows_an_ordinary_command() {
 
 #[test]
 fn a_denied_syscall_kills_the_command() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // Denying write with a process kill: the command dies with SIGSYS the
@@ -311,7 +260,7 @@ fn a_denied_syscall_kills_the_command() {
 
 #[test]
 fn an_argument_condition_kills_only_a_matching_call() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // Kill write only when its first argument, the file descriptor, is 1.
@@ -336,7 +285,7 @@ fn an_argument_condition_kills_only_a_matching_call() {
 
 #[test]
 fn an_argument_condition_spares_a_nonmatching_call() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // The same policy, but conditioned on descriptor 2. echo writes to
@@ -360,7 +309,7 @@ fn an_argument_condition_spares_a_nonmatching_call() {
 
 #[test]
 fn no_new_privileges_is_always_set() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // A seccomp-only restriction leaves the filesystem unrestricted, so the
@@ -386,7 +335,7 @@ fn no_new_privileges_is_always_set() {
 
 #[test]
 fn capabilities_are_dropped() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // A restriction always drops to the empty capability set. The command
@@ -425,7 +374,7 @@ fn capabilities_are_dropped() {
 
 #[test]
 fn the_environment_is_the_base_plus_overrides() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let output = Restriction::builder()
@@ -453,7 +402,7 @@ fn the_environment_is_the_base_plus_overrides() {
 
 #[test]
 fn the_working_directory_applies() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let output = Restriction::builder()
@@ -470,7 +419,7 @@ fn the_working_directory_applies() {
 
 #[test]
 fn the_working_directory_defaults_to_the_root() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // The default is `/`, not whatever directory the caller happened to be in:
@@ -490,7 +439,7 @@ fn the_working_directory_defaults_to_the_root() {
 
 #[test]
 fn the_handle_kills_a_running_command() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let restriction = Restriction::builder()
@@ -514,7 +463,7 @@ fn the_handle_kills_a_running_command() {
 
 #[test]
 fn landlock_grants_a_single_file_and_a_device_node() {
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     // A grant on a file and a grant on a device node, rather than on the
@@ -551,7 +500,7 @@ fn landlock_grants_a_single_file_and_a_device_node() {
 
 #[test]
 fn a_landlock_rule_that_fails_names_its_grant() {
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     // Nothing checks a grant's path at build, so a missing one fails the launch.
@@ -582,22 +531,6 @@ fn a_landlock_rule_that_fails_names_its_grant() {
     }
 }
 
-/// Skips a Landlock scope test when the kernel's Landlock ABI predates scopes,
-/// which arrive in ABI 6.
-fn landlock_scope_supported() -> bool {
-    match ferroday_cage::host::landlock_abi() {
-        Some(abi) if abi >= 6 => true,
-        abi => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE").is_none(),
-                "Landlock scopes are required but the kernel's ABI is {abi:?} (needs 6)",
-            );
-            eprintln!("skipping: Landlock ABI {abi:?} predates scopes (needs 6)");
-            false
-        }
-    }
-}
-
 /// Runs `script` under `/bin/sh` in a restriction confined by the curated
 /// seccomp policy alone, with `scopes` in place of the default, and reports
 /// whether it succeeded.
@@ -623,7 +556,7 @@ fn run_scoped(script: &str, scopes: Option<&[LandlockScope]>) -> bool {
 
 #[test]
 fn a_restriction_cannot_signal_a_process_outside_it() {
-    if !seccomp_supported() || !landlock_scope_supported() {
+    if !common::seccomp() || !common::landlock_scope() {
         return;
     }
     // A restriction shares the host's PID space and runs as the calling user,
@@ -648,14 +581,14 @@ fn a_restriction_cannot_signal_a_process_outside_it() {
 
 #[test]
 fn a_restriction_cannot_reach_an_abstract_socket_outside_it() {
-    if !seccomp_supported() || !landlock_scope_supported() {
+    if !common::seccomp() || !common::landlock_scope() {
         return;
     }
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
         .into_iter()
         .find(|path| Path::new(path).exists())
     else {
-        eprintln!("skipping: no python3 on this host to make the connection with");
+        common::require::LANDLOCK_SCOPE.skip("no python3 on this host to make the connection with");
         return;
     };
     // An abstract socket belongs to the network namespace, not the filesystem,
@@ -682,7 +615,7 @@ fn a_restriction_cannot_reach_an_abstract_socket_outside_it() {
 
 #[test]
 fn a_scoped_restriction_cannot_read_an_outside_process_environment() {
-    if !seccomp_supported() || !landlock_scope_supported() {
+    if !common::seccomp() || !common::landlock_scope() {
         return;
     }
     // Any Landlock domain refuses the ptrace access checks on a process outside
@@ -701,14 +634,14 @@ fn a_scoped_restriction_cannot_read_an_outside_process_environment() {
 
 #[test]
 fn a_syscall_answered_with_its_own_errno_reports_it() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
         .into_iter()
         .find(|path| Path::new(path).exists())
     else {
-        eprintln!("skipping: no python3 on this host to make the calls with");
+        common::require::SECCOMP.skip("no python3 on this host to make the calls with");
         return;
     };
     // `clone3` answered `ENOSYS` beside a denylist whose listed action is
@@ -748,7 +681,7 @@ fn a_syscall_answered_with_its_own_errno_reports_it() {
 
 #[test]
 fn a_missing_command_is_an_exec_setup_error() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let result = Restriction::builder()
@@ -765,7 +698,7 @@ fn a_missing_command_is_an_exec_setup_error() {
 
 #[test]
 fn a_restriction_directs_its_output_streams() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // A restriction's command inherits the caller's descriptors exactly as a
@@ -778,7 +711,7 @@ fn a_restriction_directs_its_output_streams() {
         .into_iter()
         .find(|path| Path::new(path).exists())
     else {
-        eprintln!("skipping: no shell on this host");
+        common::require::SECCOMP.skip("no shell on this host");
         return;
     };
     let (mut reader, writer) = std::io::pipe().expect("a pipe");
@@ -818,7 +751,7 @@ fn a_restriction_directs_its_output_streams() {
 
 #[test]
 fn a_restriction_runs_on_a_terminal_of_its_own() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // A host-allocated pseudoterminal needs no devpts instance, so the fallback
@@ -830,7 +763,7 @@ fn a_restriction_runs_on_a_terminal_of_its_own() {
         .into_iter()
         .find(|path| Path::new(path).exists())
     else {
-        eprintln!("skipping: no shell on this host");
+        common::require::SECCOMP.skip("no shell on this host");
         return;
     };
     let restriction = grant_system_trees(Restriction::builder())
@@ -859,7 +792,7 @@ fn a_restriction_runs_on_a_terminal_of_its_own() {
 
 #[test]
 fn a_restricted_terminal_launch_is_refused_against_a_directed_stream() {
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let restriction = Restriction::builder()

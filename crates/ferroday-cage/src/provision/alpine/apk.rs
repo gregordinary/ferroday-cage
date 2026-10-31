@@ -627,26 +627,11 @@ mod tests {
     /// segment; what varies is only what the tar inside it holds.
     fn segment(members: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write;
-        let mut tar = Vec::new();
+        let mut tar = ferroday_cage_testkit::tar::Tar::new();
         for (name, data) in members {
-            tar.extend_from_slice(
-                &crate::provision::tar::ustar_block(
-                    name.as_bytes(),
-                    b"",
-                    0o644,
-                    0,
-                    0,
-                    data.len() as u64,
-                    0,
-                    b'0',
-                    b"",
-                )
-                .expect("the header fields fit"),
-            );
-            tar.extend_from_slice(data);
-            crate::provision::tar::pad(&mut tar, data.len() as u64).expect("padding a vector");
+            tar.file(name, 0o644, data);
         }
-        tar.extend_from_slice(&[0u8; 1024]);
+        let tar = tar.finish();
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&tar).expect("writing to a vector");

@@ -1,9 +1,9 @@
 //! Integration tests for the tarball provisioner: extraction semantics,
 //! compression handling, and containment against hostile archives.
 //!
-//! Archives are built byte-by-byte by the `TarBuilder` below, so the tests
-//! can produce entries no well-behaved tar tool writes — absolute paths,
-//! `..` components, links pointing out of the tree.
+//! Archives are built byte by byte by the testkit's `Tar`, so the tests can
+//! produce entries no well-behaved tar tool writes: absolute paths, `..`
+//! components, links pointing out of the tree.
 
 mod common;
 
@@ -11,192 +11,24 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use common::Tar;
 use ferroday_cage::provision::{
     Provision, ProvisionError, ProvisionEvent, ProvisionObserver, Provisioned, Tarball, ensure,
 };
 
-/// A byte-level tar writer for test archives.
-struct TarBuilder {
-    data: Vec<u8>,
-    /// Emit pre-POSIX v7 headers: everything past byte 257 left zero, so no
-    /// magic, no version, and no prefix field.
-    v7: bool,
+/// The modification time every entry the named builders append carries, so a
+/// test reading one back has a time that is not the epoch.
+const MTIME: u64 = 1_000_000_000;
+
+/// A tar stream whose entries carry [`MTIME`].
+fn archive() -> Tar {
+    Tar::new().stamped(MTIME)
 }
 
-impl TarBuilder {
-    fn new() -> Self {
-        TarBuilder {
-            data: Vec::new(),
-            v7: false,
-        }
-    }
-
-    /// The same writer emitting v7 headers, so one fixture can be produced in
-    /// both formats and the two trees compared.
-    fn v7() -> Self {
-        TarBuilder {
-            data: Vec::new(),
-            v7: true,
-        }
-    }
-
-    /// Appends a 512-byte header. `path` and `link` are written
-    /// verbatim, unvalidated — that is the point.
-    fn header(&mut self, path: &[u8], typeflag: u8, mode: u32, size: u64, mtime: u64, link: &[u8]) {
-        assert!(path.len() <= 100, "test paths fit the name field");
-        assert!(
-            link.len() <= 100,
-            "test link targets fit the linkname field"
-        );
-        let mut block = [0u8; 512];
-        block[..path.len()].copy_from_slice(path);
-        write_octal(&mut block[100..108], u64::from(mode));
-        write_octal(&mut block[108..116], 0); // uid
-        write_octal(&mut block[116..124], 0); // gid
-        write_octal(&mut block[124..136], size);
-        write_octal(&mut block[136..148], mtime);
-        block[156] = typeflag;
-        block[157..157 + link.len()].copy_from_slice(link);
-        if !self.v7 {
-            block[257..263].copy_from_slice(b"ustar\0");
-            block[263..265].copy_from_slice(b"00");
-        }
-        let checksum: u64 = block
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                if (148..156).contains(&i) {
-                    u64::from(b' ')
-                } else {
-                    u64::from(*b)
-                }
-            })
-            .sum();
-        write_octal(&mut block[148..156], checksum);
-        self.data.extend_from_slice(&block);
-    }
-
-    /// Appends `data` padded to the block boundary.
-    fn body(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
-        self.data.resize(self.data.len().next_multiple_of(512), 0);
-    }
-
-    fn file(&mut self, path: &str, mode: u32, content: &[u8]) -> &mut Self {
-        self.file_mtime(path, mode, content, 1_000_000_000)
-    }
-
-    fn file_mtime(&mut self, path: &str, mode: u32, content: &[u8], mtime: u64) -> &mut Self {
-        self.header(
-            path.as_bytes(),
-            b'0',
-            mode,
-            content.len() as u64,
-            mtime,
-            b"",
-        );
-        self.body(content);
-        self
-    }
-
-    fn dir(&mut self, path: &str, mode: u32) -> &mut Self {
-        self.header(path.as_bytes(), b'5', mode, 0, 1_000_000_000, b"");
-        self
-    }
-
-    fn symlink(&mut self, path: &str, target: &str) -> &mut Self {
-        self.header(
-            path.as_bytes(),
-            b'2',
-            0o777,
-            0,
-            1_000_000_000,
-            target.as_bytes(),
-        );
-        self
-    }
-
-    fn hardlink(&mut self, path: &str, target: &str) -> &mut Self {
-        self.header(
-            path.as_bytes(),
-            b'1',
-            0o644,
-            0,
-            1_000_000_000,
-            target.as_bytes(),
-        );
-        self
-    }
-
-    fn fifo(&mut self, path: &str, mode: u32) -> &mut Self {
-        self.header(path.as_bytes(), b'6', mode, 0, 1_000_000_000, b"");
-        self
-    }
-
-    fn char_device(&mut self, path: &str) -> &mut Self {
-        self.header(path.as_bytes(), b'3', 0o666, 0, 1_000_000_000, b"");
-        self
-    }
-
-    /// A GNU long-name entry followed by the entry it names.
-    fn gnu_longname_file(&mut self, path: &str, content: &[u8]) -> &mut Self {
-        self.header(b"././@LongLink", b'L', 0, path.len() as u64, 0, b"");
-        self.body(path.as_bytes());
-        self.header(
-            &path.as_bytes()[..path.len().min(100)],
-            b'0',
-            0o644,
-            content.len() as u64,
-            0,
-            b"",
-        );
-        self.body(content);
-        self
-    }
-
-    /// A pax `x` header followed by the entry it describes.
-    fn pax_file(&mut self, pax_path: &str, content: &[u8]) -> &mut Self {
-        let record = pax_record("path", pax_path);
-        self.header(b"pax-header", b'x', 0o644, record.len() as u64, 0, b"");
-        self.body(record.as_bytes());
-        self.header(
-            b"pax-placeholder",
-            b'0',
-            0o644,
-            content.len() as u64,
-            0,
-            b"",
-        );
-        self.body(content);
-        self
-    }
-
-    /// Ends the archive with the two-block terminator.
-    fn finish(&self) -> Vec<u8> {
-        let mut data = self.data.clone();
-        data.extend_from_slice(&[0u8; 1024]);
-        data
-    }
-}
-
-/// A pax record: `"%d key=value\n"` where the decimal length counts the
-/// whole record, its own digits included — a fixed point reached by
-/// iteration.
-fn pax_record(key: &str, value: &str) -> String {
-    let content = format!(" {key}={value}\n");
-    let mut length = content.len();
-    loop {
-        let total = length.to_string().len() + content.len();
-        if total == length {
-            break;
-        }
-        length = total;
-    }
-    format!("{length}{content}")
-}
-
-fn write_octal(field: &mut [u8], value: u64) {
-    ferroday_cage_testkit::tar::octal(field, value);
+/// The same, writing pre-POSIX v7 headers, so one fixture can be produced in
+/// both formats and the two trees compared.
+fn archive_v7() -> Tar {
+    Tar::new().v7().stamped(MTIME)
 }
 
 /// Writes `archive` to disk and provisions a rootfs from it, returning
@@ -240,7 +72,7 @@ fn mode_of(path: &Path) -> u32 {
 
 #[test]
 fn files_directories_and_modes_extract() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("./", 0o711)
         .dir("locked", 0o555)
         .file("locked/data", 0o640, b"inside a read-only directory")
@@ -268,7 +100,7 @@ fn files_directories_and_modes_extract() {
 
 #[test]
 fn mtimes_apply_to_files_and_directories() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("d", 0o755)
         .file_mtime("d/f", 0o644, b"content", 1_234_567_890);
     let rootfs = provision("extract-mtime", &tar.finish());
@@ -281,13 +113,13 @@ fn mtimes_apply_to_files_and_directories() {
     // written afterward: directory times are applied last.
     assert_eq!(
         fs::metadata(rootfs.join("d")).unwrap().mtime(),
-        1_000_000_000
+        MTIME as i64
     );
 }
 
 #[test]
 fn symlinks_store_targets_verbatim() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.symlink("absolute", "/usr/share/zoneinfo/UTC")
         .symlink("relative", "../sibling")
         .file("through/real", 0o644, b"x");
@@ -307,7 +139,7 @@ fn symlinks_store_targets_verbatim() {
 
 #[test]
 fn hardlinks_share_the_inode() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("original", 0o644, b"shared")
         .hardlink("copy", "original");
     let rootfs = provision("extract-hardlink", &tar.finish());
@@ -320,7 +152,7 @@ fn hardlinks_share_the_inode() {
 
 #[test]
 fn fifos_extract_devices_and_labels_skip() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("dev", 0o755)
         .char_device("dev/console")
         .fifo("pipe", 0o666)
@@ -342,7 +174,7 @@ fn fifos_extract_devices_and_labels_skip() {
 
 #[test]
 fn later_entries_replace_earlier_ones() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("x", 0o644, b"old")
         .file("x", 0o600, b"new")
         .symlink("y", "x")
@@ -366,7 +198,7 @@ fn a_file_entry_landing_on_a_non_empty_directory_is_an_error() {
     // cannot be removed, and extraction must say so rather than skip the entry
     // or leave a half-replaced tree: the two differ in what the finished rootfs
     // contains, and only one of them is reportable.
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("collide", 0o755)
         .file("collide/inside", 0o644, b"occupant")
         .file("collide", 0o644, b"now a file");
@@ -387,7 +219,7 @@ fn deferred_directory_metadata_does_not_follow_a_replacing_symlink() {
     // a symlink to another in-tree directory. Finalizing the recorded metadata
     // must not follow that symlink and stamp the archive's mode onto the
     // target: the leaf is no longer the directory it described.
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("target", 0o755)
         .file("target/keep", 0o644, b"untouched")
         .dir("d", 0o700)
@@ -409,7 +241,7 @@ fn deferred_directory_metadata_does_not_follow_a_replacing_symlink() {
 #[test]
 fn gnu_long_names_and_pax_paths_apply() {
     let long = format!("deep/{}/leaf", "x".repeat(120));
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.gnu_longname_file(&long, b"long-name content")
         .pax_file("pax/renamed", b"pax content");
     let rootfs = provision("extract-longname", &tar.finish());
@@ -427,7 +259,7 @@ fn gnu_long_names_and_pax_paths_apply() {
 fn merged_usr_style_symlink_traversal_extracts() {
     // A tarball from a merged-usr system: bin is a symlink to usr/bin,
     // and later entries pass through it. In-tree traversal must work.
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("usr", 0o755)
         .dir("usr/bin", 0o755)
         .symlink("bin", "usr/bin")
@@ -452,7 +284,7 @@ fn a_directory_entry_does_not_replace_a_merged_usr_alias() {
     // a real directory: the dynamic linker under `usr/lib` is reachable only as
     // `lib/...`, so clobbering the symlink orphans it and nothing dynamically
     // linked in the tree can start.
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("usr", 0o755)
         .dir("usr/lib", 0o755)
         .symlink("lib", "usr/lib")
@@ -486,7 +318,7 @@ fn a_directory_entry_replaces_a_symlink_to_a_nondirectory() {
     // The alias exception is precise: only a symlink resolving in-tree to a
     // directory is preserved. A symlink to a non-directory, or a dangling one,
     // is still replaced by a directory entry, per the tar supersede convention.
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("afile", 0o644, b"a regular file")
         .symlink("to_file", "afile") // resolves to a non-directory
         .symlink("dangling", "nowhere") // resolves to nothing
@@ -517,7 +349,7 @@ fn a_directory_entry_replaces_a_symlink_to_a_nondirectory() {
 fn gzip_xz_zstd_and_plain_all_extract() {
     use std::io::Write;
 
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("d", 0o755)
         .file("d/f", 0o644, b"compressed content");
     let plain = tar.finish();
@@ -557,7 +389,7 @@ fn a_damaged_check_after_the_archive_ends_is_refused() {
     // what makes it the case only the check can catch.
     use std::io::Write;
 
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("f", 0o644, b"the last file in the archive");
     let plain = tar.finish();
 
@@ -609,7 +441,7 @@ fn record_padding_after_the_archive_is_read_past_but_more_is_refused() {
         gz.write_all(bytes).unwrap();
         gz.finish().unwrap()
     };
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("f", 0o644, b"content");
 
     let mut padded = tar.finish();
@@ -631,7 +463,7 @@ fn record_padding_after_the_archive_is_read_past_but_more_is_refused() {
 /// A file, a nested directory with a file under it, and a symlink: enough that
 /// the two formats' trees can differ if the v7 path reads any field wrong, and
 /// nothing that only ustar can express.
-fn v7_comparable_fixture(tar: &mut TarBuilder) {
+fn v7_comparable_fixture(tar: &mut Tar) {
     tar.dir("nested", 0o755)
         .file("nested/data", 0o640, b"under a directory")
         .file("top", 0o644, b"at the root")
@@ -644,9 +476,9 @@ fn a_v7_archive_extracts_the_tree_a_ustar_one_does() {
     // it lacks is everything after them. So the same fixture in both formats
     // has to produce the same tree, byte for byte and mode for mode -- that is
     // the whole claim the format support makes.
-    let mut ustar = TarBuilder::new();
+    let mut ustar = archive();
     v7_comparable_fixture(&mut ustar);
-    let mut old = TarBuilder::v7();
+    let mut old = archive_v7();
     v7_comparable_fixture(&mut old);
 
     let from_ustar = provision("extract-v7-control", &ustar.finish());
@@ -721,8 +553,8 @@ fn a_v7_directory_marked_only_by_a_trailing_slash_extracts_as_one() {
     // An archive old enough to be v7 is old enough to have been written by
     // something that did not set the typeflag reliably, and the convention it
     // used instead was a trailing separator on the name.
-    let mut tar = TarBuilder::v7();
-    tar.header(b"olddir/", b'0', 0o755, 0, 1_000_000_000, b"");
+    let mut tar = archive_v7();
+    tar.header(b"olddir/", b'0', 0o755, 0, MTIME, b"");
     tar.file("olddir/inside", 0o644, b"beneath a slash-marked directory");
     let rootfs = provision("extract-v7-trailing-slash", &tar.finish());
 
@@ -737,13 +569,13 @@ fn a_v7_directory_marked_only_by_a_trailing_slash_extracts_as_one() {
 fn a_v7_entry_is_held_to_the_same_containment_rules() {
     // The rules are properties of the resolved path, not of the header format,
     // so accepting a new format must not open a new way through them.
-    let mut absolute = TarBuilder::v7();
+    let mut absolute = archive_v7();
     absolute.file("/etc/evil-v7", 0o644, b"outside");
     let err = provision_err("attack-v7-absolute", &absolute.finish());
     assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
     assert!(!Path::new("/etc/evil-v7").exists());
 
-    let mut dotdot = TarBuilder::v7();
+    let mut dotdot = archive_v7();
     dotdot.file("../escapee-v7", 0o644, b"outside");
     let (err, dest) = provision_err_at("attack-v7-dotdot", &dotdot.finish());
     assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
@@ -754,7 +586,7 @@ fn a_v7_entry_is_held_to_the_same_containment_rules() {
     // out names the root's own `outside`, which this archive never made: the
     // entry beneath it is refused as one beneath any dangling link is, and
     // nothing lands outside.
-    let mut escape = TarBuilder::v7();
+    let mut escape = archive_v7();
     escape
         .symlink("esc", "../../outside")
         .file("esc/pwn", 0o644, b"escaped");
@@ -770,7 +602,7 @@ fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
     // that ships `foo` as a file and `foo/bar` after it is an ordinary malformed
     // archive, and so is a symlink entry with no target; neither tried to escape
     // anything, and both are refused as what they are.
-    let mut through_a_file = TarBuilder::new();
+    let mut through_a_file = archive();
     through_a_file
         .file("foo", 0o644, b"a file, not a directory")
         .file("foo/bar", 0o644, b"beneath it");
@@ -781,7 +613,7 @@ fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
         "the reason is carried through: {err}",
     );
 
-    let mut empty_target = TarBuilder::new();
+    let mut empty_target = archive();
     empty_target.symlink("link", "");
     let err = provision_err("malformed-empty-symlink", &empty_target.finish());
     assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
@@ -851,7 +683,7 @@ fn a_terminated_empty_archive_publishes_an_empty_rootfs() {
 
 #[test]
 fn truncation_is_reported_as_malformed() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("f", 0o644, b"some content");
     let mut bytes = tar.finish();
     bytes.truncate(600); // inside f's data block
@@ -861,7 +693,7 @@ fn truncation_is_reported_as_malformed() {
 
 #[test]
 fn sparse_entries_are_unsupported() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.header(b"sparse-file", b'S', 0o644, 0, 0, b"");
     let err = provision_err("extract-sparse", &tar.finish());
     assert!(
@@ -875,8 +707,8 @@ fn pax_overflowing_sizes_are_rejected() {
     // A pax size in the top block-sized band of the u64 range has no
     // representable block-padded length; the parser must reject it as a
     // malformed archive rather than overflow.
-    let record = pax_record("size", &u64::MAX.to_string());
-    let mut tar = TarBuilder::new();
+    let record = ferroday_cage_testkit::tar::pax_record("size", &u64::MAX.to_string());
+    let mut tar = archive();
     tar.header(b"pax-header", b'x', 0o644, record.len() as u64, 0, b"");
     tar.body(record.as_bytes());
     tar.header(b"victim", b'0', 0o644, 0, 0, b"");
@@ -886,7 +718,7 @@ fn pax_overflowing_sizes_are_rejected() {
 
 #[test]
 fn dotdot_paths_are_rejected() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("../escapee", 0o644, b"outside");
     let (err, dest) = provision_err_at("attack-dotdot", &tar.finish());
     assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
@@ -900,7 +732,7 @@ fn dotdot_paths_are_rejected() {
 
 #[test]
 fn absolute_paths_are_rejected() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("/etc/evil", 0o644, b"outside");
     let err = provision_err("attack-absolute", &tar.finish());
     assert!(matches!(err, ProvisionError::EntryUnsafe { .. }), "{err}");
@@ -914,7 +746,7 @@ fn writes_through_links_naming_host_paths_stay_in_the_root() {
     // root filesystem resolves it, inside the root, so the write lands in the
     // root's own path of that name, or is refused where the root holds none.
     for (name, target) in [("relative", "../../outside"), ("absolute", "/tmp")] {
-        let mut tar = TarBuilder::new();
+        let mut tar = archive();
         tar.symlink("esc", target)
             .file("esc/pwn", 0o644, b"escaped");
         let (err, dest) = provision_err_at(&format!("attack-symlink-{name}"), &tar.finish());
@@ -928,7 +760,7 @@ fn writes_through_links_naming_host_paths_stay_in_the_root() {
 
     // An absolute link to a directory the root holds is a link of the root,
     // and the write goes where the root itself would put it.
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("tmp", 0o1777)
         .symlink("esc", "/tmp")
         .file("esc/pwn", 0o644, b"in the root");
@@ -940,7 +772,7 @@ fn writes_through_links_naming_host_paths_stay_in_the_root() {
 #[test]
 fn escaping_hardlink_targets_are_rejected() {
     for (name, target) in [("dotdot", "../outside-file"), ("absolute", "/etc/passwd")] {
-        let mut tar = TarBuilder::new();
+        let mut tar = archive();
         tar.hardlink("grab", target);
         let err = provision_err(&format!("attack-hardlink-{name}"), &tar.finish());
         assert!(
@@ -956,11 +788,11 @@ fn hardlinks_resolved_through_links_to_host_paths_stay_in_the_root() {
     // the target resolves inside the root, so it names the root's own
     // `etc/passwd`, never the host's. An archive that never made one has
     // nothing there to link to.
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.symlink("esc", "/etc").hardlink("grab", "esc/passwd");
     provision_err("attack-hardlink-symlink", &tar.finish());
 
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("etc", 0o755)
         .file("etc/passwd", 0o644, b"root:x:0:0::/root:/bin/sh\n")
         .symlink("esc", "/etc")
@@ -993,7 +825,7 @@ fn provisioned_rootfs_runs_in_a_sandbox() {
     let loader_bytes = fs::read(loader.path()).unwrap();
     let loader_path = format!("lib/{}", loader.file_name().to_string_lossy());
 
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.dir("bin", 0o755).dir("lib", 0o755);
     tar.header(b"bin/busybox", b'0', 0o755, busybox.len() as u64, 0, b"");
     tar.body(&busybox);
@@ -1015,29 +847,21 @@ fn provisioned_rootfs_runs_in_a_sandbox() {
     let rootfs = dir.join("rootfs");
     ensure(&rootfs, &mut Tarball::new(&tarball)).unwrap();
 
-    let mut output = Vec::new();
-    struct Collect<'a>(&'a mut Vec<u8>);
-    impl ferroday_cage::Observer for Collect<'_> {
-        fn stdout(&mut self, chunk: &[u8]) {
-            self.0.extend_from_slice(chunk);
-        }
-    }
-    let mut observer = Collect(&mut output);
-    let status = ferroday_cage::Cage::builder()
+    let output = ferroday_cage::Cage::builder()
         .rootfs(&rootfs)
         .command("/bin/cat")
         .args(["/etc/greeting"])
         .build()
         .unwrap()
-        .run_with(&mut observer)
+        .output()
         .unwrap();
-    assert!(status.success());
-    assert_eq!(output, b"hello from a provisioned rootfs\n");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"hello from a provisioned rootfs\n");
 }
 
 #[test]
 fn extraction_reports_entries_and_byte_progress() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("./etc/hostname", 0o644, b"cage\n")
         .dir("./usr/", 0o755)
         .file("./usr/marker", 0o600, b"x");
@@ -1090,7 +914,7 @@ fn extraction_reports_entries_and_byte_progress() {
 
 #[test]
 fn a_cancelled_extraction_leaves_no_destination() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("./first", 0o644, b"a")
         .file("./second", 0o644, b"b");
     let archive = tar.finish();
@@ -1134,7 +958,7 @@ fn a_cancelled_extraction_leaves_no_destination() {
 
 #[test]
 fn a_tarball_extracts_from_a_reader() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("./etc/greeting", 0o644, b"from a stream\n");
     let archive = tar.finish();
 
@@ -1158,7 +982,7 @@ fn a_tarball_extracts_from_a_reader() {
 
 #[test]
 fn a_reader_source_reports_progress_without_a_total() {
-    let mut tar = TarBuilder::new();
+    let mut tar = archive();
     tar.file("./marker", 0o644, b"x");
     let archive = tar.finish();
 
@@ -1193,12 +1017,7 @@ fn a_reader_source_reports_progress_without_a_total() {
 /// carrying a read-only directory leaves exactly this shape behind.
 #[test]
 fn a_single_mapped_removal_clears_a_directory_its_own_mode_locks() {
-    if let Some(blocker) = ferroday_cage::host::userns_blocker() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_USERNS").is_none(),
-            "unprivileged user namespaces are required but unavailable: {blocker}"
-        );
-        eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
+    if !common::require::userns() {
         return;
     }
 
@@ -1218,7 +1037,9 @@ fn a_single_mapped_removal_clears_a_directory_its_own_mode_locks() {
     if plain.is_ok() {
         // A privileged runner overrides the mode outright, leaving nothing for
         // the escalation to do.
-        eprintln!("skipping: the caller can remove a mode-0500 directory's contents outright");
+        common::require::premise_unmet(
+            "the caller can remove a mode-0500 directory's contents outright",
+        );
         common::force_remove_dir_all(&dir);
         return;
     }

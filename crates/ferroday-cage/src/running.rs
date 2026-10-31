@@ -968,10 +968,10 @@ mod tests {
         );
 
         let thread = rustix::thread::gettid().as_raw_nonzero().get();
-        let before = poll::thread_ticks(thread);
+        let before = ferroday_cage_testkit::process::thread_ticks(thread);
         let started = Instant::now();
         let outcome = running.wait().expect("the outcome is collected");
-        let used = poll::thread_ticks(thread) - before;
+        let used = ferroday_cage_testkit::process::thread_ticks(thread) - before;
         holder.join().expect("the holder releases the stream");
 
         assert_eq!(outcome.code(), Some(0));

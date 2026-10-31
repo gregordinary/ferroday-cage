@@ -16,17 +16,16 @@
 //! unprivileged user namespaces; `FERRODAY_CAGE_REQUIRE_USERNS` turns each skip
 //! into a failure so a runner can assert they really ran.
 
-#![allow(unsafe_code)]
-
 mod common;
 
 use std::io::Write as _;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rustix::termios::{self, SpecialCodeIndex, Winsize};
+use common::pty;
+use rustix::termios::{self, Winsize};
 
 /// The built binary under test.
 const FCAGE: &str = env!("CARGO_BIN_EXE_fcage");
@@ -65,7 +64,7 @@ fn a_retired_standard_input_does_not_spin() {
     drop(child.stdin.take());
 
     std::thread::sleep(Duration::from_millis(1500));
-    let ticks = cpu_ticks(child.id()).expect("the relay is still running");
+    let ticks = common::cpu_ticks(child.id()).expect("the relay is still running");
     let status = child.wait().expect("the relay exits");
 
     // The kernel counts in 10ms ticks on every configuration this runs on, so
@@ -184,7 +183,7 @@ fn a_session_relays_a_typed_line_and_restores_the_terminal() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut session = Session::start(rootfs, &["/bin/sh"], winsize(24, 80));
+    let mut session = Session::start(rootfs, &["/bin/sh"], pty::winsize(24, 80));
     let before = session.settings();
 
     session.send("echo marker-from-inside\n");
@@ -196,7 +195,7 @@ fn a_session_relays_a_typed_line_and_restores_the_terminal() {
     assert_eq!(status.code(), Some(7), "{status}");
 
     let after = session.settings();
-    assert_termios_eq(&before, &after);
+    pty::assert_restored(&before, &after);
 }
 
 /// The caller's window size is copied into the sandbox at launch, so a
@@ -206,7 +205,7 @@ fn the_callers_size_is_copied_into_the_sandbox() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let size = winsize(30, 100);
+    let size = pty::winsize(30, 100);
     let mut session = Session::start(rootfs, &["/bin/sh", "-c", "stty size"], size);
     let seen = session.read_until("30 100", 2);
     let status = session.finish();
@@ -226,7 +225,7 @@ fn an_unsized_caller_terminal_falls_back_to_the_default() {
         rootfs,
         &["/bin/sh", "-c", "stty size"],
         // A pseudoterminal nobody has sized.
-        winsize(0, 0),
+        pty::winsize(0, 0),
     );
     let seen = session.read_until("24 80", 2);
     let status = session.finish();
@@ -241,7 +240,7 @@ fn a_sigwinch_resizes_the_sandboxs_terminal() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut session = Session::start(rootfs, &["/bin/sh"], winsize(30, 100));
+    let mut session = Session::start(rootfs, &["/bin/sh"], pty::winsize(30, 100));
     session.send("stty size\n");
     assert!(session.read_until("30 100", 2).contains("30 100"));
 
@@ -274,7 +273,7 @@ fn an_external_interrupt_ends_the_session_and_restores_the_terminal() {
     let mut session = Session::start(
         rootfs,
         &["/bin/sh", "-c", "echo ready; sleep 30"],
-        winsize(24, 80),
+        pty::winsize(24, 80),
     );
     let before = session.settings();
     // The marker comes from inside -- nothing is typed here, so the caller's
@@ -288,7 +287,7 @@ fn an_external_interrupt_ends_the_session_and_restores_the_terminal() {
         !status.success(),
         "an interrupted session should not report success: {status}",
     );
-    assert_termios_eq(&before, &session.settings());
+    pty::assert_restored(&before, &session.settings());
 }
 
 /// A stop restores the caller's terminal before the process stops, and a
@@ -307,16 +306,19 @@ fn a_stop_restores_the_terminal_and_a_continue_re_enters_raw_mode() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut session = Session::start(rootfs, &["/bin/sh"], winsize(24, 80));
+    let mut session = Session::start(rootfs, &["/bin/sh"], pty::winsize(24, 80));
     let cooked = session.settings();
     session.await_sandbox("ready");
-    assert!(is_raw(&session.settings()), "the session's terminal is raw");
+    assert!(
+        pty::is_raw(&session.settings()),
+        "the session's terminal is raw"
+    );
 
     session.signal(rustix::process::Signal::TSTP);
     session.await_state(b'T');
     // Restored *before* the process stopped, which is the whole discipline: the
     // shell that gets the terminal back gets it as it left it.
-    assert_termios_eq(&cooked, &session.settings());
+    pty::assert_restored(&cooked, &session.settings());
 
     // Continued, and relaying again: the marker can only have come from inside
     // the sandbox, so seeing it says the loop is back in the poll. Signals are
@@ -325,14 +327,14 @@ fn a_stop_restores_the_terminal_and_a_continue_re_enters_raw_mode() {
     session.signal(rustix::process::Signal::CONT);
     session.await_sandbox("continued");
     assert!(
-        is_raw(&session.settings()),
+        pty::is_raw(&session.settings()),
         "the continued session re-enters raw mode",
     );
 
     session.send("exit 0\n");
     let status = session.finish();
     assert!(status.success(), "{status}");
-    assert_termios_eq(&cooked, &session.settings());
+    pty::assert_restored(&cooked, &session.settings());
 }
 
 /// A caller started with its standard input closed relays the session's output
@@ -403,92 +405,7 @@ fn run_with_input(rootfs: &Path, command: &[&str], input: &str) -> std::process:
         let mut stdin = child.stdin.take().expect("the pipe is there");
         stdin.write_all(input.as_bytes()).expect("the write lands");
     }
-    let deadline = Instant::now() + PATIENCE;
-    let mut overran = false;
-    while child.try_wait().expect("the child is waitable").is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            overran = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let output = child.wait_with_output().expect("fcage finishes");
-    assert!(!overran, "the session did not end within {PATIENCE:?}");
-    output
-}
-
-/// The process's own CPU time in clock ticks: `utime + stime` from
-/// `/proc/<pid>/stat`. `None` once the process is gone.
-///
-/// The two fields sit after the command name, which is parenthesized and may
-/// itself contain spaces and parentheses, so the split starts after the last
-/// `)` rather than at the second field.
-fn cpu_ticks(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // `rest` starts at the state field, which is field 3 of the record, so
-    // utime (14) and stime (15) are indices 11 and 12 here.
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
-    Some(utime + stime)
-}
-
-/// A window size in rows and columns.
-fn winsize(rows: u16, cols: u16) -> Winsize {
-    Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    }
-}
-
-/// Asserts two termios records are identical field for field.
-fn assert_termios_eq(before: &termios::Termios, after: &termios::Termios) {
-    assert_eq!(
-        before.input_modes, after.input_modes,
-        "the input modes were not restored",
-    );
-    assert_eq!(
-        before.output_modes, after.output_modes,
-        "the output modes were not restored",
-    );
-    assert_eq!(
-        before.control_modes, after.control_modes,
-        "the control modes were not restored",
-    );
-    assert_eq!(
-        before.local_modes, after.local_modes,
-        "the local modes were not restored",
-    );
-    // `SpecialCodes` carries no equality of its own, so the characters raw mode
-    // changes are compared one by one. `make_raw` clears VMIN/VTIME and leaves
-    // the rest, so a restoration that missed any of these would show here.
-    for (name, index) in [
-        ("VINTR", SpecialCodeIndex::VINTR),
-        ("VQUIT", SpecialCodeIndex::VQUIT),
-        ("VERASE", SpecialCodeIndex::VERASE),
-        ("VKILL", SpecialCodeIndex::VKILL),
-        ("VEOF", SpecialCodeIndex::VEOF),
-        ("VTIME", SpecialCodeIndex::VTIME),
-        ("VMIN", SpecialCodeIndex::VMIN),
-        ("VSTART", SpecialCodeIndex::VSTART),
-        ("VSTOP", SpecialCodeIndex::VSTOP),
-        ("VSUSP", SpecialCodeIndex::VSUSP),
-        ("VEOL", SpecialCodeIndex::VEOL),
-        ("VREPRINT", SpecialCodeIndex::VREPRINT),
-        ("VDISCARD", SpecialCodeIndex::VDISCARD),
-        ("VWERASE", SpecialCodeIndex::VWERASE),
-        ("VLNEXT", SpecialCodeIndex::VLNEXT),
-        ("VEOL2", SpecialCodeIndex::VEOL2),
-    ] {
-        assert_eq!(
-            before.special_codes[index], after.special_codes[index],
-            "{name} was not restored",
-        );
-    }
+    common::finish_bounded(child, PATIENCE)
 }
 
 /// A driven `fcage --terminal` session: a pseudoterminal of the test's own,
@@ -509,48 +426,15 @@ struct Session {
 }
 
 impl Session {
-    /// Starts `fcage --terminal` on a fresh pseudoterminal sized `size`.
+    /// Starts `fcage --terminal` on a fresh pseudoterminal sized `size`, in a
+    /// session of its own with the replica as its controlling terminal.
     fn start(rootfs: &Path, command: &[&str], size: Winsize) -> Session {
-        use std::os::unix::process::CommandExt as _;
-
-        let primary =
-            rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
-                .expect("a pseudoterminal is available");
-        rustix::pty::unlockpt(&primary).expect("the replica unlocks");
-        // Sized before the fork, so the size the relay copies is this one and
-        // there is no race with the launch.
-        termios::tcsetwinsize(&primary, size).expect("the size is settable");
-        let replica = rustix::pty::ioctl_tiocgptpeer(
-            &primary,
-            rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY,
-        )
-        .expect("the replica opens");
-
+        let (primary, replica) = pty::pair(size.ws_row, size.ws_col);
         let mut command_line = Command::new(FCAGE);
         command_line
             .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal", "--"])
-            .args(command)
-            .stdin(Stdio::from(
-                replica.try_clone().expect("the replica clones"),
-            ))
-            .stdout(Stdio::from(
-                replica.try_clone().expect("the replica clones"),
-            ))
-            .stderr(Stdio::from(
-                replica.try_clone().expect("the replica clones"),
-            ));
-        // SAFETY: between fork and exec the child calls only `setsid` and one
-        // ioctl, both async-signal-safe, and allocates nothing. A session of
-        // its own is what makes the replica the child's controlling terminal,
-        // which is what `fcage` needs its standard input to be.
-        unsafe {
-            command_line.pre_exec(|| {
-                rustix::process::setsid()?;
-                set_controlling_terminal(rustix::stdio::stdin())?;
-                Ok(())
-            });
-        }
-        let child = command_line.spawn().expect("fcage starts");
+            .args(command);
+        let child = pty::spawn_controlled(&mut command_line, &replica);
         // The test's own copy goes, so end of file on the primary means the
         // session is over rather than that this handle is still open.
         drop(replica);
@@ -571,16 +455,13 @@ impl Session {
 
     /// Types `text` at the session.
     fn send(&mut self, text: &str) {
-        let mut written = 0;
-        while written < text.len() {
-            written += rustix::io::write(&self.primary, &text.as_bytes()[written..])
-                .expect("the write lands");
-        }
+        pty::send(&self.primary, text);
     }
 
     /// Resizes the caller's terminal. Does not itself signal the relay.
     fn resize(&self, rows: u16, cols: u16) {
-        termios::tcsetwinsize(&self.primary, winsize(rows, cols)).expect("the size is settable");
+        termios::tcsetwinsize(&self.primary, pty::winsize(rows, cols))
+            .expect("the size is settable");
     }
 
     /// Sends `signal` to the relay.
@@ -597,14 +478,7 @@ impl Session {
     /// whatever chunks the line discipline chose.
     fn read_until(&mut self, needle: &str, seconds: u64) -> String {
         let deadline = Instant::now() + Duration::from_secs(seconds);
-        while Instant::now() < deadline {
-            if self.seen.contains(needle) {
-                break;
-            }
-            if !self.drain(deadline) {
-                break;
-            }
-        }
+        pty::read_until(&self.primary, needle, deadline, &mut self.seen);
         self.seen.clone()
     }
 
@@ -658,7 +532,7 @@ impl Session {
     /// a deadline — a blocking read on a quiet session would ignore it and hang
     /// the whole run.
     fn drain(&mut self, deadline: Instant) -> bool {
-        common::drain_until(&self.primary, deadline, &mut self.seen)
+        pty::drain_until(&self.primary, deadline, &mut self.seen)
     }
 
     /// Waits for the session to end and returns its status, failing the test if
@@ -694,17 +568,6 @@ impl Drop for Session {
     }
 }
 
-/// Whether `settings` describe a terminal in raw mode.
-///
-/// Canonical input and echo are the two `make_raw` clears that a user would
-/// notice immediately, and the two the relay's whole reason for entering raw
-/// mode rests on.
-fn is_raw(settings: &termios::Termios) -> bool {
-    !settings
-        .local_modes
-        .intersects(termios::LocalModes::ICANON | termios::LocalModes::ECHO)
-}
-
 /// The process state `pid` is in, from `/proc/<pid>/stat`.
 ///
 /// The third field, and the parse starts after the last `)` because the second
@@ -714,23 +577,4 @@ fn process_state(pid: u32) -> Option<u8> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = &stat[stat.rfind(')')? + 1..];
     after_comm.split_whitespace().next()?.bytes().next()
-}
-
-/// `TIOCSCTTY`: make the terminal on `fd` this session's controlling terminal.
-const TIOCSCTTY: rustix::ioctl::Opcode = 0x540E;
-
-/// Makes `fd`'s terminal the calling session's controlling terminal.
-///
-/// Called between fork and exec, where rustix's own wrapper is not available:
-/// the ioctl takes an integer argument rather than a struct, and zero is the
-/// "do not steal it from another session" form, which is the only one wanted
-/// here.
-fn set_controlling_terminal(fd: BorrowedFd<'_>) -> std::io::Result<()> {
-    // SAFETY: TIOCSCTTY takes its argument by value rather than by pointer, so
-    // there is no buffer for the kernel to read or write. `NoArg` states
-    // exactly that.
-    let request = unsafe { rustix::ioctl::NoArg::<TIOCSCTTY>::new() };
-    // SAFETY: the descriptor is this process's standard input, which the
-    // spawn wired to the pseudoterminal replica.
-    unsafe { rustix::ioctl::ioctl(fd.as_fd(), request) }.map_err(std::io::Error::from)
 }

@@ -39,6 +39,7 @@ import gzip
 import hashlib
 import io
 import lzma
+import re
 import sys
 import tarfile
 import urllib.request
@@ -148,6 +149,16 @@ def gentoo() -> tuple[dict[str, bytes], dict[str, bytes]]:
     return held, {"service-keys.gpg": fetch(GENTOO_KEYS)}
 
 
+# What `debian-archive-keyring` ships beside the archive keyring and this crate
+# deliberately does not vendor: one keyring per release, each a subset of the
+# archive keyring for a per-suite `Signed-By`, and the keys Debian has retired,
+# which no layer may trust. Anything else the package ships as a keyring is
+# reported as added.
+DEBIAN_UNVENDORED = re.compile(
+    r"debian-archive-(?:removed-keys|[a-z]+-(?:automatic|security-automatic|stable))"
+)
+
+
 def debian() -> tuple[dict[str, bytes], dict[str, bytes]]:
     """Debian's archive keyring, out of the `debian-archive-keyring` package.
 
@@ -156,9 +167,12 @@ def debian() -> tuple[dict[str, bytes], dict[str, bytes]]:
     whenever a suite's key changes -- which is exactly the event this exists to
     notice.
 
-    The keyring is matched by stem rather than by file name: the package ships
-    it as `.pgp` today and shipped `.gpg` before, and the vendored copy keeps
-    the older spelling. What is compared is the bytes.
+    Every keyring the package ships is published, and only the release subsets
+    and the retired keys `DEBIAN_UNVENDORED` names are set aside, so a keyring
+    of a new kind arrives as an addition. A keyring is matched by stem rather
+    than by file name: the package ships `.pgp` today and shipped `.gpg`
+    before, and the vendored copy keeps the older spelling. What is compared is
+    the bytes.
     """
     held = vendored(KEYRINGS / "debian" / "keyring", "*.gpg")
     index = lzma.decompress(
@@ -179,13 +193,17 @@ def debian() -> tuple[dict[str, bytes], dict[str, bytes]]:
 
     data = deb_data_member(fetch(f"{DEBIAN_ARCHIVE}/{filename}"))
     archive = tarfile.open(fileobj=io.BytesIO(data))
+    by_stem = {Path(name).stem: name for name in held}
     published = {}
     for member in archive.getmembers():
         path = Path(member.name)
-        if member.isfile() and path.parent.name == "keyrings":
-            for name in held:
-                if Path(name).stem == path.stem:
-                    published[name] = archive.extractfile(member).read()
+        # The package also links each `.gpg` spelling to its `.pgp` file; only
+        # the files themselves are keyrings.
+        if not member.isfile() or path.parent.name != "keyrings":
+            continue
+        if DEBIAN_UNVENDORED.fullmatch(path.stem):
+            continue
+        published[by_stem.get(path.stem, path.name)] = archive.extractfile(member).read()
     return held, published
 
 

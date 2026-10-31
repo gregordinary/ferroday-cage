@@ -48,16 +48,15 @@ syscalls = { version = "0.8", default-features = false }
 rustix = { version = "1.1.4", features = ["stdio", "termios", "event", "fs", "pipe", "process"] }
 
 [dev-dependencies]
-# The workspace's shared test fixtures. The relay's tests need the rootfs and a
-# pseudoterminal reader; nothing here builds a Debian fixture.
-ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = [
-    "tarball",
-    "pty",
-] }
+# The workspace's shared test fixtures and harnesses. The relay's tests need the
+# root filesystem and the pseudoterminal harness; nothing here builds a Debian
+# fixture.
+ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = ["pty"] }
 # The relay's integration tests drive the built binary through a pseudoterminal
-# of their own, which is the only way to reach raw mode, the size copy, and the
-# restoration. `pty` is needed for that and by nothing the binary does.
-rustix = { version = "1.1.4", features = ["pty"] }
+# of the testkit's, and read the terminal's settings and signal the binary
+# themselves. Declared here for the tests' own sake, whatever the binary's
+# dependency line enables.
+rustix = { version = "1.1.4", features = ["process", "termios"] }
 
 [lints]
 workspace = true

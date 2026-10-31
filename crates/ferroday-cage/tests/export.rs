@@ -14,64 +14,11 @@ use ferroday_cage::provision;
 
 mod common;
 
-/// Skips a test when the host cannot create unprivileged user namespaces.
-///
-/// The skip is explicit on stderr, and `FERRODAY_CAGE_REQUIRE_USERNS` turns it
-/// into a failure so CI can assert the export tests actually ran.
-fn userns_available() -> bool {
-    match ferroday_cage::host::userns_blocker() {
-        None => true,
-        Some(blocker) => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_USERNS").is_none(),
-                "unprivileged user namespaces are required but unavailable: {blocker}"
-            );
-            eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
-            false
-        }
-    }
-}
-
-/// A unique, empty scratch directory for one test, removed when it drops.
-///
-/// The removal goes through [`provision::remove`] rather than
-/// `std::fs::remove_dir_all`: these trees hold subordinate-owned entries the
-/// calling user cannot unlink, which is the whole subject of the file.
-fn scratch(tag: &str) -> Scratch {
-    let dir =
-        std::env::temp_dir().join(format!("ferroday-cage-export-{tag}-{}", std::process::id()));
-    let _ = provision::remove(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    Scratch { path: dir }
-}
-
-/// A scratch directory that takes its tree with it.
-///
-/// Dereferences to its [`Path`], so it stands in for one at a call site.
-struct Scratch {
-    path: std::path::PathBuf,
-}
-
-impl std::ops::Deref for Scratch {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl AsRef<Path> for Scratch {
-    fn as_ref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for Scratch {
-    /// Best effort: a test that has already failed should report its own
-    /// assertion, not a cleanup failure raised while it unwinds.
-    fn drop(&mut self) {
-        let _ = provision::remove(&self.path);
-    }
+/// A scratch tree for one test, removed through `provision::remove` when it
+/// drops: these trees hold subordinate-owned entries the calling user cannot
+/// unlink, which is the whole subject of the file.
+fn scratch(tag: &str) -> common::RangedScratch {
+    common::ranged_scratch(&format!("export-{tag}"))
 }
 
 /// One parsed tar entry, enough to assert ownership, type, and attributes.
@@ -192,7 +139,7 @@ fn by_path(entries: &[Entry]) -> HashMap<Vec<u8>, &Entry> {
 /// and a skipped FIFO.
 #[test]
 fn exports_a_single_mapped_tree() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("single");
@@ -301,7 +248,7 @@ fn a_filter_narrows_what_the_archive_holds() {
     // The filter runs on this side of the frame stream, so this is the test
     // that the exclusion survives the real walk: the child reads and streams
     // everything, and what reaches the archive is what the predicate kept.
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("filter");
@@ -373,7 +320,7 @@ fn a_filter_narrows_what_the_archive_holds() {
 
 #[test]
 fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("atomic");
@@ -427,7 +374,7 @@ fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
 /// rename would then find nothing to publish.
 #[test]
 fn two_threads_exporting_to_one_path_each_publish_a_whole_archive() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("concurrent");
@@ -479,7 +426,7 @@ fn two_threads_exporting_to_one_path_each_publish_a_whole_archive() {
 
 #[test]
 fn an_archive_written_inside_the_tree_it_exports_is_refused() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("dest-inside");
@@ -523,15 +470,10 @@ fn an_archive_written_inside_the_tree_it_exports_is_refused() {
 fn exports_subordinate_ownership_at_intended_ids() {
     use ferroday_cage::Cage;
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
-            "a range map is required but unavailable"
-        );
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
     let Some(rootfs) = fixture_rootfs() else {
@@ -585,15 +527,10 @@ fn exports_subordinate_ownership_at_intended_ids() {
 fn explicit_mapper_exports_and_removes() {
     use ferroday_cage::{Cage, SubidMapper};
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
-            "a range map is required but unavailable"
-        );
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
     let Some(rootfs) = fixture_rootfs() else {
@@ -640,12 +577,12 @@ fn explicit_mapper_exports_and_removes() {
 /// would instead succeed.
 #[test]
 fn a_subordinate_export_without_a_delegate_is_typed() {
-    if ferroday_cage::host::userns_blocker().is_some() {
+    if !common::require::userns() {
         return;
     }
     #[cfg(feature = "subid")]
     if ferroday_cage::host::range_map_blocker().is_none() {
-        eprintln!("skipping: a delegate is available, so the export would succeed");
+        common::require::premise_unmet("a delegate is available, so the export would succeed");
         return;
     }
 
@@ -742,7 +679,7 @@ fn refuses_plain_removal(dir: &Path) -> std::path::PathBuf {
 /// Skips a test that needs a permission the caller can actually be refused.
 fn unprivileged_caller() -> bool {
     if rustix::process::geteuid().is_root() {
-        eprintln!("skipping: root is refused nothing, so the plain removal succeeds");
+        common::require::premise_unmet("root is refused nothing, so the plain removal succeeds");
         return false;
     }
     true
@@ -758,7 +695,7 @@ fn unprivileged_caller() -> bool {
 /// gate is not closed on the way out.
 #[test]
 fn a_removal_whose_delegate_cannot_apply_is_typed() {
-    if !userns_available() || !unprivileged_caller() {
+    if !common::require::userns() || !unprivileged_caller() {
         return;
     }
 
@@ -783,7 +720,7 @@ fn a_removal_whose_delegate_cannot_apply_is_typed() {
 /// other consumer of the gate protocol.
 #[test]
 fn an_export_whose_delegate_cannot_apply_is_typed() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
 
@@ -834,7 +771,7 @@ fn a_removal_whose_delegate_cannot_resolve_is_typed() {
 /// clamp equalizes wall-clock stamps: the property a reproducible build needs.
 #[test]
 fn exports_are_reproducible_across_entry_order() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("reproducible");
@@ -889,7 +826,7 @@ fn exports_are_reproducible_across_entry_order() {
 /// together.
 #[test]
 fn exports_a_large_directory_in_sorted_order() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("large-dir");
@@ -1115,7 +1052,7 @@ fn bstr(b: &[u8]) -> String {
 /// outside and no other id is representable.
 #[test]
 fn a_single_map_copy_lands_everything_as_root() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-single");
@@ -1155,7 +1092,7 @@ fn a_single_map_copy_lands_everything_as_root() {
 fn a_copy_preserves_modes_and_structure() {
     use std::os::unix::fs::PermissionsExt;
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-modes");
@@ -1193,7 +1130,7 @@ fn a_copy_preserves_modes_and_structure() {
 /// and never traversed, so nothing is written outside the destination.
 #[test]
 fn a_copy_recreates_an_escaping_symlink_without_following_it() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-escape");
@@ -1233,15 +1170,10 @@ fn a_copy_recreates_an_escaping_symlink_without_following_it() {
 fn a_copy_lands_a_file_owned_by_a_non_root_target_uid() {
     use ferroday_cage::Cage;
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
-            "a range map is required but unavailable"
-        );
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
     let Some(fixture) = fixture_rootfs() else {
@@ -1295,7 +1227,7 @@ fn a_copy_lands_a_file_owned_by_a_non_root_target_uid() {
 /// reported as such, rather than as an unexplained failure inside the child.
 #[test]
 fn a_copy_whose_delegate_cannot_resolve_is_typed() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-unprivileged");
@@ -1334,7 +1266,7 @@ fn a_copy_whose_delegate_cannot_resolve_is_typed() {
 /// tree is where the diagnostic is worth most.
 #[test]
 fn a_copy_the_child_refuses_reports_the_childs_own_step() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-child-step");
@@ -1382,7 +1314,7 @@ fn a_copy_the_child_refuses_reports_the_childs_own_step() {
 fn a_copy_keeps_the_directories_the_root_already_has() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let stamp = |path: &Path, seconds: i64| {
@@ -1447,15 +1379,10 @@ fn a_copy_keeps_the_directories_the_root_already_has() {
 fn a_copy_does_not_re_own_a_directory_the_root_already_has() {
     use ferroday_cage::Cage;
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
-            "a range map is required but unavailable"
-        );
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
     let Some(fixture) = fixture_rootfs() else {
@@ -1517,7 +1444,7 @@ fn a_copy_does_not_re_own_a_directory_the_root_already_has() {
 /// orphan the dynamic linker; refusing it would refuse every such copy.
 #[test]
 fn a_copy_into_a_merged_usr_root_lands_through_its_aliases() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-usrmerge");
@@ -1568,7 +1495,7 @@ fn a_copy_into_a_merged_usr_root_lands_through_its_aliases() {
 fn a_copy_keeps_several_names_for_one_file() {
     use std::os::unix::fs::MetadataExt;
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-hardlink");
@@ -1637,7 +1564,7 @@ fn a_copy_keeps_several_names_for_one_file() {
 fn a_copy_creates_a_named_pipe() {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-fifo");
@@ -1645,7 +1572,7 @@ fn a_copy_creates_a_named_pipe() {
     std::fs::create_dir_all(&source).unwrap();
     let fifo = source.join("initctl");
     if !make_fifo(&fifo) {
-        eprintln!("skipping: this filesystem will not hold a named pipe");
+        common::require::premise_unmet("this filesystem will not hold a named pipe");
         return;
     }
     // A mode the copy does not create the pipe at, so it is the one the copy
@@ -1668,7 +1595,7 @@ fn a_copy_creates_a_named_pipe() {
 /// in silence.
 #[test]
 fn a_copy_names_what_it_could_not_create() {
-    if !userns_available() {
+    if !common::require::userns() {
         return;
     }
     let dir = scratch("copyin-skipped");

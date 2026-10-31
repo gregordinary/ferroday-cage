@@ -63,8 +63,7 @@ pub fn scratch_dir(name: &str) -> PathBuf {
 /// library's own, so a tree a test nested deep is removed like a shallow one.
 ///
 /// A tree holding subordinate-owned entries resists this, as it resists any
-/// removal by the calling user; such a tree is removed through
-/// `provision::remove` with the map it was written under.
+/// removal by the calling user; such a tree is a [`ranged_scratch`].
 pub fn force_remove_dir_all(path: &Path) {
     let _ = Remove::new(path)
         .map(IdentityMap::Single)
@@ -72,27 +71,57 @@ pub fn force_remove_dir_all(path: &Path) {
         .run();
 }
 
-/// Whether `/dev/net/tun` is present and openable, the additional host
-/// requirement of the native network stack; the tests that need it skip when it
-/// is unavailable.
+/// A scratch tree for one test that holds subordinate-owned entries, removed
+/// through [`Remove`] under the subordinate map when it drops.
 ///
-/// The skip is always explicit: it is reported on stderr, and setting
-/// `FERRODAY_CAGE_REQUIRE_TUN` turns it into a failure so that CI can assert
-/// the network-stack tests actually ran.
-pub fn tun_available() -> bool {
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/net/tun")
-    {
-        Ok(_) => true,
-        Err(err) => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_TUN").is_none(),
-                "/dev/net/tun is required but unavailable: {err}"
-            );
-            eprintln!("skipping: /dev/net/tun is unavailable: {err}");
-            false
-        }
+/// Such a tree resists any removal by the calling user, [`scratch_dir`]'s
+/// clearing of a previous run's tree included. So it lives in the system
+/// temporary directory rather than under `target`, where a tree that outlived
+/// its guard would make `cargo clean` fail, and it is named for the process, so
+/// two runs never share one. It is removed before use too, in case the process
+/// id was reused. A scratch tree is not a published root, so no publication
+/// lock takes part.
+pub fn ranged_scratch(tag: &str) -> RangedScratch {
+    let path = std::env::temp_dir().join(format!("ferroday-cage-{tag}-{}", std::process::id()));
+    remove_ranged(&path);
+    std::fs::create_dir_all(&path).expect("the scratch tree is creatable");
+    RangedScratch { path }
+}
+
+/// Removes a tree that may hold subordinate-owned entries, best effort.
+fn remove_ranged(path: &Path) {
+    let _ = Remove::new(path)
+        .map(IdentityMap::Subordinate)
+        .remove_lock(false)
+        .run();
+}
+
+/// The guard [`ranged_scratch`] returns.
+///
+/// Dereferences to its [`Path`], so it stands in for one at a call site.
+#[derive(Debug)]
+pub struct RangedScratch {
+    path: PathBuf,
+}
+
+impl std::ops::Deref for RangedScratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for RangedScratch {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RangedScratch {
+    /// Best effort: a test that has already failed should report its own
+    /// assertion, not a cleanup failure raised while it unwinds.
+    fn drop(&mut self) {
+        remove_ranged(&self.path);
     }
 }

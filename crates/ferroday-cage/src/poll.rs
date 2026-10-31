@@ -40,21 +40,3 @@ pub(crate) fn timeout(duration: Duration) -> Timespec {
         tv_nsec: i64::from(duration.subsec_nanos()),
     }
 }
-
-/// The processor time the thread `tid` of this process has used, in clock
-/// ticks: what a test holding a loop to blocking measures it by.
-///
-/// A loop that blocks uses next to none over a window it waits through, and
-/// one that spins uses the whole window. The user and system times are fields
-/// 14 and 15 of the thread's `stat`. They are counted from the state, field 3,
-/// which follows the parenthesised name, since the name may hold spaces.
-#[cfg(test)]
-pub(crate) fn thread_ticks(tid: i32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
-        .expect("a thread's statistics are readable");
-    let fields: Vec<&str> = stat[stat.rfind(')').expect("a name") + 2..]
-        .split_whitespace()
-        .collect();
-    let field = |at: usize| fields[at].parse::<u64>().expect("a tick count");
-    field(11) + field(12)
-}

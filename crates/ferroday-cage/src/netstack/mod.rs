@@ -1366,4 +1366,34 @@ mod tests {
             .expect_err("unknown keys are refused");
         assert!(err.to_string().contains("gateway"), "{err}");
     }
+
+    /// Every key the builder's serde format can carry, pinned as the profile
+    /// format's are: the format is the one a consumer embeds in a document of
+    /// its own, and a field rename or a new setting would move a key silently.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn the_builder_format_keys_are_what_they_are() {
+        let builder = NetStack::builder()
+            .host_loopback(true)
+            .host_loopback_port(5432)
+            .publish("127.0.0.1:8080".parse().unwrap(), 80);
+        let rendered = toml::to_string(&builder).expect("the builder serializes");
+        assert_eq!(
+            crate::spec::serde_tests::profile_keys(&rendered),
+            [
+                "host-loopback",
+                "host-loopback-ports",
+                "interface",
+                "ipv4",
+                "ipv4-cidr",
+                "ipv6",
+                "ipv6-cidr",
+                "mtu",
+                "publish",
+                "publish[].guest-port",
+                "publish[].host",
+            ],
+            "the network stack's format keys moved",
+        );
+    }
 }

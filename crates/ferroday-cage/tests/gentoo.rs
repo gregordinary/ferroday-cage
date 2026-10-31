@@ -23,11 +23,6 @@ use ferroday_cage::provision::{self, Provisioned};
 /// archive.
 const NETWORK_GATE: &str = "FERRODAY_CAGE_GENTOO_NETWORK_TEST";
 
-/// The variable that asserts these tests ran, in the crate's usual shape: a
-/// skip stays a skip by default, and this turns it into a failure so a release
-/// check cannot come back green having exercised no archive at all.
-const REQUIRE_GATE: &str = "FERRODAY_CAGE_REQUIRE_NETWORK_TEST";
-
 /// The architecture the live tests read, and the variant they install: the
 /// smallest ordinary root the archive publishes for it.
 const ARCHITECTURE: &str = "amd64";
@@ -36,19 +31,10 @@ const VARIANT: &str = "amd64-openrc";
 /// The binary-package tree that goes with them.
 const BINHOST: &str = "x86-64";
 
-/// Returns `false` and prints a skip note when the network tests are not
-/// enabled.
+/// Whether the network-dependent tests run: [`NETWORK_GATE`] opts in, and
+/// `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` turns not opting in into a failure.
 fn network_enabled() -> bool {
-    if std::env::var_os(NETWORK_GATE).is_some() {
-        return true;
-    }
-    assert!(
-        std::env::var_os(REQUIRE_GATE).is_none(),
-        "{REQUIRE_GATE} is set and {NETWORK_GATE} is not, so the Gentoo tests would have \
-         been skipped",
-    );
-    eprintln!("skipping: set {NETWORK_GATE}=1 to run the Gentoo archive tests");
-    false
+    common::require::network_suite(NETWORK_GATE, "the Gentoo archive tests")
 }
 
 #[test]
@@ -412,8 +398,7 @@ fn an_increment_over_a_stage3_keeps_its_merged_usr_links() {
         return;
     };
     let scratch = common::scratch_dir("gentoo-layered");
-    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&scratch) {
-        eprintln!("skipping: overlay-rooted sandboxes are unavailable: {blocker}");
+    if !common::require::overlay(&scratch) {
         return;
     }
     let base = scratch.join("base");

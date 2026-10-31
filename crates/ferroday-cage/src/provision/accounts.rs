@@ -338,7 +338,9 @@ mod tests {
             if let Err(errno) = whiteout(&upper_dir, path) {
                 // Linux 5.8 is the first to let an unprivileged caller record
                 // one.
-                eprintln!("skipping: the host refused an unprivileged whiteout: {errno}");
+                ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                    "the host refused an unprivileged whiteout: {errno}"
+                ));
                 return;
             }
         }

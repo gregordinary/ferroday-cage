@@ -6,7 +6,8 @@
 # file is how a second answer gets decided rather than merely written.
 #
 # `pattern` is a Python regular expression, matched against each crate's `src`
-# tree with the trailing test module and every comment line removed.
+# and `examples` trees with every test-only item and every comment removed
+# (`tools/rust_source.py` is that reading).
 #
 # What is deliberately not here: a concept clippy can name as a method. Those
 # live in `clippy.toml`, which refuses them at the call rather than counting
@@ -14,15 +15,27 @@
 
 [[idiom]]
 name = "a deadline from a duration"
-pattern = 'Instant::now\(\) \+'
+# A regular expression cannot see a type, so the shape is matched on either
+# side of the `+` by the names the workspace gives the two: a clock reading
+# (`Instant::now()`, or a local `now` or `since`), or a duration (a `Duration`
+# constructor, or a named deadline, timeout, interval or backoff constant).
+pattern = '(?:Instant::now\(\)|\bnow|\bsince) \+ |\+ (?:Duration::|[A-Z][A-Z0-9_]*(?:DEADLINE|TIMEOUT|INTERVAL|BACKOFF)\b)'
 answer = """\
 `Instant::now().checked_add(d)`, and a duration the clock cannot express is no \
 deadline at all. The addition panics on overflow, and every timeout this \
 workspace takes is a caller's number: `Running::wait_timeout`, `--timeout`, \
 and `HttpFetch::request_timeout` all read an inexpressible one as a wait \
 without a bound, and two of the three learned it the hard way."""
-# No sites. The shape is refused outright, which is the whole entry: this is
-# the one idiom here that has no legitimate use in the crates' source.
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/netstack/tcp.rs"
+count = 4
+why = """\
+A TCP flow's own deadlines: `ESTABLISH_DEADLINE` (30 seconds) and \
+`HANGUP_DEADLINE` (the stack's idle timeout, minutes) added to a reading of \
+the monotonic clock. Both are constants of the stack's own rather than a \
+caller's number, and no duration that short can carry the clock past what it \
+expresses."""
 
 [[idiom]]
 name = "the kernel's retry-the-walk answer"
@@ -192,8 +205,8 @@ why = "The answer."
 path = "crates/ferroday-cage/src/provision/debian/deb.rs"
 count = 1
 why = """\
-Not a URL at all: it trims the trailing slash off a `Multi-Arch` directory \
-value read out of a control stanza."""
+Not a URL at all: it trims the `/` that terminates a member name in an `ar` \
+archive's header, the System V spelling a `.deb` writer may use."""
 
 [[idiom]]
 name = "a hand-rolled mirror walk"
@@ -229,7 +242,9 @@ why = "The answer."
 
 [[idiom]]
 name = "the host's temporary directory"
-pattern = 'env::temp_dir\(\)'
+# Not anchored on the call: the function passed by name, as a fallback, reads it
+# just the same.
+pattern = 'env::temp_dir\b'
 answer = """\
 `Scratch`, which owns the library's one reading of it and removes what it \
 creates. A second reading is a directory nothing cleans up, named by a rule \
@@ -241,14 +256,28 @@ count = 1
 why = "The answer."
 
 [[idiom.site]]
+path = "crates/ferroday-cage-testkit/src/scratch.rs"
+count = 2
+why = """\
+The two directories the test suites keep outside `target` on purpose. \
+`download_cache` holds a network suite's downloads, half a gigabyte for \
+Gentoo, which survive a `cargo clean` so a second run does not fetch them \
+again; it is one fixed directory per suite, and `FERRODAY_CAGE_FIXTURE_DIR` \
+moves it. `ranged_scratch` holds subordinate-owned trees, which `cargo clean` \
+could not remove; each is named for its process and removed through \
+`provision::Remove` when its guard drops. `Scratch` is the library's own and \
+not public, so a test crate cannot reach it."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/examples/overlay-race.rs"
 count = 1
 why = """\
-`Scratch` is the library's own and is not public, so an example — which is a \
-consumer of the public API and nothing more — cannot reach it. The tree it \
-names holds subordinate-owned entries anyway, which `Scratch` could not remove: \
-it is cleared through `provision::remove` at the start of each run, the same \
-answer `tests/export.rs` reaches for."""
+`Scratch` is the library's own and is not public, so an example, which is a \
+consumer of the public API and nothing more, cannot reach it. The tree is \
+named for the process and removed through the public API when the run ends, \
+whether it succeeds or fails: a sandbox ran in it, and an overlay's work \
+directory is left mode `0` with something inside it, which the caller cannot \
+remove by itself."""
 
 [[idiom]]
 name = "a write whose zero-byte case is decided inline"

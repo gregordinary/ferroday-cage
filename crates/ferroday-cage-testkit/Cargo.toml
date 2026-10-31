@@ -1,33 +1,31 @@
 [package]
 name = "ferroday-cage-testkit"
-description = "Test fixtures shared by the ferroday-cage workspace's integration tests"
+description = "Test fixtures shared by the ferroday-cage workspace's tests"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 # Never published: it exists so the two crates' test suites share one rootfs
-# fixture, one tar writer, one `ar` writer, and one hex encoder rather than
-# keeping a copy each. Nothing here ships.
+# fixture, one skip rule, one tar writer, one terminal harness, and one hex
+# encoder rather than keeping a copy each. Nothing here ships.
 publish = false
 
 [dependencies]
-# No features are requested. The fixture rootfs needs the tarball provisioner,
-# so that half sits behind this crate's own `tarball` feature and forwards: a
-# dependent that does not ask for it does not get it, which keeps the
-# featureless and feature-powerset checks of the library meaningful.
+# No library feature is requested, here or by any feature below: Cargo resolves
+# a dev-dependency's features once for every test and example, so one that
+# reached the library would reach every test build of it. A fixture that needs
+# a library feature takes that part from its caller instead; the crate
+# documentation says which.
 ferroday-cage = { path = "../ferroday-cage", default-features = false }
 sha2 = { version = "0.11", optional = true }
-rustix = { version = "1.1.4", features = ["event"], optional = true }
+rustix = { version = "1.1.4", features = ["event", "process", "pty", "stdio", "termios"], optional = true }
 
 [features]
-# The rootfs fixture: provisions the pinned Alpine minirootfs through the
-# library's own tarball provisioner.
-tarball = ["ferroday-cage/tarball"]
-# The Debian fixture builders: tar and `ar` writers, and a `file://` repository
-# with correct digests. The library's own feature is forwarded for `file_url`,
-# so a fixture's mirror URL is built the way a caller's is.
-debian = ["dep:sha2", "ferroday-cage/debian"]
-# The pseudoterminal reader the terminal relay's tests drain a session through.
+# SHA-256 hex digests, and the Debian fixture repository whose index states
+# them.
+hex = ["dep:sha2"]
+# The pseudoterminal harness: allocating a pair, starting a process with one as
+# its controlling terminal, and reading it against a deadline.
 pty = ["dep:rustix"]
 
 [lints]

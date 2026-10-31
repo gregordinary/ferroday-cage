@@ -548,28 +548,11 @@ mod tests {
 
     /// A `scripts.tar` archiving each named member with its body.
     fn script_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut archive = Vec::new();
+        let mut archive = ferroday_cage_testkit::tar::Tar::new();
         for (name, body) in members {
-            archive.extend_from_slice(
-                &crate::provision::tar::ustar_block(
-                    name.as_bytes(),
-                    &[],
-                    0o755,
-                    0,
-                    0,
-                    body.len() as u64,
-                    0,
-                    b'0',
-                    &[],
-                )
-                .expect("the header is writable"),
-            );
-            archive.extend_from_slice(body);
-            crate::provision::tar::pad(&mut archive, body.len() as u64)
-                .expect("the padding is short");
+            archive.file(name, 0o755, body);
         }
-        archive.extend_from_slice(&[0u8; 1024]);
-        archive
+        archive.finish()
     }
 
     /// The archive of the first record's trigger script alone.

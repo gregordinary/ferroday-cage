@@ -1040,7 +1040,8 @@ mod tests {
         ) {
             Ok(()) => true,
             Err(Errno::PERM) => {
-                eprintln!("skipping the whiteout case: this kernel refuses an unprivileged one");
+                ferroday_cage_testkit::require::OVERLAY
+                    .skip("this kernel refuses an unprivileged whiteout");
                 false
             }
             Err(errno) => panic!("making a whiteout: {errno}"),

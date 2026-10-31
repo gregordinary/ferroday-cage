@@ -2720,24 +2720,10 @@ mod tests {
 
     /// A one-file tar archive whose `etc/marker` holds `body`.
     fn tarball_marking(body: &[u8]) -> Vec<u8> {
-        use crate::provision::tar;
-        let mut out = Vec::new();
-        for (name, mode, size, typeflag) in [
-            ("etc/", 0o755, 0u64, b'5'),
-            ("etc/marker", 0o644, body.len() as u64, b'0'),
-        ] {
-            out.extend_from_slice(
-                &tar::ustar_block(name.as_bytes(), b"", mode, 0, 0, size, 0, typeflag, b"")
-                    .expect("a ustar header"),
-            );
-            if size > 0 {
-                out.extend_from_slice(body);
-                tar::pad(&mut out, size).expect("padding a member");
-            }
-        }
-        // Two zero blocks end the archive.
-        out.extend_from_slice(&[0u8; 1024]);
-        out
+        ferroday_cage_testkit::tar::Tar::new()
+            .dir("etc/", 0o755)
+            .file("etc/marker", 0o644, body)
+            .finish()
     }
 
     /// The digest the fixture digest document records for the tarball.

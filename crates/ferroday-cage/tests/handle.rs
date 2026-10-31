@@ -3,10 +3,12 @@
 
 mod common;
 
+use common::{Collect, process_exists, wait_gone};
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, Observer, Stdio};
+use ferroday_cage::{Cage, Stdio};
 
 /// Builds a cage running `/bin/sh -c <script>` in the fixture rootfs.
 fn sh(rootfs: &Path, script: &str) -> Cage {
@@ -16,17 +18,6 @@ fn sh(rootfs: &Path, script: &str) -> Cage {
         .args(["-c", script])
         .build()
         .expect("a valid sandbox configuration")
-}
-
-#[derive(Default)]
-struct Collect {
-    stdout: Vec<u8>,
-}
-
-impl Observer for Collect {
-    fn stdout(&mut self, chunk: &[u8]) {
-        self.stdout.extend_from_slice(chunk);
-    }
 }
 
 #[test]
@@ -210,11 +201,6 @@ fn spawn_abandoning_caller(mode: &str) -> u32 {
         .expect("the supervisor pid parses")
 }
 
-/// Whether a process with this pid exists on the host.
-fn process_exists(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
 #[test]
 fn stop_with_caller_ends_the_sandbox_when_the_caller_exits() {
     let Some(_) = common::fixture_rootfs() else {
@@ -223,14 +209,10 @@ fn stop_with_caller_ends_the_sandbox_when_the_caller_exits() {
     let supervisor = spawn_abandoning_caller("stop");
     // The tie is a socket hangup; give the supervisor a moment to observe
     // it, polling rather than sleeping a fixed eternity.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_exists(supervisor) {
-        assert!(
-            Instant::now() < deadline,
-            "the sandbox outlived its caller despite stop_with_caller"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        wait_gone(supervisor, Duration::from_secs(5)),
+        "the sandbox outlived its caller despite stop_with_caller",
+    );
 }
 
 #[test]

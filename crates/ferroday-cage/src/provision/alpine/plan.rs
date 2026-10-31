@@ -753,6 +753,9 @@ Origin: postmarketos-base
         assert!(!document.contains("Size:\n"), "{document}");
     }
 
+    // Needs the Debian layer beside this one, which an Alpine build alone
+    // does not have.
+    #[cfg(feature = "debian")]
     #[test]
     fn the_alpine_format_and_the_debian_one_cannot_be_read_as_each_other() {
         // Two independent formats, and the reason each document names its own:

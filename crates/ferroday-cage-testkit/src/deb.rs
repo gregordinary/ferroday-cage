@@ -1,11 +1,14 @@
-//! Hermetic Debian fixtures: `ar` archives, `.deb` packages, and a `file://`
-//! repository with correct digests, so the Debian provisioner can be tested end
-//! to end without a network.
+//! Hermetic Debian fixtures: `ar` archives, `.deb` packages, and an unsigned
+//! `file://` repository with correct digests, so the Debian provisioner can be
+//! tested end to end without a network.
+//!
+//! The archive writers need nothing. The repository needs SHA-256 for the
+//! digests its index states, which is this crate's `hex` feature.
 
+#[cfg(feature = "hex")]
 use std::path::Path;
 
-use ferroday_cage::provision::file_url;
-
+#[cfg(feature = "hex")]
 use crate::hex::sha256_hex;
 use crate::tar::Tar;
 
@@ -32,11 +35,20 @@ pub fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
 /// Builds a `.deb` from an uncompressed `data.tar` payload and an empty
 /// `control.tar`.
 pub fn deb(data_tar: &[u8]) -> Vec<u8> {
-    deb_with_control(&Tar::new().finish(), data_tar)
+    package(&Tar::new().finish(), data_tar)
 }
 
-/// Builds a `.deb` from explicit `control.tar` and `data.tar` payloads.
-pub fn deb_with_control(control_tar: &[u8], data_tar: &[u8]) -> Vec<u8> {
+/// Builds a `.deb` whose `control.tar` holds `./control` with `control` as its
+/// text, for a test that reads the package's control stanza back.
+pub fn deb_with_control(control: &str, data_tar: &[u8]) -> Vec<u8> {
+    let control_tar = Tar::new()
+        .file("./control", 0o644, control.as_bytes())
+        .finish();
+    package(&control_tar, data_tar)
+}
+
+/// A `.deb` from its two uncompressed members.
+fn package(control_tar: &[u8], data_tar: &[u8]) -> Vec<u8> {
     ar(&[
         ("debian-binary", b"2.0\n"),
         ("control.tar", control_tar),
@@ -45,6 +57,7 @@ pub fn deb_with_control(control_tar: &[u8], data_tar: &[u8]) -> Vec<u8> {
 }
 
 /// One package in a fixture repository.
+#[cfg(feature = "hex")]
 pub struct Pkg {
     /// The `Package` field.
     pub name: String,
@@ -64,6 +77,7 @@ pub struct Pkg {
     pub architecture: Option<String>,
 }
 
+#[cfg(feature = "hex")]
 impl Pkg {
     /// A required package (in the base seed) with the given payload.
     pub fn required(name: &str, deb: Vec<u8>, depends: &str) -> Pkg {
@@ -108,13 +122,13 @@ impl Pkg {
     }
 }
 
-/// Writes an unsigned `file://` repository and returns its mirror URL.
+/// Writes an unsigned repository into `dir`.
 ///
-/// The URL is built by the library's own [`file_url`], so a fixture addresses
-/// its repository in exactly the shape a caller's does.
-///
-/// [`file_url`]: ferroday_cage::provision::file_url
-pub fn write_repo(dir: &Path, suite: &str, arch: &str, packages: &[Pkg]) -> String {
+/// The mirror URL is the caller's to make, with the library's
+/// `provision::file_url`: it needs a provisioner feature of the library, and
+/// this crate enables none (see the crate documentation).
+#[cfg(feature = "hex")]
+pub fn write_repo(dir: &Path, suite: &str, arch: &str, packages: &[Pkg]) {
     let dists = dir.join(format!("dists/{suite}"));
     let binary = dists.join(format!("main/binary-{arch}"));
     std::fs::create_dir_all(&binary).unwrap();
@@ -158,6 +172,4 @@ pub fn write_repo(dir: &Path, suite: &str, arch: &str, packages: &[Pkg]) -> Stri
         index.len(),
     );
     std::fs::write(dists.join("Release"), release).unwrap();
-
-    file_url(dir).expect("the fixture's path names a file:// URL")
 }

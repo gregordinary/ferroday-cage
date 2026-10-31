@@ -923,11 +923,18 @@ mod serde_tests {
             .bind("/proc", "/proc")
             .command("/bin/sh")
             .build();
-        let Ok(cage) = built else {
+        let cage = match built {
+            Ok(cage) => cage,
             // A host that cannot establish an unprivileged overlay refuses the
-            // build; there is nothing to record and nothing to assert.
-            eprintln!("skipping: an unprivileged overlay is unavailable here");
-            return;
+            // build; there is nothing to record and nothing to assert. Any
+            // other refusal is this test's failure.
+            Err(crate::Error::Config(crate::ConfigError::OverlayUnavailable { blocker })) => {
+                ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                    "an unprivileged overlay is unavailable here: {blocker}"
+                ));
+                return;
+            }
+            Err(err) => panic!("the overlay sandbox builds: {err}"),
         };
         let layered = cage.resolved_inputs();
 

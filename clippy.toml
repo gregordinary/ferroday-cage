@@ -3,7 +3,7 @@
 # An entry here belongs to a concept the code has consolidated: the second
 # direct call is how that consolidation comes undone, and this is what makes
 # the second call say so. The site that *is* the answer carries
-# `#[allow(clippy::disallowed_methods)]`, and so does any site the answer
+# `#[expect(clippy::disallowed_methods)]`, and so does any site the answer
 # genuinely does not cover -- each with a comment giving the reason, which is
 # the convention `CONTRIBUTING.md` states for a second answer generally.
 #

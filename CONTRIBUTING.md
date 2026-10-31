@@ -61,12 +61,27 @@ CI asserts the security-property suites actually ran:
 | Variable | Turns into a failure |
 | --- | --- |
 | `FERRODAY_CAGE_REQUIRE_USERNS` | Unprivileged user namespaces unavailable |
-| `FERRODAY_CAGE_REQUIRE_SUBID` | No delegate can establish a range map |
-| `FERRODAY_CAGE_REQUIRE_TUN` | `/dev/net/tun` unavailable |
-| `FERRODAY_CAGE_REQUIRE_LANDLOCK` | The kernel offers no Landlock LSM |
+| `FERRODAY_CAGE_REQUIRE_SUBID` | No delegate can establish a range map, or the subordinate allocation cannot carry a test's map |
+| `FERRODAY_CAGE_REQUIRE_TUN` | `/dev/net/tun` or the IPv6 loopback unavailable |
+| `FERRODAY_CAGE_REQUIRE_OVERLAY` | Overlay-rooted sandboxes unavailable, or the whiteouts and `user.` attributes an overlay upper holds |
+| `FERRODAY_CAGE_REQUIRE_LANDLOCK` | The kernel offers no Landlock LSM, or one that predates network rules (ABI 4, Linux 6.7) |
 | `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE` | The kernel's Landlock ABI predates scopes (ABI 6, Linux 6.12) |
 | `FERRODAY_CAGE_REQUIRE_SECCOMP` | The kernel offers no seccomp |
 | `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` | A network suite was not opted into |
+
+A variable governs every test that needs its facility, including the host tools
+such a test drives. A Landlock test that finds no `nc` fails under
+`FERRODAY_CAGE_REQUIRE_LANDLOCK` too. A few skips have no variable, because
+their premise is how the run was started rather than what the host provides. A
+test of what happens without a delegate cannot run where one exists. One that
+needs a caller other than root, or one with a controlling terminal, depends on
+how it was started.
+
+Every skip goes through the testkit's `require` module, which is what keeps a
+variable honored at every site. A new test that skips calls it rather than
+printing a skip of its own. `require::USERNS.skip(reason)` and its siblings
+report a facility's skip, and `require::premise_unmet(reason)` reports a skip no
+variable governs.
 
 To exercise the full suite locally you need three things:
 
@@ -125,27 +140,36 @@ Three shapes cover every test here:
 - **A unit test** inside `crates/ferroday-cage/src` uses
   `crate::scratch::Scratch`, which dereferences to its `Path`.
 - **An integration test** uses `common::scratch_dir`, which places its trees
-  under `target` so `cargo clean` clears them. Two tests name a tree of their
-  own instead: `tests/export.rs` and the removal test in `tests/identity.rs`.
-  Both fill it with subordinate-owned entries, which have to be removed through
-  `provision::remove` rather than by the calling user. `scratch_dir`
-  clears the previous run's tree as the calling user, which is exactly what such
-  a tree resists.
+  under `target` so `cargo clean` clears them. A test that fills its tree with
+  subordinate-owned entries uses `common::ranged_scratch` instead, as
+  `tests/export.rs` and the removal test in `tests/identity.rs` do. Such a tree
+  resists removal by the calling user, and `scratch_dir` clears a previous run's
+  tree as that user. So it lives in the system temporary directory, and its
+  guard removes it through `provision::Remove` when it drops.
 - **A network suite's downloads** are not a scratch tree at all: they are kept
   on purpose, so that a second run does not fetch half a gigabyte again.
   `common::download_cache` names one directory per suite, under
   `FERRODAY_CAGE_FIXTURE_DIR` where it is set and the system temporary directory
-  otherwise. That is the one place here that deliberately sits outside `target`.
+  otherwise. It and `ranged_scratch` are the two places here that deliberately
+  sit outside `target`.
   A `cargo clean` costing that much to undo is a reason not to run the network
   suites.
 
-Both crates' `tests/common/mod.rs` are re-exports of `ferroday-cage-testkit`, a
-workspace member that is never published. It holds the root filesystem fixture,
-the scratch directories, and the builders for `.deb`, `ar`, and tar fixtures. The
-two suites share them rather than keeping a copy each. Every part of it that
-needs a library feature sits behind one of its own that forwards. A dependent
-enables only what it uses, which is what keeps the `features` job's featureless
-and powerset checks meaning what they say.
+Both crates' `tests/common/mod.rs` are mostly re-exports of
+`ferroday-cage-testkit`, a workspace member that is never published. It holds
+the root filesystem fixture, the scratch directories, and the skip rule. It also
+holds the tar, `ar` and `.deb` builders, the pseudoterminal harness, and the
+process helpers. The suites and the library's unit tests share them rather than
+keeping a copy each.
+
+The testkit enables none of the library's features. Cargo resolves a
+dev-dependency's features once for all of a package's tests and examples. A
+testkit feature that reached the library would turn it on in every test build.
+Where a fixture needs a library feature, the suite's `common` module supplies
+that part under its own `#[cfg(feature)]`. Provisioning the fixture root takes
+`tarball`, and naming a fixture repository's `file://` URL takes a provisioner
+feature. That is what keeps the `features` job's featureless and powerset checks
+building exactly the combination they name.
 
 ### Feature-gating a test
 
@@ -183,7 +207,8 @@ Two further gates matter when the public API moves:
   with the command in the `api` job of `.github/workflows/ci.yml`, including
   the nightly that job pins, and commit the result. The pin matters. The
   snapshot is rustdoc's JSON rendering, which differs between nightlies, so an
-  unpinned regeneration produces a diff that is not an API change.
+  unpinned regeneration produces a diff that is not an API change. The job
+  pins the `cargo-public-api` version too, for the same reason.
 
   That command needs `cargo-public-api`, whose own build links libcurl and so
   wants `libssl-dev` and `pkg-config` on the machine installing it. The library
@@ -410,7 +435,7 @@ Two guards hold the table to the code, and each covers what the other cannot:
 
 - `clippy.toml` names the primitives whose second *call* is the drift, with the
   answer in the diagnostic. A site the answer genuinely does not cover carries
-  `#[allow(clippy::disallowed_methods)]` and a comment saying which part does
+  `#[expect(clippy::disallowed_methods)]` and a comment saying which part does
   not fit.
 - `tools/idioms.toml` records where the shapes clippy cannot see occur today,
   and `tools/check-idioms.py` fails on any difference. Those shapes are an

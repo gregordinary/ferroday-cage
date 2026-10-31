@@ -306,22 +306,17 @@ name = "musl-build"
 required-features = ["alpine"]
 
 [dev-dependencies]
-# The workspace's shared test fixtures: the rootfs, the scratch directories, and
-# the tar, `ar`, and repository builders. It never ships, and every feature it
-# names here forwards to one of this crate's own — nothing is enabled that a
-# test binary does not already require.
-ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = [
-    "tarball",
-    "debian",
-    "pty",
-] }
+# The workspace's shared test fixtures and harnesses: the root filesystem, the
+# scratch directories, the skip rule, the tar, `ar`, and repository builders,
+# and the pseudoterminal harness. It never ships, and none of its features
+# enables one of this crate's, so a test target compiles under exactly the
+# features its command line and its `required-features` select.
+ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = ["hex", "pty"] }
 toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"
 # The provisioning tests generate compressed fixtures.
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
-# The Debian tests build fixture repositories with correct digests.
-sha2 = "0.11"
 # The Debian signature tests generate a throwaway signing key and sign an
 # InRelease with it, to exercise the verification path adversarially. rPGP is
 # already pulled in by the `debian` feature; this adds the RNG it needs.

@@ -1752,7 +1752,8 @@ mod tests {
             ) {
                 Ok(()) => whiteouts.push(at),
                 Err(rustix::io::Errno::PERM) => {
-                    eprintln!("skipping: this kernel refuses an unprivileged whiteout");
+                    ferroday_cage_testkit::require::OVERLAY
+                        .skip("this kernel refuses an unprivileged whiteout");
                     return;
                 }
                 Err(errno) => panic!("making a whiteout: {errno}"),

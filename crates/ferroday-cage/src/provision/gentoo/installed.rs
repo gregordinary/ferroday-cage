@@ -894,9 +894,8 @@ mod tests {
             rustix::fs::XattrFlags::empty(),
         );
         if let Err(errno) = marked {
-            eprintln!(
-                "skipping the opaque cases: this filesystem refuses user attributes ({errno})"
-            );
+            ferroday_cage_testkit::require::OVERLAY
+                .skip(format!("this filesystem refuses user attributes ({errno})"));
             return;
         }
         // `x` says the directory holds whiteouts of another form, and is not
@@ -963,7 +962,9 @@ mod tests {
             rustix::fs::Mode::empty(),
             0,
         ) {
-            eprintln!("skipping the whiteout case: a whiteout cannot be made here ({errno})");
+            ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                "the whiteout case: a whiteout cannot be made here ({errno})"
+            ));
         } else {
             let view = merged(&lower, &upper).expect("the merged view is read");
             let util_read = view
@@ -997,9 +998,9 @@ mod tests {
             b"y",
             rustix::fs::XattrFlags::empty(),
         ) {
-            eprintln!(
-                "skipping the opaque case: this filesystem refuses user attributes ({errno})"
-            );
+            ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                "the opaque case: this filesystem refuses user attributes ({errno})"
+            ));
             return;
         }
         let err = merged(&lower, &upper).expect_err("an opaque entry is the upper's alone");

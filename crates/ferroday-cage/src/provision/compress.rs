@@ -535,42 +535,13 @@ mod tests {
 
     const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
-    /// A tar stream of one file, plus the two terminator blocks. Used to prove
-    /// that a multi-member wrapper delivers every member's bytes.
+    /// A tar stream of one file, without the two blocks that end a stream, so
+    /// that two of them joined read as one stream. Used to prove that a
+    /// multi-member wrapper delivers every member's bytes.
     fn tar_of(name: &str, contents: &[u8]) -> Vec<u8> {
-        let mut block = [0u8; 512];
-        block[..name.len()].copy_from_slice(name.as_bytes());
-        for (field, value) in [
-            (100..108, 0o644u64),
-            (108..116, 0),
-            (116..124, 0),
-            (124..136, contents.len() as u64),
-            (136..148, 0),
-        ] {
-            let width = field.len() - 1;
-            let text = format!("{value:0width$o}");
-            block[field.start..field.start + text.len()].copy_from_slice(text.as_bytes());
-        }
-        block[156] = b'0';
-        block[257..263].copy_from_slice(b"ustar\0");
-        block[263..265].copy_from_slice(b"00");
-        let sum: u64 = block
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                if (148..156).contains(&i) {
-                    32
-                } else {
-                    u64::from(*b)
-                }
-            })
-            .sum();
-        let text = format!("{sum:06o}");
-        block[148..148 + text.len()].copy_from_slice(text.as_bytes());
-        let mut out = block.to_vec();
-        out.extend_from_slice(contents);
-        out.resize(out.len() + (512 - contents.len() % 512) % 512, 0);
-        out
+        ferroday_cage_testkit::tar::Tar::new()
+            .file(name, 0o644, contents)
+            .unterminated()
     }
 
     #[test]

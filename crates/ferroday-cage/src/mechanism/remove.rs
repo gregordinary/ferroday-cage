@@ -509,10 +509,9 @@ mod tests {
     /// copy means the end-of-file never arrives.
     #[test]
     fn an_abandoned_child_is_released_while_a_sibling_holds_the_gate() {
-        if let Some(blocker) = crate::host::userns_blocker() {
+        if !ferroday_cage_testkit::require::userns() {
             // Without a user namespace the child fails before reaching the
             // gate, so there would be nothing to abandon.
-            eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
             return;
         }
 

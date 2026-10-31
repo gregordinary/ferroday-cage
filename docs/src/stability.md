@@ -38,7 +38,7 @@ format without the others' dependency weight: the Debian layer pulls
 What keeps the decision cheap in the meantime is that the layers already sit on
 a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
 tar, compress, extract, digest, document and OpenPGP machinery -- and reach
-around it in twenty-one places, ten of which are internal. `tools/seam.toml`
+around it in twenty-seven places, ten of which are internal. `tools/seam.toml`
 records every one with what it would cost, `tools/check-seam.py` fails on any
 difference, and a layer naming another layer is refused outright. A split, when
 it comes, is that list plus the mechanical work.
@@ -265,11 +265,12 @@ Policy that only lives in a document decays. These are enforced:
 
 | Promise | Enforcement |
 | --- | --- |
-| No breaking API change without a version bump | `cargo-semver-checks` against the last published release |
+| No breaking API change without a version bump | `cargo-semver-checks` against the last release tag, both sides built from their own lockfiles |
 | No unintended public item, path, or re-export | A committed `cargo-public-api` snapshot, diffed in review |
 | No public type loses `Send`/`Sync` | `const` assertions in `tests/auto_traits.rs` |
 | Every feature combination compiles | `cargo hack --feature-powerset --depth 2`, plus an explicit featureless check |
 | The MSRV holds | A CI build at the declared `rust-version` |
-| The profile key set is deliberate | Explicit `#[serde(rename)]` on every field, plus a test pinning the key set |
+| The profile key set is deliberate | `rename_all` on every container, a census of the field-level renames in `tools/idioms.toml`, and tests pinning the key sets of the profile format and of `NetStackBuilder` |
+| Every public enum and every struct variant is `#[non_exhaustive]` | `tests/stability.rs`, reading the committed API snapshot |
 | The untrusted-profile surface cannot widen silently | `check_restricted` destructures `CageBuilder` exhaustively, so a new field fails to compile until it is classified |
 | A userland reaching past the provisioning seam is a decision | `tools/check-seam.py` against the record in `tools/seam.toml` |

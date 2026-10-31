@@ -5,47 +5,22 @@
 
 mod common;
 
+use common::{Collect, sleeper, wait_gone};
+
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, NetStack, NetStackError, Network, Observer, RawMount};
-
-/// Builds a cage running a long sleep in the fixture rootfs — a command that
-/// stays alive so the attachment can be exercised around it.
-fn sleeper(rootfs: &Path) -> Cage {
-    Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sleep")
-        .arg("86399")
-        .build()
-        .expect("a valid sandbox configuration")
-}
-
-/// Whether a process with this pid exists on the host.
-fn process_exists(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[derive(Default)]
-struct Collect {
-    stdout: Vec<u8>,
-}
-
-impl Observer for Collect {
-    fn stdout(&mut self, chunk: &[u8]) {
-        self.stdout.extend_from_slice(chunk);
-    }
-}
+use ferroday_cage::{Cage, NetStack, NetStackError, Network, RawMount};
 
 #[test]
 fn attach_creates_the_guest_interface() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // A sysfs instance scoped to the sandbox's namespaces lists its network
@@ -106,7 +81,7 @@ fn dropping_the_handle_does_not_kill_the_sandbox() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     let pending = sleeper(rootfs)
@@ -138,7 +113,7 @@ fn abandoning_the_pending_launch_after_attach() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     let pending = sleeper(rootfs)
@@ -152,14 +127,10 @@ fn abandoning_the_pending_launch_after_attach() {
     // Dropping the pending launch tears the sandbox down as usual; the
     // attachment does not keep it alive.
     drop(pending);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_exists(pid) {
-        assert!(
-            Instant::now() < deadline,
-            "the abandoned sandbox outlived its pending handle",
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        wait_gone(pid, Duration::from_secs(5)),
+        "the abandoned sandbox outlived its pending handle",
+    );
 
     // The pump holds the namespace open past the sandbox's death, so the
     // stack still stops in an orderly way.
@@ -206,7 +177,7 @@ fn tcp_connects_to_a_host_listener_through_the_stack() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     let (port, received) = banner_listener(b"hello from the host\n");
@@ -282,7 +253,7 @@ fn tcp_delivers_a_bulk_transfer_that_ends_in_a_prompt_close() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // Comfortably past the stack's 64 KiB transmit buffer, so the buffer is
@@ -370,7 +341,7 @@ fn back_to_back_connections_are_not_capped_by_finished_ones() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // Comfortably more than the stack's 128 flow slots, so a stack that held a
@@ -429,7 +400,7 @@ fn the_default_policy_blocks_a_host_local_service() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     let (port, _received) = banner_listener(b"unreachable\n");
@@ -536,7 +507,7 @@ fn udp_reaches_a_host_socket() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // The gateway address, which host_loopback maps to 127.0.0.1 on every
@@ -554,7 +525,7 @@ fn udp_reaches_a_host_socket_through_a_named_port() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // The narrower grant maps UDP as it maps TCP: the one port it names.
@@ -571,7 +542,7 @@ fn the_stack_resolves_only_for_the_gateway() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // The interface accepts every destination so that routed traffic reaches
@@ -630,7 +601,7 @@ fn stopping_after_the_sandbox_exits_is_clean() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // A short-lived command: the sandbox exits well before the stack is
@@ -662,7 +633,7 @@ fn a_named_loopback_port_is_the_only_one_mapped() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     let (granted, _) = banner_listener(b"through the granted port\n");
@@ -755,7 +726,7 @@ fn a_published_port_reaches_a_server_in_the_guest() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // The guest serves one connection on its port 8000: it greets, then prints
@@ -809,7 +780,7 @@ fn a_published_port_already_in_use_is_refused_at_attach() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
@@ -833,7 +804,7 @@ fn a_published_connection_the_guest_refuses_is_closed_on_the_host() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
     // Nothing in the guest listens on the published port. The host listener
@@ -873,11 +844,13 @@ fn a_published_port_reaches_a_server_in_the_guest_over_ipv6() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !common::tun_available() {
+    if !common::require::tun() {
         return;
     }
-    if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
-        eprintln!("skipping: the host has no IPv6 loopback");
+    if !common::require::TUN.holds(
+        TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok(),
+        "the host has no IPv6 loopback",
+    ) {
         return;
     }
     // An IPv6 listener carries its connections to the guest's IPv6 address,

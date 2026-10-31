@@ -32,6 +32,8 @@
 
 mod common;
 
+use common::pty;
+
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +42,7 @@ use std::time::{Duration, Instant};
 use ferroday_cage::relay::{Escalation, Relay, RelayError, Signals, restore_terminal};
 use ferroday_cage::{Cage, ExitStatus, Pty, Running, Terminal};
 use rustix::process::{Pid, Signal};
-use rustix::pty::OpenptFlags;
-use rustix::termios::{self, LocalModes, SpecialCodeIndex, Termios, Winsize};
+use rustix::termios::{self, LocalModes, Termios};
 
 /// One relay at a time; see the module documentation.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -107,48 +108,7 @@ impl Session {
     /// Compared rather than eyeballed, because "looks interactive again" is not
     /// the promise the relay makes.
     fn assert_restored(&self) {
-        assert_eq!(
-            self.before.input_modes, self.after.input_modes,
-            "the input modes were not restored",
-        );
-        assert_eq!(
-            self.before.output_modes, self.after.output_modes,
-            "the output modes were not restored",
-        );
-        assert_eq!(
-            self.before.control_modes, self.after.control_modes,
-            "the control modes were not restored",
-        );
-        assert_eq!(
-            self.before.local_modes, self.after.local_modes,
-            "the local modes were not restored",
-        );
-        // `SpecialCodes` carries no equality of its own, and `make_raw` clears
-        // VMIN and VTIME and leaves the rest, so a restoration that missed any
-        // of them would show here.
-        for (name, index) in [
-            ("VINTR", SpecialCodeIndex::VINTR),
-            ("VQUIT", SpecialCodeIndex::VQUIT),
-            ("VERASE", SpecialCodeIndex::VERASE),
-            ("VKILL", SpecialCodeIndex::VKILL),
-            ("VEOF", SpecialCodeIndex::VEOF),
-            ("VTIME", SpecialCodeIndex::VTIME),
-            ("VMIN", SpecialCodeIndex::VMIN),
-            ("VSTART", SpecialCodeIndex::VSTART),
-            ("VSTOP", SpecialCodeIndex::VSTOP),
-            ("VSUSP", SpecialCodeIndex::VSUSP),
-            ("VEOL", SpecialCodeIndex::VEOL),
-            ("VREPRINT", SpecialCodeIndex::VREPRINT),
-            ("VDISCARD", SpecialCodeIndex::VDISCARD),
-            ("VWERASE", SpecialCodeIndex::VWERASE),
-            ("VLNEXT", SpecialCodeIndex::VLNEXT),
-            ("VEOL2", SpecialCodeIndex::VEOL2),
-        ] {
-            assert_eq!(
-                self.before.special_codes[index], self.after.special_codes[index],
-                "{name} was not restored",
-            );
-        }
+        pty::assert_restored(&self.before, &self.after);
     }
 }
 
@@ -165,7 +125,7 @@ fn relayed(
     let signals = Signals::install().expect("the relay's signals install");
     let relay_thread = rustix::thread::gettid();
 
-    let (primary, replica) = caller_terminal(size);
+    let (primary, replica) = pty::pair(size.0, size.1);
     let before = termios::tcgetattr(&primary).expect("the caller terminal reports its settings");
 
     let (mut running, pty) = launch(&Terminal::new().size(size.0, size.1))
@@ -248,10 +208,7 @@ impl Caller {
             .input
             .as_ref()
             .map_or(self.primary.as_fd(), OwnedFd::as_fd);
-        let mut written = 0;
-        while written < text.len() {
-            written += rustix::io::write(fd, &text.as_bytes()[written..]).expect("the write lands");
-        }
+        pty::send(fd, text);
     }
 
     /// Closes the relay's input, which is end of input where it is a pipe.
@@ -267,12 +224,7 @@ impl Caller {
     /// whatever chunks the line discipline chose.
     fn read_until(&mut self, needle: &str, patience: Duration) -> bool {
         let deadline = Instant::now() + patience;
-        while !self.seen.contains(needle) {
-            if !common::drain_until(&self.primary, deadline, &mut self.seen) {
-                break;
-            }
-        }
-        self.seen.contains(needle)
+        pty::read_until(&self.primary, needle, deadline, &mut self.seen)
     }
 
     /// Reads until `needle` appears, failing the test if it does not.
@@ -288,9 +240,9 @@ impl Caller {
     /// was just sent.
     fn settle(&mut self, how_long: Duration) {
         let deadline = Instant::now() + how_long;
-        while Instant::now() < deadline
-            && common::drain_until(&self.primary, deadline, &mut self.seen)
-        {}
+        while Instant::now() < deadline && pty::drain_until(&self.primary, deadline, &mut self.seen)
+        {
+        }
     }
 
     /// Keeps reading until the relay reports the session over.
@@ -298,7 +250,7 @@ impl Caller {
         let deadline = Instant::now() + PATIENCE;
         while !done.load(Ordering::Acquire) && Instant::now() < deadline {
             let step = Instant::now() + Duration::from_millis(50);
-            common::drain_until(&self.primary, step, &mut self.seen);
+            pty::drain_until(&self.primary, step, &mut self.seen);
         }
     }
 
@@ -318,7 +270,7 @@ impl Caller {
     /// the session's terminal has closed.
     fn expect_restored(&mut self) {
         let deadline = Instant::now() + PROMPTLY;
-        while is_raw(&self.settings()) {
+        while pty::is_raw(&self.settings()) {
             assert!(
                 Instant::now() < deadline,
                 "the relay never stopped relaying; it printed:\n{}",
@@ -330,7 +282,8 @@ impl Caller {
 
     /// Resizes the caller's terminal. Does not itself signal the relay.
     fn resize(&self, rows: u16, cols: u16) {
-        termios::tcsetwinsize(&self.primary, winsize(rows, cols)).expect("the size is settable");
+        termios::tcsetwinsize(&self.primary, pty::winsize(rows, cols))
+            .expect("the size is settable");
     }
 
     /// Raises `signal` at the relay's thread.
@@ -347,35 +300,6 @@ impl Caller {
             )
         }
         .expect("the signal is deliverable");
-    }
-}
-
-/// A pseudoterminal pair standing in for the caller's own terminal: the user's
-/// end, and the end the relay is given.
-fn caller_terminal(size: (u16, u16)) -> (OwnedFd, OwnedFd) {
-    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-    let primary = rustix::pty::openpt(flags).expect("a pseudoterminal is available");
-    rustix::pty::unlockpt(&primary).expect("the replica unlocks");
-    let replica = rustix::pty::ioctl_tiocgptpeer(&primary, flags).expect("the replica opens");
-    termios::tcsetwinsize(&primary, winsize(size.0, size.1)).expect("the size is settable");
-    (primary, replica)
-}
-
-/// Whether `settings` are raw: canonical input and echo both off, the two a
-/// cooked terminal always has.
-fn is_raw(settings: &Termios) -> bool {
-    !settings
-        .local_modes
-        .intersects(LocalModes::ICANON | LocalModes::ECHO)
-}
-
-/// A window size in rows and columns.
-fn winsize(rows: u16, cols: u16) -> Winsize {
-    Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
     }
 }
 
@@ -953,12 +877,7 @@ fn a_deadline_stops_a_restricted_command_that_closed_its_terminal() {
 /// failure.
 #[cfg(feature = "hardening")]
 fn restricted_shell(script: &str) -> Option<ferroday_cage::Restriction> {
-    if ferroday_cage::host::landlock_abi().is_none() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
-            "Landlock is required but the kernel offers none",
-        );
-        eprintln!("skipping: the kernel offers no Landlock support");
+    if !common::landlock() {
         return None;
     }
     // The command runs from the system trees, so they are what it is granted;
@@ -996,13 +915,12 @@ const BACKGROUND_HELPER: &str = "FERRODAY_CAGE_TEST_BACKGROUND_RELAY";
 /// [`helper_relay_started_in_the_background`].
 #[test]
 fn a_session_started_in_the_background_leaves_the_terminal_to_its_shell() {
-    use std::os::unix::process::CommandExt as _;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     let Some(_) = common::fixture_rootfs() else {
         return;
     };
-    let (primary, replica) = caller_terminal((24, 80));
+    let (primary, replica) = pty::pair(24, 80);
     let exe = std::env::current_exe().expect("the test binary has a path");
     let mut command = Command::new(exe);
     command
@@ -1012,27 +930,8 @@ fn a_session_started_in_the_background_leaves_the_terminal_to_its_shell() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env(BACKGROUND_HELPER, "1")
-        .stdin(Stdio::from(
-            replica.try_clone().expect("the replica clones"),
-        ))
-        .stdout(Stdio::from(
-            replica.try_clone().expect("the replica clones"),
-        ))
-        .stderr(Stdio::from(
-            replica.try_clone().expect("the replica clones"),
-        ));
-    // SAFETY: between fork and exec the child calls only `setsid` and one
-    // ioctl, both async-signal-safe, and allocates nothing. A session of its
-    // own is what lets the replica become the child's controlling terminal.
-    unsafe {
-        command.pre_exec(|| {
-            rustix::process::setsid()?;
-            rustix::process::ioctl_tiocsctty(rustix::stdio::stdin())?;
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().expect("the helper starts");
+        .env(BACKGROUND_HELPER, "1");
+    let mut child = pty::spawn_controlled(&mut command, &replica);
     // The test's own copy goes, so the helper's exit hangs the primary up.
     drop(replica);
 
@@ -1049,13 +948,13 @@ fn a_session_started_in_the_background_leaves_the_terminal_to_its_shell() {
             let _ = child.wait();
             panic!("the helper did not finish; it printed:\n{seen}");
         }
-        common::drain_until(
+        pty::drain_until(
             &primary,
             Instant::now() + Duration::from_millis(50),
             &mut seen,
         );
     };
-    while common::drain_until(
+    while pty::drain_until(
         &primary,
         Instant::now() + Duration::from_millis(100),
         &mut seen,
@@ -1086,7 +985,7 @@ fn helper_relay_started_in_the_background() {
     let relay_thread = rustix::thread::gettid();
     let terminal = rustix::stdio::stdin();
     assert!(
-        !is_raw(&termios::tcgetattr(terminal).expect("the terminal reports its settings")),
+        !pty::is_raw(&termios::tcgetattr(terminal).expect("the terminal reports its settings")),
         "the helper's premise: a cooked terminal",
     );
 
@@ -1120,7 +1019,7 @@ fn helper_relay_started_in_the_background() {
         }
         .is_ok()
     };
-    let raw_now = || termios::tcgetattr(terminal).is_ok_and(|settings| is_raw(&settings));
+    let raw_now = || termios::tcgetattr(terminal).is_ok_and(|settings| pty::is_raw(&settings));
 
     let (outcome, report) = std::thread::scope(|scope| {
         // The driver records what it saw and always ends the session, so a
@@ -1190,7 +1089,7 @@ fn helper_relay_started_in_the_background() {
 /// recorded a raw session, this terminal is not it.
 #[test]
 fn restoring_leaves_a_terminal_no_session_touched_alone() {
-    let (primary, _replica) = caller_terminal((24, 80));
+    let (primary, _replica) = pty::pair(24, 80);
     let before = termios::tcgetattr(&primary).expect("the settings are readable");
     restore_terminal();
     restore_terminal();

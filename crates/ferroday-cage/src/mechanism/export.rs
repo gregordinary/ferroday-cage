@@ -898,10 +898,9 @@ mod tests {
     /// child has let go of its copy too.
     #[test]
     fn the_export_child_sweeps_the_descriptors_it_inherited() {
-        if let Some(blocker) = crate::host::userns_blocker() {
+        if !ferroday_cage_testkit::require::userns() {
             // The child maps itself before it walks; without a user namespace
             // it fails before the sweep could matter.
-            eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
             return;
         }
 

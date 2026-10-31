@@ -29,9 +29,23 @@ why = "A launch failure, wrapped as `DebianError::Launch`."
 
 [[layer.reach]]
 name = "IdentityMap"
+count = 2
+kind = "public"
+why = """\
+The map the builder takes and the bootstrap's own cages run under, imported \
+once by the layer and once by its bootstrap."""
+
+[[layer.reach]]
+name = "Observer"
 count = 1
 kind = "public"
-why = "The map the bootstrap's own cages run under."
+why = "The observer dpkg's output reaches the layer's own events through."
+
+[[layer.reach]]
+name = "Stdio"
+count = 1
+kind = "public"
+why = "`Stdio::Null`, the standard input a package script's cage runs with."
 
 [[layer.reach]]
 name = "host"
@@ -83,9 +97,21 @@ why = "The outcome an install script reports."
 
 [[layer.reach]]
 name = "IdentityMap"
+count = 2
+kind = "public"
+why = "As in the Debian layer: once by the layer, once by its bootstrap."
+
+[[layer.reach]]
+name = "Observer"
 count = 1
 kind = "public"
-why = "The map the bootstrap's own cages run under."
+why = "The observer an install script's output reaches the layer's own events through."
+
+[[layer.reach]]
+name = "Stdio"
+count = 1
+kind = "public"
+why = "`Stdio::Null`, the standard input an install script's cage runs with."
 
 [[layer.reach]]
 name = "host"

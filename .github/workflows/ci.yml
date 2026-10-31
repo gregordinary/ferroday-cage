@@ -23,7 +23,7 @@ jobs:
     name: Format, lint, test, docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (pinned)
         # rust-toolchain.toml pins the toolchain and its components, so fmt,
         # clippy, and the build all run under the same rustfmt everywhere.
@@ -33,7 +33,7 @@ jobs:
         # Keyed on the lockfile and the job, so a job reuses only its own
         # feature selection's artifacts and a dependency change invalidates
         # them. The workspace's own crates are never cached.
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -97,11 +97,15 @@ jobs:
           FERRODAY_CAGE_REQUIRE_USERNS: '1'
           FERRODAY_CAGE_REQUIRE_SUBID: '1'
           FERRODAY_CAGE_REQUIRE_TUN: '1'
+          FERRODAY_CAGE_REQUIRE_OVERLAY: '1'
           FERRODAY_CAGE_REQUIRE_LANDLOCK: '1'
           FERRODAY_CAGE_REQUIRE_SECCOMP: '1'
-          # FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE is not set: the scope tests
-          # need Landlock ABI 6 (Linux 6.12), which a hosted runner's kernel is
-          # not guaranteed to reach. Set it on a runner whose kernel does.
+          # The scope tests need Landlock ABI 6 (Linux 6.12). The hosted image
+          # behind `ubuntu-latest` runs a 6.17 kernel on Ubuntu 24.04 and 7.0 on
+          # 26.04, which the label is moving to, so a skip here is a regression
+          # rather than an old host. A self-hosted runner on an older kernel
+          # unsets this.
+          FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE: '1'
       - name: Test (serde without hardening)
         # A profile format built without the hardening layer must refuse a
         # profile that configures hardening; only this feature combination
@@ -125,34 +129,28 @@ jobs:
     name: Feature combinations
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (pinned)
         run: rustup show
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-hack
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-hack
+          tool: cargo-hack@0.6.45
       - name: Check the featureless build
         # The library has no default features, so this is the build a consumer
         # gets from a bare dependency line. Nothing else in CI covers it: every
         # other step is a workspace build, where the CLI's feature selection
         # unifies onto the library.
-        #
-        # Without `--all-targets`, deliberately. A test target pulls the
-        # dev-dependencies in, and the testkit's own features forward to this
-        # crate's, so `--all-targets` builds the library with whatever the tests
-        # need rather than with nothing. That build is worth checking too and is
-        # the step below; this one is the consumer's.
         run: cargo check -p ferroday-cage --no-default-features
       - name: Check the featureless build's targets
-        # The same selection with the tests and examples, which is the library
-        # plus whatever the dev-dependencies unify onto it. What this catches
-        # that the step above does not is a test or example that stops
-        # compiling; what the step above catches that this does not is the
-        # library reaching for something a bare dependency line has no access
-        # to.
+        # The same selection with the tests and examples. The testkit enables
+        # none of this crate's features, so the library is still built with
+        # none: the targets compiled are the ones that require nothing, and the
+        # featureless half of a partly gated test such as
+        # tests/debug_rendering.rs is compiled here and nowhere else. A test or
+        # example that reaches for a feature without declaring it fails here.
         run: cargo check -p ferroday-cage --no-default-features --all-targets
       - name: Check the feature powerset
         # Depth 2 keeps the matrix small while covering the pairwise
@@ -180,7 +178,8 @@ jobs:
         # `required-features` still compiles under a combination that satisfies
         # them, so one reaching past what it declared is invisible to an
         # ordinary package check and to every all-features command a contributor
-        # runs locally.
+        # runs locally. The dev-dependencies add no feature of this crate's, so
+        # each combination here is exactly the one named.
         env:
           RUSTFLAGS: -D warnings
         run: cargo hack check -p ferroday-cage --feature-powerset --depth 2 --all-targets
@@ -210,17 +209,17 @@ jobs:
       # is reviewed like any other.
       RUSTDOC_JSON_NIGHTLY: nightly-2026-07-09
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (pinned, plus the pinned nightly for rustdoc JSON)
         run: |
           rustup show
           rustup toolchain install "$RUSTDOC_JSON_NIGHTLY" --profile minimal
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-public-api
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-public-api
+          tool: cargo-public-api@0.52.0
       - name: Regenerate the snapshot
         # Auto-trait impls are kept in the snapshot on purpose: it records both
         # `impl Send for Cage` and `!Send for Running<'obs>`, so an auto trait
@@ -241,37 +240,77 @@ jobs:
     name: Semver
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The baseline is the newest release tag, so this job needs the
+          # history and its tags rather than the single commit a checkout
+          # fetches by default.
+          fetch-depth: 0
       - name: Install Rust (pinned)
         run: rustup show
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-semver-checks
-      - name: Check against the last published release
-        # Compares the working tree's public API against the newest version on
-        # crates.io and fails on an undeclared breaking change.
+          tool: cargo-semver-checks@0.50.0
+      - name: Document the last release and the tree, each from its own lockfile
+        # The baseline is the newest `v*` tag reachable from the commit before
+        # this one: the release this change would follow, and on a release
+        # commit itself the release before it.
+        #
+        # Both sides are built here, from source, with `--locked`, rather than
+        # left to cargo-semver-checks. Given a registry version or a revision,
+        # it resolves the baseline's dependencies afresh, so a dependency's own
+        # later release can stop a published baseline compiling at all and turn
+        # this job red for a reason that is not this crate's API. The tag
+        # carries the lockfile it was released with, and building from it keeps
+        # the comparison about this crate.
         #
         # `--all-features`, as the API snapshot above takes it and for the same
         # reason: the crate declares no `default` feature, so without it the
         # compared surface is the featureless one and every item a feature gates
         # -- the provisioners, the hardening layer, the network stack -- is
-        # outside the gate entirely.
-        run: cargo semver-checks check-release -p ferroday-cage --all-features
+        # outside the gate entirely. `RUSTC_BOOTSTRAP` is what lets the pinned
+        # stable toolchain emit rustdoc's JSON, as cargo-semver-checks itself
+        # does when it builds a side.
+        env:
+          RUSTC_BOOTSTRAP: '1'
+        run: |
+          baseline="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^)"
+          echo "Comparing against $baseline"
+          mkdir -p "$RUNNER_TEMP/baseline"
+          git archive "$baseline" | tar -x -C "$RUNNER_TEMP/baseline"
+          cargo rustdoc --locked --manifest-path "$RUNNER_TEMP/baseline/Cargo.toml" \
+            -p ferroday-cage --all-features --lib --target-dir "$RUNNER_TEMP/baseline-target" \
+            -- -Z unstable-options --output-format json
+          cargo rustdoc --locked -p ferroday-cage --all-features --lib \
+            -- -Z unstable-options --output-format json
+      - name: Check the tree against the last release
+        # Fails on a breaking change the version number does not declare. The
+        # verdict is relative to the workspace's `version`: while it still names
+        # the last release, the tree is judged as a compatible release of it,
+        # so a breaking change fails here with the items it breaks listed. That is the job
+        # working, not noise. A failure names what the next release must
+        # declare, and bumping the version to the next breaking release (0.4.x
+        # to 0.5.0) is what turns it green. Read the listed items against the
+        # changelog's **Breaking.** entries: every one should be there.
+        run: |
+          cargo semver-checks check-release \
+            --baseline-rustdoc "$RUNNER_TEMP/baseline-target/doc/ferroday_cage.json" \
+            --current-rustdoc target/doc/ferroday_cage.json
 
   deny:
     name: License and advisory policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Check dependency licenses and advisories
         # deny.toml pins the permitted license set, the RUSTSEC advisory
         # policy, and the registries a dependency may come from; this fails the
         # build if a dependency enters the tree under an unlisted license, from
         # anywhere but crates.io, or carrying a known, unignored advisory.
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check licenses advisories sources
 
@@ -279,7 +318,7 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (MSRV)
         # An independent floor guard: the `+1.91` override wins over the pinned
         # toolchain, which sits ahead of the floor, so this checks the version
@@ -289,7 +328,7 @@ jobs:
       # by the floor toolchain rather than the pinned one — stay in a cache of
       # their own without being told which toolchain they came from.
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check
         run: cargo +1.91 check --workspace --all-targets --all-features
 
@@ -298,15 +337,24 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MDBOOK_VERSION: 0.5.4
+      # The release asset's own digest, as GitHub records it for the release.
+      MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (pinned)
         run: rustup show
-      - name: Cache the dependency build
-        uses: Swatinem/rust-cache@v2
+      # No dependency cache in this job. What it builds is what `pages`
+      # publishes, and a restored cache is compiled code the build would run:
+      # the job pays for its own dependency build rather than trust one.
       - name: Install mdBook
+        # Checked against the digest above before it is unpacked, so a
+        # replaced release asset fails the job rather than building the site.
         run: |
-          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
+          archive="mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSLf -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/$archive"
+          echo "${MDBOOK_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive"
       - name: Build
         # Rendering only: mdBook does not compile a code block. The guide's Rust
         # blocks are doctests of the library -- src/guide.rs includes every
@@ -327,7 +375,7 @@ jobs:
       - name: Package the guide
         # Uploaded on every run, so a pull request proves the artifact builds;
         # only the deploy job below publishes it, and only from main.
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: docs/book
 
@@ -360,4 +408,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

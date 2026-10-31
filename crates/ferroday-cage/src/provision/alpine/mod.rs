@@ -4396,26 +4396,9 @@ mod tests {
     /// A one-entry uncompressed tar holding `path` with `contents`, as a
     /// package's data segment lays a file down.
     fn one_file_archive(path: &str, contents: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(
-            &crate::provision::tar::ustar_block(
-                path.as_bytes(),
-                b"",
-                0o644,
-                0,
-                0,
-                contents.len() as u64,
-                0,
-                b'0',
-                b"",
-            )
-            .expect("the header fields fit"),
-        );
-        out.extend_from_slice(contents);
-        crate::provision::tar::pad(&mut out, contents.len() as u64).expect("padding a vector");
-        // The two zero blocks that end an archive.
-        out.extend_from_slice(&[0u8; 1024]);
-        out
+        ferroday_cage_testkit::tar::Tar::new()
+            .file(path, 0o644, contents)
+            .finish()
     }
 
     /// A record for a package named `name` that carries the extra `.PKGINFO`

@@ -18,7 +18,6 @@ mod common;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// The built binary under test.
@@ -31,28 +30,8 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// Runs `command` to its end, with its streams as configured, and returns what
 /// it wrote to those that are piped. Fails the test if the run outlasts
 /// [`PATIENCE`].
-///
-/// The terminal suite bounds its runs the same way, around a pseudoterminal of
-/// its own. The wait runs on a thread of its own here, so a run whose output
-/// fills its pipe is still collected rather than mistaken for a hang.
 fn run_bounded(mut command: Command) -> Output {
-    let child = command.spawn().expect("the command starts");
-    let pid = child.id();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(child.wait_with_output());
-    });
-    match receiver.recv_timeout(PATIENCE) {
-        Ok(output) => output.expect("the command finishes"),
-        Err(_) => {
-            // Unreaped until the waiting thread collects it, so the number
-            // still names this child.
-            let pid =
-                rustix::process::Pid::from_raw(pid as i32).expect("a child's pid is positive");
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-            panic!("the run did not finish within {PATIENCE:?}");
-        }
-    }
+    common::run_bounded(&mut command, PATIENCE)
 }
 
 /// `fcage --rootfs <fixture> [extra] -- /bin/sh -c <script>`.
@@ -68,12 +47,7 @@ fn cage_sh(rootfs: &Path, extra: &[&str], script: &str) -> Command {
 /// `fcage --restrict --seccomp curated -- /bin/sh -c <script>`, when the
 /// kernel offers seccomp to confine it with.
 fn restricted_sh(script: &str) -> Option<Command> {
-    if !ferroday_cage::host::seccomp_available() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_SECCOMP").is_none(),
-            "seccomp is required but the kernel offers none",
-        );
-        eprintln!("skipping: the kernel offers no seccomp support");
+    if !common::require::seccomp(ferroday_cage::host::seccomp_available()) {
         return None;
     }
     let mut command = Command::new(FCAGE);

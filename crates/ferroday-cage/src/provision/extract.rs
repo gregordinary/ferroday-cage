@@ -1912,10 +1912,8 @@ mod layered_tests {
             rustix::fs::fsetxattr(&opened, "user.probe", b"1", rustix::fs::XattrFlags::empty())
                 .is_ok();
         fs::remove_dir(&probe).unwrap();
-        if !held {
-            eprintln!("skipping: this filesystem holds no user. attributes");
-        }
-        held
+        ferroday_cage_testkit::require::OVERLAY
+            .holds(held, "this filesystem holds no user. attributes")
     }
 
     /// Makes an overlay whiteout at `path`, or answers `false` where the
@@ -1930,7 +1928,8 @@ mod layered_tests {
         ) {
             Ok(()) => true,
             Err(rustix::io::Errno::PERM) => {
-                eprintln!("skipping: this kernel refuses an unprivileged whiteout");
+                ferroday_cage_testkit::require::OVERLAY
+                    .skip("this kernel refuses an unprivileged whiteout");
                 false
             }
             Err(errno) => panic!("making a whiteout: {errno}"),
@@ -2006,12 +2005,13 @@ mod layered_tests {
     fn the_merged_view_keeps_the_bases_links_and_shows_the_increment_through_them() {
         // The proof the kernel gives: the base and the upper mounted as the
         // overlay a build sandbox is rooted on.
-        let Some(fixture) = ferroday_cage_testkit::fixture::fixture_rootfs() else {
+        let Some(fixture) = ferroday_cage_testkit::fixture::fixture_rootfs(|tarball, root| {
+            crate::provision::ensure(root, &mut crate::provision::Tarball::new(tarball))
+        }) else {
             return;
         };
         let scratch = Scratch::for_test("extract-layered", "merged-view");
-        if let Some(blocker) = crate::host::overlay_blocker(&scratch) {
-            eprintln!("skipping: overlay-rooted sandboxes are unavailable: {blocker}");
+        if !ferroday_cage_testkit::require::overlay(&scratch) {
             return;
         }
         // The pinned minirootfs, made merged-usr where a stage3 is: `lib64`

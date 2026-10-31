@@ -1,29 +1,40 @@
-//! Test fixtures shared by the workspace's integration tests.
+//! Test fixtures and harnesses shared by the workspace's tests.
 //!
-//! Both crates' suites need the same things: the pinned Alpine minirootfs, a
-//! scratch directory that clears itself, a tar writer, an `ar` writer, and a
-//! hex encoder. Each had its own copy, and the copies drifted — one tar writer
-//! recorded per-entry ownership and another did not, one hex encoder existed
-//! only because the library's was private.
+//! Both crates' suites need the same things: the pinned Alpine minirootfs,
+//! scratch directories that clear themselves, the rule for skipping a test the
+//! host cannot run, a tar writer, `ar` and `.deb` writers, a hex encoder, a
+//! pseudoterminal to play the user at, and a few process and sandbox helpers.
+//! One copy of each is what keeps them agreeing: a skip that honors its
+//! `REQUIRE` variable in one suite honors it in every suite.
 //!
 //! Nothing here ships. The crate is `publish = false` and is a dev-dependency
 //! of both crates.
 //!
 //! # Features
 //!
-//! Every part that needs something of the library beyond its featureless core
-//! sits behind a feature of this crate, and each forwards rather than enabling
-//! anything itself. A test suite asks for what it uses, and the library's
-//! featureless and feature-powerset checks keep meaning what they say.
+//! None of this crate's features enables one of the library's. Cargo resolves
+//! a dev-dependency's features once for every test and example of a package,
+//! so a feature here that forwarded to the library's would give every test
+//! build of the library that feature. The `features` job's featureless and
+//! powerset checks would then build what no combination selects, and a test
+//! reaching past its `required-features` would compile anyway.
+//!
+//! So where a fixture needs a library feature, the dependent supplies that
+//! part under a `cfg` of its own: the fixture root's provisioning
+//! ([`fixture`]), and a fixture repository's `file://` URL ([`deb`]). The
+//! features that remain gate this crate's own dependencies:
+//!
+//! - `hex`: SHA-256, for `hex` and the repository half of [`deb`].
+//! - `pty`: rustix's terminal calls, for `pty`.
 
-#[cfg(feature = "debian")]
 pub mod deb;
-#[cfg(feature = "tarball")]
 pub mod fixture;
-#[cfg(feature = "debian")]
+#[cfg(feature = "hex")]
 pub mod hex;
+pub mod process;
 #[cfg(feature = "pty")]
 pub mod pty;
+pub mod require;
+pub mod sandbox;
 pub mod scratch;
-#[cfg(feature = "debian")]
 pub mod tar;

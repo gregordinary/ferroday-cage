@@ -4,21 +4,11 @@
 
 mod common;
 
-use std::path::Path;
-use std::time::{Duration, Instant};
+use common::{Collect, process_exists, sleeper, wait_gone};
 
-use ferroday_cage::{Cage, Network, Observer};
+use std::time::Duration;
 
-/// Builds a cage running a long sleep in the fixture rootfs — a command that
-/// stays alive so its namespace can be inspected.
-fn sleeper(rootfs: &Path) -> Cage {
-    Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sleep")
-        .arg("86399")
-        .build()
-        .expect("a valid sandbox configuration")
-}
+use ferroday_cage::{Cage, Network};
 
 /// The network namespace a process is in, as the `net:[...]` symlink target
 /// under `/proc/<pid>/ns/net`.
@@ -27,22 +17,6 @@ fn network_namespace(pid: u32) -> String {
         .expect("the process has a network namespace")
         .to_string_lossy()
         .into_owned()
-}
-
-/// Whether a process with this pid exists on the host.
-fn process_exists(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[derive(Default)]
-struct Collect {
-    stdout: Vec<u8>,
-}
-
-impl Observer for Collect {
-    fn stdout(&mut self, chunk: &[u8]) {
-        self.stdout.extend_from_slice(chunk);
-    }
 }
 
 #[test]
@@ -167,12 +141,8 @@ fn abandoning_a_pending_launch_tears_the_sandbox_down() {
     );
     // Dropping without proceeding must not leak the sandbox.
     drop(pending);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_exists(pid) {
-        assert!(
-            Instant::now() < deadline,
-            "the abandoned sandbox outlived its pending handle",
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        wait_gone(pid, Duration::from_secs(5)),
+        "the abandoned sandbox outlived its pending handle",
+    );
 }

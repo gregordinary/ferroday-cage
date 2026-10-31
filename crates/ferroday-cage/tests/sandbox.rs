@@ -1144,7 +1144,7 @@ fn the_host_resolv_conf_is_bound_read_only_with_the_host_network() {
         return;
     };
     let Ok(source) = std::fs::canonicalize("/etc/resolv.conf") else {
-        eprintln!("skipping: the host has no resolv.conf");
+        common::require::premise_unmet("the host has no resolv.conf");
         return;
     };
     let expected = std::fs::read_to_string(source).unwrap();

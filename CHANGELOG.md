@@ -614,6 +614,15 @@ consumer upgrading can skip it.
 - Dependencies refreshed within their ranges. The manifest states why a
   `debian` or `gentoo` build carries two `sha2` lines: `lzma-rust2` selects 0.11,
   and `pgp` still depends on 0.10.
+- Every test skip goes through the testkit's `require` module, which honors its
+  `REQUIRE` variable at every site, and `FERRODAY_CAGE_REQUIRE_LANDLOCK_NET` is
+  folded into `FERRODAY_CAGE_REQUIRE_LANDLOCK`. The testkit holds one copy of
+  each fixture and harness, the tar writer, the pseudoterminal and the process
+  helpers among them, and enables none of the library's features.
+- CI pins every action by commit and every installed tool by version, checks
+  mdBook's download against its digest, and builds the semver baseline from the
+  last release tag with its own lockfile. It sets
+  `FERRODAY_CAGE_REQUIRE_OVERLAY` and `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE`.
 
 ## [0.4.5] - 2026-09-26
 

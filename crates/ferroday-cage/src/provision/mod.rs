@@ -1940,8 +1940,7 @@ mod tests {
         // `PATH_MAX`, and then meets a directory whose own mode denies it the
         // read the walk needs -- what an overlay leaves in its work area, with
         // something inside it. The single-map escalation finishes the job.
-        if let Some(blocker) = crate::host::userns_blocker() {
-            eprintln!("skipping: unprivileged user namespaces are unavailable: {blocker}");
+        if !ferroday_cage_testkit::require::userns() {
             return;
         }
         let dir = Scratch::for_test("provision", "deep-sealed");

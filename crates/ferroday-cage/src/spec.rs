@@ -5385,6 +5385,18 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Whether the host has a resolver configuration a test can watch the
+    /// build bind; the skip without one says so.
+    fn resolv_conf_to_bind() -> bool {
+        let present = host_has_resolv_conf();
+        if !present {
+            ferroday_cage_testkit::require::premise_unmet(
+                "the host has no /etc/resolv.conf to bind",
+            );
+        }
+        present
+    }
+
     #[test]
     fn host_network_skips_the_loopback_and_may_bind_resolv_conf() {
         let cage = sh_in("/tmp").network(Network::Host).build().unwrap();
@@ -5406,7 +5418,7 @@ mod tests {
         // mount pushed after them takes that back for the one target they were
         // most deliberate about: the sandbox's DNS would be the host's however
         // explicitly they said otherwise.
-        if !host_has_resolv_conf() {
+        if !resolv_conf_to_bind() {
             return;
         }
         let dir = Scratch::new("resolv-replaced");
@@ -5476,7 +5488,7 @@ mod tests {
         // managed bind's target would be created in it, which is the caller's
         // host directory: an empty file left there for good, or, for a
         // read-only bind, a launch that fails. It yields instead.
-        if !host_has_resolv_conf() {
+        if !resolv_conf_to_bind() {
             return;
         }
         let dir = Scratch::new("resolv-under-a-bind");
@@ -5565,7 +5577,7 @@ mod tests {
         // has one created. The plan records that path, which is how the caller
         // side knows to take it away once the sandbox is gone. A rootfs that
         // ships the file has nothing created and so nothing to remove.
-        if !host_has_resolv_conf() {
+        if !resolv_conf_to_bind() {
             return;
         }
         let dir = Scratch::new("resolv");
@@ -5620,7 +5632,7 @@ mod tests {
         // exists — a silent no-op leaving the upper with a resolver
         // configuration the base never had, which an export of that upper
         // carries onward.
-        if !host_has_resolv_conf() {
+        if !resolv_conf_to_bind() {
             return;
         }
         let dir = Scratch::new("resolv-overlay");
@@ -5633,15 +5645,18 @@ mod tests {
             .network(Network::Host)
             .command("/bin/sh")
             .build();
-        let Ok(cage) = built else {
+        let cage = match built {
+            Ok(cage) => cage,
             // A host that cannot establish an unprivileged overlay refuses the
-            // build, so there is no plan to assert against.
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_OVERLAY").is_none(),
-                "overlay-rooted cages are required but unavailable here"
-            );
-            eprintln!("skipping: an unprivileged overlay is unavailable here");
-            return;
+            // build, so there is no plan to assert against. Any other refusal
+            // is this test's failure.
+            Err(Error::Config(ConfigError::OverlayUnavailable { blocker })) => {
+                ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                    "an unprivileged overlay is unavailable here: {blocker}"
+                ));
+                return;
+            }
+            Err(err) => panic!("the overlay sandbox builds: {err}"),
         };
         assert!(binds_resolv_conf(&cage));
         assert_eq!(
@@ -5724,7 +5739,8 @@ mod tests {
         // replaces it, which the removal has to undo, so it is told apart.
         reset();
         if let Err(errno) = whiteout(&upper.join("etc/x")) {
-            eprintln!("skipping: this host cannot create a whiteout: {errno}");
+            ferroday_cage_testkit::require::OVERLAY
+                .skip(format!("this host cannot create a whiteout: {errno}"));
             return;
         }
         assert_eq!(presence(), Presence::WhitedOut);
@@ -5757,7 +5773,8 @@ mod tests {
         // whiteouts of another kind, and is not opaque.
         reset();
         if let Err(errno) = mark_opaque(&middle.join("etc"), b"y") {
-            eprintln!("skipping: this filesystem cannot hold a user xattr: {errno}");
+            ferroday_cage_testkit::require::OVERLAY
+                .skip(format!("this filesystem cannot hold a user xattr: {errno}"));
             return;
         }
         assert_eq!(presence(), Presence::Absent);
@@ -5800,7 +5817,8 @@ mod tests {
         std::fs::create_dir_all(base.join("etc")).unwrap();
         std::fs::write(base.join("etc/shipped"), b"shipped").unwrap();
         if let Err(errno) = whiteout(&upper.join("etc/shipped")) {
-            eprintln!("skipping: this host cannot create a whiteout: {errno}");
+            ferroday_cage_testkit::require::OVERLAY
+                .skip(format!("this host cannot create a whiteout: {errno}"));
             return;
         }
         let mut lowering = Lowering::default();
@@ -5996,9 +6014,48 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "serde"))]
-mod serde_tests {
+pub(crate) mod serde_tests {
     use super::*;
     use crate::scratch::Scratch;
+
+    /// Every key a rendered TOML document carries, as a sorted list of dotted
+    /// paths, with an array index rendered as `[]`.
+    ///
+    /// The one reading behind each serde format's key pin: the profile format
+    /// here, which needs the hardening layer to name every key, and
+    /// `NetStackBuilder`'s beside the network stack.
+    #[cfg(any(feature = "hardening", feature = "netstack"))]
+    pub(crate) fn profile_keys(rendered: &str) -> Vec<String> {
+        fn walk(value: &toml::Value, prefix: &str, into: &mut Vec<String>) {
+            match value {
+                toml::Value::Table(table) => {
+                    for (key, nested) in table {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        into.push(path.clone());
+                        walk(nested, &path, into);
+                    }
+                }
+                toml::Value::Array(items) => {
+                    for item in items {
+                        walk(item, &format!("{prefix}[]"), into);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let rendered: toml::Table =
+            toml::from_str(rendered).expect("the rendering parses back as TOML");
+        let mut keys = Vec::new();
+        walk(&toml::Value::Table(rendered), "", &mut keys);
+        keys.sort();
+        keys.dedup();
+        keys
+    }
 
     /// A profile naming every field the format has, for the key-pinning test
     /// below. Nothing here is a meaningful configuration; it exists so that
@@ -6041,8 +6098,16 @@ upper = "/var/tmp/upper"
 work = "/var/tmp/work"
 
 [rlimit]
-processes = 64
+address-space = "unlimited"
+core-dump = 0
 cpu-time = { soft = 10, hard = "unlimited" }
+data = "unlimited"
+file-size = "unlimited"
+locked-memory = 65536
+open-files = 1024
+pending-signals = 64
+processes = 64
+stack = 8388608
 
 [env]
 PATH = "/usr/bin"
@@ -6074,15 +6139,54 @@ port = 443
 access = "c"
 "#;
 
-    /// The keys the exhaustive profile above renders, in sorted order.
+    /// The hardening keys the profile above cannot carry beside its own,
+    /// because each names the other form of a value it already sets: dropping
+    /// every capability rather than keeping some, and a seccomp table rather
+    /// than the curated policy, once per side, since a table allows or denies
+    /// and never both.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 61] = [
+    const OTHER_FORM_PROFILES: [&str; 2] = [
+        r#"
+[hardening]
+drop-caps = true
+
+[hardening.seccomp]
+allow = ["read", "write", "exit_group"]
+errno = { clone3 = "ENOSYS" }
+
+[[hardening.seccomp.allow-rule]]
+syscall = "ioctl"
+[[hardening.seccomp.allow-rule.arg]]
+index = 1
+len = "dword"
+op = "masked-eq"
+mask = 255
+value = 21
+"#,
+        r#"
+[hardening.seccomp]
+deny = ["ptrace"]
+
+[[hardening.seccomp.deny-rule]]
+syscall = "clone"
+[[hardening.seccomp.deny-rule.arg]]
+index = 0
+len = "qword"
+op = "eq"
+value = 268435456
+"#,
+    ];
+
+    /// The keys the profiles above render between them, in sorted order.
+    #[cfg(feature = "hardening")]
+    const EXPECTED_PROFILE_KEYS: [&str; 89] = [
         "args",
         "base-env",
         "command",
         "env",
         "env.PATH",
         "hardening",
+        "hardening.drop-caps",
         "hardening.keep-caps",
         "hardening.landlock-fs",
         "hardening.landlock-fs[].access",
@@ -6092,6 +6196,25 @@ access = "c"
         "hardening.landlock-net[].port",
         "hardening.landlock-scope",
         "hardening.seccomp",
+        "hardening.seccomp.allow",
+        "hardening.seccomp.allow-rule",
+        "hardening.seccomp.allow-rule[].arg",
+        "hardening.seccomp.allow-rule[].arg[].index",
+        "hardening.seccomp.allow-rule[].arg[].len",
+        "hardening.seccomp.allow-rule[].arg[].mask",
+        "hardening.seccomp.allow-rule[].arg[].op",
+        "hardening.seccomp.allow-rule[].arg[].value",
+        "hardening.seccomp.allow-rule[].syscall",
+        "hardening.seccomp.deny",
+        "hardening.seccomp.deny-rule",
+        "hardening.seccomp.deny-rule[].arg",
+        "hardening.seccomp.deny-rule[].arg[].index",
+        "hardening.seccomp.deny-rule[].arg[].len",
+        "hardening.seccomp.deny-rule[].arg[].op",
+        "hardening.seccomp.deny-rule[].arg[].value",
+        "hardening.seccomp.deny-rule[].syscall",
+        "hardening.seccomp.errno",
+        "hardening.seccomp.errno.clone3",
         "hostname",
         "identity-map",
         "identity-map.ranges",
@@ -6124,10 +6247,18 @@ access = "c"
         "pid-namespace",
         "resolv-conf",
         "rlimit",
+        "rlimit.address-space",
+        "rlimit.core-dump",
         "rlimit.cpu-time",
         "rlimit.cpu-time.hard",
         "rlimit.cpu-time.soft",
+        "rlimit.data",
+        "rlimit.file-size",
+        "rlimit.locked-memory",
+        "rlimit.open-files",
+        "rlimit.pending-signals",
         "rlimit.processes",
+        "rlimit.stack",
         "rootfs",
         "run-as",
         "run-as.gid",
@@ -6140,8 +6271,8 @@ access = "c"
         "workdir",
     ];
 
-    /// Every key a serialized profile can carry, as a sorted list of dotted
-    /// paths, with an array index rendered as `[]`.
+    /// Every key a serialized profile can carry, as the profiles above render
+    /// them.
     ///
     /// The profile format is a compatibility commitment, and a key's spelling
     /// comes from `rename_all` on the container rather than from a `rename` on
@@ -6152,36 +6283,12 @@ access = "c"
     #[cfg(feature = "hardening")]
     #[test]
     fn the_profile_format_keys_are_what_they_are() {
-        fn walk(value: &toml::Value, prefix: &str, into: &mut Vec<String>) {
-            match value {
-                toml::Value::Table(table) => {
-                    for (key, nested) in table {
-                        let path = if prefix.is_empty() {
-                            key.clone()
-                        } else {
-                            format!("{prefix}.{key}")
-                        };
-                        into.push(path.clone());
-                        walk(nested, &path, into);
-                    }
-                }
-                toml::Value::Array(items) => {
-                    for item in items {
-                        walk(item, &format!("{prefix}[]"), into);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let builder: CageBuilder =
-            toml::from_str(EVERY_KEY_PROFILE).expect("the exhaustive profile parses");
-        let rendered = toml::to_string(&builder).expect("the builder serializes");
-        let rendered: toml::Table =
-            toml::from_str(&rendered).expect("the rendering parses back as TOML");
-
         let mut keys = Vec::new();
-        walk(&toml::Value::Table(rendered), "", &mut keys);
+        for profile in std::iter::once(EVERY_KEY_PROFILE).chain(OTHER_FORM_PROFILES) {
+            let builder: CageBuilder = toml::from_str(profile).expect("the profile parses");
+            let rendered = toml::to_string(&builder).expect("the builder serializes");
+            keys.extend(profile_keys(&rendered));
+        }
         keys.sort();
         keys.dedup();
 
@@ -6914,11 +7021,15 @@ read-only = true
         let other = Path::new("/dev/shm");
         let device = |path: &Path| rustix::fs::stat(path).map(|stat| stat.st_dev);
         let (Ok(here), Ok(there)) = (device(&scratch), device(other)) else {
-            eprintln!("skipping: no second filesystem to place the work directory on");
+            ferroday_cage_testkit::require::premise_unmet(
+                "no second filesystem to place the work directory on",
+            );
             return;
         };
         if here == there {
-            eprintln!("skipping: /dev/shm shares the scratch directory's filesystem");
+            ferroday_cage_testkit::require::premise_unmet(
+                "/dev/shm shares the scratch directory's filesystem",
+            );
             return;
         }
         let elsewhere = other.join(format!("fcage-exdev-{}", crate::host::unique_hex()));
@@ -6940,8 +7051,10 @@ read-only = true
                 source,
                 ..
             })) => assert_eq!(source.raw_os_error(), Some(Errno::XDEV.raw_os_error())),
-            Err(Error::Config(ConfigError::OverlayUnavailable { .. })) => {
-                eprintln!("skipping: an unprivileged overlay is unavailable here");
+            Err(Error::Config(ConfigError::OverlayUnavailable { blocker })) => {
+                ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                    "an unprivileged overlay is unavailable here: {blocker}"
+                ));
                 return;
             }
             other => panic!("unexpected outcome: {other:?}"),
@@ -6968,8 +7081,10 @@ read-only = true
             .build();
         let cage = match built {
             Ok(cage) => cage,
-            Err(Error::Config(ConfigError::OverlayUnavailable { .. })) => {
-                eprintln!("skipping: an unprivileged overlay is unavailable here");
+            Err(Error::Config(ConfigError::OverlayUnavailable { blocker })) => {
+                ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                    "an unprivileged overlay is unavailable here: {blocker}"
+                ));
                 return;
             }
             Err(err) => panic!("unexpected error: {err}"),

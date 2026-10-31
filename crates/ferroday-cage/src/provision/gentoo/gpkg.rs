@@ -730,32 +730,21 @@ pub(super) mod fixture {
     use super::*;
     use crate::provision::digest::hex;
     use crate::provision::openpgp::fixture;
-    use crate::provision::tar;
 
     /// The package every container below claims to be.
     pub(in crate::provision::gentoo) const CPV: &str = "sys-libs/zlib-1.3.2";
 
     /// A tar archive of `entries`, each a name and its bytes.
     pub(in crate::provision::gentoo) fn tarball(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = ferroday_cage_testkit::tar::Tar::new();
         for (name, body) in entries {
-            let typeflag = if name.ends_with('/') { b'5' } else { b'0' };
-            let size = if typeflag == b'5' {
-                0
+            if name.ends_with('/') {
+                out.dir(name, 0o644);
             } else {
-                body.len() as u64
-            };
-            out.extend_from_slice(
-                &tar::ustar_block(name.as_bytes(), b"", 0o644, 0, 0, size, 0, typeflag, b"")
-                    .expect("a ustar header"),
-            );
-            if size > 0 {
-                out.extend_from_slice(body);
-                tar::pad(&mut out, size).expect("padding a member");
+                out.file(name, 0o644, body);
             }
         }
-        out.extend_from_slice(&[0u8; 1024]);
-        out
+        out.finish()
     }
 
     /// The metadata archive a container carries, naming `cpv` at `build_id`.
@@ -804,7 +793,7 @@ pub(super) mod fixture {
     /// `usr`, which the binhost's own packages still ship (lvm2's
     /// `lib64/libdevmapper.so.1.02` and `sbin/dmsetup`).
     fn image(fifo: bool, aliased: bool) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = ferroday_cage_testkit::tar::Tar::new().stamped(1_700_000_000);
         let mut entries: Vec<(&str, &str, u32, u64, u8)> = vec![
             ("image/", "", 0o755, 0u64, b'5'),
             ("image/usr/", "", 0o755, 0, b'5'),
@@ -824,27 +813,10 @@ pub(super) mod fixture {
             ]);
         }
         for (name, target, mode, size, typeflag) in entries {
-            out.extend_from_slice(
-                &tar::ustar_block(
-                    name.as_bytes(),
-                    b"",
-                    mode,
-                    0,
-                    0,
-                    size,
-                    1_700_000_000,
-                    typeflag,
-                    target.as_bytes(),
-                )
-                .expect("a ustar header"),
-            );
-            if size > 0 {
-                out.extend_from_slice(b"ELF\n");
-                tar::pad(&mut out, size).expect("padding a member");
-            }
+            let body: &[u8] = if size > 0 { b"ELF\n" } else { b"" };
+            out.entry(name, typeflag, mode, 0, 0, target, body);
         }
-        out.extend_from_slice(&[0u8; 1024]);
-        out
+        out.finish()
     }
 
     /// How a container is put together, so a test can bend one part of it.

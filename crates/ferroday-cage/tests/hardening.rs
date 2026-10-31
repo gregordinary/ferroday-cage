@@ -19,52 +19,6 @@ fn rootfs() -> Option<&'static Path> {
     common::fixture_rootfs()
 }
 
-/// Skips a Landlock test when the kernel offers no Landlock LSM.
-///
-/// The skip is explicit, and `FERRODAY_CAGE_REQUIRE_LANDLOCK` turns it into a
-/// failure so CI can assert the Landlock enforcement tests actually ran.
-fn landlock_supported() -> bool {
-    match ferroday_cage::host::landlock_abi() {
-        Some(_) => true,
-        None => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
-                "Landlock is required but the kernel offers none",
-            );
-            eprintln!("skipping: the kernel offers no Landlock support");
-            false
-        }
-    }
-}
-
-/// Skips a Landlock network test when the kernel's Landlock ABI predates the
-/// network rights, which arrive in ABI 4.
-///
-/// As with [`landlock_supported`], `FERRODAY_CAGE_REQUIRE_LANDLOCK` turns the
-/// skip into a failure: a runner CI marks Landlock-capable is expected to reach
-/// ABI 4.
-fn landlock_net_supported() -> bool {
-    match ferroday_cage::host::landlock_abi() {
-        Some(abi) if abi >= 4 => true,
-        Some(abi) => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
-                "Landlock network rights are required but the kernel's ABI is {abi} (needs 4)",
-            );
-            eprintln!("skipping: Landlock ABI {abi} predates network rights (needs 4)");
-            false
-        }
-        None => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
-                "Landlock is required but the kernel offers none",
-            );
-            eprintln!("skipping: the kernel offers no Landlock support");
-            false
-        }
-    }
-}
-
 /// A busybox TCP round trip over loopback: a listener binds a fixed port and
 /// sends a token, then a client connects and prints what it receives. The token
 /// reaches stdout only when the listener's bind, the client's connect, and the
@@ -99,27 +53,10 @@ const NET_UNGRANTED_TOKEN: &str = "cage-net-ungranted";
 /// The second listener's port, bound but never granted `CONNECT`.
 const NET_UNGRANTED_PORT: u16 = 50506;
 
-/// Skips a seccomp test when the kernel offers no seccomp filtering.
-///
-/// The skip is explicit, and `FERRODAY_CAGE_REQUIRE_SECCOMP` turns it into a
-/// failure so CI can assert the seccomp enforcement tests actually ran.
-fn seccomp_supported() -> bool {
-    if ferroday_cage::host::seccomp_available() {
-        true
-    } else {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_SECCOMP").is_none(),
-            "seccomp is required but the kernel offers none",
-        );
-        eprintln!("skipping: the kernel offers no seccomp support");
-        false
-    }
-}
-
 #[test]
 fn landlock_denies_a_path_outside_the_grants() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     // The command may execute from /bin and load libraries from /lib, but is
@@ -144,7 +81,7 @@ fn landlock_denies_a_path_outside_the_grants() {
 #[test]
 fn landlock_allows_a_granted_path() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     // The same command, now granted read access under /etc, succeeds. This
@@ -167,7 +104,7 @@ fn landlock_allows_a_granted_path() {
 #[test]
 fn landlock_covers_a_tmpfs_mount_in_the_pivoted_view() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     // /tmp is a tmpfs mounted after the pivot — a filesystem object that does
@@ -190,7 +127,7 @@ fn landlock_covers_a_tmpfs_mount_in_the_pivoted_view() {
 #[test]
 fn landlock_grants_a_single_file_and_a_device_node() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     // A grant on a file and a grant on a device node, rather than on the
@@ -225,7 +162,7 @@ fn landlock_grants_a_single_file_and_a_device_node() {
 #[test]
 fn a_landlock_rule_that_fails_names_its_grant() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_supported() {
+    if !common::landlock() {
         return;
     }
     // The grant's path is a sandbox path, resolved only after the pivot, so a
@@ -255,26 +192,10 @@ fn a_landlock_rule_that_fails_names_its_grant() {
     }
 }
 
-/// Skips a Landlock scope test when the kernel's Landlock ABI predates scopes,
-/// which arrive in ABI 6.
-fn landlock_scope_supported() -> bool {
-    match ferroday_cage::host::landlock_abi() {
-        Some(abi) if abi >= 6 => true,
-        abi => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE").is_none(),
-                "Landlock scopes are required but the kernel's ABI is {abi:?} (needs 6)",
-            );
-            eprintln!("skipping: Landlock ABI {abi:?} predates scopes (needs 6)");
-            false
-        }
-    }
-}
-
 #[test]
 fn the_signal_scope_confines_a_sandbox_sharing_the_host_pid_space() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_scope_supported() {
+    if !common::landlock_scope() {
         return;
     }
     // Without a PID namespace the command sees the calling user's processes,
@@ -322,7 +243,7 @@ fn landlock_request_without_the_lsm_is_a_setup_error() {
     // Only meaningful where Landlock is absent: a requested restriction that
     // cannot apply must surface as an error, never silently succeed.
     if ferroday_cage::host::landlock_abi().is_some() {
-        eprintln!("skipping: the kernel supports Landlock");
+        common::require::premise_unmet("the kernel supports Landlock");
         return;
     }
     let result = Cage::builder()
@@ -339,7 +260,7 @@ fn landlock_request_without_the_lsm_is_a_setup_error() {
 #[test]
 fn landlock_net_allows_a_granted_bind_and_connect() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_net_supported() {
+    if !common::landlock_net() {
         return;
     }
     // Every bind and connect the round trip needs is granted, so the token
@@ -373,7 +294,7 @@ fn landlock_net_allows_a_granted_bind_and_connect() {
 #[test]
 fn landlock_net_denies_a_connect_outside_the_grant() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_net_supported() {
+    if !common::landlock_net() {
         return;
     }
     // Two round trips in one run, differing in nothing but the CONNECT grant:
@@ -416,7 +337,7 @@ fn landlock_net_denies_a_connect_outside_the_grant() {
 #[test]
 fn landlock_net_denies_an_ungranted_bind() {
     let Some(rootfs) = rootfs() else { return };
-    if !landlock_net_supported() {
+    if !common::landlock_net() {
         return;
     }
     // Only CONNECT is granted, which still enrolls BIND handling. busybox nc
@@ -445,7 +366,7 @@ fn landlock_net_denies_an_ungranted_bind() {
 #[test]
 fn curated_seccomp_allows_an_ordinary_command() {
     let Some(rootfs) = rootfs() else { return };
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     let status = Cage::builder()
@@ -468,7 +389,7 @@ fn curated_seccomp_denies_a_listed_syscall() {
     let Some(rootfs) = rootfs() else {
         return;
     };
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // mount is on the curated denylist, denied with EPERM. The cage command is
@@ -513,7 +434,7 @@ fn curated_seccomp_denies_a_listed_syscall() {
 #[test]
 fn a_denied_syscall_kills_the_command() {
     let Some(rootfs) = rootfs() else { return };
-    if !seccomp_supported() {
+    if !common::seccomp() {
         return;
     }
     // Denying write with a process kill: the command dies with SIGSYS the

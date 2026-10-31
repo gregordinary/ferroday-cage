@@ -5,7 +5,7 @@ mod common;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
-use common::deb_repo::{Pkg, Tar, ar, deb, write_repo};
+use common::deb_repo::{Pkg, Tar, deb, deb_with_control, write_repo};
 use ferroday_cage::provision::debian::{Debian, DebianEvent, Plan, Pool, Repository};
 use ferroday_cage::provision::{self, ProvisionError, Provisioned};
 
@@ -18,44 +18,16 @@ fn trixie_pool(dir: &Path) -> Pool {
         .architecture("amd64")
 }
 
-/// Builds a `.deb` carrying a real `./control` member, which [`deb`] omits.
-/// `Pool::publish` reads the control stanza to synthesize the pool index, so its
-/// tests need a control-bearing package.
-fn deb_with_control(control: &str, data_tar: &[u8]) -> Vec<u8> {
-    let control_tar = Tar::new()
-        .file("./control", 0o644, control.as_bytes())
-        .finish();
-    ar(&[
-        ("debian-binary", b"2.0\n"),
-        ("control.tar", &control_tar),
-        ("data.tar", data_tar),
-    ])
-}
-
 /// The environment variable that opts into the network-dependent bootstrap
 /// tests. They fetch from a live Debian mirror and are off by default, so a
 /// plain `cargo test --all-features` — including CI — does not reach the
 /// network.
 const NETWORK_GATE: &str = "FERRODAY_CAGE_DEBIAN_NETWORK_TEST";
 
-/// The variable that asserts these tests ran, in the crate's usual shape: a
-/// skip stays a skip by default, and this turns it into a failure so a release
-/// check cannot come back green having exercised no repository at all.
-const REQUIRE_GATE: &str = "FERRODAY_CAGE_REQUIRE_NETWORK_TEST";
-
-/// Returns `false` and prints a skip note when the network tests are not
-/// enabled.
+/// Whether the network-dependent tests run: [`NETWORK_GATE`] opts in, and
+/// `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` turns not opting in into a failure.
 fn network_enabled() -> bool {
-    if std::env::var_os(NETWORK_GATE).is_some() {
-        return true;
-    }
-    assert!(
-        std::env::var_os(REQUIRE_GATE).is_none(),
-        "{REQUIRE_GATE} is set and {NETWORK_GATE} is not, so the Debian bootstrap tests \
-         would have been skipped",
-    );
-    eprintln!("skipping: set {NETWORK_GATE}=1 to run the Debian bootstrap tests");
-    false
+    common::require::network_suite(NETWORK_GATE, "the Debian bootstrap tests")
 }
 
 #[test]
@@ -351,7 +323,7 @@ fn hermetic_published_pool_is_consumable_by_the_provisioner() {
         .expect("the pool publishes");
 
     let pool_repo = Repository::builder("trixie")
-        .mirror(format!("file://{}", pool.display()))
+        .mirror(provision::file_url(&pool).expect("a file:// URL"))
         .trust_unsigned(true)
         .name("localpool")
         .build()
@@ -483,7 +455,7 @@ fn hermetic_a_second_component_does_not_retire_the_first() {
     // against the digest the release records, so drawing a package out of both
     // components is only possible if the release names both sections.
     let pool_repo = Repository::builder("trixie")
-        .mirror(format!("file://{}", pool.display()))
+        .mirror(provision::file_url(&pool).expect("a file:// URL"))
         .components(["main", "contrib"])
         .trust_unsigned(true)
         .name("localpool")
@@ -542,7 +514,7 @@ fn hermetic_empty_published_pool_is_a_valid_repository() {
         .expect("an empty pool publishes");
 
     let pool_repo = Repository::builder("trixie")
-        .mirror(format!("file://{}", pool.display()))
+        .mirror(provision::file_url(&pool).expect("a file:// URL"))
         .trust_unsigned(true)
         .name("empty")
         .build()
@@ -604,7 +576,7 @@ fn hermetic_published_pool_keeps_the_highest_version_across_calls() {
     trixie_pool(&pool).publish([&p1]).unwrap();
 
     let pool_repo = Repository::builder("trixie")
-        .mirror(format!("file://{}", pool.display()))
+        .mirror(provision::file_url(&pool).expect("a file:// URL"))
         .trust_unsigned(true)
         .name("pool")
         .build()
@@ -1052,8 +1024,7 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
     // hermetically — it runs no cage — so it needs no network or real dpkg; it
     // skips only where the overlay preflight reports the host cannot overlay.
     let dir = common::scratch_dir("debian-empty-layer");
-    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&dir) {
-        eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
+    if !common::require::overlay(&dir) {
         return;
     }
     let base_data = Tar::new()
@@ -1110,8 +1081,7 @@ fn hermetic_a_plan_is_the_increment_a_layered_build_installs() {
     // empty: `stage_layer` returned a build layer over an empty upper having
     // installed nothing, and `resolve_layer` reported that same empty closure.
     let dir = common::scratch_dir("debian-layer-plan");
-    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&dir) {
-        eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
+    if !common::require::overlay(&dir) {
         return;
     }
     let mirror = write_repo(
@@ -1209,8 +1179,7 @@ fn hermetic_a_failed_stage_layer_disposes_of_the_upper_it_created() {
     // The failure is an include the archive does not carry, which is refused
     // after the upper exists and before anything is downloaded.
     let dir = common::scratch_dir("debian-failed-layer");
-    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&dir) {
-        eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
+    if !common::require::overlay(&dir) {
         return;
     }
     let base_data = Tar::new().file("./usr/bin/x", 0o755, b"ok\n").finish();
@@ -1274,7 +1243,7 @@ fn hermetic_mirror_fallback_serves_a_missing_primary() {
     );
     // A file:// URL to a path that was never created: every resource under it is
     // reported missing, the signal the mirror walk advances past.
-    let missing = format!("file://{}", dir.join("does-not-exist").display());
+    let missing = provision::file_url(&dir.join("does-not-exist")).expect("a file:// URL");
 
     let rootfs = dir.join("rootfs");
     let mut debian = Debian::builder("trixie")
@@ -1656,7 +1625,7 @@ fn hermetic_rejects_a_digest_mismatch() {
     std::fs::write(&pool_deb, &bytes).unwrap();
 
     let rootfs = dir.join("rootfs");
-    let mirror = format!("file://{}", repo.display());
+    let mirror = provision::file_url(&repo).expect("a file:// URL");
     let mut debian = Debian::builder("trixie")
         .architecture("amd64")
         .mirror(mirror)
@@ -1699,7 +1668,7 @@ fn hermetic_stops_a_package_at_the_size_the_index_recorded() {
 
     let rootfs = dir.join("rootfs");
     let cache = dir.join("cache");
-    let mirror = format!("file://{}", repo.display());
+    let mirror = provision::file_url(&repo).expect("a file:// URL");
     let mut debian = Debian::builder("trixie")
         .architecture("amd64")
         .mirror(mirror)
@@ -1819,25 +1788,18 @@ fn full_bootstrap_configures_a_runnable_trixie() {
     // The files the keyring package ships are its own: nothing the bootstrap
     // wrote went over them, so the package's next upgrade has nothing to put
     // back.
-    let mut verify = Vec::new();
-    struct Collect<'a>(&'a mut Vec<u8>);
-    impl ferroday_cage::Observer for Collect<'_> {
-        fn stdout(&mut self, chunk: &[u8]) {
-            self.0.extend_from_slice(chunk);
-        }
-    }
-    let status = ferroday_cage::Cage::builder()
+    let verify = ferroday_cage::Cage::builder()
         .rootfs(&rootfs)
         .command("/usr/bin/dpkg")
         .args(["--verify", "debian-archive-keyring"])
         .build()
         .expect("the cage builds")
-        .run_with(&mut Collect(&mut verify))
+        .output()
         .expect("dpkg runs in the finished rootfs");
     assert!(
-        status.success() && verify.is_empty(),
+        verify.status.success() && verify.stdout.is_empty(),
         "debian-archive-keyring's files are the package's own: {}",
-        String::from_utf8_lossy(&verify),
+        String::from_utf8_lossy(&verify.stdout),
     );
 
     // Every base package reached the installed state; run dpkg in the cage
@@ -1919,8 +1881,7 @@ fn layered_build_stages_only_the_increment_over_a_pristine_base() {
         return;
     };
     let scratch = common::scratch_dir("debian-layer");
-    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&scratch) {
-        eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
+    if !common::require::overlay(&scratch) {
         return;
     }
 
@@ -2039,12 +2000,10 @@ fn layered_build_under_a_range_map_disposes_of_a_subordinate_owned_upper() {
         return;
     };
     let scratch = common::scratch_dir("debian-layer-ranged");
-    if let Some(blocker) = ferroday_cage::host::overlay_blocker(&scratch) {
-        eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
+    if !common::require::overlay(&scratch) {
         return;
     }
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
 
@@ -2123,8 +2082,7 @@ fn full_bootstrap_under_a_range_map_carries_real_ownership() {
     let Some(_) = common::fixture_rootfs() else {
         return;
     };
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
     let scratch = common::scratch_dir("debian-full-ranged");
@@ -2200,8 +2158,7 @@ fn a_dated_bootstrap_keeps_the_epoch_and_no_record_of_its_run() {
     let Some(_) = common::fixture_rootfs() else {
         return;
     };
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
     const EPOCH: i64 = 1_700_000_000;
@@ -2272,8 +2229,7 @@ fn a_bootstrap_dated_in_the_first_day_of_1970_records_no_date() {
     let Some(_) = common::fixture_rootfs() else {
         return;
     };
-    if ferroday_cage::host::range_map_blocker().is_some() {
-        eprintln!("skipping: no delegate can establish a range map");
+    if !common::require::range_map() {
         return;
     }
     let scratch = common::scratch_dir("debian-dated-day-zero");
@@ -2561,7 +2517,7 @@ fn a_plan_records_the_mirror_that_served_rather_than_the_one_configured_first() 
         "amd64",
         &[Pkg::required("base", payload("base"), "")],
     );
-    let missing = format!("file://{}", dir.join("does-not-exist").display());
+    let missing = provision::file_url(&dir.join("does-not-exist")).expect("a file:// URL");
 
     let mut debian = Debian::builder("trixie")
         .architecture("amd64")
@@ -2983,7 +2939,7 @@ fn a_pinned_install_refuses_a_digest_mismatch_without_trying_elsewhere() {
         .mirror(mirror)
         // A backstop that would serve, so this proves the failure is terminal
         // rather than merely unrecoverable for want of an alternative.
-        .mirror_fallback(format!("file://{}", dir.join("repo").display()))
+        .mirror_fallback(provision::file_url(&dir.join("repo")).expect("a file:// URL"))
         .trust_unsigned(true)
         .cache_dir(dir.join("cache"))
         .extract_only(true)

@@ -78,11 +78,12 @@ What it spells, surface by surface:
 | Exporting a rootfs | The identity map and the modification-time clamp, as `--identity-map` and `--clamp-mtime`, writing where `--export-to` names. The two settings that take code have none: an identity-map delegate, and the entry filter that says what the archive holds. |
 | Read-only archive inspection | Gentoo's, which prints stage3 variants, binhost packages, an installed set, and the vendored keyring's horizon. Debian and Alpine have no equivalent mode. |
 
-The record behind the first three rows is `tools/parity.toml`, which names every
-setting of the launch, restriction, network-stack and provisioner builders
-against the flag that reaches it or the reason it has none; a check in CI holds
-it to both surfaces. The rows below them describe surfaces built from something
-other than one of those builders.
+The record behind the table is `tools/parity.toml`. It names every setting of
+every public builder against the flag that reaches it, or the reason no flag
+does, and a check in CI holds it to both surfaces. The check finds the builders
+in the API rather than reading a list, so a new one cannot go unrecorded.
+Read-only archive inspection is the one row built from something other than a
+builder.
 
 ## Documentation
 

@@ -1217,7 +1217,7 @@ mod tests {
 
         /// The processor time the pump's thread has used, in clock ticks.
         fn ticks(&self) -> u64 {
-            crate::poll::thread_ticks(self.tid)
+            ferroday_cage_testkit::process::thread_ticks(self.tid)
         }
 
         /// How many ticks the pump's thread uses over `window`.
@@ -1305,7 +1305,7 @@ mod tests {
         // The classifier never sees a datagram behind an extension header, so
         // the source rule has to hold where the UDP table opens a flow.
         let Ok(socket) = UdpSocket::bind((StdIpv6Addr::LOCALHOST, 0)) else {
-            eprintln!("skipping: the host has no IPv6 loopback");
+            ferroday_cage_testkit::require::TUN.skip("the host has no IPv6 loopback");
             return;
         };
         socket

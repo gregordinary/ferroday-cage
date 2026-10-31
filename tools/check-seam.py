@@ -20,6 +20,10 @@ is not a ban -- several are the library's own public API, which a separate crate
 would depend on anyway. What it buys is that a new reach past the seam is
 *chosen*, in a diff a reviewer can see.
 
+A reach is counted however it is spelled: `crate::host`, a `super::` chain that
+climbs out of `provision`, or one name of a grouped `use crate::{...}`. Every
+path is resolved against the module its file defines before it is judged.
+
 It also refuses one thing outright: a userland naming another. The three formats
 are deliberately not shared, and a layer reading another layer's module is how
 that stops being true.
@@ -38,32 +42,121 @@ import sys
 import tomllib
 from pathlib import Path
 
+# The reading `tools/check-idioms.py` takes, and for the same reason: a doc
+# link naming another layer is prose about it rather than a use of it, and a
+# test may reach for whatever it needs to build a fixture. A run leaves no
+# bytecode beside the shared reader.
+sys.dont_write_bytecode = True
+from rust_source import code  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 RECORD = REPO / "tools" / "seam.toml"
-LAYERS = REPO / "crates" / "ferroday-cage" / "src" / "provision"
+SRC = REPO / "crates" / "ferroday-cage" / "src"
+LAYERS = SRC / "provision"
+
+# A `use` declaration, whatever its visibility, up to the semicolon that ends
+# it; a grouped one spans lines. Anchored at the start of a line, where
+# `cargo fmt` puts every declaration, so the word in a string is not one.
+USE = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?use[ \t]+([^;]*);", re.S | re.M)
+
+# A path in an expression or a type that starts from the crate root or climbs
+# out of the current module. `$crate` in a macro body is the crate root too.
+ROOTED = re.compile(r"\b(?:crate|super|self)(?:::[A-Za-z_][A-Za-z0-9_]*)+")
+
+# The tokens a `use` tree is written in.
+TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|::|[{},*]")
 
 
-def code(path: Path) -> str:
-    """The file's own code: no trailing test module, no comment lines.
+def module_of(path: Path) -> list[str]:
+    """The module a source file defines, as its path from the crate root."""
+    parts = list(path.relative_to(SRC).with_suffix("").parts)
+    return parts[:-1] if parts[-1] == "mod" else parts
 
-    The same reading `tools/check-idioms.py` takes, and for the same reason: a
-    doc link naming another layer is prose about it rather than a use of it,
-    and a test may reach for whatever it needs to build a fixture.
+
+def use_paths(tree: str) -> list[list[str]]:
+    """Every path a `use` tree names, a grouped one expanded.
+
+    `crate::{IdentityMap, provision::{self, Fetch}}` names three paths:
+    `crate::IdentityMap`, `crate::provision`, and `crate::provision::Fetch`.
+    An alias is dropped, since the path is what is reached; a glob keeps its
+    prefix.
     """
-    lines = path.read_text(encoding="utf-8").splitlines()
-    for index, line in enumerate(lines):
-        if line.startswith(("#[cfg(test)]", "#[cfg(all(test")):
-            lines = lines[:index]
-            break
-    return "\n".join(line for line in lines if not line.lstrip().startswith("//"))
+    tokens = TOKEN.findall(tree)
+
+    def subtree(at: int, prefix: list[str]) -> tuple[list[list[str]], int]:
+        segments = list(prefix)
+        while at < len(tokens):
+            token = tokens[at]
+            if token == "{":
+                at += 1
+                paths: list[list[str]] = []
+                while at < len(tokens) and tokens[at] != "}":
+                    found, at = subtree(at, segments)
+                    paths += found
+                    if at < len(tokens) and tokens[at] == ",":
+                        at += 1
+                return paths, at + 1
+            if token == "*":
+                return [segments], at + 1
+            if token != "self":
+                segments.append(token)
+            at += 1
+            if at < len(tokens) and tokens[at] == "::":
+                at += 1
+                continue
+            if at < len(tokens) and tokens[at] == "as":
+                at += 2
+            return [segments], at
+        return [segments], at
+
+    return subtree(0, [])[0]
+
+
+def absolute(segments: list[str], module: list[str]) -> list[str] | None:
+    """`segments` as a path from the crate root, or `None` for one that is not
+    rooted in this crate (another crate's, or a child module's by its name)."""
+    if not segments:
+        return None
+    if segments[0] == "crate":
+        return segments[1:]
+    if segments[0] == "self":
+        return module + segments[1:]
+    if segments[0] == "super":
+        climbs = 0
+        while climbs < len(segments) and segments[climbs] == "super":
+            climbs += 1
+        if climbs > len(module):
+            return None
+        return module[: len(module) - climbs] + segments[climbs:]
+    return None
+
+
+def paths_in(path: Path) -> list[list[str]]:
+    """Every crate-rooted path a source file names, from the crate root.
+
+    A `use` declaration contributes each path its tree names, and every other
+    `crate::`, `super::`, or `self::` path in the code contributes itself.
+    Resolving `super::` against the file's own module is what makes a reach
+    written as `super::super::host` count the same as one written as
+    `crate::host`.
+    """
+    module = module_of(path)
+    body = code(path)
+    found = []
+    for declaration in USE.finditer(body):
+        found += use_paths(declaration.group(1))
+    rest = USE.sub(lambda match: "\n" * match.group(0).count("\n"), body)
+    found += [match.group(0).split("::") for match in ROOTED.finditer(rest)]
+    resolved = (absolute(segments, module) for segments in found)
+    return [segments for segments in resolved if segments]
 
 
 def reaches(layer: str) -> dict[str, int]:
     """Every crate-level name `layer` uses that is not `provision`."""
     found: dict[str, int] = {}
     for path in sorted((LAYERS / layer).rglob("*.rs")):
-        for match in re.finditer(r"\bcrate::([A-Za-z_][A-Za-z0-9_]*)", code(path)):
-            name = match.group(1)
+        for segments in paths_in(path):
+            name = segments[0]
             if name == "provision":
                 continue
             found[name] = found.get(name, 0) + 1
@@ -74,11 +167,14 @@ def crossings(layer: str, others: list[str]) -> list[str]:
     """Where `layer`'s code names another userland."""
     found = []
     for path in sorted((LAYERS / layer).rglob("*.rs")):
-        body = code(path)
+        named = {
+            segments[1]
+            for segments in paths_in(path)
+            if len(segments) > 1 and segments[0] == "provision"
+        }
         for other in others:
-            for pattern in (f"provision::{other}", f"super::super::{other}"):
-                if pattern in body:
-                    found.append(f"{path.relative_to(REPO)} names {other}")
+            if other in named:
+                found.append(f"{path.relative_to(REPO)} names {other}")
     return found
 
 

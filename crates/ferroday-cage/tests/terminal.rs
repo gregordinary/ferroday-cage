@@ -183,31 +183,13 @@ fn dev_tty_resolves_to_the_sandboxs_own_terminal() {
     );
 }
 
-/// Skips a range-map test when no delegate can establish one on this host.
-///
-/// `FERRODAY_CAGE_REQUIRE_SUBID` turns the skip into a failure, as elsewhere.
-#[cfg(feature = "subid")]
-fn range_map_available() -> bool {
-    match ferroday_cage::host::range_map_blocker() {
-        None => true,
-        Some(blocker) => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_SUBID").is_none(),
-                "range maps are required but unavailable: {blocker}"
-            );
-            eprintln!("skipping: no delegate can establish a range map: {blocker}");
-            false
-        }
-    }
-}
-
 #[cfg(feature = "subid")]
 #[test]
 fn dev_tty_works_for_a_run_as_identity() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     let map = IdentityMap::Subordinate;
@@ -277,7 +259,7 @@ fn a_run_as_identity_owns_its_terminal() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    if !range_map_available() {
+    if !common::require::range_map() {
         return;
     }
     // A login's terminal belongs to the user logging in, and so does the

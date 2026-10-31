@@ -257,21 +257,6 @@ fn deb_error(package: &str, reason: &str) -> ProvisionError {
 mod tests {
     use super::*;
 
-    /// Appends one `ar` member to `archive`.
-    fn ar_member(archive: &mut Vec<u8>, name: &str, data: &[u8]) {
-        let mut header = [b' '; AR_HEADER];
-        header[..name.len()].copy_from_slice(name.as_bytes());
-        let size = data.len().to_string();
-        header[48..48 + size.len()].copy_from_slice(size.as_bytes());
-        header[58] = b'`';
-        header[59] = b'\n';
-        archive.extend_from_slice(&header);
-        archive.extend_from_slice(data);
-        if data.len() % 2 == 1 {
-            archive.push(b'\n');
-        }
-    }
-
     /// Seeks to `member`, reporting the reason rather than a typed error, and
     /// returns it with the bytes the member holds.
     fn member_of(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
@@ -291,10 +276,11 @@ mod tests {
     fn a_member_is_reached_across_the_padding_before_it() {
         // An odd-length member is followed by a padding byte, so a walk that
         // did not step over it would find the next header one byte late.
-        let mut archive = AR_MAGIC.to_vec();
-        ar_member(&mut archive, "debian-binary", b"2.0\n");
-        ar_member(&mut archive, "control.tar.gz", b"odd");
-        ar_member(&mut archive, "data.tar.xz", b"payload!");
+        let archive = ferroday_cage_testkit::deb::ar(&[
+            ("debian-binary", b"2.0\n"),
+            ("control.tar.gz", b"odd"),
+            ("data.tar.xz", b"payload!"),
+        ]);
         assert_eq!(member_of(&archive, "control.tar").unwrap(), b"odd");
         assert_eq!(member_of(&archive, "data.tar").unwrap(), b"payload!");
         // The name is matched as a prefix, because the compression suffix is
@@ -304,8 +290,7 @@ mod tests {
 
     #[test]
     fn a_member_the_archive_does_not_carry_is_reported_by_name() {
-        let mut archive = AR_MAGIC.to_vec();
-        ar_member(&mut archive, "debian-binary", b"2.0\n");
+        let archive = ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n")]);
         let reason = member_of(&archive, "data.tar").unwrap_err();
         assert!(reason.contains("no data.tar member"), "{reason}");
     }
@@ -343,16 +328,17 @@ mod tests {
     /// A `.deb` whose data member is `data_size` bytes, with its members in the
     /// given order.
     fn deb(control: &[u8], data_size: usize, control_last: bool) -> Vec<u8> {
-        let mut archive = AR_MAGIC.to_vec();
-        ar_member(&mut archive, "debian-binary", b"2.0\n");
+        let data = vec![0u8; data_size];
+        let control = control_tar(control);
+        let mut members: [(&str, &[u8]); 3] = [
+            ("debian-binary", b"2.0\n"),
+            ("control.tar", &control),
+            ("data.tar", &data),
+        ];
         if control_last {
-            ar_member(&mut archive, "data.tar", &vec![0u8; data_size]);
-            ar_member(&mut archive, "control.tar", &control_tar(control));
-        } else {
-            ar_member(&mut archive, "control.tar", &control_tar(control));
-            ar_member(&mut archive, "data.tar", &vec![0u8; data_size]);
+            members.swap(1, 2);
         }
-        archive
+        ferroday_cage_testkit::deb::ar(&members)
     }
 
     /// A reader that tallies the bytes actually read through it, so a test can
@@ -413,9 +399,10 @@ mod tests {
 
     #[test]
     fn a_deb_without_a_control_member_is_rejected() {
-        let mut archive = AR_MAGIC.to_vec();
-        ar_member(&mut archive, "debian-binary", b"2.0\n");
-        ar_member(&mut archive, "data.tar", b"payload!");
+        let archive = ferroday_cage_testkit::deb::ar(&[
+            ("debian-binary", b"2.0\n"),
+            ("data.tar", b"payload!"),
+        ]);
         let err = read_control_from(&mut Cursor::new(&archive))
             .expect_err("a .deb with no control member is rejected");
         assert!(err.to_string().contains("no control.tar member"), "{err}");
@@ -436,10 +423,10 @@ mod tests {
             (compressed.len() as u64) < CONTROL_MEMBER_LIMIT,
             "the fixture must be inside the wire bound to test the other one",
         );
-        let mut archive = AR_MAGIC.to_vec();
-        ar_member(&mut archive, "debian-binary", b"2.0\n");
-        ar_member(&mut archive, "control.tar.gz", &compressed);
-        archive
+        ferroday_cage_testkit::deb::ar(&[
+            ("debian-binary", b"2.0\n"),
+            ("control.tar.gz", &compressed),
+        ])
     }
 
     #[test]
@@ -474,8 +461,7 @@ mod tests {
         // The cap is read off the declared size, before it is used to size an
         // allocation, so a header claiming more than any real control member
         // costs nothing to refuse.
-        let mut archive = AR_MAGIC.to_vec();
-        ar_member(&mut archive, "debian-binary", b"2.0\n");
+        let mut archive = ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n")]);
         let mut header = [b' '; AR_HEADER];
         header[.."control.tar.gz".len()].copy_from_slice(b"control.tar.gz");
         let size = (CONTROL_MEMBER_LIMIT + 1).to_string();

@@ -58,8 +58,13 @@ impl PrivateKey {
             )
         };
         if joined < 0 {
+            // A premise rather than a facility: a process that cannot reach
+            // the keyring starts no sandbox that could, so there is no
+            // possession to test.
             let error = io::Error::last_os_error();
-            eprintln!("skipping: the kernel keyring is unavailable to this process: {error}");
+            common::require::premise_unmet(format!(
+                "the kernel keyring is unavailable to this process: {error}"
+            ));
             return None;
         }
 
@@ -165,12 +170,7 @@ fn a_restriction_does_not_possess_the_callers_session_keys() {
 
     use ferroday_cage::{FsAccess, Restriction};
 
-    if ferroday_cage::host::landlock_abi().is_none() {
-        assert!(
-            std::env::var_os("FERRODAY_CAGE_REQUIRE_LANDLOCK").is_none(),
-            "Landlock is required but the kernel offers none",
-        );
-        eprintln!("skipping: the kernel offers no Landlock support");
+    if !common::landlock() {
         return;
     }
     let Some(key) = PrivateKey::add("restriction") else {

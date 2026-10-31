@@ -12,24 +12,6 @@ use std::path::Path;
 
 use ferroday_cage::{Cage, ExitStatus};
 
-/// Whether overlay-rooted cages can run on this host, with the upper on the
-/// filesystem hosting `scratch`. Skips explicitly otherwise; setting
-/// `FERRODAY_CAGE_REQUIRE_OVERLAY` turns a skip into a failure so CI can assert
-/// the tests actually ran.
-fn overlay_supported(scratch: &Path) -> bool {
-    match ferroday_cage::host::overlay_blocker(scratch) {
-        None => true,
-        Some(blocker) => {
-            assert!(
-                std::env::var_os("FERRODAY_CAGE_REQUIRE_OVERLAY").is_none(),
-                "overlay-rooted cages are required but unavailable: {blocker}"
-            );
-            eprintln!("skipping: overlay-rooted cages are unavailable: {blocker}");
-            false
-        }
-    }
-}
-
 /// Runs `/bin/sh -c <script>` in an overlay of `lower` with writes in `upper`.
 fn run(lower: &Path, upper: &Path, script: &str) -> ExitStatus {
     Cage::builder()
@@ -48,7 +30,7 @@ fn writes_land_in_the_upper_and_leave_the_lower_pristine() {
         return;
     };
     let dir = common::scratch_dir("overlay-basic");
-    if !overlay_supported(&dir) {
+    if !common::require::overlay(&dir) {
         return;
     }
     let upper = dir.join("upper");
@@ -81,7 +63,7 @@ fn a_fresh_upper_is_disposable_and_a_reused_one_persists() {
         return;
     };
     let dir = common::scratch_dir("overlay-dispose");
-    if !overlay_supported(&dir) {
+    if !common::require::overlay(&dir) {
         return;
     }
 
@@ -110,7 +92,7 @@ fn a_delete_through_the_overlay_leaves_the_lower_untouched() {
         return;
     };
     let dir = common::scratch_dir("overlay-delete");
-    if !overlay_supported(&dir) {
+    if !common::require::overlay(&dir) {
         return;
     }
     assert!(
@@ -139,7 +121,7 @@ fn stacked_lowers_are_searched_base_first() {
         return;
     };
     let dir = common::scratch_dir("overlay-stacked");
-    if !overlay_supported(&dir) {
+    if !common::require::overlay(&dir) {
         return;
     }
 
@@ -257,11 +239,11 @@ fn a_work_directory_on_another_filesystem_is_refused_by_name() {
         std::fs::metadata(&dir).map(|meta| std::os::unix::fs::MetadataExt::dev(&meta)),
         std::fs::metadata(elsewhere).map(|meta| std::os::unix::fs::MetadataExt::dev(&meta)),
     ) else {
-        eprintln!("skipping: no second filesystem to place the work directory on");
+        common::require::premise_unmet("no second filesystem to place the work directory on");
         return;
     };
     if here == there {
-        eprintln!("skipping: the scratch directory and /dev/shm share a filesystem");
+        common::require::premise_unmet("the scratch directory and /dev/shm share a filesystem");
         return;
     }
 
@@ -297,7 +279,7 @@ fn a_bind_target_the_upper_had_deleted_stays_deleted_after_the_run() {
         return;
     };
     let dir = common::scratch_dir("overlay-bind-over-deleted");
-    if !overlay_supported(&dir) {
+    if !common::require::overlay(&dir) {
         return;
     }
     for path in ["etc/os-release", "etc/apk/repositories"] {

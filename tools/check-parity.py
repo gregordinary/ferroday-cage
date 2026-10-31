@@ -7,10 +7,18 @@ they read the `FLAGS` table, and a library method absent from the table is
 absent from both sides of the comparison. Only a record naming both surfaces
 can catch a builder that grew a setting `fcage` never learned.
 
-`tools/parity.toml` is that record -- every configuration method the committed
-public API snapshot holds for each builder, against the flag or flags that reach
-it, or the reason it has none. This compares the record against the snapshot and
-against the CLI's flag table, and fails on any difference.
+`tools/parity.toml` is that record -- every setting the committed public API
+snapshot holds for each builder, against the flag or flags that reach it, or the
+reason it has none. This compares the record against the snapshot and against
+the CLI's flag table, and fails on any difference.
+
+A builder is found rather than listed. A setting is an inherent method that
+takes the type by value and returns it, which is the shape every configurable
+type in the crate gives its settings, and any public type with one is a builder
+the record must name. A constructor, a terminal and an accessor have other
+shapes and are not settings. A setting taken by reference (`&mut self`
+returning `&mut Self`) would slip past that reading, so one fails the check
+outright: the crate's builders take themselves by value.
 
 It is not a demand that everything have a flag. Some settings genuinely cannot,
 for one of three reasons: the setting takes executable behavior an argument
@@ -39,69 +47,98 @@ RECORD = REPO / "tools" / "parity.toml"
 SNAPSHOT = REPO / "crates" / "ferroday-cage" / "public-api.txt"
 CLI = REPO / "crates" / "ferroday-cage-cli" / "src" / "main.rs"
 
-# Not settings. Three roles, none of which configures anything:
-#
-#   A constructor    `new`, `from_reader`, `default`. It produces the builder
-#                    that the settings then configure.
-#   A terminal       `build`, `run`, `write_to`, `write_to_path`, `provision`.
-#                    It consumes the builder and does the thing.
-#   An accessor      `get_*`, which reads back what a setting wrote. These are
-#                    what a consumer inspecting a loaded profile needs, and no
-#                    flag corresponds to one.
-#
-# Named rather than described because the test is a method name and the set is
-# the mechanism: a builder growing a terminal this does not list reads as an
-# unflagged setting, which is the direction that fails loudly rather than
-# quietly.
-NOT_SETTINGS = {
-    "build",
-    "default",
-    "new",
-    "from_reader",
-    "run",
-    "write_to",
-    "write_to_path",
-    "provision",
-}
-
 KINDS = {"code", "positional", "library"}
 
+# An inherent impl block's header: `impl Type`, `impl<'a> Type<'a>`. A trait
+# impl names the trait first and is not matched.
+IMPL = re.compile(r"^impl(?:<[^>]*>)? (ferroday_cage::[A-Za-z0-9_:]+)(?:<[^>]*>)?$")
 
-def settings(path: str) -> list[str]:
-    """Every configuration method the snapshot records for the builder at `path`.
+# A method line inside one: its path, its name, and where its parameters open.
+METHOD = re.compile(
+    r"^pub (?:const )?(?:unsafe )?fn (ferroday_cage::[A-Za-z0-9_:]+)(?:<[^>]*>)?"
+    r"::([A-Za-z_][A-Za-z0-9_]*)(?:<.*?>)?\("
+)
 
-    Only the builder's own inherent methods: a snapshot lists a trait impl's
-    methods the same way it lists an inherent one, so `Debug::fmt` and
-    `Default::default` would otherwise read as settings. The impl line above
-    each block is what separates them -- an inherent one names the type alone.
 
-    The rendering is rustdoc's, so a generic builder appears as
-    `Type<'a>::method` and the same method may be listed under more than one
-    impl block; the lifetime and generic arguments are dropped and the order of
-    first appearance is kept.
+def signature(line: str, opening: int) -> tuple[str, str]:
+    """A method line's parameter list and its return type.
+
+    The parameters are read by matching the parenthesis that opens them, since
+    a closure bound such as `impl FnMut(&Entry) -> bool` carries an arrow of its
+    own. A `where` clause after the return type is dropped.
     """
-    inherent = re.compile(
-        r"^impl(?:<[^>]*>)? " + re.escape(path) + r"(?:<[^>]*>)?$"
-    )
-    method = re.compile(
-        r"^pub fn " + re.escape(path) + r"(?:<[^>]*>)?::([A-Za-z_][A-Za-z0-9_]*)"
-    )
-    found: list[str] = []
-    own = False
+    depth = 0
+    for at in range(opening, len(line)):
+        if line[at] == "(":
+            depth += 1
+        elif line[at] == ")":
+            depth -= 1
+            if depth == 0:
+                parameters = line[opening + 1 : at]
+                rest = line[at + 1 :]
+                returned = rest[4:] if rest.startswith(" -> ") else ""
+                return parameters, returned.split(" where ")[0]
+    return line[opening + 1 :], ""
+
+
+def returns_itself(returned: str, path: str) -> bool:
+    """Whether `returned` names the type at `path` itself."""
+    return returned == "Self" or re.fullmatch(re.escape(path) + r"(?:<[^>]*>)?", returned) is not None
+
+
+def types() -> set[str]:
+    """Every type the snapshot has an inherent impl block for."""
+    return {
+        match.group(1)
+        for line in SNAPSHOT.read_text(encoding="utf-8").splitlines()
+        if (match := IMPL.match(line))
+    }
+
+
+def methods() -> list[tuple[str, str, str, str]]:
+    """Every inherent method in the snapshot: its type, name, parameters, return."""
+    found = []
+    own = None
     for line in SNAPSHOT.read_text(encoding="utf-8").splitlines():
         if line.startswith("impl"):
-            own = bool(inherent.match(line))
+            match = IMPL.match(line)
+            own = match.group(1) if match else None
             continue
-        if not own:
+        if own is None:
             continue
-        match = method.match(line)
-        if not match:
+        match = METHOD.match(line)
+        if not match or match.group(1) != own:
             continue
-        name = match.group(1)
-        if name in NOT_SETTINGS or name.startswith("get_") or name in found:
-            continue
-        found.append(name)
+        parameters, returned = signature(line, match.end() - 1)
+        found.append((own, match.group(2), parameters, returned))
     return found
+
+
+def builders() -> dict[str, list[str]]:
+    """Every builder in the snapshot and its settings, in order of appearance.
+
+    Rustdoc lists a method once per impl block, and a generic builder's blocks
+    repeat it; each setting is kept once.
+    """
+    found: dict[str, list[str]] = {}
+    for path, name, parameters, returned in methods():
+        by_value = re.match(r"(?:mut )?self(?:,|$)", parameters) is not None
+        if by_value and returns_itself(returned, path):
+            settings = found.setdefault(path, [])
+            if name not in settings:
+                settings.append(name)
+    return found
+
+
+def by_reference() -> list[str]:
+    """Every setting written to take its builder by reference."""
+    return [
+        f"{path}::{name}"
+        for path, name, parameters, returned in methods()
+        if re.match(r"&(?:'\w+ )?mut self(?:,|$)", parameters)
+        and returned.startswith("&")
+        and returns_itself(re.sub(r"^&(?:'\w+ )?mut ", "", returned), path)
+    ]
 
 
 def flags() -> set[str]:
@@ -109,10 +146,9 @@ def flags() -> set[str]:
     return set(re.findall(r'long: "(--[a-z0-9-]+)"', CLI.read_text(encoding="utf-8")))
 
 
-def check(builder: dict, offered: set[str]) -> list[str]:
+def check(builder: dict, present: list[str], offered: set[str]) -> list[str]:
     """How the record for one builder differs from the two surfaces."""
     recorded = {setting["name"]: setting for setting in builder.get("setting", [])}
-    present = settings(builder["path"])
     problems = []
 
     for name in present:
@@ -144,12 +180,39 @@ def check(builder: dict, offered: set[str]) -> list[str]:
 def main() -> int:
     record = tomllib.loads(RECORD.read_text(encoding="utf-8"))
     offered = flags()
+    found = builders()
     failures, total, unflagged = [], 0, 0
+
+    recorded = {builder["path"] for builder in record["builder"]}
+    unrecorded = sorted(set(found) - recorded)
+    vanished = sorted(recorded - types())
+    if vanished:
+        failures.append(
+            "\n".join(
+                ["The record names builders the snapshot no longer holds."]
+                + [f"    gone        {path}" for path in vanished]
+            )
+        )
+    if unrecorded:
+        failures.append(
+            "\n".join(
+                ["The snapshot holds builders the record does not name."]
+                + [f"    unrecorded  {path}: {', '.join(found[path])}" for path in unrecorded]
+            )
+        )
+    by_ref = by_reference()
+    if by_ref:
+        failures.append(
+            "\n".join(
+                ["A setting takes its builder by reference, which this check cannot see."]
+                + [f"    by reference  {name}: take self by value" for name in by_ref]
+            )
+        )
 
     for builder in record["builder"]:
         total += len(builder.get("setting", []))
         unflagged += sum(1 for s in builder.get("setting", []) if "kind" in s)
-        problems = check(builder, offered)
+        problems = check(builder, found.get(builder["path"], []), offered)
         if problems:
             failures.append(
                 "\n".join(
