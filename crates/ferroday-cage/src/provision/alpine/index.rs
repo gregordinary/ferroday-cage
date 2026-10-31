@@ -374,9 +374,9 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
         origin: value('o')
             .filter(|origin| *origin != name)
             .map(str::to_string),
-        depends: list(value('D'), Dependency::parse).map_err(&malformed)?,
-        provides: list(value('p'), Provided::parse).map_err(&malformed)?,
-        install_if: list(value('i'), Dependency::parse).map_err(&malformed)?,
+        depends: list(value('D'), Dependency::parse).map_err(malformed)?,
+        provides: list(value('p'), Provided::parse).map_err(malformed)?,
+        install_if: list(value('i'), Dependency::parse).map_err(malformed)?,
         // A `k:` that is not a number greater than zero is no priority, which is
         // measurably `apk`'s own reading rather than a lenient one: driving
         // `apk.static` 3.0.7 over a purpose-built repository, a `k:0`, a `k:-1`
