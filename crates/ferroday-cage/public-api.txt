@@ -1925,6 +1925,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::SeccompPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::SeccompPolicy
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SeccompPolicy
 #[non_exhaustive] #[repr(u32)] pub enum ferroday_cage::SetupStep
+pub ferroday_cage::SetupStep::AllocateTerminal = 56
 pub ferroday_cage::SetupStep::AwaitIdentityMap = 38
 pub ferroday_cage::SetupStep::AwaitNestedIdentityMap = 51
 pub ferroday_cage::SetupStep::AwaitNetworkStack = 37
@@ -1966,6 +1967,7 @@ pub ferroday_cage::SetupStep::RemountReadOnly = 15
 pub ferroday_cage::SetupStep::ReplaceSessionKeyring = 55
 pub ferroday_cage::SetupStep::ResetSignals = 22
 pub ferroday_cage::SetupStep::SendPidfd = 24
+pub ferroday_cage::SetupStep::SendTerminal = 57
 pub ferroday_cage::SetupStep::SetControllingTerminal = 46
 pub ferroday_cage::SetupStep::SetGid = 41
 pub ferroday_cage::SetupStep::SetGroups = 40

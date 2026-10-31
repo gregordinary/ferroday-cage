@@ -127,10 +127,14 @@ pub(super) struct Context<'a> {
     pub(super) stdout_fd: Option<BorrowedFd<'a>>,
     /// The caller-supplied standard error, when the plan names one.
     pub(super) stderr_fd: Option<BorrowedFd<'a>>,
-    /// The replica of the pseudoterminal allocated for this launch, when it is
-    /// a terminal launch: made the session's controlling terminal in the first
-    /// process of the sandbox proper, and wired onto all three standard streams.
-    pub(super) terminal_fd: Option<BorrowedFd<'a>>,
+    /// The pseudoterminal to allocate, when this is a terminal launch: the first
+    /// process of the sandbox proper allocates it once the root is in place,
+    /// makes it the session's controlling terminal, and the command wires its
+    /// replica onto all three standard streams.
+    pub(super) terminal: Option<&'a crate::terminal::Terminal>,
+    /// The sandbox end of the terminal channel, when this is a terminal launch:
+    /// the primary of the pseudoterminal goes back to the caller over it.
+    pub(super) terminal_channel_fd: Option<BorrowedFd<'a>>,
 }
 
 /// A failed setup step: the step, the errno, and the 1-based index of the
@@ -247,6 +251,15 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
             }
         }
         sys::Fork::ParentOf(child) => {
+            // The terminal channel is for the stage just forked, which allocates
+            // the terminal and sends the primary; this process has nothing to
+            // send over it.
+            if let Some(channel) = context.terminal_channel_fd {
+                // SAFETY: the raw descriptor is this process's own copy of the
+                // channel's sandbox end, closed exactly once here and never used
+                // again in this process.
+                unsafe { rustix::io::close(channel.as_raw_fd()) };
+            }
             let pidfd = match publish_supervised(context, child) {
                 Ok(pidfd) => pidfd,
                 Err(errno) => {
@@ -293,22 +306,8 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
 fn publish_supervised(context: &Context<'_>, child: Pid) -> Result<OwnedFd, Errno> {
     let pidfd = process::pidfd_open(child, PidfdFlags::empty())?;
     let payload = child.as_raw_nonzero().get().to_le_bytes();
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut ancillary = rustix::net::SendAncillaryBuffer::new(&mut space);
-    let fds = [pidfd.as_fd()];
-    ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
-    loop {
-        match rustix::net::sendmsg(
-            context.control_fd,
-            &[std::io::IoSlice::new(&payload)],
-            &mut ancillary,
-            rustix::net::SendFlags::NOSIGNAL,
-        ) {
-            Ok(_) => return Ok(pidfd),
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(errno),
-        }
-    }
+    frame::send_with_fd(context.control_fd, &payload, pidfd.as_fd())?;
+    Ok(pidfd)
 }
 
 /// Starts a session of this sandbox's own, when the plan asks for one.
@@ -336,25 +335,60 @@ fn publish_supervised(context: &Context<'_>, child: Pid) -> Result<OwnedFd, Errn
 /// launch asks for it too, whatever the plan says: the pseudoterminal must be
 /// the controlling terminal of a session the sandbox owns, and the default
 /// standard-input disposition would otherwise leave the launch in the caller's.
-///
-/// The controlling terminal is taken here rather than in `exec_command`, and it
-/// has to be. `TIOCSCTTY` succeeds only for a session leader, and with a PID
-/// namespace the command is a *fork* of the process that called `setsid`, which
-/// is not one. A controlling terminal is a property of the session, so setting
-/// it here covers the command this stage forks. Without a PID namespace the
-/// same process does the `setsid` and the exec, and both calls sit together
-/// here too.
+/// [`open_terminal`] takes that terminal later, once the root it is allocated
+/// from is in place.
 fn start_own_session(context: &Context<'_>) -> Result<(), Failure> {
-    if context.plan.own_session || context.terminal_fd.is_some() {
+    if context.plan.own_session || context.terminal.is_some() {
         process::setsid()
             .map(|_| ())
             .map_err(|errno| (SetupStep::NewSession, errno, 0))?;
     }
-    if let Some(replica) = context.terminal_fd {
-        process::ioctl_tiocsctty(replica)
-            .map_err(|errno| (SetupStep::SetControllingTerminal, errno, 0))?;
-    }
     Ok(())
+}
+
+/// Allocates the pseudoterminal of a terminal launch, makes it this session's
+/// controlling terminal, and sends its primary to the caller, returning the
+/// replica for the command. `None` for every other launch.
+///
+/// Called by the first process of the sandbox proper, after its setup: the init
+/// where there is a PID namespace, and the command stage where there is none,
+/// in a restriction as in a container. After the setup, because the
+/// `/dev/ptmx` the allocation opens has to be the one the command will see,
+/// which in a container exists only once the root is swapped. In this process,
+/// because it is the session leader [`start_own_session`] made, and `TIOCSCTTY`
+/// succeeds only for a session leader. With a PID namespace the command is a
+/// fork of this process and not a leader itself, so the controlling terminal is
+/// taken here, as a property of the session the command then inherits.
+///
+/// Under a [`run_as`](crate::CageBuilder::run_as) identity the replica is given
+/// to that identity, as a login's terminal is given to the user logging in, so
+/// the command can open its terminal by the path `ttyname` reports. Its mode is
+/// the managed `devpts` instance's `0620`.
+///
+/// The controlling terminal is taken before the primary is sent, so the caller
+/// never holds a terminal whose setup then failed. The primary and this
+/// process's copy of the channel close once it is sent: the caller's end of the
+/// primary is the only one, and end-of-file on it means the last replica closed.
+fn open_terminal(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
+    let (Some(terminal), Some(channel)) = (context.terminal, context.terminal_channel_fd) else {
+        return Ok(None);
+    };
+    let (primary, replica) = crate::terminal::allocate(terminal)
+        .map_err(|errno| (SetupStep::AllocateTerminal, errno, 0))?;
+    if let Some(run_as) = &context.plan.run_as {
+        fs::fchown(&replica, Some(run_as.uid), Some(run_as.gid))
+            .map_err(|errno| (SetupStep::AllocateTerminal, errno, 0))?;
+    }
+    process::ioctl_tiocsctty(&replica)
+        .map_err(|errno| (SetupStep::SetControllingTerminal, errno, 0))?;
+    frame::send_with_fd(channel, &[super::TERMINAL_BYTE], primary.as_fd())
+        .map_err(|errno| (SetupStep::SendTerminal, errno, 0))?;
+    drop(primary);
+    // SAFETY: the raw descriptor is this process's own copy of the channel's
+    // sandbox end, closed exactly once here and never used again in this
+    // process.
+    unsafe { rustix::io::close(channel.as_raw_fd()) };
+    Ok(Some(replica))
 }
 
 /// Stage init: PID 1 of the new PID namespace. Sets the sandbox up, forks
@@ -366,6 +400,13 @@ fn stage_init(context: &Context<'_>) -> ! {
     }
     let procfs = match setup_sandbox(context) {
         Ok(procfs) => procfs,
+        Err((step, errno, detail)) => {
+            report(context.report_fd, step, errno, detail);
+            sys::exit_group(127)
+        }
+    };
+    let replica = match open_terminal(context) {
+        Ok(replica) => replica,
         Err((step, errno, detail)) => {
             report(context.report_fd, step, errno, detail);
             sys::exit_group(127)
@@ -397,9 +438,14 @@ fn stage_init(context: &Context<'_>) -> ! {
                 drop(seam.delegate);
                 seam.command
             });
-            exec_command(context, gate)
+            exec_command(context, gate, replica)
         }
         Ok(sys::Fork::ParentOf(command)) => {
+            // The replica is the command's now. End-of-file on the caller's
+            // primary waits for the last replica anywhere to close, so this
+            // process drops its copy before it settles in to supervise, which
+            // never returns and so never drops anything.
+            drop(replica);
             // The command's pidfd is what lets the supervisor sleep in one
             // poll; opened before anything else so a failure is still
             // reportable.
@@ -461,11 +507,14 @@ fn stage_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
         #[cfg(feature = "hardening")]
         super::Confinement::Restriction => setup_restriction(context),
     });
-    if let Err((step, errno, detail)) = setup {
-        report(context.report_fd, step, errno, detail);
-        sys::exit_group(127)
+    let replica = setup.and_then(|()| open_terminal(context));
+    match replica {
+        Ok(replica) => exec_command(context, nested_gate, replica),
+        Err((step, errno, detail)) => {
+            report(context.report_fd, step, errno, detail);
+            sys::exit_group(127)
+        }
     }
-    exec_command(context, nested_gate)
 }
 
 /// The restriction setup: no namespaces to configure and no root to swap —
@@ -493,14 +542,19 @@ fn setup_restriction(context: &Context<'_>) -> Result<(), Failure> {
 ///
 /// `nested_gate` is this process's end of the gate the sandbox's own delegate
 /// established the nested identity map across, present only where a delegate
-/// writes it; it is closed as the entry returns.
+/// writes it; it is closed as the entry returns. `terminal` is the replica of a
+/// terminal launch's pseudoterminal, wired onto all three standard streams.
 ///
 /// Never returns: on success `execve` replaces the process image, and on
 /// failure the step and errno are reported over the report pipe and the
 /// process exits. The exit status of a failed stage is not meaningful to
 /// the caller, which trusts the pipe record instead.
-fn exec_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
-    if let Err(errno) = wire_stdio(context) {
+fn exec_command(
+    context: &Context<'_>,
+    nested_gate: Option<OwnedFd>,
+    terminal: Option<OwnedFd>,
+) -> ! {
+    if let Err(errno) = wire_stdio(context, terminal.as_ref().map(AsFd::as_fd)) {
         report(context.report_fd, SetupStep::WireStdio, errno, 0);
         sys::exit_group(127)
     }
@@ -667,8 +721,9 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 /// Every source is moved above the standard-stream numbers first, so no source
 /// is ever also a target. Only a caller-supplied
 /// [`StdioPlan::Fd`](super::StdioPlan::Fd) can be low — the launch creates six
-/// descriptors of its own before the null descriptor, the capture pipes, and the
-/// terminal replica, so all of those land at 3 or above — and with three streams
+/// descriptors of its own before the null descriptor and the capture pipes, and
+/// the terminal replica is opened after all of them, so each lands at 3 or
+/// above — and with three streams
 /// to wire, a low one is not merely the `dup2(fd, fd)` no-op that leaves
 /// close-on-exec set: wiring one stream would *destroy* the source another had
 /// not been copied from yet. With standard input on the caller's descriptor 1
@@ -686,7 +741,7 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 /// pre-existing rather than something the terminal introduced. What a terminal
 /// launch changes is the breadth: it wires all three, where a capturing launch
 /// wires at most two.
-fn wire_stdio(context: &Context<'_>) -> Result<(), Errno> {
+fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result<(), Errno> {
     /// The highest standard stream number: the ceiling a source must be above
     /// before anything is wired, and the floor it is moved to.
     const STDERR: RawFd = 2;
@@ -709,7 +764,7 @@ fn wire_stdio(context: &Context<'_>) -> Result<(), Errno> {
     // contract. Nothing contradicts it — the launch refuses a terminal against
     // any stated disposition, and the terminal entry points take no observer —
     // so this is a substitution rather than a precedence rule.
-    let (stdin, stdout, stderr) = match context.terminal_fd {
+    let (stdin, stdout, stderr) = match terminal {
         Some(replica) => (Some(replica), Some(replica), Some(replica)),
         None => (
             wired(&context.plan.stdin, context.stdin_fd, context.null_fd),
@@ -1421,16 +1476,17 @@ enum Role {
 /// the report-pipe copy closes (the exec convention needs every copy gone),
 /// the capture-pipe copies close (their end-of-file must track the command,
 /// not this process), a caller-supplied standard stream closes (the supervisor
-/// must not pin a caller resource for the sandbox's lifetime), a terminal
-/// launch's replica closes (end-of-file on the primary arrives only when the
-/// last replica anywhere is gone, and this process is not the command), stdio
-/// repoints at `/dev/null` (a pipeline reading the caller's stdout must not wait
-/// for the supervisor), and SIGPIPE becomes ignored so a status write after the
-/// handle is dropped fails with `EPIPE` instead of killing the supervisor.
+/// must not pin a caller resource for the sandbox's lifetime), stdio repoints
+/// at `/dev/null` (a pipeline reading the caller's stdout must not wait for the
+/// supervisor), and SIGPIPE becomes ignored so a status write after the handle
+/// is dropped fails with `EPIPE` instead of killing the supervisor.
 ///
-/// Dropping the replica costs the session nothing: the controlling-terminal
-/// association `TIOCSCTTY` established is a property of the session and survives
-/// every descriptor to the terminal closing.
+/// A terminal launch's replica is not among these. The only supervisor that
+/// ever held one is the init, which allocated it and drops it itself before it
+/// supervises; the launch stage never did. Dropping it costs the session
+/// nothing: the controlling-terminal association `TIOCSCTTY` established is a
+/// property of the session and survives every descriptor to the terminal
+/// closing.
 ///
 /// Everything here is best-effort: past this point there is no report pipe
 /// to fail through, and none of these operations can fail in a way that
@@ -1454,13 +1510,8 @@ fn supervisor_hygiene(context: &Context<'_>) {
         // number already closed here is skipped rather than closed twice, which
         // would risk closing whatever the kernel had since handed that number
         // to.
-        let caller = [
-            context.stdin_fd,
-            context.stdout_fd,
-            context.stderr_fd,
-            context.terminal_fd,
-        ]
-        .map(|fd| fd.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
+        let caller = [context.stdin_fd, context.stdout_fd, context.stderr_fd]
+            .map(|fd| fd.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
         for index in 0..caller.len() {
             let fd = caller[index];
             if fd > 2 && !caller[..index].contains(&fd) {
@@ -1688,7 +1739,7 @@ fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
         context.stdin_fd,
         context.stdout_fd,
         context.stderr_fd,
-        context.terminal_fd,
+        context.terminal_channel_fd,
     ]
     .map(|channel| channel.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
     sweep_fds_keeping(&keep)

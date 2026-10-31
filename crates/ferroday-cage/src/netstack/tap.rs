@@ -42,17 +42,13 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString};
-use std::mem::MaybeUninit;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use rustix::ioctl;
-use rustix::net::{
-    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
-};
+use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 use rustix::thread::LinkNameSpaceType;
 
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
@@ -465,34 +461,16 @@ fn run_helper(context: &HelperContext<'_>) -> Result<(), (Step, Errno)> {
 
 /// Sends the success record with the tap descriptor attached.
 fn send_tap(sock: BorrowedFd<'_>, tap: BorrowedFd<'_>) -> Result<(), Errno> {
-    let payload = [0u8; 8];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut ancillary = SendAncillaryBuffer::new(&mut space);
-    let fds = [tap];
-    ancillary.push(SendAncillaryMessage::ScmRights(&fds));
-    frame::retry_on_intr!(rustix::net::sendmsg(
-        sock,
-        &[std::io::IoSlice::new(&payload)],
-        &mut ancillary,
-        SendFlags::NOSIGNAL,
-    ))
-    .map(|_| ())
+    frame::send_with_fd(sock, &[0u8; 8], tap)
 }
 
 /// Receives the helper's one record: the tap descriptor on success, a
 /// step-and-errno report on failure, or a hangup if the helper died.
 fn receive_tap(sock: &OwnedFd, plan: &Plan) -> Result<OwnedFd, NetStackError> {
     let mut payload = [0u8; 8];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-    let received = frame::retry_on_intr!(rustix::net::recvmsg(
-        sock,
-        &mut [std::io::IoSliceMut::new(&mut payload)],
-        &mut ancillary,
-        RecvFlags::CMSG_CLOEXEC,
-    ))
-    .map_err(|_| NetStackError::HelperLost)?;
-    if received.bytes != payload.len() {
+    let (bytes, tap) =
+        frame::recv_with_fd(sock.as_fd(), &mut payload).map_err(|_| NetStackError::HelperLost)?;
+    if bytes != payload.len() {
         return Err(NetStackError::HelperLost);
     }
     let step = u32::from_le_bytes(payload[0..4].try_into().expect("four bytes"));
@@ -502,12 +480,6 @@ fn receive_tap(sock: &OwnedFd, plan: &Plan) -> Result<OwnedFd, NetStackError> {
             Some(step) => step_error(step, errno, plan),
             None => NetStackError::HelperLost,
         });
-    }
-    let mut tap = None;
-    for message in ancillary.drain() {
-        if let RecvAncillaryMessage::ScmRights(fds) = message {
-            tap = fds.into_iter().next();
-        }
     }
     tap.ok_or(NetStackError::HelperLost)
 }

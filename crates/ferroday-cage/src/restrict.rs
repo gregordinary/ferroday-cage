@@ -264,10 +264,12 @@ impl Restriction {
     ///
     /// The counterpart of
     /// [`Cage::spawn_terminal`](crate::Cage::spawn_terminal), and the fallback
-    /// supports it in full: a host-allocated pseudoterminal needs no `devpts`
-    /// instance, so a restriction gets the same interactive story a cage does.
-    /// The command process is the session leader here, since a restriction has
-    /// no PID namespace and so no init above it.
+    /// supports it in full. The terminal is allocated the same way, from the
+    /// `/dev/ptmx` the command sees, which for a restriction is the host's, so
+    /// its replica is a node of the host's `devpts` that the command can name.
+    /// The command process is the session leader here, and the allocating
+    /// process, since a restriction has no PID namespace and so no init above
+    /// it.
     pub fn spawn_terminal(
         &self,
         terminal: &crate::Terminal,

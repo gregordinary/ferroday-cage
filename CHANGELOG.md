@@ -45,6 +45,29 @@ consumer upgrading can skip it.
 - `Error::KeyQuotaExhausted`, reported when the calling user's kernel key quota
   leaves no room for the sandbox's session keyring, and
   `SetupStep::ReplaceSessionKeyring`, the step that replaces it.
+- `SetupStep::AllocateTerminal` and `SetupStep::SendTerminal`, the steps a
+  terminal launch's allocation now reports under.
+
+### Changed
+
+- **Breaking.** A terminal launch allocates its pseudoterminal inside the
+  sandbox, from the `/dev/ptmx` the command sees, rather than on the host before
+  the fork. `ttyname` now names the terminal, so `tty`, `who`, and `GPG_TTY`
+  work inside, and under a `run_as` identity the replica belongs to that
+  identity. The allocation needs the managed `/dev` or a `devpts` instance the
+  caller mounts: a terminal launch with `mount_dev(false)` or
+  `managed_mounts(false)`, in a root that ships no `/dev/ptmx`, previously ran
+  on a host pseudoterminal and now fails with `SetupStep::AllocateTerminal`.
+  `spawn_pending_terminal` waits for the terminal, so a setup failure before it
+  exists is reported there rather than from `proceed`. A restriction's terminal
+  still comes from the host's `/dev/ptmx`.
+
+### Internal
+
+- `mechanism::frame::send_with_fd` and `recv_with_fd` pass a descriptor over a
+  socket for every caller that does: the supervisor's pidfd, the network stack's
+  tap, and a terminal launch's primary. The shared vocabulary in
+  `CONTRIBUTING.md` records them.
 
 ## [0.4.5] - 2026-09-26
 

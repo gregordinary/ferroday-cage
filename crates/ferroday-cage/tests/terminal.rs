@@ -7,7 +7,7 @@ mod common;
 
 use std::io::{Read as _, Write as _};
 
-use ferroday_cage::{Cage, ConfigError, Error, IdentityMap, Pty, Stdio, Terminal};
+use ferroday_cage::{Cage, ConfigError, Error, IdentityMap, Pty, SetupStep, Stdio, Terminal};
 // The run-as case is the only one that names an identity, and it needs a range
 // map, so it and this import are gated together.
 #[cfg(feature = "subid")]
@@ -104,9 +104,9 @@ fn the_command_starts_at_the_stated_window_size() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    // The size is set on the replica before the fork, so the command cannot
-    // observe a 0x0 window even at its first instruction, and it is whatever the
-    // caller stated rather than anything read from the host.
+    // The size is set on the replica before the command exists, so the command
+    // cannot observe a 0x0 window even at its first instruction, and it is
+    // whatever the caller stated rather than anything read from the host.
     let cage = shell(rootfs, "stty size");
     let (mut running, mut pty) = cage
         .spawn_terminal(&Terminal::new().size(43, 132))
@@ -168,9 +168,8 @@ fn dev_tty_resolves_to_the_sandboxs_own_terminal() {
         return;
     };
     // `/dev/tty` is the character device 5:0, a per-process redirect to the
-    // opener's controlling terminal, so the node the private devpts does not
-    // carry is beside the point: what it yields here is the sandbox's own
-    // terminal, and a write through it reaches the caller's primary.
+    // opener's controlling terminal, so what it yields here is the sandbox's
+    // own terminal, and a write through it reaches the caller's primary.
     let cage = shell(rootfs, "echo through-dev-tty > /dev/tty");
     let (mut running, mut pty) = cage
         .spawn_terminal(&Terminal::new())
@@ -212,11 +211,10 @@ fn dev_tty_works_for_a_run_as_identity() {
         return;
     }
     let map = IdentityMap::Subordinate;
-    // The replica's inode is mode 0620 owned by the mapped calling uid, so a
-    // command running as a different mapped uid could in principle be refused. It
-    // is not: the `5:0` redirect is a per-process lookup of the opener's own
-    // controlling terminal, and the permission check the open performs is against
-    // the mode-0666 `/dev/tty` node rather than against the replica's inode.
+    // The `5:0` redirect is a per-process lookup of the opener's own controlling
+    // terminal, and the permission check the open performs is against the
+    // mode-0666 `/dev/tty` node rather than against the replica's inode, so this
+    // holds whoever the replica belongs to.
     let cage = Cage::builder()
         .rootfs(rootfs)
         .identity_map(map)
@@ -240,25 +238,108 @@ fn dev_tty_works_for_a_run_as_identity() {
     );
 }
 
+/// A script that names its terminal by path, checks the path is the terminal it
+/// runs on, and writes through the path. Exits non-zero at the first step that
+/// fails, so the status says which.
+const THROUGH_THE_PATH: &str = "t=$(tty) || exit 1; \
+     case \"$t\" in /dev/pts/*) ;; *) exit 2 ;; esac; \
+     [ -c \"$t\" ] || exit 3; \
+     echo \"named $t\" > \"$t\" || exit 4";
+
 #[test]
-fn a_path_for_the_terminal_does_not_resolve() {
+fn a_path_for_the_terminal_resolves_inside_the_sandbox() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    // The stated limit of allocating on the host: the replica's device node
-    // lives in the host's devpts, and the sandbox's /dev/pts is a private
-    // instance, so anything that resolves a path for its terminal fails. `tty`
-    // is the plain case; `GPG_TTY` is the one that bites in practice.
-    let cage = shell(rootfs, "tty || echo tty-failed > /dev/tty");
+    // The terminal is allocated from the sandbox's own devpts instance, so its
+    // replica is a node the sandbox can name. Anything that resolves a path for
+    // its terminal works: `tty` is the plain case, and `GPG_TTY`, which gpg
+    // fills from `tty` and pinentry then opens, is the one that matters.
+    let (mut running, mut pty) = shell(rootfs, THROUGH_THE_PATH)
+        .spawn_terminal(&Terminal::new())
+        .expect("the sandbox launches on a terminal");
+    let written = drain(&mut pty);
+    let status = running.wait().expect("the outcome is collected");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the terminal is named, and reachable by its name: {written:?}",
+    );
+    assert!(
+        written.contains("named /dev/pts/"),
+        "a write through the path reaches the caller's primary: {written:?}",
+    );
+}
+
+#[cfg(feature = "subid")]
+#[test]
+fn a_run_as_identity_owns_its_terminal() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !range_map_available() {
+        return;
+    }
+    // A login's terminal belongs to the user logging in, and so does the
+    // sandbox's to its run-as identity. Without that, the replica would belong
+    // to root inside and be mode 0620, and a command running as anyone else
+    // could name its terminal but not open it.
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .identity_map(IdentityMap::Subordinate)
+        .run_as(Identity::new(1000, 1000))
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!("{THROUGH_THE_PATH}; [ -O \"$t\" ] || exit 5"),
+        ])
+        .build()
+        .expect("a valid sandbox configuration");
     let (mut running, mut pty) = cage
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
     let written = drain(&mut pty);
-    running.wait().expect("the outcome is collected");
-    assert!(
-        written.contains("tty-failed"),
-        "path resolution fails while the descriptor still works: {written:?}",
+    let status = running.wait().expect("the outcome is collected");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the run-as identity owns and opens its terminal: {written:?}",
     );
+}
+
+#[test]
+fn a_terminal_launch_without_a_dev_fails_at_the_allocation() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The managed `/dev` is where `/dev/ptmx` and the devpts instance behind it
+    // come from. The fixture ships an empty `/dev`, so without the profile's
+    // there is nothing to allocate from, and the launch says which step found
+    // that, directly or held at the seam.
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .mount_dev(false)
+        .command("/bin/true")
+        .build()
+        .expect("the sandbox itself is valid");
+    let direct = cage
+        .spawn_terminal(&Terminal::new())
+        .expect_err("there is no /dev/ptmx to allocate from");
+    let held = cage
+        .spawn_pending_terminal(&Terminal::new())
+        .expect_err("the held launch reports it too, before any proceed");
+    for err in [direct, held] {
+        assert!(
+            matches!(
+                &err,
+                Error::Setup {
+                    step: SetupStep::AllocateTerminal,
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+    }
 }
 
 #[test]
@@ -267,8 +348,8 @@ fn nested_allocation_uses_the_sandboxs_own_devpts() {
         return;
     };
     // The private devpts stays mounted, so a program that allocates a terminal
-    // of its own inside the sandbox gets one from that instance — and sees no
-    // host pseudoterminal but the single replica it was handed.
+    // of its own inside the sandbox gets one from the same instance its own
+    // terminal came from, and sees no host pseudoterminal at all.
     let cage = shell(
         rootfs,
         "ls /dev/pts | tr '\\n' ' '; echo; \
@@ -292,8 +373,8 @@ fn end_of_file_arrives_when_the_session_ends() {
     };
     // The drain-then-wait shape the documentation recommends: end-of-file on
     // the primary means every replica is closed, so the wait after it is prompt.
-    // It only terminates because the caller's own copy, `stage_init`'s, and the
-    // supervisor's are all dropped.
+    // It only terminates because the init that allocated the terminal drops its
+    // copy of the replica before it supervises, and nothing else holds one.
     let (mut running, mut pty) = shell(rootfs, "echo done")
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
@@ -308,11 +389,11 @@ fn a_concurrent_export_does_not_withhold_end_of_file() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    // A fork copies the whole descriptor table, so a child forked between
-    // the replica's open and its close inherits a copy and could hold the
-    // session's end-of-file open for as long as it runs. Every such child sweeps
-    // its inherited table early, which is what bounds the exposure — asserted
-    // here by starting an export that outlives the session and requiring the
+    // A fork copies the whole descriptor table, so a child the caller
+    // forks during a launch inherits whatever the launch has open at that
+    // moment. The replica is never among it, since it exists only inside the
+    // sandbox, so a concurrent child cannot hold the session's end-of-file open.
+    // Asserted by starting an export that outlives the session and requiring the
     // drain to finish anyway.
     let export = std::thread::spawn(move || {
         let mut sink = std::io::sink();

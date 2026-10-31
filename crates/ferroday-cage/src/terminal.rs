@@ -1,15 +1,17 @@
 //! A pseudoterminal of the sandbox's own, and the caller's end of it.
 //!
-//! The pseudoterminal is allocated on the host, before the fork, rather than in
-//! the sandbox's own `devpts` instance. That single choice is what keeps the
-//! feature small: the replica is an ordinary descriptor by the time the sandbox
-//! exists, so it needs no return channel, no new pump, and no new stopping rule
-//! in the wait. What it gives up is path resolution — see [`Terminal`].
+//! The pseudoterminal is allocated inside the sandbox, from the `/dev/ptmx` the
+//! sandbox itself sees, by the first process of the sandbox proper once the
+//! root is in place. The primary then travels back to the caller over a channel
+//! of the launch's own, and the replica stays behind for the command. Allocated
+//! there, the replica's device node is one the sandbox can name, so a program
+//! that resolves a path for its terminal finds it; see [`Terminal`].
 
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
+use rustix::fs::{Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 use rustix::pty::{self, OpenptFlags};
 use rustix::termios::{
@@ -47,29 +49,34 @@ const BASELINE_SPEED: u32 = 38400;
 /// the sandbox's own pseudoterminal, and `TIOCSTI` on it pushes characters into
 /// the sandbox's own input queue.
 ///
-/// `/dev/tty` is the one entry on that list that is a *node* rather than a
-/// descriptor operation, and the node comes from the managed `/dev` profile:
+/// # Where it comes from
+///
+/// The pseudoterminal is allocated inside the sandbox, from the `/dev/ptmx` the
+/// sandbox sees, so its replica is a node in the sandbox's own `devpts`
+/// instance. A program that resolves a *path* for its terminal therefore finds
+/// one: `ttyname` names `/dev/pts/0`, and `tty(1)`, `who`, and `GPG_TTY`, which
+/// gpg populates from `tty` and pinentry then opens, all work. Under a
+/// [`run_as`](crate::CageBuilder::run_as) identity the replica belongs to that
+/// identity, as a login's terminal belongs to the user logging in, so the
+/// command can open it by that path too. The sandbox holds no host
+/// pseudoterminal at all.
+///
+/// The managed `/dev` profile is what provides the `/dev/ptmx` the allocation
+/// opens, and the `devpts` instance behind it.
 /// [`mount_dev(false)`](crate::CageBuilder::mount_dev) or
-/// [`managed_mounts(false)`](crate::CageBuilder::managed_mounts) removes it, and
-/// a rootfs that ships no `/dev/tty` of its own then has none. Everything else
-/// here — `isatty`, `tcgetattr`, `tcsetattr`, the line discipline, the window
-/// size, job control — acts on the descriptors the launch wired and is
-/// unconditional.
+/// [`managed_mounts(false)`](crate::CageBuilder::managed_mounts) removes both,
+/// and a terminal launch in a root that ships no `/dev/ptmx` of its own then
+/// fails at [`SetupStep::AllocateTerminal`](crate::SetupStep::AllocateTerminal).
+/// A caller that assembles `/dev` itself mounts a `devpts` instance with
+/// `newinstance` and links `/dev/ptmx` to its `ptmx`, as the managed profile
+/// does.
 ///
-/// # What does not work
+/// The restriction fallback has no `/dev` of its own, so a restriction's
+/// terminal comes from the host's `/dev/ptmx`, and a path for it resolves
+/// against the host's `/dev/pts`, which the command sees.
 ///
-/// **Path resolution for the terminal fails; descriptor operations work.**
-/// `ttyname` on any of the three streams fails inside the sandbox, because the
-/// replica's device node lives in the host's `devpts` and the sandbox's
-/// `/dev/pts` is a private instance. Anything that resolves a *path* for its
-/// terminal is affected: `tty(1)`, `who`, and `GPG_TTY`, which gpg populates
-/// from `tty` and pinentry then opens. Anything that operates on the
-/// *descriptor* is not — `isatty`, `tcgetattr`, `tcsetattr`, the line
-/// discipline, the window size, job control, and `/dev/tty`.
-///
-/// The private `devpts` stays mounted, so nested allocation — `tmux`, `script`,
-/// `sshd`, Python's `pty` — works normally and sees no host pseudoterminal but
-/// its own.
+/// Nested allocation, by `tmux`, `script`, `sshd`, or Python's `pty`, draws on
+/// the same private instance, and sees no pseudoterminal but the sandbox's own.
 ///
 /// # Determinism
 ///
@@ -230,7 +237,7 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Wraps the primary a launch allocated.
+    /// Wraps the primary a launch received from the sandbox.
     pub(crate) fn new(primary: OwnedFd) -> Pty {
         Pty { primary }
     }
@@ -351,33 +358,46 @@ impl io::Write for Pty {
     }
 }
 
-/// Allocates a pseudoterminal on the host and establishes its size and termios
-/// baseline, returning (primary, replica).
+/// Allocates a pseudoterminal from the `/dev/ptmx` the calling process sees and
+/// establishes its size and termios baseline, returning (primary, replica).
 ///
-/// Called before the fork, where allocation and fallible preparation are still
-/// permitted, so nothing here runs under the post-fork discipline.
+/// The launch calls this in the first process of the sandbox proper, after the
+/// root swap. In a container, `/dev/ptmx` is then the managed `/dev`'s link into
+/// the sandbox's own `devpts` instance; in a restriction, it is the host's. The
+/// call runs between `fork` and `exec`, so it keeps that window's discipline:
+/// raw syscalls over stack data, no allocation, and no panic.
 ///
-/// Both ends are opened `O_NOCTTY`: a caller that is a session leader without a
-/// controlling terminal must not acquire this one by accident, and the sandbox
-/// takes it deliberately with `TIOCSCTTY` instead. Both are opened
-/// close-on-exec, so no exec'd descendant on either side can hold one.
+/// The open refuses a magic link anywhere in the path. `/dev/ptmx` is a
+/// symbolic link in the managed profile, which is followed, but a root that
+/// shipped one pointing through `/proc/self/fd` would otherwise hand this
+/// process one of its own descriptors in place of a multiplexer. A path that
+/// names anything but a multiplexer fails at the unlock, with `ENOTTY`.
+///
+/// Both ends are opened `O_NOCTTY`: the allocating process takes the replica as
+/// its controlling terminal deliberately, with `TIOCSCTTY`, rather than by
+/// accident at the open. Both are opened close-on-exec, so no exec'd
+/// descendant can hold one it was not given.
 ///
 /// The replica is opened with `TIOCGPTPEER` rather than by the path `ptsname`
 /// reports. The peer resolves from the primary's own `devpts` mount, so the
-/// replica cannot be a different file than the one just allocated, and no path
-/// is resolved against a host `/dev/pts` the caller does not control. It is
-/// Linux 4.13, well under this crate's floor.
-pub(crate) fn allocate(terminal: &Terminal) -> Result<(OwnedFd, OwnedFd), Error> {
-    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-    // rustix translates the kernel's `ENOSPC` to `EAGAIN` here, so that its two
-    // backends answer alike; both are read as exhaustion, since neither has
-    // another meaning for an open of `/dev/ptmx`.
-    let primary = pty::openpt(flags).map_err(|errno| match errno {
-        Errno::AGAIN | Errno::NOSPC => Error::TerminalsExhausted,
-        errno => terminal_error(errno),
-    })?;
-    pty::unlockpt(&primary).map_err(terminal_error)?;
-    let replica = pty::ioctl_tiocgptpeer(&primary, flags).map_err(terminal_error)?;
+/// replica cannot be a different file than the one just allocated. It is Linux
+/// 4.13, well under this crate's floor.
+pub(crate) fn allocate(terminal: &Terminal) -> Result<(OwnedFd, OwnedFd), Errno> {
+    // Not `provision::containment::open_dir`: this opens one device node by an
+    // absolute path, where that helper opens a directory contained in a tree.
+    #[expect(clippy::disallowed_methods)]
+    let primary = rustix::fs::openat2(
+        rustix::fs::CWD,
+        c"/dev/ptmx",
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    )?;
+    pty::unlockpt(&primary)?;
+    let replica = pty::ioctl_tiocgptpeer(
+        &primary,
+        OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC,
+    )?;
 
     termios::tcsetwinsize(
         &replica,
@@ -387,10 +407,9 @@ pub(crate) fn allocate(terminal: &Terminal) -> Result<(OwnedFd, OwnedFd), Error>
             ws_xpixel: 0,
             ws_ypixel: 0,
         },
-    )
-    .map_err(terminal_error)?;
+    )?;
     let baseline = baseline_termios(&replica)?;
-    termios::tcsetattr(&replica, OptionalActions::Now, &baseline).map_err(terminal_error)?;
+    termios::tcsetattr(&replica, OptionalActions::Now, &baseline)?;
     Ok((primary, replica))
 }
 
@@ -406,8 +425,11 @@ pub(crate) fn allocate(terminal: &Terminal) -> Result<(OwnedFd, OwnedFd), Error>
 ///
 /// The speed is set last, because `set_speed` writes the baud bits of the
 /// control modes and assigning those afterwards would drop them.
-fn baseline_termios(replica: &OwnedFd) -> Result<termios::Termios, Error> {
-    let mut baseline = termios::tcgetattr(replica).map_err(terminal_error)?;
+///
+/// Post-fork safe, as [`allocate`] must be: the `Termios` lives on the stack
+/// and every write to it is a field assignment.
+fn baseline_termios(replica: &OwnedFd) -> Result<termios::Termios, Errno> {
+    let mut baseline = termios::tcgetattr(replica)?;
     baseline.input_modes = InputModes::ICRNL | InputModes::IXON;
     baseline.output_modes = OutputModes::OPOST | OutputModes::ONLCR;
     baseline.control_modes = ControlModes::CS8 | ControlModes::CREAD | ControlModes::HUPCL;
@@ -442,10 +464,7 @@ fn baseline_termios(replica: &OwnedFd) -> Result<termios::Termios, Error> {
     ] {
         baseline.special_codes[index] = code;
     }
-    baseline
-        .set_speed(BASELINE_SPEED)
-        .map_err(terminal_error)
-        .map(|()| baseline)
+    baseline.set_speed(BASELINE_SPEED).map(|()| baseline)
 }
 
 /// A failed pseudoterminal operation, as the typed error.

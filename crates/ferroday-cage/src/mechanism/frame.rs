@@ -26,9 +26,14 @@
 //! reads through a `std::io::Read` rather than a descriptor and keeps its own
 //! readers, but uses these names for the shapes they share.
 
-use std::os::fd::BorrowedFd;
+use std::mem::MaybeUninit;
+use std::os::fd::{BorrowedFd, OwnedFd};
 
 use rustix::io::Errno;
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
+};
 
 /// Writes `data` in full, looping over short writes and retrying `EINTR`.
 ///
@@ -134,3 +139,66 @@ macro_rules! retry_on_intr {
 }
 
 pub(crate) use retry_on_intr;
+
+/// Sends `payload` as one message on a socket, with `fd` attached as
+/// `SCM_RIGHTS`, retrying `EINTR`.
+///
+/// How a child hands the caller a descriptor it opened: the supervisor's pidfd,
+/// the network stack's tap, the sandbox's pseudoterminal. Each rides on a
+/// payload of its own protocol, which is the caller's to decide, and the
+/// message is sent whole or not at all. A seqpacket socket keeps the payload
+/// and its descriptor one unit on the receiving side, which is what every
+/// caller here uses.
+///
+/// `SIGPIPE` is suppressed, so a peer that has gone is an `EPIPE` to report
+/// rather than a signal to die of.
+///
+/// Post-fork safe: the control-message buffer is on the stack.
+pub(crate) fn send_with_fd(
+    socket: BorrowedFd<'_>,
+    payload: &[u8],
+    fd: BorrowedFd<'_>,
+) -> Result<(), Errno> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    let fds = [fd];
+    ancillary.push(SendAncillaryMessage::ScmRights(&fds));
+    retry_on_intr!(rustix::net::sendmsg(
+        socket,
+        &[std::io::IoSlice::new(payload)],
+        &mut ancillary,
+        SendFlags::NOSIGNAL,
+    ))
+    .map(|_| ())
+}
+
+/// Receives one message into `payload`, returning how many bytes arrived and
+/// the descriptor attached to it, if one was, retrying `EINTR`.
+///
+/// The other end of [`send_with_fd`]. The descriptor arrives close-on-exec. A
+/// message carrying more than one has the first returned and the rest closed,
+/// and one carrying none, or a hangup reported as zero bytes, returns `None`
+/// for it. Each caller judges the byte count against its own protocol, since
+/// only it knows what a short message means.
+pub(crate) fn recv_with_fd(
+    socket: BorrowedFd<'_>,
+    payload: &mut [u8],
+) -> Result<(usize, Option<OwnedFd>), Errno> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+    let received = retry_on_intr!(rustix::net::recvmsg(
+        socket,
+        &mut [std::io::IoSliceMut::new(payload)],
+        &mut ancillary,
+        RecvFlags::CMSG_CLOEXEC,
+    ))?;
+    let mut fd = None;
+    for message in ancillary.drain() {
+        if let RecvAncillaryMessage::ScmRights(mut fds) = message
+            && fd.is_none()
+        {
+            fd = fds.next();
+        }
+    }
+    Ok((received.bytes, fd))
+}

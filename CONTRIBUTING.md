@@ -386,6 +386,7 @@ it grows one, it is this row it extends.
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |
 | Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending |
+| Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd` |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
 | Declare an enum together with the roster of its own variants | `roster::roster_enum!` |

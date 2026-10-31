@@ -661,10 +661,12 @@ impl Cage {
     ///
     /// The composition an interactive session needs: a shell with outbound
     /// networking. The primary comes back here rather than out of
-    /// [`proceed`](Pending::proceed), because the pseudoterminal is allocated
-    /// before the fork and the gate sits after its controlling terminal is
-    /// established; nothing writes to the terminal while the launch is held, so
-    /// the caller attaches its stack and proceeds with the primary in hand.
+    /// [`proceed`](Pending::proceed), because the sandbox allocates the
+    /// pseudoterminal and sends its primary before the command reaches the
+    /// gate. This waits for it, so a setup step that fails before the terminal
+    /// exists is reported here rather than by `proceed`. Nothing writes to the
+    /// terminal while the launch is held, so the caller attaches its stack and
+    /// proceeds with the primary in hand.
     pub fn spawn_pending_terminal(
         &self,
         terminal: &Terminal,

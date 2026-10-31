@@ -34,6 +34,11 @@
 //!   for [`stop_with_caller`].
 //! - the supervisor's **pidfd** is the kill handle.
 //!
+//! A terminal launch adds a fifth, the **terminal channel** (a seqpacket pair):
+//! the first process of the sandbox proper allocates the pseudoterminal from
+//! the sandbox's own `/dev/ptmx` and sends its primary back over it, as one
+//! message with the descriptor attached.
+//!
 //! [`stop_with_caller`]: crate::CageBuilder::stop_with_caller
 
 #![allow(unsafe_code)]
@@ -105,17 +110,15 @@ pub(crate) use overlay::{OverlayProbe, probe_overlay_mount, xattr_unsupported};
 pub(crate) use remove::{RemoveFailure, remove_tree_mapped};
 
 use std::ffi::{CStr, CString};
-use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::RawMode;
 use rustix::io::Errno;
 use rustix::mount::MountFlags;
-use rustix::net::{
-    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SocketFlags, SocketType,
-};
+use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::pipe::{self, PipeFlags};
 use rustix::process::Signal;
 use rustix::process::{self, Pid, PidfdFlags, WaitId, WaitIdOptions, WaitOptions, WaitStatus};
@@ -857,11 +860,16 @@ struct ParentSide {
     /// stage A signals ready on it after unsharing, the caller applies the
     /// map against stage A's pid, and the go byte releases the stage.
     map_gate: Option<OwnedFd>,
-    /// The primary of the pseudoterminal allocated for a terminal launch. The
-    /// caller's end, and the only descriptor to this terminal that stays on
-    /// this side.
-    primary: Option<OwnedFd>,
+    /// Caller end of the terminal channel, present only for a terminal launch:
+    /// the sandbox sends the primary of the pseudoterminal it allocated over
+    /// it, and [`receive_primary`] takes it.
+    terminal: Option<OwnedFd>,
 }
+
+/// The payload byte the primary rides on over the terminal channel. Its value
+/// is immaterial; a message of one byte with a descriptor is the primary, and
+/// anything else is a broken protocol.
+pub(super) const TERMINAL_BYTE: u8 = b'P';
 
 /// The go byte written to the proceed pipe to release a gated command. Its
 /// value is immaterial; the child treats any byte as the signal to proceed.
@@ -1042,9 +1050,9 @@ pub(super) fn abandon_gated_child(child: Pid) {
 /// runs [`child::stage_a`], which ends in `execve` or `exit_group`. In the
 /// parent it returns the caller's ends of the channels. A `gated` launch
 /// additionally carries a proceed pipe, whose read end the command stage
-/// blocks on before `execve`; a `terminal` launch additionally allocates a
-/// pseudoterminal, whose replica the sandbox wires onto all three standard
-/// streams and whose primary comes back to the caller.
+/// blocks on before `execve`; a `terminal` launch additionally carries the
+/// terminal channel, over which the sandbox sends the primary of the
+/// pseudoterminal it allocates for itself.
 fn fork_launch(
     plan: &LaunchPlan,
     observe: bool,
@@ -1126,10 +1134,23 @@ fn fork_launch(
     } else {
         None
     };
-    // The pseudoterminal, last of the launch's own descriptors. Allocated after
-    // them so its replica cannot land on a standard-stream number: the six
-    // channel descriptors above are already taken, whatever the caller left open.
-    let terminal = terminal.map(crate::terminal::allocate).transpose()?;
+    // The terminal channel exists only for a terminal launch. The
+    // pseudoterminal itself is allocated inside the sandbox, from the
+    // `/dev/ptmx` the sandbox sees, so its replica is a node the command can
+    // name; only the primary crosses back.
+    let terminal_channel = if terminal.is_some() {
+        Some(
+            rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .map_err(spawn_error)?,
+        )
+    } else {
+        None
+    };
 
     // SAFETY: the child-process branch only constructs a struct of references
     // on its own stack and runs `child::stage_a`, which performs raw rustix
@@ -1155,7 +1176,10 @@ fn fork_launch(
                 stdin_fd: plan.stdin.caller_fd(),
                 stdout_fd: plan.stdout.caller_fd(),
                 stderr_fd: plan.stderr.caller_fd(),
-                terminal_fd: terminal.as_ref().map(|(_, replica)| replica.as_fd()),
+                terminal,
+                terminal_channel_fd: terminal_channel
+                    .as_ref()
+                    .map(|(_, sandbox)| sandbox.as_fd()),
             };
             child::stage_a(&context)
         }
@@ -1183,25 +1207,9 @@ fn fork_launch(
                 drop(stage);
                 caller
             });
-            // The replica goes as soon as the fork returns. End-of-file on the
-            // primary arrives only when the last replica descriptor anywhere
-            // closes, so every process that is not the command drops its own
-            // copy — this one, `stage_init`'s, and the supervisor's.
-            //
-            // The one copy no launch controls is a sibling's: a fork
-            // copies the whole descriptor table, so a child this caller forked
-            // between the replica's open just above and this close inherits one,
-            // exactly as the map gate records. Every child the library forks —
-            // another launch's stage A, an export, a copy-in, a removal, the
-            // network stack's tap helper — sweeps its inherited table as its
-            // first act, which bounds the exposure to that sweep rather than to
-            // the sibling's life, and the replica is opened close-on-exec so no
-            // exec'd descendant can hold one at all. A child the *consumer*
-            // forked in the same window sweeps nothing, and holds its copy until
-            // it execs or exits; that is the caller's window to keep clear.
-            let primary = terminal.map(|(primary, replica)| {
-                drop(replica);
-                primary
+            let terminal = terminal_channel.map(|(caller, sandbox)| {
+                drop(sandbox);
+                caller
             });
             Ok(ParentSide {
                 stage_a,
@@ -1212,8 +1220,53 @@ fn fork_launch(
                 stderr,
                 proceed_write,
                 map_gate,
-                primary,
+                terminal,
             })
+        }
+    }
+}
+
+/// Receives the primary of the sandbox's pseudoterminal over the terminal
+/// channel.
+///
+/// `None` when the channel hung up without one: every process that could have
+/// sent it is gone, having failed first, and the report pipe says which step.
+fn receive_primary(channel: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
+    let mut payload = [0u8; 1];
+    let (bytes, primary) =
+        frame::recv_with_fd(channel.as_fd(), &mut payload).map_err(wait_syscall_error)?;
+    match (bytes, primary) {
+        (0, _) => Ok(None),
+        (1, Some(primary)) if payload[0] == TERMINAL_BYTE => Ok(Some(primary)),
+        _ => Err(wait_syscall_error(Errno::PROTO)),
+    }
+}
+
+/// Waits for whichever comes first: the primary on the terminal channel, or
+/// word on the report pipe, and returns the primary when it came.
+///
+/// A held launch has no `execve` to wait for, so the report pipe closes only
+/// when a stage fails. Watching it beside the channel is what lets a failure
+/// before the terminal existed be read at once, rather than when the last copy
+/// of the channel's sandbox end happens to close. `None` means the report pipe
+/// has something to say, or the channel hung up, and the caller reads the
+/// report next.
+fn await_primary(channel: &OwnedFd, report: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
+    loop {
+        let mut fds = [
+            PollFd::new(channel, PollFlags::IN),
+            PollFd::new(report, PollFlags::IN),
+        ];
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(errno) => return Err(wait_syscall_error(errno)),
+        }
+        if !fds[0].revents().is_empty() {
+            return receive_primary(channel);
+        }
+        if !fds[1].revents().is_empty() {
+            return Ok(None);
         }
     }
 }
@@ -1359,8 +1412,27 @@ pub(crate) fn spawn(
     let report = read_report(&parent.report_read);
 
     match (report, received) {
-        // The command is running and the supervisor is published.
+        // The command is running and the supervisor is published. A terminal
+        // launch's primary was sent before the command was forked, so it is
+        // already waiting on the channel.
         (Ok(Report::ExecSucceeded), Ok((pidfd, pid))) => {
+            let primary = match &parent.terminal {
+                Some(channel) => match receive_primary(channel) {
+                    Ok(Some(primary)) => Some(primary),
+                    // The command runs on a terminal nobody holds. That is a
+                    // defect in this library rather than a state to hand out,
+                    // so the sandbox is torn down with it.
+                    outcome => {
+                        let _ = process::pidfd_send_signal(&pidfd, Signal::KILL);
+                        let _ = wait_for_exit(parent.stage_a);
+                        return Err(match outcome {
+                            Err(err) => err,
+                            _ => wait_syscall_error(Errno::PROTO),
+                        });
+                    }
+                },
+                None => None,
+            };
             progress(Progress::Executing);
             Ok((
                 Launched {
@@ -1372,7 +1444,7 @@ pub(crate) fn spawn(
                     stderr: parent.stderr,
                     reap: reap_after(plan.pid_namespace, parent.stage_a),
                 },
-                parent.primary,
+                primary,
             ))
         }
         // A setup step failed. Every stage at or below the failure has
@@ -1479,10 +1551,39 @@ pub(crate) fn spawn_pending(
         Ok((pidfd, pid)) => {
             progress(Progress::Supervised);
             // The primary comes back here rather than out of `proceed`: the
-            // pseudoterminal is allocated before the fork and the gate sits
-            // after the controlling terminal is established, so the caller
-            // attaches its network stack and proceeds with the primary already
-            // in hand. Nothing writes to the terminal while the launch is held.
+            // sandbox allocates the pseudoterminal and sends it before the
+            // command reaches the gate, so the caller attaches its network stack
+            // and proceeds with the primary already in hand. Nothing writes to
+            // the terminal while the launch is held.
+            let primary = match &parent.terminal {
+                Some(channel) => match await_primary(channel, &parent.report_read) {
+                    Ok(Some(primary)) => Some(primary),
+                    // A stage failed before the terminal existed, and the report
+                    // says which. With the proceed pipe still open no command
+                    // has been released, so everything the report can hold is a
+                    // failure.
+                    Ok(None) => {
+                        let report = read_report(&parent.report_read);
+                        let _ = process::pidfd_send_signal(&pidfd, Signal::KILL);
+                        let _ = wait_for_exit(parent.stage_a);
+                        return Err(match report {
+                            Ok(Report::SetupFailed {
+                                step,
+                                errno,
+                                detail,
+                            }) => setup_error(step, errno, detail, Labels::of(plan)),
+                            Ok(Report::ExecSucceeded) => Error::SupervisorLost,
+                            Err(err) => err,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = process::pidfd_send_signal(&pidfd, Signal::KILL);
+                        let _ = wait_for_exit(parent.stage_a);
+                        return Err(err);
+                    }
+                },
+                None => None,
+            };
             Ok((
                 PendingLaunch {
                     stage_a: parent.stage_a,
@@ -1499,7 +1600,7 @@ pub(crate) fn spawn_pending(
                     exec_label: plan.exec_label.clone(),
                     rlimit_labels: plan.rlimit_labels.clone(),
                 },
-                parent.primary,
+                primary,
             ))
         }
         // The supervisor was never published: a setup step failed before the
@@ -1656,6 +1757,11 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     if step == SetupStep::ReplaceSessionKeyring && errno == Errno::DQUOT.raw_os_error() {
         return Error::KeyQuotaExhausted;
     }
+    // A `devpts` instance answers an open of its multiplexer with `ENOSPC` when
+    // the host's pseudoterminals are spent, and has no other meaning for it.
+    if step == SetupStep::AllocateTerminal && errno == Errno::NOSPC.raw_os_error() {
+        return Error::TerminalsExhausted;
+    }
     // The exec step carries no detail index — there is one command, not a list
     // — so its subject comes from the plan's own label. Every other step with a
     // subject indexes the list it belongs to.
@@ -1678,36 +1784,13 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
 /// socket without the message means the stage exited before publishing.
 fn receive_supervisor(sock: &OwnedFd) -> Result<(OwnedFd, u32), Error> {
     let mut payload = [0u8; 4];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-    let received = loop {
-        match rustix::net::recvmsg(
-            sock,
-            &mut [std::io::IoSliceMut::new(&mut payload)],
-            &mut ancillary,
-            RecvFlags::CMSG_CLOEXEC,
-        ) {
-            Ok(received) => break received,
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(wait_syscall_error(errno)),
-        }
-    };
-    if received.bytes != payload.len() {
-        // A short message means the stage died before publishing the
-        // supervisor. Any descriptor a truncated message still carried is
-        // closed when `ancillary` drops — its `Drop` drains and closes every
-        // undrained `SCM_RIGHTS` fd — so this early return leaks nothing.
-        return Err(Error::SupervisorLost);
-    }
-    let mut pidfd = None;
-    for message in ancillary.drain() {
-        if let RecvAncillaryMessage::ScmRights(fds) = message {
-            pidfd = fds.into_iter().next();
-        }
-    }
+    let (bytes, pidfd) =
+        frame::recv_with_fd(sock.as_fd(), &mut payload).map_err(wait_syscall_error)?;
+    // A short message means the stage died before publishing the supervisor.
+    // A descriptor a truncated message still carried is dropped with it here.
     match pidfd {
-        Some(pidfd) => Ok((pidfd, u32::from_le_bytes(payload))),
-        None => Err(Error::SupervisorLost),
+        Some(pidfd) if bytes == payload.len() => Ok((pidfd, u32::from_le_bytes(payload))),
+        _ => Err(Error::SupervisorLost),
     }
 }
 

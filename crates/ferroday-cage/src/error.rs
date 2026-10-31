@@ -166,6 +166,11 @@ wire_enum! {
         /// Give the sandbox a session keyring of its own, in place of the one
         /// the caller's session carries.
         ReplaceSessionKeyring = 55 => "replacing the inherited session keyring",
+        /// Allocate the sandbox's pseudoterminal from the `/dev/ptmx` the
+        /// sandbox sees, and establish its size and line discipline.
+        AllocateTerminal = 56 => "allocating the sandbox's pseudoterminal",
+        /// Hand the primary of the sandbox's pseudoterminal back to the caller.
+        SendTerminal = 57 => "handing the sandbox's pseudoterminal to the caller",
     }
 }
 
@@ -931,8 +936,12 @@ pub enum Error {
     /// The delegate runs caller-side against the gated launch, so its own
     /// error is the diagnostic; the gated sandbox is torn down.
     IdentityMap(crate::IdMapError),
-    /// A pseudoterminal operation failed: allocating one for the sandbox, or
-    /// reading or setting its window size.
+    /// A pseudoterminal operation on the caller's side failed: reading or
+    /// setting the window size of the sandbox's terminal.
+    ///
+    /// The allocation itself happens inside the sandbox, so a failure there is
+    /// [`Setup`](Self::Setup) with
+    /// [`SetupStep::AllocateTerminal`](SetupStep::AllocateTerminal).
     #[non_exhaustive]
     Terminal {
         /// The error the operation failed with.
@@ -940,11 +949,13 @@ pub enum Error {
     },
     /// The host has no free pseudoterminal to allocate.
     ///
-    /// Pseudoterminals are a bounded resource — `/proc/sys/kernel/pty/max`
-    /// states the ceiling — so a host running many sandboxes at once can
-    /// exhaust them. Distinct from [`Terminal`](Self::Terminal) because it is
-    /// the one allocation failure that says nothing is wrong with the request:
-    /// the same launch succeeds once something releases a terminal.
+    /// Pseudoterminals are a bounded resource, so a host running many sandboxes
+    /// at once can exhaust them. `/proc/sys/kernel/pty/max` states the ceiling,
+    /// and `/proc/sys/kernel/pty/reserve` the share of it kept for the host's own
+    /// `devpts`, which a sandbox's private instance cannot draw on. Distinct from
+    /// [`Setup`](Self::Setup) because it is the one allocation failure that says
+    /// nothing is wrong with the request: the same launch succeeds once something
+    /// releases a terminal.
     TerminalsExhausted,
 }
 
@@ -1071,8 +1082,8 @@ impl fmt::Display for Error {
                 write!(f, "a pseudoterminal operation failed: {}", source,)
             }
             Error::TerminalsExhausted => f.write_str(
-                "the host has no free pseudoterminal to allocate; \
-                 /proc/sys/kernel/pty/max states the ceiling",
+                "the host has no free pseudoterminal to allocate; /proc/sys/kernel/pty/max \
+                 states the ceiling, less /proc/sys/kernel/pty/reserve for a sandbox's own",
             ),
         }
     }

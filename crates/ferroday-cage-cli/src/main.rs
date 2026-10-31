@@ -4782,9 +4782,9 @@ fn run_with_netstack(
     // pending launch, which tears the sandbox down.
     //
     // With a terminal, the primary comes back here rather than out of
-    // `proceed`: the pseudoterminal is allocated before the fork and the gate
-    // sits after its controlling terminal is established, so the stack is
-    // attached with the primary already in hand.
+    // `proceed`: the sandbox allocates the pseudoterminal and sends its primary
+    // before the command reaches the gate, so the stack is attached with the
+    // primary already in hand.
     let held = if terminal {
         cage.spawn_pending_terminal(&terminal::terminal_for_caller())
             .map(|(pending, pty)| (pending, Some(pty)))
@@ -4963,8 +4963,9 @@ fn run_restricted(options: Options) -> ExitCode {
     }
 
     if options.terminal {
-        // A host-allocated pseudoterminal needs no devpts instance, so the
-        // fallback gets the same interactive story a cage does.
+        // The restriction's terminal comes from the host's own /dev/ptmx, the
+        // one its command sees, so the fallback gets the same interactive
+        // story a cage does.
         let signals = match Signals::install() {
             Ok(signals) => signals,
             Err(error) => return conclude_relay(Err(error)),

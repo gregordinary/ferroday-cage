@@ -187,26 +187,44 @@ a terminal arrives only from `spawn_terminal`, which captures nothing and takes
 no observer, so no capturing pipeline — `output`, an export, provisioning — can
 compose one.
 
-## What does not work
+## Where the terminal comes from
 
-**Path resolution for the terminal fails; descriptor operations work.** The
-pseudoterminal is allocated on the host rather than in the sandbox's own
-`devpts` instance, which is what keeps the feature small. The cost is that the
-replica's device node lives in the host's `devpts` while the sandbox's
-`/dev/pts` is a private instance, so `ttyname` fails inside the sandbox.
-Affected: `tty(1)`, `who`, and `GPG_TTY`, which gpg populates from `tty` and
-pinentry then opens.
+The sandbox allocates its terminal itself. Once its root is in place, the first
+process of the sandbox opens the `/dev/ptmx` the command will see. It makes the
+terminal the controlling terminal of the sandbox's session, and sends the
+primary back to the caller over a channel of the launch's own. The replica stays
+behind for the command, and the sandbox holds no host pseudoterminal at all.
 
-Not affected: `isatty`, `tcgetattr`, `tcsetattr`, the line discipline, the
-window size, job control, and `/dev/tty` — which is the character device `5:0`,
-a per-process redirect to the opener's own controlling terminal, so what it
-yields inside a terminal launch is the sandbox's own terminal.
+The replica is therefore a node in the sandbox's own `devpts` instance, and a
+program that names its terminal by path finds it. `ttyname` reports
+`/dev/pts/0`, so `tty(1)`, `who`, and `GPG_TTY` all work. gpg fills `GPG_TTY`
+from `tty`, and pinentry then opens that path. Under a [run-as
+identity](identity-maps.md#running-as-a-non-root-identity) the replica belongs
+to that identity, the way a login's terminal belongs to the user logging in.
+The command can then open its terminal by that path as well as use the
+descriptor.
 
-The private `devpts` stays mounted, so nested allocation — `tmux`, `script`,
-`sshd`, Python's `pty` — works normally and still sees no host pseudoterminal
-but its own. The sandbox holds exactly one descriptor to one host
-pseudoterminal: its own, whose only reader is the caller. `TIOCSTI` on it
-injects into its own input queue.
+`/dev/tty` is the character device `5:0`, a per-process redirect to the opener's
+own controlling terminal. Inside a terminal launch it yields the sandbox's own
+terminal. `TIOCSTI` on that terminal injects into its own input queue, which
+only the command reads.
+
+Nested allocation, by `tmux`, `script`, `sshd`, or Python's `pty`, draws on the
+same private instance, and sees no pseudoterminal but the sandbox's own.
+
+### What the allocation needs
+
+The managed `/dev` profile provides both the `/dev/ptmx` the allocation opens and
+the `devpts` instance behind it. `mount_dev(false)` or `managed_mounts(false)`
+removes them. A terminal launch in a root that ships no `/dev/ptmx` of its own
+then fails, reporting `SetupStep::AllocateTerminal`. A caller that assembles
+`/dev` itself mounts a `devpts` instance with `newinstance` and links
+`/dev/ptmx` to its `ptmx`, as the managed profile does.
+
+A sandbox's private instance draws on the host's pseudoterminal budget. The
+budget is `/proc/sys/kernel/pty/max`, less the `/proc/sys/kernel/pty/reserve`
+kept for the host's own instance. A host that has spent it reports
+`Error::TerminalsExhausted`.
 
 **A terminal launch reports no launch milestones.** The observer is the progress
 sink as well as the capture sink, and the terminal entry points take no
@@ -264,18 +282,21 @@ let mut running = pending.proceed()?;
 # }
 ```
 
-The primary comes back beside the `Pending` rather than out of `proceed`,
-because the pseudoterminal is allocated before the fork and the gate sits after
-its controlling terminal is established. Nothing writes to the terminal while
-the launch is held, so the caller attaches its stack and proceeds with the
-primary already in hand.
+The primary comes back beside the `Pending` rather than out of `proceed`. The
+sandbox allocates the terminal and sends its primary before the command reaches
+the gate, so `spawn_pending_terminal` waits for the primary and then returns. A
+setup step that fails before the terminal exists is reported there rather than
+from `proceed`. Nothing writes to the terminal while the launch is held, so the
+caller attaches its stack and proceeds with the primary already in hand.
 
 ## The restriction fallback
 
 `Restriction::spawn_terminal` gives the [restriction
-fallback](restriction-fallback.md) the same interactive story: a host-allocated
-pseudoterminal needs no `devpts` instance, so nothing about it depends on the
-namespaces a restriction does not have.
+fallback](restriction-fallback.md) the same interactive story, by the same
+mechanism. A restriction has no `/dev` of its own, so the `/dev/ptmx` its
+command sees is the host's. Its terminal therefore comes from the host's
+`devpts`, and a path for it resolves against the host's `/dev/pts`, which the
+command also sees.
 
 ## At a shell prompt
 
@@ -285,8 +306,7 @@ namespaces a restriction does not have.
 fcage --rootfs /srv/rootfs/alpine --terminal -- /bin/sh
 ```
 
-It allocates the terminal, copies *this* terminal's current size into it, and
-relays the two. `TERM` passes through as it does for every `fcage` run, so
+It asks for a terminal the current size of *this* one, and relays the two. `TERM` passes through as it does for every `fcage` run, so
 `--setenv TERM ...` overrides it. It composes with `--restrict` and with
 `--netstack`; `--terminal` with `--stdin null` is refused at parse time, naming
 both flags. From a script, where `fcage`'s own input is not a terminal, it
