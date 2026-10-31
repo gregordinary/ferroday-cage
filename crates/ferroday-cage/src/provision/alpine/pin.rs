@@ -90,6 +90,26 @@ impl Pins {
             .is_some_and(|order| order.is_eq())
     }
 
+    /// How closely a candidate for `package` meets the pin on that name.
+    ///
+    /// What [`Index::merge`] chooses among a pinned name's candidates by. Two
+    /// repositories can offer the pinned version over different bytes, and
+    /// the one recording the pinned control segment is the package the pin
+    /// recorded, wherever it sits in the order. Answers [`Fit::Neither`] for a
+    /// package the pin does not name.
+    pub(super) fn fit(&self, package: &str, version: &str, control_identity: &str) -> Fit {
+        match self.by_name.get(package) {
+            Some(pinned) if self.holds(package, version) => {
+                if pinned.control_identity == control_identity {
+                    Fit::Exact
+                } else {
+                    Fit::Version
+                }
+            }
+            _ => Fit::Neither,
+        }
+    }
+
     /// Checks that the merged index can supply every pinned package at the
     /// version and with the control segment the pin records.
     ///
@@ -138,6 +158,18 @@ impl Pins {
         unheld.sort_by(|a, b| a.package.cmp(&b.package));
         Err(AlpineError::Pin { unheld })
     }
+}
+
+/// How closely one candidate meets a pin, from least to most: the order is the
+/// preference [`Index::merge`] chooses by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Fit {
+    /// Another version than the pinned one.
+    Neither,
+    /// The pinned version, recording another control segment.
+    Version,
+    /// The pinned version and control segment: the package the pin recorded.
+    Exact,
 }
 
 /// One package a [`pin`](super::AlpineBuilder::pin) could not be held to.
@@ -357,6 +389,31 @@ mod tests {
             }
             other => panic!("expected a pin refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_pinned_bytes_win_over_the_pinned_version_republished() {
+        // Two repositories offer the pinned version, one over the bytes the
+        // pin recorded and one over others. The pin holds whichever order they
+        // are configured in, since one of them serves exactly what it names.
+        for seeds in [["p", "other"], ["other", "p"]] {
+            let pins = pins(&[("p", "1.0-r0", "p")]);
+            let index = merged(
+                &[("p", "1.0-r0", seeds[0]), ("p", "1.0-r0", seeds[1])],
+                &pins,
+            );
+            assert_eq!(
+                index.get("p").expect("p is in the index").control_identity,
+                identity("p"),
+                "offered in the order {seeds:?}",
+            );
+            pins.check(&index).expect("the pinned package is offered");
+        }
+        // Where neither is the recorded one, the later shadows as it always
+        // does, and the refusal names what it records.
+        let pins = pins(&[("p", "1.0-r0", "p")]);
+        let index = merged(&[("p", "1.0-r0", "one"), ("p", "1.0-r0", "two")], &pins);
+        assert_eq!(index.get("p").unwrap().control_identity, identity("two"));
     }
 
     #[test]

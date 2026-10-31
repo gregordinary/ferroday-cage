@@ -83,6 +83,10 @@ consumer upgrading can skip it.
   time linear in the line's length. A few tens of kilobytes of parentheses from
   a mirror overflowed the stack and aborted the host process, and a line of
   hyphens cost the square of its length.
+- An Alpine bootstrap matches a trigger's path pattern in time bounded by the
+  pattern's and the path's lengths. A pattern of many `*`s, from a package's
+  signed metadata or a layered base's `triggers` file, could hold the bootstrap
+  for minutes per directory.
 - The Gentoo stage3 is extracted from the descriptor its SHA-512 was taken
   through, so another run renaming a download over a shared cache entry between
   the check and the extraction cannot substitute unverified bytes.
@@ -185,6 +189,9 @@ consumer upgrading can skip it.
   it: literal names, `any`, `<os>-any`, and `any-<cpu>`. It chooses the first
   alternative that applies. The restrictions were ignored, so a control file
   with a `[hurd-any]` dependency failed to resolve.
+- An Alpine install script runs with exactly the environment `apk` gives one:
+  `PATH`, `APK_SCRIPT` and `APK_PACKAGE`, plus `SOURCE_DATE_EPOCH` where one is
+  set. It also received `HOME=/root`.
 - `DebianBuilder::build` and `debian::RepositoryBuilder::build` parse a caller's
   keyring and refuse one holding no usable key with `DebianError::Config`. A bad
   keyring failed only after the first release had been fetched.
@@ -207,6 +214,20 @@ consumer upgrading can skip it.
   stage3 or binary package failed the run.
 - `DebianEvent::Downloading` counts the packages being downloaded rather than the
   plan's, as `AlpineEvent::Downloading` does.
+- A Debian or Alpine pin holding a version two repositories offer over different
+  bytes selects the repository recording the pinned bytes. Debian took the
+  earlier repository's copy and Alpine the later one's, and refused the pin
+  where that copy was a rebuild.
+- Alpine versions compare as apk 3 compares them where a suffix carries no
+  number: `1.0_p` orders below `1.0_p0`, rather than equal to it. This affects
+  which of two repositories' records is selected, `=` constraints, and pins.
+- An Alpine plan whose package states an architecture other than the plan's or
+  `noarch`, or a control identity that is not a `Q1` digest, is refused when the
+  document is read and at `build`. The architecture was written verbatim into
+  the root's installed database.
+- A layered Alpine build finds a base package's archived trigger script by its
+  whole name. A package whose name and version began another's, such as `a` at
+  `1` and `a-1.5`, could be handed the other's script.
 - Gentoo atoms follow portage and the package manager specification. A
   `=cat/pkg-1.2*` atom matches only at a version-part boundary, so
   `=dev-lang/python-3.1*` no longer admits 3.12. A package name may not contain

@@ -269,6 +269,63 @@ fn a_bootstrap_dates_the_accounts_its_scripts_create_by_the_epoch() {
     }
 }
 
+/// Two bootstraps of one plan, at different paths, export byte-identical
+/// archives under one epoch.
+///
+/// The closure holds what makes a bootstrap differ run to run: `dbus` creates
+/// an account, which busybox dates by the clock, and generates a random
+/// machine id. The epoch dates the first, the bootstrap removes the second, and
+/// the export's clamp caps every modification time, so nothing of the run that
+/// built a root survives into its archive.
+#[test]
+fn two_bootstraps_of_one_plan_export_byte_identical_archives() {
+    if !network_enabled() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        // The scripts run inside a cage, which needs user namespaces.
+        return;
+    };
+    const EPOCH: i64 = 1_700_000_000;
+    let configured = || {
+        Alpine::builder(RELEASE)
+            .source_date_epoch(EPOCH)
+            .cache_dir(common::download_cache("alpine"))
+    };
+    let plan = configured()
+        .include(["alpine-base", "dbus"])
+        .build()
+        .expect("the builder validates")
+        .resolve()
+        .expect("the closure resolves");
+
+    let scratch = common::scratch_dir("alpine-reproducible");
+    let archives: Vec<Vec<u8>> = ["one", "two"]
+        .iter()
+        .map(|name| {
+            let rootfs = scratch.join(name).join("rootfs");
+            let mut alpine = configured()
+                .plan(plan.clone())
+                .build()
+                .expect("the plan builds");
+            provision::ensure(&rootfs, &mut alpine).expect("the bootstrap runs");
+            let mut archive = Vec::new();
+            provision::Export::new(&rootfs)
+                .clamp_mtime(EPOCH)
+                .write_to(&mut archive)
+                .expect("the root exports");
+            archive
+        })
+        .collect();
+
+    assert!(
+        archives[0] == archives[1],
+        "two bootstraps of one plan exported {} and {} bytes that differ",
+        archives[0].len(),
+        archives[1].len(),
+    );
+}
+
 /// A root provisioned from Alpine's `main` and postmarketOS's repository at
 /// once.
 ///

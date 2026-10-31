@@ -707,9 +707,11 @@ impl AlpineBuilder {
     /// Nothing here leaves the repository signature chain: every control
     /// identity is still read from an index whose own signature was verified.
     /// The pin narrows which version is selected; it never becomes the authority
-    /// for what the bytes are. A pin whose control identity disagrees with the
-    /// index's for the same version is refused rather than preferred, which is
-    /// how one version published twice over different bytes is caught.
+    /// for what the bytes are. Where two repositories offer the pinned version,
+    /// the one recording the pinned control identity is selected, wherever it
+    /// sits in the order. A pin whose control identity no repository records
+    /// for that version is refused rather than preferred, which is how one
+    /// version published twice over different bytes is caught.
     ///
     /// # Errors
     ///
@@ -749,8 +751,10 @@ impl AlpineBuilder {
     /// with [`AlpineError::Config`]: one resolved for another architecture; one
     /// naming an index it does not itself carry, or more indexes than the
     /// configured repositories publish, or an index whose release and component
-    /// are not what the repository in that slot publishes; and one naming a
-    /// package by something no repository could publish it under. It also
+    /// are not what the repository in that slot publishes; and one stating a
+    /// package no index for its architecture could publish: by a name or a
+    /// version outside the format, with a malformed control identity, or for
+    /// an architecture other than the plan's or `noarch`. It also
     /// refuses the combinations that would silently drop half of what was asked
     /// for — [`include`](Self::include), [`exclude`](Self::exclude) and
     /// [`pin`](Self::pin) all describe a resolution, and a plan is one already.
@@ -838,6 +842,11 @@ impl AlpineBuilder {
     /// scripts have run, every such day the run wrote is rewritten as the
     /// epoch's. The days a package shipped are kept. Without an epoch, one plan
     /// installed on two different days gives two different roots.
+    ///
+    /// An epoch in the first day of 1970 records no day at all, which disables
+    /// password aging for those accounts. `/etc/shadow` reads a last change on
+    /// day zero as a demand for a new password at the next login, so
+    /// shadow-utils' `useradd` writes the same empty field for that epoch.
     ///
     /// The value is a plain timestamp, so a pipeline that pins a build date
     /// passes the same number here and to
@@ -1159,7 +1168,10 @@ fn validate_plan(
         // A document is held to this as it is read; a `Plan` is public and
         // `Clone`, so one taken from `resolve()` and edited reaches here having
         // passed nothing.
-        if let Some(reason) = package.unaddressable() {
+        if let Some(reason) = package
+            .unaddressable()
+            .or_else(|| package.foreign_to(&plan.architecture))
+        {
             return contradiction(reason);
         }
     }
@@ -1512,7 +1524,13 @@ impl AlpineObserver for RunObserver<'_, '_> {
 }
 
 /// An observer that reports to a sink the caller bound with [`Alpine::observe`]
-/// and takes its cancellation from the run.
+/// and stops when either that sink or the provisioning run asks it to.
+///
+/// The caller chose the richer, Alpine-specific channel for events, and a sink
+/// that answers [`cancelled`](AlpineObserver::cancelled) stops the bootstrap
+/// it watches, as it does a layered build it is handed directly. A
+/// [`Provision::observe`](crate::provision::Provision::observe) observer can
+/// still stop a bootstrap it is not reporting on.
 struct ObservedRun<'a, 'r, 'o> {
     sink: &'o mut dyn AlpineObserver,
     request: &'a ProvisionRequest<'r>,
@@ -1524,7 +1542,7 @@ impl AlpineObserver for ObservedRun<'_, '_, '_> {
     }
 
     fn cancelled(&mut self) -> bool {
-        self.request.cancelled()
+        self.sink.cancelled() || self.request.cancelled()
     }
 }
 
@@ -2730,7 +2748,9 @@ mod tests {
 
     #[test]
     fn a_negative_source_date_epoch_is_refused() {
-        // /etc/shadow counts days from 1970. Zero is 1970 itself.
+        // /etc/shadow counts days from 1970. Zero is 1970 itself, which is a
+        // valid epoch: its accounts are recorded with no day rather than day
+        // zero, which `dated` covers.
         let refused = Alpine::builder("v3.23").source_date_epoch(-1).build();
         assert!(
             matches!(&refused, Err(AlpineError::Config { reason }) if reason.contains("negative")),
@@ -4138,10 +4158,33 @@ mod tests {
             ],
         );
 
-        // And stopping. A sink bound with `observe` reports; what stops a run
-        // is the run's own observer, which is the one a caller driving several
-        // provisioners shares — so that is where the cancellation comes from,
-        // and the Alpine events still reach it through the shared vocabulary.
+        // And stopping, from the sink bound with `observe`: the same watch,
+        // told to stop, stops the run once the closure is known, and the
+        // staging tree goes with it.
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .include(["musl"])
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures");
+        let mut watch = Watch {
+            seen: Vec::new(),
+            stop: true,
+        };
+        let watched = scratch.join("watched");
+        let err = crate::provision::ensure(&watched, &mut alpine.observe(&mut watch))
+            .expect_err("the sink asked it to stop");
+        assert!(
+            matches!(err, crate::provision::ProvisionError::Cancelled),
+            "{err}",
+        );
+        assert_eq!(watch.seen, ["resolving", "resolved 1"]);
+        assert!(!watched.exists());
+
+        // And from the run's own observer, which is the one a caller driving
+        // several provisioners shares. The Alpine events reach it through the
+        // shared vocabulary.
         struct StopOnResolve {
             resolved: bool,
         }
@@ -4594,6 +4637,33 @@ mod tests {
         plan.packages[0].name = "../../escaped".to_string();
         let reason = refuses_plan(plan, |builder| builder);
         assert!(reason.contains("addressed by"), "{reason}");
+    }
+
+    #[test]
+    fn a_plan_entry_no_index_could_have_published_is_refused_at_build() {
+        // The same gates a document passes as it is read, for a `Plan` edited
+        // in code: an entry's architecture is written into the installed
+        // database as it stands, and its identity is compared exactly.
+        let mut plan = resolved_plan();
+        plan.packages[0].architecture = "aarch64".to_string();
+        let reason = refuses_plan(plan, |builder| builder);
+        assert!(reason.contains("aarch64"), "{reason}");
+
+        let mut plan = resolved_plan();
+        plan.packages[0].architecture = "noarch".to_string();
+        Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .extract_only(true)
+            .fetcher(canned())
+            .plan(plan)
+            .build()
+            .expect("noarch belongs to every architecture");
+
+        let mut plan = resolved_plan();
+        plan.packages[0].control_identity = "Q1short=".to_string();
+        let reason = refuses_plan(plan, |builder| builder);
+        assert!(reason.contains("control identity"), "{reason}");
     }
 
     #[test]

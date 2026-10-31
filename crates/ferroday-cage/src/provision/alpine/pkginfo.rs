@@ -38,15 +38,12 @@
 use std::collections::HashMap;
 
 use super::AlpineError;
-use super::index::Dependency;
+use super::index::{Dependency, NOARCH};
 use crate::provision::digest::Algorithm;
 
 /// The separator between a key and its value: one space either side, which is
 /// what `abuild` writes and what `apk` splits on.
 const SEPARATOR: &str = " = ";
-
-/// The architecture value of a package that belongs to every architecture.
-const NOARCH: &str = "noarch";
 
 /// A package's own account of itself, as much of it as a bootstrap uses.
 ///

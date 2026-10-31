@@ -239,16 +239,9 @@ impl Base {
                     ))
                 })?;
 
-            // `apk` archives a script as `<package>-<version>.<digest>.<script>`
-            // and looks it up by that whole name. The digest is the record's
-            // control identity in hexadecimal rather than the base64 the record
-            // states, so the member is found by the two ends the record does
-            // give: a package and version can carry only one trigger.
-            let opens = format!("{}-{}.", record.name, record.version);
-            let ends = format!(".{}", ScriptKind::Trigger.name());
             let script = archived
                 .iter()
-                .find(|member| member.name.starts_with(&opens) && member.name.ends_with(&ends))
+                .find(|member| is_trigger_of(&member.name, record))
                 .ok_or_else(|| {
                     refuse(format!(
                         "{} watches {patterns} and its archived trigger script is not in \
@@ -269,6 +262,22 @@ impl Base {
         }
         Ok(subjects)
     }
+}
+
+/// Whether `member` is the name `apk` archives `record`'s trigger script under.
+///
+/// That name is `<package>-<version>.<identity>.trigger`, the identity being
+/// the record's control identity spelled `X1` and hexadecimal, where the record
+/// states it `Q1` and base64. The whole name is matched, the identity as the
+/// one the record carries, so a package whose name and version merely begin
+/// another's, as `a` at `1` begins `a-1.5`, is never handed that package's
+/// script.
+fn is_trigger_of(member: &str, record: &Record) -> bool {
+    member
+        .strip_prefix(&format!("{}-{}.", record.name, record.version))
+        .and_then(|rest| rest.strip_suffix(&format!(".{}", ScriptKind::Trigger.name())))
+        .and_then(super::sign::identity_of_hex)
+        .is_some_and(|identity| identity == record.control_identity)
 }
 
 /// Reads a base's archived scripts, under either name `apk` maintains, as one
@@ -512,29 +521,51 @@ mod tests {
         (field(b"C:"), field(b"P:"), field(b"V:"))
     }
 
-    /// A `scripts.tar` archiving one trigger script, under the name `apk` gives
-    /// it.
-    fn script_archive(name: &str, version: &str, body: &[u8]) -> Vec<u8> {
-        let mut archive = crate::provision::tar::ustar_block(
-            // The digest this lookup deliberately does not reproduce: a member
-            // is found by its two ends, since the record states the identity in
-            // base64 and the name carries it in hexadecimal.
-            format!("{name}-{version}.X1{}.trigger", "0".repeat(40)).as_bytes(),
-            &[],
-            0o755,
-            0,
-            0,
-            body.len() as u64,
-            0,
-            b'0',
-            &[],
-        )
-        .expect("the header is writable")
-        .to_vec();
-        archive.extend_from_slice(body);
-        crate::provision::tar::pad(&mut archive, body.len() as u64).expect("the padding is short");
+    /// The first record's control identity as `apk` spells it in a script
+    /// archive's member names: `X1` and the hexadecimal of the SHA-1 its `Q1`
+    /// encodes in base64.
+    const FIRST_RECORD_HEX: &str = "X1545aa6f291209af89932b761d9e422c2778596cc";
+
+    /// The name `apk` archives a trigger script under.
+    fn trigger_member(name: &str, version: &str, identity_hex: &str) -> String {
+        format!("{name}-{version}.{identity_hex}.trigger")
+    }
+
+    /// A `scripts.tar` archiving each named member with its body.
+    fn script_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        for (name, body) in members {
+            archive.extend_from_slice(
+                &crate::provision::tar::ustar_block(
+                    name.as_bytes(),
+                    &[],
+                    0o755,
+                    0,
+                    0,
+                    body.len() as u64,
+                    0,
+                    b'0',
+                    &[],
+                )
+                .expect("the header is writable"),
+            );
+            archive.extend_from_slice(body);
+            crate::provision::tar::pad(&mut archive, body.len() as u64)
+                .expect("the padding is short");
+        }
         archive.extend_from_slice(&[0u8; 1024]);
         archive
+    }
+
+    /// The archive of the first record's trigger script alone.
+    fn first_record_archive(body: &[u8]) -> Vec<u8> {
+        let (identity, name, version) = first_record();
+        assert_eq!(
+            super::super::sign::identity_of_hex(FIRST_RECORD_HEX).as_deref(),
+            Some(identity.as_str()),
+            "the two spellings name one identity",
+        );
+        script_archive(&[(&trigger_member(&name, &version, FIRST_RECORD_HEX), body)])
     }
 
     #[test]
@@ -544,7 +575,7 @@ mod tests {
         // increment fire the base's trigger for a directory it created.
         let (identity, name, version) = first_record();
         let body = b"#!/bin/sh\nexit 0\n";
-        let archive = script_archive(&name, &version, body);
+        let archive = first_record_archive(body);
 
         let dir = root(
             "base-trigger",
@@ -604,11 +635,11 @@ mod tests {
         // is read from either, and what comes out is the same script.
         use std::io::Write as _;
 
-        let (identity, name, version) = first_record();
+        let (identity, _, _) = first_record();
         let body = b"#!/bin/sh\nexit 0\n";
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         encoder
-            .write_all(&script_archive(&name, &version, body))
+            .write_all(&first_record_archive(body))
             .expect("the archive compresses");
         let compressed = encoder.finish().expect("the stream closes");
 
@@ -634,9 +665,54 @@ mod tests {
 
         // And what is carried forward is the plain archive, so the increment's
         // own members are appended to it rather than to a compressed stream.
+        assert_eq!(base.carried().scripts, first_record_archive(body));
+    }
+
+    #[test]
+    fn a_trigger_script_is_found_by_its_whole_name() {
+        // `a` at `1` and a package named `a-1.5`: the second's archived name
+        // begins with the first's name and version, and ends as a trigger does.
+        // Only the identity between the two tells them apart.
+        let digest = |seed: u8| [seed; 20];
+        let q1 = |seed: u8| super::super::sign::identity(&digest(seed));
+        let x1 = |seed: u8| format!("X1{}", crate::provision::digest::hex(&digest(seed)));
+        let database = format!(
+            "C:{}\nP:a\nV:1\nA:x86_64\n\nC:{}\nP:a-1.5\nV:2\nA:x86_64\n\n",
+            q1(1),
+            q1(2),
+        );
+        let other = trigger_member("a-1.5", "2", &x1(2));
+        let own = trigger_member("a", "1", &x1(1));
+        let watched = format!("{} /bin\n", q1(1));
+        let base_with = |tag: &str, members: &[(&str, &[u8])]| {
+            root(
+                tag,
+                &[
+                    (&format!("{DB_DIR}/{INSTALLED}"), database.as_bytes()),
+                    (&format!("{DB_DIR}/{TRIGGERS}"), watched.as_bytes()),
+                    (&format!("{DB_DIR}/{SCRIPTS}"), &script_archive(members)),
+                ],
+            )
+        };
+
+        // The other package's script alone is not `a`'s.
+        let dir = base_with("whole-name-other", &[(&other, b"other\n")]);
+        let Some(err) = base_of(&dir).trigger_subjects().err() else {
+            panic!("a-1.5's script was handed to a");
+        };
+        assert!(
+            matches!(&err, AlpineError::Config { reason } if reason.contains("archived trigger")),
+            "{err}",
+        );
+
+        // With both archived, the other's first, `a` gets its own.
+        let dir = base_with("whole-name-both", &[(&other, b"other\n"), (&own, b"own\n")]);
+        let subjects = base_of(&dir)
+            .trigger_subjects()
+            .unwrap_or_else(|err| panic!("the base's triggers read: {err}"));
         assert_eq!(
-            base.carried().scripts,
-            script_archive(&name, &version, body)
+            subjects.first().map(|subject| &subject.scripts[..]),
+            Some(&[(ScriptKind::Trigger, b"own\n".to_vec())][..]),
         );
     }
 

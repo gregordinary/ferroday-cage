@@ -23,16 +23,14 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::AlpineError;
-use super::pin::Pins;
+use super::pin::{Fit, Pins};
+use super::sign::IDENTITY_PREFIX;
 use super::version::{self, Constraint};
 
 /// The architecture value a package carries when it belongs to every
-/// architecture the repository serves.
-const NOARCH: &str = "noarch";
-
-/// The prefix an index's `C:` field and apk's file checksums both carry: a
-/// SHA-1, base64-encoded, tagged with the digest it is.
-const IDENTITY_PREFIX: &str = "Q1";
+/// architecture the repository serves: in an index's `A:`, a `.PKGINFO`'s
+/// `arch`, and a plan's `Architecture`.
+pub(super) const NOARCH: &str = "noarch";
 
 /// The length of a `C:` value: [`IDENTITY_PREFIX`] and the base64 of twenty
 /// bytes.
@@ -237,7 +235,8 @@ pub(super) fn is_package_name(name: &str) -> bool {
 ///
 /// The value is recomputed and compared when a package is fetched, and written
 /// into a plan document meanwhile, so a record carrying anything else is
-/// malformed rather than merely unfamiliar.
+/// malformed rather than merely unfamiliar. A plan document is held to this
+/// too, in [`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable).
 ///
 /// The padding is where it has to be rather than merely allowed: twenty bytes
 /// of base64 is twenty-seven alphabet characters and exactly one `=`, so a value
@@ -252,7 +251,7 @@ pub(super) fn is_package_name(name: &str) -> bool {
 /// serves a malformed record has served something this reader cannot account
 /// for, and a root assembled from the remainder would be missing whatever that
 /// record named, without saying so.
-fn is_control_identity(value: &str) -> bool {
+pub(super) fn is_control_identity(value: &str) -> bool {
     let Some(encoded) = value.strip_prefix(IDENTITY_PREFIX) else {
         return false;
     };
@@ -427,9 +426,10 @@ impl Index {
     /// for a mirror serving something other than what its path says.
     ///
     /// `pins` overrides the choice for the names it holds: a pinned name selects
-    /// the pinned version wherever it is offered, and keeps the highest where it
-    /// is not, so [`Pins::check`] can report what the repositories carry instead
-    /// of only that the pin failed.
+    /// the pinned version wherever it is offered, and the pinned control segment
+    /// over another copy of that version, by [`Pins::fit`]. It keeps the highest
+    /// version where the pinned one is not offered, so [`Pins::check`] can report
+    /// what the repositories carry instead of only that the pin failed.
     pub(super) fn merge(
         inputs: impl IntoIterator<Item = Vec<Record>>,
         architecture: &str,
@@ -451,15 +451,28 @@ impl Index {
                 };
                 let keep = match by_name.get(&record.name) {
                     None => true,
-                    // A candidate the pin holds always wins, including over an
-                    // earlier one that also holds it — which is the overlay rule
-                    // again, and where this differs from the Debian layer's pin:
-                    // there a satisfied pin is never displaced, because there a
-                    // later repository does not shadow at equal version.
+                    // The candidate that fits the pin better wins. One that fits
+                    // it as well as an earlier one also wins, which is the
+                    // overlay rule again, and where this differs from the Debian
+                    // layer's pin: there a satisfied pin is never displaced,
+                    // because there a later repository does not shadow at equal
+                    // version. Where neither holds the pinned version, the
+                    // highest is kept as for any other name.
                     Some(existing) if pins.names(&record.name) => {
-                        pins.holds(&record.name, &record.version)
-                            || (!pins.holds(&record.name, &existing.version)
-                                && not_lower(&record, existing))
+                        let fit = |candidate: &Record| {
+                            pins.fit(
+                                &candidate.name,
+                                &candidate.version,
+                                &candidate.control_identity,
+                            )
+                        };
+                        match fit(&record).cmp(&fit(existing)) {
+                            Ordering::Greater => true,
+                            Ordering::Less => false,
+                            Ordering::Equal => {
+                                fit(&record) != Fit::Neither || not_lower(&record, existing)
+                            }
+                        }
                     }
                     Some(existing) => not_lower(&record, existing),
                 };

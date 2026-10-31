@@ -13,7 +13,7 @@
 //! moves when the other does.
 
 use super::AlpineError;
-use super::index::Record;
+use super::index::{NOARCH, Record};
 use super::version;
 use crate::provision::document::{self, Carried, Draft};
 use crate::provision::mirror_url;
@@ -271,13 +271,19 @@ impl PlannedPackage {
     /// the package is fetched from and the entry it is cached under. A name
     /// holding a separator or a `..` would therefore name a directory other than
     /// the cache, and the bytes would land there before the identity binding that
-    /// rejects them ever runs.
+    /// rejects them ever runs. And [`control_identity`](Self::control_identity)
+    /// is what the fetched control segment's is compared against, exactly, so
+    /// one of any other shape can only ever mismatch.
     ///
-    /// A package resolved from an index passed [`index::is_package_name`] and the
-    /// version grammar on the way in, so this is the same gate for the way a plan
-    /// arrives instead: a document a caller kept and may have edited, or a
-    /// [`Plan`] taken from [`resolve`](super::Alpine::resolve) and modified,
-    /// neither of which has an index behind it.
+    /// A package resolved from an index passed [`index::is_package_name`], the
+    /// version grammar and [`index::is_control_identity`] on the way in, so this
+    /// is the same gate for the way a plan arrives instead: a document a caller
+    /// kept and may have edited, or a [`Plan`] taken from
+    /// [`resolve`](super::Alpine::resolve) and modified, neither of which has an
+    /// index behind it.
+    ///
+    /// [`index::is_package_name`]: super::index::is_package_name
+    /// [`index::is_control_identity`]: super::index::is_control_identity
     pub(super) fn unaddressable(&self) -> Option<String> {
         if !super::index::is_package_name(&self.name) {
             return Some(format!(
@@ -291,7 +297,33 @@ impl PlannedPackage {
                 self.name, self.version,
             ));
         }
+        if !super::index::is_control_identity(&self.control_identity) {
+            return Some(format!(
+                "the plan states {} with the control identity {:?}, which is not a {} digest",
+                self.name,
+                self.control_identity,
+                super::sign::IDENTITY_PREFIX,
+            ));
+        }
         None
+    }
+
+    /// Why this entry does not belong to a plan for `architecture`, or `None`
+    /// where it does.
+    ///
+    /// A package is the plan's architecture or [`NOARCH`], which is all an index
+    /// for that architecture publishes and all [`Index::merge`] keeps. The value
+    /// becomes the package's `A:` in the installed database verbatim, so any
+    /// other would record a package the root cannot hold.
+    ///
+    /// [`Index::merge`]: super::index::Index::merge
+    pub(super) fn foreign_to(&self, architecture: &str) -> Option<String> {
+        (self.architecture != architecture && self.architecture != NOARCH).then(|| {
+            format!(
+                "the plan states {} for architecture {:?}, in a plan for {architecture}, and a                  package is the plan's architecture or {NOARCH}",
+                self.name, self.architecture,
+            )
+        })
     }
 }
 
@@ -402,10 +434,14 @@ impl Plan {
     /// [`AlpineError::PlanDocument`] for a document with no header, a format
     /// version this library does not read, a stanza missing a field the plan
     /// cannot do without, a malformed number, a package naming an index the
-    /// document does not carry, or a package whose name or version is not one an
-    /// apk repository can publish. That last is the shape an index guarantees a
-    /// resolved plan and a document guarantees nothing about: the two fields
-    /// compose the file name a package is fetched and cached under.
+    /// document does not carry, or a package an apk index for the plan's
+    /// architecture could not have published. That last is a name or a version
+    /// outside the format's grammar, a control identity of any shape but a
+    /// `Q1` digest, or an architecture other than the plan's or `noarch`. It is
+    /// the shape an index guarantees a resolved plan and a document guarantees
+    /// nothing about: the name and version compose the file name a package is
+    /// fetched and cached under, the identity is what the package is bound by,
+    /// and the architecture is recorded in the root's installed database.
     pub fn parse_document(text: &str) -> Result<Plan, AlpineError> {
         let stanzas = document::parse(text);
         let (header, rest) = stanzas
@@ -465,7 +501,10 @@ impl Plan {
                 };
                 // The document is the only thing behind a plan read this way, so
                 // the shape an index would have guaranteed is checked here.
-                if let Some(reason) = package.unaddressable() {
+                if let Some(reason) = package
+                    .unaddressable()
+                    .or_else(|| package.foreign_to(&plan.architecture))
+                {
                     return Err(plan_document(reason));
                 }
                 plan.packages.push(package);
@@ -941,6 +980,55 @@ Origin: postmarketos-base
                     assert!(reason.contains("not a version"), "{version:?}: {reason}");
                 }
                 other => panic!("expected a version refusal for {version:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_package_of_another_architecture_is_refused() {
+        // The value becomes the installed database's `A:` verbatim, and an
+        // index for the plan's architecture publishes nothing but that
+        // architecture and `noarch`, which the sample already holds.
+        for architecture in ["aarch64", "x86", "noarch2", "X86_64"] {
+            let document = sample().to_document().unwrap().replacen(
+                "Architecture: x86_64\nControl-Identity",
+                &format!("Architecture: {architecture}\nControl-Identity"),
+                1,
+            );
+            match Plan::parse_document(&document) {
+                Err(AlpineError::PlanDocument { reason }) => {
+                    assert!(reason.contains("busybox"), "{architecture:?}: {reason}");
+                    assert!(reason.contains("noarch"), "{architecture:?}: {reason}");
+                }
+                other => {
+                    panic!("expected an architecture refusal for {architecture:?}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_control_identity_that_is_not_one_is_refused() {
+        // The identity is compared exactly against the one recomputed over what
+        // arrives, so any other shape could only ever mismatch, after a download.
+        let valid = "Q18TR4AbuWsapA0X+CI3w/T/AqRyU=";
+        for identity in [
+            "",
+            "Q1",
+            "Q28TR4AbuWsapA0X+CI3w/T/AqRyU=",
+            "Q18TR4AbuWsapA0X+CI3w/T/AqRyU",
+            "Q18TR4AbuWsapA0X+CI3w/T/AqRy!=",
+            "8TR4AbuWsapA0X+CI3w/T/AqRyU=",
+        ] {
+            let document = sample().to_document().unwrap().replace(
+                &format!("Control-Identity: {valid}"),
+                &format!("Control-Identity: {identity}"),
+            );
+            match Plan::parse_document(&document) {
+                Err(AlpineError::PlanDocument { reason }) => {
+                    assert!(reason.contains("busybox"), "{identity:?}: {reason}");
+                }
+                other => panic!("expected an identity refusal for {identity:?}, got {other:?}"),
             }
         }
     }

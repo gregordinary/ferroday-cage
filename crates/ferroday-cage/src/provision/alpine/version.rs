@@ -19,6 +19,27 @@
 //! cannot be merged against another safely, and a mirror is the one publishing
 //! it.
 //!
+//! # Two versions compare token by token
+//!
+//! The comparison is `apk`'s own. It walks both versions' tokens together, and
+//! the first pair of one kind that differs in value decides. Where the next two
+//! tokens are of different kinds, or one version has run out, the kinds decide:
+//! the version whose next token comes earlier in the grammar is the greater,
+//! and running out comes after every kind. The one exception is a pre-release
+//! suffix, which makes the version it continues the lesser.
+//!
+//! So a further component outranks a letter, which outranks a suffix, then a
+//! suffix's number, a commit, a revision, and nothing at all:
+//!
+//! ```text
+//! 1.0_rc1 < 1.0 < 1.0-r1 < 1.0~abc < 1.0_p1 < 1.0a < 1.0.1
+//! ```
+//!
+//! A suffix's number is a token of its own, and that has a consequence worth
+//! stating: `1.0_p0` is above `1.0_p`, since after the shared suffix one
+//! version has a number and the other has run out. For the same reason
+//! `1.0_p_p` is above `1.0_p1`, where a second suffix meets a number.
+//!
 //! # The suffix table is what makes a version pre- or post-release
 //!
 //! ```text
@@ -27,9 +48,9 @@
 //!
 //! So `1.0_rc1` precedes `1.0`, and `1.0_p1` follows it: the absence of a suffix
 //! sits in the middle of the table rather than at either end, which is why
-//! [`NO_SUFFIX`] occupies a rank of its own and the table has a gap where it
-//! sits. Suffixes repeat, and a shorter run is compared against that rank —
-//! `1.0_p` is above `1.0_p_alpha` and below `1.0_p_p`.
+//! [`NO_SUFFIX`] divides the table and no suffix holds its rank. Suffixes
+//! repeat, and a longer run is above or below the shorter by its first extra
+//! suffix — `1.0_p` is above `1.0_p_alpha` and below `1.0_p_p`.
 //!
 //! # Numbers are compared as written
 //!
@@ -37,8 +58,15 @@
 //! version. Every later one is compared numerically *unless* either side carries
 //! a leading zero, in which case both are compared as text: `1.01` is below
 //! `1.1`, since a leading zero reads as a decimal fraction rather than as a
-//! padded integer. No component is parsed into an integer, so a version with a
-//! forty-digit component orders rather than overflowing.
+//! padded integer.
+//!
+//! No number is parsed into an integer, so a version with a forty-digit
+//! component orders as the number it writes. Here this module departs from
+//! `apk`, deliberately. `apk` reads each number into 64 bits and wraps past
+//! the largest, so the two agree on every number below 2^64 and can disagree on
+//! a longer one, which `apk` may order below a shorter. No archive publishes
+//! such a number, and an order that follows the digits is the one a reader
+//! would check by eye.
 //!
 //! # A constraint is a set of orderings
 //!
@@ -62,10 +90,11 @@ const ACCEPT_EQUAL: u8 = 2;
 /// The operator bit admitting a candidate above the constraint's version.
 const ACCEPT_GREATER: u8 = 4;
 
-/// The rank of a version carrying no suffix at a given position.
+/// The rank an absent suffix would hold, which no suffix does.
 ///
-/// The pre-release suffixes rank below it and the post-release ones above, which
-/// is the whole of what makes `1.0_rc1 < 1.0 < 1.0_p1`.
+/// The pre-release suffixes rank below it and the post-release ones above, and
+/// a suffix ranked below it is the one token whose presence lowers a version.
+/// That is the whole of what makes `1.0_rc1 < 1.0 < 1.0_p1`.
 const NO_SUFFIX: u8 = 4;
 
 /// The rank of the suffix `name`, or `None` for a name the format does not
@@ -88,42 +117,20 @@ fn suffix_rank(name: &str) -> Option<u8> {
     })
 }
 
-/// One `_name123` suffix: where it ranks, and the number it carries.
-#[derive(Debug, PartialEq, Eq)]
-struct Suffix<'a> {
-    rank: u8,
-    /// The digits as written, empty where the suffix carried none. An absent
-    /// number is zero, so `1.0_alpha` and `1.0_alpha0` are the same version.
-    number: &'a str,
-}
-
-/// A parsed apk version, borrowing the text it was parsed from.
+/// A parsed apk version: its tokens, in the order the grammar emits them,
+/// borrowing the text they were parsed from.
 ///
-/// The fields are in comparison order, and [`Ord`] compares them in that order:
-/// the numeric components, then the letter, then the suffixes, then the commit,
-/// then the revision. That order is the format's, not a choice — it is what puts
-/// `1.0a` above `1.0_p1` and `1.0~ff` above `1.0-r1`.
-#[derive(Debug, PartialEq, Eq)]
+/// [`Ord`] walks the tokens as the [module documentation](self) describes, and
+/// equality is that ordering's: `01.0` and `1.0` are one version, as are
+/// `1.0_p1` and `1.0_p01`, though no two of them are spelled alike.
+#[derive(Debug)]
 pub(super) struct Version<'a> {
-    /// The dotted components, as written, at least one.
-    numbers: Vec<&'a str>,
-    /// The single trailing lowercase letter, when there is one.
-    letter: Option<u8>,
-    /// The `_name123` suffixes, in the order written.
-    suffixes: Vec<Suffix<'a>>,
-    /// The `~` commit hash, lowercase hex.
-    commit: Option<&'a str>,
-    /// The `-r` revision's digits, as written.
-    revision: Option<&'a str>,
+    tokens: Vec<Token<'a>>,
 }
 
 impl Ord for Version<'_> {
     fn cmp(&self, other: &Version<'_>) -> Ordering {
-        compare_numbers(&self.numbers, &other.numbers)
-            .then_with(|| self.letter.cmp(&other.letter))
-            .then_with(|| compare_suffixes(&self.suffixes, &other.suffixes))
-            .then_with(|| self.commit.cmp(&other.commit))
-            .then_with(|| compare_optional_numbers(self.revision, other.revision))
+        walk(&self.tokens, &other.tokens, Walk::Whole)
     }
 }
 
@@ -133,11 +140,21 @@ impl PartialOrd for Version<'_> {
     }
 }
 
-/// One token of a version, in the order the grammar emits them.
+impl PartialEq for Version<'_> {
+    /// Whether the two are one version, by the ordering rather than by
+    /// spelling, which is what keeps [`Ord`]'s contract.
+    fn eq(&self, other: &Version<'_>) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Version<'_> {}
+
+/// One token of a version.
 ///
-/// This view exists for one job: the prefix comparison a `~` constraint is.
-/// Ordinary comparison needs no token stream, so [`Ord`] above remains the sole
-/// definition of how two versions order, and this is never consulted for it.
+/// The variants are declared in the order the grammar emits them, and that
+/// order is also how two tokens of different kinds rank at one position: see
+/// [`Token::kind`].
 #[derive(Debug)]
 enum Token<'a> {
     /// One dotted component. `dotted` is false for the first, the only one a
@@ -147,10 +164,11 @@ enum Token<'a> {
     Letter(u8),
     /// A suffix's rank, without its digits.
     Suffix(u8),
-    /// A suffix's digits, emitted only where the suffix carried some.
+    /// A suffix's digits, present only where the suffix carried some.
     ///
-    /// The split is what makes `1.0_p` a prefix of `1.0_p1`: one token against
-    /// two, rather than one token whose value differs.
+    /// The split is what makes `1.0_p` a prefix of `1.0_p1`, and what puts it
+    /// below `1.0_p0`: one token against two, rather than one token whose value
+    /// differs.
     SuffixNumber(&'a str),
     /// The `~` commit hash.
     Commit(&'a str),
@@ -158,13 +176,30 @@ enum Token<'a> {
     Revision(&'a str),
 }
 
-impl PartialEq for Token<'_> {
-    /// Whether two tokens are the same token: the same kind, equal by the rule
-    /// that kind is compared by.
+/// The kind a version that has run out of tokens has, after every real one.
+const END: u8 = 6;
+
+impl Token<'_> {
+    /// The token's place in the grammar.
     ///
-    /// A number is equal here exactly when [`Ord`] would call it equal, so
-    /// `1.0` and `01.0` are one version to a prefix comparison as well.
-    fn eq(&self, other: &Token<'_>) -> bool {
+    /// Where two versions' next tokens are of different kinds, the one whose
+    /// kind comes first is the greater version, with [`END`] last of all.
+    fn kind(&self) -> u8 {
+        match self {
+            Token::Number { .. } => 0,
+            Token::Letter(_) => 1,
+            Token::Suffix(_) => 2,
+            Token::SuffixNumber(_) => 3,
+            Token::Commit(_) => 4,
+            Token::Revision(_) => 5,
+        }
+    }
+
+    /// Compares two tokens of one kind by the rule that kind is compared by.
+    ///
+    /// Tokens of different kinds are not compared here, and report
+    /// [`Ordering::Equal`] to a caller that asks; [`walk`] never does.
+    fn compare(&self, other: &Token<'_>) -> Ordering {
         match (self, other) {
             (
                 Token::Number { text: a, dotted },
@@ -172,42 +207,65 @@ impl PartialEq for Token<'_> {
                     text: b,
                     dotted: also,
                 },
-            ) => compare_component(a, b, *dotted || *also) == Ordering::Equal,
-            (Token::Letter(a), Token::Letter(b)) => a == b,
-            (Token::Suffix(a), Token::Suffix(b)) => a == b,
-            (Token::SuffixNumber(a), Token::SuffixNumber(b)) => compare_numerically(a, b).is_eq(),
-            (Token::Commit(a), Token::Commit(b)) => a == b,
-            (Token::Revision(a), Token::Revision(b)) => compare_numerically(a, b).is_eq(),
-            _ => false,
+            ) => compare_component(a, b, *dotted || *also),
+            (Token::Letter(a), Token::Letter(b)) | (Token::Suffix(a), Token::Suffix(b)) => a.cmp(b),
+            (Token::SuffixNumber(a), Token::SuffixNumber(b))
+            | (Token::Revision(a), Token::Revision(b)) => compare_numerically(a, b),
+            (Token::Commit(a), Token::Commit(b)) => a.cmp(b),
+            _ => Ordering::Equal,
         }
+    }
+
+    /// Whether this is a pre-release suffix, the one token whose presence
+    /// lowers a version.
+    fn is_pre_release(&self) -> bool {
+        matches!(self, Token::Suffix(rank) if *rank < NO_SUFFIX)
     }
 }
 
-impl<'a> Version<'a> {
-    /// The version's tokens, in the order the grammar emits them.
-    fn tokens(&self) -> Vec<Token<'a>> {
-        let mut tokens: Vec<Token<'a>> = self
-            .numbers
-            .iter()
-            .enumerate()
-            .map(|(index, text)| Token::Number {
-                text,
-                dotted: index > 0,
-            })
-            .collect();
-        tokens.extend(self.letter.map(Token::Letter));
-        for suffix in &self.suffixes {
-            tokens.push(Token::Suffix(suffix.rank));
-            // An absent number is not a token. `1.0_p` and `1.0_p0` are the same
-            // version, but only the second states a token where a prefix
-            // comparison could stop.
-            if !suffix.number.is_empty() {
-                tokens.push(Token::SuffixNumber(suffix.number));
+/// How far a [`walk`] compares.
+#[derive(Clone, Copy, PartialEq)]
+enum Walk {
+    /// Both versions in full: the ordering.
+    Whole,
+    /// Only as far as the second version runs, which is the prefix comparison
+    /// a `~` constraint makes: a first version that continues where the
+    /// second has run out is equal to it.
+    Prefix,
+}
+
+/// Compares two token sequences as `apk` compares two versions.
+///
+/// The tokens are compared pairwise while they are of one kind, and the first
+/// pair that differs decides. At the first position where the kinds differ,
+/// or where either sequence has run out, a pre-release suffix makes its version
+/// the lesser, and otherwise the version whose token comes earlier in the
+/// grammar is the greater.
+fn walk(a: &[Token<'_>], b: &[Token<'_>], scope: Walk) -> Ordering {
+    let mut at = 0;
+    loop {
+        let (next, against) = (a.get(at), b.get(at));
+        match (next, against) {
+            (None, None) => return Ordering::Equal,
+            (Some(next), Some(against)) if next.kind() == against.kind() => {
+                let order = next.compare(against);
+                if order.is_ne() {
+                    return order;
+                }
+                at += 1;
+            }
+            (_, None) if scope == Walk::Prefix => return Ordering::Equal,
+            _ => {
+                if next.is_some_and(Token::is_pre_release) {
+                    return Ordering::Less;
+                }
+                if against.is_some_and(Token::is_pre_release) {
+                    return Ordering::Greater;
+                }
+                let kind = |token: Option<&Token<'_>>| token.map_or(END, Token::kind);
+                return kind(against).cmp(&kind(next));
             }
         }
-        tokens.extend(self.commit.map(Token::Commit));
-        tokens.extend(self.revision.map(Token::Revision));
-        tokens
     }
 }
 
@@ -221,38 +279,41 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
     let bytes = text.as_bytes();
     let mut at = 0;
 
-    let mut numbers = vec![take_digits(bytes, &mut at)?];
+    let mut tokens = vec![Token::Number {
+        text: take_digits(bytes, &mut at)?,
+        dotted: false,
+    }];
     while bytes.get(at) == Some(&b'.') {
         at += 1;
-        numbers.push(take_digits(bytes, &mut at)?);
+        tokens.push(Token::Number {
+            text: take_digits(bytes, &mut at)?,
+            dotted: true,
+        });
     }
 
-    let letter = bytes.get(at).copied().filter(u8::is_ascii_lowercase);
-    if letter.is_some() {
+    if let Some(letter) = bytes.get(at).copied().filter(u8::is_ascii_lowercase) {
+        tokens.push(Token::Letter(letter));
         at += 1;
     }
 
-    let mut suffixes = Vec::new();
     while bytes.get(at) == Some(&b'_') {
         at += 1;
         let start = at;
         while bytes.get(at).is_some_and(u8::is_ascii_lowercase) {
             at += 1;
         }
-        let rank = suffix_rank(&text[start..at])?;
+        tokens.push(Token::Suffix(suffix_rank(&text[start..at])?));
         // The digits are optional here, unlike everywhere else a digit run
-        // appears: `_p` and `_p0` are the same suffix.
+        // appears, and where they are absent there is no token for them.
         let start = at;
         while bytes.get(at).is_some_and(u8::is_ascii_digit) {
             at += 1;
         }
-        suffixes.push(Suffix {
-            rank,
-            number: &text[start..at],
-        });
+        if at > start {
+            tokens.push(Token::SuffixNumber(&text[start..at]));
+        }
     }
 
-    let mut commit = None;
     if bytes.get(at) == Some(&b'~') {
         at += 1;
         let start = at;
@@ -265,28 +326,21 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
         if at == start {
             return None;
         }
-        commit = Some(&text[start..at]);
+        tokens.push(Token::Commit(&text[start..at]));
     }
 
-    let mut revision = None;
     if bytes.get(at) == Some(&b'-') {
         at += 1;
         if bytes.get(at) != Some(&b'r') {
             return None;
         }
         at += 1;
-        revision = Some(take_digits(bytes, &mut at)?);
+        tokens.push(Token::Revision(take_digits(bytes, &mut at)?));
     }
 
     // Anything left is a token the grammar has no place for at this point,
     // which is exactly the out-of-order version this refuses.
-    (at == bytes.len()).then_some(Version {
-        numbers,
-        letter,
-        suffixes,
-        commit,
-        revision,
-    })
+    (at == bytes.len()).then_some(Version { tokens })
 }
 
 /// Compares two versions, or reports `None` where either is not a version.
@@ -356,6 +410,13 @@ impl Constraint {
 
     /// Whether `candidate` is a version this constraint accepts.
     ///
+    /// A fuzzy constraint compares only as far as its own version runs, so
+    /// `~3.12` accepts `3.12.11-r0` and `~1.0` accepts `1.0a`, `1.0-r5` and
+    /// `1.0_rc1` alike. That is a prefix rule and not an ordering, which is why
+    /// `~1.0` accepts a version below `1.0`. Nor is it a truncation: `~1.0a`
+    /// refuses `1.0.1a`, because the token after the constraint's `0` is a
+    /// letter where the candidate's is a further component.
+    ///
     /// A candidate that is not a version accepts nothing: a caller holding
     /// records from an index has already refused those, so this only fires for
     /// one that reached here unchecked.
@@ -363,33 +424,18 @@ impl Constraint {
         let (Some(candidate), Some(against)) = (parse(candidate), parse(&self.version)) else {
             return false;
         };
-        let order = if self.fuzzy && is_prefix(&against, &candidate) {
-            Ordering::Equal
+        let scope = if self.fuzzy {
+            Walk::Prefix
         } else {
-            candidate.cmp(&against)
+            Walk::Whole
         };
-        let bit = match order {
+        let bit = match walk(&candidate.tokens, &against.tokens, scope) {
             Ordering::Less => ACCEPT_LESS,
             Ordering::Equal => ACCEPT_EQUAL,
             Ordering::Greater => ACCEPT_GREATER,
         };
         self.accepts & bit != 0
     }
-}
-
-/// Whether `constraint`'s tokens are a prefix of `candidate`'s, which is what a
-/// fuzzy comparison calls equal.
-///
-/// A fuzzy comparison walks both token streams and stops as soon as the
-/// *constraint* runs out, so `~3.12` accepts `3.12.11-r0` and `~1.0` accepts
-/// `1.0a`, `1.0-r5` and `1.0_rc1` alike — it is a prefix rule and not an
-/// ordering, which is why `~1.0` accepts a version below `1.0`. It is not a
-/// truncation either: `~1.0a` refuses `1.0.1a`, because the token after the
-/// constraint's `0` is a letter where the candidate's is a further component.
-fn is_prefix(constraint: &Version<'_>, candidate: &Version<'_>) -> bool {
-    let constraint = constraint.tokens();
-    let candidate = candidate.tokens();
-    constraint.len() <= candidate.len() && constraint == candidate[..constraint.len()]
 }
 
 /// The name half of a dependency entry: everything before the operator, or the
@@ -495,30 +541,6 @@ fn compare_numerically(a: &str, b: &str) -> Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
-/// Compares two optional digit runs, an absent one below any present one.
-fn compare_optional_numbers(a: Option<&str>, b: Option<&str>) -> Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => compare_numerically(a, b),
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-    }
-}
-
-/// Compares two dotted component lists.
-///
-/// Where one list runs out and the other continues, the longer is the greater
-/// version: `1.0.0` follows `1.0`.
-fn compare_numbers(a: &[&str], b: &[&str]) -> Ordering {
-    for (index, (a, b)) in a.iter().zip(b).enumerate() {
-        let order = compare_component(a, b, index > 0);
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    a.len().cmp(&b.len())
-}
-
 /// Compares two dotted components, `dotted` being false only for the first.
 ///
 /// A leading zero on either side after the first component reads as a decimal
@@ -531,30 +553,6 @@ fn compare_component(a: &str, b: &str, dotted: bool) -> Ordering {
     } else {
         compare_numerically(a, b)
     }
-}
-
-/// Compares two suffix runs, padding the shorter with the rank of an absent
-/// suffix.
-///
-/// That padding is what makes a run's length meaningful in both directions:
-/// `1.0_p_p` is above `1.0_p`, and `1.0_p_alpha` is below it.
-fn compare_suffixes(a: &[Suffix<'_>], b: &[Suffix<'_>]) -> Ordering {
-    let absent = Suffix {
-        rank: NO_SUFFIX,
-        number: "",
-    };
-    for index in 0..a.len().max(b.len()) {
-        let a = a.get(index).unwrap_or(&absent);
-        let b = b.get(index).unwrap_or(&absent);
-        let order = a
-            .rank
-            .cmp(&b.rank)
-            .then_with(|| compare_numerically(a.number, b.number));
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    Ordering::Equal
 }
 
 #[cfg(test)]
@@ -597,9 +595,48 @@ mod tests {
     fn a_suffix_number_orders_within_its_rank() {
         lt("1.0_alpha1", "1.0_alpha2");
         lt("1.0_alpha2", "1.0_alpha10");
-        // An absent number is zero rather than a distinct value.
-        eq("1.0_alpha", "1.0_alpha0");
         eq("1.0_p1", "1.0_p01");
+        eq("1.0_p0", "1.0_p00");
+    }
+
+    #[test]
+    fn an_absent_suffix_number_is_a_token_the_version_lacks() {
+        // Every row measured with `apk version -t` from apk-tools 3.0.6. A
+        // suffix's number is a token of its own, so after a shared suffix the
+        // version with a number meets one with something else, or with
+        // nothing, and the kinds decide rather than any value.
+        lt("1.0_p", "1.0_p0");
+        lt("1.0_alpha", "1.0_alpha0");
+        lt("1.0_rc", "1.0_rc0");
+        lt("1.0_p", "1.0_p1");
+        // A revision or a commit comes later in the grammar than a number.
+        lt("1.0_p-r1", "1.0_p0");
+        lt("1.0_p-r9", "1.0_p0");
+        lt("1.0_p~ff", "1.0_p0");
+        // A further post-release suffix comes earlier than a number, and a
+        // pre-release one lowers its version whatever it meets.
+        lt("1.0_p1", "1.0_p_p");
+        lt("1.0_rc0", "1.0_rc_p");
+        lt("1.0_p0_p", "1.0_p_p");
+        lt("1.0_p_alpha", "1.0_p0");
+        lt("1.0_p0", "1.0_p0-r0");
+        lt("1.0", "1.0_p");
+    }
+
+    #[test]
+    fn equality_is_the_ordering_s_rather_than_the_spelling_s() {
+        // Spelled apart, ordered alike: `Eq` has to agree with `Ord`, or a
+        // sorted collection of versions would hold two that compare equal.
+        for (a, b) in [
+            ("01.0", "1.0"),
+            ("1.0_p1", "1.0_p01"),
+            ("1.0-r01", "1.0-r1"),
+        ] {
+            let (a, b) = (parse(a).unwrap(), parse(b).unwrap());
+            assert_eq!(a.cmp(&b), Ordering::Equal);
+            assert!(a == b);
+        }
+        assert!(parse("1.0").unwrap() != parse("1.0.0").unwrap());
     }
 
     #[test]
@@ -650,7 +687,8 @@ mod tests {
     #[test]
     fn a_component_no_integer_could_hold_still_orders() {
         // Nothing here is parsed into an integer, so a version whose digits
-        // overflow every width the language has still compares.
+        // overflow every width the language has still compares by them. apk
+        // wraps past 64 bits and orders both of these pairs the other way.
         lt("1.0-r99999999999999999999", "1.0-r99999999999999999999999");
         lt("999999999999999999999999.0", "9999999999999999999999999.0");
     }

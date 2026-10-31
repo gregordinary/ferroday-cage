@@ -64,9 +64,10 @@ const KEYS_DIR: &str = "etc/apk/keys";
 /// script.
 ///
 /// `apk` passes exactly this `PATH` and, unless the caller preserves the
-/// environment, nothing else. A script inherits no locale, no `HOME` and no
-/// `TERM`, which is also what makes what it does a function of the root rather
-/// than of the machine the bootstrap ran on.
+/// environment, nothing else. So a script's sandbox is launched without the
+/// base environment every other sandbox starts from: a script inherits no
+/// locale, no `HOME` and no `TERM`, which is also what makes what it does a
+/// function of the root rather than of the machine the bootstrap ran on.
 const SCRIPT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// The system's machine id.
@@ -109,15 +110,12 @@ pub(super) struct State<'a> {
     pub(super) beneath: Option<&'a Rooted>,
 }
 
-/// Runs every package's install scripts, fires the triggers they registered,
-/// and writes the state the finished root hands back to `apk`.
+/// Where an install script runs: the tree, how a cage is rooted on it, the map
+/// that cage runs under, and the epoch it is given.
 ///
-/// Where a maintainer script runs: the tree, how a cage is rooted on it, and the
-/// map that cage runs under.
-///
-/// The three travel together through every step of the configure wave and were
-/// threaded through each positionally. `Copy`, because they are three borrows
-/// and every step passes all three on.
+/// The four travel together through every step of the configure wave. `Copy`,
+/// because each is a borrow or a plain value and every step passes all of them
+/// on.
 #[derive(Clone, Copy)]
 pub(super) struct Site<'a> {
     /// The tree the scripts run against.
@@ -132,6 +130,9 @@ pub(super) struct Site<'a> {
     pub(super) source_date_epoch: Option<i64>,
 }
 
+/// Runs every package's install scripts, fires the triggers they registered,
+/// and writes the state the finished root hands back to `apk`.
+///
 /// `order` is the dependency order the closure was laid down in, and the one the
 /// scripts run in. `carried` is the trigger subjects of packages a layered
 /// build's base already holds, empty for a full bootstrap; they fire for the
@@ -217,32 +218,53 @@ fn clear_run_state(tree: &Rooted) -> Result<(), AlpineError> {
         ))
 }
 
+/// What an accounts file holds, as the root the tree belongs to sees it.
+enum Accounts {
+    /// The tree holds the file, with these contents.
+    Held(Vec<u8>),
+    /// The tree holds an overlay whiteout there. A layered build's scripts
+    /// removed the base's file, so the merged root holds none.
+    Removed,
+    /// Nothing occupies the name in the tree.
+    Absent,
+}
+
+impl Accounts {
+    /// Reads the accounts file at `path`, stating what occupies it first.
+    ///
+    /// A whiteout is a character device, and opening one fails, so the kind is
+    /// told apart before anything is opened. Whatever else is there that is not
+    /// a regular file is refused as [`Rooted::read`] refuses it.
+    fn read(tree: &Rooted, path: &str) -> Result<Accounts, AlpineError> {
+        let held = tree
+            .stat(path)
+            .map_err(AlpineError::at("inspecting the accounts", tree.path(path)))?;
+        match held {
+            None => Ok(Accounts::Absent),
+            Some(stat) if Rooted::is_whiteout(&stat) => Ok(Accounts::Removed),
+            Some(_) => tree
+                .read(path)
+                .map(Accounts::Held)
+                .map_err(AlpineError::at("reading the accounts", tree.path(path))),
+        }
+    }
+}
+
 /// Each account's last-change day as `/etc/shadow` records it before the
 /// scripts run: the file in the tree, or where the tree holds none, the one
-/// beneath it in a layered build. No file is no accounts.
+/// beneath it in a layered build. No file is no accounts, and neither is a
+/// whiteout, which removes the base's file from the merged root.
 fn account_dates(
     tree: &Rooted,
     beneath: Option<&Rooted>,
 ) -> Result<HashMap<Vec<u8>, Vec<u8>>, AlpineError> {
     let [shadow, _] = SHADOW;
-    let held = tree.exists(shadow).map_err(AlpineError::at(
-        "inspecting the accounts",
-        tree.path(shadow),
-    ))?;
-    let source = match (held, beneath) {
-        (false, Some(beneath)) => beneath,
-        _ => tree,
+    let held = match (Accounts::read(tree, shadow)?, beneath) {
+        (Accounts::Absent, Some(beneath)) => Accounts::read(beneath, shadow)?,
+        (held, _) => held,
     };
-    let contents = match source.read(shadow) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(err) => {
-            return Err(AlpineError::io(
-                "reading the accounts",
-                source.path(shadow),
-                err,
-            ));
-        }
+    let Accounts::Held(contents) = held else {
+        return Ok(HashMap::new());
     };
     Ok(contents
         .split(|&byte| byte == b'\n')
@@ -261,26 +283,25 @@ fn account_dates(
 /// A day the run wrote is one `found` did not record for that account: every
 /// account the scripts created, and any whose date they changed. The days the
 /// run found stay as they were, so what a package shipped is not rewritten.
+/// A file the tree does not hold, which in a layered build is one the
+/// increment's scripts never touched, is left to the base, and one they
+/// removed is left removed.
+///
 /// The files are rewritten in place, keeping the owner, group, and mode the
-/// scripts gave them. A file the tree does not hold, which in a layered build
-/// is one the increment's scripts never touched, is left to the base.
+/// scripts gave them. The host side writes them as the calling user, which is
+/// the owner a file created by the sandbox's root has under every identity map.
+/// So each must leave its owner write permission, as the `0640` Alpine ships
+/// does. One a script made read-only, or gave to another account, fails the
+/// bootstrap rather than going undated.
 fn date_accounts(
     tree: &Rooted,
     found: &HashMap<Vec<u8>, Vec<u8>>,
     epoch: i64,
 ) -> Result<(), AlpineError> {
-    let day = (epoch / SECONDS_PER_DAY).to_string();
+    let day = last_change_day(epoch);
     for path in SHADOW {
-        let contents = match tree.read(path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(AlpineError::io(
-                    "reading the accounts",
-                    tree.path(path),
-                    err,
-                ));
-            }
+        let Accounts::Held(contents) = Accounts::read(tree, path)? else {
+            continue;
         };
         if let Some(dated) = dated(&contents, found, day.as_bytes()) {
             tree.overwrite(path, &dated)
@@ -290,20 +311,39 @@ fn date_accounts(
     Ok(())
 }
 
+/// The last-change field `/etc/shadow` records for a change at `epoch`: the
+/// day it falls on, counted from 1970.
+///
+/// Except for day zero, which is empty. A last-change day of zero is not a
+/// date to `shadow(5)` but a demand that the password be changed at the next
+/// login, and an empty field disables password aging instead. That is what
+/// shadow-utils' `useradd` writes for the same epoch.
+fn last_change_day(epoch: i64) -> String {
+    match epoch / SECONDS_PER_DAY {
+        0 => String::new(),
+        day => day.to_string(),
+    }
+}
+
 /// `contents` with every last-change day `found` does not record for its
 /// account replaced by `day`, or `None` where there is none to replace.
 ///
 /// Only the third field of a line is touched, and only where it holds a day:
-/// an empty one means no date, and a line with fewer fields is not an account.
-/// Every other byte, line endings included, is kept as it stands.
+/// a decimal number other than zero. An empty field disables aging and a zero
+/// demands a new password at the next login, so neither is a date to replace,
+/// and a line with fewer fields is not an account. Every other byte, line
+/// endings included, is kept as it stands.
 fn dated(contents: &[u8], found: &HashMap<Vec<u8>, Vec<u8>>, day: &[u8]) -> Option<Vec<u8>> {
+    let is_day = |field: &[u8]| {
+        field.iter().all(u8::is_ascii_digit) && field.iter().any(|&digit| digit != b'0')
+    };
     let mut changed = false;
     let lines: Vec<Vec<u8>> = contents
         .split(|&byte| byte == b'\n')
         .map(|line| {
             let mut fields: Vec<&[u8]> = line.split(|&byte| byte == b':').collect();
             let written = fields.len() >= 3
-                && !fields[2].is_empty()
+                && is_day(fields[2])
                 && fields[2] != day
                 && found.get(fields[0]).map(Vec::as_slice) != Some(fields[2]);
             if !written {
@@ -422,6 +462,7 @@ fn launch(
         .builder(staging)
         .command(script)
         .args(args)
+        .base_env(false)
         .env("PATH", SCRIPT_PATH)
         .env("APK_SCRIPT", kind.name())
         .env("APK_PACKAGE", &subject.name);
@@ -602,9 +643,10 @@ impl ScriptSubject {
             if !pattern.starts_with('/') {
                 continue;
             }
+            let pattern = Glob::parse(pattern.as_bytes());
             for directory in directories {
                 let rooted = format!("/{}", String::from_utf8_lossy(directory));
-                if matches(pattern.as_bytes(), rooted.as_bytes()) {
+                if pattern.matches(rooted.as_bytes()) {
                     matched.push(rooted);
                 }
             }
@@ -615,83 +657,178 @@ impl ScriptSubject {
     }
 }
 
-/// Whether `path` matches `pattern`, with `*` and `?` stopping at a `/` and
-/// `[...]` naming a set.
+/// A trigger's path pattern, read once and matched against every directory.
 ///
 /// `fnmatch(3)` with `FNM_PATHNAME`, which is what `apk` matches a trigger
-/// with. The whole of what Alpine's published triggers use is a trailing `*` on
-/// one path component — `/lib/modules/*` — but the set is implemented because a
-/// pattern is a repository's to write and half a matcher would silently fire the
-/// wrong triggers.
-fn matches(pattern: &[u8], path: &[u8]) -> bool {
-    match pattern.first() {
-        None => path.is_empty(),
-        Some(b'*') => {
-            // Any run of characters within one component, including none.
-            let mut at = 0;
-            loop {
-                if matches(&pattern[1..], &path[at..]) {
-                    return true;
-                }
-                match path.get(at) {
-                    None | Some(b'/') => return false,
-                    Some(_) => at += 1,
-                }
+/// with: `*` and `?` stop at a `/`, and `[...]` names a set. The whole of what
+/// Alpine's published triggers use is a trailing `*` on one path component —
+/// `/lib/modules/*` — but the set is implemented because a pattern is a
+/// repository's to write and half a matcher would silently fire the wrong
+/// triggers.
+///
+/// A pattern comes from a signed `.PKGINFO`, or from a layered base's
+/// `triggers` file, which that base's own scripts could have rewritten. So
+/// matching costs at most the product of a component's pattern and name
+/// lengths, whatever the pattern: every `/` fixes where a component begins, and
+/// within one component only the last `*` is ever widened.
+struct Glob<'a> {
+    /// The pattern's components, split at every `/` that is not inside a set.
+    components: Vec<Vec<Element<'a>>>,
+}
+
+/// One position of a [`Glob`] component.
+#[derive(Clone, Copy)]
+enum Element<'a> {
+    /// `*`: any run of bytes within the component, including none.
+    Star,
+    /// `?`: any one byte.
+    Any,
+    /// `[...]`: one byte the set accepts.
+    Set(Set<'a>),
+    /// Any other byte, which matches only itself.
+    Literal(u8),
+}
+
+impl<'a> Glob<'a> {
+    /// Reads `pattern` into its components.
+    ///
+    /// A `[` that opens a set is one; an unterminated `[` is the literal it
+    /// looks like, which is how a name such as `cmd:[` matches itself. A `/`
+    /// inside a set does not divide a component, and since a path component
+    /// holds no `/`, such a set never matches one.
+    fn parse(pattern: &'a [u8]) -> Glob<'a> {
+        let mut components = Vec::new();
+        let mut component = Vec::new();
+        let mut rest = pattern;
+        while let Some((&byte, after)) = rest.split_first() {
+            rest = after;
+            match byte {
+                b'/' => components.push(std::mem::take(&mut component)),
+                b'*' => component.push(Element::Star),
+                b'?' => component.push(Element::Any),
+                b'[' => match Set::parse(rest) {
+                    Some((set, after_set)) => {
+                        component.push(Element::Set(set));
+                        rest = after_set;
+                    }
+                    None => component.push(Element::Literal(byte)),
+                },
+                literal => component.push(Element::Literal(literal)),
             }
         }
-        Some(b'?') => match path.first() {
-            Some(byte) if *byte != b'/' => matches(&pattern[1..], &path[1..]),
-            _ => false,
-        },
-        // A `[` that opens a set behaves as one; an unterminated `[` is the
-        // literal it looks like, which is how a name such as `cmd:[` matches
-        // itself. So the set is tried first and the literal is the fallback.
-        Some(b'[') if set(&pattern[1..]).is_some() => {
-            let (accepted, rest) = set(&pattern[1..]).expect("checked just above");
-            match path.first() {
-                Some(byte) if *byte != b'/' => accepted(*byte) && matches(rest, &path[1..]),
-                _ => false,
-            }
-        }
-        Some(literal) => match path.first() {
-            Some(byte) if byte == literal => matches(&pattern[1..], &path[1..]),
-            _ => false,
-        },
+        components.push(component);
+        Glob { components }
+    }
+
+    /// Whether `path` matches the whole pattern: the two hold the same number
+    /// of components, and each of the path's matches the pattern's at the same
+    /// position.
+    fn matches(&self, path: &[u8]) -> bool {
+        let mut names = path.split(|&byte| byte == b'/');
+        self.components.iter().all(|pattern| {
+            names
+                .next()
+                .is_some_and(|name| component_matches(pattern, name))
+        }) && names.next().is_none()
     }
 }
 
-/// Reads a `[...]` set, returning what it accepts and the pattern after it.
+/// Whether one path component, `name`, matches one pattern component.
 ///
-/// `rest` begins just after the `[`. A set that is never closed is not a set:
-/// the caller then treats the `[` as the literal it is, which is what
-/// `fnmatch(3)` does and what makes `cmd:[` — a name Alpine really publishes —
-/// match itself.
-fn set(rest: &[u8]) -> Option<(impl Fn(u8) -> bool + use<'_>, &[u8])> {
-    let (negated, rest) = match rest.first() {
-        Some(b'!' | b'^') => (true, &rest[1..]),
-        _ => (false, rest),
-    };
-    // A `]` first is the literal, not the terminator.
-    let leading = usize::from(rest.first() == Some(&b']'));
-    let close = leading + rest[leading..].iter().position(|byte| *byte == b']')?;
-    let members = &rest[..close];
-    Some((
-        move |byte: u8| {
-            let mut at = 0;
-            let mut found = false;
-            while at < members.len() {
-                if at + 2 < members.len() && members[at + 1] == b'-' {
-                    found |= (members[at]..=members[at + 2]).contains(&byte);
-                    at += 3;
-                } else {
-                    found |= members[at] == byte;
-                    at += 1;
-                }
+/// The two-pointer match: elements are consumed one byte at a time, and on a
+/// mismatch the most recent `*` takes one more byte and the elements after it
+/// are tried again from there. An earlier `*` never needs widening, because
+/// whatever it could absorb the later one can absorb instead. So the work is at
+/// most the product of the two lengths, where trying every split for every
+/// `*` would be exponential in their count.
+fn component_matches(pattern: &[Element<'_>], name: &[u8]) -> bool {
+    let (mut at, mut byte) = (0, 0);
+    // The element after the most recent `*`, and where in `name` that star's
+    // run ends.
+    let mut widen: Option<(usize, usize)> = None;
+    while at < pattern.len() || byte < name.len() {
+        match pattern.get(at) {
+            Some(Element::Star) => {
+                at += 1;
+                widen = Some((at, byte));
+                continue;
             }
-            found != negated
-        },
-        &rest[close + 1..],
-    ))
+            Some(element) if name.get(byte).is_some_and(|&found| element.accepts(found)) => {
+                at += 1;
+                byte += 1;
+                continue;
+            }
+            _ => {}
+        }
+        match widen {
+            Some((after, end)) if end < name.len() => {
+                widen = Some((after, end + 1));
+                at = after;
+                byte = end + 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+impl Element<'_> {
+    /// Whether this element can match `byte`. A `*` can match any, as part of
+    /// its run, though the match widens a star's run rather than asking it.
+    fn accepts(self, byte: u8) -> bool {
+        match self {
+            Element::Star | Element::Any => true,
+            Element::Set(set) => set.accepts(byte),
+            Element::Literal(literal) => literal == byte,
+        }
+    }
+}
+
+/// A `[...]` set: the bytes between the brackets, and whether it accepts them
+/// or everything else.
+#[derive(Clone, Copy)]
+struct Set<'a> {
+    /// Whether a leading `!` or `^` inverted it.
+    negated: bool,
+    /// The bytes between the brackets, after any inversion, ranges unexpanded.
+    members: &'a [u8],
+}
+
+impl<'a> Set<'a> {
+    /// Reads a `[...]` set, returning it and the pattern after it.
+    ///
+    /// `rest` begins just after the `[`. A set that is never closed is not a
+    /// set: the caller then treats the `[` as the literal it is, which is what
+    /// `fnmatch(3)` does and what makes `cmd:[` — a name Alpine really
+    /// publishes — match itself.
+    fn parse(rest: &'a [u8]) -> Option<(Set<'a>, &'a [u8])> {
+        let (negated, rest) = match rest.first() {
+            Some(b'!' | b'^') => (true, &rest[1..]),
+            _ => (false, rest),
+        };
+        // A `]` first is the literal, not the terminator.
+        let leading = usize::from(rest.first() == Some(&b']'));
+        let close = leading + rest[leading..].iter().position(|byte| *byte == b']')?;
+        let members = &rest[..close];
+        Some((Set { negated, members }, &rest[close + 1..]))
+    }
+
+    /// Whether the set accepts `byte`, a member or an `a-z` range naming it.
+    fn accepts(self, byte: u8) -> bool {
+        let members = self.members;
+        let mut at = 0;
+        let mut found = false;
+        while at < members.len() {
+            if at + 2 < members.len() && members[at + 1] == b'-' {
+                found |= (members[at]..=members[at + 2]).contains(&byte);
+                at += 3;
+            } else {
+                found |= members[at] == byte;
+                at += 1;
+            }
+        }
+        found != self.negated
+    }
 }
 
 /// A dependency order over the closure: a package appears after everything it
@@ -787,15 +924,40 @@ mod tests {
             // An unterminated set is the literal bracket, which is how a name
             // like `cmd:[` matches itself.
             (b"/usr/bin/[", b"/usr/bin/[", true),
+            // A `/` inside a set does not divide the component, and a set
+            // never matches a separator.
+            (b"/usr/[a/b]x", b"/usr/ax", true),
+            (b"/usr/[a/b]x", b"/usr/b/x", false),
+            // A star widens past a false start within its component.
+            (b"/lib/*x", b"/lib/axbx", true),
+            (b"/lib/*x/y", b"/lib/axbx/y", true),
+            (b"/lib/*a*", b"/lib/bbb", false),
         ] {
             assert_eq!(
-                matches(pattern, path),
+                Glob::parse(pattern).matches(path),
                 expected,
                 "{} against {}",
                 String::from_utf8_lossy(pattern),
                 String::from_utf8_lossy(path),
             );
         }
+    }
+
+    #[test]
+    fn a_pattern_of_many_stars_is_matched_in_polynomial_time() {
+        // Trying every split for every star costs the number of ways to place
+        // the stars, which for this pattern is beyond any time limit. A star
+        // widened only when it is the latest costs a pass per byte.
+        let mut pattern = b"/".to_vec();
+        for _ in 0..64 {
+            pattern.extend_from_slice(b"*a");
+        }
+        pattern.push(b'b');
+        let mut path = b"/".to_vec();
+        path.extend(std::iter::repeat_n(b'a', 200));
+        assert!(!Glob::parse(&pattern).matches(&path));
+        path.push(b'b');
+        assert!(Glob::parse(&pattern).matches(&path));
     }
 
     #[test]
@@ -999,6 +1161,82 @@ mod tests {
         // An upper that holds none after the run is left to the base.
         date_accounts(&upper, &before, 1_700_000_000).expect("nothing to date");
         assert!(!upper.exists("etc/shadow").unwrap());
+    }
+
+    /// Records an overlay whiteout at `relative` in `tree`, as an overlay
+    /// upper does for a name a script removed from the merged root, or reports
+    /// why the host refused to.
+    fn whiteout(staging: &Path, relative: &str) -> Result<(), rustix::io::Errno> {
+        let parent = staging.join(relative).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&parent).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            staging.join(relative),
+            rustix::fs::FileType::CharacterDevice,
+            rustix::fs::Mode::from_raw_mode(0),
+            0,
+        )
+    }
+
+    #[test]
+    fn a_whiteout_at_the_accounts_is_a_root_with_none() {
+        // A layered build whose scripts removed the base's files: the merged
+        // root holds neither, so the run found no accounts and has none to date.
+        let (_base_dir, base) = rooted_tree("whiteout-base");
+        base.write("etc/shadow", b"root:::0:::::\nklogd:!:19000:0:99999:7:::\n")
+            .unwrap();
+        let (upper_dir, upper) = rooted_tree("whiteout-upper");
+        for path in SHADOW {
+            if let Err(errno) = whiteout(&upper_dir, path) {
+                // Linux 5.8 is the first to let an unprivileged caller record
+                // one.
+                eprintln!("skipping: the host refused an unprivileged whiteout: {errno}");
+                return;
+            }
+        }
+
+        let before = account_dates(&upper, Some(&base)).expect("the accounts read");
+        assert_eq!(before, HashMap::new(), "the base's file is not consulted");
+        date_accounts(&upper, &before, 1_700_000_000).expect("nothing to date");
+        for path in SHADOW {
+            let stat = upper.stat(path).unwrap().expect("the whiteout is kept");
+            assert!(Rooted::is_whiteout(&stat), "{path}");
+        }
+
+        // Beside a file the scripts did write, the whiteout is still none.
+        upper.remove("etc/shadow").unwrap();
+        upper
+            .write("etc/shadow", b"klogd:!:20722:0:99999:7:::\n")
+            .unwrap();
+        date_accounts(&upper, &before, 1_700_000_000).expect("the accounts are dated");
+        assert_eq!(
+            upper.read("etc/shadow").unwrap(),
+            b"klogd:!:19675:0:99999:7:::\n"
+        );
+    }
+
+    #[test]
+    fn the_first_day_of_1970_records_no_date() {
+        // A day of zero would demand every account's password be changed at
+        // its next login; an empty field disables aging, as useradd writes.
+        assert_eq!(last_change_day(0), "");
+        assert_eq!(last_change_day(86_399), "");
+        assert_eq!(last_change_day(86_400), "1");
+        assert_eq!(last_change_day(1_700_000_000), "19675");
+
+        let after = b"root:::0:::::\nklogd:!:20722:0:99999:7:::\n";
+        let dated = dated(after, &found(&[("root", "")]), b"").expect("the run wrote a date");
+        assert_eq!(dated, b"root:::0:::::\nklogd:!::0:99999:7:::\n");
+        assert_eq!(super::dated(&dated, &found(&[("root", "")]), b""), None);
+    }
+
+    #[test]
+    fn a_demand_for_a_new_password_is_not_a_date() {
+        // A script that expires a password writes a zero, which is not a day
+        // the run happened on; dating it would withdraw the demand. Nor is
+        // anything that is not a decimal number.
+        let after = b"root:!:0:0:::::\nodd:!:x1:0:::::\n";
+        assert_eq!(dated(after, &found(&[]), b"19675"), None);
     }
 
     #[test]

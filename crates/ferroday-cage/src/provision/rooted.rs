@@ -288,14 +288,24 @@ impl Rooted {
     /// symbolic link, dangling or not. The question is whether the name is
     /// taken, so nothing is followed.
     pub(crate) fn exists(&self, relative: impl AsRef<Path>) -> io::Result<bool> {
+        Ok(self.stat(relative)?.is_some())
+    }
+
+    /// What occupies `relative`: the leaf's own `stat`, taken without following
+    /// a symbolic link, or `None` where nothing does.
+    ///
+    /// For a caller that must tell the kinds of entry apart before acting on
+    /// one, as [`is_whiteout`](Self::is_whiteout) tells an entry the merged
+    /// root does not hold from one it does.
+    pub(crate) fn stat(&self, relative: impl AsRef<Path>) -> io::Result<Option<Stat>> {
         let (parent, leaf) = match self.parent_of(relative.as_ref(), Parents::Require) {
             Ok(found) => found,
-            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(false),
+            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(None),
             Err(errno) => return Err(errno.into()),
         };
         match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(_) => Ok(true),
-            Err(Errno::NOENT | Errno::NOTDIR) => Ok(false),
+            Ok(stat) => Ok(Some(stat)),
+            Err(Errno::NOENT | Errno::NOTDIR) => Ok(None),
             Err(errno) => Err(errno.into()),
         }
     }
@@ -353,6 +363,18 @@ impl Rooted {
     #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub(crate) fn is_file_with_content(stat: &Stat) -> bool {
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_size > 0
+    }
+
+    /// Whether `stat` describes an overlay whiteout: a character device
+    /// numbered 0:0, which is how an overlay upper records that the merged root
+    /// no longer holds what a lower layer has at that name.
+    ///
+    /// A whiteout in a tree that is an overlay's upper is an absent entry to
+    /// every reader of the merged root. Opening one for reading fails with
+    /// `ENXIO`, since no driver backs the device.
+    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+    pub(crate) fn is_whiteout(stat: &Stat) -> bool {
+        FileType::from_raw_mode(stat.st_mode) == FileType::CharacterDevice && stat.st_rdev == 0
     }
 
     /// Renames `from` to `to` within the tree, replacing whatever occupies the

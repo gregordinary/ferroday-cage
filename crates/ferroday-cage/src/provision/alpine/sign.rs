@@ -63,8 +63,9 @@ use super::keyring::KeySet;
 const SIGN_PREFIX: &str = ".SIGN.";
 
 /// The tag an apk identity carries before its base64: a SHA-1, and the only
-/// digest the format spells this way.
-const IDENTITY_PREFIX: &str = "Q1";
+/// digest the format spells this way. An index's `C:` field and apk's file
+/// checksums both carry it.
+pub(super) const IDENTITY_PREFIX: &str = "Q1";
 
 /// The tag the same digest carries when it is spelled in hexadecimal, which is
 /// how the installed database's script archive names a package.
@@ -101,6 +102,32 @@ pub(super) fn control_identity_hex(payload: &[u8]) -> String {
         "{IDENTITY_HEX_PREFIX}{}",
         crate::provision::digest::hex(Sha1::digest(payload).as_slice()),
     )
+}
+
+/// The `Q1` identity an `X1` spelling names, or `None` for anything but `X1`
+/// and the forty lowercase hex digits of a SHA-1.
+///
+/// The inverse of [`control_identity_hex`]'s spelling. The installed database
+/// names a package by `Q1`, and its script archive names the same package by
+/// `X1`, so a reader holding one of each compares them as one identity, which
+/// is how `apk` itself finds the record an archived script belongs to.
+pub(super) fn identity_of_hex(spelled: &str) -> Option<String> {
+    let hex = spelled.strip_prefix(IDENTITY_HEX_PREFIX)?.as_bytes();
+    if hex.len() != 2 * Sha1::output_size() {
+        return None;
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let digest = hex
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| Some((nibble(high)? << 4) | nibble(low)?))
+        .collect::<Option<Vec<u8>>>()?;
+    Some(identity(&digest))
 }
 
 /// Encodes `bytes` as base64, RFC 4648 section 4: the standard alphabet, and
@@ -413,5 +440,24 @@ mod tests {
             control_identity_hex(&metadata.compressed),
             "X11b6c50426d3c0656e9c5a567a5a59601c7f4307a",
         );
+    }
+
+    #[test]
+    fn an_x1_spelling_names_the_identity_its_q1_spelling_does() {
+        assert_eq!(
+            identity_of_hex("X11b6c50426d3c0656e9c5a567a5a59601c7f4307a").as_deref(),
+            Some("Q1G2xQQm08BlbpxaVnpaWWAcf0MHo="),
+        );
+        // Only the spelling apk writes: its prefix, lowercase, a SHA-1's length.
+        for spelled in [
+            "Q11b6c50426d3c0656e9c5a567a5a59601c7f4307a",
+            "X11B6C50426D3C0656E9C5A567A5A59601C7F4307A",
+            "X11b6c50426d3c0656e9c5a567a5a59601c7f4307",
+            "X11b6c50426d3c0656e9c5a567a5a59601c7f4307a0",
+            "X11b6c50426d3c0656e9c5a567a5a59601c7f4307g",
+            "",
+        ] {
+            assert_eq!(identity_of_hex(spelled), None, "{spelled}");
+        }
     }
 }

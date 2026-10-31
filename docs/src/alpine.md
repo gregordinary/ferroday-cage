@@ -180,9 +180,11 @@ for package in &plan.packages {
 ## The package cache
 
 `cache_dir` keeps downloaded packages for reuse across bootstraps. Every entry is
-re-verified in full on every read — signature segment, the binding to the plan,
-and `datahash` over the file tree — and an entry that does not read back as the
-package the plan names is downloaded again rather than refused.
+re-verified in full on every read: the control segment's identity against the
+plan, and `datahash` over the file tree. Its own signature is read and not
+verified, exactly as for a fresh download (see [Trust](#trust)). An entry that
+does not read back as the package the plan names is downloaded again rather
+than refused.
 
 It has to work that way, and the reason is a real difference from the Debian
 pool: an apk index publishes no digest of the whole `.apk` file, so there is no
@@ -270,7 +272,9 @@ account's last password change in `/etc/shadow`, and it reads no
 `SOURCE_DATE_EPOCH`, for the tools that read it. Once the scripts have run,
 every day the run wrote into `/etc/shadow` becomes the epoch's day. So does every
 such day in `/etc/shadow-`, the previous version busybox keeps beside it. The
-days a package shipped are kept.
+days a package shipped are kept. An epoch in the first day of 1970 records an
+empty field instead, as `useradd` does, because `/etc/shadow` reads a day of
+zero as a demand for a new password.
 
 ```rust,no_run
 use ferroday_cage::provision::{self, Export, alpine::{Alpine, Plan}};
@@ -296,7 +300,8 @@ Export::new("/srv/images/alpine")
 The epoch dates what the scripts write, and [`Export::clamp_mtime`] caps the
 modification times the archive records. With both, two bootstraps of one plan
 export byte-identical archives, even on different days at different paths. A
-layered build dates the accounts its increment creates in its upper.
+package that generates a secret of its own is the exception. A layered build
+dates the accounts its increment creates in its upper.
 
 ### What a bootstrap does not keep
 
