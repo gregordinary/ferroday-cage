@@ -48,6 +48,12 @@ ceiling of four with three namespaces already live cannot be, because only the
 launch can know how many are in use. That one surfaces at launch as
 `Error::NestedUsernsBudgetExhausted`, which names the sysctl.
 
+The kernel key quota is a second budget of the same kind. Every running sandbox
+holds a session keyring of its own (see [The session
+keyring](how-the-sandbox-is-built.md#the-session-keyring)), charged against the
+calling user's `kernel.keys.maxkeys`, 200 by default. A launch that finds the
+quota spent reports `Error::KeyQuotaExhausted`.
+
 A host that cannot be unblocked is not entirely without options: with the
 `hardening` feature, [the restriction fallback](restriction-fallback.md)
 confines a command with Landlock and seccomp alone, which need no user

@@ -1649,6 +1649,13 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     if step == SetupStep::NestedUnshare && errno == Errno::NOSPC.raw_os_error() {
         return Error::NestedUsernsBudgetExhausted;
     }
+    // The fresh session keyring is charged against the calling user's key
+    // quota, and `EDQUOT` from creating it is that quota and nothing else, so
+    // the error names the sysctls rather than a disk quota the step never
+    // touched.
+    if step == SetupStep::ReplaceSessionKeyring && errno == Errno::DQUOT.raw_os_error() {
+        return Error::KeyQuotaExhausted;
+    }
     // The exec step carries no detail index — there is one command, not a list
     // — so its subject comes from the plan's own label. Every other step with a
     // subject indexes the list it belongs to.

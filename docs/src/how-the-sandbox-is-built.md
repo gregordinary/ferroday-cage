@@ -35,7 +35,12 @@ sequence itself.
    sandbox processes are forked from the swept table, so the command starts
    with only its streams and the supervisor pins no caller resource for the
    sandbox's lifetime.
-4. **Identity map.** The launch stage establishes the map of its freshly
+4. **Replace the session keyring.** The launch joins a fresh, anonymous session
+   keyring in place of the one it inherited from the caller. A keyring is a
+   credential rather than a descriptor, so the sweep does not reach it. No
+   namespace partitions it either. See [The session
+   keyring](#the-session-keyring).
+5. **Identity map.** The launch stage establishes the map of its freshly
    created user namespace, per the configured
    [identity map](identity-maps.md). The default single-identity map is
    written in process: `deny` to `/proc/self/setgroups`, then a one-line
@@ -48,30 +53,30 @@ sequence itself.
    anything else is forked. Either way the map is complete before the next
    step, so every process the caller can observe lives in a fully mapped
    namespace.
-5. **Publish the supervisor.** The launch stage forks the sandbox init,
+6. **Publish the supervisor.** The launch stage forks the sandbox init,
    opens a pidfd for it, and passes it back to the caller — the anchor for
    `kill`, immune to pid reuse. The remaining steps run in the init, inside
    all the new namespaces.
-6. **Hostname.** When a hostname is configured, `sethostname` sets it in the
+7. **Hostname.** When a hostname is configured, `sethostname` sets it in the
    new UTS namespace; otherwise the sandbox keeps the host's hostname, and
    either way a change inside the sandbox never reaches the host.
-7. **Loopback.** In an isolated network namespace the only interface is
+8. **Loopback.** In an isolated network namespace the only interface is
    loopback, which starts down; the init brings it up with the
    interface-flags ioctls on a throwaway datagram socket. To give the
    isolated namespace outbound connectivity, a caller attaches a userspace
    network stack at the seam described in
    [Userspace networking](userspace-networking.md).
-8. **Privatize propagation.** Mount propagation for the inherited tree is
+9. **Privatize propagation.** Mount propagation for the inherited tree is
    made recursively private, so nothing done here propagates back to the
    host, and because `pivot_root` refuses to operate under shared mounts.
-9. **Bind the rootfs.** The rootfs is bind-mounted onto itself, recursively.
-   `pivot_root` requires the new root to be a mount point; the self-bind
-   makes it one without imposing any staging directory. The canonical path
-   validated at build time is resolved here, inside the new namespace — the
-   kernel requires bind sources and targets to be mounts attached in the
-   caller's own mount namespace, so a descriptor opened before the unshare
-   cannot anchor this step.
-10. **The mount profile.** The init executes the frozen mount operations in
+10. **Bind the rootfs.** The rootfs is bind-mounted onto itself, recursively.
+    `pivot_root` requires the new root to be a mount point; the self-bind
+    makes it one without imposing any staging directory. The canonical path
+    validated at build time is resolved here, inside the new namespace — the
+    kernel requires bind sources and targets to be mounts attached in the
+    caller's own mount namespace, so a descriptor opened before the unshare
+    cannot anchor this step.
+11. **The mount profile.** The init executes the frozen mount operations in
     order: the fresh `/proc`, the minimal `/dev`, the `/tmp` tmpfs, the
     caller's own mounts, and the `resolv.conf` bind, as configured. Bind
     sources are host paths and resolve normally — the host
@@ -87,15 +92,15 @@ sequence itself.
     5.12, which lacks `mount_setattr`, only the top mount is made read-only
     (carrying along the flags the user namespace holds locked) and any
     submounts of the source keep their own flags. The restriction becomes a
-    boundary at step 12, where the command enters a nested user namespace and
+    boundary at step 13, where the command enters a nested user namespace and
     the kernel locks it — see [A read-only bind is a
     boundary](#a-read-only-bind-is-a-boundary).
-11. **Pivot.** The init enters the new mount and calls
+12. **Pivot.** The init enters the new mount and calls
     `pivot_root(".", ".")`, stacking the old root on the same mount point,
     then lazily detaches the old root and changes directory to the new `/`.
     When the step completes, the host filesystem is no longer reachable
     from the sandbox's view.
-12. **Fork and exec.** After changing to the configured working directory,
+13. **Fork and exec.** After changing to the configured working directory,
     the init forks the command process — PID 2 — which wires its standard
     streams per the configuration, applies the configured [resource
     limits](hardening.md#resource-limits), enters a nested user namespace
@@ -170,6 +175,40 @@ namespace. [`host::userns_blocker`](host-requirements.md) reports a ceiling of
 host whose ceiling is four with three namespaces already live fails the same way
 — so the launch itself reports the exhausted budget as
 `Error::NestedUsernsBudgetExhausted`, naming the sysctl.
+
+## The session keyring
+
+The kernel's keyrings belong to no namespace. A forked process inherits its
+parent's session keyring. A process also *possesses* every key reachable from
+that keyring, and possession is what the default key permissions grant reading
+to. A command holding the caller's session keyring can therefore read every key
+the caller's login session holds. That includes a Kerberos ticket cache, an
+fscrypt or eCryptfs key, and any secret a desktop cached there. No namespace,
+root swap, or descriptor sweep changes that.
+
+The launch stage joins a fresh, anonymous session keyring before it forks
+anything. Every process of the sandbox starts with that keyring, and none
+possesses the caller's. The restriction fallback does the same, since the
+reasoning does not depend on namespaces.
+
+The kernel still lists in `/proc/keys` every key whose permissions let its owner
+view it, and the sandbox's processes are that owner. A key's description
+therefore stays visible, as the mount table does. Its contents do not. See
+[What the sandbox does not hide](#what-the-sandbox-does-not-hide).
+
+The fresh keyring counts against the calling user's key quota for as long as
+the sandbox runs. The quota is `kernel.keys.maxkeys` keys and
+`kernel.keys.maxbytes` bytes, 200 and 20000 by default. Every other key the user
+holds counts against it too. A launch that finds the quota spent reports
+`Error::KeyQuotaExhausted`, which names both sysctls.
+
+A process that cannot call `keyctl` at all has no keyring to replace. Neither
+has anything it forks, because a seccomp filter is inherited, and so is a kernel
+built without key support. Container runtimes' default seccomp profiles deny the
+call in exactly this way, and a launch under one proceeds. Before it proceeds,
+the launch confirms that reading the inherited keyring is refused the same way.
+A policy that refuses only the join therefore fails the launch, rather than
+leaving the caller's keyring in place.
 
 ## The mount profile
 
@@ -363,6 +402,11 @@ bind-mount-based sandbox exposes — Docker and bubblewrap alike — and it foll
 from binding host paths at all; closing it would take a mount over `mountinfo`
 in a `/proc` of the sandbox's own, which is a larger mechanism than the
 disclosure warrants.
+
+`/proc/keys` is a disclosure of the same kind. It lists the description of every
+key the calling user owns, wherever the key's permissions let its owner view it.
+The command possesses none of those keys and cannot read their contents. See
+[The session keyring](#the-session-keyring).
 
 It is called out because the rest of the crate leans the other way. A
 [`Terminal`](terminal.md) refuses to read the host's window size, `base_env`

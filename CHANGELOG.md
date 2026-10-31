@@ -25,6 +25,20 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Security
+
+- Every launch, of a sandbox or a restriction, gives the command a fresh session
+  keyring in place of the caller's. A sandboxed command previously inherited the
+  caller's session keyring, so it possessed, and could read through `keyctl`,
+  every key the caller's login session held. Key descriptions stay listed in
+  `/proc/keys`; their contents are no longer reachable.
+
+### Added
+
+- `Error::KeyQuotaExhausted`, reported when the calling user's kernel key quota
+  leaves no room for the sandbox's session keyring, and
+  `SetupStep::ReplaceSessionKeyring`, the step that replaces it.
+
 ## [0.4.5] - 2026-09-26
 
 `fcage` 0.5.0, unchanged. Its dependency on the library is a caret range over

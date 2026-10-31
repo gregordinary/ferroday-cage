@@ -97,6 +97,13 @@ Independently of the session, the curated seccomp policy denies `ioctl` for the
 `TIOCSTI` and `TIOCLINUX` requests, the two that write to a terminal's input
 queue.
 
+The caller's session keyring is not among them either. The kernel's keyrings
+belong to no namespace, so a sandbox and a restriction are in the same position.
+Every launch of either gives the command a fresh session keyring in place of the
+one it inherited. The command therefore does not possess the keys the caller's
+login session holds, and cannot read them. See [The session
+keyring](how-the-sandbox-is-built.md#the-session-keyring).
+
 ## Falling back from a cage
 
 A cage launch on a host without user namespaces fails with

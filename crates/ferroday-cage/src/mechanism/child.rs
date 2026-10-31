@@ -3,9 +3,9 @@
 //!
 //! A launch runs across a small tree of forked processes. Stage A is forked
 //! from the caller and is short-lived: it scrubs the inherited signal state,
-//! unshares the namespaces, sweeps the inherited descriptor table, forks the
-//! next stage, and publishes that stage's pidfd back to the caller over the
-//! control socket.
+//! unshares the namespaces, sweeps the inherited descriptor table, replaces the
+//! inherited session keyring, forks the next stage, and publishes that stage's
+//! pidfd back to the caller over the control socket.
 //!
 //! With a PID namespace (the default), the process A forks is the sandbox
 //! init — PID 1 inside the namespace. It performs the sandbox setup
@@ -187,6 +187,12 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // stream; `wire_stdio` marks it close-on-exec once it has, so it is gone
     // by the time the command image starts.
     sweep_fds(context).map_err(|errno| (SetupStep::SweepFds, errno, 0))?;
+
+    // The session keyring, the one piece of the caller's session the sweep
+    // cannot reach because it is a credential rather than a descriptor. Every
+    // sandbox stage is forked from this process, so replacing it here replaces
+    // it for all of them, in a restriction as in a container.
+    replace_session_keyring().map_err(|errno| (SetupStep::ReplaceSessionKeyring, errno, 0))?;
 
     // Establish the identity map, after the sweep so the map gate survives
     // it, and before any further fork so every sandbox stage runs in a
@@ -1743,6 +1749,67 @@ fn parse_fd(name: &CStr) -> Option<RawFd> {
         value = value.checked_mul(10)?.checked_add((byte - b'0') as RawFd)?;
     }
     Some(value)
+}
+
+/// `KEYCTL_GET_KEYRING_ID`: report the serial of a special keyring, creating
+/// nothing when the third argument is zero.
+const KEYCTL_GET_KEYRING_ID: usize = 0;
+/// `KEYCTL_JOIN_SESSION_KEYRING`: replace the session keyring, with a fresh
+/// anonymous one when the name argument is null.
+const KEYCTL_JOIN_SESSION_KEYRING: usize = 1;
+/// `KEY_SPEC_SESSION_KEYRING`: the calling process's session keyring.
+const KEY_SPEC_SESSION_KEYRING: i32 = -3;
+
+/// Gives this process, and every process it forks, a session keyring of its
+/// own in place of the one it inherited.
+///
+/// The kernel's keyrings are not partitioned by any namespace a launch
+/// creates. A forked process inherits its parent's session keyring, and a
+/// process *possesses* every key reachable from it, which is the one standing
+/// the default key permissions grant reading and searching to. Left alone, a
+/// command in a fully isolated sandbox could still read, through `keyctl`,
+/// every key the caller's login session holds: a Kerberos ticket cache, an
+/// fscrypt or eCryptfs key, a secret a desktop cached there. Joining a fresh
+/// anonymous keyring ends the possession, and with it that reach.
+///
+/// What remains is what the kernel shows any process of the same user. A key
+/// whose permissions grant its owner *view* is still listed in `/proc/keys`,
+/// description and all, much as the mount table stays readable; its contents
+/// are not.
+///
+/// A process that cannot call `keyctl` at all has nothing to replace, and
+/// neither has anything it forks: a seccomp filter is inherited, and so is a
+/// kernel built without key support. Container runtimes' default seccomp
+/// profiles deny the call exactly so, and a launch under one proceeds. That is
+/// established by asking rather than read into the errno: a refused join is
+/// excused only when a read-only query of the inherited keyring is refused the
+/// same way, so a refusal aimed at the join alone, which would leave the old
+/// keyring in place and readable, still fails the launch.
+///
+/// Post-fork safe: raw syscalls only.
+fn replace_session_keyring() -> Result<(), Errno> {
+    match keyctl(KEYCTL_JOIN_SESSION_KEYRING, 0) {
+        Ok(()) => Ok(()),
+        Err(refused @ (Errno::PERM | Errno::NOSYS)) => {
+            match keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING as usize) {
+                Err(Errno::PERM | Errno::NOSYS) => Ok(()),
+                _ => Err(refused),
+            }
+        }
+        Err(errno) => Err(errno),
+    }
+}
+
+/// Issues one two-argument `keyctl` operation, discarding its result value.
+fn keyctl(operation: usize, argument: usize) -> Result<(), Errno> {
+    // SAFETY: both operations used here take integer arguments only; a zero
+    // second argument to `KEYCTL_JOIN_SESSION_KEYRING` is the null name the
+    // kernel reads as "anonymous", so no pointer is passed and none is read.
+    // The third argument is zero, which `KEYCTL_GET_KEYRING_ID` reads as "do
+    // not create".
+    unsafe { syscalls::syscall!(Sysno::keyctl, operation, argument, 0usize) }
+        .map(|_| ())
+        .map_err(sys::errno)
 }
 
 /// Creates one mount-target directory at exactly `mode`, leaving an existing

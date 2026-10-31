@@ -1595,6 +1595,7 @@ impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::ConfigError
 #[non_exhaustive] pub enum ferroday_cage::Error
 pub ferroday_cage::Error::Config(ferroday_cage::ConfigError)
 pub ferroday_cage::Error::IdentityMap(ferroday_cage::IdMapError)
+pub ferroday_cage::Error::KeyQuotaExhausted
 pub ferroday_cage::Error::NestedUsernsBudgetExhausted
 #[non_exhaustive] pub ferroday_cage::Error::Setup
 pub ferroday_cage::Error::Setup::detail: core::option::Option<alloc::string::String>
@@ -1962,6 +1963,7 @@ pub ferroday_cage::SetupStep::OpenSandboxProcfs = 52
 pub ferroday_cage::SetupStep::PivotRoot = 17
 pub ferroday_cage::SetupStep::PrivatizeMounts = 7
 pub ferroday_cage::SetupStep::RemountReadOnly = 15
+pub ferroday_cage::SetupStep::ReplaceSessionKeyring = 55
 pub ferroday_cage::SetupStep::ResetSignals = 22
 pub ferroday_cage::SetupStep::SendPidfd = 24
 pub ferroday_cage::SetupStep::SetControllingTerminal = 46

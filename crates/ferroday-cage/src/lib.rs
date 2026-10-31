@@ -53,7 +53,9 @@
 //! the caller's variables. Every part of that profile is a builder call
 //! away: mounts can be dropped, the host network shared, the hostname set,
 //! the working directory, environment, and stream dispositions chosen, and
-//! unmodeled mounts expressed through the [`RawMount`] escape hatch.
+//! unmodeled mounts expressed through the [`RawMount`] escape hatch. One
+//! property is not configurable: the command starts with a session keyring
+//! of its own, so it possesses none of the keys the caller's session holds.
 //!
 //! The isolation bounds what the command can reach, not what it can learn. Its
 //! own mount table — `/proc/self/mountinfo` — names the host path of the rootfs

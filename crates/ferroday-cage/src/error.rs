@@ -163,6 +163,9 @@ wire_enum! {
         NestedMapGate = 53 => "operating the nested identity-map gate",
         /// Mark the sandbox's root mount `nosuid`.
         NosuidRootfs = 54 => "marking the root mount nosuid",
+        /// Give the sandbox a session keyring of its own, in place of the one
+        /// the caller's session carries.
+        ReplaceSessionKeyring = 55 => "replacing the inherited session keyring",
     }
 }
 
@@ -861,6 +864,17 @@ pub enum Error {
     /// host that permits no user namespace at all: here the sandbox was built
     /// and only the second namespace was refused.
     NestedUsernsBudgetExhausted,
+    /// The calling user's kernel key quota is exhausted, so the sandbox could
+    /// not be given a session keyring of its own.
+    ///
+    /// Every launch replaces the session keyring it inherited with a fresh one,
+    /// so that the command cannot read the keys the caller's session holds, and
+    /// that keyring is charged against the calling user's quota for as long as
+    /// the sandbox runs. The quota is `kernel.keys.maxkeys` keys and
+    /// `kernel.keys.maxbytes` bytes per user, 200 and 20000 by default, shared
+    /// with every other key the user holds. A host running that many sandboxes
+    /// at once as one user reports this rather than a bare `EDQUOT`.
+    KeyQuotaExhausted,
     /// A sandbox setup step failed in the child process.
     #[non_exhaustive]
     Setup {
@@ -1018,6 +1032,12 @@ impl fmt::Display for Error {
                  raise user.max_user_namespaces, or reduce the number of namespaces already \
                  live",
             ),
+            Error::KeyQuotaExhausted => f.write_str(
+                "the sandbox could not be given a session keyring of its own: the calling \
+                 user's kernel key quota is exhausted. Every running sandbox holds one keyring; \
+                 raise kernel.keys.maxkeys and kernel.keys.maxbytes, or run fewer sandboxes \
+                 at once",
+            ),
             Error::Setup {
                 step,
                 source,
@@ -1064,6 +1084,7 @@ impl std::error::Error for Error {
     /// Every OS failure this type carries is an [`io::Error`], so every one of
     /// them is returned here. The variants that answer `None` carry nothing:
     /// [`NestedUsernsBudgetExhausted`](Self::NestedUsernsBudgetExhausted),
+    /// [`KeyQuotaExhausted`](Self::KeyQuotaExhausted),
     /// [`SupervisorLost`](Self::SupervisorLost), and
     /// [`TerminalsExhausted`](Self::TerminalsExhausted) are conditions the
     /// library recognized rather than syscalls that failed.

@@ -161,6 +161,13 @@ required-features = ["tarball"]
 name = "network_seam"
 required-features = ["tarball"]
 
+# The keyring tests launch a sandbox against the rootfs fixture; the
+# restriction case runs a host shell and is gated on `hardening` within the
+# binary.
+[[test]]
+name = "keyring"
+required-features = ["tarball"]
+
 [[test]]
 name = "provision"
 required-features = ["tarball"]
