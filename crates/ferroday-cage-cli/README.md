@@ -73,6 +73,11 @@ fcage --rootfs ./root \
 `--restrict` is the fallback for a host that disables user namespaces entirely. It confines
 a plain host process with the same Landlock and seccomp primitives, without a sandbox root.
 
+A standard stream that is a file, as in `fcage ... < notes.txt` or `fcage ... >> build.log`,
+is never handed to the command. The command gets a pipe instead, and `fcage` copies between
+the pipe and the file. Without that, the command could reopen the file through
+`/proc/self/fd` with more access than the stream carried, and rewrite it.
+
 The isolated network is loopback-only by default. `--netstack` attaches a native userspace
 TCP/IP stack for outbound IPv4 and IPv6 with no helper binary. `--share-net` gives the
 command the host's network instead.

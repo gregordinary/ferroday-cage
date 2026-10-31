@@ -26,7 +26,10 @@
 //! delegate as code. `--stdin` therefore offers the two dispositions a profile
 //! can name, and `--identity-map` the delegates the library bundles. The output
 //! pair has no flag at all: a shell already spells both of its dispositions,
-//! and a profile carries `stdout` and `stderr` where they belong.
+//! and a profile carries `stdout` and `stderr` where they belong. `fcage` does
+//! reach for `Stdio::Fd` itself, for one purpose: a standard stream that is a
+//! file is relayed through a pipe rather than handed to the command, which
+//! [`streams`] explains.
 //!
 //! The same holds for the native network stack: every `NetStackBuilder` setting
 //! has a `--netstack-*` flag. The provisioners are narrower, and deliberately:
@@ -38,6 +41,7 @@
 //! publishes the enumerations they print. `tools/parity.toml` records the whole
 //! comparison, setting by setting, and a check holds it to the code.
 
+mod streams;
 mod terminal;
 
 use std::ffi::{OsStr, OsString};
@@ -1919,11 +1923,18 @@ clean environment: PATH and HOME, the host TERM when set, profile variables,
 and the --setenv values. With --restrict the base is PATH alone, there being
 no sandbox root for HOME to name. --no-base-env drops the base either way.
 
+A standard stream that is a regular file or a block device is not handed
+to the command. It gets a pipe instead, and fcage copies between the pipe
+and the file, so the command cannot reopen the file through /proc/self/fd
+with more access than the stream carried. A relayed standard input also
+puts the command in a session of its own, as --stdin null does.
+
 Exit status: the command's own exit code, or 128 plus the signal number
 when it is terminated by a signal, or 124 when --timeout expires. fcage
-itself exits 125 when the sandbox cannot be built or launched, 126 when
-the command exists but cannot be executed, 127 when the command does not
-exist, and 2 on usage errors.
+itself exits 125 when the sandbox cannot be built or launched, or when a
+relayed stream could not be delivered, 126 when the command exists but
+cannot be executed, 127 when the command does not exist, and 2 on usage
+errors.
 ";
 
 /// A parsed command line.
@@ -4578,6 +4589,41 @@ fn run(options: Options) -> ExitCode {
         None => {}
     }
 
+    if options.terminal && !options.netstack {
+        return run_on_a_terminal(builder, options.timeout, options.kill_after);
+    }
+
+    // Every launch below hands the sandbox `fcage`'s own standard streams, so
+    // any of them that is a file is relayed rather than handed over. The
+    // builder is asked rather than the flags, so a profile's stream settings
+    // count exactly as `--stdin` does.
+    let mut relay = None;
+    if !options.terminal {
+        let inherited = [
+            matches!(builder.get_stdin(), Stdio::Inherit),
+            matches!(builder.get_stdout(), Stdio::Inherit),
+            matches!(builder.get_stderr(), Stdio::Inherit),
+        ];
+        let mut started = match streams::StreamRelay::start(inherited) {
+            Ok(started) => started,
+            Err(error) => {
+                eprintln!("fcage: cannot relay the standard streams: {error}");
+                return ExitCode::from(125);
+            }
+        };
+        let [stdin, stdout, stderr] = started.take_replacements();
+        if let Some(stdin) = stdin {
+            builder = builder.stdin(stdin);
+        }
+        if let Some(stdout) = stdout {
+            builder = builder.stdout(stdout);
+        }
+        if let Some(stderr) = stderr {
+            builder = builder.stderr(stderr);
+        }
+        relay = Some(started);
+    }
+
     if options.netstack {
         // The native stack composes the sandbox's DNS from the host's routable
         // nameservers, unless the run opts out. --no-managed-mounts opts out
@@ -4591,24 +4637,42 @@ fn run(options: Options) -> ExitCode {
         if builder.get_resolv_conf() {
             builder = compose_netstack_resolv_conf(builder);
         }
-        return run_with_netstack(
+        let code = run_with_netstack(
             builder,
             stack.expect("assembled above for exactly this branch"),
             options.terminal,
             options.timeout,
             options.kill_after,
         );
-    }
-
-    if options.terminal {
-        return run_on_a_terminal(builder, options.timeout, options.kill_after);
+        return finish_relay(relay, code);
     }
 
     let outcome = builder
         .build()
         .and_then(|cage| cage.spawn())
         .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
-    conclude(outcome)
+    finish_relay(relay, conclude(outcome))
+}
+
+/// Waits for the stream relays to deliver what the command wrote, and settles
+/// the exit status.
+///
+/// A relay that failed lost output the command believed delivered, which is a
+/// failure of `fcage` rather than of the command, so it is reported and the run
+/// exits 125 whatever the command's own status was.
+fn finish_relay(relay: Option<streams::StreamRelay>, code: ExitCode) -> ExitCode {
+    let Some(relay) = relay else {
+        return code;
+    };
+    let failures = relay.finish();
+    for (stream, error) in &failures {
+        eprintln!("fcage: relaying the command's {stream}: {error}");
+    }
+    if failures.is_empty() {
+        code
+    } else {
+        ExitCode::from(125)
+    }
 }
 
 /// Runs a sandbox on a pseudoterminal of its own and relays the caller's
@@ -4876,6 +4940,9 @@ fn run_restricted(options: Options) -> ExitCode {
     if let Some(chdir) = options.chdir {
         builder = builder.current_dir(chdir);
     }
+    // Read before the disposition moves into the builder; the stream relay
+    // below needs to know whether standard input is inherited.
+    let stdin_inherited = matches!(options.stdin, None | Some(Stdio::Inherit));
     if let Some(stdin) = options.stdin {
         builder = builder.stdin(stdin);
     }
@@ -4921,11 +4988,32 @@ fn run_restricted(options: Options) -> ExitCode {
         ));
     }
 
+    // As for a cage: a stream that is a file is relayed rather than handed over.
+    // A restriction's output pair has no flag, so only standard input can have
+    // been sent elsewhere.
+    let mut relay = match streams::StreamRelay::start([stdin_inherited, true, true]) {
+        Ok(relay) => relay,
+        Err(error) => {
+            eprintln!("fcage: cannot relay the standard streams: {error}");
+            return ExitCode::from(125);
+        }
+    };
+    let [stdin, stdout, stderr] = relay.take_replacements();
+    if let Some(stdin) = stdin {
+        builder = builder.stdin(stdin);
+    }
+    if let Some(stdout) = stdout {
+        builder = builder.stdout(stdout);
+    }
+    if let Some(stderr) = stderr {
+        builder = builder.stderr(stderr);
+    }
+
     let outcome = builder
         .build()
         .and_then(|restriction| restriction.spawn())
         .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
-    conclude(outcome)
+    finish_relay(Some(relay), conclude(outcome))
 }
 
 /// The Landlock access set a --landlock-ro or --landlock-rw grant confers.

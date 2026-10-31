@@ -281,6 +281,33 @@ an inherited terminal whether or not `/dev/tty` has a name.
 [`Running::terminate`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.terminate
 [`Running::kill`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.kill
 
+### A stream that is a file
+
+A descriptor carries its file, and the file is reachable through it by path.
+`/proc/self/fd/N` reopens whatever a descriptor names. The access comes from the
+command's own credentials, not from the mode the descriptor was opened with.
+Under the single-identity map those credentials are the caller's.
+
+So a stream that is a file hands over the file itself:
+
+- A command whose standard input is an open file can open `/proc/self/fd/0`
+  for writing and rewrite the file.
+- A command whose standard output is a log opened for appending can read the
+  log back and truncate it.
+
+`Stdio::Inherit` and `Stdio::from_fd` reach the file alike. No namespace or
+swapped root changes that.
+
+A Landlock grant closes it. The reopened file lies outside every grant, so the
+kernel refuses the open. Without Landlock, a caller that means only a file's
+bytes to cross hands the command a pipe instead. It then copies between the pipe
+and the file itself. `fcage` does exactly that for a standard stream that is a
+regular file or a block device.
+
+A pipe, a socket, and `/dev/null` carry no such reach. Reopening a pipe reaches
+the same pipe, and a socket cannot be reopened at all. A terminal is the subject
+of [the section above](#the-dispositions-and-the-callers-terminal).
+
 ### Feeding the command input
 
 `Stdio::from_fd` takes anything readable — the read end of a pipe the caller

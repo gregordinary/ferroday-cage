@@ -32,6 +32,13 @@ consumer upgrading can skip it.
   caller's session keyring, so it possessed, and could read through `keyctl`,
   every key the caller's login session held. Key descriptions stay listed in
   `/proc/keys`; their contents are no longer reachable.
+- `fcage`: a standard stream that is a regular file or a block device is relayed
+  through a pipe rather than handed to the command. A command could previously
+  reopen such a file through `/proc/self/fd` with more access than the stream
+  carried: rewrite a file given as standard input, or read back and truncate a
+  log opened for appending. A relayed standard input puts the command in a
+  session of its own, as `--stdin null` does, and a relay that cannot deliver
+  the command's output exits 125.
 
 ### Added
 

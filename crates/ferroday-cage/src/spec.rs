@@ -176,6 +176,28 @@ pub enum Network {
 /// or `Fd` on the output pair is what closes that, and a capturing launch
 /// closes it too by supplying pipes of its own.
 ///
+/// # A stream that is a file
+///
+/// A descriptor carries its file, and the file is reachable through it by path.
+/// `/proc/self/fd/N` reopens whatever a descriptor names, with the access the
+/// command's own credentials allow rather than the access the descriptor was
+/// opened with. Under the single-identity map those credentials are the
+/// caller's. A command whose standard input is an open file can therefore open
+/// `/proc/self/fd/0` for writing and rewrite the file, and one whose standard
+/// output is a log opened for appending can read the log back and truncate it.
+/// [`Inherit`](Self::Inherit) and [`Fd`](Self::Fd) reach the file alike, and no
+/// namespace or swapped root changes that.
+///
+/// A Landlock grant closes it: the reopened file lies outside every grant, so
+/// the open is refused. Without one, a caller that means only a file's bytes to
+/// cross hands the command a pipe and copies between the pipe and the file
+/// itself. `fcage` does exactly that for a standard stream that is a regular
+/// file or a block device.
+///
+/// A pipe, a socket, and `/dev/null` carry no such reach. Reopening a pipe
+/// reaches the same pipe, and a socket cannot be reopened at all. A terminal is
+/// the subject of the section above.
+///
 /// # Job control
 ///
 /// Job control has two senses, and the disposition decides where each happens.
