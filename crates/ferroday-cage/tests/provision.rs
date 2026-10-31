@@ -546,6 +546,86 @@ fn gzip_xz_zstd_and_plain_all_extract() {
     }
 }
 
+#[test]
+fn a_damaged_check_after_the_archive_ends_is_refused() {
+    // Each format closes a compressed stream with a check over the last part
+    // of it: a gzip member's CRC, an xz index and footer, a zstd frame's
+    // content checksum. The tar terminator sits inside that last part, so a
+    // reader stopping at the terminator never compares the check, and a
+    // damaged final block would extract as though it were sound. Damaging the
+    // check itself leaves every byte the archive decodes to intact, which is
+    // what makes it the case only the check can catch.
+    use std::io::Write;
+
+    let mut tar = TarBuilder::new();
+    tar.file("f", 0o644, b"the last file in the archive");
+    let plain = tar.finish();
+
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&plain).unwrap();
+    let gz = gz.finish().unwrap();
+
+    let mut xz =
+        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+    xz.write_all(&plain).unwrap();
+    let xz = xz.finish().unwrap();
+
+    let zst = ruzstd::encoding::compress_to_vec(
+        plain.as_slice(),
+        ruzstd::encoding::CompressionLevel::Fastest,
+    );
+
+    // gzip's trailer is the CRC and the length, xz's footer ends with the
+    // closing magic, and a zstd frame ends with its checksum.
+    for (name, mut bytes, from_end) in [("gz", gz, 8), ("xz", xz, 1), ("zst", zst, 1)] {
+        let rootfs = provision(&format!("extract-check-{name}"), &bytes);
+        assert_eq!(
+            fs::read(rootfs.join("f")).unwrap(),
+            b"the last file in the archive",
+            "format {name}: the undamaged stream extracts",
+        );
+
+        let at = bytes.len() - from_end;
+        bytes[at] ^= 0x01;
+        let err = provision_err(&format!("extract-check-{name}-damaged"), &bytes);
+        assert!(
+            matches!(err, ProvisionError::Archive { .. }),
+            "format {name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn record_padding_after_the_archive_is_read_past_but_more_is_refused() {
+    // `tar` pads an archive to whole records, ten kibibytes by default, so
+    // zeros after the terminator are ordinary. The stream is read to its end
+    // so that a compressed one's closing check is compared, and what follows
+    // the terminator is decoded only to be discarded: past a mebibyte of it,
+    // the stream is refused rather than decoded on.
+    use std::io::Write;
+
+    let gzip = |bytes: &[u8]| {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(bytes).unwrap();
+        gz.finish().unwrap()
+    };
+    let mut tar = TarBuilder::new();
+    tar.file("f", 0o644, b"content");
+
+    let mut padded = tar.finish();
+    padded.resize(10 * 1024, 0);
+    let rootfs = provision("extract-record-padding", &gzip(&padded));
+    assert_eq!(fs::read(rootfs.join("f")).unwrap(), b"content");
+
+    let mut overlong = tar.finish();
+    overlong.resize(overlong.len() + (1 << 20) + 1, 0);
+    let err = provision_err("extract-overlong-trailer", &gzip(&overlong));
+    assert!(
+        matches!(&err, ProvisionError::Archive { reason, .. } if reason.contains("follow the end")),
+        "{err}"
+    );
+}
+
 /// The fixture the v7 tests extract, written into whichever builder is given.
 ///
 /// A file, a nested directory with a file under it, and a symlink: enough that

@@ -83,7 +83,7 @@ use pin::Pins;
 
 /// The suffix a run-owned `.deb` cache takes on the tree it is building.
 const DEB_CACHE: &str = ".fcage-debs";
-use crate::provision::openpgp::Keyring;
+use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
 use release::Release;
 
 /// The mode a bootstrapped rootfs's own root directory takes.
@@ -2012,10 +2012,11 @@ fn fetch_component_index(
 /// the transport, and returning the last such error when every mirror is
 /// exhausted.
 ///
-/// No size travels with these: this fetches a release file, which is the trust
-/// root and so has nothing signed to declare its length. The fetcher's own
-/// ceiling is the bound there, which is the right one — a release is small, and
-/// the alternative would be a ceiling of this module's invention.
+/// A release file is the trust root, so nothing signed declares its length. It
+/// is fetched under [`MAX_SIGNED_DOCUMENT_BYTES`], the ceiling every layer holds
+/// an unsized signed document to and the most that verifying one reads. The
+/// unsigned `Release` a trusted local mirror serves is held to the same
+/// ceiling: it is the same document without its armor.
 fn fetch_from_mirrors(
     fetcher: &mut dyn Fetch,
     mirrors: &[String],
@@ -2031,7 +2032,8 @@ fn fetch_from_mirrors(
             // snapshot backstop resolves against whichever one served, and a
             // record naming the list would describe a choice rather than the
             // choice made.
-            fetch_bytes(fetcher, &url, None).map(|bytes| (bytes, mirror.clone()))
+            fetch_bytes(fetcher, &url, Some(MAX_SIGNED_DOCUMENT_BYTES))
+                .map(|bytes| (bytes, mirror.clone()))
         },
         || {
             DebianError::Fetch(FetchError::NotFound {
@@ -2544,7 +2546,8 @@ fn maintainer_env(source_date_epoch: Option<i64>) -> Vec<(String, String)> {
 }
 
 /// Fetches a URL fully into memory, bounded by the size a verified source
-/// declares for it where there is one.
+/// declares for it, or by the ceiling for a document nothing declares a size
+/// for.
 ///
 /// The declared size travels with the request, so a transport that honours it
 /// refuses an oversized framing before reading a byte, *and* bounds the sink
@@ -3440,6 +3443,55 @@ mod tests {
         let reason = result.unwrap_err().to_string();
         assert!(reason.contains("last.example"), "{reason}");
         assert!(!reason.contains("first.example"), "{reason}");
+    }
+
+    #[test]
+    fn a_release_past_the_signed_document_ceiling_is_refused_as_it_arrives() {
+        // A release is the trust root, so nothing signed declares its length,
+        // and a transport is free to ignore the size a request states. The
+        // ceiling travels with the request for a transport that honours it, and
+        // the sink holds it for one that does not, so an oversized release is
+        // refused before it is held rather than after.
+        struct Serving {
+            body: Vec<u8>,
+            asked: Option<u64>,
+        }
+        impl Fetch for Serving {
+            fn fetch(
+                &mut self,
+                request: &FetchRequest<'_>,
+                sink: &mut dyn std::io::Write,
+            ) -> Result<(), FetchError> {
+                self.asked = request.size();
+                sink.write_all(&self.body)
+                    .map_err(|err| FetchError::io("writing the body", request.url(), err))
+            }
+        }
+        let ceiling = usize::try_from(MAX_SIGNED_DOCUMENT_BYTES).unwrap();
+        let mirrors = ["http://mirror.example/debian".to_string()];
+        let fetch = |len: usize| {
+            let mut fetcher = Serving {
+                body: vec![b'x'; len],
+                asked: None,
+            };
+            let result = fetch_from_mirrors(
+                &mut fetcher,
+                &mirrors,
+                "dists/stable/InRelease",
+                &mut Silent,
+            );
+            assert_eq!(fetcher.asked, Some(MAX_SIGNED_DOCUMENT_BYTES));
+            result
+        };
+        let (bytes, _) = fetch(ceiling).expect("a release at the ceiling is fetched");
+        assert_eq!(bytes.len(), ceiling);
+        assert!(
+            matches!(
+                fetch(ceiling + 1),
+                Err(DebianError::Fetch(FetchError::Io { .. }))
+            ),
+            "a release past the ceiling is refused",
+        );
     }
 
     #[test]

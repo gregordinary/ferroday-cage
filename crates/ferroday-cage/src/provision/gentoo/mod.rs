@@ -106,9 +106,24 @@ const DEFAULT_MIRROR: &str = "http://distfiles.gentoo.org";
 const DEFAULT_MAX_POINTER_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// The ceiling on a pointer document, which declares no size of its own.
-const MAX_POINTER_BYTES: u64 = 1024 * 1024;
+///
+/// Tighter than [`MAX_SIGNED_DOCUMENT_BYTES`], the ceiling every signed
+/// document is held to, which is sized for the largest release file any
+/// archive serves. The pointer is one line per stage3 variant of one
+/// architecture, 2.3 KB for amd64's, so this is about thirty times what it
+/// holds and still a sixteenth of what the shared ceiling would let a mirror
+/// make the layer buffer and verify.
+///
+/// [`MAX_SIGNED_DOCUMENT_BYTES`]: super::openpgp::MAX_SIGNED_DOCUMENT_BYTES
+const MAX_POINTER_BYTES: u64 = 64 * 1024;
 
 /// The ceiling on a digest document, which declares no size of its own.
+///
+/// Tighter than [`MAX_SIGNED_DOCUMENT_BYTES`] for the reason
+/// [`MAX_POINTER_BYTES`] is: a digest document lists one build's few files,
+/// about 1.4 KB for an amd64 stage3.
+///
+/// [`MAX_SIGNED_DOCUMENT_BYTES`]: super::openpgp::MAX_SIGNED_DOCUMENT_BYTES
 const MAX_DIGESTS_BYTES: u64 = 64 * 1024;
 
 /// The ceiling on a binary-package index, which declares no size of its own.
@@ -2944,17 +2959,30 @@ mod tests {
 
     #[test]
     fn a_certificate_that_can_vouch_for_nothing_says_so() {
-        // The 2004 release signing key is DSA-1024, which the public-key floor
-        // refuses, and it delegates to no signing subkey. Its expiry reads like
-        // every other certificate's, so without this flag it is
-        // indistinguishable from a working anchor.
+        // Seven of the eleven certificates can sign nothing. The 2004 release
+        // signing key is DSA-1024, which the public-key floor refuses. The
+        // other six are certify-only primaries with no signing subkey: the
+        // authority keys, and the two infrastructure keys whose only subkeys
+        // encrypt. Each one's expiry reads like every other certificate's, so
+        // without this flag it is indistinguishable from a working anchor.
         let horizon = gentoo().keyring_horizon();
         let unusable: Vec<&str> = horizon
             .iter()
             .filter(|held| !held.signs)
             .map(|held| held.fingerprint.as_str())
             .collect();
-        assert_eq!(unusable, ["D99EAC7379A850BCE47DA5F29E6438C817072058"]);
+        assert_eq!(
+            unusable,
+            [
+                "D99EAC7379A850BCE47DA5F29E6438C817072058", // Release Signing Key, DSA
+                "ABD00913019D6354BA1D9A132839FE0D796198B1", // Authority Key L1
+                "2C13823B8237310FA213034930D132FF0FF50EEB", // Authority Key L2, Developers
+                "18F703D702B1B9591373148C55D3238EC050396E", // Authority Key L2, Services
+                "ABA5E4E7F4E407ABE9CA7EC7422C9066E21F705A", // Authority Key L2, Infrastructure
+                "A4C2DA3DB804FE238938F9A3F8F17B35278B92DD", // Infra petrel
+                "404024B21B2B39E9868A6E77AD990531CBE7DB75", // Infra finch
+            ],
+        );
     }
 
     #[test]

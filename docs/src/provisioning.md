@@ -585,6 +585,13 @@ has been read, because a publication is durable. A stream taken for a complete
 archive of nothing would publish an empty tree. Every later `ensure` then
 returns that as `Provisioned::Existing` without consulting the source again.
 
+The stream is read to its end, past the archive's end marker. Each compression
+carries integrity checks: a CRC per gzip member, a check per xz block, a
+checksum per zstd frame. The last of them follows the end marker, and reading on
+is what compares it. A damaged final block therefore fails the run rather than
+extracting. More than a mebibyte after the marker is refused, which leaves room
+for the record padding `tar` writes.
+
 Extraction is unprivileged and designed for archives that describe a root
 filesystem:
 

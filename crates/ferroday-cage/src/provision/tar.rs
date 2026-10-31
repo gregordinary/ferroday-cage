@@ -25,6 +25,7 @@
 use std::io::{self, Read, Write};
 
 use super::ProvisionError;
+use super::compress::read_fully;
 
 /// The size of a tar block, and of a tar header.
 pub(crate) const BLOCK: u64 = 512;
@@ -424,31 +425,70 @@ impl<R: Read> TarReader<R> {
     /// Reads one full block. Returns `false` on clean EOF at the block
     /// boundary; a partial block is an error.
     fn read_block(&mut self, block: &mut [u8; BLOCK as usize]) -> Result<bool, ProvisionError> {
-        let mut filled = 0;
-        while filled < block.len() {
-            let got = match self.inner.read(&mut block[filled..]) {
-                Ok(got) => got,
+        let filled = match read_fully(&mut self.inner, block) {
+            Ok(filled) => filled,
+            Err(err) => {
+                self.read_failed = true;
+                return Err(malformed(
+                    self.offset,
+                    &format!("cannot read the archive: {err}"),
+                ));
+            }
+        };
+        self.offset += filled as u64;
+        match filled {
+            0 => Ok(false),
+            filled if filled == block.len() => Ok(true),
+            _ => Err(malformed(
+                self.offset,
+                "the archive ends inside a header block",
+            )),
+        }
+    }
+
+    /// Reads the stream on past the end-of-archive marker to its end, refusing
+    /// more than `limit` bytes of it.
+    ///
+    /// A tar archive ends at its marker, and nothing after it is part of the
+    /// archive. The stream the archive is read from may not end there: the
+    /// rest of the last record is padding, and a compressed stream closes with
+    /// the check over the last block it decoded, which covers the marker and
+    /// the entries before it. Stopping at the marker leaves that check unread,
+    /// so a corrupt final block would be extracted as though it were sound.
+    /// Reading on to the end is what has the decoder compare it.
+    ///
+    /// For an archive whose bytes are verified against a digest before it is
+    /// read, the decoder's check adds nothing, and a caller reading one need not
+    /// finish it. For one nothing else vouches for, the check is the only
+    /// thing that would say the stream is damaged.
+    ///
+    /// What follows the marker is decoded only to be discarded, so `limit`
+    /// bounds what a stream can make that cost: a few mebibytes of input can
+    /// decompress to far more than any record padding.
+    pub(crate) fn finish(&mut self, limit: u64) -> Result<(), ProvisionError> {
+        let mut remaining = limit;
+        let mut scratch = [0u8; 4096];
+        loop {
+            let got = match self.inner.read(&mut scratch) {
+                Ok(0) => return Ok(()),
+                Ok(got) => got as u64,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     self.read_failed = true;
                     return Err(malformed(
                         self.offset,
-                        &format!("cannot read the archive: {err}"),
+                        &format!("cannot read the stream past the archive's end: {err}"),
                     ));
                 }
             };
-            if got == 0 {
-                if filled == 0 {
-                    return Ok(false);
-                }
-                return Err(malformed(
+            self.offset += got;
+            remaining = remaining.checked_sub(got).ok_or_else(|| {
+                malformed(
                     self.offset,
-                    "the archive ends inside a header block",
-                ));
-            }
-            filled += got;
-            self.offset += got as u64;
+                    &format!("more than {limit} bytes follow the end of the archive"),
+                )
+            })?;
         }
-        Ok(true)
     }
 
     /// Reads the current (metadata) entry's data in full, with a sanity
@@ -636,6 +676,19 @@ fn base256_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
     Ok(value)
 }
 
+/// A pax record's decimal number: one or more ASCII digits, and nothing else.
+///
+/// Rust's integer parsers also accept a leading `+`, which no pax writer emits.
+/// The record length is framing, deciding where the next record begins, and a
+/// reader more lenient than the format is one that reads an archive
+/// differently from the tools that wrote it.
+fn pax_decimal<T: std::str::FromStr>(text: &[u8]) -> Option<T> {
+    if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(text).ok()?.parse().ok()
+}
+
 /// Parses a pax header body: a sequence of `"%d key=value\n"` records,
 /// where the decimal length counts the whole record. Unknown keys are
 /// ignored.
@@ -647,10 +700,8 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             .iter()
             .position(|b| *b == b' ')
             .ok_or("a pax record has no length delimiter")?;
-        let length: usize = std::str::from_utf8(&rest[..space])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or("a pax record length is not decimal")?;
+        let length: usize =
+            pax_decimal(&rest[..space]).ok_or("a pax record length is not decimal")?;
         if length <= space + 1 || length > rest.len() {
             return Err("a pax record length is out of bounds");
         }
@@ -668,10 +719,7 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             b"path" => records.path = Some(value.to_vec()),
             b"linkpath" => records.link_target = Some(value.to_vec()),
             b"size" => {
-                let size: u64 = std::str::from_utf8(value)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("a pax size record is not decimal")?;
+                let size: u64 = pax_decimal(value).ok_or("a pax size record is not decimal")?;
                 // A size whose block-padded length does not fit in u64
                 // cannot describe real entry data; rejecting it here keeps
                 // the reader's data and padding arithmetic overflow-free.
@@ -685,10 +733,8 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             // ownership here and nowhere else. Ignoring them while reporting
             // the header's ids as meaningful yields silently wrong ownership.
             b"uid" | b"gid" => {
-                let id: u32 = std::str::from_utf8(value)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("a pax uid or gid record is not a decimal id")?;
+                let id: u32 =
+                    pax_decimal(value).ok_or("a pax uid or gid record is not a decimal id")?;
                 if key == b"uid" {
                     records.uid = Some(id);
                 } else {
@@ -720,14 +766,26 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
                 // what extraction applies. The fraction floors rather than
                 // truncates toward zero, as GNU tar does: `-1.5` is the instant
                 // between `-2` and `-1`, so the second containing it is `-2`.
-                let text =
-                    std::str::from_utf8(value).map_err(|_| "a pax mtime record is not ASCII")?;
-                let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
-                let seconds: i64 = whole
-                    .parse()
-                    .map_err(|_| "a pax mtime record is not numeric")?;
-                let negative_fraction =
-                    whole.starts_with('-') && fraction.bytes().any(|b| b != b'0');
+                let (whole, fraction) = match value.iter().position(|byte| *byte == b'.') {
+                    Some(dot) => (&value[..dot], &value[dot + 1..]),
+                    None => (value, &[][..]),
+                };
+                let (negative, magnitude) = match whole.strip_prefix(b"-") {
+                    Some(magnitude) => (true, magnitude),
+                    None => (false, whole),
+                };
+                if !fraction.iter().all(u8::is_ascii_digit) {
+                    return Err("a pax mtime record is not numeric");
+                }
+                let magnitude: u64 =
+                    pax_decimal(magnitude).ok_or("a pax mtime record is not numeric")?;
+                let seconds = if negative {
+                    0i64.checked_sub_unsigned(magnitude)
+                } else {
+                    i64::try_from(magnitude).ok()
+                }
+                .ok_or("a pax mtime record is out of range")?;
+                let negative_fraction = negative && fraction.iter().any(|b| *b != b'0');
                 let mtime = if negative_fraction {
                     seconds
                         .checked_sub(1)
@@ -945,6 +1003,27 @@ mod tests {
         // A zero fraction is not a fraction, in either direction.
         assert_eq!(parse_pax(b"14 mtime=-1.0\n").unwrap().mtime, Some(-1));
         assert_eq!(parse_pax(b"12 mtime=-1\n").unwrap().mtime, Some(-1));
+    }
+
+    #[test]
+    fn a_pax_number_is_digits_and_nothing_else() {
+        // An integer parser also takes a leading `+`, which no pax writer
+        // emits. The record length decides where the next record begins, so a
+        // reader more lenient than the format reads an archive differently
+        // from the tools that wrote it.
+        assert!(parse_pax(b"+12 uid=1000\n").is_err());
+        assert!(parse_pax(b"14 size=+1234\n").is_err());
+        assert!(parse_pax(b"13 uid=+1000\n").is_err());
+        assert!(parse_pax(b"15 mtime=+1000\n").is_err());
+        assert!(parse_pax(b"17 mtime=1000.+5\n").is_err());
+        assert!(parse_pax(b"8 size=\n").is_err());
+        // The forms the format does have still read.
+        assert_eq!(parse_pax(b"13 size=1234\n").unwrap().size, Some(1234));
+        assert_eq!(
+            parse_pax(b"30 mtime=-9223372036854775808\n").unwrap().mtime,
+            Some(i64::MIN)
+        );
+        assert!(parse_pax(b"29 mtime=9223372036854775808\n").is_err());
     }
 
     #[test]

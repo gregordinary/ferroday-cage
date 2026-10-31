@@ -621,18 +621,22 @@ for held in gentoo.keyring_horizon() {
 The report is per certificate, and there is no single date it reduces to. Two of
 the eleven lapse about twenty months before the rest. One number would therefore
 say the keyring is nearly stale while the certificate the archive currently
-signs with is good for years. `signs` separates a second case. The keyring holds
-a DSA-1024 release key from 2004 whose expiry reads like every other
-certificate's. The public-key floor refuses it, and it delegates to no signing
-subkey that would pass.
+signs with is good for years.
+
+`signs` separates a second case. Seven of the eleven certificates can sign
+nothing, though each one's expiry reads like every other's. One is a DSA-1024
+release key from 2004, which the public-key floor refuses. The other six are
+certify-only primaries with no signing subkey: the authority keys and two
+infrastructure keys. A primary signs a document only where its own
+self-signatures grant it the signing flag, as GnuPG and Sequoia require.
 
 What rules out a reduction is that every certificate in the keyring is an
-equally trusted anchor. This layer accepts a signature from any of them. Which
-certificate signs a given document is therefore the archive's choice, and not
-something the keyring records. `signs` says a certificate *could* produce an
-accepted signature, never that anything rests on it today. A short-dated
-certificate the archive happens not to use pulls any earliest-expiry number down
-to itself. That is the reading the per-certificate report exists to avoid.
+equally trusted anchor. This layer accepts a signature from any of them that can
+sign. Which certificate signs a given document is therefore the archive's
+choice, and not something the keyring records. `signs` says a certificate
+*could* produce an accepted signature, never that anything rests on it today. A
+short-dated certificate the archive happens not to use pulls any earliest-expiry
+number down to itself. That is the reading the per-certificate report exists to avoid.
 
 The date your own provisioning depends on is the one on the certificate that
 verified a document you actually read. This layer reads two: the stage3 pointer
@@ -834,7 +838,7 @@ amd64-openrc	20260810T204554Z	495865168
 $ fcage --gentoo-keyring-horizon
 13EBBDBEDE7A12775DFDB1BABB572E0E2D182910	signs	1846022400	Gentoo Linux Release Engineering (Automated Weekly Release Key) <releng@gentoo.org>
 ...
-11 certificates, 10 can sign	expiring between 1795718963 and 1846022400
+11 certificates, 4 can sign	expiring between 1795718963 and 1846022400
 ```
 
 `--gentoo-variants` reads the signed enumeration. It takes `--gentoo-mirror`,

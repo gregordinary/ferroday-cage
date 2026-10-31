@@ -39,6 +39,38 @@ consumer upgrading can skip it.
   log opened for appending. A relayed standard input puts the command in a
   session of its own, as `--stdin null` does, and a relay that cannot deliver
   the command's output exits 125.
+- The `pgp` dependency moves to 0.21 and the `ruzstd` floor to 0.9.1. rPGP 0.20
+  parsed nested embedded signatures by unbounded recursion, so a signed document
+  fetched from a mirror (a Debian `InRelease`, a Gentoo pointer, digest document
+  or binary package Manifest) could exhaust the stack and abort the process
+  before any signature was checked. ruzstd 0.9.0 let a crafted zstd block decode
+  past the format's block size, outside the window cap (RUSTSEC-2026-0344),
+  which `Tarball` and the unsigned Gentoo binary-package index reached.
+- A zstd stream of many frames decodes in time linear in their number. Each
+  frame wrapped the stream in one more reader, so a stream of a hundred thousand
+  empty skippable frames took seconds to decode, and exhausted the stack in a
+  build without tail-call optimization. The unsigned Gentoo binary-package index
+  reached it.
+- Verifying a signed document is bounded before it is parsed: at most one
+  mebibyte, 8,192 lines, and 16 signatures. Framing a cleartext document and
+  checking each signature against each key cost more than the document's length,
+  so a mirror serving a crafted `InRelease`, Gentoo pointer, digest document or
+  binary package Manifest could make the host spend minutes of CPU before any
+  signature was accepted. A Debian `InRelease`, and the `Release` of a mirror
+  trusted unsigned, is fetched under the same one-mebibyte ceiling, where
+  nothing bounded it but the bundled client's body limit. The Gentoo pointer
+  document's ceiling drops from one mebibyte to 64 KiB, and a binary package's
+  Manifest from four mebibytes to one.
+- A certificate's primary key verifies a document only where the certificate's
+  own self-signatures grant it the signing capability, and a self-signature that
+  states no key flags grants none. A certify-only primary, as several of
+  Gentoo's vendored service keys are, was accepted as a signer for the stage3
+  pointer, digest documents and binary package Manifests. Six of Gentoo's
+  eleven vendored certificates can no longer sign, and `Gentoo::keyring_horizon`,
+  and so `fcage --gentoo-keyring-horizon`, reports four that can.
+- Only a text signature verifies a cleartext-signed document. A standalone or
+  timestamp signature by an archive key covers no document, and rPGP verified
+  one against any body sharing its first byte.
 
 ### Added
 
@@ -101,6 +133,20 @@ consumer upgrading can skip it.
   named pipe left at that path. Opening one for reading waited for a writer that
   never came, which stalled the bootstrap for good. It is now refused, as any
   path that is not a regular file is.
+- A mirror that redirects to an `https://` URL, which the bundled client cannot
+  follow, is a mirror that could not serve the request, so a walk over several
+  mirrors asks the next one. It ended the walk as a malformed URL. The refusal
+  names the remedy without naming one layer's builder.
+- A `Tarball` is read to the end of its stream, past the archive's
+  end-of-archive marker, so a compressed stream's final integrity check is
+  compared, and a zstd frame's content checksum is compared as each frame ends.
+  A damaged final block was extracted as though it were sound. More than a
+  mebibyte after the marker is refused.
+- The bundled HTTP client reads a response's framing to its grammar: a
+  `Content-Length` or chunk size with a sign is refused, `Transfer-Encoding` is
+  read as a list in which only one `chunked` is accepted, and a folded header
+  line continues the field before it rather than starting a new one. The tar
+  reader refuses a pax number with a sign.
 - An xz block that chains more than one filter before LZMA2 decodes. Since
   0.4.2 such a block was refused. `xz` writes at most one such filter, so no
   archive it produced was affected.
@@ -111,10 +157,13 @@ consumer upgrading can skip it.
   socket for every caller that does: the supervisor's pidfd, the network stack's
   tap, and a terminal launch's primary. The shared vocabulary in
   `CONTRIBUTING.md` records them.
-- `lzma-rust2` moves to 0.21, whose own reader accepts the memory limit. The xz
+- `lzma-rust2` moves to 0.23, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the
   sans-I/O decoder to apply the limit is gone. The cap, and what an archive over
   it does, are unchanged.
+- Dependencies refreshed within their ranges. The manifest states why a
+  `debian` or `gentoo` build carries two `sha2` lines: `lzma-rust2` selects 0.11,
+  and `pgp` still depends on 0.10.
 
 ## [0.4.5] - 2026-09-26
 

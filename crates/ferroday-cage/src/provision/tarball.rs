@@ -17,6 +17,15 @@ use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, compr
 /// small archive reports a handful of times rather than thousands.
 const REPORT_EVERY: u64 = 1 << 20;
 
+/// The most of the decoded stream that may follow the end-of-archive marker.
+///
+/// What legitimately follows it is the rest of the last record, zero-filled. A
+/// record is ten kibibytes at the blocking factor `tar` and `bsdtar` default
+/// to, and few archivers write records much larger, so a mebibyte covers any
+/// record size in use. What the stream holds beyond that is decoded only to be
+/// discarded, and this is what bounds it. See [`TarReader::finish`].
+const MAX_TRAILING_BYTES: u64 = 1 << 20;
+
 /// Where a [`Tarball`]'s archive comes from.
 enum Source {
     /// A file on the host, opened afresh for each provisioning run.
@@ -44,6 +53,13 @@ enum Source {
 /// publish an empty tree that every later run then trusted. A *missing final
 /// terminator* is tolerated, as GNU tar tolerates it, but only once at least
 /// one entry has been read.
+///
+/// A compressed stream is read to its end, past the archive's end-of-archive
+/// marker, so the integrity check each format carries is compared for every
+/// part of it: each gzip member's CRC, each xz block's check, and each zstd
+/// frame's content checksum. A damaged stream is refused rather than extracted.
+/// At most a mebibyte may follow the marker, which is more than the padding of
+/// any record size in use.
 ///
 /// # Progress and cancellation
 ///
@@ -87,9 +103,11 @@ enum Source {
 ///
 /// Extraction imposes no size or entry-count quota, so a caller extracting
 /// untrusted archives should bound disk usage externally. Decoder memory is
-/// bounded, however: a zstd frame declaring a window larger than 128 MiB is
-/// refused before decoding, so a compression bomb cannot exhaust memory, and
-/// the xz decoder sizes its dictionary fallibly.
+/// bounded, however. A zstd frame declaring a window larger than 128 MiB, and an
+/// xz block declaring a dictionary larger than 128 MiB, are refused from their
+/// headers before the decoder allocates anything for them. Every frame and every
+/// block is held to the bound, not only the first, so a small archive cannot
+/// name a large memory cost anywhere in it.
 pub struct Tarball {
     source: Source,
 }
@@ -209,7 +227,11 @@ impl Provisioner for Tarball {
             Ok(Placement::Write)
         });
         match outcome {
-            Ok(()) => Ok(()),
+            // The archive is complete, but the stream it came from may still
+            // hold the check over its last compressed block. An archive passed
+            // in as a path or a stream is one nothing else vouches for, so that
+            // check is read too.
+            Ok(()) => archive.finish(MAX_TRAILING_BYTES),
             // A stream whose very first block is not a tar header is not
             // a tar archive at all.
             Err(ProvisionError::Archive { .. }) if archive.rejected_at_start() => {

@@ -29,7 +29,8 @@ impl<'a> FetchRequest<'a> {
     /// signed release records the length of every index alongside its digest,
     /// and the index records the length of every package. Both are known before
     /// the request is made and are as trustworthy as the signature they hang
-    /// from.
+    /// from. A signed document is the trust root, so nothing declares its
+    /// length, and the provisioner states the ceiling it holds one to instead.
     pub fn sized(mut self, bytes: u64) -> FetchRequest<'a> {
         self.size = Some(bytes);
         self
@@ -79,9 +80,8 @@ impl<'a> FetchRequest<'a> {
         scheme_of(self.url)
     }
 
-    /// The size the body is expected to be, or `None` where nothing declares
-    /// one — a release file, which is the trust root and so has no signed
-    /// length of its own.
+    /// The size the body is expected to be, or `None` where the provisioner
+    /// states none.
     ///
     /// An implementation that honours it refuses a body larger than the stated
     /// size, and may refuse a declared framing larger than it before reading
@@ -470,8 +470,9 @@ impl FetchError {
     /// names: an answer over the size the resource may weigh, or a redirect
     /// chain that never arrives at one, is what a mirror did rather than how the
     /// caller spelled it, and each is carried as a transport failure so that a
-    /// walk treats it as one — as is a redirect refused for leaving the host,
-    /// since where a mirror sends a request is that mirror's arrangement.
+    /// walk treats it as one — as is a redirect refused for leaving the host or
+    /// for leading to a URL the transport cannot fetch, such as an `https://`
+    /// one, since where a mirror sends a request is that mirror's arrangement.
     ///
     /// This asks only about the transport. A digest or signature failure is not
     /// a `FetchError` at all — it is the layer's own, raised over bytes that did

@@ -1291,6 +1291,12 @@ verified against an embedded copy of the Debian archive keyring. Every index and
 every package is then checked against a SHA-256 digest that chains back to that
 signature.
 
+Nothing signed states how large the `InRelease` is, so it is held to a ceiling
+of one mebibyte, four times the largest an archive serves. Verification also
+refuses a document of more than 8,192 lines or 16 signatures. Each bound keeps a
+mirror from choosing how much work checking its answer costs. A release past
+one is refused, never read short.
+
 A different keyring is supplied with [`keyring`]. [`trust_unsigned`] accepts an
 unsigned `Release` for a local mirror under the caller's control, the equivalent
 of apt's `trusted=yes`. It removes the only authenticity check, leaving the
@@ -1322,6 +1328,12 @@ primary. A subkey is admitted only on the terms OpenPGP sets for one. The primar
 signing capability, the subkey must have counter-signed that binding, and the
 binding must not be revoked.
 
+A primary key signs a release itself only where its certificate grants it the
+signing capability. The grant is read from the certificate's own
+self-signatures, and one that states no capabilities grants none. A certify-only
+primary vouches for its subkeys and is refused as a signer, as GnuPG and Sequoia
+refuse it.
+
 Where a subkey has been re-bound over time, the newest binding the primary
 issued is the one judged. It is the certificate's latest word on that subkey. A
 defect in it therefore refuses the subkey, rather than returning authority to
@@ -1335,7 +1347,8 @@ made is judged. A release is therefore accepted whenever any of its signatures
 is acceptable.
 
 Beyond the key, the signature itself has to be worth resting a decision on. It
-carries a creation time, every check being relative to it. Its digest is not
+is a text signature, the type a cleartext-signed document carries. It carries a
+creation time, every check being relative to it. Its digest is not
 MD5, SHA-1 or RIPEMD-160, whose collisions are within reach. Neither the signing
 key nor the certificate behind it is DSA or an RSA key narrower than 2048 bits.
 A signature is worth no more than the weaker of the digest it covers and the key

@@ -82,7 +82,7 @@ use super::plan::PlannedPackage;
 use super::{GentooError, MAX_METADATA_BYTES};
 use crate::provision::compress;
 use crate::provision::digest::{self, Algorithm};
-use crate::provision::openpgp::Keyring;
+use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
 use crate::provision::tar::TarReader;
 
 /// The member every container must carry, and the marker that says which format
@@ -111,7 +111,11 @@ pub(super) const IMAGE_DIR: &str = "image/";
 
 /// The ceiling on the Manifest, which the container declares no size for until
 /// the Manifest itself is read.
-const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// The shared ceiling on a signed document, which is also the most that
+/// verifying one reads, so a Manifest past it is refused as it arrives rather
+/// than held and then refused. A real one is a few lines, one per member.
+const MAX_MANIFEST_BYTES: u64 = MAX_SIGNED_DOCUMENT_BYTES;
 
 /// A verified container: its metadata, and where its image sits.
 ///

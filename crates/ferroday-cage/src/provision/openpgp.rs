@@ -16,10 +16,42 @@
 
 use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey, SignedPublicSubKey};
 use pgp::crypto::hash::HashAlgorithm;
-use pgp::packet::{Signature, SignatureType, SubpacketData};
+use pgp::packet::{KeyFlags, Signature, SignatureType, SubpacketData};
 use pgp::types::{KeyDetails, PublicParams, RsaPublicParams, Tag, Timestamp, VerifyingKey};
 
 use crate::provision::now_epoch;
+
+/// The largest signed document [`Keyring::verify`] reads, in bytes, and the
+/// ceiling a layer fetches an unsized signed document under.
+///
+/// A trust root has nothing signed to declare its length, so what bounds one
+/// is a ceiling of this crate's choosing, and every layer that fetches one
+/// uses this ceiling or a tighter one of its own. The largest such document an
+/// archive serves is Ubuntu's release file, at about 250 KB; Debian's are under
+/// 200 KB. One mebibyte is four times the first. A document past it is refused
+/// whole, never read short.
+///
+/// It bounds time as well as memory, together with
+/// [`MAX_SIGNED_DOCUMENT_LINES`].
+pub(crate) const MAX_SIGNED_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
+/// The most lines a signed document [`Keyring::verify`] reads may hold.
+///
+/// rPGP finds the end of a cleartext body by searching everything it has read
+/// after each line it reads, so framing a document costs its line count times
+/// its length. Bounding both bounds that product: at this count and
+/// [`MAX_SIGNED_DOCUMENT_BYTES`] it is under a second, where a mebibyte of
+/// one-byte lines would take most of a minute. The largest release file an archive
+/// serves has about 2,600 lines.
+const MAX_SIGNED_DOCUMENT_LINES: usize = 8 * 1024;
+
+/// The most signatures a signed document may carry.
+///
+/// Each signature is checked against every key in the keyring it might have
+/// been made with, which is every key when its issuer subpackets name none or
+/// all of them, and each check hashes the whole document. A Debian release
+/// carries two or three signatures, one per archive key in rotation.
+const MAX_DOCUMENT_SIGNATURES: usize = 16;
 
 /// A failure establishing a document's authenticity.
 ///
@@ -39,7 +71,8 @@ pub(crate) enum OpenPgpError {
     /// against a key in the keyring, or one that did was refused by a validity
     /// gate — a hash or public-key algorithm this crate does not trust, a
     /// missing creation time, a retired signing key, or a signature that has
-    /// itself expired.
+    /// itself expired. A document past the bounds verification is held to is
+    /// refused the same way, before any signature on it is examined.
     Signature(String),
 }
 
@@ -99,12 +132,20 @@ impl Keyring {
     /// or by one of its signing-capable subkeys, and both are tried: an archive
     /// that signs with a dedicated signing subkey rather than with the primary
     /// — Debian's archive automatic signing keys do — would otherwise have
-    /// every genuine document of its own rejected. A subkey is admitted as a
-    /// candidate only when a binding
-    /// signature the primary issued over it cryptographically verifies, carries
-    /// the subkey's own back signature, grants the signing key flag, and has not
-    /// been revoked; an encryption subkey is never a candidate. See
+    /// every genuine document of its own rejected. The primary signs only where
+    /// the certificate's own self-signatures grant it the signing key flag (see
+    /// [`primary_may_sign`]). A subkey is admitted as a candidate only when a
+    /// binding signature the primary issued over it cryptographically verifies,
+    /// carries the subkey's own back signature, grants the signing key flag, and
+    /// has not been revoked; an encryption subkey is never a candidate. See
     /// [`subkey_candidates`].
+    ///
+    /// The document is held to bounds before rPGP reads any of it: at most
+    /// [`MAX_SIGNED_DOCUMENT_BYTES`] and [`MAX_SIGNED_DOCUMENT_LINES`], and,
+    /// once parsed, at most [`MAX_DOCUMENT_SIGNATURES`] signatures. Framing a
+    /// cleartext document and checking its signatures both cost more than the
+    /// document's length, and the bounds are what keep a hostile mirror from
+    /// choosing how much more.
     ///
     /// Several checks are layered over rPGP's cryptographic verification, which
     /// on its own accepts a signature regardless of key or signature validity:
@@ -112,9 +153,9 @@ impl Keyring {
     /// - The signing key's public-key algorithm must be one this crate trusts,
     ///   and so must the algorithm of the primary key that vouches for it. See
     ///   [`key_is_acceptable`].
-    /// - The signature must carry a creation time, must not use a hash this
-    ///   crate refuses, and must not carry a critical subpacket this crate
-    ///   cannot interpret. See [`check_signature_valid`].
+    /// - The signature must be a text signature, carry a creation time, not
+    ///   use a hash this crate refuses, and not carry a critical subpacket this
+    ///   crate cannot interpret. See [`check_signature_valid`].
     /// - The signing key must have existed, and must not yet have expired, when
     ///   the signature was made. For a subkey that means neither its own
     ///   binding's expiry nor the primary's had passed: an expired primary
@@ -139,8 +180,16 @@ impl Keyring {
         document: &[u8],
         require_fresh: bool,
     ) -> Result<Verified, OpenPgpError> {
+        check_document_bounds(document)?;
         let (message, _headers) = CleartextSignedMessage::from_armor(document)
             .map_err(|err| OpenPgpError::Signature(err.to_string()))?;
+        if message.signatures().len() > MAX_DOCUMENT_SIGNATURES {
+            return Err(OpenPgpError::Signature(format!(
+                "the document carries {} signatures, more than the {MAX_DOCUMENT_SIGNATURES} \
+                 a signed document may carry",
+                message.signatures().len(),
+            )));
+        }
         // The normalized text every signature on the document is checked
         // against, and the body a successful verification returns. Computed once
         // here rather than by each call that takes a key, as rPGP's own entry
@@ -167,12 +216,14 @@ impl Keyring {
             // authority is delegated by a binding only that primary could issue.
             let anchored = key_is_acceptable(&cert.primary_key);
 
-            // The primary, judged against its own validity window.
+            // The primary, judged against its own grant and validity window.
             for signature in signatures_by(&message, &signed_text, &cert.primary_key) {
-                let signer = if anchored {
-                    Ok(SigningWindow::of(&cert.primary_key, primary_expiry()))
-                } else {
+                let signer = if !anchored {
                     Err(WEAK_CERTIFICATE)
+                } else if !primary_may_sign(cert) {
+                    Err(NON_SIGNING_PRIMARY)
+                } else {
+                    Ok(SigningWindow::of(&cert.primary_key, primary_expiry()))
                 };
                 match check_signature_valid(signature, signer, require_fresh) {
                     Ok(()) => {
@@ -274,8 +325,9 @@ pub(crate) struct Horizon {
     /// [`Keyring::verify`] would accept.
     ///
     /// `false` for a certificate that is in the keyring but cannot vouch for
-    /// anything: its primary rests on an algorithm this crate refuses and it
-    /// delegates to no signing subkey that does. Such a certificate is harmless
+    /// anything: its primary may not sign, because it rests on an algorithm
+    /// this crate refuses or is not certified for signing, and it delegates to
+    /// no signing subkey that may. Such a certificate is harmless
     /// — nothing rests on a key until it produces a signature that passes the
     /// gates — but its expiry says nothing about the keyring's shelf life, and
     /// reading the two together is what keeps it from being mistaken for a
@@ -289,11 +341,12 @@ impl Horizon {
     fn of(cert: &SignedPublicKey) -> Horizon {
         let primary_expiry = key_expiry_epoch(cert);
         // Every key under the certificate a signature could legitimately come
-        // from, each paired with the epoch its own authority lapses at. The
-        // primary qualifies unless its algorithm is refused; a subkey qualifies
-        // on the same terms `verify` admits it as a candidate on.
+        // from, each paired with the epoch its own authority lapses at. Each
+        // qualifies on the terms `verify` accepts it on: the primary when its
+        // algorithm is trusted and its self-signatures grant it signing, a
+        // subkey when it is a candidate.
         let mut lapses: Vec<Option<i64>> = Vec::new();
-        if key_is_acceptable(&cert.primary_key) {
+        if key_is_acceptable(&cert.primary_key) && primary_may_sign(cert) {
             lapses.push(primary_expiry);
         }
         for candidate in subkey_candidates(cert) {
@@ -416,6 +469,10 @@ impl SigningWindow {
     }
 }
 
+/// Refused because the certificate's own self-signatures do not grant its
+/// primary key the signing capability. See [`primary_may_sign`].
+const NON_SIGNING_PRIMARY: &str =
+    "the primary key that made the signature is not certified for signing";
 /// Refused because the certificate's primary key — the anchor every key under it
 /// derives its authority from — rests on an algorithm this crate does not trust.
 const WEAK_CERTIFICATE: &str =
@@ -492,10 +549,10 @@ fn fingerprint_hex(fingerprint: &pgp::types::Fingerprint) -> String {
 }
 
 /// Applies the validity gates layered over rPGP's cryptographic verification: a
-/// signature is accepted only if the key that made it may sign at all, it is
-/// well-formed enough to judge, that key was within its validity window when
-/// the signature was made, and — when `require_fresh` — the signature has not
-/// itself expired.
+/// signature is accepted only if the key that made it may sign at all, it is a
+/// text signature, it is well-formed enough to judge, that key was within its
+/// validity window when the signature was made, and — when `require_fresh` —
+/// the signature has not itself expired.
 ///
 /// `signer` is the verdict on the key whose signature this is: the window
 /// within which its signatures are legitimate, or the reason it may not sign. A
@@ -509,12 +566,25 @@ fn fingerprint_hex(fingerprint: &pgp::types::Fingerprint) -> String {
 /// permission would let the very party [`check_key_valid_at_signing`] guards
 /// against — someone signing with retired key material — disable that check by
 /// omitting a subpacket.
+///
+/// A cleartext-signed document is signed as text, which is what every archive
+/// publishes, and a signature of any other type is refused. Another type states
+/// something else about other bytes. A binary signature covers bytes rather
+/// than lines, and a standalone or timestamp signature covers no document at
+/// all. rPGP hashes only the first byte of the body for either of those, so a
+/// key's standalone signature made anywhere would verify any body that starts
+/// with the same byte.
 fn check_signature_valid(
     signature: &Signature,
     signer: Result<SigningWindow, &'static str>,
     require_fresh: bool,
 ) -> Result<(), OpenPgpError> {
     let window = signer.map_err(|reason| OpenPgpError::Signature(reason.to_string()))?;
+    if signature.typ() != Some(SignatureType::Text) {
+        return Err(OpenPgpError::Signature(
+            "the signature is not a text signature over the document".to_string(),
+        ));
+    }
     if !hash_is_acceptable(signature) {
         return Err(OpenPgpError::Signature(
             "the signature uses a hash that is no longer trusted".to_string(),
@@ -980,9 +1050,20 @@ fn check_key_valid_at_signing(
 /// producer emits: it can only reach here by having been put in the keyring,
 /// which is already the decision to trust it wholesale.
 fn key_expiry_epoch(key: &SignedPublicKey) -> Option<i64> {
-    let primary = &key.primary_key;
-    let primary_created = i64::from(primary.created_at().as_secs());
+    let primary_created = i64::from(key.primary_key.created_at().as_secs());
+    governing_self_signatures(key)
+        .filter_map(|signature| expiry_epoch(primary_created, signature))
+        .min()
+}
 
+/// The self-signatures that govern a certificate's primary key: the newest
+/// direct-key signature, and the governing certification over each user id.
+///
+/// A signature governs the object it was made over, so recency is compared
+/// within an object rather than across them; see [`key_expiry_epoch`]. Each is
+/// counted only once it verifies as issued by the primary over that object.
+fn governing_self_signatures(key: &SignedPublicKey) -> impl Iterator<Item = &Signature> {
+    let primary = &key.primary_key;
     // The key itself, as covered by direct-key signatures.
     let direct = governing_signature(key.details.direct_signatures.iter().filter(|signature| {
         signature.typ() == Some(SignatureType::Key) && signature.verify_key(primary).is_ok()
@@ -992,13 +1073,76 @@ fn key_expiry_epoch(key: &SignedPublicKey) -> Option<i64> {
         .details
         .users
         .iter()
-        .map(|user| governing_certification(primary, user));
+        .map(move |user| governing_certification(primary, user));
+    std::iter::once(direct).chain(certified).flatten()
+}
 
-    std::iter::once(direct)
-        .chain(certified)
-        .flatten()
-        .filter_map(|signature| expiry_epoch(primary_created, signature))
-        .min()
+/// Whether a certificate's own self-signatures grant its primary key the
+/// signing capability.
+///
+/// A primary key's capabilities are stated by the key-flags subpacket of the
+/// self-signatures that govern it (see [`governing_self_signatures`]). The
+/// primary may sign a document when at least one of them states key flags, and
+/// every one that does grants signing. Where they disagree the narrower grant
+/// holds, as the earliest expiry does in [`key_expiry_epoch`], so a grant made
+/// on one user id is not widened by another that says something else.
+///
+/// A self-signature carrying no key-flags subpacket grants nothing, and takes
+/// no part in the judgement. Some implementations infer a key's capabilities
+/// from its algorithm when no subpacket states them. Reading that silence as a
+/// grant would let an omission widen what a key may do, which is the direction
+/// every other rule here refuses; a subkey binding without the subpacket is
+/// refused for the same reason. Both vendored keyrings state key flags on every
+/// user id's self-certification, and the direct-key signatures Debian's archive
+/// keys carry state none, so the certification's grant is what governs there.
+///
+/// A primary that may only certify is the common shape of an offline anchor:
+/// it vouches for signing subkeys, and a signature it made over a document
+/// directly is refused, as GnuPG and Sequoia refuse it.
+fn primary_may_sign(cert: &SignedPublicKey) -> bool {
+    let mut stated = governing_self_signatures(cert)
+        .filter_map(stated_key_flags)
+        .peekable();
+    stated.peek().is_some() && stated.all(KeyFlags::sign)
+}
+
+/// The key flags a signature's hashed area states, or `None` where it states
+/// none.
+///
+/// rPGP's own accessor answers an empty set for both, and the difference is the
+/// whole of what [`primary_may_sign`] needs. Only the hashed area is read: the
+/// unhashed one is not covered by the signature.
+fn stated_key_flags(signature: &Signature) -> Option<&KeyFlags> {
+    signature
+        .config()?
+        .hashed_subpackets()
+        .find_map(|subpacket| match &subpacket.data {
+            SubpacketData::KeyFlags(flags) => Some(flags),
+            _ => None,
+        })
+}
+
+/// Refuses a document past the bounds [`Keyring::verify`] holds a document to,
+/// before rPGP reads any of it.
+///
+/// Both bounds are on the document as it arrived, armor and all. Lines are
+/// counted by their line feeds, which is where rPGP's reader ends one.
+fn check_document_bounds(document: &[u8]) -> Result<(), OpenPgpError> {
+    if document.len() as u64 > MAX_SIGNED_DOCUMENT_BYTES {
+        return Err(OpenPgpError::Signature(format!(
+            "the document is {} bytes, over the {MAX_SIGNED_DOCUMENT_BYTES} a signed document may \
+             be",
+            document.len(),
+        )));
+    }
+    let lines = document.iter().filter(|byte| **byte == b'\n').count();
+    if lines > MAX_SIGNED_DOCUMENT_LINES {
+        return Err(OpenPgpError::Signature(format!(
+            "the document holds {lines} lines, over the {MAX_SIGNED_DOCUMENT_LINES} a signed \
+             document may hold",
+        )));
+    }
+    Ok(())
 }
 
 /// Whether a signature is a certification of a user id, as opposed to a
@@ -1371,12 +1515,31 @@ mod tests {
     /// creation time and optional key-expiration. Key generation emits a single
     /// certification per user id, so a test that needs a re-dating — the shape
     /// a key extended or shortened in place has — crafts the packet here.
+    ///
+    /// It grants the primary signing and certification, as a re-dating carries
+    /// the key's flags forward; [`craft_certification_granting`] states other
+    /// flags, or none.
     #[cfg(test)]
     fn craft_certification(
         signer: &pgp::composed::SignedSecretKey,
         user: &pgp::types::SignedUser,
         created: pgp::types::Timestamp,
         key_expiration: Option<pgp::types::Duration>,
+    ) -> Signature {
+        let mut flags = signing_key_flags();
+        flags.set_certify(true);
+        craft_certification_granting(signer, user, created, key_expiration, Some(flags))
+    }
+
+    /// [`craft_certification`], stating `key_flags` where it is `Some` and
+    /// carrying no key-flags subpacket where it is `None`.
+    #[cfg(test)]
+    fn craft_certification_granting(
+        signer: &pgp::composed::SignedSecretKey,
+        user: &pgp::types::SignedUser,
+        created: pgp::types::Timestamp,
+        key_expiration: Option<pgp::types::Duration>,
+        key_flags: Option<KeyFlags>,
     ) -> Signature {
         use pgp::packet::{SignatureConfig, Subpacket, SubpacketData};
         use pgp::types::Password;
@@ -1389,6 +1552,11 @@ mod tests {
             Subpacket::regular(SubpacketData::IssuerFingerprint(signer.fingerprint()))
                 .expect("issuer subpacket"),
         ];
+        if let Some(flags) = key_flags {
+            hashed.push(
+                Subpacket::regular(SubpacketData::KeyFlags(flags)).expect("key-flags subpacket"),
+            );
+        }
         if let Some(duration) = key_expiration {
             hashed.push(
                 Subpacket::regular(SubpacketData::KeyExpirationTime(duration))
@@ -2614,6 +2782,325 @@ mod tests {
         keyring
             .verify(signed.as_bytes(), true)
             .expect("a zero expiration does not expire the signature");
+    }
+
+    /// Generates a throwaway certificate whose Ed25519 primary may only
+    /// certify, delegating signing to one Ed25519 subkey: the shape of an
+    /// offline anchor.
+    #[cfg(test)]
+    fn test_certify_only_key(user_id: &str) -> pgp::composed::SignedSecretKey {
+        use pgp::composed::{KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
+        let signing_subkey = SubkeyParamsBuilder::default()
+            .key_type(KeyType::Ed25519)
+            .can_sign(true)
+            .build()
+            .expect("valid signing subkey params");
+        SecretKeyParamsBuilder::default()
+            .key_type(KeyType::Ed25519)
+            .can_sign(false)
+            .can_certify(true)
+            .primary_user_id(user_id.to_string())
+            .subkey(signing_subkey)
+            .build()
+            .expect("valid key params")
+            .generate(rand::thread_rng())
+            .expect("key generation")
+    }
+
+    /// Whether `result` is a refusal for exactly `reason`.
+    #[cfg(test)]
+    fn refused_for(result: &Result<Verified, OpenPgpError>, reason: &str) -> bool {
+        matches!(result, Err(OpenPgpError::Signature(given)) if given == reason)
+    }
+
+    #[test]
+    fn a_certify_only_primary_cannot_sign_a_document() {
+        // A primary whose self-signatures grant it only certification is an
+        // anchor for the subkeys it binds, not a signer. GnuPG and Sequoia
+        // refuse a document it signs directly, and so does this, while the
+        // subkey it delegated signing to still signs.
+        let anchor = test_certify_only_key("anchor <anchor@test.invalid>");
+        let public = anchor.to_public_key();
+        let keyring = Keyring {
+            keys: vec![public.clone()],
+        };
+
+        // rPGP accepts the primary's signature, so the refusal is this crate's.
+        let by_primary = clearsign(&anchor, SIGNED_BODY);
+        let (message, _) =
+            CleartextSignedMessage::from_armor(by_primary.as_bytes()).expect("armored document");
+        message.verify(&public).expect("cryptographically valid");
+        assert!(
+            refused_for(
+                &keyring.verify(by_primary.as_bytes(), false),
+                NON_SIGNING_PRIMARY
+            ),
+            "a certify-only primary is refused as a signer",
+        );
+
+        let subkey = anchor.secret_subkeys.first().expect("a signing subkey");
+        keyring
+            .verify(clearsign_with(&**subkey, SIGNED_BODY).as_bytes(), false)
+            .expect("the subkey the primary delegated to still signs");
+    }
+
+    #[test]
+    fn a_self_signature_stating_no_key_flags_grants_nothing() {
+        // What a primary may do is what its governing self-signatures state.
+        // One that states no key flags grants nothing and takes no part in the
+        // judgement; where two state different flags, the narrower holds.
+        let archive = test_key_created_at(
+            "archive <archive@test.invalid>",
+            Timestamp::from_secs(KEY_CREATED),
+            &["archive <second@test.invalid>"],
+        );
+        let (first, second) = (
+            archive.details.users[0].clone(),
+            archive.details.users[1].clone(),
+        );
+        let signed = clearsign(&archive, SIGNED_BODY);
+        let certified = |flags: [Option<KeyFlags>; 2]| {
+            let mut public = archive.to_public_key();
+            for (index, (user, flags)) in [&first, &second].into_iter().zip(flags).enumerate() {
+                public.details.users[index].signatures = vec![craft_certification_granting(
+                    &archive,
+                    user,
+                    Timestamp::from_secs(KEY_CREATED),
+                    None,
+                    flags,
+                )];
+            }
+            Keyring { keys: vec![public] }.verify(signed.as_bytes(), false)
+        };
+        let mut signs = signing_key_flags();
+        signs.set_certify(true);
+        let mut certifies = KeyFlags::default();
+        certifies.set_certify(true);
+
+        assert!(certified([Some(signs.clone()), Some(signs.clone())]).is_ok());
+        // Silence beside a grant leaves the grant to govern.
+        assert!(certified([Some(signs.clone()), None]).is_ok());
+        // Silence alone is no grant.
+        assert!(refused_for(&certified([None, None]), NON_SIGNING_PRIMARY));
+        // Two statements that disagree: the narrower one holds.
+        assert!(refused_for(
+            &certified([Some(signs), Some(certifies)]),
+            NON_SIGNING_PRIMARY
+        ));
+    }
+
+    /// Clear-signs `body` with `signer`, as a signature of type `typ`.
+    ///
+    /// rPGP signs a document only as a binary or a text signature, so the
+    /// signature is assembled here from the steps its own signer takes: the
+    /// document hashed as `typ` hashes it, then the signature's own fields and
+    /// trailer, then the key's raw signature over the digest.
+    #[cfg(test)]
+    fn clearsign_as(
+        signer: &impl pgp::types::SigningKey,
+        body: &str,
+        typ: SignatureType,
+    ) -> String {
+        use pgp::packet::{SignatureConfig, Subpacket};
+        use pgp::types::Password;
+        CleartextSignedMessage::new_many(body, |text| {
+            let mut config = SignatureConfig::from_key(rand::thread_rng(), signer, typ)?;
+            config.hashed_subpackets = vec![
+                Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now()))?,
+                Subpacket::regular(SubpacketData::IssuerFingerprint(signer.fingerprint()))?,
+            ];
+            let mut hasher = config.hash_alg.new_hasher()?;
+            config.hash_data_to_sign(&mut hasher, text.as_bytes())?;
+            let length = config.hash_signature_data(&mut hasher)?;
+            hasher.update(&config.trailer(length)?);
+            let digest = hasher.finalize();
+            let signature = signer.sign(&Password::empty(), config.hash_alg, &digest)?;
+            Ok(vec![Signature::from_config(
+                config,
+                [digest[0], digest[1]],
+                signature,
+            )?])
+        })
+        .expect("signing")
+        .to_armored_string(None.into())
+        .expect("armoring")
+    }
+
+    #[test]
+    fn only_a_text_signature_verifies_a_document() {
+        // A cleartext-signed document is signed as text. A binary signature
+        // covers bytes rather than lines, and a standalone signature covers no
+        // document at all, so either one by the archive key is a statement
+        // about something other than the body in front of the reader.
+        let archive = test_key("archive <archive@test.invalid>");
+        let public = archive.to_public_key();
+        let keyring = Keyring {
+            keys: vec![public.clone()],
+        };
+        let refusal = "the signature is not a text signature over the document";
+        for typ in [SignatureType::Binary, SignatureType::Standalone] {
+            let signed = clearsign_as(&*archive, SIGNED_BODY, typ);
+            let (message, _) =
+                CleartextSignedMessage::from_armor(signed.as_bytes()).expect("armored document");
+            message.verify(&public).expect("cryptographically valid");
+            assert!(
+                refused_for(&keyring.verify(signed.as_bytes(), false), refusal),
+                "{typ:?}",
+            );
+        }
+
+        // What a standalone signature is worth over a document: rPGP hashes
+        // only the body's first byte for one, so a signature made over one body
+        // verifies another that starts the same way.
+        let standalone = clearsign_as(&*archive, SIGNED_BODY, SignatureType::Standalone);
+        let substituted = standalone.replace("Suite: test", "Suite: evil");
+        assert_ne!(substituted, standalone, "the body is replaced");
+        let (message, _) =
+            CleartextSignedMessage::from_armor(substituted.as_bytes()).expect("armored document");
+        message
+            .verify(&public)
+            .expect("rPGP accepts it over a body it was not made over");
+        assert!(refused_for(
+            &keyring.verify(substituted.as_bytes(), false),
+            refusal
+        ));
+
+        keyring
+            .verify(
+                clearsign_as(&*archive, SIGNED_BODY, SignatureType::Text).as_bytes(),
+                false,
+            )
+            .expect("a text signature verifies");
+    }
+
+    #[test]
+    fn a_document_past_the_size_or_line_bound_is_refused_unread() {
+        // Framing a cleartext document costs rPGP its line count times its
+        // length, so both are bounded before it reads a byte. A refusal names
+        // the bound rather than whatever rPGP would have said about the bytes.
+        let archive = test_key("archive <archive@test.invalid>");
+        let keyring = Keyring {
+            keys: vec![archive.to_public_key()],
+        };
+        let refusal = |document: &[u8]| match keyring.verify(document, false) {
+            Err(OpenPgpError::Signature(reason)) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        let oversized = vec![b'x'; usize::try_from(MAX_SIGNED_DOCUMENT_BYTES).unwrap() + 1];
+        assert!(refusal(&oversized).contains("bytes"));
+        let overlong = vec![b'\n'; MAX_SIGNED_DOCUMENT_LINES + 1];
+        assert!(refusal(&overlong).contains("lines"));
+
+        // A genuine signature does not carry a document past the bound.
+        let signed = clearsign(&archive, &"a\n".repeat(MAX_SIGNED_DOCUMENT_LINES));
+        assert!(refusal(signed.as_bytes()).contains("lines"));
+    }
+
+    #[test]
+    fn a_document_carrying_too_many_signatures_is_refused() {
+        // Every signature is checked against every key it might be from, and
+        // each check hashes the whole document, so the count is bounded once
+        // the document is parsed and before any signature is checked.
+        let archive = test_key("archive <archive@test.invalid>");
+        let keyring = Keyring {
+            keys: vec![archive.to_public_key()],
+        };
+        let mut hashes = vec![HashAlgorithm::Sha256; MAX_DOCUMENT_SIGNATURES];
+        keyring
+            .verify(
+                clearsign_many(&*archive, SIGNED_BODY, &hashes).as_bytes(),
+                false,
+            )
+            .expect("a document at the bound verifies");
+        hashes.push(HashAlgorithm::Sha256);
+        match keyring.verify(
+            clearsign_many(&*archive, SIGNED_BODY, &hashes).as_bytes(),
+            false,
+        ) {
+            Err(OpenPgpError::Signature(reason)) => assert!(reason.contains("signatures")),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A version 6 signature packet body of type `typ`, whose hashed area holds
+    /// `inner` as an embedded-signature subpacket where it is given. The
+    /// signature itself is zeros: the document it builds is refused before
+    /// anything would check one.
+    #[cfg(test)]
+    fn v6_signature_embedding(typ: u8, inner: Option<&[u8]>) -> Vec<u8> {
+        const EMBEDDED_SIGNATURE: u8 = 32;
+        let mut hashed = Vec::new();
+        if let Some(inner) = inner {
+            // A subpacket's length counts its type octet; the five-octet form
+            // holds any length.
+            hashed.push(0xFF);
+            hashed.extend_from_slice(&(inner.len() as u32 + 1).to_be_bytes());
+            hashed.push(EMBEDDED_SIGNATURE);
+            hashed.extend_from_slice(inner);
+        }
+        // Version, type, Ed25519, SHA-256, then the four-octet area lengths.
+        let mut body = vec![6, typ, 27, 8];
+        body.extend_from_slice(&(hashed.len() as u32).to_be_bytes());
+        body.extend_from_slice(&hashed);
+        body.extend_from_slice(&0u32.to_be_bytes());
+        // The left sixteen bits of the hash, the salt, and the signature.
+        body.extend_from_slice(&[0, 0, 16]);
+        body.extend_from_slice(&[0; 16]);
+        body.extend_from_slice(&[0; 64]);
+        body
+    }
+
+    #[test]
+    fn a_nested_embedded_signature_is_refused_rather_than_recursed_into() {
+        // An embedded-signature subpacket holds a whole signature, whose own
+        // hashed area may hold another. A reader that follows the nesting by
+        // recursion, with no bound, runs out of stack a few thousand levels
+        // down, which aborts the process rather than failing the verification.
+        // A version 6 signature's areas take four-octet lengths, so a document
+        // of a few hundred kilobytes, well inside the bounds a document is
+        // held to, reaches that depth.
+        let mut nested = v6_signature_embedding(0x19, None);
+        for _ in 0..2_000 {
+            nested = v6_signature_embedding(0x19, Some(&nested));
+        }
+        let outer = v6_signature_embedding(0x01, Some(&nested));
+        let mut packet = vec![0xC2, 0xFF];
+        packet.extend_from_slice(&(outer.len() as u32).to_be_bytes());
+        packet.extend_from_slice(&outer);
+
+        const BASE64: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut armor = String::new();
+        for (index, chunk) in packet.chunks(3).enumerate() {
+            if index > 0 && index % 16 == 0 {
+                armor.push('\n');
+            }
+            let triple = chunk.iter().enumerate().fold(0u32, |triple, (at, byte)| {
+                triple | u32::from(*byte) << (16 - 8 * at)
+            });
+            for sextet in 0..4 {
+                armor.push(if sextet <= chunk.len() {
+                    char::from(BASE64[(triple >> (18 - 6 * sextet) & 63) as usize])
+                } else {
+                    '='
+                });
+            }
+        }
+        let document = format!(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n{SIGNED_BODY}\
+             -----BEGIN PGP SIGNATURE-----\n\n{armor}\n-----END PGP SIGNATURE-----\n"
+        );
+        assert!(document.len() as u64 <= MAX_SIGNED_DOCUMENT_BYTES);
+        assert!(document.lines().count() <= MAX_SIGNED_DOCUMENT_LINES);
+
+        let keyring = Keyring {
+            keys: vec![test_key("archive <archive@test.invalid>").to_public_key()],
+        };
+        assert!(matches!(
+            keyring.verify(document.as_bytes(), false),
+            Err(OpenPgpError::Signature(_))
+        ));
     }
 
     #[test]

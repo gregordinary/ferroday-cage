@@ -52,6 +52,13 @@ const MAX_LINE: usize = 16 * 1024;
 /// mirror that dribbles endless headers within the per-read timeout.
 const MAX_HEADERS: usize = 256;
 
+/// How to fetch from an `https://` mirror, which this client cannot.
+///
+/// Named in a refusal, because a caller who has just typed a perfectly good
+/// `https://` address otherwise reads the refusal as a malformed URL.
+const TLS_REMEDY: &str =
+    "an https:// mirror needs a Fetch implementation of your own, set with the builder's fetcher";
+
 /// The default HTTP and `file://` fetcher.
 #[derive(Debug)]
 pub struct HttpFetch {
@@ -375,7 +382,7 @@ impl HttpFetch {
         cap: u64,
         deadline: Option<Instant>,
     ) -> Result<Step, FetchError> {
-        let parsed = parse_http_url(url)?;
+        let parsed = parse_http_url(url).map_err(|reason| FetchError::url(url, reason))?;
 
         let kept = self
             .idle
@@ -547,7 +554,7 @@ impl HttpFetch {
                     }
                 }
                 let next = resolve_redirect(url, &location);
-                self.check_redirect_host(url, &next)
+                self.check_redirect(url, &next)
                     .map_err(Exchange::AfterBody)?;
                 return Ok(Step::Redirect(next));
             }
@@ -610,40 +617,49 @@ impl HttpFetch {
         })
     }
 
-    /// Enforces the same-origin redirect policy: unless cross-host redirects are
-    /// allowed, a redirect must resolve to the same host *and port* as the URL
-    /// it came from. A target that does not parse as `http://` is left to the
-    /// next request, which refuses it. Closes the blind, GET-only SSRF an
-    /// unconstrained redirect target would otherwise allow — including the port
-    /// scan a same-host, different-port redirect amounts to.
+    /// Refuses a redirect this client will not follow: one to a URL it cannot
+    /// fetch, and, unless cross-host redirects are allowed, one that leaves the
+    /// host *and port* of the URL it came from. The second closes the blind,
+    /// GET-only SSRF an unconstrained redirect target would otherwise allow —
+    /// including the port scan a same-host, different-port redirect amounts to.
     ///
-    /// The refusal is carried as a transport failure, for the reason a redirect
-    /// chain that never arrives is: where a mirror sends a request is that
-    /// mirror's own arrangement rather than a URL the caller spelled wrong, so a
-    /// walk over interchangeable mirrors asks the next one. One CDN-fronting
-    /// mirror in a list would otherwise abort the whole walk.
-    fn check_redirect_host(&self, from: &str, to: &str) -> Result<(), FetchError> {
+    /// Either refusal is carried as a transport failure, for the reason a
+    /// redirect chain that never arrives is: where a mirror sends a request is
+    /// that mirror's own arrangement rather than a URL the caller spelled
+    /// wrong, so a walk over interchangeable mirrors asks the next one. One
+    /// mirror redirecting to `https://`, or to a CDN, would otherwise abort the
+    /// whole walk. The target is judged here rather than by the request that
+    /// would follow it, which would report it as a URL the caller spelled.
+    fn check_redirect(&self, from: &str, to: &str) -> Result<(), FetchError> {
+        let refuse = |reason: String| {
+            FetchError::io(
+                "following a redirect",
+                to,
+                io::Error::new(io::ErrorKind::InvalidData, reason),
+            )
+        };
+        if strip_scheme(to, "http://").is_none() {
+            return Err(refuse(format!(
+                "a redirect is followed only to another http:// URL; {TLS_REMEDY}"
+            )));
+        }
+        let to_url = parse_http_url(to)
+            .map_err(|reason| refuse(format!("the redirect target cannot be fetched: {reason}")))?;
         if self.cross_host_redirects {
             return Ok(());
         }
-        let (Ok(from_url), Ok(to_url)) = (parse_http_url(from), parse_http_url(to)) else {
+        let Ok(from_url) = parse_http_url(from) else {
+            // Not reached: `from` is the URL the request was just made to.
             return Ok(());
         };
         if from_url.host.eq_ignore_ascii_case(&to_url.host) && from_url.port == to_url.port {
             Ok(())
         } else {
-            Err(FetchError::io(
-                "following a redirect",
-                to,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "redirect to a different host ({}:{}) than {}:{}; \
-                         enable cross-host redirects to follow it",
-                        to_url.host, to_url.port, from_url.host, from_url.port
-                    ),
-                ),
-            ))
+            Err(refuse(format!(
+                "redirect to a different host ({}:{}) than {}:{}; enable cross-host redirects to \
+                 follow it",
+                to_url.host, to_url.port, from_url.host, from_url.port
+            )))
         }
     }
 }
@@ -754,13 +770,13 @@ fn is_absolute_url(s: &str) -> bool {
 /// Resolves a redirect `location` against the `base` URL it was returned for.
 ///
 /// An absolute URL is returned unchanged — a non-`http` scheme is then refused
-/// by [`parse_http_url`], so a redirect cannot escape to `file://`. A
+/// by [`HttpFetch::check_redirect`], so a redirect cannot escape to `file://`. A
 /// network-path reference (`//host/x`, RFC 3986 section 4.2) carries an
 /// authority of its own and inherits only the scheme. Any other path reference
 /// resolves against the base's `http://host[:port]` origin: an absolute path
 /// (`/x`) replaces the base path, a relative one (`x`) resolves against the base
 /// path's directory. This resolves the target only; the same-host redirect
-/// policy is applied separately by [`HttpFetch::check_redirect_host`], and a
+/// policy is applied separately by [`HttpFetch::check_redirect`], and a
 /// redirected response is still checked against the signed digest, so a redirect
 /// can never substitute content.
 fn resolve_redirect(base: &str, location: &str) -> String {
@@ -804,7 +820,8 @@ fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
         .then(|| &url[scheme.len()..])
 }
 
-/// Parses an `http://host[:port]/path` URL.
+/// Parses an `http://host[:port]/path` URL, or answers why it is not one this
+/// client fetches.
 ///
 /// The scheme is matched case-insensitively, as RFC 3986 §3.1 requires and as
 /// [`scheme_of`](super::fetch::scheme_of) documents. A literal comparison would
@@ -821,23 +838,16 @@ fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
 /// otherwise write headers of its own into the follow-up request. Refusing here
 /// covers the whole URL rather than the path alone, since the host reaches the
 /// request line too, through the `Host:` header.
-fn parse_http_url(url: &str) -> Result<HttpUrl, FetchError> {
-    let bad = |reason: &str| FetchError::url(url, reason);
+fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
+    let bad = |reason: &str| reason.to_string();
     if !url.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(bad(
             "the URL carries a space or a control character, which no part of a request line \
              can hold",
         ));
     }
-    // The remedy is named, not just the constraint: the scheme is refused
-    // because this fetcher carries no TLS, which a caller reads as a broken URL
-    // unless told that supplying a transport is how an https:// mirror works.
-    let rest = strip_scheme(url, "http://").ok_or_else(|| {
-        bad(
-            "this fetcher speaks only http:// and file://; an https:// mirror needs a Fetch \
-             implementation of your own, set with DebianBuilder::fetcher",
-        )
-    })?;
+    let rest = strip_scheme(url, "http://")
+        .ok_or_else(|| format!("this fetcher speaks only http:// and file://; {TLS_REMEDY}"))?;
     let (authority, path) = match rest.find('/') {
         Some(slash) => (&rest[..slash], &rest[slash..]),
         None => (rest, "/"),
@@ -965,11 +975,22 @@ fn parse_version(token: &str) -> Option<(u8, u8)> {
 /// a truncated response — an overloaded backend, a proxy that dropped the
 /// response — and is refused rather than read as a complete section with no
 /// framing, which would deliver an empty body as a successful fetch.
+///
+/// A line beginning with a space or a tab continues the field before it, the
+/// obsolete line folding RFC 9112 section 5.2 has a recipient replace with a
+/// space before reading the value. Read as a field of its own, a folded line
+/// holding a colon would be a header the server did not send, framing
+/// included. A field is therefore handed on only once the next line shows it
+/// is not continued, and a continuation with nothing before it is refused.
 fn read_field_section<R: BufRead>(
     reader: &mut R,
     section: &str,
     mut field: impl FnMut(&str) -> io::Result<()>,
 ) -> io::Result<()> {
+    let malformed = |reason: &str| io::Error::new(io::ErrorKind::InvalidData, reason.to_string());
+    // The field line read last, held until the next line shows whether it is
+    // continued.
+    let mut held: Option<String> = None;
     for _ in 0..MAX_HEADERS {
         let mut line = String::new();
         if read_line_limited(reader, &mut line)? == 0 {
@@ -979,10 +1000,28 @@ fn read_field_section<R: BufRead>(
             ));
         }
         let line = line.trim_end();
+        if line.starts_with([' ', '\t']) {
+            let Some(continued) = held.as_mut() else {
+                return Err(malformed(&format!(
+                    "the {section} section begins with a continuation line"
+                )));
+            };
+            continued.push(' ');
+            continued.push_str(line.trim_start());
+            if continued.len() > MAX_LINE {
+                return Err(malformed(&format!(
+                    "a folded {section} line exceeded the length cap"
+                )));
+            }
+            continue;
+        }
+        if let Some(complete) = held.take() {
+            field(&complete)?;
+        }
         if line.is_empty() {
             return Ok(());
         }
-        field(line)?;
+        held = Some(line.to_string());
     }
     // More field lines than the cap without a blank separator: a hostile or
     // broken mirror, refused rather than read on.
@@ -990,6 +1029,20 @@ fn read_field_section<R: BufRead>(
         io::ErrorKind::InvalidData,
         format!("the response sent more {section} lines than the cap"),
     ))
+}
+
+/// `text` as a number the framing grammar spells: one or more digits of
+/// `radix`, and nothing else.
+///
+/// Rust's integer parsers also take a leading `+`, which neither
+/// `Content-Length` (`1*DIGIT`) nor a chunk size (`1*HEXDIG`) admits. Both
+/// decide where a body ends, and framing read more leniently than its grammar
+/// is framing that another reader of the same bytes disagrees with.
+fn framing_number(text: &str, radix: u32) -> Option<u64> {
+    if text.is_empty() || !text.chars().all(|digit| digit.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(text, radix).ok()
 }
 
 /// Reads the response headers up to the blank separator line.
@@ -1004,7 +1057,7 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
                 // body's extent unknown. Reading such a response to end of
                 // stream would turn a truncation into a short, successful body,
                 // so it is refused instead.
-                let length: u64 = value.parse().map_err(|_| {
+                let length = framing_number(value, 10).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "malformed Content-Length")
                 })?;
                 if headers.content_length.is_some_and(|first| first != length) {
@@ -1014,10 +1067,24 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
                     ));
                 }
                 headers.content_length = Some(length);
-            } else if name.eq_ignore_ascii_case("transfer-encoding")
-                && value.to_ascii_lowercase().contains("chunked")
-            {
-                headers.chunked = true;
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                // A list of codings, which repeated field lines extend. This
+                // client offers to read none but `chunked`, and a server may
+                // apply no other unless offered. Any other coding, or `chunked`
+                // twice, leaves the body unreadable here, so it is refused
+                // rather than handed on as the resource. Matched by token: a
+                // substring match would take `notchunked` for the one coding
+                // that is understood.
+                for coding in value.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+                    if !coding.eq_ignore_ascii_case("chunked") || headers.chunked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the response applied a transfer coding other than one chunked \
+                             coding, which this client does not read",
+                        ));
+                    }
+                    headers.chunked = true;
+                }
             } else if name.eq_ignore_ascii_case("location") {
                 headers.location = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("connection")
@@ -1119,8 +1186,8 @@ fn read_chunked<R: BufRead>(reader: &mut R, sink: &mut dyn Write) -> io::Result<
         let mut line = String::new();
         read_line_limited(reader, &mut line)?;
         // The chunk size is hex, before any `;`-delimited extension.
-        let size = u64::from_str_radix(line.trim().split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed chunk size"))?;
+        let size = framing_number(line.trim().split(';').next().unwrap_or("").trim(), 16)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed chunk size"))?;
         if size == 0 {
             // The last chunk is followed by the trailer section, which is part
             // of this response and not of the next one.
@@ -1969,10 +2036,7 @@ mod tests {
             "http://[nonsense]/x",   // not an IPv6 literal
             "http://[]/x",           // empty
         ] {
-            assert!(
-                matches!(parse_http_url(url), Err(FetchError::Url { .. })),
-                "{url} should be refused"
-            );
+            assert!(parse_http_url(url).is_err(), "{url} should be refused");
         }
     }
 
@@ -1990,19 +2054,13 @@ mod tests {
             "http://mirror.example/x\0",
             "http://mirror.exam\rple/x",
         ] {
-            assert!(
-                matches!(parse_http_url(url), Err(FetchError::Url { .. })),
-                "{url:?} should be refused",
-            );
+            assert!(parse_http_url(url).is_err(), "{url:?} should be refused");
         }
         // And a redirect carrying one is refused as the URL it resolves to,
         // rather than reaching the request line.
         let injected =
             resolve_redirect("http://mirror.example/debian/x", "/pool/y\r\nX-Injected: 1");
-        assert!(matches!(
-            parse_http_url(&injected),
-            Err(FetchError::Url { .. }),
-        ));
+        assert!(parse_http_url(&injected).is_err());
     }
 
     #[test]
@@ -2023,7 +2081,7 @@ mod tests {
         // And it is then a cross-host redirect, which the default policy
         // refuses rather than following.
         let refused = HttpFetch::new()
-            .check_redirect_host(base, &resolve_redirect(base, "//cdn.example/x"))
+            .check_redirect(base, &resolve_redirect(base, "//cdn.example/x"))
             .expect_err("a network-path redirect leaves the host");
         assert!(refused.is_failover(), "{refused}");
     }
@@ -2069,18 +2127,54 @@ mod tests {
 
     #[test]
     fn non_http_schemes_are_rejected() {
-        let Err(err) = parse_http_url("https://host/x") else {
-            panic!("https is not this fetcher's scheme");
-        };
-        assert!(matches!(err, FetchError::Url { .. }));
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new("https://host/x"), &mut Vec::new())
+            .expect_err("https is not this fetcher's scheme");
+        assert!(matches!(err, FetchError::Url { .. }), "{err:?}");
         // The refusal points at the transport a TLS mirror needs rather than
         // reading as a malformed URL, which is the whole of the diagnosis for a
-        // caller who has just typed a perfectly good https:// address.
+        // caller who has just typed a perfectly good https:// address. It names
+        // no one layer's builder, since every layer takes a transport the same
+        // way.
         let rendered = err.to_string();
         assert!(
-            rendered.contains("DebianBuilder::fetcher"),
+            rendered.contains(TLS_REMEDY),
             "the scheme refusal must name the remedy, got {rendered}",
         );
+    }
+
+    #[test]
+    fn a_redirect_to_a_url_this_client_cannot_follow_is_the_mirrors_state() {
+        // An http:// mirror redirecting to https:// is common, and this client
+        // speaks no TLS. Where a mirror sends a request is its own arrangement
+        // rather than a URL the caller spelled wrong, so the refusal is a
+        // transport failure and a walk over mirrors asks the next one. Allowing
+        // cross-host redirects widens where a redirect may go, not what this
+        // client can fetch, so it changes nothing here.
+        let moved = b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://mirror.example/x\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n";
+        for cross_host in [false, true] {
+            let (url, served) = serving(1, moved.to_vec());
+            let err = HttpFetch::new()
+                .cross_host_redirects(cross_host)
+                .fetch(&FetchRequest::new(&url), &mut Vec::new())
+                .expect_err("an https:// target cannot be followed");
+            assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
+            assert!(err.is_failover(), "{err}");
+            assert!(err.to_string().contains(TLS_REMEDY), "{err}");
+            served.join().expect("the server thread ends");
+        }
+
+        // The same for a target that cannot be fetched at all, and for one that
+        // names the local filesystem.
+        let fetch = HttpFetch::new();
+        for target in ["file:///etc/passwd", "http://mirror.example:port/x"] {
+            let refused = fetch
+                .check_redirect("http://mirror.example/x", target)
+                .expect_err("the target is refused");
+            assert!(matches!(refused, FetchError::Io { .. }), "{refused:?}");
+            assert!(refused.is_failover(), "{refused}");
+        }
     }
 
     #[test]
@@ -2351,11 +2445,78 @@ mod tests {
             "Content-Length: abc\r\n\r\n",                     // not a number
             "Content-Length: 18446744073709551616\r\n\r\n",    // past u64
             "Content-Length: 9\r\nContent-Length: 10\r\n\r\n", // contradictory
+            "Content-Length: +9\r\n\r\n",                      // a sign
+            "Content-Length:\r\n\r\n",                         // empty
         ] {
             let mut reader = BufReader::new(body.as_bytes());
             let err = read_headers(&mut reader).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{body:?}");
         }
+    }
+
+    #[test]
+    fn a_chunk_size_is_hex_digits_and_nothing_else() {
+        // A sign is no part of `1*HEXDIG`, and the size decides where the chunk
+        // ends. An extension after a `;` is still read past.
+        for body in ["+4\r\nWiki\r\n0\r\n\r\n", "\r\nWiki\r\n0\r\n\r\n"] {
+            let mut reader = BufReader::new(body.as_bytes());
+            let err = read_chunked(&mut reader, &mut Vec::new()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{body:?}");
+        }
+        let mut reader = BufReader::new("4;name=value\r\nWiki\r\n0\r\n\r\n".as_bytes());
+        let mut out = Vec::new();
+        read_chunked(&mut reader, &mut out).unwrap();
+        assert_eq!(out, b"Wiki");
+    }
+
+    #[test]
+    fn transfer_codings_are_read_as_a_list_of_tokens() {
+        // `chunked` is the one coding this client reads, and it is matched as
+        // a token in the comma-separated list, across repeated field lines.
+        for body in [
+            "Transfer-Encoding: chunked\r\n\r\n",
+            "Transfer-Encoding: Chunked\r\n\r\n",
+            "Transfer-Encoding: , chunked\r\n\r\n",
+        ] {
+            let mut reader = BufReader::new(body.as_bytes());
+            assert!(read_headers(&mut reader).unwrap().chunked, "{body:?}");
+        }
+        // A coding it does not read leaves the body unreadable, a substring is
+        // not the token, and chunked twice is not a framing a sender may use.
+        for body in [
+            "Transfer-Encoding: gzip, chunked\r\n\r\n",
+            "Transfer-Encoding: notchunked\r\n\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "Transfer-Encoding: identity\r\n\r\n",
+        ] {
+            let mut reader = BufReader::new(body.as_bytes());
+            let err = read_headers(&mut reader).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_folded_field_line_continues_the_field_before_it() {
+        // A line beginning with whitespace continues the previous field's
+        // value. Read as a field of its own, this one would be a framing header
+        // the server did not send.
+        let body = "X-Note: first\r\n Content-Length: 99\r\n\r\n";
+        let mut reader = BufReader::new(body.as_bytes());
+        let headers = read_headers(&mut reader).unwrap();
+        assert_eq!(headers.content_length, None);
+
+        // A folded value is read whole, so a framing field split across lines
+        // is read as one.
+        let mut reader = BufReader::new("Location: /a\r\n\t/b\r\n\r\n".as_bytes());
+        assert_eq!(
+            read_headers(&mut reader).unwrap().location.as_deref(),
+            Some("/a /b")
+        );
+
+        // A continuation with no field before it continues nothing.
+        let mut reader = BufReader::new(" Content-Length: 9\r\n\r\n".as_bytes());
+        let err = read_headers(&mut reader).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -2389,21 +2550,21 @@ mod tests {
         // A same-host redirect (only the path changes) is allowed.
         assert!(
             fetch
-                .check_redirect_host(from, "http://mirror.example/pool/y.deb")
+                .check_redirect(from, "http://mirror.example/pool/y.deb")
                 .is_ok()
         );
         // A redirect to another host is refused: it is the blind SSRF vector.
         // Carried as a transport failure, so a walk asks the next mirror rather
         // than aborting the list over where this one sends its requests.
         let refused = fetch
-            .check_redirect_host(from, "http://169.254.169.254/latest/meta-data")
+            .check_redirect(from, "http://169.254.169.254/latest/meta-data")
             .expect_err("a cross-host redirect is refused");
         assert!(matches!(refused, FetchError::Io { .. }), "{refused:?}");
         assert!(refused.is_failover(), "{refused}");
         // So is another port on the same host, which is the same vector aimed
         // at whatever else that host is running.
         let refused = fetch
-            .check_redirect_host(from, "http://mirror.example:9000/pool/y.deb")
+            .check_redirect(from, "http://mirror.example:9000/pool/y.deb")
             .expect_err("a cross-port redirect is refused");
         assert!(matches!(refused, FetchError::Io { .. }), "{refused:?}");
         assert!(refused.is_failover(), "{refused}");
@@ -2411,7 +2572,7 @@ mod tests {
         let permissive = HttpFetch::new().cross_host_redirects(true);
         assert!(
             permissive
-                .check_redirect_host(from, "http://cdn.example/x.deb")
+                .check_redirect(from, "http://cdn.example/x.deb")
                 .is_ok()
         );
     }
