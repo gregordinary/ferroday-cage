@@ -744,7 +744,8 @@ architecture the plan's is adopted, since a plan states which architecture it is
 for.
 
 Everything that shapes *how* rather than *what* still applies: `cache_dir`,
-`identity_map`, `pre_configure_overlay`, the repositories, and the fetcher. A
+`identity_map`, `pre_configure_overlay`, `source_date_epoch`, the repositories,
+and the fetcher. A
 package is fetched from the repository its `archive` index names, so configuring
 a snapshot mirror is enough to replay the same plan against one.
 
@@ -1018,6 +1019,64 @@ it at all, or record different bytes for the one pinned.
 A live mirror serving a single version per suite will move past a pin as soon as
 it publishes. A [snapshot mirror](#installing-a-plan-without-resolving-again) is
 what holds one open, and it is the same configuration a replayed plan uses.
+
+## A reproducible root
+
+A plan fixes which packages a bootstrap installs. What their configuration
+writes is a second input, because the maintainer scripts run tools that date
+what they write from the clock. The ones a bootstrap reaches create accounts:
+`useradd`, `pwconv`, and `systemd-sysusers` record the day of each account's
+last password change in `/etc/shadow`. [`source_date_epoch`] states that date
+instead. Every maintainer script receives it as `SOURCE_DATE_EPOCH`, the
+reproducible-builds convention, so each account records the epoch's day rather
+than the day the bootstrap ran.
+
+```rust,no_run
+use ferroday_cage::IdentityMap;
+use ferroday_cage::provision::{self, Export, debian::{Debian, Plan}};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// One date for the whole build: the time of the source's last change.
+const EPOCH: i64 = 1_700_000_000;
+
+let kept = Plan::parse_document(&std::fs::read_to_string("trixie.plan")?)?;
+let mut debian = Debian::builder("trixie")
+    .plan(kept)
+    .identity_map(IdentityMap::Subordinate)
+    .source_date_epoch(EPOCH)
+    .build()?;
+provision::ensure("/srv/images/trixie", &mut debian)?;
+
+Export::new("/srv/images/trixie")
+    .map(IdentityMap::Subordinate)
+    .clamp_mtime(EPOCH)
+    .write_to_path("trixie.tar")?;
+# Ok(())
+# }
+```
+
+The epoch is a plain timestamp, the same number a pipeline gives
+[`Export::clamp_mtime`] and [`Pool::date`]. The epoch dates what the scripts
+write, and the clamp caps the modification times the archive records. With
+both, two bootstraps of one plan export byte-identical archives, even on
+different days at different paths. A package that generates a secret of its own
+is the exception. A layered build passes the epoch to its increment's scripts in the same
+way. At a shell prompt, `--debian-source-date-epoch EPOCH` sets it.
+
+A negative epoch is refused at `build` with `DebianError::Config`, because the
+account tools read the variable as unsigned and date from the clock instead.
+The epoch is a moment already past: the shadow tools refuse one later than the
+build host's clock.
+
+### What stays the caller's
+
+A package that generates a secret for its own service during configuration makes
+the root differ however the bootstrap is dated. `openssh-server` is the common
+one: its configuration generates the SSH host keys, which every machine deployed
+from the root would share. Removing them is the deployment's decision, because
+something must generate new ones before `sshd` starts. On trixie that is
+`sshd-keygen.service`, which runs on a first boot, so a deployment that removes
+the keys also removes `/etc/machine-id`.
 
 ## Asking what an archive carries
 
@@ -1485,6 +1544,7 @@ The `--debian-arch`, `--debian-mirror`, `--debian-components`,
 [`pin`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.pin
 [`foreign_interpreter`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/fn.foreign_interpreter.html
 [`pre_configure_overlay`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.pre_configure_overlay
+[`source_date_epoch`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.source_date_epoch
 [`Repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Repository.html
 [`repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.repository
 [`mirror_fallback`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.mirror_fallback

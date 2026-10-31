@@ -386,6 +386,10 @@ name = "identity_map"
 flags = ["--debian-identity-map"]
 
 [[builder.setting]]
+name = "source_date_epoch"
+flags = ["--debian-source-date-epoch"]
+
+[[builder.setting]]
 name = "fetcher"
 kind = "code"
 why = "A transport is a trait object."

@@ -494,6 +494,22 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--debian-source-date-epoch",
+        section: Section::Provisioning,
+        placeholder: "EPOCH",
+        help: &[
+            "Give every maintainer script SOURCE_DATE_EPOCH, a",
+            "Unix timestamp in seconds, so the accounts the",
+            "install creates are dated by EPOCH rather than by",
+            "the day the bootstrap ran",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.debian_source_date_epoch = Some(parse_epoch(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--debian-identity-map",
         section: Section::Provisioning,
         placeholder: "M",
@@ -2052,6 +2068,7 @@ struct Options {
     debian_trust_unsigned: bool,
     debian_allow_stale_release: bool,
     debian_pre_configure_overlay: Option<PathBuf>,
+    debian_source_date_epoch: Option<i64>,
     debian_identity_map: Option<IdentityMap>,
     debian_repositories: Vec<Repository>,
     provision_alpine: Option<String>,
@@ -2581,6 +2598,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         debian_trust_unsigned: false,
         debian_allow_stale_release: false,
         debian_pre_configure_overlay: None,
+        debian_source_date_epoch: None,
         debian_identity_map: None,
         debian_repositories: Vec::new(),
         provision_alpine: None,
@@ -3236,9 +3254,15 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
         } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
             map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
         } else if arg == "--clamp-mtime" {
-            clamp_mtime = Some(parse_epoch(&string_value("--clamp-mtime", &mut args)?)?);
+            clamp_mtime = Some(parse_epoch(
+                "--clamp-mtime",
+                &string_value("--clamp-mtime", &mut args)?,
+            )?);
         } else if let Some(value) = flag_value(&arg, b"--clamp-mtime=") {
-            clamp_mtime = Some(parse_epoch(&into_string("--clamp-mtime", value)?)?);
+            clamp_mtime = Some(parse_epoch(
+                "--clamp-mtime",
+                &into_string("--clamp-mtime", value)?,
+            )?);
         } else {
             return Err(mode_conflict(
                 &arg,
@@ -3264,14 +3288,17 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
     })
 }
 
-/// Parses the `--clamp-mtime` ceiling: a Unix timestamp in seconds.
+/// Parses the Unix timestamp in seconds that `flag` takes: `--clamp-mtime`'s
+/// ceiling or `--debian-source-date-epoch`'s date.
 ///
 /// Signed, because the ceiling is a plain timestamp rather than a duration and
-/// a tree may legitimately be pinned to an instant before the epoch.
-fn parse_epoch(value: &str) -> Result<i64, String> {
+/// a tree may legitimately be pinned to an instant before the epoch. The
+/// Debian bootstrap refuses a negative date when it is built, with the library's
+/// reason, so the two flags share this parse and differ only there.
+fn parse_epoch(flag: &str, value: &str) -> Result<i64, String> {
     value
         .parse::<i64>()
-        .map_err(|_| format!("--clamp-mtime: {value:?} is not a Unix timestamp in whole seconds"))
+        .map_err(|_| format!("{flag}: {value:?} is not a Unix timestamp in whole seconds"))
 }
 
 /// Whether any `--debian-*` modifier flag was given.
@@ -3291,6 +3318,7 @@ fn has_debian_modifiers(options: &Options) -> bool {
         || options.debian_trust_unsigned
         || options.debian_allow_stale_release
         || options.debian_pre_configure_overlay.is_some()
+        || options.debian_source_date_epoch.is_some()
         || options.debian_identity_map.is_some()
         || !options.debian_repositories.is_empty()
 }
@@ -5216,6 +5244,9 @@ fn provision_debian(
     if let Some(overlay) = &options.debian_pre_configure_overlay {
         builder = builder.pre_configure_overlay(overlay);
     }
+    if let Some(epoch) = options.debian_source_date_epoch {
+        builder = builder.source_date_epoch(epoch);
+    }
     if let Some(map) = &options.debian_identity_map {
         builder = builder.identity_map(map.clone());
     }
@@ -7094,6 +7125,42 @@ mod tests {
         }
         let error = parse_error(&["--export-rootfs", "/roots/a", "/bin/true"]);
         assert!(error.contains("/bin/true"), "{error}");
+    }
+
+    #[test]
+    fn a_debian_source_date_epoch_is_a_timestamp_named_by_its_own_flag() {
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/trixie",
+            "--provision-debian",
+            "trixie",
+            "--debian-source-date-epoch",
+            "1700000000",
+        ]);
+        assert_eq!(options.debian_source_date_epoch, Some(1_700_000_000));
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/trixie",
+            "--provision-debian",
+            "trixie",
+            "--debian-source-date-epoch=1700000000",
+        ]);
+        assert_eq!(options.debian_source_date_epoch, Some(1_700_000_000));
+
+        // The parse is the one --clamp-mtime uses, and the error names the flag
+        // it was given to rather than the other one.
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/trixie",
+            "--provision-debian",
+            "trixie",
+            "--debian-source-date-epoch",
+            "yesterday",
+        ]);
+        assert!(
+            error.contains("--debian-source-date-epoch") && !error.contains("--clamp-mtime"),
+            "{error}",
+        );
     }
 
     #[test]

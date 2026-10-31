@@ -58,6 +58,10 @@ consumer upgrading can skip it.
   could not bind. The profile keys are `host-loopback-ports` and `[[publish]]`
   tables of `host` and `guest-port`. `fcage`: `--netstack-publish HOST
   GUEST_PORT`, which reports a kernel-chosen port on standard error.
+- `DebianBuilder::source_date_epoch`, which gives every maintainer script
+  `SOURCE_DATE_EPOCH`, so the accounts a bootstrap creates record the epoch's
+  day in `/etc/shadow` rather than the day it ran. A negative epoch is refused
+  at `build`. `fcage`: `--debian-source-date-epoch EPOCH`.
 
 ### Changed
 

@@ -124,6 +124,9 @@ pub struct Debian<'a> {
     identity_map: IdentityMap,
     cache_dir: Option<PathBuf>,
     overlay: Option<PathBuf>,
+    /// The `SOURCE_DATE_EPOCH` every maintainer script is given, set by
+    /// [`DebianBuilder::source_date_epoch`]. `None` gives them none.
+    source_date_epoch: Option<i64>,
     /// The pristine base a layered build stages its increment over, set by
     /// [`DebianBuilder::base_layer`]. `None` for a full bootstrap; required by
     /// [`Debian::stage_layer`] and [`Debian::resolve_layer`].
@@ -177,6 +180,8 @@ struct Bootstrap<'a> {
     /// A tree laid over the staging root between the unpack and configure
     /// waves.
     overlay: Option<&'a Path>,
+    /// The `SOURCE_DATE_EPOCH` the maintainer scripts are given.
+    source_date_epoch: Option<i64>,
 }
 
 impl<'a> Debian<'a> {
@@ -200,6 +205,7 @@ impl<'a> Debian<'a> {
             identity_map,
             cache_dir,
             overlay,
+            source_date_epoch,
             fetcher,
             // Read by the entry points rather than by a step: it decides which
             // of them a call is, and by the time there is a bootstrap to
@@ -222,6 +228,7 @@ impl<'a> Debian<'a> {
                 identity_map,
                 cache_dir: cache_dir.as_deref(),
                 overlay: overlay.as_deref(),
+                source_date_epoch: *source_date_epoch,
             },
             fetcher.as_mut(),
         )
@@ -399,6 +406,7 @@ impl fmt::Debug for Debian<'_> {
             .field("identity_map", &self.identity_map)
             .field("cache_dir", &self.cache_dir)
             .field("overlay", &self.overlay)
+            .field("source_date_epoch", &self.source_date_epoch)
             .field("base_layer", &self.base_layer)
             .field("repositories", &self.repositories)
             .field("fetcher", &Delegate("dyn Fetch"))
@@ -424,6 +432,7 @@ impl<'a> Debian<'a> {
             identity_map: IdentityMap::Single,
             cache_dir: None,
             overlay: None,
+            source_date_epoch: None,
             base_layer: None,
             keyring_path: None,
             trust_unsigned: false,
@@ -710,7 +719,7 @@ impl<'a> Debian<'a> {
             observer,
         )?;
 
-        let env = maintainer_env();
+        let env = maintainer_env(config.source_date_epoch);
         let wave = bootstrap::Configure {
             archives_host: archives.path(),
             installables: &installables,
@@ -748,6 +757,7 @@ pub struct DebianBuilder<'a> {
     identity_map: IdentityMap,
     cache_dir: Option<PathBuf>,
     overlay: Option<PathBuf>,
+    source_date_epoch: Option<i64>,
     base_layer: Option<PathBuf>,
     keyring_path: Option<PathBuf>,
     trust_unsigned: bool,
@@ -777,6 +787,7 @@ impl fmt::Debug for DebianBuilder<'_> {
             .field("identity_map", &self.identity_map)
             .field("cache_dir", &self.cache_dir)
             .field("overlay", &self.overlay)
+            .field("source_date_epoch", &self.source_date_epoch)
             .field("base_layer", &self.base_layer)
             .field("keyring_path", &self.keyring_path)
             .field("trust_unsigned", &self.trust_unsigned)
@@ -926,8 +937,9 @@ impl<'a> DebianBuilder<'a> {
     ///
     /// Everything that shapes *how* rather than *what* still applies:
     /// [`cache_dir`](Self::cache_dir), [`identity_map`](Self::identity_map),
-    /// [`pre_configure_overlay`](Self::pre_configure_overlay), the repositories,
-    /// and the fetcher. A package is fetched from the repository its
+    /// [`pre_configure_overlay`](Self::pre_configure_overlay),
+    /// [`source_date_epoch`](Self::source_date_epoch), the repositories, and
+    /// the fetcher. A package is fetched from the repository its
     /// [`PlannedPackage::archive`] names, so a reproduce run may point the same
     /// plan at a snapshot mirror.
     ///
@@ -1119,6 +1131,46 @@ impl<'a> DebianBuilder<'a> {
         self
     }
 
+    /// Gives every maintainer script `SOURCE_DATE_EPOCH`, set to `epoch` in
+    /// Unix seconds, so the tools they run date what they write from it rather
+    /// than from the clock.
+    ///
+    /// In a bootstrap those tools are the ones that create accounts. `useradd`,
+    /// `pwconv`, and `systemd-sysusers` record the day of each account's last
+    /// password change in `/etc/shadow`. Without an epoch that day is the one
+    /// the bootstrap ran on, so one plan installed on two different days gives
+    /// two different roots.
+    ///
+    /// The value is a plain timestamp rather than something read from the
+    /// environment, so a pipeline that pins a build date passes the same number
+    /// here and to [`Export::clamp_mtime`](crate::provision::Export::clamp_mtime).
+    /// The epoch dates what the scripts write, and the clamp caps the
+    /// modification times the archive records; a byte-reproducible archive
+    /// takes both. The records of a run that no epoch dates, dpkg's own log
+    /// among them, are removed from every bootstrap, with or without one.
+    ///
+    /// Unset, the maintainer environment carries no time. A layered build
+    /// passes the epoch to the increment's scripts as a full bootstrap does,
+    /// and [`extract_only`](Self::extract_only) runs no script and ignores it.
+    ///
+    /// The epoch is a moment already past, as the convention has it: the time
+    /// of the source's last change. shadow's tools refuse one later than the
+    /// build host's clock and date from the clock instead, while
+    /// `systemd-sysusers` takes it, so a future epoch leaves the accounts dated
+    /// two ways.
+    ///
+    /// # Refused values
+    ///
+    /// A negative epoch is refused at [`build`](Self::build) with
+    /// [`DebianError::Config`]. The account tools read the variable as an
+    /// unsigned count and date from the clock when it is negative, which is the
+    /// date this setting exists to replace. `clamp_mtime` accepts one, because
+    /// a ceiling before 1970 is still a ceiling.
+    pub fn source_date_epoch(mut self, epoch: i64) -> Self {
+        self.source_date_epoch = Some(epoch);
+        self
+    }
+
     /// Stages this provisioner's packages as an increment over an existing base,
     /// rather than as a full bootstrap.
     ///
@@ -1204,6 +1256,7 @@ impl<'a> DebianBuilder<'a> {
     /// Returns [`DebianError::Config`] for a configuration that contradicts
     /// itself — a plan alongside a setting that would reshape it, a plan and a
     /// pin at once, or either resolved for a different suite or architecture —
+    /// for a negative [`source_date_epoch`](Self::source_date_epoch),
     /// and for a suite, component, or architecture the archive cannot be
     /// addressed by: an empty value, one carrying whitespace or a control
     /// character, or one that would resolve outside the mirror root through a
@@ -1216,6 +1269,16 @@ impl<'a> DebianBuilder<'a> {
         if self.suite.trim().is_empty() {
             return Err(DebianError::Config {
                 reason: "no suite was given".to_string(),
+            });
+        }
+        if let Some(epoch) = self.source_date_epoch
+            && epoch < 0
+        {
+            return Err(DebianError::Config {
+                reason: format!(
+                    "the source date epoch {epoch} is negative, and the tools that read \
+                     SOURCE_DATE_EPOCH date from the clock instead"
+                ),
             });
         }
         // A plan states which architecture it is for, so a builder that names
@@ -1303,6 +1366,7 @@ impl<'a> DebianBuilder<'a> {
             identity_map: self.identity_map,
             cache_dir: self.cache_dir,
             overlay: self.overlay,
+            source_date_epoch: self.source_date_epoch,
             base_layer: self.base_layer,
             repositories,
             fetcher: self.fetcher.unwrap_or_else(|| Box::new(HttpFetch::new())),
@@ -1469,6 +1533,7 @@ fn bootstrap_suite(
         identity_map,
         cache_dir,
         overlay,
+        source_date_epoch,
         // Read by the resolution this delegates to rather than here.
         base_priority: _,
         includes: _,
@@ -1527,7 +1592,7 @@ fn bootstrap_suite(
     )?;
 
     if !extract_only {
-        let env = maintainer_env();
+        let env = maintainer_env(source_date_epoch);
         let wave = bootstrap::Configure {
             archives_host: archives.path(),
             installables: &installables,
@@ -2461,9 +2526,9 @@ fn init_dpkg_database(staging: &Path) -> Result<(), ProvisionError> {
 }
 
 /// The maintainer-script environment: non-interactive, deterministic locale
-/// and timezone.
-fn maintainer_env() -> Vec<(String, String)> {
-    [
+/// and timezone, and the caller's `SOURCE_DATE_EPOCH` where one was set.
+fn maintainer_env(source_date_epoch: Option<i64>) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = [
         ("DEBIAN_FRONTEND", "noninteractive"),
         ("DEBCONF_NONINTERACTIVE_SEEN", "true"),
         ("LC_ALL", "C.UTF-8"),
@@ -2471,7 +2536,11 @@ fn maintainer_env() -> Vec<(String, String)> {
     ]
     .into_iter()
     .map(|(name, value)| (name.to_string(), value.to_string()))
-    .collect()
+    .collect();
+    if let Some(epoch) = source_date_epoch {
+        env.push(("SOURCE_DATE_EPOCH".to_string(), epoch.to_string()));
+    }
+    env
 }
 
 /// Fetches a URL fully into memory, bounded by the size a verified source
@@ -3432,6 +3501,45 @@ mod tests {
             .unwrap();
         assert_eq!(configured.base_priority, Priority::Important);
         assert_eq!(configured.excludes, ["isc-dhcp-client", "dhcpcd-base"]);
+    }
+
+    #[test]
+    fn a_source_date_epoch_reaches_the_maintainer_scripts_only_when_set() {
+        let named = |env: &[(String, String)]| {
+            env.iter()
+                .find(|(name, _)| name == "SOURCE_DATE_EPOCH")
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(named(&maintainer_env(None)), None);
+        assert_eq!(
+            named(&maintainer_env(Some(1_700_000_000))).as_deref(),
+            Some("1700000000"),
+        );
+
+        let mut debian = Debian::builder("trixie")
+            .source_date_epoch(1_700_000_000)
+            .build()
+            .expect("the builder validates");
+        let (config, _) = debian.split();
+        assert_eq!(config.source_date_epoch, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn a_negative_source_date_epoch_is_refused() {
+        // The account tools read the variable as unsigned and date from the
+        // clock when it is negative, so the setting would silently do nothing.
+        // Zero is 1970 and is a date they accept.
+        let refused = Debian::builder("trixie").source_date_epoch(-1).build();
+        assert!(
+            matches!(&refused, Err(DebianError::Config { reason }) if reason.contains("negative")),
+            "{refused:?}",
+        );
+        assert!(
+            Debian::builder("trixie")
+                .source_date_epoch(0)
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]
