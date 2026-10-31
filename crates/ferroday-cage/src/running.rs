@@ -106,6 +106,20 @@ pub struct Running<'obs> {
     _placeholders: PlaceholderGuard,
 }
 
+/// Which channel one of the pump's poll slots watches, and where its readiness
+/// is recorded after a poll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// The captured standard output.
+    Stdout,
+    /// The captured standard error.
+    Stderr,
+    /// The status pipe the supervisor writes the outcome to.
+    Status,
+    /// A waiter's own descriptor; see [`Running::wait_or_readable`].
+    Wake,
+}
+
 /// Which captured stream a read belongs to.
 ///
 /// Deliberately a second answer to the question `provision::Stream` also asks.
@@ -391,43 +405,53 @@ impl<'obs> Running<'obs> {
                 }
             };
 
-            // One fixed poll slot per channel, so the hot loop allocates
-            // nothing. A retired channel's slot watches the pidfd with no
-            // requested events: a valid descriptor the poll ignores. The
-            // waiter's own channel, where there is none, is the same.
-            let mut pollfds = [
-                poll::slot(&self.stdout, &self.pidfd),
-                poll::slot(&self.stderr, &self.pidfd),
-                poll::slot(&self.status, &self.pidfd),
-                match wake {
-                    Some(wake) => PollFd::from_borrowed_fd(wake, PollFlags::IN),
-                    None => PollFd::new(&self.pidfd, PollFlags::empty()),
-                },
-            ];
+            // Only the live channels are polled: each is gathered to the front
+            // of a fixed array, so the hot loop allocates nothing, and the
+            // slice handed to `poll` ends where they do. A retired channel
+            // left in it would be ready on every pass (see `poll`). The
+            // entries past the live ones are never polled; they hold the pidfd
+            // only because every entry of the array needs a descriptor.
+            let mut watched = [Watch::Stdout; 4];
+            let mut pollfds: [PollFd<'_>; 4] =
+                std::array::from_fn(|_| PollFd::new(&self.pidfd, PollFlags::empty()));
+            let mut live = 0;
+            for (watch, fd) in [
+                (Watch::Stdout, self.stdout.as_ref().map(AsFd::as_fd)),
+                (Watch::Stderr, self.stderr.as_ref().map(AsFd::as_fd)),
+                (Watch::Status, self.status.as_ref().map(AsFd::as_fd)),
+                (Watch::Wake, wake),
+            ] {
+                if let Some(fd) = fd {
+                    watched[live] = watch;
+                    pollfds[live] = PollFd::from_borrowed_fd(fd, PollFlags::IN);
+                    live += 1;
+                }
+            }
 
-            match rustix::event::poll(&mut pollfds, timeout.as_ref()) {
+            match rustix::event::poll(&mut pollfds[..live], timeout.as_ref()) {
                 Ok(0) => return Ok(None),
                 Ok(_) => {}
                 Err(Errno::INTR) => continue,
                 Err(errno) => return Err(wait_error(errno)),
             }
 
-            let ready: [bool; 4] = std::array::from_fn(|i| !pollfds[i].revents().is_empty());
-            if ready[0] {
+            let mut ready = [false; 4];
+            for (&watch, fd) in watched[..live].iter().zip(&pollfds) {
+                ready[watch as usize] = !fd.revents().is_empty();
+            }
+            if ready[Watch::Stdout as usize] {
                 self.drain_stream(Channel::Stdout)?;
             }
-            if ready[1] {
+            if ready[Watch::Stderr as usize] {
                 self.drain_stream(Channel::Stderr)?;
             }
-            if ready[2] {
+            if ready[Watch::Status as usize] {
                 self.drain_status()?;
             }
             // The waiter's channel is answered after this pass's own reads,
             // so an outcome that arrived beside it is reported rather than
-            // left for the next wait. Without one, the slot's readiness is
-            // the placeholder's, not a waiter's: a pidfd reports a hangup once
-            // its process has been reaped, whatever events were asked for.
-            if wake.is_some() && ready[3] {
+            // left for the next wait.
+            if ready[Watch::Wake as usize] {
                 return match self.settled() {
                     true => self.resolve().map(Some),
                     false => Ok(None),
@@ -874,4 +898,90 @@ fn signal_error(errno: Errno) -> Error {
 
 fn clone_error(err: std::io::Error) -> Error {
     Error::Signal { source: err }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustix::pipe::{PipeFlags, pipe_with};
+    use rustix::process::{Pid, PidfdFlags};
+
+    use super::*;
+    use crate::observer::Progress;
+
+    /// How many clock ticks a wait may use over the window below while it
+    /// blocks. A spinning wait uses the whole window, a hundred and more.
+    const IDLE_TICKS: u64 = 20;
+
+    /// A reaped process's pidfd reports a hangup whatever is asked of it, and
+    /// the pump holds the supervisor's for as long as it waits. Without a PID
+    /// namespace the supervisor is reaped as soon as it exits, while a
+    /// descendant may hold the captured output open long after. Waiting out
+    /// that stream must block, not spin on the pidfd.
+    #[test]
+    fn a_wait_on_a_stream_that_outlives_the_supervisor_blocks() {
+        // The supervisor: a process that exits and is reaped before the wait.
+        let mut supervisor = std::process::Command::new("true")
+            .spawn()
+            .expect("a process to stand for the supervisor");
+        let pid = Pid::from_raw(i32::try_from(supervisor.id()).expect("a pid fits"))
+            .expect("a process id is not zero");
+        let pidfd = process::pidfd_open(pid, PidfdFlags::empty()).expect("a pidfd");
+        supervisor.wait().expect("the stand-in is reaped");
+
+        // The outcome is already waiting in the status pipe.
+        let (status, status_write) = pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        let mut record = [0u8; 8];
+        record[..4].copy_from_slice(&mechanism::STATUS_EXITED.to_le_bytes());
+        rustix::io::write(&status_write, &record).expect("the record fits the pipe");
+        drop(status_write);
+
+        // A descendant's hold on standard output, released after the window.
+        let window = Duration::from_millis(1500);
+        let (stdout, stdout_write) = pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(window);
+            drop(stdout_write);
+        });
+
+        let (control, _peer) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket pair stands in for the control channel");
+        let mut observer = |_: Progress| {};
+        let mut running = Running::from_launched(
+            mechanism::Launched {
+                pidfd,
+                pid: supervisor.id(),
+                control,
+                status,
+                stdout: Some(stdout),
+                stderr: None,
+                reap: None,
+            },
+            Some(&mut observer),
+            PlaceholderGuard {
+                placeholders: ManagedPlaceholders::default(),
+            },
+        );
+
+        let thread = rustix::thread::gettid().as_raw_nonzero().get();
+        let before = poll::thread_ticks(thread);
+        let started = Instant::now();
+        let outcome = running.wait().expect("the outcome is collected");
+        let used = poll::thread_ticks(thread) - before;
+        holder.join().expect("the holder releases the stream");
+
+        assert_eq!(outcome.code(), Some(0));
+        assert!(
+            started.elapsed() >= window - Duration::from_millis(100),
+            "the wait returned before the stream closed"
+        );
+        assert!(
+            used < IDLE_TICKS,
+            "the wait spun: {used} ticks while the stream was held open"
+        );
+    }
 }

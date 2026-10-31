@@ -39,6 +39,7 @@
 //! so a symbolic link at `var/db/pkg` is a thing that can be there. Resolved
 //! this way it names something inside the tree or nothing at all.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
@@ -320,7 +321,18 @@ pub fn installed(root: impl AsRef<Path>) -> Result<Installed, GentooError> {
 ///
 /// `at` names the root in a failure; nothing resolves through it.
 fn read_database(rooted: &Rooted, at: &Path) -> Result<Vec<InstalledPackage>, GentooError> {
-    let mut packages = Vec::new();
+    entries(rooted, at)?
+        .iter()
+        .map(|(category, pf)| read_entry(&Layers::Plain(rooted), at, category, pf))
+        .collect()
+}
+
+/// Every entry directory the database holds, as its category and its `PF`, in
+/// a stable order.
+///
+/// An interrupted merge's entry is skipped: see [`MERGING_PREFIX`].
+fn entries(rooted: &Rooted, at: &Path) -> Result<Vec<(String, String)>, GentooError> {
+    let mut found = Vec::new();
     let categories = rooted
         .directories(DB_DIR)
         .map_err(GentooError::at("reading the package database", at))?;
@@ -347,16 +359,57 @@ fn read_database(rooted: &Rooted, at: &Path) -> Result<Vec<InstalledPackage>, Ge
             if pf.starts_with(MERGING_PREFIX) {
                 continue;
             }
-            packages.push(read_entry(rooted, at, &category, &pf)?);
+            found.push((category.clone(), pf));
         }
     }
-    Ok(packages)
+    Ok(found)
+}
+
+/// The layers one entry's files are read from.
+///
+/// A plain root holds each entry whole. An overlay's merged view need not: an
+/// entry directory the upper holds and the base holds too is the union of the
+/// two, because overlayfs copies up only what changes. An entry one file of
+/// which a command inside the sandbox rewrote holds that file alone in the
+/// upper, and every other file of it in the base.
+enum Layers<'a> {
+    /// One tree, holding every entry whole.
+    Plain(&'a Rooted),
+    /// An overlay upper over a base: each file is the upper's where the upper
+    /// names it, and otherwise the base's, where `lower` is given because the
+    /// upper does not hide the base's entry as a whole.
+    Over {
+        /// The upper.
+        upper: &'a Rooted,
+        /// The base, where its entry shows through.
+        lower: Option<&'a Rooted>,
+    },
+}
+
+impl Layers<'_> {
+    /// The file at `path`, or `None` where the entry holds none.
+    ///
+    /// A whiteout in the upper is the file removed, so the base's copy beneath
+    /// it is not read; [`Rooted::is_whiteout`] tells one from a file.
+    fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
+        match *self {
+            Layers::Plain(tree) => tree.read_if_present(path, MAX_METADATA_BYTES),
+            Layers::Over { upper, lower } => match upper.stat(path)? {
+                Some(stat) if Rooted::is_whiteout(&stat) => Ok(None),
+                Some(_) => upper.read_if_present(path, MAX_METADATA_BYTES),
+                None => match lower {
+                    Some(lower) => lower.read_if_present(path, MAX_METADATA_BYTES),
+                    None => Ok(None),
+                },
+            },
+        }
+    }
 }
 
 /// Reads one entry: its name and version from the two directory names, its slot
-/// and flags from the files inside.
+/// and flags from the files inside, each read through `layers`.
 fn read_entry(
-    rooted: &Rooted,
+    layers: &Layers<'_>,
     at: &Path,
     category: &str,
     pf: &str,
@@ -377,8 +430,8 @@ fn read_entry(
     // a container holds to `MAX_METADATA_BYTES` together; one past that alone
     // is not one portage wrote.
     let field = |file: &str| -> Result<Option<String>, GentooError> {
-        rooted
-            .read_if_present(format!("{dir}/{file}"), MAX_METADATA_BYTES)
+        layers
+            .read(&format!("{dir}/{file}"))
             .map(|bytes| bytes.map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string()))
             .map_err(|err| GentooError::io("reading a package database entry", at, err))
     };
@@ -444,23 +497,37 @@ fn read_entry(
 /// removed inside a sandbox rooted on the overlay leaves a whiteout in the
 /// upper where its entry was, and an entry or a category recreated there is
 /// marked opaque; [`Upper::hides`] reads both the way overlayfs does.
+///
+/// An entry both layers hold is read file by file through the two, as
+/// [`Layers`] describes. That is the shape a base entry takes once something in
+/// the sandbox has changed one of its files, and the upper's directory alone
+/// would read as an entry missing its `SLOT`.
 pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooError> {
+    let base = Rooted::open(lower).map_err(GentooError::at("opening the root", lower))?;
+    let top = Rooted::open(upper).map_err(GentooError::at("opening the overlay upper", upper))?;
     let layer = Upper::open(upper).map_err(GentooError::at("opening the overlay upper", upper))?;
+    // Whether the base's entry of this name shows through the upper.
+    let shows = |category: &str, pf: &str| {
+        layer
+            .hides(&format!("{DB_DIR}/{category}/{pf}"))
+            .map(|hidden| !hidden)
+            .map_err(|err| GentooError::io("reading the overlay upper", upper, err))
+    };
+    let held: BTreeSet<(String, String)> = entries(&top, upper)?.into_iter().collect();
+
     let mut packages = Vec::new();
-    for below in installed(lower)?.packages {
-        let (category, package) = below
-            .name
-            .split_once('/')
-            .expect("an entry's name is a category and a package");
-        let entry = format!("{DB_DIR}/{category}/{package}-{}", below.version);
-        let hidden = layer
-            .hides(&entry)
-            .map_err(|err| GentooError::io("reading the overlay upper", upper, err))?;
-        if !hidden {
-            packages.push(below);
+    for (category, pf) in entries(&base, lower)? {
+        if held.contains(&(category.clone(), pf.clone())) || !shows(&category, &pf)? {
+            continue;
         }
+        packages.push(read_entry(&Layers::Plain(&base), lower, &category, &pf)?);
     }
-    for above in installed(upper)?.packages {
+    for (category, pf) in &held {
+        let layers = Layers::Over {
+            upper: &top,
+            lower: shows(category, pf)?.then_some(&base),
+        };
+        let above = read_entry(&layers, upper, category, pf)?;
         packages.retain(|below| {
             !(below.name == above.name && slot_of(&below.slot) == slot_of(&above.slot))
         });
@@ -849,6 +916,94 @@ mod tests {
             names(&merged(&lower, &upper).expect("the merged view is read")),
             ["sys-apps/util-linux"],
         );
+    }
+
+    #[test]
+    fn a_base_entry_changed_in_the_sandbox_is_read_through_both_layers() {
+        // Overlayfs copies up what changes, so a base entry one file of which a
+        // command inside the sandbox rewrote holds that file alone in the
+        // upper. The merged view's entry is the union: the rewritten file from
+        // the upper, every other one from the base.
+        let lower = stage3("partial-lower");
+        let upper = Scratch::for_test("gentoo-installed", "partial-upper");
+        let zlib = upper.join(DB_DIR).join("sys-libs/zlib-1.3.1-r1");
+        std::fs::create_dir_all(&zlib).unwrap();
+        std::fs::write(zlib.join(USE_FILE), "amd64 minizip static-libs\n").unwrap();
+
+        let view = merged(&lower, &upper).expect("a partly copied-up entry is read");
+        assert_eq!(
+            names(&view),
+            ["app-crypt/pinentry", "sys-apps/util-linux", "sys-libs/zlib"],
+        );
+        let zlib_read = view
+            .under("sys-libs/zlib")
+            .next()
+            .expect("zlib is installed");
+        assert_eq!(zlib_read.slot(), "0/1", "the slot is the base's");
+        assert_eq!(
+            zlib_read.use_flags().collect::<Vec<_>>(),
+            ["amd64", "minizip", "static-libs"],
+            "the flags are the upper's",
+        );
+        assert_eq!(
+            zlib_read.use_flag("static-libs"),
+            Some(true),
+            "a flag the base's IUSE_EFFECTIVE does not know is still answered from USE",
+        );
+
+        // A whiteout in the entry is that file removed: the base's copy beneath
+        // it is not read. The overlay's own shape, where the host lets one be
+        // made.
+        let util = upper.join(DB_DIR).join("sys-apps/util-linux-2.41.2");
+        std::fs::create_dir_all(&util).unwrap();
+        if let Err(errno) = rustix::fs::mknodat(
+            rustix::fs::CWD,
+            util.join(USE_FILE),
+            rustix::fs::FileType::CharacterDevice,
+            rustix::fs::Mode::empty(),
+            0,
+        ) {
+            eprintln!("skipping the whiteout case: a whiteout cannot be made here ({errno})");
+        } else {
+            let view = merged(&lower, &upper).expect("the merged view is read");
+            let util_read = view
+                .under("sys-apps/util-linux")
+                .next()
+                .expect("util-linux is installed");
+            assert_eq!(util_read.slot(), "0");
+            assert_eq!(
+                util_read.use_flags().count(),
+                0,
+                "the base's USE is removed"
+            );
+        }
+
+        // An entry recreated opaque in the upper shows nothing of the base's,
+        // so the upper's directory is the whole entry, and one without a SLOT is
+        // what it reads as. The marker lives in a `user.` attribute.
+        let pinentry = upper.join(DB_DIR).join("app-crypt/pinentry-1.3.2-r1");
+        std::fs::create_dir_all(&pinentry).unwrap();
+        std::fs::write(pinentry.join(USE_FILE), "amd64\n").unwrap();
+        assert!(
+            merged(&lower, &upper)
+                .expect("an entry merged with the base's is whole")
+                .under("app-crypt/pinentry")
+                .next()
+                .is_some()
+        );
+        if let Err(errno) = rustix::fs::setxattr(
+            &pinentry,
+            containment::OPAQUE,
+            b"y",
+            rustix::fs::XattrFlags::empty(),
+        ) {
+            eprintln!(
+                "skipping the opaque case: this filesystem refuses user attributes ({errno})"
+            );
+            return;
+        }
+        let err = merged(&lower, &upper).expect_err("an opaque entry is the upper's alone");
+        assert!(err.to_string().contains("SLOT"), "{err}");
     }
 
     #[test]

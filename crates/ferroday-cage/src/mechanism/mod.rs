@@ -873,6 +873,36 @@ const MS_REMOUNT: u32 = 0x20;
 /// `MS_MOVE`, kept to rustix's own move call for the same reason.
 const MS_MOVE: u32 = 0x2000;
 
+impl Arrival {
+    /// What a raw mount carrying `flags` brings to rest on its target, or
+    /// `None` where it brings none.
+    ///
+    /// Read the way `mount(2)` reads its flags, in the order the kernel tests
+    /// them. A remount changes a mount already standing and brings none.
+    /// `MS_BIND` binds a tree, whatever else is set. A propagation change
+    /// brings none. `MS_MOVE` moves a mount standing elsewhere onto the target,
+    /// and anything else mounts a fresh filesystem of the type named.
+    pub(crate) fn of_raw(flags: MountFlags) -> Option<Arrival> {
+        let propagation = (MountPropagationFlags::SHARED
+            | MountPropagationFlags::PRIVATE
+            | MountPropagationFlags::DOWNSTREAM
+            | MountPropagationFlags::UNBINDABLE)
+            .bits();
+        let flags = flags.bits();
+        if flags & MS_REMOUNT != 0 {
+            None
+        } else if flags & MountFlags::BIND.bits() != 0 {
+            Some(Arrival::Tree)
+        } else if flags & propagation != 0 {
+            None
+        } else if flags & MS_MOVE != 0 {
+            Some(Arrival::Tree)
+        } else {
+            Some(Arrival::Fresh)
+        }
+    }
+}
+
 impl MountAction {
     /// The rootfs-relative path this action brings a mount to rest on, and
     /// what arrives there, or `None` for an action that brings none.
@@ -880,13 +910,8 @@ impl MountAction {
     /// A path under one of these is inside that mount once the action has run,
     /// not in the rootfs directory on the host, which is what decides whether
     /// a target the launch creates has a host path at all. It also decides
-    /// what an earlier mount at the same place still shows.
-    ///
-    /// A raw action is read the way `mount(2)` reads its flags, in the order the
-    /// kernel tests them. A remount changes a mount already standing and brings
-    /// none. `MS_BIND` binds a tree, whatever else is set. A propagation change
-    /// brings none. `MS_MOVE` moves a mount standing elsewhere onto the target,
-    /// and anything else mounts a fresh filesystem of the type named.
+    /// what an earlier mount at the same place still shows. A raw action is
+    /// read through [`Arrival::of_raw`].
     pub(crate) fn arrival(&self) -> Option<(&CStr, Arrival)> {
         match self {
             MountAction::Tmpfs { target, .. }
@@ -894,23 +919,7 @@ impl MountAction {
             | MountAction::Devpts { target, .. } => Some((target, Arrival::Fresh)),
             MountAction::Bind { target, .. } => Some((target, Arrival::Tree)),
             MountAction::Raw { target, flags, .. } => {
-                let propagation = (MountPropagationFlags::SHARED
-                    | MountPropagationFlags::PRIVATE
-                    | MountPropagationFlags::DOWNSTREAM
-                    | MountPropagationFlags::UNBINDABLE)
-                    .bits();
-                let flags = flags.bits();
-                if flags & MS_REMOUNT != 0 {
-                    None
-                } else if flags & MountFlags::BIND.bits() != 0 {
-                    Some((target, Arrival::Tree))
-                } else if flags & propagation != 0 {
-                    None
-                } else if flags & MS_MOVE != 0 {
-                    Some((target, Arrival::Tree))
-                } else {
-                    Some((target, Arrival::Fresh))
-                }
+                Arrival::of_raw(*flags).map(|arrival| (target.as_c_str(), arrival))
             }
             MountAction::Symlink { .. } => None,
         }

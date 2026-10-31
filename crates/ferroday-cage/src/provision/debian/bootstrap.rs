@@ -33,6 +33,7 @@ use std::path::Path;
 use super::repository::{Repository, Trust};
 use super::{DebianError, DebianEvent, DebianObserver};
 use crate::provision::Stream;
+use crate::provision::accounts;
 use crate::provision::document;
 use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
@@ -272,7 +273,7 @@ fn record_path(line: &str) -> Option<&str> {
 
 /// What a configure wave installs, and the environment it installs it in.
 ///
-/// The same five values travel from a bootstrap down through `configure`,
+/// The same values travel from a bootstrap down through `configure`,
 /// `core_install` and `run_dpkg`, and were threaded through each positionally.
 /// Gathered here, a step names what it reads.
 pub(crate) struct Configure<'a> {
@@ -289,6 +290,9 @@ pub(crate) struct Configure<'a> {
     pub(crate) identity_map: &'a IdentityMap,
     /// The maintainer-script environment.
     pub(crate) env: &'a [(String, String)],
+    /// The `SOURCE_DATE_EPOCH` that environment carries, if any, by which the
+    /// accounts the scripts create are [dated](date_accounts).
+    pub(crate) source_date_epoch: Option<i64>,
 }
 
 /// Configures every unpacked package, leaving a consistent dpkg database.
@@ -302,7 +306,8 @@ pub(crate) struct Configure<'a> {
 ///
 /// Once the last wave has run, what it recorded of its own run is
 /// [cleared](clear_run_state), so the finished rootfs carries no log of the
-/// bootstrap and no machine identity it generated.
+/// bootstrap and no machine identity it generated. With an epoch, the accounts
+/// the scripts created are [dated](date_accounts) by it.
 ///
 /// Under the single-identity map the reconciliation neutralizes the
 /// [`chown`/`chgrp` commands](OWNERSHIP_TOOLS), so a maintainer script that
@@ -321,6 +326,7 @@ pub(crate) fn configure(
         installables,
         statoverride,
         identity_map,
+        source_date_epoch,
         // Read by the dpkg waves this hands the gathered value down to.
         archives_host: _,
         env: _,
@@ -335,6 +341,9 @@ pub(crate) fn configure(
     // tree. The cages are rooted by path, which the kernel resolves once, at
     // the pivot.
     let tree = open_tree(staging)?;
+    // What the accounts' dates were before any script ran, so that afterwards
+    // the ones the run wrote can be told from the ones it found.
+    let found = found_dates(source_date_epoch, &tree, None)?;
 
     // Suppress daemon startup and, under the single-identity map, neutralize
     // direct chown/chgrp for the whole configuration, before any maintainer
@@ -408,6 +417,9 @@ pub(crate) fn configure(
     }
     remove_policy_rc_d(&tree)?;
     clear_run_state(&tree)?;
+    if let (Some(epoch), Some(found)) = (source_date_epoch, &found) {
+        date_accounts(&tree, found, epoch)?;
+    }
     write_repository_sources(&tree, repositories)?;
     if single {
         write_apt_sandbox_user(&tree)?;
@@ -443,7 +455,8 @@ pub(crate) fn configure(
 /// base it increments, so a package needing real ids fails here for the same
 /// reason it fails in a full bootstrap. What the increment's waves record of
 /// their run is [cleared](clear_run_state) from the upper as a full bootstrap
-/// clears it from the rootfs.
+/// clears it from the rootfs, and with an epoch the accounts they created are
+/// [dated](date_accounts) there.
 ///
 /// `overlay_source` is the caller's pre-configure overlay, laid over the upper
 /// between the unpack and configure waves exactly as for a full bootstrap.
@@ -458,6 +471,7 @@ pub(crate) fn configure_delta(
         installables,
         statoverride,
         identity_map,
+        source_date_epoch,
         // Read by the dpkg waves this hands the gathered value down to.
         archives_host: _,
         env: _,
@@ -467,9 +481,13 @@ pub(crate) fn configure_delta(
     // The increment's own tree, which every host-side step below is anchored
     // to, over the base so a directory a step creates never hides a link the
     // base holds; the base is otherwise opened where it is read.
+    let base = open_tree(lower)?;
     let tree = open_tree(upper)?
-        .over(Some(&open_tree(lower)?))
+        .over(Some(&base))
         .map_err(DebianError::at("opening the tree", upper))?;
+    // The accounts' dates before any script runs, the base's where the upper
+    // holds no file of its own yet.
+    let found = found_dates(source_date_epoch, &tree, Some(&base))?;
 
     // Suppress daemon startup and, under the single-identity map, neutralize
     // direct chown/chgrp and seed the merged statoverride, before any maintainer
@@ -528,6 +546,9 @@ pub(crate) fn configure_delta(
     }
     remove_policy_rc_d(&tree)?;
     clear_run_state(&tree)?;
+    if let (Some(epoch), Some(found)) = (source_date_epoch, &found) {
+        date_accounts(&tree, found, epoch)?;
+    }
 
     // dpkg copied the base's status database up into the upper on its first
     // write, so the merged database — base plus increment — is read from the
@@ -767,6 +788,8 @@ fn run_dpkg(
         // which is what dpkg is told to act on.
         installables: _,
         statoverride: _,
+        // The scripts read it from `env`; the dates are the caller's to fix.
+        source_date_epoch: _,
     } = wave;
     let cage = rooting
         .builder(staging)
@@ -839,6 +862,44 @@ fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianErro
     } else {
         Err(DebianError::NotConfigured { packages: missing })
     }
+}
+
+/// Each account's last-change day before the scripts run, where an epoch is
+/// given; see [`accounts::account_dates`]. `beneath` is a layered build's
+/// base.
+fn found_dates(
+    epoch: Option<i64>,
+    tree: &Rooted,
+    beneath: Option<&Rooted>,
+) -> Result<Option<accounts::Dates>, DebianError> {
+    epoch
+        .map(|_| accounts::account_dates(tree, beneath).map_err(accounts_failure))
+        .transpose()
+}
+
+/// Records the epoch's day where `systemd-sysusers` wrote 1970's first day as
+/// a zero.
+///
+/// The tools a Debian bootstrap creates accounts with all date them by
+/// `SOURCE_DATE_EPOCH`, and they disagree about one day. shadow's `useradd`
+/// and `pwconv` leave the field empty for an epoch in 1970's first day, since
+/// a zero demands a new password at the next login. `systemd-sysusers` writes
+/// the epoch's day as it is, zero included. So under such an epoch, a zero the
+/// run wrote is that day, and it is recorded as
+/// [`last_change_day`](accounts::last_change_day) records it. Only the fields
+/// the run wrote are touched, as [`accounts::redate`] describes. Under a later
+/// epoch every tool wrote the day itself, and nothing is rewritten.
+fn date_accounts(tree: &Rooted, found: &accounts::Dates, epoch: i64) -> Result<(), DebianError> {
+    if epoch / accounts::SECONDS_PER_DAY != 0 {
+        return Ok(());
+    }
+    let day = accounts::last_change_day(epoch);
+    accounts::redate(tree, found, day.as_bytes(), |field| field == b"0").map_err(accounts_failure)
+}
+
+/// An accounts step's failure, reported as this layer's own.
+fn accounts_failure(failure: accounts::Failure) -> DebianError {
+    DebianError::io(failure.op, failure.path, failure.source)
 }
 
 /// Removes what the configure waves leave that belongs to their run rather
@@ -1216,6 +1277,7 @@ mod tests {
             statoverride: &StatOverride::default(),
             identity_map: &IdentityMap::Single,
             env: &[],
+            source_date_epoch: None,
         };
         let outcome = run_dpkg(
             "configure",
@@ -1552,6 +1614,69 @@ mod tests {
             Path::new("mawk"),
         );
         assert!(fs::symlink_metadata(staging.join("usr/sbin/policy-rc.d")).is_err());
+    }
+
+    /// What `systemd-sysusers` writes for an account it creates under an epoch
+    /// in 1970's first day, beside what shadow's `useradd` writes for one, and
+    /// a package's own account that ships with no date.
+    const DAY_ZERO_SHADOW: &[u8] = b"root:*::0:99999:7:::\n\
+        systemd-network:!*:0::::::\n\
+        _apt:!::0:99999:7:::\n";
+
+    #[test]
+    fn the_first_day_of_1970_is_recorded_as_no_date_whatever_wrote_it() {
+        // A zero demands a new password at the next login, which is not what
+        // the epoch meant; useradd leaves the field empty for the same day.
+        for epoch in [0, 86_399] {
+            let (staging, tree) = rooted_tree("day-zero");
+            for path in accounts::SHADOW {
+                tree.write_mode(path, DAY_ZERO_SHADOW, 0o640).unwrap();
+            }
+            date_accounts(&tree, &accounts::Dates::new(), epoch).expect("the accounts are dated");
+            for path in accounts::SHADOW {
+                assert_eq!(
+                    fs::read(staging.join(path)).unwrap(),
+                    b"root:*::0:99999:7:::\nsystemd-network:!*:::::::\n_apt:!::0:99999:7:::\n",
+                    "{path} under {epoch}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_is_a_date_only_under_the_epoch_whose_day_it_is() {
+        // Under any later epoch every tool wrote that day itself, so a zero
+        // the run wrote is a script's demand for a new password, and is kept.
+        let (staging, tree) = rooted_tree("day-zero-later-epoch");
+        tree.write_mode("etc/shadow", DAY_ZERO_SHADOW, 0o640)
+            .unwrap();
+        date_accounts(&tree, &accounts::Dates::new(), 86_400).expect("nothing to date");
+        assert_eq!(
+            fs::read(staging.join("etc/shadow")).unwrap(),
+            DAY_ZERO_SHADOW
+        );
+
+        // And a zero the run found, in a layered build's base, is the base's
+        // own whatever the epoch.
+        let (_base_dir, base) = rooted_tree("day-zero-base");
+        base.write("etc/shadow", b"root:*:0:0:99999:7:::\n")
+            .unwrap();
+        let (upper_dir, upper) = rooted_tree("day-zero-upper");
+        let found = found_dates(Some(0), &upper, Some(&base))
+            .expect("the accounts read")
+            .expect("an epoch was given");
+        upper
+            .write(
+                "etc/shadow",
+                b"root:*:0:0:99999:7:::\nsystemd-network:!*:0::::::\n",
+            )
+            .unwrap();
+        date_accounts(&upper, &found, 0).expect("the accounts are dated");
+        assert_eq!(
+            fs::read(upper_dir.join("etc/shadow")).unwrap(),
+            b"root:*:0:0:99999:7:::\nsystemd-network:!*:::::::\n",
+        );
+        assert_eq!(found_dates(None, &upper, Some(&base)).unwrap(), None);
     }
 
     #[test]

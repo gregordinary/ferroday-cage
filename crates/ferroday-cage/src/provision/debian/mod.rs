@@ -730,6 +730,7 @@ impl<'a> Debian<'a> {
             statoverride: &statoverride,
             identity_map: config.identity_map,
             env: &env,
+            source_date_epoch: config.source_date_epoch,
         };
         bootstrap::configure_delta(&base, upper, &wave, config.overlay, observer).map_err(wrap)?;
 
@@ -1153,6 +1154,12 @@ impl<'a> DebianBuilder<'a> {
     /// password change in `/etc/shadow`. Without an epoch that day is the one
     /// the bootstrap ran on, so one plan installed on two different days gives
     /// two different roots.
+    ///
+    /// An epoch in the first day of 1970 records an empty field, as `useradd`
+    /// and `pwconv` write it, because `/etc/shadow` reads a day of zero as a
+    /// demand for a new password at the next login. `systemd-sysusers` writes
+    /// the zero, and the bootstrap empties each one its run wrote, in
+    /// `/etc/shadow` and in `/etc/shadow-`, once the scripts have run.
     ///
     /// The value is a plain timestamp rather than something read from the
     /// environment, so a pipeline that pins a build date passes the same number
@@ -1625,6 +1632,7 @@ fn bootstrap_suite(
             statoverride: &statoverride,
             identity_map,
             env: &env,
+            source_date_epoch,
         };
         bootstrap::configure(staging, &wave, repositories, overlay, observer).map_err(wrap)?;
         // The read-only bind mount left an empty mount point in the rootfs.

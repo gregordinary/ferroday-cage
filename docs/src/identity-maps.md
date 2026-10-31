@@ -200,9 +200,14 @@ in the message:
   privilege.
 - A missing helper, commonly a container runtime installed without its
   recommended packages.
-- A helper stripped of its privilege, or a file-capability helper too old to
-  map uid 0 (shadow before 4.11.1).
+- A helper stripped of its privilege.
 - A symlinked subordinate file, or an absent allocation.
+
+A file-capability helper needs only the capability its map file asks for,
+`CAP_SETUID` or `CAP_SETGID`, which is how shadow installs them. Linux also
+wants `CAP_SETFCAP` for a uid map that names the parent namespace's uid 0 among
+its outside ids. Only a root caller's own uid is that, and a root caller's
+helper gains its capabilities from the caller rather than from the file.
 
  `Subordinate` on a build
 without the `subid` feature is refused the same way, at `build` for code and

@@ -54,6 +54,7 @@ Two further modes stand on their own:
 
 ```sh
 fcage --remove-rootfs ./root                      # including trees not owned by you
+fcage --remove-overlay-upper ./run-42             # an overlay upper, with its work directory
 fcage --export-rootfs ./root --export-to root.tar # ownership and xattrs preserved
 ```
 

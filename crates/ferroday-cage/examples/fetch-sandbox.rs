@@ -22,10 +22,11 @@
 //! [`stop`](ferroday_cage::NetStackHandle::stop) to tear the stack down after
 //! the command exits.
 //!
-//! DNS is the caller's to arrange. The stack refuses loopback destinations, so a
-//! host running systemd-resolved — whose `127.0.0.53` stub is the only entry in
-//! `/etc/resolv.conf` — offers the sandbox no working resolver. This example
-//! binds the host's `resolv.conf` only when it names a routable nameserver, and
+//! DNS is the caller's to arrange. The stack refuses loopback and link-local
+//! destinations, so a host running systemd-resolved — whose `127.0.0.53` stub is
+//! the only entry in `/etc/resolv.conf` — offers the sandbox no working
+//! resolver. This example binds the host's `resolv.conf` only when it names a
+//! nameserver the stack [forwards](ferroday_cage::NetStack::forwards) to, and
 //! otherwise leaves the sandbox to resolve nothing; fetching a literal IP
 //! address always works.
 //!
@@ -147,17 +148,6 @@ impl From<NetStackError> for FetchFailure {
 /// with `?` through [`FetchFailure`], rather than being unwrapped — attaching
 /// the stack stands up a tap device and can fail for real reasons.
 fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
-    let mut builder = Cage::builder()
-        .rootfs(&options.rootfs)
-        .command(WGET)
-        .args(["-qO-", &options.url.to_string_lossy()]);
-    // Give the sandbox the host's DNS only if it can be used through the
-    // stack, which refuses loopback destinations.
-    if host_has_routable_nameserver() {
-        builder = builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf");
-    }
-    let cage = builder.build()?;
-
     // Configure the stack. host_loopback lets the sandbox reach a service on
     // the host's own loopback through the gateway address.
     let mut stack = NetStack::builder().host_loopback(options.host_loopback);
@@ -165,6 +155,17 @@ fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
         stack = stack.ipv4_cidr(network, prefix_len);
     }
     let stack = stack.build()?;
+
+    let mut builder = Cage::builder()
+        .rootfs(&options.rootfs)
+        .command(WGET)
+        .args(["-qO-", &options.url.to_string_lossy()]);
+    // Give the sandbox the host's DNS only if the stack forwards to one of its
+    // nameservers.
+    if host_has_forwarded_nameserver(&stack) {
+        builder = builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf");
+    }
+    let cage = builder.build()?;
 
     // Hold the command at the gate, stand the network up in the sandbox's
     // namespace, then release the command so it sees the network from its
@@ -184,8 +185,8 @@ fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
 }
 
 /// Whether the host's `resolv.conf` names a nameserver reachable through the
-/// stack — that is, one that is not a loopback address.
-fn host_has_routable_nameserver() -> bool {
+/// stack, by the stack's own [`forwards`](NetStack::forwards).
+fn host_has_forwarded_nameserver(stack: &NetStack) -> bool {
     let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
         return false;
     };
@@ -203,7 +204,7 @@ fn host_has_routable_nameserver() -> bool {
         address
             .trim()
             .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| !address.is_loopback())
+            .is_ok_and(|address| stack.forwards(std::net::SocketAddr::new(address, 53)))
     })
 }
 

@@ -13,8 +13,6 @@ impl core::marker::UnsafeUnpin for ferroday_cage::host::OverlayBlocker
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::host::OverlayBlocker
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::host::OverlayBlocker
 #[non_exhaustive] pub enum ferroday_cage::host::RangeMapBlocker
-#[non_exhaustive] pub ferroday_cage::host::RangeMapBlocker::HelperCannotMapRoot
-pub ferroday_cage::host::RangeMapBlocker::HelperCannotMapRoot::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::host::RangeMapBlocker::HelperMissing
 pub ferroday_cage::host::RangeMapBlocker::HelperMissing::helper: &'static str
 #[non_exhaustive] pub ferroday_cage::host::RangeMapBlocker::HelperUnprivileged
@@ -2322,6 +2320,7 @@ pub struct ferroday_cage::NetStack
 impl ferroday_cage::NetStack
 pub fn ferroday_cage::NetStack::attach(&self, &ferroday_cage::Pending<'_>) -> core::result::Result<ferroday_cage::NetStackHandle, ferroday_cage::NetStackError>
 pub fn ferroday_cage::NetStack::builder() -> ferroday_cage::NetStackBuilder
+pub fn ferroday_cage::NetStack::forwards(&self, core::net::socket_addr::SocketAddr) -> bool
 impl core::default::Default for ferroday_cage::NetStack
 pub fn ferroday_cage::NetStack::default() -> Self
 impl core::marker::Freeze for ferroday_cage::NetStack

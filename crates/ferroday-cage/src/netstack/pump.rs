@@ -964,6 +964,48 @@ mod tests {
         assert_eq!(host_target(v6("2001:db8::1", 443), &stack.plan), None);
     }
 
+    #[test]
+    fn the_public_question_is_answered_by_the_policy_itself() {
+        // `NetStack::forwards` is how a consumer composing the guest's resolver
+        // configuration asks this, so it must answer as the pump does for every
+        // kind of destination, the resolvers a host lists among them.
+        let resolvers = [
+            v4(9, 9, 9, 9, 53),
+            v4(127, 0, 0, 53, 53),
+            v4(169, 254, 169, 253, 53),
+            v4(10, 0, 2, 3, 53),
+            v4(10, 0, 2, 2, 53),
+            v6("2606:4700:4700::1111", 53),
+            v6("fd00:ec2::253", 53),
+            v6("fe80::1", 53),
+            v6("fd00::2", 53),
+        ];
+        for stack in [
+            NetStack::default(),
+            NetStack::builder()
+                .host_loopback_port(53)
+                .build()
+                .expect("a valid configuration"),
+            NetStack::builder()
+                .ipv6(false)
+                .build()
+                .expect("a valid configuration"),
+        ] {
+            for dst in resolvers {
+                let destination = SocketAddr::from((IpAddr::from(dst.addr), dst.port));
+                assert_eq!(
+                    stack.forwards(destination),
+                    host_target(dst, &stack.plan).is_some(),
+                    "{dst}",
+                );
+            }
+        }
+        let stack = NetStack::default();
+        assert!(stack.forwards("9.9.9.9:53".parse().unwrap()));
+        assert!(!stack.forwards("169.254.169.253:53".parse().unwrap()));
+        assert!(!stack.forwards("[fd00:ec2::253]:53".parse().unwrap()));
+    }
+
     // -- The pump driven over a socket pair ----------------------------------
     //
     // A sequenced-packet socket pair stands in for the tap: each write is one
@@ -1175,15 +1217,7 @@ mod tests {
 
         /// The processor time the pump's thread has used, in clock ticks.
         fn ticks(&self) -> u64 {
-            let stat = std::fs::read_to_string(format!("/proc/self/task/{}/stat", self.tid))
-                .expect("the pump thread's statistics are readable");
-            // After the parenthesised name: state is the first field, and the
-            // user and system times are the twelfth and thirteenth.
-            let fields: Vec<&str> = stat[stat.rfind(')').expect("a name") + 2..]
-                .split_whitespace()
-                .collect();
-            let field = |at: usize| fields[at].parse::<u64>().expect("a tick count");
-            field(11) + field(12)
+            crate::poll::thread_ticks(self.tid)
         }
 
         /// How many ticks the pump's thread uses over `window`.

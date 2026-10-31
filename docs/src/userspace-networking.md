@@ -290,12 +290,14 @@ The stack carries packets; it does not resolve names. A sandbox resolves
 through whatever `/etc/resolv.conf` it has, and that file is the caller's to
 provide. One case needs care: a host running systemd-resolved lists only
 `127.0.0.53`, a loopback stub the stack refuses, so binding that
-`resolv.conf` into the sandbox yields no working DNS. Bind the host's
-`resolv.conf` only when it names a routable (non-loopback) nameserver, point
-the sandbox at a public resolver, or address services by IP. The
-[`fcage`](#the-command-line) command and the `fetch-sandbox` example both
-apply the first rule. Large answers have a size ceiling of their own — see
-[One datagram, one packet](#one-datagram-one-packet).
+`resolv.conf` into the sandbox yields no working DNS. A cloud host's
+link-local resolver is refused the same way. Bind the host's `resolv.conf`
+only when it names a nameserver the stack forwards to, point the sandbox at a
+public resolver, or address services by IP.
+[`forwards`][`NetStack::forwards`] answers the first question for each
+address, by the stack's own rules. The [`fcage`](#the-command-line) command and
+the `fetch-sandbox` example both ask it. Large answers have a size ceiling of
+their own — see [One datagram, one packet](#one-datagram-one-packet).
 
 Reaching a host-local resolver through the gateway is the remaining option,
 and it has a precise requirement: the resolver must listen on `127.0.0.1`,
@@ -336,20 +338,25 @@ being no stack left to attach.
 `fcage` report the port the kernel chose, on standard error, before the command
 starts.
 
-`--netstack` composes the sandbox's `resolv.conf` from the host's routable
-nameservers. A host offering only loopback resolvers composes nothing and warns:
-the sandbox keeps whatever `resolv.conf` its rootfs ships, which may name a
-routable resolver and work perfectly well, so the warning reports what was not
-composed rather than predicting the run's DNS. `--no-resolv-conf` opts out of
-the composition, and so does `--no-managed-mounts`, whose promise is that the
-sandbox carries exactly the binds the command line names; a profile setting
-either toggle governs it the same way. A mount of the caller's own onto
-`/etc/resolv.conf` — `--bind`, `--ro-bind` or `--raw-mount` — replaces the
-composed one rather than sitting under it, so a run that supplies its own
-resolver configuration need not also decline this one. A rootfs that ships no
-`/etc/resolv.conf` gets one created to mount onto and taken away again
-afterwards, as every file bind target does. The flag conflicts with
-`--share-net` and with `--restrict`.
+`--netstack` binds the host's `resolv.conf` into the sandbox when it names a
+nameserver the stack forwards to. A host whose resolvers are all loopback or
+link-local composes nothing and warns. The sandbox then keeps whatever
+`resolv.conf` its rootfs ships, which may name a routable resolver and work
+perfectly well. The warning reports what was not composed rather than
+predicting the run's DNS.
+
+`--no-resolv-conf` opts out of the composition, and so does
+`--no-managed-mounts`, whose promise is that the sandbox carries exactly the
+binds the command line names. A profile setting either toggle governs it the
+same way. A mount of the caller's own onto `/etc/resolv.conf` replaces the
+composed one rather than sitting under it, whether `--bind`, `--ro-bind` or
+`--raw-mount` made it. So does a host directory bound over `/etc`. A run that
+supplies its own resolver configuration therefore need not also decline this
+one. These are the rules the library's own bind follows for a host-network
+sandbox, read from [`get_resolv_conf`][`CageBuilder::get_resolv_conf`]. A
+rootfs that ships no `/etc/resolv.conf` gets one created to mount onto and
+taken away again afterwards, as every file bind target does. The flag conflicts
+with `--share-net` and with `--restrict`.
 
 ### A worked example
 
@@ -416,6 +423,8 @@ interface itself can start from the bare namespace of [`Network::None`].
 [`NetStack`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html
 [`NetStack::attach`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.attach
 [`NetStack::default`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html
+[`NetStack::forwards`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.forwards
+[`CageBuilder::get_resolv_conf`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.get_resolv_conf
 [`NetStackBuilder`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html
 [`NetStackBuilder::ipv4`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv4
 [`NetStackBuilder::ipv6`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv6

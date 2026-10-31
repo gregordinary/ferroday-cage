@@ -499,6 +499,10 @@ An increment resolving against its own empty upper would ask the archive for
 everything the base already has. It would then fail on the packages the binhost
 does not publish.
 
+Each entry is read file by file as the overlay shows it. An entry the upper
+removed is gone. An entry with one file rewritten inside the sandbox holds that
+file in the upper, and the rest are read from the base.
+
 The merge writes the merged view too. A stage3 is merged-usr: `lib64` and
 `sbin` are links into `usr`. A package that still ships `lib64/` or `sbin/`
 lands in the upper's `usr`, beside a copy of the base's link. The merged

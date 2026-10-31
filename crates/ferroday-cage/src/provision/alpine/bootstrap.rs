@@ -44,6 +44,7 @@ use super::installed::{DB_DIR, Database, EXEC_DIR};
 use super::repository::Repository;
 use super::{AlpineError, AlpineEvent, AlpineObserver};
 use crate::provision::Stream;
+use crate::provision::accounts;
 use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
 use crate::{IdentityMap, Observer, Stdio};
@@ -76,25 +77,6 @@ const SCRIPT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// which writes a random id that every machine deployed from the root would
 /// then share.
 const MACHINE_ID: &str = "etc/machine-id";
-
-/// The shadow file, and the copy of its previous version that busybox's
-/// account applets leave beside it on every change.
-///
-/// Both record, for each account, the day its password last changed, and
-/// busybox's `adduser` writes the day it ran there: it reads the clock and no
-/// `SOURCE_DATE_EPOCH`. With an epoch, [`date_accounts`] rewrites what the run
-/// wrote.
-const SHADOW: [&str; 2] = ["etc/shadow", "etc/shadow-"];
-
-/// The seconds in the unit `/etc/shadow` counts in, a day.
-const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
-
-/// The most of a [`SHADOW`] file a host-side step reads.
-///
-/// An account is one line of about a hundred bytes, so this is past a hundred
-/// thousand of them. A script can make the file any length it likes without
-/// writing to it, and this is what such a file meets.
-const MAX_SHADOW: u64 = 16 * 1024 * 1024;
 
 /// The state a finished root hands back to `apk`, beside its database.
 ///
@@ -165,7 +147,7 @@ pub(super) fn configure(
     // What the accounts' dates were before any script ran, so that afterwards
     // the ones the run wrote can be told from the ones it found.
     let found = match site.source_date_epoch {
-        Some(_) => Some(account_dates(&tree, state.beneath)?),
+        Some(_) => Some(accounts::account_dates(&tree, state.beneath).map_err(accounts_failure)?),
         None => None,
     };
 
@@ -225,143 +207,31 @@ fn clear_run_state(tree: &Rooted) -> Result<(), AlpineError> {
         ))
 }
 
-/// What an accounts file holds, as the root the tree belongs to sees it.
-enum Accounts {
-    /// The tree holds the file, with these contents.
-    Held(Vec<u8>),
-    /// The tree holds an overlay whiteout there. A layered build's scripts
-    /// removed the base's file, so the merged root holds none.
-    Removed,
-    /// Nothing occupies the name in the tree.
-    Absent,
-}
-
-impl Accounts {
-    /// Reads the accounts file at `path`, stating what occupies it first.
-    ///
-    /// A whiteout is a character device, and opening one fails, so the kind is
-    /// told apart before anything is opened. Whatever else is there that is not
-    /// a regular file is refused as [`Rooted::read`] refuses it.
-    fn read(tree: &Rooted, path: &str) -> Result<Accounts, AlpineError> {
-        let held = tree
-            .stat(path)
-            .map_err(AlpineError::at("inspecting the accounts", tree.path(path)))?;
-        match held {
-            None => Ok(Accounts::Absent),
-            Some(stat) if Rooted::is_whiteout(&stat) => Ok(Accounts::Removed),
-            Some(_) => tree
-                .read(path, MAX_SHADOW)
-                .map(Accounts::Held)
-                .map_err(AlpineError::at("reading the accounts", tree.path(path))),
-        }
-    }
-}
-
-/// Each account's last-change day as `/etc/shadow` records it before the
-/// scripts run: the file in the tree, or where the tree holds none, the one
-/// beneath it in a layered build. No file is no accounts, and neither is a
-/// whiteout, which removes the base's file from the merged root.
-fn account_dates(
-    tree: &Rooted,
-    beneath: Option<&Rooted>,
-) -> Result<HashMap<Vec<u8>, Vec<u8>>, AlpineError> {
-    let [shadow, _] = SHADOW;
-    let held = match (Accounts::read(tree, shadow)?, beneath) {
-        (Accounts::Absent, Some(beneath)) => Accounts::read(beneath, shadow)?,
-        (held, _) => held,
-    };
-    let Accounts::Held(contents) = held else {
-        return Ok(HashMap::new());
-    };
-    Ok(contents
-        .split(|&byte| byte == b'\n')
-        .filter_map(|line| {
-            let mut fields = line.split(|&byte| byte == b':');
-            let name = fields.next()?;
-            let _password = fields.next()?;
-            Some((name.to_vec(), fields.next()?.to_vec()))
-        })
-        .collect())
-}
-
 /// Records every last-change day the run wrote as the day of `epoch`, in
 /// `/etc/shadow` and in the previous version busybox keeps beside it.
 ///
-/// A day the run wrote is one `found` did not record for that account: every
-/// account the scripts created, and any whose date they changed. The days the
-/// run found stay as they were, so what a package shipped is not rewritten.
-/// A file the tree does not hold, which in a layered build is one the
-/// increment's scripts never touched, is left to the base, and one they
-/// removed is left removed.
-///
-/// The files are rewritten in place, keeping the owner, group, and mode the
-/// scripts gave them. The host side writes them as the calling user, which is
-/// the owner a file created by the sandbox's root has under every identity map.
-/// So each must leave its owner write permission, as the `0640` Alpine ships
-/// does. One a script made read-only, or gave to another account, fails the
-/// bootstrap rather than going undated.
-fn date_accounts(
-    tree: &Rooted,
-    found: &HashMap<Vec<u8>, Vec<u8>>,
-    epoch: i64,
-) -> Result<(), AlpineError> {
-    let day = last_change_day(epoch);
-    for path in SHADOW {
-        let Accounts::Held(contents) = Accounts::read(tree, path)? else {
-            continue;
-        };
-        if let Some(dated) = dated(&contents, found, day.as_bytes()) {
-            tree.overwrite(path, &dated)
-                .map_err(AlpineError::at("dating the accounts", tree.path(path)))?;
-        }
-    }
-    Ok(())
+/// busybox's `adduser` writes the day it ran there: it reads the clock and no
+/// `SOURCE_DATE_EPOCH`. Every day the run wrote, and only those, is rewritten,
+/// as [`accounts::redate`] describes, to the epoch's
+/// [`last_change_day`](accounts::last_change_day). A field is a day where it
+/// [holds one](is_day).
+fn date_accounts(tree: &Rooted, found: &accounts::Dates, epoch: i64) -> Result<(), AlpineError> {
+    let day = accounts::last_change_day(epoch);
+    accounts::redate(tree, found, day.as_bytes(), is_day).map_err(accounts_failure)
 }
 
-/// The last-change field `/etc/shadow` records for a change at `epoch`: the
-/// day it falls on, counted from 1970.
+/// Whether a last-change field holds a day: a decimal number other than zero.
 ///
-/// Except for day zero, which is empty. A last-change day of zero is not a
-/// date to `shadow(5)` but a demand that the password be changed at the next
-/// login, and an empty field disables password aging instead. That is what
-/// shadow-utils' `useradd` writes for the same epoch.
-fn last_change_day(epoch: i64) -> String {
-    match epoch / SECONDS_PER_DAY {
-        0 => String::new(),
-        day => day.to_string(),
-    }
+/// An empty field disables aging and a zero demands a new password at the next
+/// login, so neither is a date. A script that expires a password writes the
+/// zero, and dating it would withdraw the demand.
+fn is_day(field: &[u8]) -> bool {
+    field.iter().all(u8::is_ascii_digit) && field.iter().any(|&digit| digit != b'0')
 }
 
-/// `contents` with every last-change day `found` does not record for its
-/// account replaced by `day`, or `None` where there is none to replace.
-///
-/// Only the third field of a line is touched, and only where it holds a day:
-/// a decimal number other than zero. An empty field disables aging and a zero
-/// demands a new password at the next login, so neither is a date to replace,
-/// and a line with fewer fields is not an account. Every other byte, line
-/// endings included, is kept as it stands.
-fn dated(contents: &[u8], found: &HashMap<Vec<u8>, Vec<u8>>, day: &[u8]) -> Option<Vec<u8>> {
-    let is_day = |field: &[u8]| {
-        field.iter().all(u8::is_ascii_digit) && field.iter().any(|&digit| digit != b'0')
-    };
-    let mut changed = false;
-    let lines: Vec<Vec<u8>> = contents
-        .split(|&byte| byte == b'\n')
-        .map(|line| {
-            let mut fields: Vec<&[u8]> = line.split(|&byte| byte == b':').collect();
-            let written = fields.len() >= 3
-                && is_day(fields[2])
-                && fields[2] != day
-                && found.get(fields[0]).map(Vec::as_slice) != Some(fields[2]);
-            if !written {
-                return line.to_vec();
-            }
-            changed = true;
-            fields[2] = day;
-            fields.join(&b':')
-        })
-        .collect();
-    changed.then(|| lines.join(&b'\n'))
+/// An accounts step's failure, reported as this layer's own.
+fn accounts_failure(failure: accounts::Failure) -> AlpineError {
+    AlpineError::io(failure.op, failure.path, failure.source)
 }
 
 /// Runs the `.trigger` script of every package whose watched paths the finished
@@ -1090,12 +960,22 @@ mod tests {
         (scratch, tree)
     }
 
-    /// The accounts `found` in a shadow file, as `account_dates` records them.
-    fn found(lines: &[(&str, &str)]) -> HashMap<Vec<u8>, Vec<u8>> {
+    /// The accounts `found` in a shadow file, as `accounts::account_dates`
+    /// records them.
+    fn found(lines: &[(&str, &str)]) -> accounts::Dates {
         lines
             .iter()
             .map(|(name, day)| (name.as_bytes().to_vec(), day.as_bytes().to_vec()))
             .collect()
+    }
+
+    /// Dates the shadow file `after` in a scratch tree as a run that found
+    /// `before` and was given `epoch`, and returns what the file then holds.
+    fn date(tag: &str, before: &accounts::Dates, after: &[u8], epoch: i64) -> Vec<u8> {
+        let (staging, tree) = rooted_tree(tag);
+        tree.write_mode("etc/shadow", after, 0o640).unwrap();
+        date_accounts(&tree, before, epoch).expect("the accounts are dated");
+        std::fs::read(staging.join("etc/shadow")).unwrap()
     }
 
     #[test]
@@ -1105,128 +985,10 @@ mod tests {
         let before = found(&[("root", ""), ("bin", "0"), ("daemon", "19000")]);
         let after = b"root:::0:::::\nbin:!:0:0:::::\ndaemon:!:20722:0:::::\n\
                       klogd:!:20722:0:99999:7:::\n";
-        let dated = dated(after, &before, b"19675").expect("the run wrote dates");
         assert_eq!(
-            dated,
+            date("dated", &before, after, 1_700_000_000),
             b"root:::0:::::\nbin:!:0:0:::::\ndaemon:!:19675:0:::::\n\
               klogd:!:19675:0:99999:7:::\n"
-        );
-        // Nothing to date is no rewrite, and one already at the epoch's day is
-        // nothing to date.
-        assert_eq!(super::dated(&dated, &before, b"19675"), None);
-    }
-
-    #[test]
-    fn a_line_that_is_not_an_account_is_kept_as_it_stands() {
-        // Too few fields, an empty line, and no trailing newline: none is an
-        // account, and the bytes around the one rewrite are untouched.
-        let after = b"garbage\n\nnew:!:20722";
-        assert_eq!(
-            dated(after, &found(&[]), b"1").as_deref(),
-            Some(&b"garbage\n\nnew:!:1"[..]),
-        );
-    }
-
-    #[test]
-    fn the_accounts_are_dated_in_place_in_both_files() {
-        let (staging, tree) = rooted_tree("shadow");
-        let shipped = b"root:::0:::::\n";
-        tree.write_mode("etc/shadow", shipped, 0o640).unwrap();
-        let before = account_dates(&tree, None).expect("the accounts read");
-
-        // What busybox's adduser leaves: the file with the new account, and the
-        // previous version beside it.
-        tree.overwrite("etc/shadow", b"root:::0:::::\nklogd:!:20722:0:99999:7:::\n")
-            .unwrap();
-        tree.write_mode(
-            "etc/shadow-",
-            b"root:::0:::::\nklogd:!:20722:0:99999:7:::\n",
-            0o640,
-        )
-        .unwrap();
-        use std::os::unix::fs::MetadataExt;
-        let inode = std::fs::metadata(staging.join("etc/shadow")).unwrap().ino();
-
-        date_accounts(&tree, &before, 1_700_000_000).expect("the accounts are dated");
-
-        for path in SHADOW {
-            assert_eq!(
-                std::fs::read(staging.join(path)).unwrap(),
-                b"root:::0:::::\nklogd:!:19675:0:99999:7:::\n",
-                "{path}",
-            );
-        }
-        assert_eq!(
-            std::fs::metadata(staging.join("etc/shadow")).unwrap().ino(),
-            inode
-        );
-    }
-
-    #[test]
-    fn a_layered_build_reads_the_accounts_of_the_base_beneath_it() {
-        // The upper holds no shadow file until a script writes one, so what the
-        // run found is the base's.
-        let (_base_dir, base) = rooted_tree("shadow-base");
-        base.write("etc/shadow", b"root:::0:::::\nklogd:!:19000:0:99999:7:::\n")
-            .unwrap();
-        let (_upper_dir, upper) = rooted_tree("shadow-upper");
-        let before = account_dates(&upper, Some(&base)).expect("the accounts read");
-        assert_eq!(before, found(&[("root", ""), ("klogd", "19000")]));
-
-        // An upper that holds none after the run is left to the base.
-        date_accounts(&upper, &before, 1_700_000_000).expect("nothing to date");
-        assert!(!upper.exists("etc/shadow").unwrap());
-    }
-
-    /// Records an overlay whiteout at `relative` in `tree`, as an overlay
-    /// upper does for a name a script removed from the merged root, or reports
-    /// why the host refused to.
-    fn whiteout(staging: &Path, relative: &str) -> Result<(), rustix::io::Errno> {
-        let parent = staging.join(relative).parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&parent).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            staging.join(relative),
-            rustix::fs::FileType::CharacterDevice,
-            rustix::fs::Mode::from_raw_mode(0),
-            0,
-        )
-    }
-
-    #[test]
-    fn a_whiteout_at_the_accounts_is_a_root_with_none() {
-        // A layered build whose scripts removed the base's files: the merged
-        // root holds neither, so the run found no accounts and has none to date.
-        let (_base_dir, base) = rooted_tree("whiteout-base");
-        base.write("etc/shadow", b"root:::0:::::\nklogd:!:19000:0:99999:7:::\n")
-            .unwrap();
-        let (upper_dir, upper) = rooted_tree("whiteout-upper");
-        for path in SHADOW {
-            if let Err(errno) = whiteout(&upper_dir, path) {
-                // Linux 5.8 is the first to let an unprivileged caller record
-                // one.
-                eprintln!("skipping: the host refused an unprivileged whiteout: {errno}");
-                return;
-            }
-        }
-
-        let before = account_dates(&upper, Some(&base)).expect("the accounts read");
-        assert_eq!(before, HashMap::new(), "the base's file is not consulted");
-        date_accounts(&upper, &before, 1_700_000_000).expect("nothing to date");
-        for path in SHADOW {
-            let stat = upper.stat(path).unwrap().expect("the whiteout is kept");
-            assert!(Rooted::is_whiteout(&stat), "{path}");
-        }
-
-        // Beside a file the scripts did write, the whiteout is still none.
-        upper.remove("etc/shadow").unwrap();
-        upper
-            .write("etc/shadow", b"klogd:!:20722:0:99999:7:::\n")
-            .unwrap();
-        date_accounts(&upper, &before, 1_700_000_000).expect("the accounts are dated");
-        assert_eq!(
-            upper.read("etc/shadow", MAX_SHADOW).unwrap(),
-            b"klogd:!:19675:0:99999:7:::\n"
         );
     }
 
@@ -1234,15 +996,14 @@ mod tests {
     fn the_first_day_of_1970_records_no_date() {
         // A day of zero would demand every account's password be changed at
         // its next login; an empty field disables aging, as useradd writes.
-        assert_eq!(last_change_day(0), "");
-        assert_eq!(last_change_day(86_399), "");
-        assert_eq!(last_change_day(86_400), "1");
-        assert_eq!(last_change_day(1_700_000_000), "19675");
-
         let after = b"root:::0:::::\nklogd:!:20722:0:99999:7:::\n";
-        let dated = dated(after, &found(&[("root", "")]), b"").expect("the run wrote a date");
-        assert_eq!(dated, b"root:::0:::::\nklogd:!::0:99999:7:::\n");
-        assert_eq!(super::dated(&dated, &found(&[("root", "")]), b""), None);
+        for epoch in [0, 86_399] {
+            assert_eq!(
+                date("dated-day-zero", &found(&[("root", "")]), after, epoch),
+                b"root:::0:::::\nklogd:!::0:99999:7:::\n",
+                "{epoch}",
+            );
+        }
     }
 
     #[test]
@@ -1250,8 +1011,12 @@ mod tests {
         // A script that expires a password writes a zero, which is not a day
         // the run happened on; dating it would withdraw the demand. Nor is
         // anything that is not a decimal number.
+        for field in [&b"0"[..], b"00", b"", b"x1", b"-1"] {
+            assert!(!is_day(field), "{:?}", String::from_utf8_lossy(field));
+        }
+        assert!(is_day(b"20722") && is_day(b"01"));
         let after = b"root:!:0:0:::::\nodd:!:x1:0:::::\n";
-        assert_eq!(dated(after, &found(&[]), b"19675"), None);
+        assert_eq!(date("expired", &found(&[]), after, 1_700_000_000), after);
     }
 
     #[test]

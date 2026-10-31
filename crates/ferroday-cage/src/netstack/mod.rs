@@ -225,6 +225,34 @@ impl NetStack {
         NetStackBuilder::default()
     }
 
+    /// Whether the stack carries the guest's traffic to `destination` on to the
+    /// host.
+    ///
+    /// This is the forwarding policy every attachment applies, asked of one
+    /// destination, TCP and UDP alike. It answers `false` for a destination the
+    /// stack refuses: loopback, link-local, multicast, AWS's IPv6 instance
+    /// services, the guest's own subnet, and a protocol the configuration turns
+    /// off. The gateway address is carried only on a port
+    /// [`host_loopback`](NetStackBuilder::host_loopback) or
+    /// [`host_loopback_port`](NetStackBuilder::host_loopback_port) admits.
+    ///
+    /// A caller composing the guest's configuration asks this rather than
+    /// restating the rules. `fcage --netstack` binds the host's `resolv.conf`
+    /// only where it names a nameserver the stack forwards to on port 53.
+    ///
+    /// ```
+    /// use ferroday_cage::NetStack;
+    ///
+    /// let stack = NetStack::default();
+    /// assert!(stack.forwards("192.0.2.53:53".parse().unwrap()));
+    /// // systemd-resolved's stub, and AWS's IPv4 resolver.
+    /// assert!(!stack.forwards("127.0.0.53:53".parse().unwrap()));
+    /// assert!(!stack.forwards("169.254.169.253:53".parse().unwrap()));
+    /// ```
+    pub fn forwards(&self, destination: SocketAddr) -> bool {
+        pump::host_target(destination.into(), &self.plan).is_some()
+    }
+
     /// Attaches the stack to a pending sandbox launch.
     ///
     /// A forked helper process joins the sandbox's user and network

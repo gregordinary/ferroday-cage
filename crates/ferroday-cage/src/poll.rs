@@ -4,11 +4,27 @@
 //! Both answers are subtle enough to be worth stating once. The supervisor
 //! loop, the network stack's pump, and the terminal relay each block in `poll`
 //! with a deadline and each retire channels as they close.
+//!
+//! # A retired channel leaves the polled slice
+//!
+//! A loop that has finished with a channel stops watching it by not passing
+//! it to `poll` at all. `poll` reports `POLLHUP`, `POLLERR`, and `POLLNVAL`
+//! whatever events were requested, so a slot left in the slice with no events
+//! asked of it is not quiet. On a closed or hung-up descriptor it is ready on
+//! every pass, and the loop spins at full CPU without ever blocking.
+//!
+//! Substituting another descriptor in the retired slot fails the same way
+//! unless that descriptor can never hang up, which is a property of its kind
+//! rather than of who holds it. A pidfd is the trap here: the loop holds it
+//! for its whole life and it stays valid, yet it reports `POLLHUP` once its
+//! process has been reaped. So no slot holds a placeholder. The supervisor
+//! loop gathers its live channels to the front of a fixed array and polls only
+//! those. The terminal relay's one retiring channel, the caller's input, is
+//! last, so it shortens the slice.
 
-use std::os::fd::OwnedFd;
 use std::time::Duration;
 
-use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::event::Timespec;
 
 /// Converts a remaining duration into a `poll` timeout.
 ///
@@ -25,31 +41,20 @@ pub(crate) fn timeout(duration: Duration) -> Timespec {
     }
 }
 
-/// Builds the poll entry for a channel: the channel's descriptor when it is
-/// live, and otherwise `placeholder` with no requested events.
+/// The processor time the thread `tid` of this process has used, in clock
+/// ticks: what a test holding a loop to blocking measures it by.
 ///
-/// # Why a placeholder rather than a muted descriptor
-///
-/// A loop that has finished with a channel has three ways to stop watching its
-/// slot, and only two of them work:
-///
-/// - Substitute a *different*, live descriptor with `PollFlags::empty()`, as
-///   this does. The slot stays quiet because the substitute can neither hang up
-///   nor be invalid for as long as the loop holds it.
-/// - Shorten the polled slice so the slot is not passed at all, which needs the
-///   retiring channel to be last.
-/// - Mute the *real* descriptor with `PollFlags::empty()`. This does not work.
-///   `poll` reports `POLLHUP`, `POLLERR`, and `POLLNVAL` whatever the requested
-///   events are, so a muted slot on a closed or hung-up descriptor is ready on
-///   every pass and the loop spins at full CPU without ever blocking.
-///
-/// The placeholder here is the supervisor's own pidfd, which the loop owns for
-/// its whole life, so the first technique holds. A loop whose retiring channel
-/// is naturally last — the terminal relay's caller-side input — uses the
-/// second.
-pub(crate) fn slot<'fd>(fd: &'fd Option<OwnedFd>, placeholder: &'fd OwnedFd) -> PollFd<'fd> {
-    match fd {
-        Some(fd) => PollFd::new(fd, PollFlags::IN),
-        None => PollFd::new(placeholder, PollFlags::empty()),
-    }
+/// A loop that blocks uses next to none over a window it waits through, and
+/// one that spins uses the whole window. The user and system times are fields
+/// 14 and 15 of the thread's `stat`. They are counted from the state, field 3,
+/// which follows the parenthesised name, since the name may hold spaces.
+#[cfg(test)]
+pub(crate) fn thread_ticks(tid: i32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+        .expect("a thread's statistics are readable");
+    let fields: Vec<&str> = stat[stat.rfind(')').expect("a name") + 2..]
+        .split_whitespace()
+        .collect();
+    let field = |at: usize| fields[at].parse::<u64>().expect("a tick count");
+    field(11) + field(12)
 }

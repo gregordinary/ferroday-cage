@@ -2257,6 +2257,56 @@ fn a_dated_bootstrap_keeps_the_epoch_and_no_record_of_its_run() {
     provision::remove(&rootfs).expect("the removal succeeds");
 }
 
+/// A bootstrap dated in 1970's first day, `SOURCE_DATE_EPOCH=0` being a common
+/// pipeline value: no account demands a new password at its next login.
+///
+/// shadow's tools leave the last-change field empty for that day, and
+/// `systemd-sysusers` writes it as a zero, which `shadow(5)` reads as that
+/// demand. The bootstrap records every one of them as `useradd` does.
+#[cfg(feature = "subid")]
+#[test]
+fn a_bootstrap_dated_in_the_first_day_of_1970_records_no_date() {
+    if !network_enabled() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    if ferroday_cage::host::range_map_blocker().is_some() {
+        eprintln!("skipping: no delegate can establish a range map");
+        return;
+    }
+    let scratch = common::scratch_dir("debian-dated-day-zero");
+    let rootfs = scratch.join("rootfs");
+    {
+        let mut debian = Debian::builder("trixie")
+            .include(["systemd", "dbus"])
+            .identity_map(ferroday_cage::IdentityMap::Subordinate)
+            .source_date_epoch(0)
+            .cache_dir(common::download_cache("debian"))
+            .build()
+            .expect("the builder validates");
+        provision::ensure(&rootfs, &mut debian).expect("the dated bootstrap runs");
+    }
+
+    let shadow = std::fs::read_to_string(rootfs.join("etc/shadow")).expect("the shadow file reads");
+    assert!(
+        shadow
+            .lines()
+            .any(|line| line.starts_with("systemd-network:")),
+        "systemd-sysusers created its accounts: {shadow}"
+    );
+    for account in shadow.lines() {
+        assert_eq!(
+            account.split(':').nth(2),
+            Some(""),
+            "{account} records no date"
+        );
+    }
+
+    provision::remove(&rootfs).expect("the removal succeeds");
+}
+
 /// A payload for a fixture package: one file under `/usr/bin` named for it.
 fn payload(name: &str) -> Vec<u8> {
     deb(&Tar::new()

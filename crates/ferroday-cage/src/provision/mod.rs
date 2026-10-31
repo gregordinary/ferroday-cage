@@ -46,6 +46,8 @@ use crate::failure::path_io_error;
 use crate::mechanism::frame;
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
+mod accounts;
+#[cfg(any(feature = "debian", feature = "alpine"))]
 mod available;
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod binfmt;

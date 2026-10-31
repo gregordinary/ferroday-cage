@@ -748,7 +748,12 @@ a shared parent safe: the mount options name the layers as paths, and the kernel
 resolves them again at mount time.
 
 On the command line, `--overlay-lower` and `--overlay-upper` stand in for
-`--rootfs`.
+`--rootfs`, and `--remove-overlay-upper` discards the upper with its work
+directory:
+
+```sh
+fcage --remove-overlay-upper /var/cache/myapp/run-42 --identity-map single
+```
 
 ## Custom provisioners
 

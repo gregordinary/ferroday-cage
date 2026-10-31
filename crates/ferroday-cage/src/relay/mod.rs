@@ -174,8 +174,8 @@ const RELAY_BUF: usize = 8192;
 /// what keeps the loop from spinning. `poll` reports `POLLHUP`, `POLLERR`, and
 /// `POLLNVAL` whatever the requested events are, so a muted slot on a hung-up
 /// pipe — `producer | relaying-program ...` after the producer exits — is ready
-/// on every pass and the loop never blocks again. [`poll::slot`] states the
-/// other technique that works, for the loops whose retiring channel is not last.
+/// on every pass and the loop never blocks again. The [`poll`] module states
+/// the rule, and how a loop whose retiring channels are not last keeps it.
 ///
 /// The other two indices stay stable across the change, and an unpolled slot's
 /// `revents` stays as `PollFd::new` left it: empty.

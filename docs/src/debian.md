@@ -1052,6 +1052,11 @@ instead. Every maintainer script receives it as `SOURCE_DATE_EPOCH`, the
 reproducible-builds convention, so each account records the epoch's day rather
 than the day the bootstrap ran.
 
+An epoch in the first day of 1970 records an empty field instead. A day of zero
+is a demand for a new password to `/etc/shadow`. The shadow suite's tools leave
+the field empty for that day, and `systemd-sysusers` writes a zero. The
+bootstrap empties each zero its run wrote once the scripts have run.
+
 ```rust,no_run
 use ferroday_cage::IdentityMap;
 use ferroday_cage::provision::{self, Export, debian::{Debian, Plan}};

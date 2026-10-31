@@ -186,18 +186,6 @@ pub enum RangeMapBlocker {
         /// The unprivileged helper.
         path: PathBuf,
     },
-    /// The helper carries file capabilities without `CAP_SETFCAP`, so the
-    /// kernel refuses to let it map uid 0.
-    ///
-    /// shadow builds before 4.11.1 granted only `CAP_SETUID`; every map
-    /// this library establishes contains uid 0, which since Linux 5.12
-    /// requires the writer to also hold `CAP_SETFCAP`. Setuid-root helpers
-    /// are unaffected.
-    #[non_exhaustive]
-    HelperCannotMapRoot {
-        /// The affected helper.
-        path: PathBuf,
-    },
     /// A subordinate file is a symbolic link, which the helpers refuse.
     ///
     /// `newuidmap` opens the file with `O_NOFOLLOW` and reports the
@@ -249,12 +237,6 @@ impl fmt::Display for RangeMapBlocker {
                 "{} is neither setuid-root nor granted a file capability, so it cannot \
                  establish maps; reinstall the shadow suite's subordinate-id helpers or \
                  restore the packaged privilege",
-                path.display(),
-            ),
-            RangeMapBlocker::HelperCannotMapRoot { path } => write!(
-                f,
-                "{} carries file capabilities without CAP_SETFCAP and so cannot map uid 0 \
-                 (shadow before 4.11.1); upgrade the shadow suite",
                 path.display(),
             ),
             RangeMapBlocker::SubordinateFileSymlink { path } => write!(
@@ -553,11 +535,20 @@ fn overlay_mount_probe(base: &Path) -> Option<crate::mechanism::OverlayProbe> {
 /// the kernel's map write both require the capabilities effective and do not
 /// raise them from the permitted set, so a caller that has parked them in
 /// `permitted` — after a privilege-lowering wrapper, say — reads as needing
-/// the delegate until it raises them into effective itself. A map whose
-/// outside ids include uid 0 needs `CAP_SETFCAP` as well; that is a property
-/// of the request, which the probe does not know, so the build judges it. The probe is
-/// best-effort and read-only; `None` is an absence of known blockers, not a
-/// guarantee.
+/// the delegate until it raises them into effective itself.
+///
+/// A map naming the parent namespace's uid 0 among its outside ids needs
+/// `CAP_SETFCAP` as well. That is a property of the request, which the probe
+/// does not know: for a direct write the build judges it. Only a root caller's
+/// own uid is outside uid 0, so an unprivileged caller's delegated map never
+/// names it. A root caller's exec of a helper grants every capability in its
+/// bounding set, whatever capabilities the helper's file carries, unless the
+/// caller set `SECBIT_NOROOT`. shadow's helpers keep `CAP_SETFCAP` for such a
+/// map since shadow 4.9. So a helper's own file capabilities do not decide it,
+/// and the probe does not read them for it.
+///
+/// The probe is best-effort and read-only; `None` is an absence of known
+/// blockers, not a guarantee.
 pub fn range_map_blocker() -> Option<RangeMapBlocker> {
     // A caller holding CAP_SETUID and CAP_SETGID in its effective set writes
     // maps directly; nothing else matters. The effective set is the right
@@ -603,16 +594,8 @@ fn delegated_blocker() -> Option<RangeMapBlocker> {
         let Some(path) = find_on_path(helper) else {
             return Some(RangeMapBlocker::HelperMissing { helper });
         };
-        match helper_privilege(&path, capability) {
-            HelperPrivilege::SetuidRoot | HelperPrivilege::FileCaps { setfcap: true } => {}
-            // CAP_SETGID needs no CAP_SETFCAP: only mapping uid 0 does.
-            HelperPrivilege::FileCaps { setfcap: false } if helper == "newgidmap" => {}
-            HelperPrivilege::FileCaps { setfcap: false } => {
-                return Some(RangeMapBlocker::HelperCannotMapRoot { path });
-            }
-            HelperPrivilege::None => {
-                return Some(RangeMapBlocker::HelperUnprivileged { path });
-            }
+        if helper_privilege(&path, capability) == HelperPrivilege::None {
+            return Some(RangeMapBlocker::HelperUnprivileged { path });
         }
     }
 
@@ -648,13 +631,18 @@ fn delegated_blocker() -> Option<RangeMapBlocker> {
 }
 
 /// How a shadow helper holds its privilege, if at all.
+///
+/// A file-capability helper needs only the one capability its map file asks
+/// for. `CAP_SETFCAP` matters only to a map naming the parent namespace's uid 0,
+/// which is a root caller's, and a root caller's exec does not take its
+/// capabilities from the file; see [`range_map_blocker`].
 #[cfg(feature = "subid")]
+#[derive(Debug, PartialEq, Eq)]
 enum HelperPrivilege {
     /// Setuid-root: full privilege when run.
     SetuidRoot,
-    /// File capabilities carrying the needed `CAP_SETUID`/`CAP_SETGID`;
-    /// `setfcap` reports whether `CAP_SETFCAP` accompanies it.
-    FileCaps { setfcap: bool },
+    /// File capabilities carrying the needed `CAP_SETUID`/`CAP_SETGID`.
+    FileCaps,
     /// Neither: the helper cannot work.
     None,
 }
@@ -683,17 +671,28 @@ fn helper_privilege(
         return HelperPrivilege::SetuidRoot;
     }
 
-    // The VFS capability attribute: a little-endian magic/version word, then
-    // per-word permitted and inheritable masks. CAP_SETUID, CAP_SETGID, and
-    // CAP_SETFCAP all live in the low word, the attribute's second u32.
     let mut buf = [0u8; 40];
     let Ok(len) = rustix::fs::getxattr(path, "security.capability", &mut buf[..]) else {
         return HelperPrivilege::None;
     };
-    if len < 8 {
+    file_capability_privilege(&buf[..len], capability)
+}
+
+/// What a helper's `security.capability` attribute grants it, for a helper
+/// that needs `capability`.
+///
+/// The attribute is a little-endian magic/version word, then per-word
+/// permitted and inheritable masks. `CAP_SETUID` and `CAP_SETGID` both live in
+/// the low word, the attribute's second `u32`.
+#[cfg(feature = "subid")]
+fn file_capability_privilege(
+    attribute: &[u8],
+    capability: rustix::thread::CapabilitySet,
+) -> HelperPrivilege {
+    let (Some(magic), Some(permitted_low)) = (attribute.get(0..4), attribute.get(4..8)) else {
         return HelperPrivilege::None;
-    }
-    let magic = u32::from_le_bytes(buf[0..4].try_into().expect("slice length is 4"));
+    };
+    let magic = u32::from_le_bytes(magic.try_into().expect("slice length is 4"));
     // The effective bit rides in the magic word. Without it the capability is
     // permitted but not raised at exec, so a helper that is not itself
     // capability-aware — and `newuidmap` is not — runs without it and fails.
@@ -702,12 +701,11 @@ fn helper_privilege(
     if magic & VFS_CAP_FLAGS_EFFECTIVE == 0 {
         return HelperPrivilege::None;
     }
-    let permitted_low = u32::from_le_bytes(buf[4..8].try_into().expect("slice length is 4"));
+    let permitted_low = u32::from_le_bytes(permitted_low.try_into().expect("slice length is 4"));
     if u64::from(permitted_low) & capability.bits() == 0 {
         return HelperPrivilege::None;
     }
-    let setfcap = u64::from(permitted_low) & rustix::thread::CapabilitySet::SETFCAP.bits() != 0;
-    HelperPrivilege::FileCaps { setfcap }
+    HelperPrivilege::FileCaps
 }
 
 /// Finds an executable on `PATH`, returning its absolute path.
@@ -752,6 +750,64 @@ mod tests {
         // The result is host-dependent; the probe itself must always be safe
         // to call.
         let _ = userns_blocker();
+    }
+
+    /// A `security.capability` attribute of the second revision: the magic
+    /// word with the effective flag where asked for, then the permitted and
+    /// inheritable masks of the low and high words.
+    #[cfg(feature = "subid")]
+    fn capability_attribute(effective: bool, permitted_low: u32) -> Vec<u8> {
+        const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+        let flags = if effective {
+            VFS_CAP_FLAGS_EFFECTIVE
+        } else {
+            0
+        };
+        let magic = VFS_CAP_REVISION_2 | flags;
+        [magic, permitted_low, 0, 0, 0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+    }
+
+    /// shadow installs `newuidmap` with `cap_setuid+ep` and nothing else, and
+    /// that helper writes every map an unprivileged caller can ask for: only a
+    /// map naming the parent's uid 0 needs `CAP_SETFCAP`, and that map is a
+    /// root caller's, whose exec does not take its capabilities from the file.
+    #[cfg(feature = "subid")]
+    #[test]
+    fn a_helper_granted_only_its_own_capability_is_a_working_one() {
+        use rustix::thread::CapabilitySet;
+
+        let setuid = u32::try_from(CapabilitySet::SETUID.bits()).expect("a low-word capability");
+        let setgid = u32::try_from(CapabilitySet::SETGID.bits()).expect("a low-word capability");
+        assert_eq!(
+            file_capability_privilege(&capability_attribute(true, setuid), CapabilitySet::SETUID),
+            HelperPrivilege::FileCaps,
+        );
+        assert_eq!(
+            file_capability_privilege(&capability_attribute(true, setgid), CapabilitySet::SETGID),
+            HelperPrivilege::FileCaps,
+        );
+
+        // The capability the map file asks for is the one that counts.
+        assert_eq!(
+            file_capability_privilege(&capability_attribute(true, setgid), CapabilitySet::SETUID),
+            HelperPrivilege::None,
+        );
+        // Permitted but not raised at exec, which `newuidmap` does not do itself.
+        assert_eq!(
+            file_capability_privilege(&capability_attribute(false, setuid), CapabilitySet::SETUID),
+            HelperPrivilege::None,
+        );
+        // An attribute too short to carry a permitted mask grants nothing.
+        assert_eq!(
+            file_capability_privilege(
+                &capability_attribute(true, setuid)[..6],
+                CapabilitySet::SETUID
+            ),
+            HelperPrivilege::None,
+        );
     }
 
     #[test]

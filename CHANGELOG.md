@@ -206,10 +206,22 @@ consumer upgrading can skip it.
   `[[publish]]` tables of `host` and `guest-port`. `fcage`: `--netstack-publish
   HOST GUEST_PORT`, which reports a kernel-chosen port on standard error and
   refuses a guest port of 0 as a usage error.
+- `NetStack::forwards`, which answers whether the stack carries the guest's
+  traffic to a destination: the forwarding policy every attachment applies,
+  asked of one address.
+- `provision::Remove::overlay_upper`, which removes the upper layer of an
+  overlay root together with the work directory the library manages beside it,
+  and leaves the publication lock alone. `provision::remove`, which the guide
+  had named for this, leaves the work directory behind. `fcage`:
+  `--remove-overlay-upper DIR`, which takes `--identity-map` as
+  `--remove-rootfs` does.
 - `DebianBuilder::source_date_epoch`, which gives every maintainer script
   `SOURCE_DATE_EPOCH`, so the accounts a bootstrap creates record the epoch's
-  day in `/etc/shadow` rather than the day it ran. A negative epoch is refused
-  at `build`. `fcage`: `--debian-source-date-epoch EPOCH`.
+  day in `/etc/shadow` rather than the day it ran. An epoch in the first day of
+  1970 records no day, as `useradd` does; the zero `systemd-sysusers` writes for
+  it is emptied once the scripts have run. A negative epoch is refused at
+  `build`. `fcage`: `--debian-source-date-epoch EPOCH`, which refuses a negative
+  epoch as a usage error.
 - `AlpineBuilder::source_date_epoch`, which gives every install script
   `SOURCE_DATE_EPOCH` and dates the accounts a bootstrap creates by the epoch's
   day. busybox's `adduser` reads the clock whatever the environment says, so the
@@ -296,6 +308,13 @@ consumer upgrading can skip it.
   `#[non_exhaustive]`, as every other struct variant is. A pattern naming their
   fields needs `..`, and they cannot be constructed outside the crate.
   `ResolvedHardening::Applied` gains `landlock_scope`.
+- **Breaking.** `RangeMapBlocker::HelperCannotMapRoot` is removed, and
+  `host::range_map_blocker` no longer reports a `newuidmap` whose file
+  capabilities lack `CAP_SETFCAP`. That is how shadow installs the helper, and
+  it writes every map an unprivileged caller can ask for: Linux wants
+  `CAP_SETFCAP` only for a map naming the parent's uid 0, which only a root
+  caller's map does, and a root caller's helper does not take its capabilities
+  from the file. Match on the remaining variants.
 - Extraction resolves a symbolic link in the tree as the root filesystem does:
   an absolute link re-anchors at the destination, so `var/run -> /run` carries
   an entry beneath it to the root's own `run/`, and the pre-configure overlay
@@ -304,6 +323,10 @@ consumer upgrading can skip it.
   refused with `ProvisionError::EntryRefused`. Nothing is written outside the
   destination either way, and an entry whose own path is absolute or contains
   `..` is still `EntryUnsafe`.
+- `CageBuilder::get_resolv_conf` also answers `false` where a mount of the
+  caller's claims `/etc/resolv.conf`: one at the path, or a host tree bound or
+  moved over a directory above it. Those mounts replace the library's bind, and
+  the getter now says so.
 - An export leaves out the extended attributes the host assigns rather than the
   tree carries: security-module labels (`security.selinux`, `security.SMACK64*`,
   `security.apparmor`), integrity measurements (`security.ima`, `security.evm`),
@@ -373,6 +396,10 @@ consumer upgrading can skip it.
   the profile with `NestedUsernsNeedsProcfs`, since neither mounts anything over
   the procfs. A raw move is read as `mount(2)` reads it, and a move naming
   `proc` serves only where its source is a procfs.
+- Waiting on a sandbox without a PID namespace no longer spins at full CPU while
+  a process the command left behind holds its captured output open. The wait
+  watched the exited command's pidfd in place of each finished channel, and a
+  pidfd reports a hangup once its process is reaped.
 - `Relay::run`, and so `fcage --terminal`, honors the `Escalation` deadline and
   the relayed signals until the command's exit is collected. End-of-file on the
   sandbox's terminal ended the session's supervision, so a command that closed
@@ -391,6 +418,11 @@ consumer upgrading can skip it.
 - `NetStackBuilder::build` refuses an interface name holding a vertical tab or
   the byte `0xA0`, which the kernel refuses, rather than failing at `attach` as
   `TapCreate`.
+- `fcage --netstack` binds the host's `resolv.conf` only when it names a
+  nameserver the stack forwards to. A link-local resolver, such as AWS's
+  `169.254.169.253`, was counted as reachable and bound into a sandbox that
+  could not reach it. A host directory bound over `/etc` replaces the composed
+  bind, as it replaces the library's own.
 - `fcage --export-rootfs` and `--export-to` refuse a value spelled as another
   flag, as every other flag does. `--export-to --clamp-mtime=0` wrote an archive
   named `--clamp-mtime=0`, without the clamp, and exited 0.
@@ -409,6 +441,12 @@ consumer upgrading can skip it.
   entry that is not a directory is refused over a directory the base holds, and
   one beneath a base directory the calling user cannot search fails naming the
   entry.
+- A layered Gentoo build reads the base's package database as the overlay shows
+  it. An entry the upper whites out, or hides under an opaque directory, no
+  longer counts as installed, and an entry a command in the sandbox changed one
+  file of is read from both layers, the changed file from the upper and the rest
+  from the base. It was read from the upper alone and refused for carrying no
+  `SLOT`.
 - `CopyIn` lays a source's `bin/`, `sbin/`, `lib/` and `lib64/` into a merged-usr
   root through the root's aliases, resolving each from the root as the sandbox
   would, and leaves the owner, mode, and modification time of a directory the
@@ -553,6 +591,10 @@ consumer upgrading can skip it.
   the decoders, and `compress::Codec` names the formats `decompress` recognizes.
 - `provision::document::header` and `document::number` read every plan
   document's header and number fields, in all three layers.
+- `provision::accounts` is the shadow-file mechanism the Debian and Alpine
+  bootstraps share, and `binfmt::preflight` the one refusal of a foreign
+  bootstrap. `provision::fetch::percent_decode`, moved out of the Debian index
+  reader, decodes a URL's escapes for that reader and the bundled fetcher alike.
 - `mechanism::overlay_options` composes an overlay's mount options for a build
   and for the host probe, `spec::validate_command` validates the command for both
   builders, and `MountAction::arrival` reads what a mount op brings to rest on
@@ -562,6 +604,8 @@ consumer upgrading can skip it.
   the package-name rule shares.
 - `limits::Resource` and Debian's `Priority` are declared through
   `roster_enum!`, and the `roster` module is unconditional.
+- `poll::slot` is gone. A `poll` loop leaves a finished channel out of the
+  polled slice, as the `poll` module states.
 - `fcage` and the examples state their exit codes once each.
 - `lzma-rust2` moves to 0.23, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the

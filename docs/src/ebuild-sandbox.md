@@ -173,7 +173,8 @@ layered over the shared stage3 — the same base, one upper per line of work.
 Discard an upper with `provision::Remove::overlay_upper` rather than `rm -rf`,
 naming the identity map the build ran under. It removes the overlay's hidden
 work directory along with the upper, including the mode-`0` directory the kernel
-leaves there.
+leaves there. At a shell prompt, `fcage --remove-overlay-upper DIR` does the
+same.
 
 The library models one prepared root per launch and leaves the choice of reuse
 or renewal to the consumer; the overlay is how the choice is expressed without

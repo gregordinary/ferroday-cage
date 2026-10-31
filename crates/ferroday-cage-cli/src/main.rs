@@ -1086,6 +1086,24 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--remove-overlay-upper",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &[
+            "Delete the overlay upper at DIR and the work directory",
+            "kept beside it, and exit: how a run on --overlay-upper",
+            "is reverted. Give the --identity-map the sandbox ran",
+            "under; the default is 'subordinate'. A work directory",
+            "named with --overlay-work is removed with",
+            "--remove-rootfs and --keep-lock. Removing a path that",
+            "is not there succeeds. Takes no other option",
+        ],
+        mode: Mode::Remove,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--export-rootfs",
         section: Section::Provisioning,
         placeholder: "DIR",
@@ -1189,8 +1207,9 @@ const FLAGS: &[Flag] = &[
         placeholder: "DIR",
         help: &[
             "Where the overlay's writes land; DIR persists after",
-            "the sandbox exits, so discarding it reverts the run.",
-            "Required with --overlay-lower",
+            "the sandbox exits, so discarding it with",
+            "--remove-overlay-upper reverts the run. Required with",
+            "--overlay-lower",
         ],
         take: Take::One(|options, _flag, value| {
             options.overlay_upper = Some(PathBuf::from(value));
@@ -1478,12 +1497,13 @@ const FLAGS: &[Flag] = &[
             "Attach the native userspace network stack: IPv4 and",
             "IPv6 for the isolated network, outbound and to any",
             "--netstack-publish port, carried over host sockets",
-            "with no external helper. Composes the",
-            "sandbox's resolv.conf from the host's routable",
-            "nameservers unless --no-resolv-conf or",
-            "--no-managed-mounts is given; a host with only loopback",
-            "nameservers composes nothing, leaving the rootfs's own",
-            "resolv.conf in place",
+            "with no external helper. Binds the host's resolv.conf",
+            "when it names a nameserver the stack forwards to,",
+            "unless --no-resolv-conf or --no-managed-mounts is",
+            "given or a mount of the run's own claims the file; a",
+            "host whose nameservers are all loopback or link-local",
+            "composes nothing, leaving the rootfs's own resolv.conf",
+            "in place",
         ],
         take: Take::Bare(|options| {
             options.netstack = true;
@@ -2043,7 +2063,8 @@ const SYNOPSIS: &str = "\
 Run a command inside an unprivileged Linux sandbox.
 
 Usage: fcage [--rootfs DIR | --overlay-lower DIR | --profile FILE | --restricted-profile FILE | --restrict] [OPTIONS] [--] [COMMAND [ARGS...]]
-       fcage --remove-rootfs DIR [--identity-map M]
+       fcage --remove-rootfs DIR [--identity-map M] [--keep-lock]
+       fcage --remove-overlay-upper DIR [--identity-map M]
        fcage --export-rootfs DIR [--export-to FILE] [--identity-map M] [--clamp-mtime EPOCH]
 ";
 
@@ -2096,13 +2117,13 @@ reader gone; and 2 on usage errors.
 enum Invocation {
     /// Launch a sandbox.
     Run(Box<Options>),
-    /// Delete a provisioned rootfs, under the identity map it was written
-    /// under.
+    /// Delete a provisioned rootfs or an overlay upper, under the identity map
+    /// it was written under.
     Remove {
         dest: PathBuf,
         map: IdentityMap,
-        /// Whether the `<dest>.lock` sibling goes with the tree.
-        remove_lock: bool,
+        /// What the tree at `dest` is, which decides what goes with it.
+        removal: Removal,
     },
     /// Print the stage3 variants an architecture publishes.
     GentooVariants {
@@ -2617,11 +2638,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Invocation::Run(options)) => run(*options),
-        Ok(Invocation::Remove {
-            dest,
-            map,
-            remove_lock,
-        }) => remove_rootfs(&dest, map, remove_lock),
+        Ok(Invocation::Remove { dest, map, removal }) => remove_tree(&dest, map, removal),
         Ok(Invocation::GentooVariants {
             architecture,
             mirror,
@@ -3084,36 +3101,75 @@ fn help_or_version(args: &[OsString]) -> Option<Invocation> {
     None
 }
 
-/// Parses a `--remove-rootfs` command line, excluding the program name.
+/// What a removal deletes, besides the tree it is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A published rootfs, with its `<dest>.lock` sibling unless `--keep-lock`
+    /// declines it.
+    Rootfs { remove_lock: bool },
+    /// An overlay upper, with the work directory the library keeps beside it.
+    OverlayUpper,
+}
+
+/// The flags that select a removal, each with what it removes. Exactly one
+/// names the tree.
+const REMOVALS: [(&str, Removal); 2] = [
+    ("--remove-rootfs", Removal::Rootfs { remove_lock: true }),
+    ("--remove-overlay-upper", Removal::OverlayUpper),
+];
+
+/// The removal flag `arg` is, in either form, with the value it carries when
+/// it is written joined.
+fn removal_flag(arg: &OsStr) -> Option<(&'static str, Removal, Option<OsString>)> {
+    REMOVALS.into_iter().find_map(|(flag, removal)| {
+        if arg == flag {
+            return Some((flag, removal, None));
+        }
+        let joined = flag_value(arg, format!("{flag}=").as_bytes())?;
+        Some((flag, removal, Some(joined)))
+    })
+}
+
+/// Parses a `--remove-rootfs` or `--remove-overlay-upper` command line,
+/// excluding the program name.
 ///
-/// A removal takes the destination, the identity map the tree was written
-/// under, and whether the lock sibling goes with it. Every other flag configures
-/// a launch that does not happen here, so naming one is a usage error rather
-/// than a setting with no effect.
+/// A removal takes the tree, the identity map it was written under, and for a
+/// rootfs whether the lock sibling goes with it. Every other flag configures a
+/// launch that does not happen here, so naming one is a usage error rather than
+/// a setting with no effect. So is `--keep-lock` beside an overlay upper, whose
+/// removal never takes a lock.
 fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     if let Some(answer) = help_or_version(&args) {
         return Ok(answer);
     }
-    let mut dest: Option<PathBuf> = None;
+    // Named in a refusal: the flag that selected the mode, wherever it sits.
+    let mode = args
+        .iter()
+        .find_map(|arg| removal_flag(arg))
+        .map_or("--remove-rootfs", |(flag, _, _)| flag);
+    let mut target: Option<(&'static str, Removal, PathBuf)> = None;
     // The same default the library's own removal carries: a tree written by a
     // bundled-delegate sandbox is the case that needs the escalation at all.
     let mut map = IdentityMap::Subordinate;
-    // Likewise the library's default. Provisioning wrote `<dest>.lock`, so for
-    // the published rootfs this command is named on, the two round-trip
-    // together; `--keep-lock` is for the `dest` that merely holds such trees.
-    let mut remove_lock = true;
+    // The library's default is to take the lock. Provisioning wrote
+    // `<dest>.lock`, so for the published rootfs `--remove-rootfs` is named on,
+    // the two round-trip together; `--keep-lock` is for the `dest` that merely
+    // holds such trees.
+    let mut keep_lock = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
-        if arg == "--remove-rootfs" {
-            dest = Some(PathBuf::from(value_for(
-                "--remove-rootfs",
-                "a value",
-                Arity::One,
-                &mut args,
-            )?));
-        } else if let Some(value) = flag_value(&arg, b"--remove-rootfs=") {
-            dest = Some(PathBuf::from(value));
+        if let Some((flag, removal, joined)) = removal_flag(&arg) {
+            let dest = match joined {
+                Some(value) => value,
+                None => value_for(flag, "a value", Arity::One, &mut args)?,
+            };
+            if let Some((named, _, _)) = target
+                && named != flag
+            {
+                return Err(format!("{named} and {flag} are alternatives"));
+            }
+            target = Some((flag, removal, PathBuf::from(dest)));
         } else if arg == "--identity-map" {
             map = parse_identity_map(
                 "--identity-map",
@@ -3122,27 +3178,40 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
         } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
             map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
         } else if arg == "--keep-lock" {
-            remove_lock = false;
+            keep_lock = true;
         } else {
             return Err(mode_conflict(
                 &arg,
-                "--remove-rootfs",
-                &["--remove-rootfs", "--identity-map", "--keep-lock"],
+                mode,
+                &[
+                    "--remove-rootfs",
+                    "--remove-overlay-upper",
+                    "--identity-map",
+                    "--keep-lock",
+                ],
             ));
         }
     }
 
-    // The caller established that the flag is present, so this is a guard
-    // rather than a live path: the only value-taking flag here would reject
-    // `--remove-rootfs` as a map spelling before reaching it. It stays a usage
-    // error rather than an `expect` because what upholds it is the shape of the
-    // argument vector, not an invariant of this module.
-    let dest = dest.ok_or_else(|| "--remove-rootfs requires a value".to_string())?;
-    Ok(Invocation::Remove {
-        dest,
-        map,
-        remove_lock,
-    })
+    // The caller established that a removal flag is present, so this is a
+    // guard rather than a live path: the only value-taking flag here would
+    // reject a removal flag as a map spelling before reaching it. It stays a
+    // usage error rather than an `expect` because what upholds it is the shape
+    // of the argument vector, not an invariant of this module.
+    let (flag, removal, dest) = target.ok_or_else(|| format!("{mode} requires a value"))?;
+    let removal = match removal {
+        Removal::Rootfs { .. } => Removal::Rootfs {
+            remove_lock: !keep_lock,
+        },
+        Removal::OverlayUpper if keep_lock => {
+            return Err(format!(
+                "--keep-lock cannot be used with {flag}, which leaves any lock beside the upper \
+                 in place"
+            ));
+        }
+        Removal::OverlayUpper => Removal::OverlayUpper,
+    };
+    Ok(Invocation::Remove { dest, map, removal })
 }
 
 /// Parses a `--gentoo-variants` command line, excluding the program name.
@@ -4539,25 +4608,30 @@ fn load_profile(
     Ok((builder, meta))
 }
 
-/// Deletes the provisioned rootfs at `dest`, under the identity map it was
-/// written under.
+/// Deletes the provisioned rootfs or the overlay upper at `dest`, under the
+/// identity map it was written under.
 ///
 /// A tree a range-mapped sandbox wrote carries subordinate ownership that a
 /// plain `rm -rf` cannot delete; the library re-enters the same map to remove
 /// it. A failure exits 125, the code every other setup failure uses: nothing
 /// ran, so there is no command status to report.
 ///
-/// `remove_lock` carries `--keep-lock` through to the library's own setting.
-/// Deleting `<dest>.lock` is right for the published rootfs this command is
-/// usually named on, and a deletion outside what the caller named for a `dest`
-/// that merely holds such trees, which is a distinction only the caller can
-/// make.
-fn remove_rootfs(dest: &Path, map: IdentityMap, remove_lock: bool) -> ExitCode {
-    match ferroday_cage::provision::Remove::new(dest)
-        .map(map)
-        .remove_lock(remove_lock)
-        .run()
-    {
+/// A rootfs removal's `remove_lock` carries `--keep-lock` through to the
+/// library's own setting. Deleting `<dest>.lock` is right for the published
+/// rootfs this command is usually named on, and a deletion outside what the
+/// caller named for a `dest` that merely holds such trees, which is a
+/// distinction only the caller can make. An overlay upper's removal is
+/// [`Remove::overlay_upper`](ferroday_cage::provision::Remove::overlay_upper),
+/// which takes the work directory the library manages beside the upper with
+/// it.
+fn remove_tree(dest: &Path, map: IdentityMap, removal: Removal) -> ExitCode {
+    use ferroday_cage::provision::Remove;
+
+    let remove = match removal {
+        Removal::Rootfs { remove_lock } => Remove::new(dest).remove_lock(remove_lock),
+        Removal::OverlayUpper => Remove::overlay_upper(dest),
+    };
+    match remove.map(map).run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(error),
     }
@@ -4889,8 +4963,9 @@ fn run(options: Options) -> ExitCode {
     };
 
     if options.netstack {
-        // The native stack composes the sandbox's DNS from the host's routable
-        // nameservers, unless the run opts out. --no-managed-mounts opts out
+        // The native stack composes the sandbox's DNS from the host's own,
+        // where the stack forwards to one of its nameservers, unless the run
+        // opts out. --no-managed-mounts opts out
         // as surely as --no-resolv-conf does: its promise is that the sandbox
         // carries exactly the binds the command line names, and this would be
         // one it does not.
@@ -4898,12 +4973,18 @@ fn run(options: Options) -> ExitCode {
         // The builder is asked rather than the flags, so that a profile
         // setting either toggle governs this composition exactly as the
         // matching flag does. Both have already been applied above.
+        //
+        // The same getter folds in the caller's own claim on the target: a
+        // mount of theirs at `/etc/resolv.conf`, or a host tree of theirs over
+        // `/etc`, which this composition yields to exactly as the library's own
+        // bind for a host-network sandbox does.
+        let stack = stack.expect("assembled above for exactly this branch");
         if builder.get_resolv_conf() {
-            builder = compose_netstack_resolv_conf(builder);
+            builder = compose_netstack_resolv_conf(builder, &stack);
         }
         return run_with_netstack(
             builder,
-            stack.expect("assembled above for exactly this branch"),
+            stack,
             &options.netstack_publish,
             options.terminal,
             options.timeout,
@@ -5119,54 +5200,31 @@ fn run_with_netstack(
     report(outcome, delivered)
 }
 
-/// Whether one of the caller's own mounts targets the sandbox's
-/// `/etc/resolv.conf`.
-///
-/// The same question the library asks of a host-network sandbox's managed bind,
-/// asked again here because the bind a `--netstack` run composes is `fcage`'s
-/// own and the library never sees it. Both answers must move together: a target
-/// the library yields to and this one overrides would have the sandbox's DNS
-/// depend on which of the two composed the bind.
-///
-/// Every kind of mount counts, not only a bind. A `--raw-mount` carries a source
-/// and the kernel's own flags, so a bind is expressible through it, and a caller
-/// who reaches for it has claimed the target as deliberately as `--bind` does.
-///
-/// `Path` compares by components, so `/etc//resolv.conf` and
-/// `/etc/./resolv.conf` are the same target here as they are there.
-fn mounts_resolv_conf(builder: &CageBuilder) -> bool {
-    builder
-        .get_mounts()
-        .iter()
-        .any(|mount| mount.get_target() == Path::new("/etc/resolv.conf"))
-}
-
 /// Composes the sandbox's `resolv.conf` for a native-stack run: binds the
-/// host's `resolv.conf` read-only when it names a routable nameserver, and
-/// otherwise composes nothing and says so.
+/// host's `resolv.conf` read-only when it names a nameserver the stack forwards
+/// to, and otherwise composes nothing and says so.
 ///
-/// A loopback nameserver — systemd-resolved's `127.0.0.53` stub is the
-/// common one — is unreachable through the stack, which refuses loopback
-/// destinations, so binding it would only produce silent DNS failures.
+/// Called only where [`CageBuilder::get_resolv_conf`] holds, which folds in
+/// both opt-outs and the caller's own claim on the target. A caller's mount at
+/// `/etc/resolv.conf` or over `/etc` replaces this bind as it replaces the
+/// library's own for a host-network sandbox.
+///
+/// A nameserver the stack refuses is unreachable from the sandbox, so binding a
+/// file that names only such ones would produce nothing but silent DNS
+/// failures. systemd-resolved's `127.0.0.53` stub is the common one, and a
+/// cloud host's link-local resolver another; [`NetStack::forwards`] is the
+/// stack's own answer for each.
 ///
 /// Composing nothing leaves whatever `resolv.conf` the rootfs ships, which
 /// may name a routable resolver and resolve perfectly well. The warning
 /// therefore reports what was not composed; it does not predict that the
 /// sandbox has no DNS, which is not this function's to know.
-fn compose_netstack_resolv_conf(builder: CageBuilder) -> CageBuilder {
-    // A caller who mounted the target themselves named it deliberately, and
-    // this bind is composed after every mount the command line and the profile
-    // carry -- so it would land on top of theirs and decide the sandbox's DNS
-    // in silence. Their mount replaces this one, as it does the library's own
-    // managed bind for a host-network sandbox.
-    if mounts_resolv_conf(&builder) {
-        return builder;
-    }
+fn compose_netstack_resolv_conf(builder: CageBuilder, stack: &NetStack) -> CageBuilder {
     let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
         // No host resolv.conf to compose from; leave the sandbox's as-is.
         return builder;
     };
-    if resolv_conf_has_routable_nameserver(&contents) {
+    if names_a_forwarded_nameserver(&contents, stack) {
         return builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf");
     }
     // The remedies are named as flags rather than as goals. This is the default
@@ -5174,9 +5232,9 @@ fn compose_netstack_resolv_conf(builder: CageBuilder) -> CageBuilder {
     // users of --netstack ever see, and "point it at a routable nameserver" is
     // not something anyone can type.
     eprintln!(
-        "fcage: the host's nameservers are all on loopback, which the network stack \
-         refuses, so no resolv.conf was composed; the sandbox resolves through whatever \
-         its rootfs ships"
+        "fcage: the host's nameservers are all ones the network stack refuses, such as a \
+         loopback or link-local address, so no resolv.conf was composed; the sandbox \
+         resolves through whatever its rootfs ships"
     );
     eprintln!(
         "Try '--ro-bind FILE /etc/resolv.conf' with a file naming a routable nameserver, \
@@ -5188,9 +5246,13 @@ fn compose_netstack_resolv_conf(builder: CageBuilder) -> CageBuilder {
     builder
 }
 
-/// Whether a `resolv.conf` names at least one nameserver that is not a
-/// loopback address, and so reachable through the network stack.
-fn resolv_conf_has_routable_nameserver(contents: &str) -> bool {
+/// The port a `resolv.conf` nameserver is queried on: `resolv.conf` names no
+/// port, and the resolver always asks 53.
+const DNS_PORT: u16 = 53;
+
+/// Whether a `resolv.conf` names at least one nameserver the network stack
+/// forwards DNS to.
+fn names_a_forwarded_nameserver(contents: &str, stack: &NetStack) -> bool {
     contents.lines().any(|line| {
         let line = line.trim();
         let Some(address) = line.strip_prefix("nameserver") else {
@@ -5204,7 +5266,7 @@ fn resolv_conf_has_routable_nameserver(contents: &str) -> bool {
             return false;
         }
         match address.trim().parse::<std::net::IpAddr>() {
-            Ok(address) => !address.is_loopback(),
+            Ok(address) => stack.forwards(SocketAddr::new(address, DNS_PORT)),
             Err(_) => false,
         }
     })
@@ -6019,40 +6081,6 @@ mod tests {
             Err(message) => message,
             Ok(_) => panic!("{args:?} should be refused"),
         }
-    }
-
-    #[test]
-    fn every_kind_of_caller_mount_claims_the_resolv_conf_target() {
-        // Asserted against the predicate rather than through
-        // `compose_netstack_resolv_conf`, which reads the host's own
-        // `resolv.conf` and composes nothing when its nameservers are all on
-        // loopback -- so a test driven through it would pass on a
-        // systemd-resolved host whatever the predicate answered.
-        for claimed in [
-            Cage::builder().bind_ro("/etc/hosts", "/etc/resolv.conf"),
-            // Written the way `Path`'s component comparison normalizes.
-            Cage::builder().bind_ro("/etc/hosts", "/etc/./resolv.conf"),
-            // A bind spelled through the raw escape hatch: a source and the
-            // kernel's own `MS_BIND`.
-            Cage::builder().raw_mount(
-                RawMount::new("/etc/resolv.conf")
-                    .source("/etc/hosts")
-                    .flags(0x1000),
-            ),
-            // A raw mount of any other kind still claims the target.
-            Cage::builder().raw_mount(RawMount::new("/etc/resolv.conf").fstype("tmpfs")),
-        ] {
-            assert!(
-                mounts_resolv_conf(&claimed),
-                "a caller's own mount at the target must be left in force",
-            );
-        }
-
-        // A mount elsewhere leaves the composed bind to be made.
-        assert!(!mounts_resolv_conf(
-            &Cage::builder().bind_ro("/etc/hosts", "/etc/hosts")
-        ));
-        assert!(!mounts_resolv_conf(&Cage::builder()));
     }
 
     #[test]
@@ -7105,19 +7133,16 @@ mod tests {
             ["--remove-rootfs=/var/lib/roots/trixie"].as_slice(),
         ] {
             match parse_args(args).expect("the removal should parse") {
-                Invocation::Remove {
-                    dest,
-                    map,
-                    remove_lock,
-                } => {
+                Invocation::Remove { dest, map, removal } => {
                     assert_eq!(dest, PathBuf::from("/var/lib/roots/trixie"));
                     assert_eq!(
                         map,
                         IdentityMap::Subordinate,
                         "the default is the map a bundled-delegate sandbox writes under"
                     );
-                    assert!(
-                        remove_lock,
+                    assert_eq!(
+                        removal,
+                        Removal::Rootfs { remove_lock: true },
                         "the default takes the lock with the tree, as the library's own does"
                     );
                 }
@@ -7152,13 +7177,96 @@ mod tests {
             ["--keep-lock", "--remove-rootfs", "/roots/cache"].as_slice(),
         ] {
             match parse_args(args).expect("the removal should parse") {
-                Invocation::Remove { remove_lock, .. } => assert!(
-                    !remove_lock,
+                Invocation::Remove { removal, .. } => assert_eq!(
+                    removal,
+                    Removal::Rootfs { remove_lock: false },
                     "--keep-lock should leave the sibling for {args:?}"
                 ),
                 _ => panic!("expected a removal for {args:?}"),
             }
         }
+    }
+
+    #[test]
+    fn remove_overlay_upper_takes_an_upper_in_either_form() {
+        for args in [
+            ["--remove-overlay-upper", "/var/cache/run-42"].as_slice(),
+            ["--remove-overlay-upper=/var/cache/run-42"].as_slice(),
+            [
+                "--identity-map",
+                "single",
+                "--remove-overlay-upper",
+                "/var/cache/run-42",
+            ]
+            .as_slice(),
+        ] {
+            match parse_args(args).expect("the removal should parse") {
+                Invocation::Remove { dest, removal, .. } => {
+                    assert_eq!(dest, PathBuf::from("/var/cache/run-42"));
+                    assert_eq!(removal, Removal::OverlayUpper, "{args:?}");
+                }
+                _ => panic!("expected a removal for {args:?}"),
+            }
+        }
+        match parse_args(&["--remove-overlay-upper", "/up", "--identity-map=single"])
+            .expect("the removal should parse")
+        {
+            Invocation::Remove { map, .. } => assert_eq!(map, IdentityMap::Single),
+            _ => panic!("expected a removal"),
+        }
+    }
+
+    #[test]
+    fn remove_overlay_upper_refuses_what_does_not_apply_to_an_upper() {
+        // An upper is not a published rootfs, so its removal takes no lock and
+        // `--keep-lock` would be a setting with no effect.
+        let error = parse_error(&["--remove-overlay-upper", "/up", "--keep-lock"]);
+        assert!(
+            error.contains("--keep-lock") && error.contains("--remove-overlay-upper"),
+            "{error}"
+        );
+        // One removal names one tree, of one kind.
+        for args in [
+            ["--remove-overlay-upper", "/up", "--remove-rootfs", "/r"].as_slice(),
+            ["--remove-rootfs=/r", "--remove-overlay-upper=/up"].as_slice(),
+        ] {
+            let error = parse_error(args);
+            assert!(error.contains("are alternatives"), "{args:?}: {error}");
+        }
+        // A launch option is refused, named against the mode that was asked for.
+        let error = parse_error(&["--remove-overlay-upper", "/up", "--rootfs", "/r"]);
+        assert!(
+            error.contains("--rootfs") && error.contains("--remove-overlay-upper"),
+            "{error}"
+        );
+        assert!(parse_args(&["--remove-overlay-upper"]).is_err());
+        assert!(parse_args(&["--remove-overlay-upper", "/up", "/bin/true"]).is_err());
+    }
+
+    #[test]
+    fn remove_overlay_upper_takes_the_work_directory_beside_the_upper() {
+        // The library keeps an overlay's work directory as a hidden sibling of
+        // the upper, and this removal is how a caller at a shell prompt takes
+        // both. A tree the calling user owns needs no map to be entered.
+        let base = ferroday_cage_testkit::scratch::scratch_dir("fcage-remove-overlay-upper");
+        let upper = base.join("run-42");
+        let work = base.join(".run-42.work");
+        std::fs::create_dir_all(upper.join("etc")).expect("the upper is laid out");
+        std::fs::write(upper.join("etc/hostname"), b"run-42\n").expect("a file in the upper");
+        std::fs::create_dir_all(work.join("work")).expect("the work directory is laid out");
+        std::fs::write(base.join("run-42.lock"), b"").expect("a lock beside the upper");
+
+        let code = remove_tree(&upper, IdentityMap::Single, Removal::OverlayUpper);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(!upper.exists(), "the upper is removed");
+        assert!(!work.exists(), "the work directory goes with it");
+        assert!(
+            base.join("run-42.lock").exists(),
+            "a lock beside an upper is not the removal's to take"
+        );
+        // Removing what is no longer there succeeds, so the call is repeatable.
+        let code = remove_tree(&upper, IdentityMap::Single, Removal::OverlayUpper);
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 
     #[test]
@@ -8263,16 +8371,30 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_only_resolv_conf_is_not_routable() {
-        assert!(!resolv_conf_has_routable_nameserver(
-            "nameserver 127.0.0.53\noptions edns0\n"
+    fn only_a_nameserver_the_stack_forwards_to_is_composed() {
+        let stack = NetStack::default();
+        let forwarded = |contents: &str| names_a_forwarded_nameserver(contents, &stack);
+        assert!(!forwarded("nameserver 127.0.0.53\noptions edns0\n"));
+        assert!(forwarded("nameserver 127.0.0.53\nnameserver 9.9.9.9\n"));
+        assert!(forwarded("nameserver 2606:4700:4700::1111\n"));
+        assert!(!forwarded("# only a comment\n"));
+        // A cloud host's own resolvers: AWS's link-local IPv4 one and its
+        // instance-service IPv6 one, both of which the stack refuses.
+        assert!(!forwarded("nameserver 169.254.169.253\n"));
+        assert!(!forwarded("nameserver fd00:ec2::253\n"));
+        // A resolver on the guest's own subnet is on-link to the guest, and the
+        // stack forwards nothing there.
+        assert!(!forwarded("nameserver 10.0.2.3\n"));
+        // The keyword and the address run together is not a nameserver line.
+        assert!(!forwarded("nameserver9.9.9.9\n"));
+        // A protocol the run turns off reaches nothing.
+        let ipv4_only = NetStack::builder()
+            .ipv6(false)
+            .build()
+            .expect("a valid configuration");
+        assert!(!names_a_forwarded_nameserver(
+            "nameserver 2606:4700:4700::1111\n",
+            &ipv4_only
         ));
-        assert!(resolv_conf_has_routable_nameserver(
-            "nameserver 127.0.0.53\nnameserver 9.9.9.9\n"
-        ));
-        assert!(resolv_conf_has_routable_nameserver(
-            "nameserver 2606:4700:4700::1111\n"
-        ));
-        assert!(!resolv_conf_has_routable_nameserver("# only a comment\n"));
     }
 }

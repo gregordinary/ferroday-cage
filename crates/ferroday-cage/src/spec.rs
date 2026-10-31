@@ -66,8 +66,8 @@ const RESOLV_CONF: &str = "/etc/resolv.conf";
 /// [`RESOLV_CONF`] as the root-relative target the lowered ops carry.
 const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
 
-/// Whether the mounts lowered so far have claimed the sandbox's
-/// [`RESOLV_CONF`], so the managed bind there yields to them.
+/// Whether a mount of the caller's claims the sandbox's [`RESOLV_CONF`], so
+/// the managed bind there yields to it.
 ///
 /// A mount at the target itself claims it, whatever its kind. What the managed
 /// mount yields to is the caller having claimed the target, and a
@@ -83,20 +83,23 @@ const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
 /// above the target is the sandbox's own, and the target is created in it as
 /// it would be in the root.
 ///
-/// Every target is frozen from [`path::absolute_components`], so
-/// `/etc//resolv.conf` and `/etc/./resolv.conf` are the same target here as they
-/// will be at launch.
-///
-/// `fcage` asks the same question of the bind a `--netstack` run composes, which
-/// is one this crate never makes and so cannot answer.
-fn resolv_conf_claimed(ops: &[MountOp]) -> bool {
-    ops.iter().any(|op| match op.action.arrival() {
-        Some((target, arrival)) => {
-            target == RESOLV_CONF_TARGET
-                || (arrival == Arrival::Tree && covers(target, RESOLV_CONF_TARGET))
-        }
-        None => false,
-    })
+/// A target is read through [`path::absolute_components`], as the launch
+/// freezes it, so `/etc//resolv.conf` and `/etc/./resolv.conf` are the same
+/// target here as they will be at launch. A mount whose target or flags
+/// [`build`](CageBuilder::build) refuses claims nothing, since no sandbox is
+/// built with it.
+fn claims_resolv_conf(mount: &Mount) -> bool {
+    let arrival = match mount {
+        Mount::Bind(_) => Some(Arrival::Tree),
+        Mount::Raw(raw) => u32::try_from(raw.flags)
+            .ok()
+            .and_then(|flags| Arrival::of_raw(MountFlags::from_bits_retain(flags))),
+    };
+    let (Some(arrival), Ok(target)) = (arrival, sandbox_path_components(mount.get_target())) else {
+        return false;
+    };
+    let resolv_conf = [OsStr::new("etc"), OsStr::new("resolv.conf")];
+    target == resolv_conf || (arrival == Arrival::Tree && resolv_conf.starts_with(&target))
 }
 /// The mode of a mount point standing in for a world-writable sticky
 /// directory: `/tmp` and `/dev/shm`, which the profile covers with a
@@ -1912,14 +1915,18 @@ impl CageBuilder {
         self.network
     }
 
-    /// Whether the host's `resolv.conf` bind is enabled, with the
-    /// managed-mount master switch folded in.
+    /// Whether the host's `resolv.conf` bind is made: the
+    /// [`resolv_conf`](Self::resolv_conf) setting, with the managed-mount
+    /// master switch folded in, and with the caller's own claim on the target.
     ///
-    /// The library acts on this only under [`Network::Host`]. A caller that
-    /// composes resolver configuration of its own — as `fcage` does for a
-    /// native-stack run — can read it to honor the same opt-out.
+    /// A mount of the caller's at `/etc/resolv.conf`, or a host tree bound or
+    /// moved over a directory above it, replaces the bind, so this answers
+    /// `false` for a sandbox carrying one. The library acts on this only under
+    /// [`Network::Host`]. A caller that composes resolver configuration of its
+    /// own, as `fcage` does for a native-stack run, reads it to honor the same
+    /// opt-outs and to yield to the same mounts.
     pub fn get_resolv_conf(&self) -> bool {
-        self.managed(self.resolv_conf)
+        self.managed(self.resolv_conf) && !self.mounts.iter().any(claims_resolv_conf)
     }
 
     /// Whether the sandbox gets its own PID namespace.
@@ -2052,7 +2059,9 @@ impl CageBuilder {
         let mount_proc = profile_managed && self.mount_proc.unwrap_or(true);
         let mount_dev = profile_managed && self.mount_dev.unwrap_or(true);
         let mount_tmp = profile_managed && self.mount_tmp.unwrap_or(true);
-        let resolv_conf = profile_managed && self.resolv_conf.unwrap_or(true);
+        // The caller's own claim on the target folds in here as well: a mount
+        // of theirs at it, or a tree of theirs over it, replaces the bind.
+        let resolv_conf = self.get_resolv_conf();
         let base_env = self.base_env.unwrap_or(true);
 
         // Exactly one root is in force: a plain rootfs, or an overlay whose
@@ -2183,17 +2192,14 @@ impl CageBuilder {
                 Mount::Raw(raw) => lowering.push_raw(raw)?,
             }
         }
-        // The managed `resolv.conf` bind, unless the caller mounted something of
-        // their own at that target, or a tree of their own over it. Theirs was
-        // pushed by the loop above and this would land on top of it, which
-        // takes back the "among the caller's own, the order is theirs" rule for
-        // the one mount they were most deliberate about. A caller who mounts it
-        // has replaced the managed one as surely as `resolv_conf(false)`
-        // declines it.
-        if resolv_conf
-            && matches!(self.network, Network::Host)
-            && !resolv_conf_claimed(&lowering.ops)
-        {
+        // The managed `resolv.conf` bind, which `resolv_conf` above already
+        // withholds where the caller mounted something of their own at that
+        // target, or a tree of their own over it. Theirs was pushed by the loop
+        // above and this would land on top of it, which takes back the "among
+        // the caller's own, the order is theirs" rule for the one mount they
+        // were most deliberate about. A caller who mounts it has replaced the
+        // managed one as surely as `resolv_conf(false)` declines it.
+        if resolv_conf && matches!(self.network, Network::Host) {
             lowering.push_resolv_conf()?;
         }
 
@@ -5512,6 +5518,45 @@ mod tests {
             cage.plan.managed_placeholders.is_empty(),
             "the target is created in the tmpfs, not in the root"
         );
+    }
+
+    /// The same signal answers for the caller's own claim on the target, so a
+    /// consumer composing its own bind yields to exactly the mounts the
+    /// library's bind yields to.
+    #[test]
+    fn a_callers_claim_on_the_target_turns_the_resolv_conf_bind_off() {
+        for claimed in [
+            Cage::builder().bind_ro("/etc/hosts", "/etc/resolv.conf"),
+            Cage::builder().bind_ro("/etc/hosts", "/etc/./resolv.conf"),
+            Cage::builder().raw_mount(
+                RawMount::new("/etc/resolv.conf")
+                    .source("/etc/hosts")
+                    .flags(0x1000), // MS_BIND
+            ),
+            // Any kind of mount at the target itself claims it.
+            Cage::builder().raw_mount(RawMount::new("/etc/resolv.conf").fstype("tmpfs")),
+            // A host tree over a directory above it: a bind, a raw bind, a move.
+            Cage::builder().bind("/srv/etc", "/etc"),
+            Cage::builder().bind_ro("/srv/etc", "/etc"),
+            Cage::builder().raw_mount(RawMount::new("/etc").source("/srv/etc").flags(0x1000)),
+            Cage::builder().raw_mount(RawMount::new("/etc").source("/srv/etc").flags(0x2000)),
+        ] {
+            assert!(!claimed.get_resolv_conf(), "{:?}", claimed.get_mounts());
+        }
+
+        for unclaimed in [
+            Cage::builder(),
+            Cage::builder().bind_ro("/etc/hosts", "/etc/hosts"),
+            // A fresh filesystem above the target is the sandbox's own.
+            Cage::builder().raw_mount(RawMount::new("/etc").fstype("tmpfs")),
+            // A remount and a propagation change bring no mount at all.
+            Cage::builder().raw_mount(RawMount::new("/etc/resolv.conf").flags(0x20)),
+            Cage::builder().raw_mount(RawMount::new("/etc").flags(1 << 18)),
+            // A target the build refuses names nothing.
+            Cage::builder().bind_ro("/etc/hosts", "etc/resolv.conf"),
+        ] {
+            assert!(unclaimed.get_resolv_conf(), "{:?}", unclaimed.get_mounts());
+        }
     }
 
     #[test]
