@@ -23,7 +23,7 @@ jobs:
     name: Format, lint, test, docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust (pinned)
         # rust-toolchain.toml pins the toolchain and its components, so fmt,
         # clippy, and the build all run under the same rustfmt everywhere.
@@ -33,7 +33,7 @@ jobs:
         # Keyed on the lockfile and the job, so a job reuses only its own
         # feature selection's artifacts and a dependency change invalidates
         # them. The workspace's own crates are never cached.
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -129,13 +129,13 @@ jobs:
     name: Feature combinations
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust (pinned)
         run: rustup show
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install cargo-hack
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-hack@0.6.45
       - name: Check the featureless build
@@ -209,15 +209,15 @@ jobs:
       # is reviewed like any other.
       RUSTDOC_JSON_NIGHTLY: nightly-2026-07-09
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust (pinned, plus the pinned nightly for rustdoc JSON)
         run: |
           rustup show
           rustup toolchain install "$RUSTDOC_JSON_NIGHTLY" --profile minimal
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install cargo-public-api
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-public-api@0.52.0
       - name: Regenerate the snapshot
@@ -240,7 +240,7 @@ jobs:
     name: Semver
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The baseline is the newest release tag, so this job needs the
           # history and its tags rather than the single commit a checkout
@@ -249,11 +249,11 @@ jobs:
       - name: Install Rust (pinned)
         run: rustup show
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-semver-checks@0.50.0
+          tool: cargo-semver-checks@0.51.0
       - name: Document the last release and the tree, each from its own lockfile
         # The baseline is the newest `v*` tag reachable from the commit before
         # this one: the release this change would follow, and on a release
@@ -304,7 +304,7 @@ jobs:
     name: License and advisory policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check dependency licenses and advisories
         # deny.toml pins the permitted license set, the RUSTSEC advisory
         # policy, and the registries a dependency may come from; this fails the
@@ -318,7 +318,7 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust (MSRV)
         # An independent floor guard: the `+1.91` override wins over the pinned
         # toolchain, which sits ahead of the floor, so this checks the version
@@ -328,7 +328,7 @@ jobs:
       # by the floor toolchain rather than the pinned one — stay in a cache of
       # their own without being told which toolchain they came from.
       - name: Cache the dependency build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check
         run: cargo +1.91 check --workspace --all-targets --all-features
 
@@ -340,7 +340,7 @@ jobs:
       # The release asset's own digest, as GitHub records it for the release.
       MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust (pinned)
         run: rustup show
       # No dependency cache in this job. What it builds is what `pages`
@@ -375,7 +375,7 @@ jobs:
       - name: Package the guide
         # Uploaded on every run, so a pull request proves the artifact builds;
         # only the deploy job below publishes it, and only from main.
-        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/book
 
@@ -408,4 +408,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
