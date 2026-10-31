@@ -62,6 +62,12 @@ consumer upgrading can skip it.
   `SOURCE_DATE_EPOCH`, so the accounts a bootstrap creates record the epoch's
   day in `/etc/shadow` rather than the day it ran. A negative epoch is refused
   at `build`. `fcage`: `--debian-source-date-epoch EPOCH`.
+- `AlpineBuilder::source_date_epoch`, which gives every install script
+  `SOURCE_DATE_EPOCH` and dates the accounts a bootstrap creates by the epoch's
+  day. busybox's `adduser` reads the clock whatever the environment says, so the
+  days the run wrote into `/etc/shadow` and `/etc/shadow-` are rewritten once
+  the scripts have run. A negative epoch is refused at `build`. `fcage`:
+  `--alpine-source-date-epoch EPOCH`.
 
 ### Changed
 

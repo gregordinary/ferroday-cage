@@ -51,9 +51,8 @@ A bootstrap runs in stages:
    runs the install scripts in a second, both in dependency order, then fires the
    triggers whose watched directories the install changed. The scripts run inside
    a cage rooted at the staging tree, so they need no privilege on the host. When
-   they have run, the bootstrap removes the machine id a script generated, as [A
-   reproducible root](#a-reproducible-root) describes, and publishes the root
-   filesystem.
+   they have run, the bootstrap clears [what the run leaves
+   behind](#what-a-bootstrap-does-not-keep) and publishes the root filesystem.
 
 The finished root carries `/lib/apk/db/installed`, `/etc/apk/world`,
 `/etc/apk/repositories`, `/etc/apk/arch` and the repositories' trusted keys, so
@@ -261,9 +260,45 @@ whitespace.
 
 ## A reproducible root
 
-A plan fixes which packages a bootstrap installs. Two bootstraps of one plan on
-the same day produce the same root, even at different paths. Their exports are
-byte-identical when [`Export::clamp_mtime`] caps the modification times.
+A plan fixes which packages a bootstrap installs. What the install scripts write
+is a second input, because the accounts they create are dated. Alpine's scripts
+create them with busybox's `adduser`. It records the day it ran as each new
+account's last password change in `/etc/shadow`, and it reads no
+`SOURCE_DATE_EPOCH`.
+
+[`source_date_epoch`] states that date instead. Every script receives it as
+`SOURCE_DATE_EPOCH`, for the tools that read it. Once the scripts have run,
+every day the run wrote into `/etc/shadow` becomes the epoch's day. So does every
+such day in `/etc/shadow-`, the previous version busybox keeps beside it. The
+days a package shipped are kept.
+
+```rust,no_run
+use ferroday_cage::provision::{self, Export, alpine::{Alpine, Plan}};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// One date for the whole build: the time of the source's last change.
+const EPOCH: i64 = 1_700_000_000;
+
+let kept = Plan::parse_document(&std::fs::read_to_string("v3.23.plan")?)?;
+let mut alpine = Alpine::builder("v3.23")
+    .plan(kept)
+    .source_date_epoch(EPOCH)
+    .build()?;
+provision::ensure("/srv/images/alpine", &mut alpine)?;
+
+Export::new("/srv/images/alpine")
+    .clamp_mtime(EPOCH)
+    .write_to_path("alpine.tar")?;
+# Ok(())
+# }
+```
+
+The epoch dates what the scripts write, and [`Export::clamp_mtime`] caps the
+modification times the archive records. With both, two bootstraps of one plan
+export byte-identical archives, even on different days at different paths. A
+layered build dates the accounts its increment creates in its upper.
+
+### What a bootstrap does not keep
 
 A bootstrap keeps no machine id its scripts generated. `dbus`'s install script
 writes a random `/etc/machine-id`, which every machine deployed from the root
@@ -279,11 +314,6 @@ file makes `dbus-uuidgen` fail, and the system bus with it.
 
 A sandbox has no boot, so a program that asks for the machine id inside one finds
 none until `dbus-uuidgen --ensure=/etc/machine-id` runs in the root.
-
-The date a bootstrap runs on is not fixed. Alpine's scripts create accounts with
-busybox's `adduser`, which records the day it ran as each account's last
-password change in `/etc/shadow`. It reads no `SOURCE_DATE_EPOCH`, so two
-bootstraps of one plan on different days differ in those lines.
 
 ## Layered build roots
 
@@ -525,8 +555,9 @@ $ fcage --rootfs ./alpine /usr/bin/cc --version
 The `--alpine-arch`, `--alpine-mirror`, `--alpine-mirror-fallback`,
 `--alpine-components`, `--alpine-include`, `--alpine-exclude`,
 `--alpine-extract-only`, `--alpine-cache`, `--alpine-keys`,
-`--alpine-pre-configure-overlay`, `--alpine-identity-map` and
-`--alpine-repository` options map onto the builder. `--alpine-include`,
+`--alpine-pre-configure-overlay`, `--alpine-identity-map`,
+`--alpine-source-date-epoch` and `--alpine-repository` options map onto the
+builder. `--alpine-include`,
 `--alpine-exclude` and `--alpine-components` take comma-separated lists and may
 be repeated.
 
@@ -551,3 +582,4 @@ $ fcage --rootfs ./pmos --provision-alpine v3.23 \
 [`KeySet::insert`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.KeySet.html#method.insert
 [`overlay_rootfs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_rootfs
 [`Export::clamp_mtime`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/struct.Export.html#method.clamp_mtime
+[`source_date_epoch`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.AlpineBuilder.html#method.source_date_epoch

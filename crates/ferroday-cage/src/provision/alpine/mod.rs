@@ -201,6 +201,9 @@ pub struct Alpine {
     cache_dir: Option<PathBuf>,
     /// A tree laid over the unpacked closure before the scripts run.
     overlay: Option<PathBuf>,
+    /// The date the scripts are given and the accounts they create are
+    /// recorded at, set by [`AlpineBuilder::source_date_epoch`].
+    source_date_epoch: Option<i64>,
     /// The pristine base a layered build stages its increment over, set by
     /// [`AlpineBuilder::base_layer`]. `None` for a full bootstrap; required by
     /// [`Alpine::stage_layer`] and [`Alpine::resolve_layer`].
@@ -223,6 +226,7 @@ impl fmt::Debug for Alpine {
             .field("identity_map", &self.identity_map)
             .field("cache_dir", &self.cache_dir)
             .field("overlay", &self.overlay)
+            .field("source_date_epoch", &self.source_date_epoch)
             .field("base_layer", &self.base_layer)
             .finish_non_exhaustive()
     }
@@ -247,6 +251,7 @@ impl Alpine {
             identity_map: IdentityMap::Single,
             cache_dir: None,
             overlay: None,
+            source_date_epoch: None,
             base_layer: None,
             repositories: Vec::new(),
             fetcher: None,
@@ -560,6 +565,7 @@ pub struct AlpineBuilder {
     identity_map: IdentityMap,
     cache_dir: Option<PathBuf>,
     overlay: Option<PathBuf>,
+    source_date_epoch: Option<i64>,
     base_layer: Option<PathBuf>,
     repositories: Vec<Repository>,
     fetcher: Option<Box<dyn Fetch>>,
@@ -584,6 +590,7 @@ impl fmt::Debug for AlpineBuilder {
             .field("identity_map", &self.identity_map)
             .field("cache_dir", &self.cache_dir)
             .field("overlay", &self.overlay)
+            .field("source_date_epoch", &self.source_date_epoch)
             .field("base_layer", &self.base_layer)
             .field("repositories", &self.repositories)
             .finish_non_exhaustive()
@@ -820,6 +827,35 @@ impl AlpineBuilder {
         self
     }
 
+    /// Dates what the install scripts write by `epoch`, in Unix seconds, rather
+    /// than by the clock.
+    ///
+    /// Every script is given `SOURCE_DATE_EPOCH`, for the tools that read it.
+    /// The ones a bootstrap reaches create accounts, and busybox's `adduser`,
+    /// which Alpine's scripts call, is not among them: it records the day it
+    /// ran as each new account's last password change in `/etc/shadow`, and in
+    /// the previous version of the file it leaves beside it. So once the
+    /// scripts have run, every such day the run wrote is rewritten as the
+    /// epoch's. The days a package shipped are kept. Without an epoch, one plan
+    /// installed on two different days gives two different roots.
+    ///
+    /// The value is a plain timestamp, so a pipeline that pins a build date
+    /// passes the same number here and to
+    /// [`Export::clamp_mtime`](crate::provision::Export::clamp_mtime), and a
+    /// byte-reproducible archive takes both. A layered build dates the accounts
+    /// its increment creates as a full bootstrap does, and
+    /// [`extract_only`](Self::extract_only) runs no script and ignores it.
+    ///
+    /// # Refused values
+    ///
+    /// A negative epoch is refused at [`build`](Self::build) with
+    /// [`AlpineError::Config`]: `/etc/shadow` counts days from 1970 and has no
+    /// way to record one before it.
+    pub fn source_date_epoch(mut self, epoch: i64) -> Self {
+        self.source_date_epoch = Some(epoch);
+        self
+    }
+
     /// Stages over the provisioned root at `base` rather than bootstrapping a
     /// whole one.
     ///
@@ -871,9 +907,20 @@ impl AlpineBuilder {
     /// Returns [`AlpineError::Config`] when the architecture is not one a
     /// repository can be addressed by, when the bundle holds no keys for it and
     /// none were given, when the primary repository's release or a component is
-    /// not addressable, or when a [`plan`](Self::plan) does not describe
-    /// something this configuration could install.
+    /// not addressable, when a [`plan`](Self::plan) does not describe
+    /// something this configuration could install, or when the
+    /// [`source_date_epoch`](Self::source_date_epoch) is negative.
     pub fn build(self) -> Result<Alpine, AlpineError> {
+        if let Some(epoch) = self.source_date_epoch
+            && epoch < 0
+        {
+            return Err(AlpineError::Config {
+                reason: format!(
+                    "the source date epoch {epoch} is negative, and /etc/shadow records days \
+                     since 1970"
+                ),
+            });
+        }
         // A plan states which architecture it is for, so a builder that names
         // none adopts it: refusing a plan the caller never contradicted, over a
         // default the caller never chose, would be a confusing rejection. A pin
@@ -950,6 +997,7 @@ impl AlpineBuilder {
             identity_map: self.identity_map,
             cache_dir: self.cache_dir,
             overlay: self.overlay,
+            source_date_epoch: self.source_date_epoch,
             base_layer: self.base_layer,
             fetcher: self
                 .fetcher
@@ -1689,6 +1737,7 @@ fn install(
             staging: into,
             rooting: Rooting::over(base.map(layer::Base::path)),
             identity_map: &alpine.identity_map,
+            source_date_epoch: alpine.source_date_epoch,
         },
         &database,
         &subjects,
@@ -2677,6 +2726,21 @@ mod tests {
             .keys(KeySet::postmarketos())
             .build()
             .expect("the repository validates")
+    }
+
+    #[test]
+    fn a_negative_source_date_epoch_is_refused() {
+        // /etc/shadow counts days from 1970. Zero is 1970 itself.
+        let refused = Alpine::builder("v3.23").source_date_epoch(-1).build();
+        assert!(
+            matches!(&refused, Err(AlpineError::Config { reason }) if reason.contains("negative")),
+            "{refused:?}",
+        );
+        let built = Alpine::builder("v3.23")
+            .source_date_epoch(0)
+            .build()
+            .expect("the builder validates");
+        assert_eq!(built.source_date_epoch, Some(0));
     }
 
     #[test]

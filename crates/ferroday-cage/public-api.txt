@@ -234,6 +234,7 @@ pub fn ferroday_cage::provision::alpine::AlpineBuilder::pin(self, ferroday_cage:
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::plan(self, ferroday_cage::provision::alpine::Plan) -> Self
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::pre_configure_overlay(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::repository(self, ferroday_cage::provision::alpine::Repository) -> Self
+pub fn ferroday_cage::provision::alpine::AlpineBuilder::source_date_epoch(self, i64) -> Self
 impl core::fmt::Debug for ferroday_cage::provision::alpine::AlpineBuilder
 pub fn ferroday_cage::provision::alpine::AlpineBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::provision::alpine::AlpineBuilder

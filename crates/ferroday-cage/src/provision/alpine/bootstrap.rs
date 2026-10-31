@@ -76,6 +76,18 @@ const SCRIPT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// then share.
 const MACHINE_ID: &str = "etc/machine-id";
 
+/// The shadow file, and the copy of its previous version that busybox's
+/// account applets leave beside it on every change.
+///
+/// Both record, for each account, the day its password last changed, and
+/// busybox's `adduser` writes the day it ran there: it reads the clock and no
+/// `SOURCE_DATE_EPOCH`. With an epoch, [`date_accounts`] rewrites what the run
+/// wrote.
+const SHADOW: [&str; 2] = ["etc/shadow", "etc/shadow-"];
+
+/// The seconds in the unit `/etc/shadow` counts in, a day.
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
 /// The state a finished root hands back to `apk`, beside its database.
 ///
 /// One value because a layered build supplies a different one of each: its
@@ -114,6 +126,10 @@ pub(super) struct Site<'a> {
     pub(super) rooting: Rooting<'a>,
     /// The map the script cages run under.
     pub(super) identity_map: &'a IdentityMap,
+    /// The `SOURCE_DATE_EPOCH` every script is given, and the date the accounts
+    /// the run creates are recorded at. `None` gives the scripts none and
+    /// leaves the dates as they wrote them.
+    pub(super) source_date_epoch: Option<i64>,
 }
 
 /// `order` is the dependency order the closure was laid down in, and the one the
@@ -124,8 +140,9 @@ pub(super) struct Site<'a> {
 /// it.
 ///
 /// Once the last trigger has run, the machine identity the scripts generated is
-/// [cleared](clear_run_state), so the finished root carries none. A layered
-/// build clears it from the upper.
+/// [cleared](clear_run_state), so the finished root carries none, and with an
+/// epoch the accounts they created are [dated](date_accounts) by it. A layered
+/// build does both in the upper.
 pub(super) fn configure(
     site: Site<'_>,
     database: &Database,
@@ -137,6 +154,12 @@ pub(super) fn configure(
     let staging = site.staging;
     let tree = Rooted::open(staging).map_err(AlpineError::at("opening the tree", staging))?;
     write_state(&tree, database, state)?;
+    // What the accounts' dates were before any script ran, so that afterwards
+    // the ones the run wrote can be told from the ones it found.
+    let found = match site.source_date_epoch {
+        Some(_) => Some(account_dates(&tree, state.beneath)?),
+        None => None,
+    };
 
     for subject in order {
         for kind in [ScriptKind::PreInstall, ScriptKind::PostInstall] {
@@ -163,7 +186,11 @@ pub(super) fn configure(
     }
 
     fire_triggers(site, &tree, database, order, carried, observer)?;
-    clear_run_state(&tree)
+    clear_run_state(&tree)?;
+    match (site.source_date_epoch, found) {
+        (Some(epoch), Some(found)) => date_accounts(&tree, &found, epoch),
+        _ => Ok(()),
+    }
 }
 
 /// Removes what the scripts leave that belongs to their run rather than to the
@@ -188,6 +215,106 @@ fn clear_run_state(tree: &Rooted) -> Result<(), AlpineError> {
             "removing the machine id",
             tree.path(MACHINE_ID),
         ))
+}
+
+/// Each account's last-change day as `/etc/shadow` records it before the
+/// scripts run: the file in the tree, or where the tree holds none, the one
+/// beneath it in a layered build. No file is no accounts.
+fn account_dates(
+    tree: &Rooted,
+    beneath: Option<&Rooted>,
+) -> Result<HashMap<Vec<u8>, Vec<u8>>, AlpineError> {
+    let [shadow, _] = SHADOW;
+    let held = tree.exists(shadow).map_err(AlpineError::at(
+        "inspecting the accounts",
+        tree.path(shadow),
+    ))?;
+    let source = match (held, beneath) {
+        (false, Some(beneath)) => beneath,
+        _ => tree,
+    };
+    let contents = match source.read(shadow) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => {
+            return Err(AlpineError::io(
+                "reading the accounts",
+                source.path(shadow),
+                err,
+            ));
+        }
+    };
+    Ok(contents
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| {
+            let mut fields = line.split(|&byte| byte == b':');
+            let name = fields.next()?;
+            let _password = fields.next()?;
+            Some((name.to_vec(), fields.next()?.to_vec()))
+        })
+        .collect())
+}
+
+/// Records every last-change day the run wrote as the day of `epoch`, in
+/// `/etc/shadow` and in the previous version busybox keeps beside it.
+///
+/// A day the run wrote is one `found` did not record for that account: every
+/// account the scripts created, and any whose date they changed. The days the
+/// run found stay as they were, so what a package shipped is not rewritten.
+/// The files are rewritten in place, keeping the owner, group, and mode the
+/// scripts gave them. A file the tree does not hold, which in a layered build
+/// is one the increment's scripts never touched, is left to the base.
+fn date_accounts(
+    tree: &Rooted,
+    found: &HashMap<Vec<u8>, Vec<u8>>,
+    epoch: i64,
+) -> Result<(), AlpineError> {
+    let day = (epoch / SECONDS_PER_DAY).to_string();
+    for path in SHADOW {
+        let contents = match tree.read(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(AlpineError::io(
+                    "reading the accounts",
+                    tree.path(path),
+                    err,
+                ));
+            }
+        };
+        if let Some(dated) = dated(&contents, found, day.as_bytes()) {
+            tree.overwrite(path, &dated)
+                .map_err(AlpineError::at("dating the accounts", tree.path(path)))?;
+        }
+    }
+    Ok(())
+}
+
+/// `contents` with every last-change day `found` does not record for its
+/// account replaced by `day`, or `None` where there is none to replace.
+///
+/// Only the third field of a line is touched, and only where it holds a day:
+/// an empty one means no date, and a line with fewer fields is not an account.
+/// Every other byte, line endings included, is kept as it stands.
+fn dated(contents: &[u8], found: &HashMap<Vec<u8>, Vec<u8>>, day: &[u8]) -> Option<Vec<u8>> {
+    let mut changed = false;
+    let lines: Vec<Vec<u8>> = contents
+        .split(|&byte| byte == b'\n')
+        .map(|line| {
+            let mut fields: Vec<&[u8]> = line.split(|&byte| byte == b':').collect();
+            let written = fields.len() >= 3
+                && !fields[2].is_empty()
+                && fields[2] != day
+                && found.get(fields[0]).map(Vec::as_slice) != Some(fields[2]);
+            if !written {
+                return line.to_vec();
+            }
+            changed = true;
+            fields[2] = day;
+            fields.join(&b':')
+        })
+        .collect();
+    changed.then(|| lines.join(&b'\n'))
 }
 
 /// Runs the `.trigger` script of every package whose watched paths the finished
@@ -289,14 +416,19 @@ fn launch(
         staging,
         rooting,
         identity_map,
+        source_date_epoch,
     } = site;
-    let cage = rooting
+    let mut builder = rooting
         .builder(staging)
         .command(script)
         .args(args)
         .env("PATH", SCRIPT_PATH)
         .env("APK_SCRIPT", kind.name())
-        .env("APK_PACKAGE", &subject.name)
+        .env("APK_PACKAGE", &subject.name);
+    if let Some(epoch) = source_date_epoch {
+        builder = builder.env("SOURCE_DATE_EPOCH", epoch.to_string());
+    }
+    let cage = builder
         .stdin(Stdio::Null)
         // The script exists only to serve this bootstrap. Tie it to the caller
         // so a caller killed mid-bootstrap does not leave a maintainer script
@@ -779,6 +911,94 @@ mod tests {
         let scratch = Scratch::for_test("alpine-bootstrap", tag);
         let tree = Rooted::open(&scratch).expect("the scratch tree opens");
         (scratch, tree)
+    }
+
+    /// The accounts `found` in a shadow file, as `account_dates` records them.
+    fn found(lines: &[(&str, &str)]) -> HashMap<Vec<u8>, Vec<u8>> {
+        lines
+            .iter()
+            .map(|(name, day)| (name.as_bytes().to_vec(), day.as_bytes().to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn only_the_days_the_run_wrote_are_dated() {
+        // root and bin as a package ships them, with no date and with one; klogd
+        // created by the run; daemon's date changed by it.
+        let before = found(&[("root", ""), ("bin", "0"), ("daemon", "19000")]);
+        let after = b"root:::0:::::\nbin:!:0:0:::::\ndaemon:!:20722:0:::::\n\
+                      klogd:!:20722:0:99999:7:::\n";
+        let dated = dated(after, &before, b"19675").expect("the run wrote dates");
+        assert_eq!(
+            dated,
+            b"root:::0:::::\nbin:!:0:0:::::\ndaemon:!:19675:0:::::\n\
+              klogd:!:19675:0:99999:7:::\n"
+        );
+        // Nothing to date is no rewrite, and one already at the epoch's day is
+        // nothing to date.
+        assert_eq!(super::dated(&dated, &before, b"19675"), None);
+    }
+
+    #[test]
+    fn a_line_that_is_not_an_account_is_kept_as_it_stands() {
+        // Too few fields, an empty line, and no trailing newline: none is an
+        // account, and the bytes around the one rewrite are untouched.
+        let after = b"garbage\n\nnew:!:20722";
+        assert_eq!(
+            dated(after, &found(&[]), b"1").as_deref(),
+            Some(&b"garbage\n\nnew:!:1"[..]),
+        );
+    }
+
+    #[test]
+    fn the_accounts_are_dated_in_place_in_both_files() {
+        let (staging, tree) = rooted_tree("shadow");
+        let shipped = b"root:::0:::::\n";
+        tree.write_mode("etc/shadow", shipped, 0o640).unwrap();
+        let before = account_dates(&tree, None).expect("the accounts read");
+
+        // What busybox's adduser leaves: the file with the new account, and the
+        // previous version beside it.
+        tree.overwrite("etc/shadow", b"root:::0:::::\nklogd:!:20722:0:99999:7:::\n")
+            .unwrap();
+        tree.write_mode(
+            "etc/shadow-",
+            b"root:::0:::::\nklogd:!:20722:0:99999:7:::\n",
+            0o640,
+        )
+        .unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(staging.join("etc/shadow")).unwrap().ino();
+
+        date_accounts(&tree, &before, 1_700_000_000).expect("the accounts are dated");
+
+        for path in SHADOW {
+            assert_eq!(
+                std::fs::read(staging.join(path)).unwrap(),
+                b"root:::0:::::\nklogd:!:19675:0:99999:7:::\n",
+                "{path}",
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(staging.join("etc/shadow")).unwrap().ino(),
+            inode
+        );
+    }
+
+    #[test]
+    fn a_layered_build_reads_the_accounts_of_the_base_beneath_it() {
+        // The upper holds no shadow file until a script writes one, so what the
+        // run found is the base's.
+        let (_base_dir, base) = rooted_tree("shadow-base");
+        base.write("etc/shadow", b"root:::0:::::\nklogd:!:19000:0:99999:7:::\n")
+            .unwrap();
+        let (_upper_dir, upper) = rooted_tree("shadow-upper");
+        let before = account_dates(&upper, Some(&base)).expect("the accounts read");
+        assert_eq!(before, found(&[("root", ""), ("klogd", "19000")]));
+
+        // An upper that holds none after the run is left to the base.
+        date_accounts(&upper, &before, 1_700_000_000).expect("nothing to date");
+        assert!(!upper.exists("etc/shadow").unwrap());
     }
 
     #[test]

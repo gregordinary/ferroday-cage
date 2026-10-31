@@ -168,6 +168,21 @@ impl Rooted {
         self.open_regular(relative.as_ref(), OFlags::RDONLY)
     }
 
+    /// Replaces the contents of the regular file at `relative` in place.
+    ///
+    /// Where [`write`](Self::write) replaces the file, this keeps it: the inode,
+    /// and with it the owner, the group, and the mode, are the ones the file
+    /// already had. That is the difference for a file whose ownership a script
+    /// set, which a replacement written by the calling user would lose. The
+    /// file must exist, and anything that is not a regular file is refused as
+    /// [`reader`](Self::reader) refuses it, before anything is truncated.
+    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+    pub(crate) fn overwrite(&self, relative: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
+        let mut file = self.open_regular(relative.as_ref(), OFlags::WRONLY)?;
+        file.set_len(0)?;
+        file.write_all(contents)
+    }
+
     /// Opens the regular file at `relative` for `access`, refusing anything
     /// else without waiting on it.
     ///
@@ -553,6 +568,32 @@ mod tests {
                 .contains(OFlags::NONBLOCK)
         );
         assert_eq!(tree.read("etc/os-release").unwrap(), b"ID=test\n");
+    }
+
+    #[test]
+    fn an_overwrite_keeps_the_file_it_rewrites() {
+        // The inode, and so the owner, group, and mode a script gave the file,
+        // survive the rewrite; only the contents change.
+        let (scratch, tree) = tree("overwrite");
+        tree.write_mode("etc/shadow", b"root:*:19000:0:::::\n", 0o640)
+            .unwrap();
+        let path = scratch.join("tree/etc/shadow");
+        let before = std::fs::metadata(&path).unwrap();
+
+        tree.overwrite("etc/shadow", b"root:*:1:0:::::\n").unwrap();
+
+        use std::os::unix::fs::MetadataExt;
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"root:*:1:0:::::\n");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.permissions().mode() & 0o7777, 0o640);
+
+        // A file that is not there is not created, and a link is not written
+        // through.
+        assert!(tree.overwrite("etc/absent", b"x").is_err());
+        std::os::unix::fs::symlink(&path, scratch.join("tree/etc/link")).unwrap();
+        assert!(tree.overwrite("etc/link", b"x").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"root:*:1:0:::::\n");
     }
 
     #[test]

@@ -747,6 +747,22 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--alpine-source-date-epoch",
+        section: Section::Provisioning,
+        placeholder: "EPOCH",
+        help: &[
+            "Give every install script SOURCE_DATE_EPOCH, a",
+            "Unix timestamp in seconds, and date the accounts",
+            "the install creates by EPOCH rather than by the",
+            "day the bootstrap ran",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.alpine_source_date_epoch = Some(parse_epoch(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--alpine-repository",
         section: Section::Provisioning,
         placeholder: "SPEC",
@@ -2085,6 +2101,7 @@ struct Options {
     alpine_mirror_fallback: Vec<String>,
     alpine_pre_configure_overlay: Option<PathBuf>,
     alpine_identity_map: Option<IdentityMap>,
+    alpine_source_date_epoch: Option<i64>,
     alpine_repositories: Vec<AlpineRepositorySpec>,
     provision_gentoo: Option<String>,
     gentoo_variant: Option<String>,
@@ -2626,6 +2643,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         gentoo_max_pointer_age: None,
         alpine_pre_configure_overlay: None,
         alpine_identity_map: None,
+        alpine_source_date_epoch: None,
         alpine_repositories: Vec::new(),
         command_line: Vec::new(),
         path_lookup: None,
@@ -3289,12 +3307,13 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
 }
 
 /// Parses the Unix timestamp in seconds that `flag` takes: `--clamp-mtime`'s
-/// ceiling or `--debian-source-date-epoch`'s date.
+/// ceiling, or the date `--debian-source-date-epoch` and
+/// `--alpine-source-date-epoch` give a bootstrap.
 ///
 /// Signed, because the ceiling is a plain timestamp rather than a duration and
-/// a tree may legitimately be pinned to an instant before the epoch. The
-/// Debian bootstrap refuses a negative date when it is built, with the library's
-/// reason, so the two flags share this parse and differ only there.
+/// a tree may legitimately be pinned to an instant before the epoch. Each
+/// bootstrap refuses a negative date when it is built, with the library's
+/// reason, so the three flags share this parse and differ only there.
 fn parse_epoch(flag: &str, value: &str) -> Result<i64, String> {
     value
         .parse::<i64>()
@@ -3338,6 +3357,7 @@ fn has_alpine_modifiers(options: &Options) -> bool {
         || !options.alpine_mirror_fallback.is_empty()
         || options.alpine_pre_configure_overlay.is_some()
         || options.alpine_identity_map.is_some()
+        || options.alpine_source_date_epoch.is_some()
         || !options.alpine_repositories.is_empty()
 }
 
@@ -5368,6 +5388,9 @@ fn provision_alpine(
     if let Some(map) = &options.alpine_identity_map {
         builder = builder.identity_map(map.clone());
     }
+    if let Some(epoch) = options.alpine_source_date_epoch {
+        builder = builder.source_date_epoch(epoch);
+    }
     for spec in &options.alpine_repositories {
         let mut repository = Repository::builder(&spec.release).keys(
             alpine_key_set("--alpine-repository", &spec.keys, &architecture)
@@ -7161,6 +7184,28 @@ mod tests {
             error.contains("--debian-source-date-epoch") && !error.contains("--clamp-mtime"),
             "{error}",
         );
+    }
+
+    #[test]
+    fn an_alpine_source_date_epoch_is_a_timestamp_named_by_its_own_flag() {
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--provision-alpine",
+            "v3.23",
+            "--alpine-source-date-epoch",
+            "1700000000",
+        ]);
+        assert_eq!(options.alpine_source_date_epoch, Some(1_700_000_000));
+        let error = parse_error(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--provision-alpine",
+            "v3.23",
+            "--alpine-source-date-epoch",
+            "yesterday",
+        ]);
+        assert!(error.contains("--alpine-source-date-epoch"), "{error}");
     }
 
     #[test]

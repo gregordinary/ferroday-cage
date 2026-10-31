@@ -209,6 +209,66 @@ fn a_bootstrap_keeps_no_machine_id_and_dbus_generates_one() {
     assert_eq!(id.trim_end().len(), 32, "{id}");
 }
 
+/// A bootstrap given an epoch dates the accounts its scripts create by it.
+///
+/// busybox's `adduser` writes the day it ran into `/etc/shadow`, and into the
+/// previous version it keeps at `/etc/shadow-`, whatever the environment says.
+/// `alpine-baselayout` ships the file, which `adduser` leaves alone where it is
+/// missing, and `dbus`'s pre-install creates an account in it.
+#[test]
+fn a_bootstrap_dates_the_accounts_its_scripts_create_by_the_epoch() {
+    if !network_enabled() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        // The scripts run inside a cage, which needs user namespaces.
+        return;
+    };
+    const EPOCH: i64 = 1_700_000_000;
+    let rootfs = common::scratch_dir("alpine-epoch").join("rootfs");
+    let mut alpine = Alpine::builder(RELEASE)
+        .include(["alpine-baselayout", "dbus"])
+        .source_date_epoch(EPOCH)
+        .cache_dir(common::download_cache("alpine"))
+        .build()
+        .expect("the builder validates");
+    provision::ensure(&rootfs, &mut alpine).expect("the bootstrap runs");
+
+    let epoch_day = (EPOCH / 86_400).to_string();
+    let today = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_secs()
+        / 86_400)
+        .to_string();
+    let last_changed = |path: &str| -> Vec<(String, String)> {
+        std::fs::read_to_string(rootfs.join(path))
+            .expect("the scripts wrote the file")
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split(':');
+                let name = fields.next()?.to_string();
+                let _password = fields.next()?;
+                Some((name, fields.next()?.to_string()))
+            })
+            .collect()
+    };
+
+    let shadow = last_changed("etc/shadow");
+    assert!(
+        shadow.contains(&("messagebus".to_string(), epoch_day.clone())),
+        "the account dbus created is dated by the epoch: {shadow:?}",
+    );
+    let previous = last_changed("etc/shadow-");
+    assert!(
+        previous.iter().any(|(_, day)| *day == epoch_day),
+        "the previous version is dated too: {previous:?}",
+    );
+    for (name, day) in shadow.iter().chain(&previous) {
+        assert_ne!(*day, today, "{name} carries the day the bootstrap ran");
+    }
+}
+
 /// A root provisioned from Alpine's `main` and postmarketOS's repository at
 /// once.
 ///
