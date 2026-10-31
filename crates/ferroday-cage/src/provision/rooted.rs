@@ -48,7 +48,7 @@
 // so once is clearer than gating a dozen methods one by one.
 #![cfg_attr(not(feature = "debian"), allow(dead_code))]
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -245,9 +245,8 @@ impl Rooted {
     /// Enumerating a tree is the Gentoo layer's alone — its package database is
     /// a directory of directories, where Debian's and Alpine's are files whose
     /// names the layer already knows — so a build without that feature has no
-    /// caller, and neither has [`open_read_dir`](Self::open_read_dir) below it.
-    /// The module's own blanket allowance does not cover the pair, since they
-    /// are dead under `debian` as well.
+    /// caller. The module's own blanket allowance does not cover it, since it
+    /// is dead under `debian` as well.
     #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
     pub(crate) fn directories(&self, relative: impl AsRef<Path>) -> io::Result<Vec<Vec<u8>>> {
         let components = components(relative.as_ref())?;
@@ -308,6 +307,41 @@ impl Rooted {
             Err(Errno::NOENT | Errno::NOTDIR) => Ok(None),
             Err(errno) => Err(errno.into()),
         }
+    }
+
+    /// The value of the extended attribute `name` on the directory at
+    /// `relative`, or `None` when the directory does not carry it.
+    ///
+    /// Read through a descriptor for the directory, since an `O_PATH` one
+    /// cannot be asked for an attribute. A directory is the one kind opened, so
+    /// nothing here can wait on a named pipe.
+    pub(crate) fn directory_xattr(
+        &self,
+        relative: impl AsRef<Path>,
+        name: &CStr,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let components = components(relative.as_ref())?;
+        let dir = self.open_read_dir(&components)?;
+        let size = match rustix::fs::fgetxattr(&dir, name, &mut [0u8; 0][..]) {
+            Ok(size) => size,
+            Err(Errno::NODATA) => return Ok(None),
+            Err(errno) => return Err(errno.into()),
+        };
+        let mut value = vec![0; size];
+        let read = rustix::fs::fgetxattr(&dir, name, &mut value)?;
+        value.truncate(read);
+        Ok(Some(value))
+    }
+
+    /// Creates an overlay whiteout at `relative`: a character device numbered
+    /// 0:0, which hides the name from every layer below the one holding it.
+    ///
+    /// The kernel lets an unprivileged process create this one device. A name
+    /// already taken is refused rather than replaced.
+    pub(crate) fn whiteout(&self, relative: impl AsRef<Path>) -> io::Result<()> {
+        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Require)?;
+        rustix::fs::mknodat(&parent, &leaf, FileType::CharacterDevice, Mode::empty(), 0)?;
+        Ok(())
     }
 
     /// Removes `relative` if it exists, treating an already-absent path — and
@@ -372,7 +406,6 @@ impl Rooted {
     /// A whiteout in a tree that is an overlay's upper is an absent entry to
     /// every reader of the merged root. Opening one for reading fails with
     /// `ENXIO`, since no driver backs the device.
-    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub(crate) fn is_whiteout(stat: &Stat) -> bool {
         FileType::from_raw_mode(stat.st_mode) == FileType::CharacterDevice && stat.st_rdev == 0
     }
@@ -456,11 +489,7 @@ impl Rooted {
     ///
     /// `O_RDONLY` where [`open_dir`](Self::open_dir) takes `O_PATH`: an
     /// `O_PATH` descriptor anchors an `*at` call and cannot be handed to
-    /// `getdents`.
-    ///
-    /// [`directories`](Self::directories) is its only caller, so it is dead in
-    /// the same builds and gated the same way.
-    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+    /// `getdents` or asked for an extended attribute.
     fn open_read_dir(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
         let path = if components.is_empty() {
             CString::new(&b"."[..])

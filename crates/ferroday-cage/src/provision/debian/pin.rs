@@ -199,6 +199,7 @@ pub struct UnheldPin {
 #[non_exhaustive]
 pub enum UnheldReason {
     /// The archives offer the package, but only at another version.
+    #[non_exhaustive]
     Version {
         /// The version the archives offer.
         archive: String,
@@ -206,6 +207,7 @@ pub enum UnheldReason {
     /// The archives offer no version of the package at all.
     Absent,
     /// The archives offer the pinned version, recording different bytes for it.
+    #[non_exhaustive]
     Digest {
         /// The digest the pin records, lowercase hex.
         pin: String,

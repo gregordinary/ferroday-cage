@@ -660,25 +660,9 @@ fn overlay_mount_probe(base: &Path) -> Option<crate::mechanism::OverlayProbe> {
     let work = dir("work")?;
     let merged = dir("merged")?;
 
-    // The option string names the three layer paths verbatim; a ',' or ':' in
-    // any would misparse, so an unusual scratch path is left inconclusive rather
-    // than reported as a mount refusal.
-    for path in [&lower, &upper, &work] {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.contains(&b',') || bytes.contains(&b':') {
-            return None;
-        }
-    }
-    let mut options = Vec::new();
-    options.extend_from_slice(b"lowerdir=");
-    options.extend_from_slice(lower.as_os_str().as_bytes());
-    options.extend_from_slice(b",upperdir=");
-    options.extend_from_slice(upper.as_os_str().as_bytes());
-    options.extend_from_slice(b",workdir=");
-    options.extend_from_slice(work.as_os_str().as_bytes());
-    options.extend_from_slice(b",userxattr");
-
-    let options = CString::new(options).ok()?;
+    // A scratch path the option string cannot carry leaves the probe
+    // inconclusive rather than reported as a mount refusal.
+    let options = crate::mechanism::overlay_options(&[lower], &upper, &work).ok()?;
     let merged = CString::new(merged.as_os_str().as_bytes()).ok()?;
     Some(crate::mechanism::probe_overlay_mount(&merged, &options))
 }

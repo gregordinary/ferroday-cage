@@ -37,11 +37,12 @@
 //!
 //! # The sandbox
 //!
-//! A launch creates new user, mount, PID, UTS, IPC, cgroup, and (by
-//! default) network namespaces, maps the calling user to root inside,
-//! assembles the mount profile over the configured rootfs, pivots into it,
-//! and executes the command as PID 2 under a minimal init that collects
-//! orphaned descendants and tears the namespace down when the command exits.
+//! A launch creates new user, mount, UTS, IPC, and cgroup namespaces, and by
+//! default PID and network namespaces too. It maps the calling user to root
+//! inside, assembles the mount profile over the configured root filesystem,
+//! and pivots into it. With the default PID namespace it executes the command as PID 2
+//! under a minimal init that collects orphaned descendants and tears the
+//! namespace down when the command exits.
 //!
 //! By default the command sees the rootfs at `/` with a fresh `/proc`, a
 //! minimal `/dev`, and a tmpfs `/tmp` assembled over it, plus any bind
@@ -198,6 +199,22 @@ bootstraps a Debian suite from the archive and configures it inside a
 cage of its own.
 "
 )]
+#![cfg_attr(
+    feature = "alpine",
+    doc = "
+With the `alpine` feature, [`Alpine`](provision::alpine::Alpine)
+bootstraps an Alpine or postmarketOS release from an apk repository,
+running each package's scripts inside a sandbox of its own.
+"
+)]
+#![cfg_attr(
+    feature = "gentoo",
+    doc = "
+With the `gentoo` feature, [`Gentoo`](provision::gentoo::Gentoo)
+bootstraps a root from a signed Gentoo stage3 and installs prebuilt
+packages from a binary package host into it.
+"
+)]
 //!
 //! # Host requirements
 //!
@@ -285,7 +302,7 @@ pub use netstack::{NetStack, NetStackBuilder, NetStackError, NetStackHandle};
 pub use observer::{Observer, Output, Progress};
 pub use resolved::{
     ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs, ResolvedLandlockNet,
-    ResolvedMount, ResolvedRlimit, ResolvedRoot, ResolvedStdio, ResolvedStreams,
+    ResolvedMount, ResolvedRlimit, ResolvedRoot, ResolvedRunAs, ResolvedStdio, ResolvedStreams,
 };
 #[cfg(feature = "hardening")]
 pub use restrict::{Restriction, RestrictionBuilder};

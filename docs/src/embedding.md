@@ -165,46 +165,66 @@ boundary moves the *inputs* across and constructs it there — which is what the
 
 ## Recording what a build ran under
 
-What a command produces depends on the filesystem it sees, the environment it
-carries, the identity it holds, whether it can reach a network, and which
-syscalls will succeed. A runtime that publishes artifacts usually needs to state
-those in the artifact's provenance, and the library version alone does not: the
-mount profile and the base environment are both [outside the compatibility
-promise](stability.md#what-is-not-covered) and may change in a patch release.
+What a command produces depends on the filesystem it sees and the environment it
+carries. It also depends on the identity and privileges it holds, whether it can
+reach a network, and which syscalls succeed. A runtime that publishes artifacts
+usually needs to state those in the artifact's provenance, and the library
+version alone does not: the mount profile and the base environment are both
+[outside the compatibility promise](stability.md#what-is-not-covered) and may
+change in a patch release.
 
 [`resolved_inputs`] reports them as data. It is a projection of the frozen
 launch plan, computed on demand, so calling it costs nothing until asked and
 adds nothing to a launch:
 
-```rust,no_run
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let cage = ferroday_cage::Cage::builder()
-    .rootfs("/srv/rootfs/alpine")
-    .command("/usr/bin/make")
-    // Prevention: the library contributes no mount and no variable of its
-    // own, in this release or any later one.
-    .managed_mounts(false)
-    .base_env(false)
-    .env("PATH", "/usr/bin:/bin")
-    .env("SOURCE_DATE_EPOCH", "1700000000")
-    .bind_ro("/srv/src", "/usr/src")
-    .build()?;
+```rust
+use std::path::Path;
 
-// Verification: what the sandbox will actually apply, ready to stamp beside
-// the consumer's own version pin.
-let provenance = toml::to_string(&cage.resolved_inputs())?;
-# let _ = provenance;
+use ferroday_cage::{Cage, RawMount};
+
+/// The provenance record of a build over `rootfs`, with `sources` at
+/// `/usr/src`.
+fn provenance(rootfs: &Path, sources: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/usr/bin/make")
+        // Prevention: the library contributes no mount and no variable of
+        // its own, in this release or any later one.
+        .managed_mounts(false)
+        .base_env(false)
+        // The one mount a container cannot do without: the procfs its nested
+        // user namespace establishes an identity map through. The flags are
+        // MS_NOSUID | MS_NODEV | MS_NOEXEC, as the managed procfs has them.
+        .raw_mount(RawMount::new("/proc").fstype("proc").flags(0xe))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SOURCE_DATE_EPOCH", "1700000000")
+        .bind_ro(sources, "/usr/src")
+        .build()?;
+
+    // Verification: what the sandbox will actually apply, ready to stamp
+    // beside the consumer's own version pin.
+    Ok(toml::to_string(&cage.resolved_inputs())?)
+}
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# // Directories every host has, so the recipe builds wherever it is tested.
+# let record = provenance(&std::env::temp_dir(), Path::new("/etc"))?;
+# assert!(record.contains("fstype = \"proc\""), "{record}");
 # Ok(())
 # }
 ```
 
+Without the managed mounts, a profile declares its own procfs. Every container
+enters a nested user namespace, which is what locks its mount flags, and that
+namespace's identity map is written through a procfs. A build that declares
+none is refused with `NestedUsernsNeedsProcfs`. [Identity
+maps](identity-maps.md) sets out the one configuration that needs none.
+
 The two are complements. The opt-outs keep the inputs from drifting under a
-library upgrade; the record states what they were, which is what catches the
-case where a declaration and the sandbox disagree. Note what the record
-contains that no other accessor can report: with the managed profile in force
-it lists the six `/dev` device nodes and the five `/dev` symlinks
-individually, where `get_mount_dev()` answers only whether `/dev` is
-assembled.
+library upgrade. The record states what they were, which catches the case where
+a declaration and the sandbox disagree. It also holds what no other accessor
+reports. With the managed profile in force, it lists the six `/dev` device nodes
+and the five `/dev` symlinks one by one, where `get_mount_dev()` answers only
+whether `/dev` is assembled.
 
 ### What the record carries
 
@@ -216,12 +236,19 @@ because that stack is what the root was made of. Recording only the mounts would
 leave two builds — one on a rootfs, one on an overlay over the same base —
 looking identical.
 
-`identity`, `network`, `rlimits`, and `hardening` are the posture the launch
-puts the command under, and each changes what a build produces:
+`identity`, `run-as`, `no-new-privileges`, `network`, `rlimits`, and
+`hardening` are the posture the launch puts the command under, and each changes
+what a build produces:
 
-- **`identity`** — whether the build sees uid 0 or a mapped id. A Debian
-  build's `Rules-Requires-Root` handling turns on exactly this, and a file's
-  recorded ownership follows from it.
+- **`identity`** — the identity map: which ids exist inside the sandbox. A
+  file's recorded ownership follows from it.
+- **`run-as`** — the id the command runs as, where one is configured, and
+  uid 0 where the key is absent. A Debian build's `Rules-Requires-Root`
+  handling turns on exactly this. A non-root id also leaves the command no
+  capabilities, unless the hardening keep set carries some across.
+- **`no-new-privileges`** — whether a set-user-ID binary or a file capability
+  grants anything across `execve`. A run-as identity sets it, and so does any
+  hardening control.
 - **`network`** — the namespace the sandbox creates. A stack attached to a
   pending launch is not visible here, being established after the cage is built.
 - **`rlimits`** — a build that adapts its parallelism to `RLIMIT_NOFILE`, or

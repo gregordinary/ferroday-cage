@@ -107,17 +107,14 @@ pub trait Observer {
 /// one line per milestone writes the same thing on either side:
 ///
 /// ```no_run
-/// # #[cfg(feature = "tarball")]
 /// # fn main() -> Result<(), ferroday_cage::Error> {
 /// use ferroday_cage::{Cage, Progress};
 ///
 /// # let rootfs = "/var/cache/myapp/rootfs";
-/// let mut cage = Cage::builder().command("/bin/true").rootfs(rootfs).build()?;
+/// let cage = Cage::builder().command("/bin/true").rootfs(rootfs).build()?;
 /// cage.run_with(&mut |event: Progress| eprintln!("{event:?}"))?;
 /// # Ok(())
 /// # }
-/// # #[cfg(not(feature = "tarball"))]
-/// # fn main() {}
 /// ```
 ///
 /// A closure cannot receive the command's output, because it would have no way

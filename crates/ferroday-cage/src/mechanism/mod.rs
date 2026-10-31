@@ -106,7 +106,9 @@ pub(crate) use export::{
     ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
     StartError, kill_export, start_export,
 };
-pub(crate) use overlay::{OverlayProbe, probe_overlay_mount, xattr_unsupported};
+pub(crate) use overlay::{
+    OverlayOptionsError, OverlayProbe, overlay_options, probe_overlay_mount, xattr_unsupported,
+};
 pub(crate) use remove::{RemoveFailure, remove_tree_mapped};
 
 use std::ffi::{CStr, CString};
@@ -117,7 +119,7 @@ use std::sync::Arc;
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::RawMode;
 use rustix::io::Errno;
-use rustix::mount::MountFlags;
+use rustix::mount::{MountFlags, MountPropagationFlags};
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::pipe::{self, PipeFlags};
 use rustix::process::Signal;
@@ -252,8 +254,8 @@ pub(crate) struct NestedPlan {
 /// overlay root; a plain cage binds its rootfs onto itself instead.
 #[derive(Debug, Clone)]
 pub(crate) struct OverlayPlan {
-    /// The overlay mount options, preformatted at build time:
-    /// `lowerdir=<base>,upperdir=<upper>,workdir=<work>,userxattr`.
+    /// The overlay mount options, composed at build time by
+    /// [`overlay_options`]: `lowerdir=<lowers>,upperdir=<upper>,workdir=<work>,userxattr`.
     pub(crate) options: CString,
     /// The resolved lower layers, first (the base the overlay mounts over)
     /// first. Kept beside the formatted options so `resolved_inputs` can report
@@ -382,6 +384,13 @@ pub(crate) struct ManagedPlaceholders {
     pub(crate) root: PathBuf,
     /// The targets, as paths relative to [`root`](Self::root).
     pub(crate) paths: Vec<PathBuf>,
+    /// The targets among [`paths`](Self::paths) an overlay's upper held a
+    /// whiteout at before the launch, which the removal puts back.
+    ///
+    /// Creating the target over a whiteout replaces the whiteout, so removing
+    /// the target alone would bring back the entry a lower layer holds there,
+    /// which the upper had deleted.
+    pub(crate) whiteouts: Vec<PathBuf>,
 }
 
 impl ManagedPlaceholders {
@@ -774,20 +783,62 @@ pub(crate) enum MountAction {
     },
 }
 
+/// What a [`MountAction`] brings to rest on its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// A filesystem instance of its own, which nothing outside the sandbox
+    /// holds: a tmpfs, a procfs, a devpts, or a raw mount of a filesystem type.
+    Fresh,
+    /// A tree that already stood elsewhere, bound or moved onto the target:
+    /// what is written under it lands wherever that tree lives.
+    Tree,
+}
+
+/// `MS_REMOUNT`. rustix keeps the flag to its own remount call, and a raw
+/// mount carries the caller's bits verbatim.
+const MS_REMOUNT: u32 = 0x20;
+/// `MS_MOVE`, kept to rustix's own move call for the same reason.
+const MS_MOVE: u32 = 0x2000;
+
 impl MountAction {
-    /// The rootfs-relative path this action mounts something on, or `None` for
-    /// the one action that mounts nothing.
+    /// The rootfs-relative path this action brings a mount to rest on, and
+    /// what arrives there, or `None` for an action that brings none.
     ///
     /// A path under one of these is inside that mount once the action has run,
     /// not in the rootfs directory on the host, which is what decides whether
-    /// a target the launch creates has a host path at all.
-    pub(crate) fn target(&self) -> Option<&CStr> {
+    /// a target the launch creates has a host path at all. It also decides
+    /// what an earlier mount at the same place still shows.
+    ///
+    /// A raw action is read the way `mount(2)` reads its flags, in the order the
+    /// kernel tests them. A remount changes a mount already standing and brings
+    /// none. `MS_BIND` binds a tree, whatever else is set. A propagation change
+    /// brings none. `MS_MOVE` moves a mount standing elsewhere onto the target,
+    /// and anything else mounts a fresh filesystem of the type named.
+    pub(crate) fn arrival(&self) -> Option<(&CStr, Arrival)> {
         match self {
             MountAction::Tmpfs { target, .. }
             | MountAction::Procfs { target }
-            | MountAction::Devpts { target, .. }
-            | MountAction::Bind { target, .. }
-            | MountAction::Raw { target, .. } => Some(target),
+            | MountAction::Devpts { target, .. } => Some((target, Arrival::Fresh)),
+            MountAction::Bind { target, .. } => Some((target, Arrival::Tree)),
+            MountAction::Raw { target, flags, .. } => {
+                let propagation = (MountPropagationFlags::SHARED
+                    | MountPropagationFlags::PRIVATE
+                    | MountPropagationFlags::DOWNSTREAM
+                    | MountPropagationFlags::UNBINDABLE)
+                    .bits();
+                let flags = flags.bits();
+                if flags & MS_REMOUNT != 0 {
+                    None
+                } else if flags & MountFlags::BIND.bits() != 0 {
+                    Some((target, Arrival::Tree))
+                } else if flags & propagation != 0 {
+                    None
+                } else if flags & MS_MOVE != 0 {
+                    Some((target, Arrival::Tree))
+                } else {
+                    Some((target, Arrival::Fresh))
+                }
+            }
             MountAction::Symlink { .. } => None,
         }
     }

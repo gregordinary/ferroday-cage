@@ -279,9 +279,82 @@ fn a_work_directory_on_another_filesystem_is_refused_by_name() {
         .command("/bin/sh")
         .build()
         .expect_err("a work directory on another filesystem must be refused");
+    let left_behind = work.exists();
     let _ = std::fs::remove_dir(&work);
     assert!(
         err.to_string().contains("overlay work directory"),
         "the refusal must name the work directory: {err}"
+    );
+    assert!(
+        !left_behind,
+        "a refused build removes the layer directories it created"
+    );
+}
+
+#[test]
+fn a_bind_target_the_upper_had_deleted_stays_deleted_after_the_run() {
+    let Some(lower) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("overlay-bind-over-deleted");
+    if !overlay_supported(&dir) {
+        return;
+    }
+    for path in ["etc/os-release", "etc/apk/repositories"] {
+        assert!(
+            lower.join(path).is_file(),
+            "the fixture carries {path}, which the test deletes",
+        );
+    }
+    let upper = dir.join("upper");
+    let source = dir.join("bound");
+    std::fs::write(&source, b"bound\n").unwrap();
+
+    // An earlier run deletes one file, which the upper records as a whiteout,
+    // and replaces a directory, which it records as an opaque directory.
+    let status = run(
+        lower,
+        &upper,
+        "rm /etc/os-release && rm -r /etc/apk && mkdir /etc/apk",
+    );
+    assert!(status.success(), "the deletions go through the overlay");
+
+    // A later run binds a file onto each deleted path. The merged view holds
+    // nothing at either, so the launch creates both targets in the upper, and
+    // the bind shows through them.
+    let status = Cage::builder()
+        .overlay_rootfs(lower, &upper)
+        .bind_ro(&source, "/etc/os-release")
+        .bind_ro(&source, "/etc/apk/repositories")
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "test \"$(cat /etc/os-release)\" = bound && \
+             test \"$(cat /etc/apk/repositories)\" = bound",
+        ])
+        .build()
+        .expect("a valid overlay sandbox configuration")
+        .run()
+        .expect("the overlay sandbox launches");
+    assert!(status.success(), "both binds are in place for the run");
+
+    // Once the sandbox is gone the upper holds what it held before: the
+    // deletions stand, rather than an empty file at each path or the lower's
+    // files showing through again.
+    assert!(
+        run(
+            lower,
+            &upper,
+            "test ! -e /etc/os-release && test ! -e /etc/apk/repositories"
+        )
+        .success(),
+        "the run's targets were removed and the deletions restored",
+    );
+    let whiteout = std::fs::symlink_metadata(upper.join("etc/os-release"))
+        .expect("the upper still records the deletion");
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_char_device(&whiteout.file_type())
+            && std::os::unix::fs::MetadataExt::rdev(&whiteout) == 0,
+        "the deletion is recorded as a whiteout: {whiteout:?}",
     );
 }

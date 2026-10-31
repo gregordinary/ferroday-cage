@@ -127,7 +127,7 @@ stores is bounded; a seam it only borrows for the duration of a call is not.**
 
 | Trait | How the library holds it | Bounds |
 | --- | --- | --- |
-| `IdMapper` | Stored in `IdentityMap` | `Send + Sync` |
+| `IdMapper` | Stored in `CageBuilder` and the `Cage` it builds | `Send + Sync` |
 | `Fetch` | Stored in `Debian` | `Send` |
 | `Provisioner` | `&mut dyn`, for one `ensure` call | None |
 | `Observer` | `&mut dyn`, for one run | None |
@@ -219,6 +219,8 @@ release, including a patch.
   mounts off with `managed_mounts(false)` and declare its own — mounts apply
   in declaration order, so a `raw_mount` tmpfs followed by the binds that
   populate it reproduces a managed mount's structure as well as its contents.
+  Its own set includes a procfs, which every container needs, as [Recording
+  what a build ran under](embedding.md#recording-what-a-build-ran-under) shows.
 - **The base environment.** `PATH` and `HOME=/root`, and nothing else, is the
   current default. A build whose output depends on the environment should set
   every variable it cares about explicitly through `env`, and use
@@ -237,10 +239,10 @@ and they are complements rather than alternatives:
 
 - **Declare, with the two opt-outs above.** `managed_mounts(false)` and
   `base_env(false)` reduce the library's contribution to nothing, so the
-  sandbox carries exactly what the consumer declared. This is prevention: the
-  inputs cannot drift under a library upgrade.
+  sandbox carries exactly what the consumer declared, a procfs among it. This
+  is prevention: the inputs cannot drift under a library upgrade.
 - **Record, with `Cage::resolved_inputs`.** The built cage reports the
-  environment it will apply and the mounts it will establish, as data. Stamped
+  environment, the mounts, and the posture it will apply, as data. Stamped
   into an artifact's provenance beside the library version, it states the
   inputs a build actually ran under rather than leaving them to be inferred.
   This is verification, and it is worth doing even with both opt-outs set,

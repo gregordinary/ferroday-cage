@@ -545,17 +545,10 @@ impl RestrictionBuilder {
     /// restriction with no grant and no policy is rejected as
     /// [`ConfigError::RestrictionEmpty`].
     pub fn build(self) -> Result<Restriction, Error> {
-        let command = self.command.ok_or(ConfigError::CommandMissing)?;
-        // The absence of a command written down, reported as that rather than
-        // as a path that is not absolute; a cage reads it the same way.
-        if command.as_os_str().is_empty() {
-            return Err(ConfigError::CommandMissing.into());
-        }
-        if !command.is_absolute() {
-            return Err(ConfigError::CommandNotAbsolute { command }.into());
-        }
-        let program = spec::cstring(command.as_os_str())?;
-        let exec_label = spec::exec_label(&command, &[]);
+        // The rule a sandbox reads its command by, without path lookup: a
+        // restriction never searches the host's `PATH`.
+        let command = spec::validate_command(self.command, false)?;
+        let exec_label = spec::exec_label(&command.path, &[]);
         let (rlimits, rlimit_labels) = spec::lower_rlimits(&self.rlimits)?;
         let args = self
             .args
@@ -602,7 +595,7 @@ impl RestrictionBuilder {
                 identity: IdentityPlan::Single,
                 nested: None,
                 run_as: None,
-                program,
+                program: command.program,
                 // A restriction keeps the absolute-command contract: no PATH
                 // search over the shared host filesystem.
                 program_search: Vec::new(),
@@ -715,6 +708,22 @@ mod tests {
             err,
             Error::Config(ConfigError::CommandNotAbsolute { .. })
         ));
+    }
+
+    #[test]
+    fn a_dot_or_dot_dot_command_is_refused_as_a_cage_refuses_it() {
+        // The command is read by the rule a sandbox reads its own by.
+        for command in [".", ".."] {
+            let err = Restriction::builder()
+                .command(command)
+                .seccomp(SeccompPolicy::Curated)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::CommandNotAbsolute { .. })),
+                "{command}: {err}"
+            );
+        }
     }
 
     #[test]

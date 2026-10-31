@@ -29,7 +29,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::host::UsernsBlocker;
-use crate::spec::command_has_slash;
+use crate::spec::is_command_name;
 use crate::wire::wire_enum;
 
 wire_enum! {
@@ -246,7 +246,8 @@ pub enum ConfigError {
     /// The message names the remedy that fits: a bare command name — the most
     /// common form of this mistake — is resolvable with
     /// [`path_lookup`](crate::CageBuilder::path_lookup), while a relative path
-    /// containing a slash is never searched and must be made absolute.
+    /// is never searched and must be made absolute. That includes `.` and `..`,
+    /// which carry no slash but name directories rather than commands.
     #[non_exhaustive]
     CommandNotAbsolute {
         /// The command path as it was given to the builder.
@@ -286,6 +287,8 @@ pub enum ConfigError {
     /// A raw mount's flags do not fit the kernel's mount-flags word.
     #[non_exhaustive]
     MountFlagsInvalid {
+        /// The raw mount's target, as it was given to the builder.
+        target: PathBuf,
         /// The flags as they were given to the builder.
         flags: u64,
     },
@@ -295,16 +298,30 @@ pub enum ConfigError {
         /// The working directory as it was given to the builder.
         path: PathBuf,
     },
-    /// The hostname is empty or longer than 64 bytes.
-    HostnameInvalid,
-    /// An environment variable name is empty or contains `=`.
+    /// The hostname is empty, longer than 64 bytes, or contains a NUL byte.
+    #[non_exhaustive]
+    HostnameInvalid {
+        /// The hostname as it was given to the builder.
+        name: std::ffi::OsString,
+    },
+    /// An environment variable name is empty, contains `=`, or contains a NUL
+    /// byte.
     #[non_exhaustive]
     EnvNameInvalid {
         /// The offending variable name.
         name: std::ffi::OsString,
     },
-    /// A configured path, name, or value contains an interior NUL byte.
-    EmbeddedNul,
+    /// A configured path, argument, or value contains an interior NUL byte,
+    /// which nothing the kernel is handed can carry.
+    ///
+    /// A hostname and an environment variable's name are reported by their own
+    /// variants, [`HostnameInvalid`](Self::HostnameInvalid) and
+    /// [`EnvNameInvalid`](Self::EnvNameInvalid).
+    #[non_exhaustive]
+    EmbeddedNul {
+        /// The configured value holding the NUL, as it was given.
+        value: std::ffi::OsString,
+    },
     /// A seccomp policy could not be compiled into a BPF program.
     #[non_exhaustive]
     SeccompInvalid {
@@ -452,6 +469,11 @@ pub enum ConfigError {
     IdentityMapUnavailable {
         /// Why each delegate refused, and any identified host blocker.
         reason: String,
+        /// The refusal of the delegate configured with
+        /// [`id_mapper`](crate::CageBuilder::id_mapper), which is the whole
+        /// chain when one is configured. `None` for the bundled chain, whose
+        /// `reason` collects a refusal from each of its delegates.
+        source: Option<crate::IdMapError>,
     },
     /// A run-as id is not contained in the identity map.
     ///
@@ -508,16 +530,31 @@ pub enum ConfigError {
         capability: &'static str,
     },
     /// An overlay-root path holds a character the overlay mount options cannot
-    /// carry.
+    /// carry: a `,`.
     ///
-    /// The lower, upper, and work directories are passed to the kernel as a
-    /// comma-separated, colon-delimited option string, so a `,` or `:` in any of
-    /// their resolved paths would be misparsed. Such a path is refused rather
-    /// than silently truncated.
+    /// The lower, upper, and work directories are passed to the kernel in one
+    /// comma-separated option string. A `\` or a `:` in a layer path is escaped
+    /// there, but a comma is not one every reader of the string honours an
+    /// escape for: a security module that takes its own options out of the same
+    /// string splits it at every comma first. Such a path is refused rather than
+    /// mounted as something else.
     #[non_exhaustive]
     OverlayPathInvalid {
         /// The offending path.
         path: PathBuf,
+    },
+    /// An overlay root's mount options are longer than the kernel passes on
+    /// whole.
+    ///
+    /// The options name every layer by its absolute path, and `mount(2)` cuts
+    /// its data at one page rather than refusing a longer string. A cut string
+    /// still mounts whenever what is left names directories that exist, which
+    /// is a different overlay from the one configured, so a stack whose paths
+    /// do not fit is refused. Fewer lowers, or shorter paths to them, fit.
+    #[non_exhaustive]
+    OverlayOptionsTooLong {
+        /// The length of the composed options, in bytes.
+        length: usize,
     },
     /// An overlay root names no lower layer.
     ///
@@ -565,15 +602,18 @@ pub enum ConfigError {
         /// The path that was already occupied.
         path: PathBuf,
     },
-    /// An overlay's upper layer is the filesystem root.
+    /// An overlay's upper or work directory is the filesystem root, or another
+    /// path that names no directory inside a parent, such as one ending in
+    /// `..`.
     ///
-    /// The upper needs a parent directory: the work directory the library
-    /// derives is a sibling of the upper, and the host overlay preflight runs in
-    /// that parent so its scratch entries land beside the upper rather than
-    /// inside it. `/` has no parent — and an upper there would put the sandbox's
-    /// writes over the whole host root.
+    /// The library creates both directories inside their parents, and the
+    /// upper's parent also holds the work directory the library derives and
+    /// the host overlay preflight's scratch entries. `/` has no parent, and an
+    /// upper there would put the sandbox's writes over the whole host root.
     #[non_exhaustive]
-    OverlayUpperIsRoot {
+    OverlayLayerIsRoot {
+        /// Which layer directory the path was given for.
+        layer: OverlayLayer,
         /// The offending path.
         path: PathBuf,
     },
@@ -622,9 +662,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::CommandMissing => f.write_str("no command was provided"),
             // A bare name is the usual case, and `path_lookup` is exactly its
-            // remedy; a relative path with a slash is never searched, so
-            // pointing at path lookup there would be misdirection.
-            ConfigError::CommandNotAbsolute { command } if !command_has_slash(command) => write!(
+            // remedy; a relative path is never searched, so pointing at path
+            // lookup there would be misdirection.
+            ConfigError::CommandNotAbsolute { command } if is_command_name(command) => write!(
                 f,
                 "the command path {} is not absolute; give an absolute path, or enable \
                  path lookup to resolve a bare command name against the sandbox's PATH",
@@ -653,25 +693,31 @@ impl fmt::Display for ConfigError {
                 "the mount target {} is not a normal absolute path inside the rootfs",
                 path.display(),
             ),
-            ConfigError::MountFlagsInvalid { flags } => write!(
+            ConfigError::MountFlagsInvalid { target, flags } => write!(
                 f,
-                "the raw mount flags {flags:#x} do not fit the kernel's mount-flags word",
+                "the flags {flags:#x} of the raw mount at {} do not fit the kernel's mount-flags \
+                 word",
+                target.display(),
             ),
             ConfigError::WorkdirNotAbsolute { path } => write!(
                 f,
                 "the working directory {} is not absolute",
                 path.display(),
             ),
-            ConfigError::HostnameInvalid => {
-                f.write_str("the hostname is empty or longer than 64 bytes")
-            }
+            ConfigError::HostnameInvalid { name } => write!(
+                f,
+                "the hostname {name:?} is empty, longer than 64 bytes, or contains a NUL byte",
+            ),
             ConfigError::EnvNameInvalid { name } => write!(
                 f,
-                "the environment variable name {:?} is empty or contains '='",
+                "the environment variable name {:?} is empty or contains '=' or a NUL byte",
                 name,
             ),
-            ConfigError::EmbeddedNul => {
-                f.write_str("a configured path, name, or value contains an interior NUL byte")
+            ConfigError::EmbeddedNul { value } => {
+                write!(
+                    f,
+                    "the configured value {value:?} contains an interior NUL byte"
+                )
             }
             ConfigError::SeccompInvalid { reason } => {
                 write!(f, "the seccomp policy could not be compiled: {reason}")
@@ -734,7 +780,7 @@ impl fmt::Display for ConfigError {
             ConfigError::IdentityMapInvalid { reason } => {
                 write!(f, "the identity map is invalid: {reason}")
             }
-            ConfigError::IdentityMapUnavailable { reason } => {
+            ConfigError::IdentityMapUnavailable { reason, .. } => {
                 write!(
                     f,
                     "no delegate can establish the requested identity map: {reason}"
@@ -765,9 +811,14 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::OverlayPathInvalid { path } => write!(
                 f,
-                "the overlay-root path {} contains a ',' or ':', which the overlay mount \
-                 options cannot carry",
+                "the overlay-root path {} contains a ',', which the overlay mount options \
+                 cannot carry",
                 path.display(),
+            ),
+            ConfigError::OverlayOptionsTooLong { length } => write!(
+                f,
+                "the overlay root's mount options are {length} bytes, longer than the kernel \
+                 passes on whole; stack fewer lowers, or reach them by shorter paths",
             ),
             ConfigError::OverlayLowerMissing => {
                 f.write_str("the overlay root names no lower layer to mount over")
@@ -793,10 +844,10 @@ impl fmt::Display for ConfigError {
                  sandbox's writes wherever it pointed",
                 path.display(),
             ),
-            ConfigError::OverlayUpperIsRoot { path } => write!(
+            ConfigError::OverlayLayerIsRoot { layer, path } => write!(
                 f,
-                "cannot use {} as the overlay upper directory: the upper needs a parent \
-                 directory, for the work directory beside it and for the host preflight",
+                "cannot use {} as the overlay {layer} directory: it names no directory inside a \
+                 parent, and the {layer} is created in one",
                 path.display(),
             ),
             ConfigError::OverlayUnavailable { blocker } => {
@@ -815,7 +866,9 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {
-    /// The OS failure underneath, for the three refusals that have one.
+    /// The failure underneath, for the refusals that have one: an OS failure
+    /// for the three that resolve a host path, and a configured identity-map
+    /// delegate's own error.
     ///
     /// Every other variant is a request the builder refused on its own terms —
     /// a contradiction, a missing field, a path that is not the shape it has to
@@ -825,6 +878,10 @@ impl std::error::Error for ConfigError {
             ConfigError::RootfsUnusable { source, .. }
             | ConfigError::BindSourceUnusable { source, .. }
             | ConfigError::OverlayDirUnusable { source, .. } => Some(source),
+            ConfigError::IdentityMapUnavailable {
+                source: Some(source),
+                ..
+            } => Some(source),
             _ => None,
         }
     }

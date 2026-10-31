@@ -198,6 +198,7 @@ pub struct UnheldPin {
 #[non_exhaustive]
 pub enum UnheldReason {
     /// The repositories offer the package, and only at another version.
+    #[non_exhaustive]
     Version {
         /// The version the repositories offer.
         repository: String,
@@ -206,6 +207,7 @@ pub enum UnheldReason {
     Absent,
     /// The repositories offer the pinned version, recording a different control
     /// segment for it.
+    #[non_exhaustive]
     Identity {
         /// The identity the pin records.
         pin: String,

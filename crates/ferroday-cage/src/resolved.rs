@@ -9,9 +9,9 @@
 //!
 //! The distinction matters to a consumer recording provenance. What a build
 //! produces depends on the environment and the filesystem the command sees, on
-//! the identity it holds, on whether it can reach a network, and on which
-//! syscalls will succeed — and neither the caller's own inputs nor a library
-//! version number states those directly. [`ResolvedInputs`] does, as data a
+//! the identity it holds and the privileges that come with it, on whether it
+//! can reach a network, and on which syscalls will succeed — and neither the
+//! caller's own inputs nor a library version number states those directly. [`ResolvedInputs`] does, as data a
 //! consumer can stamp into an artifact beside its own version pin.
 
 use std::ffi::{CString, OsString};
@@ -59,7 +59,11 @@ use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction};
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
 pub struct ResolvedInputs {
     /// What the command's root filesystem is.
     ///
@@ -79,8 +83,30 @@ pub struct ResolvedInputs {
     ///
     /// Empty for a restriction, which mounts nothing.
     pub mounts: Vec<ResolvedMount>,
-    /// The identity the command holds inside the sandbox.
+    /// The identity map of the sandbox's user namespace: which ids exist
+    /// inside it, and what each is on the host.
     pub identity: ResolvedIdentity,
+    /// The identity the command switches to before it executes, when one is
+    /// configured with [`run_as`](crate::CageBuilder::run_as).
+    ///
+    /// `None` runs the command as uid 0 of the sandbox's user namespace, or,
+    /// for a restriction, as the calling user. Whether a build sees uid 0 or
+    /// another id changes what it produces: a Debian build's
+    /// `Rules-Requires-Root` handling turns on exactly this.
+    ///
+    /// A switch to a non-root id clears the command's capabilities, unless a
+    /// keep set carries some across it, which [`hardening`](Self::hardening)
+    /// records. A configured identity of any id also sets
+    /// [`no_new_privileges`](Self::no_new_privileges).
+    pub run_as: Option<ResolvedRunAs>,
+    /// Whether the command runs with the no-new-privileges flag set, so that a
+    /// set-user-ID binary or a file capability grants nothing across
+    /// `execve`.
+    ///
+    /// A run-as identity sets it, and so does any hardening control. A build
+    /// whose packages reach for `sudo` or a capability-bearing helper behaves
+    /// differently under it.
+    pub no_new_privileges: bool,
     /// The network the command can reach.
     ///
     // The sentence links a feature-gated item, so its doc text is gated on the
@@ -141,12 +167,14 @@ pub enum ResolvedRoot {
     )]
     Host,
     /// A plain rootfs, pivoted into.
+    #[non_exhaustive]
     Plain {
         /// The rootfs as the build resolved it: an absolute, canonicalized host
         /// path.
         path: PathBuf,
     },
     /// An overlay assembled over the rootfs and pivoted into.
+    #[non_exhaustive]
     Overlay {
         /// The lower layers, base first — the reverse of the kernel's own
         /// highest-precedence-first option order.
@@ -158,11 +186,12 @@ pub enum ResolvedRoot {
     },
 }
 
-/// The identity a built sandbox's command holds.
+/// The identity map a built sandbox's user namespace carries.
 ///
-/// Whether a build sees uid 0 or a mapped id changes what it produces: a
-/// Debian build's `Rules-Requires-Root` handling turns on exactly this, and a
-/// file's recorded ownership follows from it.
+/// Which ids exist inside the sandbox changes what a build produces: a file's
+/// recorded ownership follows from it, and a `chown` to an id the map does not
+/// hold fails. The id the command itself runs as is
+/// [`ResolvedInputs::run_as`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -186,12 +215,31 @@ pub enum ResolvedIdentity {
     /// and no other id is mapped.
     Single,
     /// A range map, written from outside the namespace by a delegate.
+    #[non_exhaustive]
     Ranged {
         /// The uid extents, in the order they are written.
         uid: Vec<IdRange>,
         /// The gid extents, in the order they are written.
         gid: Vec<IdRange>,
     },
+}
+
+/// The identity a built sandbox's command switches to before it executes.
+///
+/// The resolved counterpart of [`Identity`](crate::Identity), with every id a
+/// sandbox-inside one, as the map in [`ResolvedInputs::identity`] holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ResolvedRunAs {
+    /// The uid the command runs as.
+    pub uid: u32,
+    /// The gid the command runs as.
+    pub gid: u32,
+    /// The supplementary groups the command runs with. Under the
+    /// single-identity map none can be set, and the command keeps the list it
+    /// inherited, every entry of which the map presents as the overflow gid.
+    pub groups: Vec<u32>,
 }
 
 /// Where a built sandbox wires the command's three standard streams.
@@ -299,6 +347,7 @@ pub enum ResolvedHardening {
     Unavailable,
     /// The hardening layer is compiled in; these are the controls in force.
     /// Every field empty is a sandbox that applies no hardening.
+    #[non_exhaustive]
     Applied {
         /// The Landlock filesystem grants, in the order they were declared.
         landlock_fs: Vec<ResolvedLandlockFs>,
@@ -312,8 +361,11 @@ pub enum ResolvedHardening {
         /// policy from another at a glance, and a consumer that needs to pin
         /// the exact program has the policy it supplied.
         seccomp_instructions: Option<usize>,
-        /// The capability bits retained across the drop; `None` leaves the
-        /// namespaced capability set untouched.
+        /// The capability bits retained across the drop.
+        ///
+        /// `None` drops nothing, leaving the set the identity switch leaves:
+        /// every capability of the namespace's root, or none at all for a
+        /// non-root [`run_as`](ResolvedInputs::run_as).
         keep_capabilities: Option<u64>,
     },
 }
@@ -370,6 +422,7 @@ pub struct ResolvedLandlockNet {
 )]
 pub enum ResolvedMount {
     /// A tmpfs.
+    #[non_exhaustive]
     Tmpfs {
         /// The mount point inside the sandbox.
         target: PathBuf,
@@ -379,11 +432,13 @@ pub enum ResolvedMount {
         data: String,
     },
     /// A procfs instance.
+    #[non_exhaustive]
     Procfs {
         /// The mount point inside the sandbox.
         target: PathBuf,
     },
     /// A devpts instance.
+    #[non_exhaustive]
     Devpts {
         /// The mount point inside the sandbox.
         target: PathBuf,
@@ -391,6 +446,7 @@ pub enum ResolvedMount {
         data: String,
     },
     /// A bind of a host path.
+    #[non_exhaustive]
     Bind {
         /// The host path bound in.
         source: PathBuf,
@@ -404,6 +460,7 @@ pub enum ResolvedMount {
     /// The optional fields report `None` both for a parameter that was never
     /// set and for one set to the empty string: the two are frozen alike, and
     /// the kernel receives the same nothing from either.
+    #[non_exhaustive]
     Raw {
         /// The mount source, when one was given.
         source: Option<PathBuf>,
@@ -421,6 +478,7 @@ pub enum ResolvedMount {
     /// Not a mount in the kernel's sense, but part of what the managed profile
     /// establishes — the five `/dev` symlinks arrive this way — and so part of
     /// the filesystem the command sees.
+    #[non_exhaustive]
     Symlink {
         /// The link's own path inside the sandbox.
         path: PathBuf,
@@ -461,6 +519,12 @@ impl ResolvedInputs {
                 .map(|op| project_mount(&op.action))
                 .collect(),
             identity: project_identity(plan),
+            run_as: plan.run_as.as_ref().map(|run_as| ResolvedRunAs {
+                uid: run_as.uid.as_raw(),
+                gid: run_as.gid.as_raw(),
+                groups: run_as.groups.iter().map(|gid| gid.as_raw()).collect(),
+            }),
+            no_new_privileges: no_new_privileges(plan),
             network: plan.network,
             streams: ResolvedStreams {
                 stdin: project_stdio(&plan.stdin),
@@ -521,6 +585,20 @@ fn project_identity(plan: &LaunchPlan) -> ResolvedIdentity {
             },
         },
     }
+}
+
+/// Whether the launch sets the no-new-privileges flag on the command.
+///
+/// The two places the launch sets it decide this: the identity switch sets it
+/// whenever a run-as identity is configured, and the hardening layer whenever
+/// its plan holds any control. A restriction's plan always does, since it drops
+/// every capability.
+fn no_new_privileges(plan: &LaunchPlan) -> bool {
+    #[cfg(feature = "hardening")]
+    let hardened = !plan.hardening.is_empty();
+    #[cfg(not(feature = "hardening"))]
+    let hardened = false;
+    plan.run_as.is_some() || hardened
 }
 
 /// Projects one frozen resource limit.
@@ -758,12 +836,14 @@ mod serde_tests {
         let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\n";
         #[cfg(not(feature = "hardening"))]
         let hardening = "[hardening]\nkind = \"unavailable\"\n";
-        // TOML puts bare keys ahead of tables, so `network` and `rlimits` lead
-        // whatever order the struct declares; the rest follow in declaration
-        // order. A `None` renders as an absent key, which is what TOML has.
+        // TOML puts bare keys ahead of tables, so `no-new-privileges`,
+        // `network` and `rlimits` lead whatever order the struct declares; the
+        // rest follow in declaration order. A `None` renders as an absent key,
+        // which is what TOML has: no `run-as` table here.
         assert_eq!(
             rendered,
-            "network = \"isolated\"\n\
+            "no-new-privileges = false\n\
+             network = \"isolated\"\n\
              rlimits = []\n\
              \n\
              [root]\n\
@@ -898,6 +978,90 @@ mod serde_tests {
                 },
             ],
         );
+    }
+
+    /// A run-as identity reaches the record with the no-new-privileges flag the
+    /// launch sets alongside it, so two builds that differ only in the id they
+    /// run as record differently.
+    #[test]
+    fn a_run_as_identity_reaches_the_record_with_its_no_new_privileges() {
+        #[derive(Debug)]
+        struct Ranges;
+        impl crate::IdMapper for Ranges {
+            fn resolve(
+                &self,
+                _request: &crate::IdentityMap,
+            ) -> Result<crate::ResolvedMap, crate::IdMapError> {
+                let extent = crate::IdRange {
+                    inside: 0,
+                    outside: 100000,
+                    count: 65536,
+                };
+                Ok(crate::ResolvedMap::new(vec![extent], vec![extent]))
+            }
+            fn apply(&self, _pid: u32, _map: &crate::ResolvedMap) -> Result<(), crate::IdMapError> {
+                Ok(())
+            }
+        }
+        let record = |run_as: Option<crate::Identity>| {
+            let builder = Cage::builder()
+                .rootfs("/tmp")
+                .command("/bin/sh")
+                .identity_map(crate::IdentityMap::Subordinate)
+                .id_mapper(Ranges);
+            let builder = match run_as {
+                Some(identity) => builder.run_as(identity),
+                None => builder,
+            };
+            builder
+                .build()
+                .expect("a valid sandbox configuration")
+                .resolved_inputs()
+        };
+
+        let unset = record(None);
+        assert_eq!(unset.run_as, None);
+        assert!(!unset.no_new_privileges);
+
+        let root = record(Some(crate::Identity::new(0, 0)));
+        let builder = record(Some(crate::Identity::new(1000, 1000).groups([1000, 27])));
+        assert_eq!(unset.identity, builder.identity, "the map is the same");
+        assert_ne!(root, builder, "the identity the build ran as is not");
+        assert_eq!(
+            builder.run_as,
+            Some(crate::ResolvedRunAs {
+                uid: 1000,
+                gid: 1000,
+                groups: vec![1000, 27],
+            }),
+        );
+        assert!(root.no_new_privileges && builder.no_new_privileges);
+
+        let rendered = toml::to_string(&builder).expect("the record serializes");
+        assert!(
+            rendered.contains("no-new-privileges = true\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("[run-as]\nuid = 1000\ngid = 1000\ngroups = [1000, 27]\n"),
+            "{rendered}"
+        );
+    }
+
+    /// Any hardening control sets the no-new-privileges flag, which the record
+    /// states rather than leaving it to be inferred from the controls.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_hardening_control_records_its_no_new_privileges() {
+        let inputs = Cage::builder()
+            .rootfs("/tmp")
+            .command("/bin/sh")
+            .seccomp(crate::SeccompPolicy::Curated)
+            .build()
+            .expect("a valid sandbox configuration")
+            .resolved_inputs();
+        assert!(inputs.no_new_privileges);
+        assert_eq!(inputs.run_as, None);
     }
 
     /// A hardening posture reaches the record: the grants by path and port, and

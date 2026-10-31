@@ -34,9 +34,16 @@ const _: () = assert_send_sync::<ferroday_cage::Bind>();
 const _: () = assert_send_sync::<ferroday_cage::Mount>();
 const _: () = assert_send_sync::<ferroday_cage::RawMount>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedInputs>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedRoot>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedMount>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedIdentity>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedRunAs>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedStreams>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedStdio>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedRlimit>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedHardening>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedLandlockFs>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedLandlockNet>();
 const _: () = assert_send_sync::<ferroday_cage::Stdio>();
 // A terminal launch hands back a live descriptor whose whole point is being
 // driven from a second thread: a reader beside the wait, a resize beside both.

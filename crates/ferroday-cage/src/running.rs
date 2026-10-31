@@ -547,6 +547,13 @@ impl Drop for PlaceholderGuard {
         for path in &self.placeholders.paths {
             remove_managed_placeholder(&root, path);
         }
+        // A target created over an overlay whiteout replaced it; the whiteout
+        // goes back once the target is gone. One that is still occupied, by a
+        // target that was not removed or one the launch never created, refuses
+        // the whiteout, and is left as it is.
+        for path in &self.placeholders.whiteouts {
+            let _ = root.whiteout(path);
+        }
     }
 }
 

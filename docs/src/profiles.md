@@ -20,7 +20,10 @@ traits and leaves the format to the consumer.
 
 ## The format
 
-Keys are kebab-case and correspond one-to-one with the builder's methods.
+Keys are kebab-case, and each sets what a builder method sets. Most share the
+method's name. `workdir` is set by `current_dir`, and `[[mount]]` entries by
+`bind`, `bind_ro` and `raw_mount`. In `[hardening]`, `drop-caps` and
+`keep-caps` are set by `drop_all_capabilities` and `keep_capabilities`.
 Unknown keys are rejected — a typo in a profile is an error, not a silently
 ignored setting. Every key is optional; an omitted key keeps the library
 default.

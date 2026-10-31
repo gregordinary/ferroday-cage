@@ -256,7 +256,10 @@ read-only onto `/etc/resolv.conf` when the host network is shared. Unless the
 caller mounted that target themselves: a mount of their own there replaces this
 one rather than sitting under it, so applying it last does not take back the
 rule that among the caller's mounts the order is theirs. Every kind of mount
-counts, a raw mount as much as a bind.
+counts, a raw mount as much as a bind. A bind of the caller's over a directory
+above the target, such as `/etc`, counts too. That directory is the caller's
+own, and the target would otherwise be created in it. A tmpfs there is the
+sandbox's own, and the bind lands in it.
 
 ### A read-only bind is a boundary
 
@@ -326,6 +329,11 @@ created inside an earlier mount — under the `/tmp` tmpfs, or under a bind of
 the caller's own — belongs to that mount rather than to the root, and for an
 overlay root the created file lands in the upper, where the merged view's
 writes go, and is removed from there.
+
+For an overlay root, whether a target is already there is what the merged view
+shows. A whiteout or an opaque directory in a higher layer hides what a lower
+layer holds. A target created over a whiteout in the upper replaces it, and the
+whiteout is restored once the target is removed.
 
 ## Failure reporting
 

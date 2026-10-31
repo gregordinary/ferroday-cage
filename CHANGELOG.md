@@ -39,6 +39,11 @@ consumer upgrading can skip it.
   log opened for appending. A relayed standard input puts the command in a
   session of its own, as `--stdin null` does, and a relay that cannot deliver
   the command's output exits 125.
+- An overlay layer path holding a `\` names the directory it names. Overlayfs
+  unescapes every layer path it is given, so an upper written `up\x` was
+  mounted as `upx`, and the sandbox's writes landed in a directory other than
+  the one whose ownership the build had checked. Layer paths are escaped in the
+  mount options.
 - The network stack refuses AWS's IPv6 instance-service block, `fd00:ec2::/32`,
   whose metadata service at `fd00:ec2::254` serves the instance role's
   credentials. The IPv4 metadata service was already refused as link-local.
@@ -117,6 +122,11 @@ consumer upgrading can skip it.
   `SetupStep::ReplaceSessionKeyring`, the step that replaces it.
 - `SetupStep::AllocateTerminal` and `SetupStep::SendTerminal`, the steps a
   terminal launch's allocation now reports under.
+- `ConfigError::OverlayOptionsTooLong`, refusing an overlay whose mount options
+  exceed the 4095 bytes `mount(2)` passes on whole. The kernel cut a longer
+  string short, and the remainder could mount a different work directory.
+- `ConfigError::IdentityMapUnavailable::source`, the configured identity-map
+  delegate's own error, which `source()` now returns.
 - `NetStackBuilder::host_loopback_port`, which maps connections to the gateway
   address on one port onto host loopback, where `host_loopback(true)` maps every
   port. The two combine. `fcage`: `--netstack-host-port PORT`.
@@ -192,6 +202,22 @@ consumer upgrading can skip it.
   it: literal names, `any`, `<os>-any`, and `any-<cpu>`. It chooses the first
   alternative that applies. The restrictions were ignored, so a control file
   with a `[hurd-any]` dependency failed to resolve.
+- **Breaking.** `ConfigError::OverlayUpperIsRoot` is
+  `ConfigError::OverlayLayerIsRoot`, which names the layer, so a work directory
+  at `/` is no longer reported as an upper. It also covers a layer path ending
+  in `..`.
+- **Breaking.** `ConfigError::EmbeddedNul` and `ConfigError::HostnameInvalid`
+  are struct variants naming the value they refuse, and
+  `ConfigError::MountFlagsInvalid` names the raw mount's target. A NUL in an
+  environment variable's name is `EnvNameInvalid`, and a NUL in the hostname is
+  `HostnameInvalid`.
+- **Breaking.** The struct variants of `ResolvedRoot`, `ResolvedIdentity`,
+  `ResolvedHardening`, `ResolvedMount`, and both `UnheldReason`s are
+  `#[non_exhaustive]`, as every other struct variant is. A pattern naming their
+  fields needs `..`, and they cannot be constructed outside the crate.
+  `ResolvedHardening::Applied` gains `landlock_scope`.
+- An overlay layer path may hold a `:`, which is escaped in the mount options. A
+  `,` is still refused with `ConfigError::OverlayPathInvalid`.
 - An Alpine install script runs with exactly the environment `apk` gives one:
   `PATH`, `APK_SCRIPT` and `APK_PACKAGE`, plus `SOURCE_DATE_EPOCH` where one is
   set. It also received `HOME=/root`.
@@ -204,9 +230,29 @@ consumer upgrading can skip it.
   and `/`, so a path holding a space, a newline, or a non-UTF-8 byte names one
   URL, and the bundled fetcher decodes it back. It no longer fails for a
   non-UTF-8 path.
+- The guide's recipe for a reproducible provenance record declares the procfs a
+  container needs, and the doctests run it. As written it failed `build`.
 
 ### Fixed
 
+- A file bind onto a path an overlay's upper had deleted, or that lies in a
+  directory the upper made opaque, no longer leaves an empty file in the upper
+  after the run. The target was judged present because a lower held it, so the
+  empty file the launch created was never removed, and it hid the deletion. A
+  target created over a deletion has the deletion restored.
+- With host networking, a bind of a host directory over `/etc` no longer
+  receives an empty `resolv.conf` from the launch, and a read-only one no longer
+  fails the launch with `EROFS`. The managed bind yields to such a bind as it
+  does to a mount at `/etc/resolv.conf` itself.
+- A refused build leaves no overlay upper or work directory behind. They are
+  created once the rest of the configuration is accepted, and removed again when
+  the overlay itself is refused.
+- A command of `.` or `..` under `path_lookup` is refused at build as the
+  relative path it is, rather than failing at launch with `EACCES`.
+- A raw remount or propagation change at `/proc` no longer makes `build` refuse
+  the profile with `NestedUsernsNeedsProcfs`, since neither mounts anything over
+  the procfs. A raw move is read as `mount(2)` reads it, and a move naming
+  `proc` serves only where its source is a procfs.
 - `Relay::run`, and so `fcage --terminal`, honors the `Escalation` deadline and
   the relayed signals until the command's exit is collected. End-of-file on the
   sandbox's terminal ended the session's supervision, so a command that closed
@@ -288,6 +334,10 @@ consumer upgrading can skip it.
   socket for every caller that does: the supervisor's pidfd, the network stack's
   tap, and a terminal launch's primary. The shared vocabulary in
   `CONTRIBUTING.md` records them.
+- `mechanism::overlay_options` composes an overlay's mount options for a build
+  and for the host probe, `spec::validate_command` validates the command for both
+  builders, and `MountAction::arrival` reads what a mount op brings to rest on
+  its target, for the placeholder, procfs and `resolv.conf` checks alike.
 - The Gentoo layer checks a path component with `path::is_ordinary_component`,
   and splits a name from its version through one `version::version_hyphen` that
   the package-name rule shares.

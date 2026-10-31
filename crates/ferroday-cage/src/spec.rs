@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode, ResolveFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode};
 use rustix::io::Errno;
 use rustix::mount::MountFlags;
 use rustix::thread::UnshareFlags;
@@ -16,11 +16,13 @@ use crate::error::{ConfigError, Error, OverlayLayer};
 use crate::idmap::{self, IdMapper, Identity, IdentityMap};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
-    Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction, MountDir, MountOp,
-    NestedMap, NestedPlan, OverlayPlan, RlimitPlan, RunAsPlan, StdioPlan,
+    Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction, MountDir,
+    MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, RlimitPlan, RunAsPlan,
+    StdioPlan,
 };
 use crate::observer::{Collect, Observer, Output};
 use crate::path;
+use crate::provision::rooted::Rooted;
 use crate::resolved::ResolvedInputs;
 use crate::running::{Pending, Running};
 use crate::status::ExitStatus;
@@ -61,26 +63,40 @@ const DIR_MODE: RawMode = 0o755;
 /// one a caller's own mount there replaces.
 const RESOLV_CONF: &str = "/etc/resolv.conf";
 
-/// Whether one of the caller's own mounts targets the sandbox's
-/// [`RESOLV_CONF`].
+/// [`RESOLV_CONF`] as the root-relative target the lowered ops carry.
+const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
+
+/// Whether the mounts lowered so far have claimed the sandbox's
+/// [`RESOLV_CONF`], so the managed bind there yields to them.
 ///
-/// Every kind of mount counts, not only a bind. What the managed mount yields
-/// to is the caller having claimed the target, and a [`Mount::Raw`] carries a
-/// source and the kernel's own flags -- so a bind spelled through the escape
-/// hatch is the more deliberate spelling of the claim, not a weaker one.
+/// A mount at the target itself claims it, whatever its kind. What the managed
+/// mount yields to is the caller having claimed the target, and a
+/// [`Mount::Raw`] carries a source and the kernel's own flags, so a bind
+/// spelled through the escape hatch is the more deliberate spelling of the
+/// claim, not a weaker one.
 ///
-/// The target is compared by its components, which is what a mount target is:
-/// [`path::absolute_components`] is what every mount's target is read through,
-/// so `/etc//resolv.conf` and `/etc/./resolv.conf` are the same target here as
-/// they will be there.
+/// A mount over a directory above the target claims it too when what arrives
+/// there is a tree that already stood elsewhere: a bind, or a raw bind or move.
+/// The managed bind's target would otherwise be created inside that tree, which
+/// is the caller's host directory: an empty file left there for good, or a
+/// launch that fails where the bind is read-only. A fresh filesystem mounted
+/// above the target is the sandbox's own, and the target is created in it as
+/// it would be in the root.
+///
+/// Every target is frozen from [`path::absolute_components`], so
+/// `/etc//resolv.conf` and `/etc/./resolv.conf` are the same target here as they
+/// will be at launch.
 ///
 /// `fcage` asks the same question of the bind a `--netstack` run composes, which
 /// is one this crate never makes and so cannot answer.
-fn mounts_resolv_conf(mounts: &[Mount]) -> bool {
-    let wanted = path::absolute_components(Path::new(RESOLV_CONF)).ok();
-    mounts
-        .iter()
-        .any(|mount| path::absolute_components(mount.get_target()).ok() == wanted)
+fn resolv_conf_claimed(ops: &[MountOp]) -> bool {
+    ops.iter().any(|op| match op.action.arrival() {
+        Some((target, arrival)) => {
+            target == RESOLV_CONF_TARGET
+                || (arrival == Arrival::Tree && covers(target, RESOLV_CONF_TARGET))
+        }
+        None => false,
+    })
 }
 /// The mode of a mount point standing in for a world-writable sticky
 /// directory: `/tmp` and `/dev/shm`, which the profile covers with a
@@ -1264,7 +1280,7 @@ impl CageBuilder {
     ///
     /// The path is interpreted inside the sandbox's root filesystem and must
     /// be absolute, unless [`path_lookup`](Self::path_lookup) is enabled and
-    /// the command has no slash, in which case it is resolved against the
+    /// the command is a bare name, in which case it is resolved against the
     /// sandbox's `PATH`.
     pub fn command(mut self, program: impl AsRef<Path>) -> Self {
         self.command = Some(program.as_ref().to_path_buf());
@@ -1282,7 +1298,8 @@ impl CageBuilder {
     /// search happens inside the sandbox against its own filesystem, after the
     /// root swap, so it finds the sandbox's executables rather than the host's.
     /// A command that contains a slash is still required to be absolute; path
-    /// lookup never resolves a relative path.
+    /// lookup never resolves a relative path. Nor does it take `.` or `..` for a
+    /// name: each is a relative path, and is refused as one.
     ///
     /// Only absolute `PATH` entries are searched — an empty or relative entry is
     /// skipped rather than resolved against the working directory. A `PATH` with
@@ -1705,7 +1722,10 @@ impl CageBuilder {
     /// A [`bind`](Self::bind) of the caller's own onto `/etc/resolv.conf`
     /// replaces the managed bind rather than sitting under it, so a caller who
     /// composes their own resolver configuration need not also decline this
-    /// one.
+    /// one. So does a bind of a host directory over `/etc`: that directory is
+    /// the caller's, and the managed bind would otherwise create its target
+    /// there. A tmpfs over `/etc` is the sandbox's own, and the managed bind
+    /// lands in it.
     ///
     /// The bind only happens with [`Network::Host`], where host DNS
     /// configuration is meaningful: the host's `/etc/resolv.conf` is
@@ -1953,6 +1973,11 @@ impl CageBuilder {
     /// environment are marshaled into their final form. After `build`
     /// succeeds, launching performs no work that can fail for configuration
     /// reasons.
+    ///
+    /// An overlay root's upper and work directories are the one thing `build`
+    /// creates on the host. It creates them once the rest of the configuration
+    /// has been accepted, and removes what it created if the overlay is then
+    /// refused, so a refused build leaves nothing behind.
     pub fn build(self) -> Result<Cage, Error> {
         // Opting out of the managed mounts while explicitly asking for one of
         // them is a contradiction. Refuse it rather than let either side win
@@ -1998,35 +2023,14 @@ impl CageBuilder {
                 .clone(),
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
-        let command = self.command.ok_or(ConfigError::CommandMissing)?;
-        // An empty path is the absence of a command written down, and every
-        // check below reads it as something else: it carries no slash, so a
-        // path lookup takes it for a bare name to search, and joining it onto a
-        // `PATH` entry yields that entry — leaving a candidate list of
-        // directories that `SearchPathUnusable` has no reason to refuse. What
-        // survives is an `execve` of a directory at launch, reported as a
-        // failure of the sandbox rather than of the configuration.
-        if command.as_os_str().is_empty() {
-            return Err(ConfigError::CommandMissing.into());
-        }
-
-        // A command with no slash is resolved against PATH only when path
-        // lookup is opted into; otherwise, and for any command that contains a
-        // slash, the path must be absolute. This is the execvp rule plus the
-        // cage's absolute-path requirement: a slash-bearing relative path is
-        // never searched.
-        let searchable = self.path_lookup && !command_has_slash(&command);
-        if !command.is_absolute() && !searchable {
-            return Err(ConfigError::CommandNotAbsolute { command }.into());
-        }
-        let program = cstring(command.as_os_str())?;
-        let program_search = if searchable {
+        let command = validate_command(self.command, self.path_lookup)?;
+        let program_search = if command.searched {
             // A `PATH` with no absolute entry leaves nothing to search. Refuse
             // it here rather than fall through to an `execve` of the bare name,
             // which the kernel would resolve against the sandbox's working
             // directory — the relative resolution path lookup exists to avoid.
             let path = effective_path(&self.env, base_env);
-            let candidates = search_candidates(&path, &command)?;
+            let candidates = search_candidates(&path, &command.path)?;
             if candidates.is_empty() {
                 return Err(ConfigError::SearchPathUnusable { path }.into());
             }
@@ -2038,7 +2042,7 @@ impl CageBuilder {
         // either "no such binary" or "no such ELF interpreter", so naming the
         // command — and, for a path lookup, every candidate that was tried —
         // is what makes the report actionable.
-        let exec_label = exec_label(&command, &program_search);
+        let exec_label = exec_label(&command.path, &program_search);
         let (rlimits, rlimit_labels) = lower_rlimits(&self.rlimits)?;
         let args = self
             .args
@@ -2085,18 +2089,6 @@ impl CageBuilder {
             source: errno.into(),
         })?;
         let rootfs_path = cstring(canonical.as_os_str())?;
-
-        // An overlay root: `canonical` is the base lower the overlay mounts
-        // over, any further lowers are resolved beside it, and the caller's
-        // upper — with its work directory — is prepared and frozen into the
-        // mount options here, so the sandbox stage only replays them. A host
-        // that cannot establish an unprivileged overlay is refused now, before
-        // any fork.
-        let overlay = self
-            .overlay
-            .as_ref()
-            .map(|overlay| build_overlay_plan(&canonical, overlay))
-            .transpose()?;
 
         let mut unshare = UnshareFlags::NEWUSER
             | UnshareFlags::NEWNS
@@ -2145,34 +2137,18 @@ impl CageBuilder {
             }
         }
         // The managed `resolv.conf` bind, unless the caller mounted something of
-        // their own at that target. Theirs was pushed by the loop above and this
-        // would land on top of it, which takes back the "among the caller's
-        // own, the order is theirs" rule for the one mount they were most
-        // deliberate about. A caller who mounts it has replaced the managed one
-        // as surely as `resolv_conf(false)` declines it.
-        if resolv_conf && matches!(self.network, Network::Host) && !mounts_resolv_conf(&self.mounts)
+        // their own at that target, or a tree of their own over it. Theirs was
+        // pushed by the loop above and this would land on top of it, which
+        // takes back the "among the caller's own, the order is theirs" rule for
+        // the one mount they were most deliberate about. A caller who mounts it
+        // has replaced the managed one as surely as `resolv_conf(false)`
+        // declines it.
+        if resolv_conf
+            && matches!(self.network, Network::Host)
+            && !resolv_conf_claimed(&lowering.ops)
         {
             lowering.push_resolv_conf()?;
         }
-
-        // Every mount target the launch has to create as an empty file, as the
-        // host path it comes to rest at. A file the sandbox creates only to
-        // mount over is not part of the root, so the caller side takes it away
-        // once the sandbox is gone. Writes land in the rootfs itself for a
-        // plain root and in the upper for an overlay root, whose pivoted root
-        // is the merged view; an existing file may come from any layer. Both
-        // are canonical paths, so a root the caller named relatively does not
-        // leave a path that re-resolves against whatever directory the process
-        // happens to be in when the handle drops.
-        let (writable, layers) = match &overlay {
-            Some(plan) => {
-                let mut layers = vec![plan.upper.clone()];
-                layers.extend(plan.lower.iter().cloned());
-                (plan.upper.as_path(), layers)
-            }
-            None => (canonical.as_path(), vec![canonical.clone()]),
-        };
-        let managed_placeholders = created_file_targets(&lowering.ops, writable, &layers);
 
         // The identity plan: validate the requested map, resolve a range
         // request through the delegate seam, and validate the run-as
@@ -2243,13 +2219,45 @@ impl CageBuilder {
             hardening
         };
 
+        // An overlay root: `canonical` is the base lower the overlay mounts
+        // over, any further lowers are resolved beside it, and the caller's
+        // upper — with its work directory — is prepared and frozen into the
+        // mount options here, so the sandbox stage only replays them. A host
+        // that cannot establish an unprivileged overlay is refused now, before
+        // any fork. This is the one step that creates anything on the host, so
+        // it runs once every other part of the configuration has been accepted:
+        // a build refused for any other reason leaves no layer directory behind.
+        let overlay = self
+            .overlay
+            .as_ref()
+            .map(|overlay| build_overlay_plan(&canonical, overlay))
+            .transpose()?;
+
+        // Every mount target the launch has to create as an empty file, as the
+        // host path it comes to rest at. A file the sandbox creates only to
+        // mount over is not part of the root, so the caller side takes it away
+        // once the sandbox is gone. Writes land in the root filesystem itself
+        // for a plain root and in the upper for an overlay root, whose pivoted
+        // root is the merged view. Both are canonical paths, so a root the
+        // caller named relatively does not leave a path that re-resolves
+        // against whatever directory the process happens to be in when the
+        // handle drops.
+        let root = match &overlay {
+            Some(plan) => RootLayers::Overlay {
+                upper: &plan.upper,
+                lower: &plan.lower,
+            },
+            None => RootLayers::Plain(&canonical),
+        };
+        let managed_placeholders = created_file_targets(&lowering.ops, &root);
+
         Ok(Cage {
             plan: LaunchPlan {
                 confinement: Confinement::Container,
                 identity,
                 nested: Some(nested),
                 run_as,
-                program,
+                program: command.program,
                 program_search,
                 args,
                 env,
@@ -2490,19 +2498,26 @@ fn resolve_mapper(
     configured: Option<Arc<dyn IdMapper>>,
     request: &IdentityMap,
 ) -> Result<(Arc<dyn IdMapper>, idmap::ResolvedMap), Error> {
-    // A configured delegate is the whole chain: its refusal is final.
+    // A configured delegate is the whole chain: its refusal is final, and is
+    // carried whole rather than as its text alone.
     if let Some(mapper) = configured {
         return match mapper.resolve(request) {
             Ok(map) => Ok((mapper, map)),
             Err(err) => Err(ConfigError::IdentityMapUnavailable {
                 reason: err.to_string(),
+                source: Some(err),
             }
             .into()),
         };
     }
 
-    idmap::resolve_default_chain(request)
-        .map_err(|reason| ConfigError::IdentityMapUnavailable { reason }.into())
+    idmap::resolve_default_chain(request).map_err(|reason| {
+        ConfigError::IdentityMapUnavailable {
+            reason,
+            source: None,
+        }
+        .into()
+    })
 }
 
 /// Validates a run-as identity against the identity plan and freezes it.
@@ -2592,7 +2607,7 @@ fn build_nested_plan(
                 path.extend_from_slice(target);
                 path.push(b'/');
                 path.extend_from_slice(leaf.as_bytes());
-                CString::new(path).map_err(|_| ConfigError::EmbeddedNul)
+                CString::new(path).map_err(|err| embedded_nul(err.into_vec()))
             };
             let root = [idmap::IdRange {
                 inside: 0,
@@ -2645,7 +2660,9 @@ fn build_nested_plan(
 /// The ops execute in order, so a later mount can hide an earlier one; the scan
 /// follows the same order and drops a procfs another mount comes to rest on top
 /// of. Where a profile mounts more than one, the last still visible is taken —
-/// any of them would serve.
+/// any of them would serve. An op that brings no mount to rest, such as a
+/// remount or a propagation change, hides nothing; see
+/// [`MountAction::arrival`].
 fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
     // Walked backwards, because what is wanted is the *last* one still visible:
     // a candidate qualifies when nothing after it comes to rest on top of it.
@@ -2658,8 +2675,8 @@ fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
         };
         let covered = ops[at + 1..]
             .iter()
-            .filter_map(|later| later.action.target())
-            .any(|over| covers(over, target));
+            .filter_map(|later| later.action.arrival())
+            .any(|(over, _)| covers(over, target));
         if !covered {
             return Some(target);
         }
@@ -2680,31 +2697,23 @@ fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
 /// through `self`, which every procfs instance resolves for its reader.
 ///
 /// A raw mount is read by what the kernel will do with it rather than by what it
-/// says: `mount(2)` ignores `fstype` entirely when `MS_BIND` is set, so a raw
-/// op carrying that flag is a bind however it spells its filesystem, and is held
-/// to the bind rule rather than to the fresh-instance one. Reading it the other
-/// way would let `RawMount::new("/proc").source("/proc").fstype("proc")
+/// says, through [`MountAction::arrival`]: `mount(2)` ignores `fstype` entirely
+/// when `MS_BIND` or `MS_MOVE` is set, so a raw op carrying either flag brings a
+/// tree that already stood elsewhere however it spells its filesystem, and is
+/// held to the bind rule rather than to the fresh-instance one. Reading it the
+/// other way would let `RawMount::new("/proc").source("/proc").fstype("proc")
 /// .flags(MS_BIND)` satisfy a requirement it does not meet, and the failure
 /// would arrive at launch instead of as the typed build error this machinery
-/// exists to give.
+/// exists to give. A remount or a propagation change mounts nothing.
 fn procfs_op_target(op: &MountOp, needs_fresh: bool) -> Option<&CStr> {
-    match &op.action {
-        MountAction::Procfs { target } => Some(target),
-        MountAction::Raw {
-            source,
-            target,
-            fstype,
-            flags,
-            ..
-        } => {
-            if flags.contains(MountFlags::BIND) {
-                (!needs_fresh && is_procfs(source)).then_some(target.as_c_str())
-            } else {
-                (fstype.as_bytes() == b"proc").then_some(target.as_c_str())
-            }
+    match (&op.action, op.action.arrival()?) {
+        (MountAction::Procfs { target }, _) => Some(target),
+        (MountAction::Bind { source, target, .. }, _)
+        | (MountAction::Raw { source, target, .. }, (_, Arrival::Tree)) => {
+            (!needs_fresh && is_procfs(source)).then_some(target.as_c_str())
         }
-        MountAction::Bind { source, target, .. } if !needs_fresh && is_procfs(source) => {
-            Some(target)
+        (MountAction::Raw { target, fstype, .. }, (_, Arrival::Fresh)) => {
+            (fstype.as_bytes() == b"proc").then_some(target.as_c_str())
         }
         _ => None,
     }
@@ -2851,9 +2860,12 @@ pub(crate) fn compose_env(
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
         .collect();
     for (name, value) in vars {
-        if name.is_empty() || name.as_bytes().contains(&b'=') {
+        // A NUL in the name is the name's fault, and is reported against it; a
+        // NUL in the value is reported as the value it is.
+        if name.is_empty() || name.as_bytes().contains(&b'=') || cstring(name).is_err() {
             return Err(ConfigError::EnvNameInvalid { name: name.clone() }.into());
         }
+        cstring(value)?;
         env.insert(name.clone(), value.clone());
     }
     env.iter()
@@ -2862,17 +2874,22 @@ pub(crate) fn compose_env(
             entry.extend_from_slice(name.as_bytes());
             entry.push(b'=');
             entry.extend_from_slice(value.as_bytes());
-            CString::new(entry).map_err(|_| ConfigError::EmbeddedNul.into())
+            CString::new(entry).map_err(|err| embedded_nul(err.into_vec()).into())
         })
         .collect()
 }
 
 /// Validates a hostname: non-empty, at most 64 bytes, no NUL.
 fn validate_hostname(name: &OsStr) -> Result<CString, Error> {
+    let invalid = || {
+        Error::from(ConfigError::HostnameInvalid {
+            name: name.to_os_string(),
+        })
+    };
     if name.is_empty() || name.len() > 64 {
-        return Err(ConfigError::HostnameInvalid.into());
+        return Err(invalid());
     }
-    Ok(cstring(name)?)
+    CString::new(name.as_bytes()).map_err(|_| invalid())
 }
 
 /// Validates a working directory: absolute, no NUL. Returns `None` for `/`,
@@ -2890,17 +2907,23 @@ pub(crate) fn validate_workdir(path: &Path) -> Result<Option<CString>, Error> {
     Ok(Some(cstring(path.as_os_str())?))
 }
 
-/// Prepares an overlay root: creates the upper and its work directory, refuses
-/// a host that cannot mount an unprivileged overlay, and freezes the mount
-/// options.
+/// Prepares an overlay root: resolves the lowers, creates the upper and its work
+/// directory, refuses a host that cannot mount an unprivileged overlay, and
+/// freezes the mount options.
 ///
-/// `lower` is the already-canonicalized rootfs. The upper is created if absent
-/// and resolved, and a hidden work directory — which the overlay requires empty
-/// and on the same filesystem as the upper — is created beside it. The three
-/// layer paths are checked for the `,` and `:` characters the overlay option
-/// string reserves, the host is preflighted through
-/// [`overlay_blocker`](crate::host::overlay_blocker), and the
-/// `lowerdir=…,upperdir=…,workdir=…,userxattr` option string is built once.
+/// `base` is the already-canonicalized root filesystem, which is the first
+/// lower. Every further lower is resolved beside it, and the upper and work
+/// directories are resolved to the absolute paths the mount options name. The
+/// work directory, which the overlay requires empty and on the upper's
+/// filesystem, is a hidden sibling of the upper unless the caller named one.
+///
+/// Everything that can be refused without creating a layer directory is checked
+/// before one is created: the lowers, the presence of an upper, whether the
+/// option string can carry every layer path, and whether the host can mount an
+/// unprivileged overlay at all, through
+/// [`overlay_blocker`](crate::host::overlay_blocker). A refusal after that
+/// removes the directories this call created, so a refused build leaves the host
+/// as it found it.
 fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Error> {
     // The base is already canonical: it is the first lower, resolved as the
     // rootfs. Resolve any further lowers the same way, so a missing or
@@ -2928,31 +2951,44 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         return Err(ConfigError::OverlayUpperMissing.into());
     };
 
-    // Create and resolve the upper. A relative or non-existent upper is created;
-    // the result is the absolute path the mount options name.
-    let upper = prepare_layer_dir(OverlayLayer::Upper, upper)?;
-
-    // The upper needs a parent directory: the work directory the library
-    // derives is a sibling of the upper, and the host preflight below runs in
-    // the parent so its scratch entries land beside the upper rather than inside
-    // it. The upper is canonical here, so the only path without one is `/` —
-    // which an overlay could not use anyway, since its writes would land over
-    // the whole host root.
-    let Some(scratch) = upper.parent().map(Path::to_path_buf) else {
-        return Err(ConfigError::OverlayUpperIsRoot { path: upper }.into());
-    };
-
+    let mut created = CreatedDirs::default();
+    let upper = layer_path(OverlayLayer::Upper, upper, &mut created)?;
     // The work directory sits beside the upper, on the same filesystem, so the
     // overlay can move files between them. A hidden sibling keyed to the upper's
     // name keeps it out of the way and distinct per upper; a caller may name its
     // own instead.
     let work = match overlay.work.as_deref() {
-        Some(work) => work.to_path_buf(),
-        None => overlay_work_dir(&upper).ok_or(ConfigError::OverlayUpperIsRoot {
-            path: upper.clone(),
-        })?,
+        Some(work) => layer_path(OverlayLayer::Work, work, &mut created)?,
+        None => LayerPath {
+            parent: upper.parent.clone(),
+            name: overlay_work_name(&upper.name),
+        },
     };
-    let work = prepare_layer_dir(OverlayLayer::Work, &work)?;
+    let (upper_path, work_path) = (upper.path(), work.path());
+
+    let options =
+        crate::mechanism::overlay_options(&lowers, &upper_path, &work_path).map_err(|refusal| {
+            match refusal {
+                OverlayOptionsError::Unrepresentable(path) => {
+                    ConfigError::OverlayPathInvalid { path }
+                }
+                OverlayOptionsError::TooLong(length) => {
+                    ConfigError::OverlayOptionsTooLong { length }
+                }
+            }
+        })?;
+
+    // Refuse a host that cannot establish an unprivileged overlay whose upper
+    // lives on this filesystem, before any fork — the same fail-early posture
+    // the identity-map validation takes. The probe runs in the upper's parent,
+    // whose filesystem the upper is created on, so its scratch entries land
+    // beside the upper rather than inside it.
+    if let Some(blocker) = crate::host::overlay_blocker(&upper.parent) {
+        return Err(ConfigError::OverlayUnavailable { blocker }.into());
+    }
+
+    create_layer_dir(OverlayLayer::Upper, &upper, &mut created)?;
+    create_layer_dir(OverlayLayer::Work, &work, &mut created)?;
 
     // The overlay moves files between the upper and the work directory, so the
     // kernel requires them on one filesystem. A caller that named its own work
@@ -2964,62 +3000,21 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
             .map(|stat| stat.st_dev)
             .map_err(|errno| overlay_errno(layer, path, errno))
     };
-    if device(OverlayLayer::Upper, &upper)? != device(OverlayLayer::Work, &work)? {
+    if device(OverlayLayer::Upper, &upper_path)? != device(OverlayLayer::Work, &work_path)? {
         return Err(ConfigError::OverlayDirUnusable {
             layer: OverlayLayer::Work,
-            path: work,
+            path: work_path,
             source: Errno::XDEV.into(),
         }
         .into());
     }
 
-    // The option string is comma-separated and colon-delimited; a layer path
-    // bearing either character would misparse, so refuse it rather than build a
-    // truncated mount.
-    for path in lowers
-        .iter()
-        .map(PathBuf::as_path)
-        .chain([upper.as_path(), work.as_path()])
-    {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.contains(&b',') || bytes.contains(&b':') {
-            return Err(ConfigError::OverlayPathInvalid {
-                path: path.to_path_buf(),
-            }
-            .into());
-        }
-    }
-
-    // Refuse a host that cannot establish an unprivileged overlay whose upper
-    // lives on this filesystem, before any fork — the same fail-early posture
-    // the identity-map validation takes. The probe runs on the upper's parent
-    // (its own filesystem, since the upper is a directory within it), so its
-    // scratch files land beside the upper rather than inside it.
-    if let Some(blocker) = crate::host::overlay_blocker(&scratch) {
-        return Err(ConfigError::OverlayUnavailable { blocker }.into());
-    }
-
-    // `lowerdir=` is highest-precedence-first, the reverse of this type's
-    // base-first order, so the resolved stack is emitted reversed.
-    let mut options = Vec::new();
-    options.extend_from_slice(b"lowerdir=");
-    for (i, lower) in lowers.iter().rev().enumerate() {
-        if i > 0 {
-            options.push(b':');
-        }
-        options.extend_from_slice(lower.as_os_str().as_bytes());
-    }
-    options.extend_from_slice(b",upperdir=");
-    options.extend_from_slice(upper.as_os_str().as_bytes());
-    options.extend_from_slice(b",workdir=");
-    options.extend_from_slice(work.as_os_str().as_bytes());
-    options.extend_from_slice(b",userxattr");
-    let options = CString::new(options).map_err(|_| ConfigError::EmbeddedNul)?;
+    created.keep();
     Ok(OverlayPlan {
         options,
         lower: lowers,
-        upper,
-        work,
+        upper: upper_path,
+        work: work_path,
     })
 }
 
@@ -3028,15 +3023,22 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
 /// requires it share with the upper. Returns `None` when `upper` has no parent or
 /// no file name.
 ///
-/// Shared by the overlay-plan construction here and the layered-build layer's
-/// disposal, so the directory an overlay-rooted cage creates and the one the
-/// build layer removes are the same.
+/// The layered-build layer's disposal finds the work directory through this,
+/// and the overlay-plan construction here names it through
+/// [`overlay_work_name`], so the directory an overlay-rooted sandbox creates and
+/// the one the build layer removes are the same.
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub(crate) fn overlay_work_dir(upper: &Path) -> Option<PathBuf> {
     let (parent, name) = (upper.parent()?, upper.file_name()?);
+    Some(parent.join(overlay_work_name(name)))
+}
+
+/// The name of the work directory managed beside an upper named `upper`.
+fn overlay_work_name(upper: &OsStr) -> OsString {
     let mut work_name = OsString::from(".");
-    work_name.push(name);
+    work_name.push(upper);
     work_name.push(".work");
-    Some(parent.join(work_name))
+    work_name
 }
 
 /// The mode an overlay layer directory the library creates is given.
@@ -3048,8 +3050,64 @@ pub(crate) fn overlay_work_dir(upper: &Path) -> Option<PathBuf> {
 /// already there is left at the mode its owner gave it.
 const OVERLAY_DIR_MODE: RawMode = 0o755;
 
-/// Creates an overlay layer directory if it is absent and returns its absolute
-/// path, refusing to adopt an entry the calling user does not own.
+/// Where an overlay layer directory goes: its parent directory, resolved, and
+/// the layer's own name inside it.
+///
+/// The absolute path the mount options name is composed from the parent's
+/// canonical path and the leaf's own name, so the leaf is never resolved as a
+/// link. [`create_layer_dir`] establishes that it is not one.
+struct LayerPath {
+    /// The parent directory, canonical.
+    parent: PathBuf,
+    /// The layer directory's name inside `parent`.
+    name: OsString,
+}
+
+impl LayerPath {
+    /// The layer directory's absolute path.
+    fn path(&self) -> PathBuf {
+        self.parent.join(&self.name)
+    }
+}
+
+/// Resolves where the layer directory `path` goes, creating the directories
+/// above it that are missing, and not the layer directory itself.
+///
+/// Ancestors above the leaf are created as `create_dir_all` creates them: the
+/// caller named them, so reaching them through a symbolic link is the caller's
+/// business, the same position `provision::containment::open_dir` takes. Each
+/// one created is recorded in `created`.
+fn layer_path(
+    layer: OverlayLayer,
+    path: &Path,
+    created: &mut CreatedDirs,
+) -> Result<LayerPath, Error> {
+    // A path with no file name is `/` or one ending in `..`; neither names a
+    // directory this can create inside a parent.
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(ConfigError::OverlayLayerIsRoot {
+            layer,
+            path: path.to_path_buf(),
+        }
+        .into());
+    };
+    // An empty parent means a bare relative name: the working directory.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    created
+        .create_all(parent)
+        .map_err(|err| overlay_io(layer, parent, err))?;
+    Ok(LayerPath {
+        parent: std::fs::canonicalize(parent).map_err(|err| overlay_io(layer, parent, err))?,
+        name: name.to_os_string(),
+    })
+}
+
+/// Creates an overlay layer directory if it is absent, refusing to adopt an
+/// entry the calling user does not own.
 ///
 /// The layer directories are the one part of an overlay root the library
 /// creates on the host, and the caller may well name them under a directory it
@@ -3065,37 +3123,23 @@ const OVERLAY_DIR_MODE: RawMode = 0o755;
 /// adopted only when `fstatat` — with `AT_SYMLINK_NOFOLLOW`, so a link is a link
 /// and not its destination — reports a directory belonging to the calling user.
 /// The same discipline [`host::overlay_blocker`](crate::host::overlay_blocker)
-/// already applies to its throwaway probe entries in the same directory.
-///
-/// Ancestors above the leaf are created with `create_dir_all`, as before: the
-/// caller named them, so reaching them through a symbolic link is the caller's
-/// business, the same position [`open_dir`] takes. The absolute path is composed
-/// from the *parent's* canonical path and the leaf's own name, so the leaf is
-/// never resolved as a link that the checks above just established it is not.
-fn prepare_layer_dir(layer: OverlayLayer, path: &Path) -> Result<PathBuf, Error> {
-    // A path with no file name is `/` or a `..` chain; neither is a directory
-    // this can create, and `/` as a layer is refused by name below.
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(ConfigError::OverlayUpperIsRoot {
-            path: path.to_path_buf(),
-        }
-        .into());
-    };
-    // An empty parent means a bare relative name: the working directory.
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    std::fs::create_dir_all(parent).map_err(|err| overlay_io(layer, parent, err))?;
+/// already applies to its throwaway probe entries in the same directory. A
+/// directory this creates is recorded in `created`; an adopted one is not, and
+/// is never removed.
+fn create_layer_dir(
+    layer: OverlayLayer,
+    at: &LayerPath,
+    created: &mut CreatedDirs,
+) -> Result<(), Error> {
+    let path = at.path();
     let dirfd = rustix::fs::open(
-        parent,
+        &at.parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| overlay_errno(layer, parent, errno))?;
+    .map_err(|errno| overlay_errno(layer, &at.parent, errno))?;
 
-    match rustix::fs::mkdirat(&dirfd, name, Mode::from_raw_mode(OVERLAY_DIR_MODE)) {
+    match rustix::fs::mkdirat(&dirfd, &at.name, Mode::from_raw_mode(OVERLAY_DIR_MODE)) {
         // The mode is set again, because `mkdir` narrows it by the process
         // umask and the layer outlives the sandbox on the host: a build under
         // `umask 077` would otherwise leave a `0700` upper for whatever consumes
@@ -3103,31 +3147,76 @@ fn prepare_layer_dir(layer: OverlayLayer, path: &Path) -> Result<PathBuf, Error>
         // adopted one keeps the mode its owner gave it — the same rule the
         // sandbox stage follows for a mount point it creates.
         Ok(()) => {
+            created.record(path.clone());
             rustix::fs::chmodat(
                 &dirfd,
-                name,
+                &at.name,
                 Mode::from_raw_mode(OVERLAY_DIR_MODE),
                 AtFlags::empty(),
             )
-            .map_err(|errno| overlay_errno(layer, path, errno))?;
+            .map_err(|errno| overlay_errno(layer, &path, errno))?;
         }
         Err(Errno::EXIST) => {
-            let stat = rustix::fs::statat(&dirfd, name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|errno| overlay_errno(layer, path, errno))?;
+            let stat = rustix::fs::statat(&dirfd, &at.name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|errno| overlay_errno(layer, &path, errno))?;
             let is_dir = FileType::from_raw_mode(stat.st_mode) == FileType::Directory;
             if !is_dir || stat.st_uid != rustix::process::geteuid().as_raw() {
-                return Err(ConfigError::OverlayDirUnowned {
-                    layer,
-                    path: path.to_path_buf(),
-                }
-                .into());
+                return Err(ConfigError::OverlayDirUnowned { layer, path }.into());
             }
         }
-        Err(errno) => return Err(overlay_errno(layer, path, errno)),
+        Err(errno) => return Err(overlay_errno(layer, &path, errno)),
+    }
+    Ok(())
+}
+
+/// The host directories one overlay preparation created, removed again unless
+/// the build that created them succeeds.
+///
+/// Removal is `rmdir`, deepest first, so a directory goes only while it is
+/// still empty. One that something else wrote into meanwhile stays, and so does
+/// every directory above it.
+#[derive(Default)]
+struct CreatedDirs(Vec<PathBuf>);
+
+impl CreatedDirs {
+    /// Creates `dir` and every missing directory above it, as `create_dir_all`
+    /// does, recording each one created.
+    fn create_all(&mut self, dir: &Path) -> std::io::Result<()> {
+        if dir.as_os_str().is_empty() || dir.is_dir() {
+            return Ok(());
+        }
+        if let Some(parent) = dir.parent() {
+            self.create_all(parent)?;
+        }
+        match std::fs::create_dir(dir) {
+            Ok(()) => {
+                self.record(dir.to_path_buf());
+                Ok(())
+            }
+            // Created by someone else in the meantime, or a `..` naming a
+            // directory that already exists.
+            Err(_) if dir.is_dir() => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
-    let parent = std::fs::canonicalize(parent).map_err(|err| overlay_io(layer, parent, err))?;
-    Ok(parent.join(name))
+    /// Records a directory this preparation created.
+    fn record(&mut self, dir: PathBuf) {
+        self.0.push(dir);
+    }
+
+    /// Keeps every directory recorded: the build succeeded, and they are its.
+    fn keep(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for CreatedDirs {
+    fn drop(&mut self) {
+        for dir in self.0.iter().rev() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
 }
 
 /// Builds the configuration error for a host I/O failure preparing an overlay
@@ -3350,18 +3439,20 @@ impl Lowering {
 
     fn push_raw(&mut self, raw: &RawMount) -> Result<(), Error> {
         let components = sandbox_path_components(&raw.target)?;
-        let flags = u32::try_from(raw.flags)
-            .map_err(|_| ConfigError::MountFlagsInvalid { flags: raw.flags })?;
+        let flags = u32::try_from(raw.flags).map_err(|_| ConfigError::MountFlagsInvalid {
+            target: raw.target.clone(),
+            flags: raw.flags,
+        })?;
         let source = match &raw.source {
             Some(path) => cstring(path.as_os_str())?,
             None => CString::default(),
         };
         let fstype = match &raw.fstype {
-            Some(fstype) => CString::new(fstype.as_str()).map_err(|_| ConfigError::EmbeddedNul)?,
+            Some(fstype) => cstring(OsStr::new(fstype))?,
             None => CString::default(),
         };
         let data = match &raw.data {
-            Some(data) => CString::new(data.as_str()).map_err(|_| ConfigError::EmbeddedNul)?,
+            Some(data) => cstring(OsStr::new(data))?,
             None => CString::default(),
         };
         self.push(
@@ -3404,10 +3495,10 @@ impl Lowering {
         self.push(
             MountOp {
                 dirs: dir_chain(&["etc"], DIR_MODE)?,
-                create_file: Some(rel_cstring(&["etc", "resolv.conf"])?),
+                create_file: Some(RESOLV_CONF_TARGET.to_owned()),
                 action: MountAction::Bind {
                     source: cstring(source.as_os_str())?,
-                    target: rel_cstring(&["etc", "resolv.conf"])?,
+                    target: RESOLV_CONF_TARGET.to_owned(),
                     read_only: true,
                 },
             },
@@ -3415,6 +3506,22 @@ impl Lowering {
         );
         Ok(())
     }
+}
+
+/// The host directories a sandbox's root is made of, as far as the mount
+/// targets the launch creates are concerned.
+enum RootLayers<'a> {
+    /// A plain root filesystem: the launch's writes land in it, and an entry is
+    /// present when the root filesystem holds one.
+    Plain(&'a Path),
+    /// An overlay root: the launch's writes land in the upper, and an entry is
+    /// present when the merged view of the layers shows one.
+    Overlay {
+        /// The upper layer.
+        upper: &'a Path,
+        /// The lower layers, base first.
+        lower: &'a [PathBuf],
+    },
 }
 
 /// The host paths of the mount targets `ops` has to create as empty files.
@@ -3425,18 +3532,14 @@ impl Lowering {
 /// contribution, not part of the root, so it is reported here for the caller
 /// side to remove once the sandbox is gone.
 ///
-/// `writable` is the host directory the sandbox's writes land in, and `layers`
-/// the host directories an already-present target could come from; for a plain
-/// rootfs both are that rootfs, and for an overlay root the upper and the whole
-/// layer stack respectively.
-///
 /// Two targets are deliberately left out, because neither is a file in the root
 /// at a path this can name:
 ///
-/// - one already present in any layer, which the root ships and the launch
+/// - one already present in the root, which the root ships and the launch
 ///   therefore does not create. Presence is any entry at the path, a symbolic
 ///   link included: the launch creates the target with `O_EXCL`, so an entry of
-///   any kind is one it leaves alone;
+///   any kind is one it leaves alone. For an overlay root, presence is what the
+///   merged view shows; see [`merged_presence`];
 /// - one under the target of an earlier op, which is created inside that mount
 ///   — a tmpfs that vanishes with the namespace, or a caller's own bind source
 ///   — rather than in the root directory on the host.
@@ -3444,26 +3547,46 @@ impl Lowering {
 /// Directories the launch creates are not placeholders: a mount point directory
 /// is part of what a launch contributes to a tree, created at the mode of the
 /// directory it stands for, and is left in place.
-fn created_file_targets(
-    ops: &[MountOp],
-    writable: &Path,
-    layers: &[PathBuf],
-) -> ManagedPlaceholders {
+fn created_file_targets(ops: &[MountOp], root: &RootLayers<'_>) -> ManagedPlaceholders {
+    // One descriptor per layer, in the order the merged view consults them:
+    // the upper, then the lowers from the last stacked down to the base. A
+    // layer that cannot be opened at all is a lookup that reaches no verdict.
+    let (writable, layers): (&Path, Vec<Option<Rooted>>) = match root {
+        RootLayers::Plain(rootfs) => (rootfs, vec![Rooted::open(rootfs).ok()]),
+        RootLayers::Overlay { upper, lower } => (
+            upper,
+            std::iter::once(*upper)
+                .chain(lower.iter().rev().map(PathBuf::as_path))
+                .map(|layer| Rooted::open(layer).ok())
+                .collect(),
+        ),
+    };
+    let overlay = matches!(root, RootLayers::Overlay { .. });
+
     let mut mounted: Vec<PathBuf> = Vec::new();
     let mut paths = Vec::new();
-    let layers: Vec<Option<OwnedFd>> = layers.iter().map(|layer| open_root(layer)).collect();
+    let mut whiteouts = Vec::new();
     for op in ops {
         if let Some(file) = &op.create_file {
             let relative = Path::new(OsStr::from_bytes(file.to_bytes()));
             let covered = mounted.iter().any(|mount| relative.starts_with(mount));
-            let present = layers
-                .iter()
-                .any(|layer| entry_in_root(layer.as_ref(), relative) != Presence::Absent);
-            if !covered && !present {
-                paths.push(relative.to_path_buf());
+            let presence = if overlay {
+                merged_presence(&layers, relative)
+            } else {
+                layer_presence(layers[0].as_ref(), relative)
+            };
+            if !covered {
+                match presence {
+                    Presence::Absent => paths.push(relative.to_path_buf()),
+                    Presence::WhitedOut => {
+                        paths.push(relative.to_path_buf());
+                        whiteouts.push(relative.to_path_buf());
+                    }
+                    Presence::Present | Presence::Unknown => {}
+                }
             }
         }
-        if let Some(target) = op.action.target() {
+        if let Some((target, _)) = op.action.arrival() {
             mounted.push(PathBuf::from(OsStr::from_bytes(target.to_bytes())));
         }
     }
@@ -3474,76 +3597,116 @@ fn created_file_targets(
             writable.to_path_buf()
         },
         paths,
+        whiteouts,
     }
 }
 
-/// What a root-relative lookup found.
+/// What a lookup in the root found at a mount target's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Presence {
+enum Presence {
     /// Nothing is at the path.
     Absent,
+    /// Nothing is at the path in the merged view, because the overlay's upper
+    /// holds a whiteout there: creating the target replaces the whiteout.
+    WhitedOut,
     /// An entry of some kind is at the path.
     Present,
     /// The lookup could not reach a verdict — a permission refusal, an
-    /// unreadable root. Treated as [`Present`](Self::Present) everywhere here:
-    /// what the answer decides is whether the launch created an entry that this
-    /// side may later unlink, and "not sure" must not become "mine to remove".
+    /// unreadable layer. Treated as [`Present`](Self::Present): what the answer
+    /// decides is whether the launch created an entry that this side may later
+    /// unlink, and "not sure" must not become "mine to remove".
     Unknown,
 }
 
-/// Opens a root directory for the root-relative lookups below, or `None` when it
-/// cannot be opened at all.
+/// Whether `relative` names an entry inside the tree `layer` holds.
 ///
-/// `O_PATH`: this descriptor is only ever the anchor of an `openat2`, so it needs
-/// no read access to the directory itself.
-pub(crate) fn open_root(root: &Path) -> Option<OwnedFd> {
-    rustix::fs::open(
-        root,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .ok()
+/// Resolved through [`Rooted`], the containment every host-side operation on a
+/// tree takes: `openat2` with `RESOLVE_IN_ROOT`, as the sandbox stage resolves
+/// every mount target against the new-root descriptor. An absolute symbolic link
+/// inside the tree — `./etc -> /etc` in an untrusted unpacked tarball, or the
+/// `/etc/resolv.conf -> /run/systemd/resolve/…` any image taken from a resolved
+/// host ships — therefore resolves *within the tree* rather than against the
+/// host's own root. Joining the two paths and asking the host instead would
+/// answer a question about the host's filesystem, and would let a later removal
+/// keyed to the same path land outside the tree entirely.
+///
+/// The leaf is not followed, so an entry is an entry whatever its kind: the
+/// launch creates its target with `O_EXCL` and leaves anything already there
+/// alone, dangling symbolic link included.
+fn layer_presence(layer: Option<&Rooted>, relative: &Path) -> Presence {
+    match layer.map(|layer| layer.stat(relative)) {
+        Some(Ok(Some(_))) => Presence::Present,
+        Some(Ok(None)) => Presence::Absent,
+        Some(Err(_)) | None => Presence::Unknown,
+    }
 }
 
-/// Whether `relative` names an entry inside the tree rooted at `root`.
+/// The extended attribute an unprivileged overlay marks an opaque directory
+/// with. The library mounts every overlay with `userxattr`, which is what makes
+/// overlayfs read its markers from the `user.` namespace.
+const OVERLAY_OPAQUE: &CStr = c"user.overlay.opaque";
+
+/// Whether the merged view of an overlay shows an entry at `relative`.
 ///
-/// Resolved with `openat2` and `RESOLVE_IN_ROOT`, the same way the sandbox stage
-/// resolves every mount target against the new-root descriptor, so that an
-/// absolute symbolic link inside the tree — `./etc -> /etc` in an untrusted
-/// unpacked tarball, or the `/etc/resolv.conf -> /run/systemd/resolve/…` any
-/// image taken from a resolved host ships — resolves *within the tree* rather
-/// than against the host's own root. Joining the two paths and asking the host
-/// instead would answer a question about the host's filesystem, and would let a
-/// later removal keyed to the same path land outside the tree entirely.
+/// `layers` is in the order overlayfs consults them: the upper, then the lowers
+/// from the last stacked down to the base. The first layer holding an entry at
+/// the path decides. A whiteout there, a character device numbered 0:0, hides
+/// the name from every layer below; anything else is the entry the merged view
+/// shows. A layer holding nothing at the path passes the question down, unless
+/// it hides the directory the path lies in: a whiteout or another non-directory
+/// at an ancestor, or an ancestor directory marked opaque, behind which the
+/// layers below do not show.
 ///
-/// `O_NOFOLLOW` on the final component, so an entry is an entry whatever its
-/// kind: the launch creates its target with `O_EXCL` and leaves anything already
-/// there alone, dangling symbolic link included.
-pub(crate) fn entry_in_root(root: Option<&OwnedFd>, relative: &Path) -> Presence {
-    let Some(root) = root else {
-        return Presence::Unknown;
-    };
-    let Ok(relative) = CString::new(relative.as_os_str().as_bytes()) else {
-        return Presence::Unknown;
-    };
-    // Not `provision::containment::open_dir`: the question is whether a *leaf*
-    // is there, of whatever kind, so this opens with `O_NOFOLLOW` and without
-    // `O_DIRECTORY`, and every failure becomes a verdict rather than an error.
-    #[expect(clippy::disallowed_methods)]
-    let opened = rustix::fs::openat2(
-        root,
-        relative.as_c_str(),
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::IN_ROOT,
-    );
-    match opened {
-        Ok(_) => Presence::Present,
-        // Nothing at the path, or a non-directory where a directory would have
-        // to be for anything to sit under it: either way the entry is absent.
-        Err(Errno::NOENT | Errno::NOTDIR) => Presence::Absent,
-        Err(_) => Presence::Unknown,
+/// Each layer is read on its own, with symbolic links resolved inside it, where
+/// the merged view resolves a link across layers. An ancestor that is a link
+/// therefore passes the question down rather than deciding it, which is right
+/// for the links a provisioned root carries, such as a merged-usr `bin`, since
+/// every layer that has one has the same one.
+fn merged_presence(layers: &[Option<Rooted>], relative: &Path) -> Presence {
+    let ancestors: Vec<&Path> = relative
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect();
+    for (depth, layer) in layers.iter().enumerate() {
+        let Some(layer) = layer else {
+            return Presence::Unknown;
+        };
+        match layer.stat(relative) {
+            Ok(Some(stat)) if Rooted::is_whiteout(&stat) => {
+                return if depth == 0 {
+                    Presence::WhitedOut
+                } else {
+                    Presence::Absent
+                };
+            }
+            Ok(Some(_)) => return Presence::Present,
+            Ok(None) => {}
+            Err(_) => return Presence::Unknown,
+        }
+        // Outermost ancestor first, as the kernel walks the path.
+        for ancestor in ancestors.iter().rev() {
+            let stat = match layer.stat(ancestor) {
+                // Nothing here at or below this ancestor: the layers beneath
+                // decide.
+                Ok(None) => break,
+                Ok(Some(stat)) => stat,
+                Err(_) => return Presence::Unknown,
+            };
+            match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Directory => match layer.directory_xattr(ancestor, OVERLAY_OPAQUE) {
+                    Ok(Some(value)) if value == b"y" => return Presence::Absent,
+                    Ok(_) => {}
+                    Err(_) => return Presence::Unknown,
+                },
+                FileType::Symlink => break,
+                // A whiteout, or a file standing where a directory would have to
+                // be: either way nothing below shows through here.
+                _ => return Presence::Absent,
+            }
+        }
     }
+    Presence::Absent
 }
 
 /// Splits an absolute sandbox path into its ordinary components.
@@ -3579,7 +3742,7 @@ fn dir_chain<S: AsRef<OsStr>>(
     let mut parent: Vec<u8> = Vec::new();
     for (depth, component) in components.iter().enumerate() {
         chain.push(MountDir {
-            parent: CString::new(parent.clone()).map_err(|_| ConfigError::EmbeddedNul)?,
+            parent: CString::new(parent.clone()).map_err(|err| embedded_nul(err.into_vec()))?,
             leaf: cstring(component.as_ref())?,
             // Only the mount point itself carries the profile's mode; an
             // ancestor created on the way to it is an ordinary directory.
@@ -3606,12 +3769,19 @@ fn rel_cstring<S: AsRef<OsStr>>(components: &[S]) -> Result<CString, Error> {
         }
         path.extend_from_slice(component.as_ref().as_bytes());
     }
-    Ok(CString::new(path).map_err(|_| ConfigError::EmbeddedNul)?)
+    Ok(CString::new(path).map_err(|err| embedded_nul(err.into_vec()))?)
 }
 
 /// Converts an `OsStr` to a `CString`, rejecting interior NUL bytes.
 pub(crate) fn cstring(value: &OsStr) -> Result<CString, ConfigError> {
-    CString::new(value.as_bytes()).map_err(|_| ConfigError::EmbeddedNul)
+    CString::new(value.as_bytes()).map_err(|err| embedded_nul(err.into_vec()))
+}
+
+/// The refusal of a configured value that holds a NUL, naming the value.
+fn embedded_nul(value: Vec<u8>) -> ConfigError {
+    ConfigError::EmbeddedNul {
+        value: OsString::from_vec(value),
+    }
 }
 
 /// Validates the configured resource limits and lowers them into the plan's
@@ -3667,10 +3837,62 @@ pub(crate) fn exec_label(command: &Path, search: &[CString]) -> String {
     format!("{command}, searched {}", candidates.join(", "))
 }
 
-/// Whether a command path contains a path separator, so it names a location
-/// rather than a bare name to resolve against `PATH`.
-pub(crate) fn command_has_slash(command: &Path) -> bool {
-    command.as_os_str().as_bytes().contains(&b'/')
+/// A command validated for execution.
+pub(crate) struct ValidCommand {
+    /// The command as it was configured, for the label a failed exec reports.
+    pub(crate) path: PathBuf,
+    /// The command as `execve` is handed it, and as `argv[0]`.
+    pub(crate) program: CString,
+    /// Whether the command is a bare name, resolved against the sandbox's
+    /// `PATH` rather than executed as a path.
+    pub(crate) searched: bool,
+}
+
+/// Validates the command a builder was given: present, not empty, holding no
+/// NUL, and either an absolute path or a bare name that `path_lookup` resolves.
+///
+/// [`CageBuilder::build`] and `RestrictionBuilder::build` both read their
+/// command through this, so the two accept the same commands. A restriction
+/// passes `path_lookup` as `false`: it never searches the host's `PATH`.
+///
+/// An empty path is the absence of a command written down, and every later
+/// check reads it as something else: it carries no slash, so a path lookup takes
+/// it for a bare name to search, and joining it onto a `PATH` entry yields that
+/// entry. What would survive is an `execve` of a directory at launch, reported
+/// as a failure of the sandbox rather than of the configuration.
+///
+/// A bare name is one ordinary path component, as
+/// [`path::is_ordinary_component`] defines it. `.` and `..` carry no slash and
+/// are still not names: joined onto a `PATH` entry, each names a directory,
+/// which `execve` refuses only at launch. They are relative paths, and are
+/// refused as one whether path lookup is on or not.
+pub(crate) fn validate_command(
+    command: Option<PathBuf>,
+    path_lookup: bool,
+) -> Result<ValidCommand, Error> {
+    let command = command.ok_or(ConfigError::CommandMissing)?;
+    if command.as_os_str().is_empty() {
+        return Err(ConfigError::CommandMissing.into());
+    }
+    let program = cstring(command.as_os_str())?;
+    // The execvp rule plus the absolute-path requirement: a bare name is
+    // resolved against `PATH` only when path lookup is opted into, and anything
+    // else must be absolute. A relative path is never searched.
+    let searched = path_lookup && is_command_name(&command);
+    if !command.is_absolute() && !searched {
+        return Err(ConfigError::CommandNotAbsolute { command }.into());
+    }
+    Ok(ValidCommand {
+        path: command,
+        program,
+        searched,
+    })
+}
+
+/// Whether a command is a bare name, which path lookup resolves against `PATH`,
+/// rather than a path naming a location.
+pub(crate) fn is_command_name(command: &Path) -> bool {
+    path::is_ordinary_component(command.as_os_str().as_bytes())
 }
 
 /// The `PATH` a path-lookup command is resolved against: the last `PATH` the
@@ -3977,6 +4199,34 @@ mod tests {
     }
 
     #[test]
+    fn a_dot_or_dot_dot_command_is_a_relative_path_rather_than_a_name() {
+        // Neither carries a slash, and neither is a name: searched, each joins
+        // onto a `PATH` entry as that directory or its parent, and `execve`
+        // refuses a directory only at launch. Both are refused here as the
+        // relative paths they are, and the refusal does not suggest the path
+        // lookup that would not help.
+        for command in [".", ".."] {
+            for lookup in [true, false] {
+                let err = sh_in("/tmp")
+                    .command(command)
+                    .path_lookup(lookup)
+                    .build()
+                    .unwrap_err();
+                assert!(
+                    !err.to_string().contains("path lookup"),
+                    "{command} under path_lookup({lookup}): {err}",
+                );
+                match err {
+                    Error::Config(ConfigError::CommandNotAbsolute { command: refused }) => {
+                        assert_eq!(refused, Path::new(command));
+                    }
+                    other => panic!("{command} under path_lookup({lookup}): {other}"),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn path_lookup_without_a_base_or_a_path_has_nothing_to_search() {
         // The base is where `PATH` would otherwise come from. Opting out of it
         // and setting none leaves the command with no `PATH` at all, so the
@@ -4070,7 +4320,62 @@ mod tests {
             .arg(OsStr::from_bytes(b"with\0nul"))
             .build()
             .unwrap_err();
-        assert!(matches!(err, Error::Config(ConfigError::EmbeddedNul)));
+        match err {
+            Error::Config(ConfigError::EmbeddedNul { value }) => {
+                assert_eq!(value, OsStr::from_bytes(b"with\0nul"), "the value is named");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_nul_byte_is_reported_against_what_carries_it() {
+        // In a variable's name it is the name that is invalid, and it is
+        // reported as one, beside an empty name and one holding `=`.
+        let err = sh_in("/tmp")
+            .env(OsStr::from_bytes(b"NA\0ME"), "value")
+            .build()
+            .unwrap_err();
+        match err {
+            Error::Config(ConfigError::EnvNameInvalid { name }) => {
+                assert_eq!(name, OsStr::from_bytes(b"NA\0ME"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // In its value, the value is named.
+        let err = sh_in("/tmp")
+            .env("NAME", OsStr::from_bytes(b"val\0ue"))
+            .build()
+            .unwrap_err();
+        match err {
+            Error::Config(ConfigError::EmbeddedNul { value }) => {
+                assert_eq!(value, OsStr::from_bytes(b"val\0ue"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // In a hostname, the hostname is what is invalid.
+        let err = sh_in("/tmp")
+            .hostname(OsStr::from_bytes(b"host\0name"))
+            .build()
+            .unwrap_err();
+        match err {
+            Error::Config(ConfigError::HostnameInvalid { name }) => {
+                assert_eq!(name, OsStr::from_bytes(b"host\0name"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // In the command, the command is named.
+        let err = Cage::builder()
+            .rootfs("/tmp")
+            .command(OsStr::from_bytes(b"/bin/s\0h"))
+            .build()
+            .unwrap_err();
+        match err {
+            Error::Config(ConfigError::EmbeddedNul { value }) => {
+                assert_eq!(value, OsStr::from_bytes(b"/bin/s\0h"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -4199,13 +4504,25 @@ mod tests {
     #[test]
     fn build_rejects_an_empty_hostname() {
         let err = sh_in("/tmp").hostname("").build().unwrap_err();
-        assert!(matches!(err, Error::Config(ConfigError::HostnameInvalid)));
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::HostnameInvalid { .. })
+        ));
     }
 
     #[test]
     fn build_rejects_an_overlong_hostname() {
         let err = sh_in("/tmp").hostname("h".repeat(65)).build().unwrap_err();
-        assert!(matches!(err, Error::Config(ConfigError::HostnameInvalid)));
+        match err {
+            Error::Config(ConfigError::HostnameInvalid { name }) => {
+                assert_eq!(
+                    name,
+                    OsString::from("h".repeat(65)),
+                    "the hostname is named"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -4434,10 +4751,13 @@ mod tests {
             .raw_mount(RawMount::new("/raw").flags(1 << 40))
             .build()
             .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Config(ConfigError::MountFlagsInvalid { flags }) if flags == 1 << 40
-        ));
+        match err {
+            Error::Config(ConfigError::MountFlagsInvalid { target, flags }) => {
+                assert_eq!(flags, 1 << 40);
+                assert_eq!(target, Path::new("/raw"), "the raw mount is named");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -4446,7 +4766,12 @@ mod tests {
             .raw_mount(RawMount::new("/raw").fstype("tmpfs").data("mode\u{0}777"))
             .build()
             .unwrap_err();
-        assert!(matches!(err, Error::Config(ConfigError::EmbeddedNul)));
+        match err {
+            Error::Config(ConfigError::EmbeddedNul { value }) => {
+                assert_eq!(value, OsStr::new("mode\u{0}777"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -4499,6 +4824,64 @@ mod tests {
         // Composed from the procfs that is still standing, not from the one
         // the tmpfs came to rest on.
         assert_eq!(uid_map_path.to_bytes(), b"/proc/self/uid_map");
+    }
+
+    #[test]
+    fn an_op_that_mounts_nothing_does_not_hide_a_procfs() {
+        // A remount and a propagation change act on the mount already standing
+        // at their target; neither brings a mount to rest over it. Each kept
+        // the managed procfs standing, so the profile is valid.
+        const MS_REMOUNT: u64 = 0x20;
+        const MS_PRIVATE: u64 = 1 << 18;
+        const MS_RDONLY: u64 = 1;
+        for flags in [
+            MS_REMOUNT | MS_RDONLY,
+            MS_REMOUNT | u64::from(MountFlags::BIND.bits()) | MS_RDONLY,
+            MS_PRIVATE,
+        ] {
+            sh_in("/tmp")
+                .raw_mount(RawMount::new("/proc").flags(flags))
+                .build()
+                .unwrap_or_else(|err| panic!("flags {flags:#x}: {err}"));
+        }
+
+        // A move does bring a mount to rest: whatever stood at its source now
+        // covers the managed procfs, which is gone from the sandbox's view.
+        const MS_MOVE: u64 = 0x2000;
+        let err = sh_in("/tmp")
+            .raw_mount(RawMount::new("/proc").source("/mnt").flags(MS_MOVE))
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::NestedUsernsNeedsProcfs)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_moved_mount_is_held_to_the_bind_rule() {
+        // `mount(2)` ignores the filesystem type of a move as it does of a bind,
+        // so a move naming `proc` is a fresh procfs only if its source is one,
+        // and then not a fresh one.
+        const MS_MOVE: u64 = 0x2000;
+        let moved = |source: &str| {
+            sh_in("/tmp")
+                .mount_proc(false)
+                .raw_mount(
+                    RawMount::new("/proc")
+                        .source(source)
+                        .fstype("proc")
+                        .flags(MS_MOVE),
+                )
+                .build()
+        };
+        assert!(matches!(
+            moved("/tmp").unwrap_err(),
+            Error::Config(ConfigError::NestedUsernsNeedsProcfs),
+        ));
+        // The host's procfs, moved, serves the single map, whose command
+        // reaches its own map files through `self`.
+        moved("/proc").expect("a moved procfs serves the single-identity map");
     }
 
     #[test]
@@ -4719,6 +5102,52 @@ mod tests {
             err,
             Error::Config(ConfigError::IdentityMapUnavailable { .. })
         ));
+    }
+
+    #[test]
+    fn a_configured_delegates_refusal_is_carried_as_the_source() {
+        #[derive(Debug)]
+        struct Refusing;
+        impl crate::IdMapper for Refusing {
+            fn resolve(
+                &self,
+                _request: &IdentityMap,
+            ) -> Result<crate::ResolvedMap, crate::IdMapError> {
+                Err(crate::IdMapError::helper_spawn(
+                    "newuidmap",
+                    Some(std::io::Error::from_raw_os_error(
+                        Errno::ACCESS.raw_os_error(),
+                    )),
+                ))
+            }
+            fn apply(&self, _pid: u32, _map: &crate::ResolvedMap) -> Result<(), crate::IdMapError> {
+                Ok(())
+            }
+        }
+        let err = sh_in("/tmp")
+            .identity_map(IdentityMap::Subordinate)
+            .id_mapper(Refusing)
+            .build()
+            .unwrap_err();
+        let Error::Config(config) = &err else {
+            panic!("unexpected error: {err}");
+        };
+        // The delegate's error is the source, and its own source, the OS
+        // error, is reachable through it rather than flattened into text.
+        let delegate = std::error::Error::source(config).expect("the delegate's refusal");
+        assert!(
+            matches!(
+                delegate.downcast_ref::<crate::IdMapError>(),
+                Some(crate::IdMapError::HelperSpawn { .. })
+            ),
+            "{delegate}"
+        );
+        let os = delegate.source().expect("the helper's OS error");
+        assert_eq!(
+            os.downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(Errno::ACCESS.raw_os_error()),
+        );
     }
 
     #[test]
@@ -4980,6 +5409,56 @@ mod tests {
     }
 
     #[test]
+    fn a_callers_tree_over_etc_claims_resolv_conf_and_a_fresh_one_does_not() {
+        // A bind of a host directory over /etc is the caller's /etc. The
+        // managed bind's target would be created in it, which is the caller's
+        // host directory: an empty file left there for good, or, for a
+        // read-only bind, a launch that fails. It yields instead.
+        if !host_has_resolv_conf() {
+            return;
+        }
+        let dir = Scratch::new("resolv-under-a-bind");
+        std::fs::create_dir_all(dir.join("host-etc")).unwrap();
+        for read_only in [false, true] {
+            let builder = sh_in("/tmp").network(Network::Host);
+            let builder = if read_only {
+                builder.bind_ro(dir.join("host-etc"), "/etc")
+            } else {
+                builder.bind(dir.join("host-etc"), "/etc")
+            };
+            let cage = builder.build().unwrap();
+            assert!(!binds_resolv_conf(&cage), "read-only: {read_only}");
+            assert!(cage.plan.managed_placeholders.is_empty());
+        }
+        // A raw bind and a move bring a tree of the host's just the same.
+        for flags in [0x1000, 0x2000] {
+            let cage = sh_in("/tmp")
+                .network(Network::Host)
+                .raw_mount(
+                    RawMount::new("/etc")
+                        .source(dir.join("host-etc"))
+                        .flags(flags),
+                )
+                .build()
+                .unwrap();
+            assert!(!binds_resolv_conf(&cage), "flags {flags:#x}");
+        }
+
+        // A fresh filesystem over /etc is the sandbox's own, and the target is
+        // created in it as it would be in the root: the managed bind stays.
+        let cage = sh_in("/tmp")
+            .network(Network::Host)
+            .raw_mount(RawMount::new("/etc").fstype("tmpfs"))
+            .build()
+            .unwrap();
+        assert!(binds_resolv_conf(&cage));
+        assert!(
+            cage.plan.managed_placeholders.is_empty(),
+            "the target is created in the tmpfs, not in the root"
+        );
+    }
+
+    #[test]
     fn a_resolv_conf_target_the_launch_creates_is_recorded_for_removal() {
         // A bind needs its target to exist, so a rootfs shipping no resolv.conf
         // has one created. The plan records that path, which is how the caller
@@ -5086,6 +5565,158 @@ mod tests {
             .build()
             .unwrap();
         assert!(shipped.plan.managed_placeholders.is_empty());
+    }
+
+    /// Creates an overlay whiteout at `path`, or says why the host cannot.
+    fn whiteout(path: &Path) -> Result<(), Errno> {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            FileType::CharacterDevice,
+            Mode::empty(),
+            0,
+        )
+    }
+
+    /// Marks the directory at `path` opaque, as an unprivileged overlay does,
+    /// or says why the filesystem cannot.
+    fn mark_opaque(path: &Path, value: &[u8]) -> Result<(), Errno> {
+        rustix::fs::setxattr(path, OVERLAY_OPAQUE, value, rustix::fs::XattrFlags::empty())
+    }
+
+    #[test]
+    fn the_merged_view_decides_what_an_overlay_root_already_ships() {
+        // Three layers as overlayfs stacks them: the upper over a middle lower
+        // over the base. The base ships `etc/x` in every case below; what the
+        // layers above do to it decides whether the merged view shows it.
+        let scratch = Scratch::new("merged-presence");
+        let (upper, middle, base) = (
+            scratch.join("upper"),
+            scratch.join("middle"),
+            scratch.join("base"),
+        );
+        let reset = || {
+            for layer in [&upper, &middle, &base] {
+                let _ = std::fs::remove_dir_all(layer);
+                std::fs::create_dir_all(layer.join("etc")).unwrap();
+            }
+            std::fs::write(base.join("etc/x"), b"shipped").unwrap();
+        };
+        let presence = || {
+            let layers: Vec<Option<Rooted>> = [&upper, &middle, &base]
+                .into_iter()
+                .map(|layer| Rooted::open(layer).ok())
+                .collect();
+            merged_presence(&layers, Path::new("etc/x"))
+        };
+
+        reset();
+        assert_eq!(presence(), Presence::Present, "the base shows through");
+
+        // A whiteout in the upper hides the base's entry. Creating the target
+        // replaces it, which the removal has to undo, so it is told apart.
+        reset();
+        if let Err(errno) = whiteout(&upper.join("etc/x")) {
+            eprintln!("skipping: this host cannot create a whiteout: {errno}");
+            return;
+        }
+        assert_eq!(presence(), Presence::WhitedOut);
+
+        // One in a lower hides it too, and stays where it is.
+        reset();
+        whiteout(&middle.join("etc/x")).unwrap();
+        assert_eq!(presence(), Presence::Absent);
+
+        // A whiteout, or a file, where a directory above the target would have
+        // to be hides everything beneath it.
+        reset();
+        std::fs::remove_dir(upper.join("etc")).unwrap();
+        whiteout(&upper.join("etc")).unwrap();
+        assert_eq!(presence(), Presence::Absent);
+        reset();
+        std::fs::remove_dir(middle.join("etc")).unwrap();
+        std::fs::write(middle.join("etc"), b"").unwrap();
+        assert_eq!(presence(), Presence::Absent);
+
+        // An entry in a higher layer is what the merged view shows, whatever
+        // the layers below it hold.
+        reset();
+        std::fs::write(upper.join("etc/x"), b"").unwrap();
+        whiteout(&middle.join("etc/x")).unwrap();
+        assert_eq!(presence(), Presence::Present);
+
+        // A directory above the target marked opaque hides what the layers
+        // below hold in it. The marker's other value names a directory holding
+        // whiteouts of another kind, and is not opaque.
+        reset();
+        if let Err(errno) = mark_opaque(&middle.join("etc"), b"y") {
+            eprintln!("skipping: this filesystem cannot hold a user xattr: {errno}");
+            return;
+        }
+        assert_eq!(presence(), Presence::Absent);
+        reset();
+        mark_opaque(&middle.join("etc"), b"x").unwrap();
+        assert_eq!(presence(), Presence::Present);
+
+        // A symbolic link above the target, as a merged-usr layer carries one,
+        // is resolved by the merged view across layers: the question passes to
+        // the layers below, which carry the same link.
+        reset();
+        for layer in [&upper, &base] {
+            std::fs::create_dir_all(layer.join("usr/lib")).unwrap();
+            std::os::unix::fs::symlink("usr/lib", layer.join("lib")).unwrap();
+        }
+        std::fs::remove_dir_all(upper.join("usr")).unwrap();
+        std::fs::write(base.join("usr/lib/y"), b"").unwrap();
+        let layers: Vec<Option<Rooted>> = [&upper, &middle, &base]
+            .into_iter()
+            .map(|layer| Rooted::open(layer).ok())
+            .collect();
+        assert_eq!(
+            merged_presence(&layers, Path::new("lib/y")),
+            Presence::Present
+        );
+        assert_eq!(
+            merged_presence(&layers, Path::new("lib/z")),
+            Presence::Absent
+        );
+    }
+
+    #[test]
+    fn a_target_created_over_a_whiteout_puts_the_whiteout_back() {
+        // The build records a target whose name the upper had whited out, and
+        // the teardown, once the launch's empty file is gone, recreates the
+        // whiteout: the upper goes on recording the deletion it held.
+        let scratch = Scratch::new("whiteout-restore");
+        let (upper, base) = (scratch.join("upper"), scratch.join("base"));
+        std::fs::create_dir_all(upper.join("etc")).unwrap();
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::write(base.join("etc/shipped"), b"shipped").unwrap();
+        if let Err(errno) = whiteout(&upper.join("etc/shipped")) {
+            eprintln!("skipping: this host cannot create a whiteout: {errno}");
+            return;
+        }
+        let mut lowering = Lowering::default();
+        lowering
+            .push_bind(&Bind::new("/etc/hostname", "/etc/shipped"))
+            .unwrap();
+        let lower = [base.clone()];
+        let placeholders = created_file_targets(
+            &lowering.ops,
+            &RootLayers::Overlay {
+                upper: &upper,
+                lower: &lower,
+            },
+        );
+        assert_eq!(placeholders.paths, [Path::new("etc/shipped")]);
+        assert_eq!(placeholders.whiteouts, [Path::new("etc/shipped")]);
+
+        // What the launch does: the target replaces the whiteout.
+        std::fs::remove_file(upper.join("etc/shipped")).unwrap();
+        std::fs::write(upper.join("etc/shipped"), b"").unwrap();
+        drop(crate::running::PlaceholderGuard { placeholders });
+        let stat = rustix::fs::lstat(upper.join("etc/shipped")).expect("the name is taken");
+        assert!(Rooted::is_whiteout(&stat), "the whiteout is back");
     }
 
     #[test]
@@ -5988,6 +6619,16 @@ read-only = true
         );
     }
 
+    /// Resolves and creates one layer directory as an overlay build does,
+    /// keeping whatever it creates.
+    fn prepare_layer(layer: OverlayLayer, path: &Path) -> Result<PathBuf, Error> {
+        let mut created = CreatedDirs::default();
+        let at = layer_path(layer, path, &mut created)?;
+        create_layer_dir(layer, &at, &mut created)?;
+        created.keep();
+        Ok(at.path())
+    }
+
     #[test]
     fn an_overlay_layer_directory_is_created_fresh_and_owned() {
         use std::os::unix::fs::PermissionsExt;
@@ -6000,7 +6641,7 @@ read-only = true
         // parallel threads, so narrowing it would reach every directory another
         // test created meanwhile.)
         let fresh = scratch.join("nested/fresh");
-        let prepared = prepare_layer_dir(OverlayLayer::Upper, &fresh).unwrap();
+        let prepared = prepare_layer(OverlayLayer::Upper, &fresh).unwrap();
         assert_eq!(prepared, std::fs::canonicalize(&fresh).unwrap());
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode(&fresh), OVERLAY_DIR_MODE);
@@ -6012,8 +6653,8 @@ read-only = true
         // mode changed underneath it.
         std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
-            prepare_layer_dir(OverlayLayer::Upper, &fresh).unwrap(),
-            prepared,
+            prepare_layer(OverlayLayer::Upper, &fresh).unwrap(),
+            prepared
         );
         assert_eq!(mode(&fresh), 0o700, "an adopted layer keeps its own mode");
 
@@ -6024,7 +6665,7 @@ read-only = true
         std::fs::create_dir(&destination).unwrap();
         let planted = scratch.join("planted");
         std::os::unix::fs::symlink(&destination, &planted).unwrap();
-        let err = prepare_layer_dir(OverlayLayer::Upper, &planted).unwrap_err();
+        let err = prepare_layer(OverlayLayer::Upper, &planted).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -6039,7 +6680,7 @@ read-only = true
         // So is an entry that is not a directory at all.
         let file = scratch.join("file");
         std::fs::write(&file, b"").unwrap();
-        let err = prepare_layer_dir(OverlayLayer::Work, &file).unwrap_err();
+        let err = prepare_layer(OverlayLayer::Work, &file).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -6053,19 +6694,207 @@ read-only = true
     }
 
     #[test]
-    fn an_overlay_upper_at_the_filesystem_root_is_refused() {
+    fn an_overlay_layer_at_the_filesystem_root_is_refused_by_its_layer() {
         // `/` has no parent, so there is nowhere for the work directory beside
         // the upper or for the host preflight's scratch entries — and an upper
-        // there would put the sandbox's writes over the whole host root.
-        let lower = Scratch::new("overlay-upper-root");
+        // there would put the sandbox's writes over the whole host root. The
+        // refusal names the layer the path was given for.
+        let scratch = Scratch::new("overlay-layer-root");
         let err = Cage::builder()
-            .overlay_rootfs(&*lower, "/")
+            .overlay_rootfs(&*scratch, "/")
+            .command("/bin/sh")
+            .build()
+            .unwrap_err();
+        match err {
+            Error::Config(ConfigError::OverlayLayerIsRoot { layer, path }) => {
+                assert_eq!(
+                    (layer, path.as_path()),
+                    (OverlayLayer::Upper, Path::new("/"))
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let err = Cage::builder()
+            .overlay(
+                Overlay::new()
+                    .lower(&*scratch)
+                    .upper(scratch.join("upper"))
+                    .work("/"),
+            )
+            .command("/bin/sh")
+            .build()
+            .unwrap_err();
+        match err {
+            Error::Config(ConfigError::OverlayLayerIsRoot { layer, path }) => {
+                assert_eq!(
+                    (layer, path.as_path()),
+                    (OverlayLayer::Work, Path::new("/"))
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            !scratch.join("upper").exists(),
+            "a refused build leaves no upper behind"
+        );
+    }
+
+    #[test]
+    fn a_build_refused_for_any_reason_leaves_no_layer_directory_behind() {
+        // The layer directories are the one thing a build creates on the host,
+        // so they are created once everything else has been accepted.
+        let scratch = Scratch::new("overlay-refused");
+        let upper = scratch.join("fresh/parent/upper");
+        let err = Cage::builder()
+            .overlay_rootfs(&*scratch, &upper)
+            .command("/bin/sh")
+            .hostname("")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::HostnameInvalid { .. })),
+            "{err}"
+        );
+        assert!(!scratch.join("fresh").exists(), "nothing was created");
+
+        // A refusal inside the overlay's own preparation, after the parents of
+        // the upper were created, takes them away again. Options the kernel
+        // would cut short are refused before the layers themselves exist.
+        // Two lowers whose paths each fit a path, and together do not fit a
+        // page of options.
+        let deep = |name: &str| {
+            let mut deep = scratch.join(name);
+            while deep.as_os_str().len() < 2200 {
+                deep.push("l".repeat(200));
+            }
+            std::fs::create_dir_all(&deep).unwrap();
+            deep
+        };
+        let (first, second) = (deep("first"), deep("second"));
+        let err = Cage::builder()
+            .overlay(
+                Overlay::new()
+                    .lower(&*scratch)
+                    .lower(&first)
+                    .lower(&second)
+                    .upper(&upper),
+            )
             .command("/bin/sh")
             .build()
             .unwrap_err();
         assert!(
-            matches!(err, Error::Config(ConfigError::OverlayUpperIsRoot { .. })),
+            matches!(
+                err,
+                Error::Config(ConfigError::OverlayOptionsTooLong { .. })
+            ),
             "{err}"
+        );
+        assert!(
+            !scratch.join("fresh").exists(),
+            "the parents created for the upper are removed again"
+        );
+    }
+
+    #[test]
+    fn a_layer_refused_after_creation_is_removed_again() {
+        // A caller-named work directory on another filesystem is refused once
+        // both layer directories exist, since the device comparison needs them;
+        // the refusal takes both away again, and the parents created for them.
+        let scratch = Scratch::new("overlay-exdev");
+        let other = Path::new("/dev/shm");
+        let device = |path: &Path| rustix::fs::stat(path).map(|stat| stat.st_dev);
+        let (Ok(here), Ok(there)) = (device(&scratch), device(other)) else {
+            eprintln!("skipping: no second filesystem to place the work directory on");
+            return;
+        };
+        if here == there {
+            eprintln!("skipping: /dev/shm shares the scratch directory's filesystem");
+            return;
+        }
+        let elsewhere = other.join(format!("fcage-exdev-{}", crate::host::unique_hex()));
+        let upper = scratch.join("fresh/upper");
+        let built = Cage::builder()
+            .overlay(
+                Overlay::new()
+                    .lower(&*scratch)
+                    .upper(&upper)
+                    .work(elsewhere.join("work")),
+            )
+            .command("/bin/sh")
+            .build();
+        let leftover = elsewhere.exists();
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        match built {
+            Err(Error::Config(ConfigError::OverlayDirUnusable {
+                layer: OverlayLayer::Work,
+                source,
+                ..
+            })) => assert_eq!(source.raw_os_error(), Some(Errno::XDEV.raw_os_error())),
+            Err(Error::Config(ConfigError::OverlayUnavailable { .. })) => {
+                eprintln!("skipping: an unprivileged overlay is unavailable here");
+                return;
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert!(!leftover, "the work directory and its parent are removed");
+        assert!(
+            !scratch.join("fresh").exists(),
+            "so are the upper and its parent"
+        );
+    }
+
+    #[test]
+    fn a_layer_path_the_kernel_would_unescape_mounts_the_directory_named() {
+        // Overlayfs unescapes every layer path, so `up\x` written verbatim is
+        // mounted as `upx`. The options name it escaped, which is the directory
+        // whose ownership the build checked.
+        let scratch = Scratch::new("overlay-escape");
+        let base = scratch.join("ba:se");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(scratch.join("upx")).unwrap();
+        let built = Cage::builder()
+            .overlay_rootfs(&base, scratch.join(r"up\x"))
+            .command("/bin/sh")
+            .build();
+        let cage = match built {
+            Ok(cage) => cage,
+            Err(Error::Config(ConfigError::OverlayUnavailable { .. })) => {
+                eprintln!("skipping: an unprivileged overlay is unavailable here");
+                return;
+            }
+            Err(err) => panic!("unexpected error: {err}"),
+        };
+        let options = cage
+            .plan
+            .overlay
+            .as_ref()
+            .unwrap()
+            .options
+            .to_str()
+            .unwrap();
+        let canonical = std::fs::canonicalize(&*scratch).unwrap();
+        let canonical = canonical.to_str().unwrap();
+        assert_eq!(
+            options,
+            format!(
+                r"lowerdir={canonical}/ba\:se,upperdir={canonical}/up\\x,workdir={canonical}/.up\\x.work,userxattr"
+            ),
+        );
+
+        // A comma is refused rather than escaped.
+        let err = Cage::builder()
+            .overlay_rootfs(&base, scratch.join("up,per"))
+            .command("/bin/sh")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::OverlayPathInvalid { .. })),
+            "{err}"
+        );
+        assert!(
+            !scratch.join("up,per").exists(),
+            "and nothing is created for it"
         );
     }
 

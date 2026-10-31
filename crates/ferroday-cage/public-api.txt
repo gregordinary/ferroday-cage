@@ -183,10 +183,10 @@ impl<'a> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::a
 impl<'a> core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::alpine::AlpineEvent<'a>
 #[non_exhaustive] pub enum ferroday_cage::provision::alpine::UnheldReason
 pub ferroday_cage::provision::alpine::UnheldReason::Absent
-pub ferroday_cage::provision::alpine::UnheldReason::Identity
+#[non_exhaustive] pub ferroday_cage::provision::alpine::UnheldReason::Identity
 pub ferroday_cage::provision::alpine::UnheldReason::Identity::pin: alloc::string::String
 pub ferroday_cage::provision::alpine::UnheldReason::Identity::repository: alloc::string::String
-pub ferroday_cage::provision::alpine::UnheldReason::Version
+#[non_exhaustive] pub ferroday_cage::provision::alpine::UnheldReason::Version
 pub ferroday_cage::provision::alpine::UnheldReason::Version::repository: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::alpine::UnheldReason
 impl core::marker::Send for ferroday_cage::provision::alpine::UnheldReason
@@ -490,10 +490,10 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::debia
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::Priority
 #[non_exhaustive] pub enum ferroday_cage::provision::debian::UnheldReason
 pub ferroday_cage::provision::debian::UnheldReason::Absent
-pub ferroday_cage::provision::debian::UnheldReason::Digest
+#[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Digest
 pub ferroday_cage::provision::debian::UnheldReason::Digest::archive: alloc::string::String
 pub ferroday_cage::provision::debian::UnheldReason::Digest::pin: alloc::string::String
-pub ferroday_cage::provision::debian::UnheldReason::Version
+#[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Version
 pub ferroday_cage::provision::debian::UnheldReason::Version::archive: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::debian::UnheldReason
 impl core::marker::Send for ferroday_cage::provision::debian::UnheldReason
@@ -1516,16 +1516,19 @@ pub ferroday_cage::ConfigError::BindSourceUnusable::source: core::io::error::Err
 pub ferroday_cage::ConfigError::CommandMissing
 #[non_exhaustive] pub ferroday_cage::ConfigError::CommandNotAbsolute
 pub ferroday_cage::ConfigError::CommandNotAbsolute::command: std::path::PathBuf
-pub ferroday_cage::ConfigError::EmbeddedNul
+#[non_exhaustive] pub ferroday_cage::ConfigError::EmbeddedNul
+pub ferroday_cage::ConfigError::EmbeddedNul::value: std::ffi::os_str::OsString
 #[non_exhaustive] pub ferroday_cage::ConfigError::EnvNameInvalid
 pub ferroday_cage::ConfigError::EnvNameInvalid::name: std::ffi::os_str::OsString
 #[non_exhaustive] pub ferroday_cage::ConfigError::HostNetworkLandlockUnenforceable
 pub ferroday_cage::ConfigError::HostNetworkLandlockUnenforceable::abi: core::option::Option<i32>
-pub ferroday_cage::ConfigError::HostnameInvalid
+#[non_exhaustive] pub ferroday_cage::ConfigError::HostnameInvalid
+pub ferroday_cage::ConfigError::HostnameInvalid::name: std::ffi::os_str::OsString
 #[non_exhaustive] pub ferroday_cage::ConfigError::IdentityMapInvalid
 pub ferroday_cage::ConfigError::IdentityMapInvalid::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::IdentityMapUnavailable
 pub ferroday_cage::ConfigError::IdentityMapUnavailable::reason: alloc::string::String
+pub ferroday_cage::ConfigError::IdentityMapUnavailable::source: core::option::Option<ferroday_cage::IdMapError>
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockGrantEmpty
 pub ferroday_cage::ConfigError::LandlockGrantEmpty::grant: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockPathInvalid
@@ -1534,6 +1537,7 @@ pub ferroday_cage::ConfigError::LandlockPathInvalid::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::ManagedMountsContradiction::toggle: &'static str
 #[non_exhaustive] pub ferroday_cage::ConfigError::MountFlagsInvalid
 pub ferroday_cage::ConfigError::MountFlagsInvalid::flags: u64
+pub ferroday_cage::ConfigError::MountFlagsInvalid::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::MountTargetInvalid
 pub ferroday_cage::ConfigError::MountTargetInvalid::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::NestedUsernsNeedsProcfs
@@ -1544,13 +1548,16 @@ pub ferroday_cage::ConfigError::OverlayDirUnowned::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::OverlayDirUnusable::layer: ferroday_cage::OverlayLayer
 pub ferroday_cage::ConfigError::OverlayDirUnusable::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::OverlayDirUnusable::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayLayerIsRoot
+pub ferroday_cage::ConfigError::OverlayLayerIsRoot::layer: ferroday_cage::OverlayLayer
+pub ferroday_cage::ConfigError::OverlayLayerIsRoot::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::OverlayLowerMissing
+#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayOptionsTooLong
+pub ferroday_cage::ConfigError::OverlayOptionsTooLong::length: usize
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayPathInvalid
 pub ferroday_cage::ConfigError::OverlayPathInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayUnavailable
 pub ferroday_cage::ConfigError::OverlayUnavailable::blocker: ferroday_cage::host::OverlayBlocker
-#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayUpperIsRoot
-pub ferroday_cage::ConfigError::OverlayUpperIsRoot::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::OverlayUpperMissing
 #[non_exhaustive] pub ferroday_cage::ConfigError::ProfileOperationForbidden
 pub ferroday_cage::ConfigError::ProfileOperationForbidden::operation: &'static str
@@ -1781,7 +1788,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::Progress
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Progress
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Progress
 #[non_exhaustive] pub enum ferroday_cage::ResolvedHardening
-pub ferroday_cage::ResolvedHardening::Applied
+#[non_exhaustive] pub ferroday_cage::ResolvedHardening::Applied
 pub ferroday_cage::ResolvedHardening::Applied::keep_capabilities: core::option::Option<u64>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_fs: alloc::vec::Vec<ferroday_cage::ResolvedLandlockFs>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_net: alloc::vec::Vec<ferroday_cage::ResolvedLandlockNet>
@@ -1796,7 +1803,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedHardenin
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedHardening
 #[non_exhaustive] pub enum ferroday_cage::ResolvedIdentity
 pub ferroday_cage::ResolvedIdentity::Caller
-pub ferroday_cage::ResolvedIdentity::Ranged
+#[non_exhaustive] pub ferroday_cage::ResolvedIdentity::Ranged
 pub ferroday_cage::ResolvedIdentity::Ranged::gid: alloc::vec::Vec<ferroday_cage::IdRange>
 pub ferroday_cage::ResolvedIdentity::Ranged::uid: alloc::vec::Vec<ferroday_cage::IdRange>
 pub ferroday_cage::ResolvedIdentity::Single
@@ -1808,25 +1815,25 @@ impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedIdentity
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedIdentity
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedIdentity
 #[non_exhaustive] pub enum ferroday_cage::ResolvedMount
-pub ferroday_cage::ResolvedMount::Bind
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Bind
 pub ferroday_cage::ResolvedMount::Bind::read_only: bool
 pub ferroday_cage::ResolvedMount::Bind::source: std::path::PathBuf
 pub ferroday_cage::ResolvedMount::Bind::target: std::path::PathBuf
-pub ferroday_cage::ResolvedMount::Devpts
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Devpts
 pub ferroday_cage::ResolvedMount::Devpts::data: alloc::string::String
 pub ferroday_cage::ResolvedMount::Devpts::target: std::path::PathBuf
-pub ferroday_cage::ResolvedMount::Procfs
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Procfs
 pub ferroday_cage::ResolvedMount::Procfs::target: std::path::PathBuf
-pub ferroday_cage::ResolvedMount::Raw
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Raw
 pub ferroday_cage::ResolvedMount::Raw::data: core::option::Option<alloc::string::String>
 pub ferroday_cage::ResolvedMount::Raw::flags: u64
 pub ferroday_cage::ResolvedMount::Raw::fstype: core::option::Option<alloc::string::String>
 pub ferroday_cage::ResolvedMount::Raw::source: core::option::Option<std::path::PathBuf>
 pub ferroday_cage::ResolvedMount::Raw::target: std::path::PathBuf
-pub ferroday_cage::ResolvedMount::Symlink
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Symlink
 pub ferroday_cage::ResolvedMount::Symlink::path: std::path::PathBuf
 pub ferroday_cage::ResolvedMount::Symlink::target: std::path::PathBuf
-pub ferroday_cage::ResolvedMount::Tmpfs
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Tmpfs
 pub ferroday_cage::ResolvedMount::Tmpfs::data: alloc::string::String
 pub ferroday_cage::ResolvedMount::Tmpfs::flags: u64
 pub ferroday_cage::ResolvedMount::Tmpfs::target: std::path::PathBuf
@@ -1841,11 +1848,11 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedMount
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedMount
 #[non_exhaustive] pub enum ferroday_cage::ResolvedRoot
 pub ferroday_cage::ResolvedRoot::Host
-pub ferroday_cage::ResolvedRoot::Overlay
+#[non_exhaustive] pub ferroday_cage::ResolvedRoot::Overlay
 pub ferroday_cage::ResolvedRoot::Overlay::lower: alloc::vec::Vec<std::path::PathBuf>
 pub ferroday_cage::ResolvedRoot::Overlay::upper: std::path::PathBuf
 pub ferroday_cage::ResolvedRoot::Overlay::work: std::path::PathBuf
-pub ferroday_cage::ResolvedRoot::Plain
+#[non_exhaustive] pub ferroday_cage::ResolvedRoot::Plain
 pub ferroday_cage::ResolvedRoot::Plain::path: std::path::PathBuf
 impl core::marker::Freeze for ferroday_cage::ResolvedRoot
 impl core::marker::Send for ferroday_cage::ResolvedRoot
@@ -2471,8 +2478,10 @@ pub ferroday_cage::ResolvedInputs::hardening: ferroday_cage::ResolvedHardening
 pub ferroday_cage::ResolvedInputs::identity: ferroday_cage::ResolvedIdentity
 pub ferroday_cage::ResolvedInputs::mounts: alloc::vec::Vec<ferroday_cage::ResolvedMount>
 pub ferroday_cage::ResolvedInputs::network: ferroday_cage::Network
+pub ferroday_cage::ResolvedInputs::no_new_privileges: bool
 pub ferroday_cage::ResolvedInputs::rlimits: alloc::vec::Vec<ferroday_cage::ResolvedRlimit>
 pub ferroday_cage::ResolvedInputs::root: ferroday_cage::ResolvedRoot
+pub ferroday_cage::ResolvedInputs::run_as: core::option::Option<ferroday_cage::ResolvedRunAs>
 pub ferroday_cage::ResolvedInputs::streams: ferroday_cage::ResolvedStreams
 impl core::marker::Freeze for ferroday_cage::ResolvedInputs
 impl core::marker::Send for ferroday_cage::ResolvedInputs
@@ -2524,6 +2533,17 @@ impl core::marker::Unpin for ferroday_cage::ResolvedRlimit
 impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedRlimit
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedRlimit
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedRlimit
+#[non_exhaustive] pub struct ferroday_cage::ResolvedRunAs
+pub ferroday_cage::ResolvedRunAs::gid: u32
+pub ferroday_cage::ResolvedRunAs::groups: alloc::vec::Vec<u32>
+pub ferroday_cage::ResolvedRunAs::uid: u32
+impl core::marker::Freeze for ferroday_cage::ResolvedRunAs
+impl core::marker::Send for ferroday_cage::ResolvedRunAs
+impl core::marker::Sync for ferroday_cage::ResolvedRunAs
+impl core::marker::Unpin for ferroday_cage::ResolvedRunAs
+impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedRunAs
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedRunAs
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedRunAs
 #[non_exhaustive] pub struct ferroday_cage::ResolvedStreams
 pub ferroday_cage::ResolvedStreams::stderr: ferroday_cage::ResolvedStdio
 pub ferroday_cage::ResolvedStreams::stdin: ferroday_cage::ResolvedStdio
