@@ -71,6 +71,22 @@ consumer upgrading can skip it.
 - Only a text signature verifies a cleartext-signed document. A standalone or
   timestamp signature by an archive key covers no document, and rPGP verified
   one against any body sharing its first byte.
+- The Gentoo binary-package index, which nothing signs, is read only as gzip or
+  plain text, the two forms the archive publishes, and is refused rather than
+  truncated when it decompresses past 256 MiB. Its parser bounds how deeply
+  dependency groups nest, at 16 levels, skipping a stanza that nests deeper as
+  it skips any other unreadable stanza, and splits a `category/name-version` in
+  time linear in the line's length. A few tens of kilobytes of parentheses from
+  a mirror overflowed the stack and aborted the host process, and a line of
+  hyphens cost the square of its length.
+- The Gentoo stage3 is extracted from the descriptor its SHA-512 was taken
+  through, so another run renaming a download over a shared cache entry between
+  the check and the extraction cannot substitute unverified bytes.
+- The Gentoo binary-package cache keys each container by its full archive path,
+  architecture, generation and binhost included, so binhosts sharing a
+  `cache_dir` no longer serve each other's builds: an `x86-64-v3` build could
+  reach an `x86-64` root. Containers cached under the previous layout are not
+  read again and can be deleted.
 
 ### Added
 
@@ -133,6 +149,21 @@ consumer upgrading can skip it.
   named pipe left at that path. Opening one for reading waited for a writer that
   never came, which stalled the bootstrap for good. It is now refused, as any
   path that is not a regular file is.
+- Gentoo atoms follow portage and the package manager specification. A
+  `=cat/pkg-1.2*` atom matches only at a version-part boundary, so
+  `=dev-lang/python-3.1*` no longer admits 3.12. A package name may not contain
+  `.`, a slot may not begin with `-`, `.` or `+`, and a USE flag must begin with
+  a letter or digit. `cat/pkg::repo` is refused as a repository dependency
+  rather than as a malformed slot.
+- Gentoo resolution honors the blockers that packages already in the root
+  state, refusing a build one of them blocks as portage does.
+  `GentooEvent::Conflict` gains `stated_in_root`. A root whose database holds a
+  runtime dependency class that does not parse is refused by
+  `gentoo::installed`.
+- A Gentoo root whose merge counter cannot take another ordinal is refused
+  before anything is merged, rather than panicking or wrapping.
+- A Gentoo binary package holding a member twice, or two image or metadata
+  archives, is refused.
 - A mirror that redirects to an `https://` URL, which the bundled client cannot
   follow, is a mirror that could not serve the request, so a walk over several
   mirrors asks the next one. It ended the walk as a malformed URL. The refusal
@@ -157,6 +188,9 @@ consumer upgrading can skip it.
   socket for every caller that does: the supervisor's pidfd, the network stack's
   tap, and a terminal launch's primary. The shared vocabulary in
   `CONTRIBUTING.md` records them.
+- The Gentoo layer checks a path component with `path::is_ordinary_component`,
+  and splits a name from its version through one `version::version_hyphen` that
+  the package-name rule shares.
 - `lzma-rust2` moves to 0.23, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the
   sans-I/O decoder to apply the limit is gone. The cap, and what an archive over

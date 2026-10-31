@@ -69,7 +69,6 @@ mod version;
 
 use std::fmt;
 use std::io;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -128,9 +127,10 @@ const MAX_DIGESTS_BYTES: u64 = 64 * 1024;
 
 /// The ceiling on a binary-package index, which declares no size of its own.
 ///
-/// Sized against today's 19.1 MB with room for the archive to grow. It applies
+/// Sized against today's 21.5 MB with room for the archive to grow. It applies
 /// to the plain and the compressed form alike -- for the compressed one, to the
-/// decompressed stream, since that is what a decompression bomb inflates.
+/// decompressed stream too, since that is what a decompression bomb inflates.
+/// An index past it is refused rather than read as far as the ceiling.
 const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The ceiling on a binary package's metadata archive, which the container
@@ -1062,6 +1062,7 @@ impl Gentoo {
                 to.progress(GentooEvent::Conflict {
                     atom: &conflict.atom,
                     stated_by: &conflict.stated_by,
+                    stated_in_root: conflict.stated_in_root,
                     blocks: &conflict.blocks,
                     installed: conflict.installed,
                 });
@@ -1108,7 +1109,7 @@ impl Gentoo {
             |name| {
                 let suffix = format!("{directory}/{name}");
                 let served = self.read_bytes(&suffix, MAX_INDEX_BYTES, to)?;
-                read_index_body(&served)
+                read_index_body(&served, MAX_INDEX_BYTES)
             },
             || GentooError::Fetch(no_mirror(&directory)),
         )
@@ -1334,25 +1335,47 @@ struct Fetched {
     body: Vec<u8>,
 }
 
-/// Reads a fetched index body into a parsed index.
+/// Reads a fetched index body into a parsed index, refusing one that
+/// decompresses to more than `limit` bytes.
 ///
 /// The compression is selected from the bytes rather than from the file name,
 /// so the plain form and the compressed one go through one path — and a mirror
 /// serving one under the other's name is read for what it is rather than for
-/// what it is called.
+/// what it is called. Only gzip and plain text are read, because that is all
+/// the archive publishes this document as, on every architecture. Nothing signs
+/// the index, so a body in another format is refused before its decoder runs
+/// rather than handed to one this document never needs.
 ///
 /// The decompressed stream is bounded as well as the fetch: the fetch's ceiling
 /// bounds what arrived, and this one bounds what that inflates to, which is the
-/// only place a decompression bomb could spend anything.
-fn read_index_body(served: &Fetched) -> Result<index::Index, GentooError> {
+/// only place a decompression bomb could spend anything. A stream past the
+/// ceiling is refused rather than cut at it. A cut index parses perfectly as a
+/// smaller archive, and its own package count cannot be relied on to notice,
+/// since the count is optional and the mirror's to write.
+fn read_index_body(served: &Fetched, limit: u64) -> Result<index::Index, GentooError> {
+    let unreadable = |err: &dyn fmt::Display| {
+        GentooError::index(&served.url, format!("could not be read: {err}"))
+    };
     let mut body = served.body.as_slice();
-    let head = compress::sniff_head(&mut body)
-        .map_err(|err| GentooError::index(&served.url, format!("could not be read: {err}")))?;
-    let mut reader = compress::decompress(&head, body)
-        .map_err(|err| GentooError::index(&served.url, format!("could not be read: {err}")))?;
+    let head = compress::sniff_head(&mut body).map_err(|err| unreadable(&err))?;
+    let refused = match compress::Codec::of(&head) {
+        compress::Codec::Gzip | compress::Codec::Plain => None,
+        compress::Codec::Xz => Some("xz"),
+        compress::Codec::Zstd => Some("zstd"),
+    };
+    if let Some(codec) = refused {
+        return Err(GentooError::index(
+            &served.url,
+            format!(
+                "is compressed with {codec}, and the archive publishes the index only as gzip or \
+                 as plain text"
+            ),
+        ));
+    }
+    let mut reader = compress::decompress(&head, body).map_err(|err| unreadable(&err))?;
     let mut bytes = Vec::new();
-    io::copy(&mut reader.by_ref().take(MAX_INDEX_BYTES), &mut bytes)
-        .map_err(|err| GentooError::index(&served.url, format!("could not be read: {err}")))?;
+    io::copy(&mut reader, &mut LimitedWriter::new(&mut bytes, limit))
+        .map_err(|err| unreadable(&err))?;
     // Lossy rather than strict: the index is fifteen thousand stanzas of which
     // this layer reads a dozen fields, and one package's description holding a
     // byte sequence that is not UTF-8 is not a reason to refuse the archive.
@@ -1488,33 +1511,37 @@ impl Gentoo {
             PackageCache::beside(request.staging(), self.cache_dir.as_deref(), STAGE3_CACHE);
         std::fs::create_dir_all(cache.path())
             .map_err(GentooError::at("creating the download cache", cache.path()))?;
-        let file = stage3.file_name();
-        let tarball = cache.path().join(file);
+        let tarball = cache.path().join(stage3.file_name());
 
-        // A cached tarball is bytes on a disk this crate does not own, so it is
-        // verified on the read rather than trusted for having been verified
-        // once. That makes the cache-hit path and the fresh-download path one
-        // code path, whichever produced the file.
-        if !tarball.is_file() {
-            self.download(&stage3, &tarball, to)?;
-        }
-        // A digest pass over the whole tarball is the second long step, and
-        // what precedes it is a complete file in a cache that outlives the run,
-        // so stopping here costs the download nothing.
-        stop_if_cancelled(to)?;
-        to.progress(GentooEvent::Verifying {
-            path: tarball.as_path(),
-        });
-        verify(&tarball, stage3.sha512())?;
-
-        to.progress(GentooEvent::Extracting {
-            path: tarball.as_path(),
-        });
         // The bytes are verified before the extractor sees them, rather than
         // streamed through it as they arrive: an archive that turns out not to
         // be the one the signed document named would otherwise already have
         // written most of a root filesystem.
-        Tarball::new(&tarball).provision(request)?;
+        let verified = cached_or_fetched(
+            &tarball,
+            to,
+            |to| {
+                // A digest pass over the whole tarball is the second long step,
+                // and what precedes it is a complete file in a cache that
+                // outlives the run, so stopping here costs the download nothing.
+                stop_if_cancelled(to)?;
+                to.progress(GentooEvent::Verifying {
+                    path: tarball.as_path(),
+                });
+                verify(&tarball, stage3.sha512())
+            },
+            |to| self.download(&stage3, &tarball, to),
+        )?;
+
+        to.progress(GentooEvent::Extracting {
+            path: tarball.as_path(),
+        });
+        // From the descriptor the digest pass read, rather than from the path
+        // opened again. The cache is a caller's to share between runs, and
+        // another run publishes its download by renaming a file over this name,
+        // so a second open reads whatever the name binds by then: bytes nothing
+        // verified, after a digest pass that reported success.
+        Tarball::from_file(verified, &tarball).provision(request)?;
 
         // The second wave. A run that asked for no package stops here and has
         // done exactly what a stage3 bootstrap does, byte for byte.
@@ -1638,14 +1665,26 @@ impl Gentoo {
             let below = Rooted::open(base).map_err(GentooError::at("opening the base", base))?;
             counter = counter.max(vdb::counter_of(base, &below)?);
         }
+        // Every ordinal the wave stamps, settled before anything is merged. The
+        // counter is read out of a root this crate does not own, so it can
+        // stand anywhere, and a wave that ran out of ordinals part way would
+        // leave a root holding half of what was asked for.
+        let Some(last) = counter.checked_add(plan.packages.len() as u64) else {
+            return Err(GentooError::database(
+                root,
+                format!(
+                    "its merge counter stands at {counter}, and {} more merges would carry it \
+                     past the largest value it can hold",
+                    plan.packages.len(),
+                ),
+            )
+            .into());
+        };
         // The cache pass, before anything is fetched: the paths a merge will
         // read, and which of them are not there yet.
         let mut cached: Vec<PathBuf> = Vec::with_capacity(plan.packages.len());
         for planned in &plan.packages {
-            // The path came out of an index or a plan document and passed
-            // `coordinate::check` either way, so it names something under the
-            // cache and under the binhost directory and nothing else.
-            let path = cache.path().join(&planned.path);
+            let path = cache_entry(cache.path(), &directory, planned);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(GentooError::at("creating the download cache", parent))?;
@@ -1661,34 +1700,28 @@ impl Gentoo {
             .collect();
         self.prefetch_packages(&directory, &missing, to)?;
 
-        for (planned, cached) in plan.packages.iter().zip(&cached) {
+        // `last` is `counter` plus a non-empty plan's length, so the first
+        // ordinal does not overflow either.
+        let ordinals = counter + 1..=last;
+        for ((planned, cached), ordinal) in plan.packages.iter().zip(&cached).zip(ordinals) {
             stop_if_cancelled(to)?;
-            // A cached container is bytes on a disk this crate does not own, so
-            // it is verified on the read rather than trusted for having been
-            // verified once -- which makes the cache-hit path and the
-            // fresh-download path one code path.
-            if !cached.is_file() {
-                self.download_package(&directory, planned, cached, to)?;
-            }
+            let keyring = &self.keyring;
+            let (fetcher, mirrors) = (&mut self.fetcher, &self.mirrors);
+            let package = cached_or_fetched(
+                cached,
+                to,
+                |_| {
+                    gpkg::Package::open(cached, planned, keyring).inspect_err(|_| {
+                        let _ = std::fs::remove_file(cached);
+                    })
+                },
+                |to| download_package(fetcher.as_mut(), mirrors, &directory, planned, cached, to),
+            )?;
             to.progress(GentooEvent::Merging {
                 package: &planned.name,
                 version: &planned.version,
             });
-            let package = match gpkg::Package::open(cached, planned, &self.keyring) {
-                Ok(package) => package,
-                Err(err) => {
-                    // A container that is not what it should be is not the
-                    // archive's file whatever it is, and leaving it would make
-                    // every later run fail identically out of its own cache --
-                    // which reads as a permanent failure rather than as a
-                    // mirror that served the wrong bytes once. The same rule
-                    // the stage3's digest check applies.
-                    let _ = std::fs::remove_file(cached);
-                    return Err(err.into());
-                }
-            };
-            counter += 1;
-            vdb::merge(root, &rooted, cached, &package, planned, counter)?;
+            vdb::merge(root, &rooted, cached, &package, planned, ordinal)?;
         }
         Ok(())
     }
@@ -1710,8 +1743,8 @@ impl Gentoo {
     /// package and the walk that follows fetches it with every mirror available
     /// to it, so this is an optimization and nothing more. What the rename
     /// publishes is a complete container rather than a verified one, exactly as
-    /// [`download_package`](Self::download_package) does: the verification is
-    /// the read that follows, which is the same read a cache hit goes through.
+    /// [`download_package`] does: the verification is the read that follows,
+    /// which is the same read a cache hit goes through.
     fn prefetch_packages(
         &mut self,
         directory: &str,
@@ -1767,37 +1800,6 @@ impl Gentoo {
         Ok(())
     }
 
-    /// Downloads one binary package into the cache, atomically.
-    ///
-    /// Bounded by the length the index published for it *and* by
-    /// [`MAX_PACKAGE_BYTES`], because the index's number can be wrong in both
-    /// directions and only one of them fails closed. Understated, it stops the
-    /// download short and the container fails its digest. Overstated, it merely
-    /// relaxes the bound — a transport caps at the smaller of the declared size
-    /// and its own ceiling — so a hostile or damaged index buys whatever that
-    /// ceiling is, once per package. Nothing signs the index, so this layer
-    /// keeps a ceiling of its own and the smaller of the two wins.
-    fn download_package(
-        &mut self,
-        directory: &str,
-        planned: &PlannedPackage,
-        dest: &Path,
-        to: Reporting<'_>,
-    ) -> Result<(), GentooError> {
-        let fetcher = &mut self.fetcher;
-        walk_mirrors(
-            &self.mirrors,
-            |mirror| {
-                stop_if_cancelled(to)?;
-                let url = mirror_url(mirror, &format!("{directory}/{}", planned.path));
-                to.progress(GentooEvent::Fetching { url: &url });
-                let bound = planned.size.min(MAX_PACKAGE_BYTES);
-                fetch_to(fetcher.as_mut(), &url, bound, dest, BINARY_PACKAGE, to)
-            },
-            || GentooError::Fetch(no_mirror(&planned.path)),
-        )
-    }
-
     /// Downloads a stage3 into the cache, atomically.
     ///
     /// The body is written to a staging file beside the destination and renamed
@@ -1831,6 +1833,93 @@ impl Gentoo {
             || GentooError::Fetch(no_mirror(&stage3.path)),
         )
     }
+}
+
+/// Downloads one binary package into the cache, atomically.
+///
+/// Bounded by the length the index published for it *and* by
+/// [`MAX_PACKAGE_BYTES`], because the index's number can be wrong in both
+/// directions and only one of them fails closed. Understated, it stops the
+/// download short and the container fails its digest. Overstated, it merely
+/// relaxes the bound — a transport caps at the smaller of the declared size and
+/// its own ceiling — so a hostile or damaged index buys whatever that ceiling
+/// is, once per package. Nothing signs the index, so this layer keeps a ceiling
+/// of its own and the smaller of the two wins.
+///
+/// A function of the transport and the mirror list rather than a method, so a
+/// caller can hold the keyring that verifies the result at the same time.
+fn download_package(
+    fetcher: &mut dyn Fetch,
+    mirrors: &[String],
+    directory: &str,
+    planned: &PlannedPackage,
+    dest: &Path,
+    to: Reporting<'_>,
+) -> Result<(), GentooError> {
+    walk_mirrors(
+        mirrors,
+        |mirror| {
+            stop_if_cancelled(to)?;
+            let url = mirror_url(mirror, &format!("{directory}/{}", planned.path));
+            to.progress(GentooEvent::Fetching { url: &url });
+            let bound = planned.size.min(MAX_PACKAGE_BYTES);
+            fetch_to(fetcher, &url, bound, dest, BINARY_PACKAGE, to)
+        },
+        || GentooError::Fetch(no_mirror(&planned.path)),
+    )
+}
+
+/// Where the cache under `cache` holds the container `planned` names, which
+/// `directory` publishes.
+///
+/// At the path the archive publishes it under, binhost directory included:
+/// `releases/<arch>/binpackages/<generation>/<binhost>/<category>/<name>/<file>`.
+/// The binhost-relative path alone is not an identity. Two binhosts of one
+/// architecture publish builds of a package under one relative path, every
+/// `Manifest` is signed by the same key, and a build id is a small counter each
+/// binhost keeps for itself. So `x86-64` and `x86-64-v3` publish distinct
+/// containers that pass every check under each other's name, and a cache keyed
+/// by that name alone would merge code built for a newer processor into a root
+/// meant for an older one.
+///
+/// `planned.path` came out of an index or a plan document and passed
+/// `coordinate::check` either way, and `directory` is composed of coordinates
+/// checked at build time, so the result names something under the cache and
+/// nothing else.
+fn cache_entry(cache: &Path, directory: &str, planned: &PlannedPackage) -> PathBuf {
+    cache.join(directory).join(&planned.path)
+}
+
+/// What the cache holds at `cached`, verified; or, where it holds nothing that
+/// verifies, what `fetch` leaves there, verified.
+///
+/// The one rule both of this layer's caches keep. A cache entry is bytes on a
+/// disk this crate does not own, so it is verified on the read rather than
+/// trusted for having been verified once. One that does not verify is not the
+/// archive's file, whatever it is: a body a crash cut short, a container a
+/// batch fetched from a mirror that served the wrong bytes, something put there
+/// by hand. It is a download waiting to happen rather than a refusal, so the
+/// mirror walk fetches it again and what that leaves is held to the same check.
+/// A fresh download that does not verify is a refusal.
+///
+/// `verify` removes what it refuses, so a refused download leaves nothing for a
+/// later run to meet the same refusal in. A cancellation it reports is the
+/// run's own outcome rather than a verdict on the entry, and ends the call.
+fn cached_or_fetched<T>(
+    cached: &Path,
+    to: Reporting<'_>,
+    mut verify: impl FnMut(Reporting<'_>) -> Result<T, GentooError>,
+    fetch: impl FnOnce(Reporting<'_>) -> Result<(), GentooError>,
+) -> Result<T, GentooError> {
+    if cached.is_file() {
+        match verify(&mut *to) {
+            Ok(verified) => return Ok(verified),
+            Err(GentooError::Cancelled) => return Err(GentooError::Cancelled),
+            Err(_) => {}
+        }
+    }
+    fetch(&mut *to)?;
+    verify(to)
 }
 
 /// What a download is of, so the three operations [`fetch_to`] can fail at name
@@ -1963,14 +2052,19 @@ impl<W: io::Write> io::Write for CancellableWriter<'_, W> {
     }
 }
 
-/// Holds a downloaded tarball to the SHA-512 the signed document recorded.
+/// Holds a cached tarball to the SHA-512 the signed document recorded, and
+/// returns the descriptor the digest was taken through.
+///
+/// The descriptor is the result, rather than a yes, because what is verified
+/// is the file it reads: the extractor reads it again from the start, and a
+/// path opened a second time names whatever the cache holds by then.
 ///
 /// A tarball that does not match is removed rather than left in the cache. It
 /// is not the archive's file whatever it is, and leaving it would make every
 /// later run of the same build fail identically out of its own cache, which
 /// reads as a permanent failure rather than as a mirror that served the wrong
 /// bytes once.
-fn verify(tarball: &Path, expected: &str) -> Result<(), GentooError> {
+fn verify(tarball: &Path, expected: &str) -> Result<std::fs::File, GentooError> {
     let mut file = std::fs::File::open(tarball).map_err(GentooError::at("opening", tarball))?;
     let (actual, _) = digest::stream(Algorithm::Sha512, &mut file)
         .map_err(GentooError::at("digesting", tarball))?;
@@ -1982,7 +2076,7 @@ fn verify(tarball: &Path, expected: &str) -> Result<(), GentooError> {
             actual,
         });
     }
-    Ok(())
+    Ok(file)
 }
 
 /// Something the Gentoo provisioner is doing, reported to a [`GentooObserver`]
@@ -2020,7 +2114,9 @@ pub enum GentooEvent<'a> {
     /// Reported for a fresh download and a cache hit alike, both going through
     /// the same check: a file in the cache is bytes on a disk this crate does
     /// not own, so it is verified on the read rather than trusted for having
-    /// been verified once.
+    /// been verified once. A cache hit that does not verify is downloaded
+    /// again, so this is followed by a [`Fetching`](Self::Fetching) and a
+    /// second `Verifying`.
     #[non_exhaustive]
     Verifying {
         /// The tarball, in the cache.
@@ -2094,12 +2190,18 @@ pub enum GentooEvent<'a> {
         version: &'a str,
     },
     /// A blocker matched something the root has or the resolution chose.
+    ///
+    /// The blocker is one a chosen build states, or one a package the root
+    /// already has states against a chosen build. Portage refuses either.
     #[non_exhaustive]
     Conflict {
         /// The blocker atom, as it was written.
         atom: &'a str,
-        /// The package that states it.
+        /// The package that states it, as `category/name-version`.
         stated_by: &'a str,
+        /// Whether the package that states it is already in the root, rather
+        /// than a build this same resolution chose.
+        stated_in_root: bool,
         /// What it matched, as `category/name-version`.
         blocks: &'a str,
         /// Whether what it matched is already in the root, rather than
@@ -2574,11 +2676,21 @@ impl GentooBuilder {
         self
     }
 
-    /// Where the downloaded tarball is kept across runs.
+    /// Where downloads are kept across runs: the stage3 tarball, and the binary
+    /// packages an install merges.
     ///
     /// A directory the caller owns and that survives the run. Without one the
-    /// tarball is downloaded beside the tree being built and removed with it,
+    /// downloads land beside the tree being built and are removed with it,
     /// which costs a re-download on the next provision of the same build.
+    ///
+    /// The tarball is held under its file name, which names the variant and
+    /// the build. A binary package is held under the path the archive publishes
+    /// it at, such as
+    /// `releases/amd64/binpackages/23.0/x86-64/dev-vcs/git/git-2.54.0-5.gpkg.tar`,
+    /// which names the architecture and the binhost as well. So one directory
+    /// serves several architectures and binhosts without one serving another's
+    /// build. Every entry is verified each time it is read, and one that does
+    /// not verify is downloaded again.
     pub fn cache_dir(mut self, dir: impl AsRef<std::path::Path>) -> GentooBuilder {
         self.cache_dir = Some(dir.as_ref().to_path_buf());
         self
@@ -2809,8 +2921,12 @@ mod tests {
 
     /// A one-file tar archive, as the layer will extract it.
     fn tarball_bytes() -> Vec<u8> {
+        tarball_marking(b"a provisioned root\n")
+    }
+
+    /// A one-file tar archive whose `etc/marker` holds `body`.
+    fn tarball_marking(body: &[u8]) -> Vec<u8> {
         use crate::provision::tar;
-        let body = b"a provisioned root\n";
         let mut out = Vec::new();
         for (name, mode, size, typeflag) in [
             ("etc/", 0o755, 0u64, b'5'),
@@ -3414,6 +3530,56 @@ mod tests {
     }
 
     #[test]
+    fn an_index_past_the_ceiling_is_refused_rather_than_cut_at_it() {
+        // Cut at the ceiling, an index parses perfectly as a smaller archive,
+        // and this one states no count of its own to notice with: the count is
+        // optional, and the mirror's to write. Both forms are held to it, the
+        // compressed one after it inflates.
+        let body = index_body().replace("PACKAGES: 1\n", "");
+        let ceiling = body.len() as u64;
+        for served in [body.as_bytes().to_vec(), gzipped(&body)] {
+            let fetched = |body: Vec<u8>| Fetched {
+                url: binhost_url("Packages"),
+                body,
+            };
+            let read = read_index_body(&fetched(served.clone()), ceiling)
+                .expect("an index of exactly the ceiling reads");
+            assert_eq!(read.records().len(), 2);
+            let err = read_index_body(&fetched(served), ceiling - 1)
+                .expect_err("an index past the ceiling is refused");
+            assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
+            assert!(err.to_string().contains("exceeded"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_index_in_a_compression_the_archive_never_publishes_is_refused_unread() {
+        // gzip and plain text are what the archive serves this document as. A
+        // body in another format is refused on its magic, before its decoder
+        // runs, so the decoders the index never needs are never handed one a
+        // mirror composed.
+        let xz = [&[0xFD, b'7', b'z', b'X', b'Z', 0x00][..], b"not a stream"].concat();
+        let zstd = [&[0x28, 0xB5, 0x2F, 0xFD][..], b"not a frame"].concat();
+        let skippable = [&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0][..], b"x"].concat();
+        for (body, codec) in [(xz, "xz"), (zstd, "zstd"), (skippable, "zstd")] {
+            let err = read_index_body(
+                &Fetched {
+                    url: binhost_url("Packages.gz"),
+                    body,
+                },
+                MAX_INDEX_BYTES,
+            )
+            .expect_err("the compression is refused");
+            assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
+            assert!(
+                err.to_string()
+                    .contains(&format!("is compressed with {codec}")),
+                "{err}",
+            );
+        }
+    }
+
+    #[test]
     fn an_index_naming_nothing_this_layer_can_act_on_is_refused() {
         // A preamble and nothing else is a document that arrived and is not an
         // index. It is refused as one rather than reported as an empty archive,
@@ -3717,11 +3883,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_tarball_is_verified_on_the_read_rather_than_trusted() {
+    fn a_cached_tarball_that_does_not_verify_is_downloaded_again() {
         // A cache is bytes on a disk this crate does not own, so a file already
         // sitting at the cache path goes through the same check a fresh download
-        // does. Here the transport would serve the real archive, and the planted
-        // file is what is refused.
+        // does. One that fails it is not the archive's file, so the run fetches
+        // the archive's own rather than failing over a stale entry.
         let scratch = Scratch::for_test("gentoo", "cache-hit");
         let (_key, mut gentoo) = current();
         let cache = scratch.join("cache");
@@ -3730,17 +3896,226 @@ mod tests {
         std::fs::write(&planted, b"planted in the cache by something else").unwrap();
         gentoo.cache_dir = Some(cache);
 
-        let err = crate::provision::ensure(scratch.join("root"), &mut gentoo)
-            .expect_err("the planted file does not verify");
-        assert!(
-            err.to_string().contains("does not have the digest"),
-            "{err}"
+        let mut seen: Vec<&str> = Vec::new();
+        crate::provision::Provision::new(scratch.join("root"))
+            .observe(&mut |event: ProvisionEvent<'_>| {
+                if let ProvisionEvent::Gentoo(event) = event {
+                    seen.push(match event {
+                        GentooEvent::Fetching { .. } => "fetching",
+                        GentooEvent::Resolved { .. } => "resolved",
+                        GentooEvent::Verifying { .. } => "verifying",
+                        GentooEvent::Extracting { .. } => "extracting",
+                        _ => "other",
+                    });
+                }
+            })
+            .run(&mut gentoo)
+            .expect("the planted file is replaced from the archive");
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("root/etc/marker")).expect("the root holds it"),
+            "a provisioned root\n",
         );
-        assert!(!planted.exists(), "the refused entry is cleared");
+        assert_eq!(
+            std::fs::read(&planted).expect("the cache holds the archive's file"),
+            tarball_bytes(),
+        );
+        // The pointer and the digest document, the planted entry refused, the
+        // tarball fetched, and the fetched one verified before it is extracted.
+        assert_eq!(
+            seen,
+            [
+                "fetching",
+                "fetching",
+                "resolved",
+                "verifying",
+                "fetching",
+                "verifying",
+                "extracting"
+            ],
+        );
+    }
 
-        // With it cleared, the same provisioner downloads and succeeds.
-        crate::provision::ensure(scratch.join("root"), &mut gentoo)
-            .expect("the second run downloads the real archive");
-        assert!(scratch.join("root/etc/marker").is_file());
+    #[test]
+    fn the_tarball_extracted_is_the_one_whose_digest_was_taken() {
+        // Two runs may share a cache, and a run publishes its download by
+        // renaming it over the name. Here that rename lands between the digest
+        // pass and the extraction, carrying bytes nothing verified; the
+        // extraction reads the descriptor the digest pass read, so the root
+        // holds the archive the signed document named.
+        let scratch = Scratch::for_test("gentoo", "verified-descriptor");
+        let (_key, mut gentoo) = current();
+        let cache = scratch.join("cache");
+        gentoo.cache_dir = Some(cache.clone());
+        let tarball = cache.join(format!("stage3-amd64-openrc-{BUILD}.tar.xz"));
+        let substitute = scratch.join("substitute.tar");
+        std::fs::write(&substitute, tarball_marking(b"bytes nothing verified\n")).unwrap();
+
+        crate::provision::Provision::new(scratch.join("root"))
+            .observe(&mut |event: ProvisionEvent<'_>| {
+                if let ProvisionEvent::Gentoo(GentooEvent::Extracting { .. }) = event {
+                    std::fs::rename(&substitute, &tarball).expect("the other run publishes");
+                }
+            })
+            .run(&mut gentoo)
+            .expect("the root is provisioned");
+        assert!(!substitute.exists(), "the substitution happened");
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("root/etc/marker")).expect("the root holds it"),
+            "a provisioned root\n",
+        );
+    }
+
+    /// The architecture's binhost directory a fixture plan for `binhost` reads.
+    fn package_url(binhost: &str) -> String {
+        format!(
+            "{DEFAULT_MIRROR}/{}/sys-libs/zlib/zlib-1.3.2-1.gpkg.tar",
+            index::directory(ARCH, binhost),
+        )
+    }
+
+    /// A plan installing the fixture container from `binhost`.
+    fn plan_from(binhost: &str) -> Plan {
+        Plan::parse_document(&format!(
+            "Format: ferroday-cage-gentoo-plan 1\nArchitecture: {ARCH}\nBinhost: {binhost}\n\n\
+             Package: sys-libs/zlib\nVersion: 1.3.2\nBuild-Id: 1\n\
+             Path: sys-libs/zlib/zlib-1.3.2-1.gpkg.tar\nSize: 1048576\n\
+             MD5: 3a61f698748c7323c87081584f383b3c\n",
+        ))
+        .expect("a fixture plan")
+    }
+
+    /// The bytes of the fixture container `built`, signed by `key`.
+    fn container(key: &SignedSecretKey, built: gpkg::fixture::Built) -> Vec<u8> {
+        let scratch = Scratch::for_test("gentoo", "container");
+        let path = scratch.join("package.gpkg.tar");
+        built.write(&path, key);
+        std::fs::read(&path).expect("the container is written")
+    }
+
+    /// A provisioner trusting `key` that installs the fixture plan for
+    /// `binhost` into a root, from an archive serving `served` there.
+    fn installing(key: &SignedSecretKey, binhost: &str, served: Vec<u8>, cache: &Path) -> Gentoo {
+        let archive = Canned::new(HashMap::from([(package_url(binhost), served)]));
+        let mut gentoo = provisioner(key, Box::new(archive));
+        gentoo.plan = Some(plan_from(binhost));
+        gentoo.cache_dir = Some(cache.to_path_buf());
+        gentoo
+    }
+
+    /// A fresh, empty root under `scratch`.
+    fn empty_root(scratch: &Scratch, name: &str) -> PathBuf {
+        let root = scratch.join(name);
+        std::fs::create_dir_all(&root).expect("the root is created");
+        root
+    }
+
+    #[test]
+    fn two_binhosts_sharing_a_cache_never_serve_each_others_builds() {
+        // Both binhosts publish `sys-libs/zlib-1.3.2` build 1 under one
+        // relative path, and both containers pass every check under either
+        // name: one key signs every Manifest, and the identity inside says
+        // nothing about the binhost. The second build here ships a named pipe
+        // the first does not, which is what tells the two apart in a root.
+        let scratch = Scratch::for_test("gentoo", "binhost-cache");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let cache = scratch.join("cache");
+        let ordinary = container(&key, gpkg::fixture::Built::ordinary());
+        let other = container(
+            &key,
+            gpkg::fixture::Built {
+                fifo: true,
+                ..gpkg::fixture::Built::ordinary()
+            },
+        );
+
+        let first = empty_root(&scratch, "x86-64");
+        installing(&key, "x86-64", ordinary, &cache)
+            .install_wave(&first, None, &mut Silent)
+            .expect("the first binhost's build installs");
+        let second = empty_root(&scratch, "x86-64-v3");
+        installing(&key, "x86-64-v3", other, &cache)
+            .install_wave(&second, None, &mut Silent)
+            .expect("the second binhost's build installs");
+
+        assert!(!first.join("usr/lib/zlib.pipe").exists());
+        assert!(
+            second.join("usr/lib/zlib.pipe").exists(),
+            "the second root holds its own binhost's build",
+        );
+        for binhost in ["x86-64", "x86-64-v3"] {
+            assert!(
+                cache
+                    .join(index::directory(ARCH, binhost))
+                    .join("sys-libs/zlib/zlib-1.3.2-1.gpkg.tar")
+                    .is_file(),
+                "the cache holds {binhost}'s build under its own directory",
+            );
+        }
+    }
+
+    #[test]
+    fn a_cached_package_that_does_not_verify_is_downloaded_again() {
+        // The walk asks whether a cache entry verifies, not whether it exists:
+        // an entry that does not is a download waiting to happen, and the run
+        // that meets it fetches the archive's own and installs that.
+        let scratch = Scratch::for_test("gentoo", "package-cache-hit");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let cache = scratch.join("cache");
+        let mut gentoo = installing(
+            &key,
+            BINHOST,
+            container(&key, gpkg::fixture::Built::ordinary()),
+            &cache,
+        );
+        let plan = plan_from(BINHOST);
+        let entry = cache_entry(&cache, &index::directory(ARCH, BINHOST), &plan.packages[0]);
+        std::fs::create_dir_all(entry.parent().expect("a parent")).unwrap();
+        std::fs::write(&entry, b"a container cut short").unwrap();
+
+        let root = empty_root(&scratch, "root");
+        gentoo
+            .install_wave(&root, None, &mut Silent)
+            .expect("the planted entry is replaced from the archive");
+        assert!(root.join("usr/lib/libz.so.1.3.2").is_file());
+        assert!(
+            root.join("var/db/pkg/sys-libs/zlib-1.3.2/CONTENTS")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_merge_counter_with_no_ordinals_left_is_refused_before_anything_merges() {
+        // The counter is read out of a root this crate does not own. At its
+        // largest value there is no next ordinal to stamp, and the wave refuses
+        // whole rather than merging some packages and wrapping on the next.
+        let scratch = Scratch::for_test("gentoo", "counter-exhausted");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let built = container(&key, gpkg::fixture::Built::ordinary());
+        let counter_at = |root: &Path, value: u64| {
+            std::fs::create_dir_all(root.join("var/cache/edb")).unwrap();
+            std::fs::write(root.join("var/cache/edb/counter"), value.to_string()).unwrap();
+        };
+
+        let full = empty_root(&scratch, "full");
+        counter_at(&full, u64::MAX);
+        let err = installing(&key, BINHOST, built.clone(), &scratch.join("cache"))
+            .install_wave(&full, None, &mut Silent)
+            .expect_err("no ordinal is left");
+        assert!(err.to_string().contains("merge counter"), "{err}");
+        assert!(
+            !full.join("usr/lib/libz.so.1.3.2").exists(),
+            "nothing merged"
+        );
+
+        // One ordinal left is one merge, stamped with the last value there is.
+        let last = empty_root(&scratch, "last");
+        counter_at(&last, u64::MAX - 1);
+        installing(&key, BINHOST, built, &scratch.join("cache"))
+            .install_wave(&last, None, &mut Silent)
+            .expect("one ordinal is left");
+        assert_eq!(
+            std::fs::read_to_string(last.join("var/db/pkg/sys-libs/zlib-1.3.2/COUNTER")).unwrap(),
+            u64::MAX.to_string(),
+        );
     }
 }

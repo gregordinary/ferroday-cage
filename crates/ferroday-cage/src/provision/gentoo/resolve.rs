@@ -13,6 +13,9 @@
 //! 5. An `|| ( ... )` group with a satisfied alternative is done; otherwise its
 //!    first alternative with a viable candidate is taken.
 //! 6. A blocker is checked against the finished set, and a match is a conflict.
+//!    That is a blocker a chosen build states against the root or the
+//!    resolution, and one a package the root already has states against the
+//!    resolution.
 //! 7. An atom nothing answers is unsatisfiable, and the refusal says which of
 //!    the name, the version, the slot or a USE flag was the wall.
 //!
@@ -82,9 +85,9 @@ impl Preference {
             Some(flag) => (false, flag),
             None => (true, text),
         };
-        // The atom grammar's own byte class, not a second one: a preference
-        // naming a flag an atom could not name would silently never be met.
-        if flag.is_empty() || !flag.bytes().all(atom::is_flag_byte) {
+        // The atom grammar's own rule, not a second one: a preference naming a
+        // flag an atom could not name would silently never be met.
+        if !atom::is_flag(flag) {
             return Err(format!("{text:?} does not name a USE flag"));
         }
         Ok(Preference {
@@ -125,8 +128,11 @@ pub(super) struct Unsatisfied {
 pub(super) struct Conflict {
     /// The blocker atom, as it was written.
     pub atom: String,
-    /// The package that states it.
+    /// The package that states it, as `category/name-version`.
     pub stated_by: String,
+    /// Whether the package stating it is already in the root, rather than a
+    /// build this resolution chose.
+    pub stated_in_root: bool,
     /// What it matched, as `category/name-version`.
     pub blocks: String,
     /// Whether what it matched is already in the root or would be installed.
@@ -190,8 +196,13 @@ impl Refusals {
         }
         for conflict in &self.conflicts {
             parts.push(format!(
-                "{} blocks {} with {}, and {} would {}",
+                "{}{} blocks {} with {}, and {} would {}",
                 conflict.stated_by,
+                if conflict.stated_in_root {
+                    ", which the root has,"
+                } else {
+                    ""
+                },
                 conflict.blocks,
                 conflict.atom,
                 conflict.blocks,
@@ -356,6 +367,7 @@ pub(super) fn resolve(
                 refusals.conflicts.push(Conflict {
                     atom: blocker.to_string(),
                     stated_by: stated_by.clone(),
+                    stated_in_root: false,
                     blocks: format!("{}-{}", package.name(), package.version()),
                     installed: true,
                 });
@@ -366,9 +378,30 @@ pub(super) fn resolve(
                 refusals.conflicts.push(Conflict {
                     atom: blocker.to_string(),
                     stated_by: stated_by.clone(),
+                    stated_in_root: false,
                     blocks: record.cpv(),
                     installed: false,
                 });
+            }
+        }
+    }
+    // The root states blockers too, and a build this resolution chose is as
+    // blocked by one as by its own: portage will not merge a package an
+    // installed one refuses to share the root with. Held to the chosen builds
+    // only, since what the root's own packages say of each other is the state
+    // it arrived in rather than something this resolution did.
+    for package in installed.packages() {
+        for blocker in package.blockers() {
+            for record in chosen.iter().filter(|record| record.name == blocker.name()) {
+                if blocker.matches(record) {
+                    refusals.conflicts.push(Conflict {
+                        atom: blocker.to_string(),
+                        stated_by: format!("{}-{}", package.name(), package.version()),
+                        stated_in_root: true,
+                        blocks: record.cpv(),
+                        installed: false,
+                    });
+                }
             }
         }
     }
@@ -871,6 +904,42 @@ USE: amd64
         );
         // With nothing to block, the same request resolves.
         assert!(run(&root(&[]), &["www-client/firefox"], &[]).1.is_empty());
+    }
+
+    #[test]
+    fn a_blocker_the_root_states_against_a_chosen_build_is_a_conflict() {
+        // The other direction: a package already in the root refuses what the
+        // resolution would install beside it. Portage refuses the merge, so a
+        // resolution that held only its own choices' blockers would install
+        // what the root forbids.
+        let installed = root(&["sys-apps/openrc-0.62"])
+            .blocking("sys-apps/openrc", &["!app-editors/vim", "!<dev-vcs/git-2"]);
+        let (_, refusals) = run(&installed, &["app-editors/vim"], &[]);
+        assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
+        let conflict = &refusals.conflicts[0];
+        assert_eq!(conflict.atom, "!app-editors/vim");
+        assert_eq!(conflict.stated_by, "sys-apps/openrc-0.62");
+        assert!(conflict.stated_in_root, "the root states it");
+        assert_eq!(conflict.blocks, "app-editors/vim-9.1");
+        assert!(!conflict.installed, "what it blocks would be installed");
+        assert!(
+            refusals
+                .describe()
+                .contains("sys-apps/openrc-0.62, which the root has, blocks app-editors/vim-9.1"),
+            "{}",
+            refusals.describe(),
+        );
+
+        // A blocker the chosen build does not match is no conflict: git 2.54 is
+        // not below 2.
+        let (resolved, refusals) = run(&installed, &["dev-vcs/git"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert!(
+            resolved
+                .packages
+                .iter()
+                .any(|record| record.name == "dev-vcs/git")
+        );
     }
 
     #[test]

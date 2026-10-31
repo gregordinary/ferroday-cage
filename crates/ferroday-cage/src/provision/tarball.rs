@@ -30,6 +30,10 @@ const MAX_TRAILING_BYTES: u64 = 1 << 20;
 enum Source {
     /// A file on the host, opened afresh for each provisioning run.
     Path(PathBuf),
+    /// A file already open, taken by the first run that uses it, with the path
+    /// it was opened at to name it in a failure.
+    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+    File(Option<File>, PathBuf),
     /// A caller-supplied stream, taken by the first run that uses it.
     Reader(Option<Box<dyn Read + Send>>),
 }
@@ -154,6 +158,23 @@ impl Tarball {
             source: Source::Reader(Some(Box::new(reader))),
         }
     }
+
+    /// A provisioner for the archive `file` holds, read from its start.
+    ///
+    /// For a caller that has checked the file it holds, by digesting it, and
+    /// must extract that same file rather than whatever `path` names by the
+    /// time an extraction would open it. The descriptor is rewound before the
+    /// first read, so the check may leave it anywhere. `path` names the archive
+    /// in a failure and is never opened.
+    ///
+    /// Byte progress carries the file's length as its total, as a path source's
+    /// does. The file is consumed by the first run, as a reader is.
+    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+    pub(crate) fn from_file(file: File, path: impl Into<PathBuf>) -> Self {
+        Tarball {
+            source: Source::File(Some(file), path.into()),
+        }
+    }
 }
 
 impl fmt::Debug for Tarball {
@@ -161,6 +182,7 @@ impl fmt::Debug for Tarball {
         let mut debug = f.debug_struct("Tarball");
         match &self.source {
             Source::Path(path) => debug.field("path", path),
+            Source::File(file, path) => debug.field("file", path).field("open", &file.is_some()),
             Source::Reader(reader) => debug.field("reader", &reader.is_some()),
         }
         .finish()
@@ -172,7 +194,7 @@ impl Provisioner for Tarball {
         // The name a failure is reported against: the archive's path, or a
         // stand-in for a stream that has none.
         let subject: PathBuf = match &self.source {
-            Source::Path(path) => path.clone(),
+            Source::Path(path) | Source::File(_, path) => path.clone(),
             Source::Reader(_) => PathBuf::from("<reader>"),
         };
 
@@ -180,6 +202,18 @@ impl Provisioner for Tarball {
             Source::Path(path) => {
                 let file =
                     File::open(&*path).map_err(|err| ProvisionError::io("opening", &*path, err))?;
+                let total = file.metadata().ok().map(|meta| meta.len());
+                (Box::new(file), total)
+            }
+            Source::File(file, path) => {
+                let mut file = file.take().ok_or_else(|| {
+                    ProvisionError::other(
+                        "this Tarball's file was consumed by an earlier provisioning run; an \
+                         open file can be extracted only once",
+                    )
+                })?;
+                std::io::Seek::rewind(&mut file)
+                    .map_err(|err| ProvisionError::io("rewinding", &*path, err))?;
                 let total = file.metadata().ok().map(|meta| meta.len());
                 (Box::new(file), total)
             }

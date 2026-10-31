@@ -54,11 +54,11 @@ enum Operator {
     AtMost,
     /// `=`: exactly it.
     Equal,
-    /// `=...*`: a version whose text begins with the atom's.
+    /// `=...*`: a version whose text begins with the atom's, at a boundary
+    /// between two of its parts.
     ///
-    /// A text prefix rather than a version-algebra comparison, which is what
-    /// the format defines it as: `=dev-lang/python-3.12*` admits `3.12.1` and
-    /// `3.121` alike, and portage reads it the same way.
+    /// `=dev-lang/python-3.1*` admits `3.1` and `3.1.4` and refuses `3.12`.
+    /// [`version::has_prefix`] states the boundary, which is portage's.
     EqualPrefix,
     /// `~`: the atom's version at any revision.
     AnyRevision,
@@ -210,7 +210,7 @@ impl Atom {
             return true;
         };
         if operator == Operator::EqualPrefix {
-            return candidate.starts_with(wanted);
+            return version::has_prefix(candidate, wanted);
         }
         if operator == Operator::AnyRevision {
             return version::same_but_revision(candidate, wanted);
@@ -378,6 +378,17 @@ pub(super) fn parse(text: &str) -> Result<Atom, String> {
         rest = &rest[..open];
     }
 
+    // `::repo` names the repository a package must come from. It is portage's
+    // own extension rather than part of the grammar the package manager
+    // specification defines, and a binhost index carries none, so it is refused
+    // for what it is rather than read as a slot named `:repo`.
+    if rest.contains("::") {
+        return refuse(
+            "names a repository with `::`, which is not part of the atom grammar the package \
+             manager specification defines",
+        );
+    }
+
     let slot = match rest.split_once(':') {
         Some((before, spec)) => {
             rest = before;
@@ -453,7 +464,7 @@ fn parse_use_dep(entry: &str) -> Result<UseDep, String> {
         }
         None => true,
     };
-    if rest.is_empty() || !rest.bytes().all(is_flag_byte) {
+    if !is_flag(rest) {
         return Err(format!("{entry:?} does not name a USE flag"));
     }
     Ok(UseDep {
@@ -475,20 +486,18 @@ fn parse_slot(spec: &str) -> Result<SlotDep, String> {
         Some((slot, subslot)) => (slot, Some(subslot)),
         None => (spec, None),
     };
-    if slot.is_empty() || !slot.bytes().all(is_slot_byte) {
+    if !is_name(slot) {
         return Err(format!("{spec:?} does not name a slot"));
     }
     match subslot {
-        Some(subslot) if subslot.is_empty() || !subslot.bytes().all(is_slot_byte) => {
-            Err(format!("{spec:?} does not name a sub-slot"))
-        }
+        Some(subslot) if !is_name(subslot) => Err(format!("{spec:?} does not name a sub-slot")),
         Some(subslot) => Ok(SlotDep::SubSlot(slot.to_string(), subslot.to_string())),
         None => Ok(SlotDep::Slot(slot.to_string())),
     }
 }
 
-/// Whether `text` is `category/name` with both parts spelled from the bytes the
-/// format allows.
+/// Whether `text` is `category/name` with both parts spelled as the package
+/// manager specification allows.
 ///
 /// The check is what stands between an index record and a URL: the package name
 /// becomes two path segments of a fetch, and a name carrying a separator or a
@@ -497,46 +506,58 @@ pub(super) fn is_package(text: &str) -> bool {
     let Some((category, name)) = text.split_once('/') else {
         return false;
     };
-    is_name(category) && is_name(name)
+    is_name(category) && is_package_name(name)
 }
 
-/// Whether `text` is one category or package name.
+/// Whether `text` is a category name or a slot name.
 ///
-/// The format allows letters, digits, `+`, `_`, `-` and `.`, and requires the
-/// first character to be a letter, a digit or `_` — which is what keeps a name
-/// from being `.`, `..`, or a hidden entry.
+/// The specification gives the two one rule: letters, digits, `+`, `_`, `.` and
+/// `-`, with no name beginning with `-`, `.` or `+`. The first-character rule is
+/// what keeps a category from being `.`, `..`, or a hidden entry.
+fn is_name(text: &str) -> bool {
+    let Some(first) = text.bytes().next() else {
+        return false;
+    };
+    !matches!(first, b'-' | b'.' | b'+')
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'.' | b'-'))
+}
+
+/// Whether `text` is a package name.
+///
+/// The specification's rule for one is [`is_name`]'s without the dot.
 ///
 /// It also forbids a name that ends in a hyphen followed by something that
 /// parses as a version, which is the rule that makes a `CPV` split
-/// unambiguously and is why [`version::split_cpv`] can scan from the left. The
-/// rule earns its place here rather than only there: without it a versionless
-/// atom spelled `dev-vcs/git-2.54.0` would be read as naming a package called
-/// `git-2.54.0`, and the resolver would report an archive that does not publish
-/// it instead of an atom that is not one.
-fn is_name(text: &str) -> bool {
-    let mut bytes = text.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphanumeric() || first == b'_') {
-        return false;
-    }
-    if !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-' | b'.'))
-    {
-        return false;
-    }
-    !text
-        .match_indices('-')
-        .any(|(at, _)| version::parse(&text[at + 1..]).is_some())
+/// unambiguously and is what [`version::split_cpv`] rests on. The rule earns its
+/// place here rather than only there: without it a versionless atom spelled
+/// `dev-vcs/git-2.54.0` would be read as naming a package called `git-2.54.0`,
+/// and the resolver would report an archive that does not publish it instead of
+/// an atom that is not one.
+fn is_package_name(text: &str) -> bool {
+    is_name(text) && !text.contains('.') && version::version_hyphen(text).is_none()
 }
 
-/// Whether `byte` may appear in a USE flag's name.
+/// Whether `text` is a USE flag's name.
+///
+/// The specification allows letters, digits, `+`, `_`, `@` and `-`, and
+/// requires the first character to be a letter or a digit.
 ///
 /// Reachable from the rest of the layer because a flag's name is spelled in more
 /// than one place -- an atom's USE dependency and a caller's build preference —
 /// and the two must admit the same names: a preference naming a flag an atom
 /// could not name would silently never be met.
-pub(super) fn is_flag_byte(byte: u8) -> bool {
+pub(super) fn is_flag(text: &str) -> bool {
+    text.bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && text.bytes().all(is_flag_byte)
+}
+
+/// Whether `byte` may appear in a USE flag's name, at any position but the
+/// first. [`is_flag`] is the whole rule.
+fn is_flag_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-' | b'@')
 }
 
@@ -586,11 +607,6 @@ pub(super) fn use_flag(flags: &str, iuse: &str, flag: &str) -> Option<bool> {
     }
 }
 
-/// Whether `byte` may appear in a slot or sub-slot name.
-fn is_slot_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-' | b'.')
-}
-
 /// One dependency in a class: a plain atom, or an any-of group of them.
 ///
 /// The index publishes no other shape. It is USE-evaluated, so no conditional
@@ -613,12 +629,25 @@ pub(super) enum Dependency {
     AnyOf(Vec<Atom>),
 }
 
+/// How deeply one group may nest inside others in a dependency class.
+///
+/// The index is USE-evaluated, so the conditionals that would nest one group in
+/// another are gone by the time it is written: no `RDEPEND` or `PDEPEND` in the
+/// live index nests deeper than two, an all-of inside an any-of. The bound is
+/// far above that and far below the depth at which [`parse_group`]'s recursion
+/// would exhaust the stack. Nothing
+/// signs the index, and a stack overflow aborts the process rather than
+/// returning a failure: without the bound, forty kilobytes of parentheses in one
+/// stanza are enough to take down whatever embeds this crate.
+const MAX_GROUP_DEPTH: usize = 16;
+
 /// Parses a whole dependency class — an `RDEPEND` or a `PDEPEND` value.
 ///
 /// # Errors
 ///
 /// Returns the reason where a token is not an atom, where an `||` is not
-/// followed by a group, or where the parentheses do not balance.
+/// followed by a group, where the parentheses do not balance, or where groups
+/// nest more than [`MAX_GROUP_DEPTH`] deep.
 pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
     let mut tokens = text.split_ascii_whitespace().peekable();
     let mut out = Vec::new();
@@ -628,7 +657,7 @@ pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
                 if tokens.next() != Some("(") {
                     return Err("an `||` is not followed by a group".to_string());
                 }
-                let alternatives = parse_group(&mut tokens, Grouping::AnyOf)?;
+                let alternatives = parse_group(&mut tokens, Grouping::AnyOf, 1)?;
                 // A group with nothing in it asks for nothing, exactly as the
                 // empty all-of group below does: that arm splices its contents,
                 // and an empty one contributes none. Kept, this would reach the
@@ -644,7 +673,7 @@ pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
             // A bare group with no operator is an all-of group, which means
             // the same as its contents written out, so it is spliced in.
             "(" => {
-                for atom in parse_group(&mut tokens, Grouping::AllOf)? {
+                for atom in parse_group(&mut tokens, Grouping::AllOf, 1)? {
                     out.push(Dependency::One(atom));
                 }
             }
@@ -685,16 +714,23 @@ enum Grouping {
 ///   and that direction manufactures an unsatisfiable atom out of a satisfiable
 ///   one. It is refused.
 ///
-/// No shape here appears in practice: `RDEPEND` and `PDEPEND` were read across
-/// the whole index and carry no nested group at all, because the index is
-/// USE-evaluated and the conditionals that would produce one are gone by the
-/// time it is written. Refusing the one that would be wrong is what turns a
-/// future archive publishing it into a diagnostic instead of a silently
-/// different meaning.
+/// Of these shapes the index publishes one, and rarely: an all-of inside an
+/// any-of, in two of its `RDEPEND`s (`virtual/zlib` offers `sys-libs/zlib`, or
+/// `zlib-ng` and `minizip-ng` together). The index is USE-evaluated, so the
+/// conditionals that would produce the rest are gone by the time it is written.
+/// Refusing the one that would be wrong is what turns a future archive
+/// publishing it into a diagnostic instead of a silently different meaning.
+///
+/// `depth` is how many groups are open, this one included, and a group past
+/// [`MAX_GROUP_DEPTH`] is refused before anything inside it is read.
 fn parse_group<'t>(
     tokens: &mut std::iter::Peekable<impl Iterator<Item = &'t str>>,
     grouping: Grouping,
+    depth: usize,
 ) -> Result<Vec<Atom>, String> {
+    if depth > MAX_GROUP_DEPTH {
+        return Err(format!("its groups nest more than {MAX_GROUP_DEPTH} deep"));
+    }
     let mut atoms = Vec::new();
     loop {
         match tokens.next() {
@@ -703,7 +739,7 @@ fn parse_group<'t>(
             // A bare group nested in either kind is spliced. Inside an all-of
             // that is exact; inside an any-of it is the loosening described
             // above.
-            Some("(") => atoms.extend(parse_group(tokens, grouping)?),
+            Some("(") => atoms.extend(parse_group(tokens, grouping, depth + 1)?),
             Some("||") => {
                 if tokens.next() != Some("(") {
                     return Err("an `||` is not followed by a group".to_string());
@@ -714,7 +750,7 @@ fn parse_group<'t>(
                             .to_string(),
                     );
                 }
-                atoms.extend(parse_group(tokens, Grouping::AnyOf)?);
+                atoms.extend(parse_group(tokens, Grouping::AnyOf, depth + 1)?);
             }
             Some(token) => atoms.push(parse(token)?),
         }
@@ -960,6 +996,111 @@ mod tests {
         // A bare atom with no operator carries no version, so a name that
         // looks like a `CPV` is a name.
         assert_eq!(parse("dev-vcs/git").unwrap().name(), "dev-vcs/git");
+    }
+
+    #[test]
+    fn names_are_held_to_the_rules_the_specification_states_for_each() {
+        // A category may carry a dot and a package name may not; neither may
+        // begin with the characters each forbids, and neither may a slot.
+        for text in [
+            "dev-vcs/gi.t",
+            "dev-vcs/.git",
+            ".dev/git",
+            "+dev/git",
+            "-dev/git",
+            "dev-vcs/+git",
+            "dev-vcs/-git",
+            "dev-vcs/git:.0",
+            "dev-vcs/git:-0",
+            "dev-vcs/git:+0",
+            "dev-vcs/git:0/.1",
+            // A flag begins with a letter or a digit.
+            "dev-vcs/git[_curl]",
+            "dev-vcs/git[@curl]",
+            "dev-vcs/git[-+curl]",
+        ] {
+            assert!(parse(text).is_err(), "{text:?} was accepted");
+        }
+        for text in [
+            "dev.extra/git",
+            "dev-vcs/git_2",
+            "dev-vcs/git+",
+            "dev-vcs/git:0.1",
+            "dev-vcs/git[curl_2,-net@x]",
+        ] {
+            parse(text).unwrap_or_else(|reason| panic!("{text:?}: {reason}"));
+        }
+    }
+
+    #[test]
+    fn a_repository_dependency_is_refused_for_what_it_is() {
+        // `::repo` is portage's own extension. Read as a slot dependency, it
+        // would be refused as a slot named `:gentoo`, which names nothing a
+        // caller could act on.
+        for text in ["dev-vcs/git::gentoo", "dev-vcs/git:0::gentoo"] {
+            let reason = parse(text).expect_err("a repository dependency is refused");
+            assert!(reason.contains("names a repository"), "{text}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_glob_matches_at_a_boundary_between_version_parts() {
+        let python = |version: &'static str| Record {
+            name: "dev-lang/python",
+            version,
+            slot: "3.1",
+            use_flags: &[],
+            iuse: &[],
+        };
+        for version in ["3.1", "3.1.4", "3.1_rc1", "3.1-r2", "3.1a"] {
+            assert!(
+                admits("=dev-lang/python-3.1*", &python(version)),
+                "3.1* should admit {version}",
+            );
+        }
+        // The whole reason for the boundary: 3.12 is not a 3.1.
+        for version in ["3.12", "3.10", "3", "3.2", "13.1"] {
+            assert!(
+                !admits("=dev-lang/python-3.1*", &python(version)),
+                "3.1* should refuse {version}",
+            );
+        }
+        // A prefix ending in a letter meets a digit at a boundary too.
+        assert!(admits("=dev-lang/python-3.1_rc*", &python("3.1_rc1")));
+        assert!(admits("=dev-lang/python-3.1_rc*", &python("3.1_rc")));
+        // The first component is compared by value, so its leading zeros are
+        // not part of the prefix on either side.
+        assert!(admits("=dev-lang/python-3*", &python("03.1")));
+        assert!(admits("=dev-lang/python-03*", &python("3.1")));
+        assert!(!admits("=dev-lang/python-3*", &python("30.1")));
+    }
+
+    /// A class holding one atom inside `depth` all-of groups.
+    fn nested(depth: usize) -> String {
+        format!("{}a-b/c{}", "( ".repeat(depth), " )".repeat(depth))
+    }
+
+    #[test]
+    fn groups_nest_as_deep_as_the_bound_and_no_deeper() {
+        let at = parse_class(&nested(MAX_GROUP_DEPTH)).expect("a class at the bound");
+        assert_eq!(at.len(), 1);
+        let past = parse_class(&nested(MAX_GROUP_DEPTH + 1)).expect_err("a class past the bound");
+        assert!(past.contains("nest more than"), "{past}");
+
+        // An any-of group counts the same as an all-of one.
+        let any_of = |depth: usize| format!("{}a-b/c{}", "|| ( ".repeat(depth), " )".repeat(depth));
+        alternatives(&any_of(MAX_GROUP_DEPTH), 1);
+        assert!(parse_class(&any_of(MAX_GROUP_DEPTH + 1)).is_err());
+    }
+
+    #[test]
+    fn a_nest_deep_enough_to_exhaust_the_stack_is_refused_rather_than_followed() {
+        // Far past the depth at which an unbounded recursion overflows the
+        // stack, which aborts the process instead of returning anything. The
+        // bound refuses it before the recursion is more than a few frames deep,
+        // so this is as cheap as a class of ordinary length.
+        let reason = parse_class(&nested(100_000)).expect_err("the nest is refused");
+        assert!(reason.contains("nest more than"), "{reason}");
     }
 
     #[test]

@@ -322,12 +322,12 @@ fn read_record(stanza: &Stanza) -> Option<Record> {
     if !atom::is_package(&name) {
         return None;
     }
-    // The digest every package is verified against, and the `MD5` a plan
-    // document carries. Held to the algorithm's own alphabet here, where the
-    // record is built, because both readers downstream assume it: no digest
-    // check can pass on a value outside it, and `Plan::parse_document` refuses
-    // one — so a plan projected from such a record is a document this crate
-    // emits and will not read back.
+    // The `BINPKGMD5` a merge records and the `MD5` a plan document carries:
+    // bookkeeping rather than a trust decision, as `Record::md5` says. Held to
+    // the algorithm's own alphabet here, where the record is built, because
+    // `Plan::parse_document` refuses a value outside it, so a plan projected
+    // from such a record would be a document this crate emits and will not
+    // read back.
     let md5 = stanza.get("MD5")?;
     if !Algorithm::Md5.is_hex(md5) {
         return None;
@@ -360,7 +360,8 @@ fn read_record(stanza: &Stanza) -> Option<Record> {
 /// and reading it costs nothing to implement because
 /// [`compress::decompress`](super::super::compress::decompress) selects a
 /// decoder by magic rather than by file name. No other compression is
-/// published: `.xz`, `.bz2` and `.zst` are all 404.
+/// published, on any architecture: `.xz`, `.bz2` and `.zst` are all 404. The
+/// reader holds a body to that, refusing any other compression it finds.
 pub(super) const NAMES: [&str; 2] = ["Packages.gz", "Packages"];
 
 /// The mirror-relative directory the binhost for `architecture` and
@@ -675,6 +676,34 @@ SIZE: 1
         assert_eq!(index.records().len(), 1);
         assert_eq!(index.skipped(), 4);
         assert!(index.publishes("sys-libs/zlib"));
+    }
+
+    #[test]
+    fn a_stanza_built_to_exhaust_the_parser_is_left_out_like_any_other() {
+        // Nothing signs the index, so a stanza can be shaped to cost the reader
+        // rather than to describe a package: groups nested past the depth the
+        // stack can follow, and a `CPV` that is a megabyte of hyphens. Each is
+        // a stanza this layer cannot act on, and is counted as one.
+        let nest = 100_000;
+        let body = format!(
+            "TIMESTAMP: 1\n\n\
+             BUILD_ID: 1\nCPV: sys-libs/zlib-1.3.1\n\
+             MD5: d41d8cd98f00b204e9800998ecf8427e\n\
+             PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar\n\
+             RDEPEND: {}dev-libs/a{}\nSIZE: 1\n\n\
+             BUILD_ID: 1\nCPV: a/b{}\n\
+             MD5: d41d8cd98f00b204e9800998ecf8427e\n\
+             PATH: a/b/b-1-1.gpkg.tar\nSIZE: 1\n\n\
+             BUILD_ID: 1\nCPV: sys-libs/zlib-1.3.1\n\
+             MD5: d41d8cd98f00b204e9800998ecf8427e\n\
+             PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar\nSIZE: 1\n",
+            "( ".repeat(nest),
+            " )".repeat(nest),
+            "-".repeat(1 << 20),
+        );
+        let index = Index::parse(&body);
+        assert_eq!(index.records().len(), 1);
+        assert_eq!(index.skipped(), 2);
     }
 
     #[test]

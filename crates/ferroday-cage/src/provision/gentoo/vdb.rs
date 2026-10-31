@@ -63,6 +63,7 @@ use std::path::Path;
 use super::gpkg::{IMAGE_DIR, Package};
 use super::plan::PlannedPackage;
 use super::{DB_DIR, GentooError, MAX_CONTENTS_ENTRIES};
+use crate::path;
 use crate::provision::ProvisionError;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::extract::{Extraction, Placement};
@@ -132,9 +133,10 @@ pub(super) fn merge(
     // extraction leaves the staging tree that `provision::ensure` removes.
     for (name, bytes) in package.metadata_files() {
         // A metadata file is a name from inside a verified container, and it
-        // becomes a leaf of a path. The container's own grammar has already
-        // held it to one component; this is the boundary it crosses.
-        if name.contains('/') || name == "." || name == ".." {
+        // becomes a leaf of a path. The container's reader has already held it
+        // to one ordinary component; this is the boundary it crosses, so the
+        // rule is asked again here.
+        if !path::is_ordinary_component(name.as_bytes()) {
             return Err(GentooError::database(
                 root,
                 format!("the container names a metadata file {name:?}"),

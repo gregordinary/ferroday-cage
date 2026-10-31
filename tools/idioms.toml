@@ -258,11 +258,11 @@ why = "The answer."
 name = "the bytes a USE flag's name may contain"
 pattern = "matches!\\(byte, b'\\+' \\| b'_' \\| b'-' \\| b'@'\\)"
 answer = """\
-`provision::gentoo::atom::is_flag_byte`. A flag is named in two places -- an \
-atom's USE dependency and a caller's build preference -- and the two must admit \
-the same names: a preference naming a flag no atom could name would silently \
-never be met, which is a resolution quietly ignoring what the caller asked \
-for rather than a failure."""
+`provision::gentoo::atom::is_flag`, built on `atom::is_flag_byte`. A flag is \
+named in two places -- an atom's USE dependency and a caller's build \
+preference -- and the two must admit the same names: a preference naming a \
+flag no atom could name would silently never be met, which is a resolution \
+quietly ignoring what the caller asked for rather than a failure."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/gentoo/atom.rs"

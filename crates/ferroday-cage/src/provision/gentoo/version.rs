@@ -329,14 +329,71 @@ pub(super) fn same_but_revision(candidate: &str, wanted: &str) -> bool {
     }
 }
 
+/// Whether `candidate` begins with `prefix` at a boundary between two version
+/// parts, which is what the `=cat/pkg-1.2*` operator asks.
+///
+/// A text prefix, as the format defines the operator, held to the boundary
+/// portage holds it to. What follows the prefix must be nothing, a separator
+/// (`.`, `_` or `-`), or a change from digits to letters or back. So
+/// `=dev-lang/python-3.1*` admits `3.1`, `3.1.4`, `3.1_rc1` and `3.1-r2`, and
+/// refuses `3.12`, which the operator exists to tell apart from `3.1`.
+///
+/// Leading zeros of the first component are dropped from both sides first, as
+/// portage drops them, because the first component is compared by value
+/// everywhere else: `=cat/pkg-1*` admits `01.5`.
+pub(super) fn has_prefix(candidate: &str, prefix: &str) -> bool {
+    let (candidate, prefix) = (
+        without_leading_zeros(candidate),
+        without_leading_zeros(prefix),
+    );
+    let Some(rest) = candidate.strip_prefix(prefix) else {
+        return false;
+    };
+    match rest.bytes().next() {
+        None | Some(b'.' | b'_' | b'-') => true,
+        Some(next) => prefix
+            .bytes()
+            .last()
+            .is_some_and(|last| last.is_ascii_digit() != next.is_ascii_digit()),
+    }
+}
+
+/// `version` with the leading zeros of its first component removed, keeping one
+/// where the component is nothing else.
+fn without_leading_zeros(version: &str) -> &str {
+    let trimmed = version.trim_start_matches('0');
+    if trimmed.len() == version.len() || trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+        trimmed
+    } else {
+        // The first component was all zeros, and it is still a component.
+        &version[version.len() - trimmed.len() - 1..]
+    }
+}
+
+/// Where `text` divides into a name and the version after it: the first hyphen,
+/// with something before it, whose remainder parses whole as a version.
+///
+/// The format forbids a package name that ends in a hyphen followed by
+/// something that parses as a version, so that hyphen is unambiguous. Only the
+/// last two hyphens of `text` can be it. A version holds at most one hyphen of
+/// its own, the one before a `-r` revision, so a remainder holding two cannot
+/// parse. Asking only those two keeps the search linear in the text. Asking
+/// every hyphen costs the square of a line's length instead, and nothing signs
+/// the index whose lines this reads.
+pub(super) fn version_hyphen(text: &str) -> Option<usize> {
+    let last = text.rfind('-')?;
+    let before = text[..last].rfind('-');
+    [before, Some(last)]
+        .into_iter()
+        .flatten()
+        .find(|&at| at > 0 && parse(&text[at + 1..]).is_some())
+}
+
 /// Splits `cpv` into its category, package name and version.
 ///
 /// A `CPV` is `category/name-version`, and the separator between the name and
 /// the version is a hyphen the name may also contain. The split is nonetheless
-/// unambiguous, because the format forbids a package name that ends in a hyphen
-/// followed by something that parses as a version: the first hyphen whose
-/// remainder is a whole version is therefore the one, and this scans from the
-/// left for it.
+/// unambiguous, and [`version_hyphen`] says why and finds it.
 ///
 /// Returns `None` for a value that is not one — no category separator, an empty
 /// part, or no hyphen with a version after it.
@@ -345,16 +402,8 @@ pub(super) fn split_cpv(cpv: &str) -> Option<(&str, &str, &str)> {
     if category.is_empty() || rest.is_empty() || category.contains('/') {
         return None;
     }
-    let mut at = 0;
-    while let Some(offset) = rest[at..].find('-') {
-        let hyphen = at + offset;
-        let (name, version) = (&rest[..hyphen], &rest[hyphen + 1..]);
-        if !name.is_empty() && parse(version).is_some() {
-            return Some((category, name, version));
-        }
-        at = hyphen + 1;
-    }
-    None
+    let hyphen = version_hyphen(rest)?;
+    Some((category, &rest[..hyphen], &rest[hyphen + 1..]))
 }
 
 #[cfg(test)]
@@ -598,6 +647,106 @@ mod tests {
         );
         for text in ["git-2.54.0", "dev-vcs/git", "dev-vcs/", "/git-1.0", ""] {
             assert!(split_cpv(text).is_none(), "{text:?} was accepted");
+        }
+    }
+
+    /// The split as the format states it: the first hyphen, with a name before
+    /// it, whose remainder is a whole version, found by asking every hyphen.
+    fn split_by_asking_every_hyphen(cpv: &str) -> Option<(&str, &str, &str)> {
+        let (category, rest) = cpv.split_once('/')?;
+        if category.is_empty() || rest.is_empty() || category.contains('/') {
+            return None;
+        }
+        rest.match_indices('-')
+            .map(|(at, _)| at)
+            .find(|&at| at > 0 && parse(&rest[at + 1..]).is_some())
+            .map(|at| (category, &rest[..at], &rest[at + 1..]))
+    }
+
+    #[test]
+    fn asking_the_last_two_hyphens_splits_exactly_as_asking_every_one() {
+        // The linear split rests on a property of the grammar -- a version
+        // holds at most one hyphen of its own -- so it is held to the
+        // definition over names shaped to tempt it: hyphens, digits after
+        // them, `r` after them, and every version shape the archive publishes,
+        // with and without a revision.
+        let names = [
+            "git",
+            "util-linux",
+            "a-1",
+            "a-1-b",
+            "_cron-failure",
+            "x-r1",
+            "p-r",
+            "-",
+            "",
+            "a--b",
+            "libressl-3",
+        ];
+        let mut tails: Vec<String> = Vec::new();
+        for version in PUBLISHED {
+            tails.push(version.to_string());
+            tails.push(format!("{version}-r7"));
+        }
+        tails
+            .extend(["", "r1", "-r1", "1-r", "1--r1", "1-r1-r2", "a", "1.0-x"].map(str::to_string));
+        for name in names {
+            for tail in &tails {
+                let cpv = format!("cat/{name}-{tail}");
+                assert_eq!(split_cpv(&cpv), split_by_asking_every_hyphen(&cpv), "{cpv}",);
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_run_of_hyphens_is_split_in_one_pass() {
+        // Asking every hyphen of an unsigned line made of them costs the
+        // square of its length, which at this size is hours. Asked of the last
+        // two, it is the length of the line.
+        let run = "-".repeat(1 << 20);
+        assert!(split_cpv(&format!("a/b{run}")).is_none());
+        // A digit after every hyphen, which a test of the first character after
+        // a hyphen alone would not turn away.
+        let digits = "-1".repeat(1 << 19);
+        assert!(split_cpv(&format!("a/b{digits}-")).is_none());
+        assert_eq!(
+            split_cpv(&format!("a/b{digits}")).map(|(_, _, version)| version),
+            Some("1"),
+            "the last hyphen is the one a whole version follows",
+        );
+    }
+
+    #[test]
+    fn a_prefix_matches_only_at_a_boundary_between_version_parts() {
+        for (candidate, prefix) in [
+            ("3.1", "3.1"),
+            ("3.1.4", "3.1"),
+            ("3.1_rc1", "3.1"),
+            ("3.1-r2", "3.1"),
+            ("3.1a", "3.1"),
+            ("3.1_rc2", "3.1_rc"),
+            ("01.5", "1"),
+            ("1.5", "01"),
+            ("0.5", "0"),
+            ("00.5", "0"),
+        ] {
+            assert!(
+                has_prefix(candidate, prefix),
+                "{prefix}* admits {candidate}"
+            );
+        }
+        for (candidate, prefix) in [
+            ("3.12", "3.1"),
+            ("3.10", "3.1"),
+            ("3", "3.1"),
+            ("10.5", "1"),
+            ("3.1_rcx", "3.1_rc"),
+            ("0.5", "05"),
+        ] {
+            assert!(
+                !has_prefix(candidate, prefix),
+                "{prefix}* refuses {candidate}"
+            );
         }
     }
 }

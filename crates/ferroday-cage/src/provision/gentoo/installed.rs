@@ -28,7 +28,8 @@
 //!
 //! The category and the version are the directory names; `SLOT` and `USE` are
 //! one-line files inside the entry. That is everything an atom is matched
-//! against, so reading an entry is two small reads.
+//! against. `RDEPEND` and `PDEPEND` beside them carry the blockers the package
+//! states, which bind what a resolution may install into the same root.
 //!
 //! # The tree is read as an untrusted one
 //!
@@ -38,11 +39,18 @@
 //! so a symbolic link at `var/db/pkg` is a thing that can be there. Resolved
 //! this way it names something inside the tree or nothing at all.
 
+use std::ffi::CString;
+use std::io;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 
-use super::atom::{self, Candidate};
+use rustix::fs::{OFlags, ResolveFlags};
+use rustix::io::Errno;
+
+use super::atom::{self, Atom, Candidate, Dependency};
 use super::version;
 use super::{DB_DIR, GentooError};
+use crate::provision::containment;
 use crate::provision::rooted::Rooted;
 
 /// The file inside an entry naming its slot.
@@ -63,6 +71,14 @@ const IUSE_EFFECTIVE_FILE: &str = "IUSE_EFFECTIVE";
 /// The file naming what the ebuild itself declared, read where an entry carries
 /// no `IUSE_EFFECTIVE`.
 const IUSE_FILE: &str = "IUSE";
+
+/// The two files holding an entry's runtime dependencies, the classes whose
+/// blockers bind for as long as the package is installed.
+///
+/// The same two the resolver reads of an index record. Portage writes both
+/// USE-evaluated, as the index publishes them, so they are read with the same
+/// grammar.
+const RUNTIME_DEPENDENCY_FILES: [&str; 2] = ["RDEPEND", "PDEPEND"];
 
 /// The prefix portage gives an entry it is part way through merging.
 ///
@@ -94,6 +110,15 @@ pub struct InstalledPackage {
     /// heard of it", and the difference decides whether an atom with no
     /// `(+)`/`(-)` default can be answered at all.
     iuse: String,
+    /// The blockers its runtime dependencies state: what must not be installed
+    /// beside it.
+    ///
+    /// Not exposed, for the reason [`iuse`](Self::iuse) is not: it is what a
+    /// resolution holds its choices to, rather than what a caller asks of an
+    /// installed package. A blocker inside an any-of group is one alternative
+    /// among several and binds nothing on its own, so only the plain ones are
+    /// kept, which is the reading the resolver gives a chosen build's own.
+    blockers: Vec<Atom>,
 }
 
 impl InstalledPackage {
@@ -120,6 +145,11 @@ impl InstalledPackage {
     /// The USE flags the package was built with.
     pub fn use_flags(&self) -> impl Iterator<Item = &str> {
         self.use_flags.split_ascii_whitespace()
+    }
+
+    /// The blockers the package's runtime dependencies state.
+    pub(super) fn blockers(&self) -> &[Atom] {
+        &self.blockers
     }
 }
 
@@ -205,9 +235,26 @@ impl Installed {
                     slot,
                     iuse: use_flags.clone(),
                     use_flags,
+                    blockers: Vec::new(),
                 })
                 .collect(),
         )
+    }
+
+    /// The same set, with the package published under `name` stating
+    /// `blockers` as its runtime dependencies would.
+    #[cfg(test)]
+    pub(super) fn blocking(mut self, name: &str, blockers: &[&str]) -> Installed {
+        let package = self
+            .packages
+            .iter_mut()
+            .find(|package| package.name == name)
+            .expect("the fixture root holds the package");
+        package.blockers = blockers
+            .iter()
+            .map(|text| atom::parse(text).expect("a fixture blocker"))
+            .collect();
+        self
     }
 
     /// Puts the entries in the order the type promises.
@@ -245,10 +292,10 @@ impl Installed {
 ///
 /// Returns [`GentooError::Database`] for a tree whose `/var/db/pkg` holds
 /// something that is not a package entry — a directory that does not name a
-/// `name-version`, or one carrying no `SLOT` — and [`GentooError::Io`] where
-/// the tree could not be read. A root with no `/var/db/pkg` at all reports no
-/// packages rather than failing: an empty answer is a true one about a
-/// directory that is not there.
+/// `name-version`, one carrying no `SLOT`, or one whose runtime dependencies do
+/// not parse — and [`GentooError::Io`] where the tree could not be read. A
+/// root with no `/var/db/pkg` at all reports no packages rather than failing:
+/// an empty answer is a true one about a directory that is not there.
 ///
 /// # Example
 ///
@@ -343,6 +390,24 @@ fn read_entry(
             format!("{dir} names a package but carries no {SLOT_FILE} file"),
         ));
     };
+    // A package with no runtime dependencies may carry neither file, so their
+    // absence is no blockers. One that does not parse is a gap in what the
+    // root forbids, and resolving past it could install what it blocks.
+    let mut blockers = Vec::new();
+    for file in RUNTIME_DEPENDENCY_FILES {
+        let class = field(file)?.unwrap_or_default();
+        let parsed = atom::parse_class(&class).map_err(|reason| {
+            GentooError::database(at, format!("{dir}/{file} cannot be read: {reason}"))
+        })?;
+        blockers.extend(
+            parsed
+                .into_iter()
+                .filter_map(|dependency| match dependency {
+                    Dependency::One(atom) if atom.blocker().is_some() => Some(atom),
+                    _ => None,
+                }),
+        );
+    }
     Ok(InstalledPackage {
         name,
         version: version.to_string(),
@@ -355,6 +420,7 @@ fn read_entry(
             Some(effective) => effective,
             None => field(IUSE_FILE)?.unwrap_or_default(),
         },
+        blockers,
     })
 }
 
@@ -372,8 +438,27 @@ fn read_entry(
 /// replaced the first — but a sub-slot is not a slot, so a package rebuilt
 /// against a new one replaces what the base had rather than joining it. Matched
 /// through [`slot_of`] for that reason.
+///
+/// A base entry the upper hides is not in the merged view at all. A package
+/// removed inside a sandbox rooted on the overlay leaves a whiteout in the
+/// upper where its entry was, and an entry or a category recreated there is
+/// marked opaque; [`Upper::hides`] reads both the way overlayfs does.
 pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooError> {
-    let mut packages = installed(lower)?.packages;
+    let layer = Upper::open(upper).map_err(GentooError::at("opening the overlay upper", upper))?;
+    let mut packages = Vec::new();
+    for below in installed(lower)?.packages {
+        let (category, package) = below
+            .name
+            .split_once('/')
+            .expect("an entry's name is a category and a package");
+        let entry = format!("{DB_DIR}/{category}/{package}-{}", below.version);
+        let hidden = layer
+            .hides(&entry)
+            .map_err(|err| GentooError::io("reading the overlay upper", upper, err))?;
+        if !hidden {
+            packages.push(below);
+        }
+    }
     for above in installed(upper)?.packages {
         packages.retain(|below| {
             !(below.name == above.name && slot_of(&below.slot) == slot_of(&above.slot))
@@ -381,6 +466,85 @@ pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooErro
         packages.push(above);
     }
     Ok(Installed::sorted(packages))
+}
+
+/// The upper layer of an overlay, read for what it hides of the layer beneath.
+///
+/// Read through descriptors with no symbolic link followed, since overlayfs
+/// follows none inside a layer: a link in the upper at a directory's name is a
+/// non-directory there, whatever it points at.
+struct Upper {
+    /// The upper's root. `O_PATH`: it is only ever the anchor of an `openat2`.
+    fd: OwnedFd,
+}
+
+/// The attribute that marks an upper directory opaque, in the `user.`
+/// namespace the overlays this crate mounts read their metadata from.
+const OPAQUE_XATTR: &str = "user.overlay.opaque";
+
+impl Upper {
+    /// Opens the upper at `path`.
+    fn open(path: &Path) -> io::Result<Upper> {
+        let fd = rustix::fs::open(
+            path,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        Ok(Upper { fd })
+    }
+
+    /// Whether the upper hides what the lower holds at `path`, a `/`-separated
+    /// path of ordinary components.
+    ///
+    /// Overlayfs looks a path up one component at a time, the upper first. The
+    /// lower shows through while each component is, in the upper, absent or a
+    /// directory that is not opaque. From the first absent one on, nothing in
+    /// the upper speaks for the rest of the path. A whiteout, the character
+    /// device overlayfs leaves where something of the lower was removed, hides
+    /// it. So does any other non-directory, since only a directory merges with
+    /// what lies beneath it. An opaque directory hides everything beneath it.
+    fn hides(&self, path: &str) -> io::Result<bool> {
+        let mut prefix = String::new();
+        for component in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            let walked = CString::new(prefix.as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let dir = match containment::open_dir(
+                self.fd.as_fd(),
+                &walked,
+                OFlags::RDONLY | OFlags::NOFOLLOW,
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(dir) => dir,
+                Err(Errno::NOENT) => return Ok(false),
+                // The upper holds something at the name that is not a
+                // directory: a whiteout, a file, or a symbolic link.
+                Err(Errno::NOTDIR | Errno::LOOP) => return Ok(true),
+                Err(errno) => return Err(errno.into()),
+            };
+            if is_opaque(&dir)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Whether `dir` carries overlayfs's opaque marker.
+///
+/// The marker is the value `y`. Overlayfs gives the attribute one other value,
+/// `x`, which says a directory holds whiteouts of another form and is not
+/// opaque. A filesystem without `user.` attributes carries no marker at all.
+fn is_opaque(dir: &OwnedFd) -> io::Result<bool> {
+    let mut value = [0u8; 1];
+    match rustix::fs::fgetxattr(dir, OPAQUE_XATTR, &mut value) {
+        Ok(read) => Ok(value[..read] == *b"y"),
+        Err(Errno::NODATA | Errno::NOTSUP | Errno::RANGE) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
 }
 
 /// The slot proper of a `slot` or `slot/subslot` spelling.
@@ -594,6 +758,122 @@ mod tests {
         assert_eq!(util, ["0", "1"]);
         assert!(merged.under("dev-vcs/git").next().is_some());
         assert!(merged.under("app-crypt/pinentry").next().is_some());
+    }
+
+    #[test]
+    fn an_entry_carries_the_blockers_its_runtime_dependencies_state() {
+        // Plain blockers bind; one inside an any-of group is an alternative
+        // and binds nothing on its own; and an atom that requires rather than
+        // refuses is no blocker at all.
+        let dir = Scratch::for_test("gentoo-installed", "blockers");
+        entry(&dir, "sys-apps", "openrc-0.62", Some("0"), "amd64");
+        let at = dir.join(DB_DIR).join("sys-apps/openrc-0.62");
+        std::fs::write(
+            at.join("RDEPEND"),
+            "!sys-apps/sysvinit >=sys-libs/glibc-2.40 || ( !app-misc/a app-misc/b )\n",
+        )
+        .unwrap();
+        std::fs::write(at.join("PDEPEND"), "!!<sys-fs/udev-250\n").unwrap();
+        let read = installed(&*dir).expect("the database is read");
+        let openrc = read.packages().next().expect("openrc is installed");
+        let blockers: Vec<String> = openrc.blockers().iter().map(Atom::to_string).collect();
+        assert_eq!(blockers, ["!sys-apps/sysvinit", "!!<sys-fs/udev-250"]);
+
+        // A class that does not parse is a gap in what the root forbids, and
+        // is refused rather than read as forbidding nothing.
+        std::fs::write(at.join("RDEPEND"), "|| ( sys-apps/a\n").unwrap();
+        let err = installed(&*dir).expect_err("an unreadable class is refused");
+        assert!(matches!(err, GentooError::Database { .. }), "{err:?}");
+        assert!(err.to_string().contains("RDEPEND"), "{err}");
+    }
+
+    /// The names `merged` reports, in its order.
+    fn names(installed: &Installed) -> Vec<&str> {
+        installed.packages().map(InstalledPackage::name).collect()
+    }
+
+    #[test]
+    fn a_base_entry_the_upper_hides_is_not_in_the_merged_view() {
+        // What a package manager inside the sandbox removed, the overlay
+        // records in the upper: a whiteout where an entry was, or a directory
+        // recreated opaque. The merged view holds neither entry, so neither may
+        // count as installed.
+        let lower = stage3("hidden-lower");
+        let upper = Scratch::for_test("gentoo-installed", "hidden-upper");
+        assert_eq!(
+            names(&merged(&lower, &upper).expect("an empty upper hides nothing")),
+            ["app-crypt/pinentry", "sys-apps/util-linux", "sys-libs/zlib"],
+        );
+
+        // Anything but a directory at an entry's name hides it. A whiteout is
+        // the overlay's own shape for that, where the host lets one be made;
+        // a regular file takes the same path through the upper.
+        let zlib = upper.join(DB_DIR).join("sys-libs/zlib-1.3.1-r1");
+        std::fs::create_dir_all(zlib.parent().expect("a category")).unwrap();
+        let whiteout = rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &zlib,
+            rustix::fs::FileType::CharacterDevice,
+            rustix::fs::Mode::empty(),
+            0,
+        );
+        if let Err(errno) = whiteout {
+            eprintln!("a whiteout cannot be made here ({errno}); hiding with a regular file");
+            std::fs::write(&zlib, b"").unwrap();
+        }
+        assert_eq!(
+            names(&merged(&lower, &upper).expect("the merged view is read")),
+            ["app-crypt/pinentry", "sys-apps/util-linux"],
+        );
+
+        // A category the upper holds as an ordinary directory merges with the
+        // base's, so the base's entries in it still show through.
+        std::fs::create_dir_all(upper.join(DB_DIR).join("sys-apps")).unwrap();
+        assert!(
+            names(&merged(&lower, &upper).expect("the merged view is read"))
+                .contains(&"sys-apps/util-linux")
+        );
+
+        // An opaque one does not. The marker lives in a `user.` attribute,
+        // which some filesystems cannot hold.
+        let crypt = upper.join(DB_DIR).join("app-crypt");
+        std::fs::create_dir_all(&crypt).unwrap();
+        let marked =
+            rustix::fs::setxattr(&crypt, OPAQUE_XATTR, b"x", rustix::fs::XattrFlags::empty());
+        if let Err(errno) = marked {
+            eprintln!(
+                "skipping the opaque cases: this filesystem refuses user attributes ({errno})"
+            );
+            return;
+        }
+        // `x` says the directory holds whiteouts of another form, and is not
+        // opaque.
+        assert!(
+            names(&merged(&lower, &upper).expect("the merged view is read"))
+                .contains(&"app-crypt/pinentry")
+        );
+        rustix::fs::setxattr(&crypt, OPAQUE_XATTR, b"y", rustix::fs::XattrFlags::empty())
+            .expect("the marker is set");
+        assert_eq!(
+            names(&merged(&lower, &upper).expect("the merged view is read")),
+            ["sys-apps/util-linux"],
+        );
+    }
+
+    #[test]
+    fn a_symbolic_link_in_the_upper_hides_the_base_directory_at_its_name() {
+        // A layer's link is not followed by overlayfs: at a directory's name it
+        // is a non-directory, and the base's directory beneath it is hidden
+        // whatever the link points at.
+        let lower = stage3("link-lower");
+        let upper = Scratch::for_test("gentoo-installed", "link-upper");
+        std::fs::create_dir_all(upper.join("var")).unwrap();
+        std::os::unix::fs::symlink("/elsewhere", upper.join("var/db")).unwrap();
+        assert!(
+            merged(&lower, &upper)
+                .expect("the merged view is read")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -124,3 +124,13 @@ name = "failure"
 count = 1
 kind = "internal"
 why = "`failure::path_io_error!`, as in the other two layers."
+
+[[layer.reach]]
+name = "path"
+count = 2
+kind = "internal"
+why = """\
+`path::is_ordinary_component`, the one rule for a name that becomes a single \
+path component: a container member's directory and name, a metadata file's \
+name as the container lists it, and the same name again where it becomes a \
+leaf of a package database entry."""

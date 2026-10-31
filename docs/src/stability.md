@@ -38,7 +38,7 @@ format without the others' dependency weight: the Debian layer pulls
 What keeps the decision cheap in the meantime is that the layers already sit on
 a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
 tar, compress, extract, digest, document and OpenPGP machinery -- and reach
-around it in nineteen places, eight of which are internal. `tools/seam.toml`
+around it in twenty-one places, ten of which are internal. `tools/seam.toml`
 records every one with what it would cost, `tools/check-seam.py` fails on any
 difference, and a layer naming another layer is refused outright. A split, when
 it comes, is that list plus the mechanical work.

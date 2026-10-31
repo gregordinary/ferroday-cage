@@ -113,41 +113,73 @@ pub(crate) fn read_fully(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<u
     Ok(filled)
 }
 
+/// A compression [`decompress`] recognizes by its magic, or none.
+///
+/// Named so that a caller reading a document published in only some of these
+/// can refuse the others before any decoder runs. A decoder that never runs
+/// costs nothing, whatever its input would have asked of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Codec {
+    /// gzip, one member or several.
+    Gzip,
+    /// xz, one stream or several.
+    Xz,
+    /// zstd, one frame or several, skippable frames included.
+    Zstd,
+    /// No compression this module recognizes.
+    Plain,
+}
+
+impl Codec {
+    /// The compression `head` begins, as [`decompress`] selects it.
+    ///
+    /// `head` is the bytes [`sniff_head`] read from the front of a stream.
+    pub(crate) fn of(head: &[u8]) -> Codec {
+        if head.starts_with(&[0x1f, 0x8b]) {
+            Codec::Gzip
+        } else if head.starts_with(&XZ_MAGIC) {
+            Codec::Xz
+        } else if is_zstd_start(head) {
+            Codec::Zstd
+        } else {
+            Codec::Plain
+        }
+    }
+}
+
 /// Wraps `rest` in the decoder selected by `head`, reconstructing the full
 /// stream with `head` prepended.
 ///
 /// `head` is the bytes [`sniff_head`] read from the front of the same
 /// stream; `rest` is that stream with those bytes already consumed. gzip,
-/// xz, and zstd are detected by magic; anything else is treated as a plain
-/// tar stream and the caller's tar reader decides whether it truly is one.
+/// xz, and zstd are detected by magic ([`Codec::of`]); anything else is
+/// treated as a plain tar stream and the caller's tar reader decides whether
+/// it truly is one.
 pub(crate) fn decompress<'r, R: Read + 'r>(
     head: &[u8],
     rest: R,
 ) -> Result<Box<dyn Read + 'r>, ProvisionError> {
     let stream = io::Cursor::new(head.to_vec()).chain(rest);
-    Ok(if head.starts_with(&[0x1f, 0x8b]) {
+    Ok(match Codec::of(head) {
         // Several concatenated gzip members are one legal gzip file, and a
         // single-member decoder stops silently at the first member's end. A tar
         // reader tolerates a missing terminator at end of input, so a truncated
         // read there provisions an incomplete rootfs without an error.
-        Box::new(flate2::read::MultiGzDecoder::new(stream))
-    } else if head.starts_with(&XZ_MAGIC) {
+        Codec::Gzip => Box::new(flate2::read::MultiGzDecoder::new(stream)),
         // Every block of every stream declares its own dictionary and every one
         // is allocated, so the decode runs under a memory budget the decoder
         // checks against each block header before it allocates. Multiple
         // concatenated xz streams are legal in one file and some producers emit
         // them; the reader decodes them as one.
-        Box::new(XzReader::new(stream))
-    } else if is_zstd_start(head) {
+        Codec::Xz => Box::new(XzReader::new(stream)),
         // zstd is framed, and a producer such as `pzstd` emits several frames
         // (often behind a leading skippable frame). Decode every frame, each
         // under the window cap: an uncapped decoder would buffer a hostile
         // window into an OOM.
-        Box::new(ZstdReader::new(Box::new(stream))?)
-    } else {
+        Codec::Zstd => Box::new(ZstdReader::new(Box::new(stream))?),
         // Not a recognized compression: assume plain tar and let the header
         // check decide.
-        Box::new(stream)
+        Codec::Plain => Box::new(stream),
     })
 }
 

@@ -299,8 +299,11 @@ had as a preference.
 ### Conflicts are reported, not resolved around
 
 A blocker atom that matches something the root has or the resolution chose is a
-conflict, and the run fails naming both sides. There is no backtracking, and the
-evidence is why. An any-of policy that preferred a non-conflicting alternative
+conflict, and the run fails naming both sides. The root's own packages state
+blockers too, in their database entries. One that matches a chosen build is the
+same conflict from the other side.
+
+There is no backtracking, and the evidence is why. An any-of policy that preferred a non-conflicting alternative
 changed nothing over the same four hundred seeds. The conflicts that remain are
 ones portage refuses too. Almost all are a desktop stack asked for in a root
 built against the other init system. The commonest single case, 27 of the 50, is
@@ -549,6 +552,14 @@ in any form, and its own per-package digests are MD5 and SHA-1. So a hostile
 mirror can decide *which* package a resolution asks for, even though it cannot
 forge the package it then serves.
 
+The index is therefore read as a document a mirror composed. The archive
+publishes it as gzip and as plain text, and a body in any other compression is
+refused before a decoder runs. Decompressed, it is held to 256 MiB, and a larger
+one is refused rather than read as far as the limit. Parsing it costs time in
+proportion to its length, and dependency groups nest at most 16 deep. A stanza
+this layer cannot read is left out and counted rather than failing the whole
+index.
+
 It also decides each download's declared size, which is why the layer keeps a
 ceiling of its own beside it. The index's `SIZE` bounds a fetch, and an
 understated one fails closed: the download stops short and the container fails
@@ -700,25 +711,44 @@ the wrong one for a live network.
 
 ## The cache
 
-`cache_dir` names a directory the downloaded tarball is kept in across runs. A
-stage3 is hundreds of megabytes, so a caller provisioning more than one root
-from the same build wants one. Without it the tarball is downloaded beside the
-tree being built and removed with it.
+`cache_dir` names a directory downloads are kept in across runs: the stage3
+tarball, and the binary packages an install merges. A stage3 is hundreds of
+megabytes, so a caller provisioning more than one root from the same build wants
+one. Without it the downloads land beside the tree being built and are removed
+with it.
 
-A cached tarball is verified on the read, not trusted for having been verified
+The tarball is kept under its file name, which names the variant and the build.
+A binary package is kept under the path the archive publishes it at:
+
+```text
+<cache_dir>/releases/amd64/binpackages/23.0/x86-64/dev-vcs/git/git-2.54.0-5.gpkg.tar
+```
+
+That path names the architecture, the generation and the binhost as well as the
+package, and it has to. Two binhosts publish builds of one package under one
+relative path. The same key signs every `Manifest`, and each binhost numbers its
+builds on its own. An `x86-64-v3` container therefore passes every check under
+the `x86-64` name. A cache keyed by the relative path alone would merge code
+built for newer processors into a root meant for older ones. Keyed this way, one
+directory serves several architectures and binhosts.
+
+A cached entry is verified on the read, not trusted for having been verified
 once. What sits at a cache path is bytes on a disk this crate does not own. A
-cache hit and a fresh download therefore go through the same check.
+cache hit and a fresh download therefore go through the same check. An entry that does not
+verify is not the archive's file, whatever it is, and the run downloads it
+again. A fresh download that does not verify fails the run. It is removed, so a
+later run does not meet the same refusal in its own cache.
 
-A tarball that does not match is removed rather than left behind. It is not the
-archive's file whatever it is. Keeping it would make every later run of that
-build fail out of its own cache. Binary packages are cached the same way and on
-the same terms.
+What is verified is what is extracted. The tarball is extracted through the
+descriptor its digest was taken through, and a container's image through the
+descriptor its `Manifest` was checked against. Another run sharing the cache
+publishes its downloads by renaming them over these names. A rename leaves an
+open descriptor on the file it held.
 
-**The cache directory is inside the trust boundary.** A container is verified in
-one pass and extracted in a second, both over the file on disk. Anything able to
-write the directory between the two therefore substitutes unverified content
-into the merge. In normal use nobody else can: the cache is `cache_dir`, or a
-sibling of the tree being built where you name none. Pointing `cache_dir` at a shared or
+**The cache directory is inside the trust boundary all the same.** A held
+descriptor cannot answer a write *into* the file between the check and the
+extraction. Nothing in this crate writes a cache entry in place, but anything
+else with write access to the files can. Pointing `cache_dir` at a shared or
 world-writable location extends the boundary to whoever can write there.
 
 ## Mirrors

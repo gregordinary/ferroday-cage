@@ -787,6 +787,7 @@ pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::atom: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::blocks: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::installed: bool
 pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::stated_by: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::stated_in_root: bool
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::DependencyCycle
 pub ferroday_cage::provision::gentoo::GentooEvent::DependencyCycle::packages: &'a [alloc::string::String]
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Extracting

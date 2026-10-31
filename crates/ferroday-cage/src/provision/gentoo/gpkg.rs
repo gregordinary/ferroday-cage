@@ -48,19 +48,22 @@
 //! for. Nothing is decompressed before its digest matches, which is what GLEP
 //! 78 asks of a reader that finds a bad signature.
 //!
-//! # The cache directory is inside the trust boundary
+//! # One descriptor, both passes
 //!
 //! What the two passes establish is that the *bytes the first pass read* were
-//! the ones the Manifest vouched for. The second pass opens the file again, so
-//! anything able to write the cache between them substitutes content nothing
-//! verified into the merge.
+//! the ones the Manifest vouched for, so the second pass reads them again
+//! through the descriptor the first one read rather than opening the path a
+//! second time. A cache entry is published by renaming a staging file over its
+//! name, which is how two runs sharing a cache write into it, and a rename
+//! leaves a descriptor already open on the file it held.
 //!
-//! In normal use nobody else can: the cache is
-//! [`cache_dir`](super::GentooBuilder::cache_dir), or a sibling of the tree
-//! being built where the caller named none. A caller who points `cache_dir` at a
-//! world-writable or shared location is extending the trust boundary to whoever
-//! can write there, and is entitled to know that is the decision they are
-//! making.
+//! What a held descriptor cannot answer is a write *into* that file between the
+//! passes. Nothing in this crate writes a cache entry in place, so only
+//! something outside it can, holding write access to the file itself. The cache
+//! is [`cache_dir`](super::GentooBuilder::cache_dir), or a sibling of the tree
+//! being built where the caller named none. A caller who points `cache_dir` at
+//! a location others can write to is extending the trust boundary to them, and
+//! is entitled to know that is the decision they are making.
 //!
 //! # What is deliberately not read
 //!
@@ -80,6 +83,7 @@ use std::path::Path;
 
 use super::plan::PlannedPackage;
 use super::{GentooError, MAX_METADATA_BYTES};
+use crate::path;
 use crate::provision::compress;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
@@ -117,6 +121,48 @@ pub(super) const IMAGE_DIR: &str = "image/";
 /// than held and then refused. A real one is a few lines, one per member.
 const MAX_MANIFEST_BYTES: u64 = MAX_SIGNED_DOCUMENT_BYTES;
 
+/// The token a Manifest line names its SHA-512 by, spelled as GLEP 74 spells
+/// it.
+const SHA512: &str = "SHA512";
+
+/// What one member of a container is, by its name below the directory prefix.
+///
+/// The one rule both passes select members by. The first pass records what it
+/// verified under it, and the second finds the image archive by it again, so
+/// the member the second pass extracts is the one the first pass digested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The format marker.
+    Format,
+    /// The cleartext-signed digests of every other member.
+    Manifest,
+    /// The archive of the files merged into the root.
+    Image,
+    /// The archive of the package's own metadata files.
+    Metadata,
+    /// Anything else, the two detached signatures included: digested by the
+    /// Manifest like every member, and otherwise not read.
+    Other,
+}
+
+impl Role {
+    /// The role of the member named `name`.
+    ///
+    /// The archives are named by a prefix, since their compression is a suffix
+    /// of the name. A `.sig` beside one is a signature over it rather than a
+    /// second archive.
+    fn of(name: &str) -> Role {
+        match name {
+            FORMAT_MEMBER => Role::Format,
+            MANIFEST_MEMBER => Role::Manifest,
+            _ if name.ends_with(".sig") => Role::Other,
+            _ if name.starts_with(IMAGE_MEMBER) => Role::Image,
+            _ if name.starts_with(METADATA_MEMBER) => Role::Metadata,
+            _ => Role::Other,
+        }
+    }
+}
+
 /// A verified container: its metadata, and where its image sits.
 ///
 /// Holding one means the Manifest verified against the vendored keyring, every
@@ -134,9 +180,6 @@ pub(super) struct Package {
     /// dozen files — and because the merge writes most of them out again as the
     /// root's own database entry.
     metadata: BTreeMap<String, Vec<u8>>,
-    /// The member holding the image archive, with its prefix, so the second
-    /// pass can find it again.
-    image: Vec<u8>,
     /// The container itself, held open from the pass that verified it.
     ///
     /// The second pass rewinds this rather than opening the path again. The
@@ -179,7 +222,6 @@ impl Package {
         check_identity(path, planned, &metadata)?;
         Ok(Package {
             metadata,
-            image: scan.image.clone(),
             container,
         })
     }
@@ -200,6 +242,9 @@ impl Package {
     /// Everything this yields was covered by the verified Manifest, so it is
     /// where a caller may act on the container's contents and the first place it
     /// may.
+    ///
+    /// The image is the member [`Role::of`] names the image archive, which the
+    /// first pass refused a container to hold more than one of.
     pub(super) fn image(&self, path: &Path) -> Result<TarReader<Box<dyn Read + '_>>, GentooError> {
         let mut file = &self.container;
         io::Seek::rewind(&mut file).map_err(GentooError::at("rewinding the container", path))?;
@@ -208,7 +253,11 @@ impl Package {
             .next_entry()
             .map_err(|err| container(path, err.to_string()))?
         {
-            if entry.path != self.image {
+            let is_image = entry.typeflag != b'5'
+                && split_member(&entry.path)
+                    .and_then(|(_, name)| std::str::from_utf8(name).ok())
+                    .is_some_and(|name| Role::of(name) == Role::Image);
+            if !is_image {
                 continue;
             }
             let mut member = Member {
@@ -235,10 +284,9 @@ struct Scan {
     members: Vec<Seen>,
     /// The Manifest's bytes.
     manifest: Vec<u8>,
-    /// The image archive's member name, with its prefix, so the second pass
-    /// can find it again. The bytes are not held: an image runs to hundreds of
-    /// megabytes.
-    image: Vec<u8>,
+    /// Whether an image archive was seen. Its bytes are not held: an image
+    /// runs to hundreds of megabytes, and the second pass reads it again.
+    has_image: bool,
     /// The metadata archive's bytes, still compressed.
     ///
     /// Held from the first pass rather than read again, and held *compressed*:
@@ -271,7 +319,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
     let mut scan = Scan {
         members: Vec::new(),
         manifest: Vec::new(),
-        image: Vec::new(),
+        has_image: false,
         metadata: Vec::new(),
         has_metadata: false,
         marked: false,
@@ -314,15 +362,34 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             return Err(container(path, "holds a member whose name is not UTF-8"));
         };
         let name = name.to_string();
+        // One member per name, since the Manifest has one line per name and
+        // cannot vouch for two members under it. And one image archive and one
+        // metadata archive, whatever their compression suffixes: a second image
+        // is one the two passes could each take for the image.
+        let role = Role::of(&name);
+        if scan.members.iter().any(|seen| seen.name == name) {
+            return Err(container(path, format!("holds the member {name} twice")));
+        }
+        let repeated = match role {
+            Role::Image if scan.has_image => Some("image"),
+            Role::Metadata if scan.has_metadata => Some("metadata"),
+            _ => None,
+        };
+        if let Some(archive) = repeated {
+            return Err(container(
+                path,
+                format!("holds a second {archive} archive, {name}"),
+            ));
+        }
 
         // The Manifest and the metadata archive are held in memory: the first
         // to verify, the second because the merge writes most of it back out.
         // Both are small and both are bounded, since the container arrives with
         // no length for either until the Manifest has been read.
-        let held = match name.as_str() {
-            MANIFEST_MEMBER => Some(MAX_MANIFEST_BYTES),
-            _ if name.starts_with(METADATA_MEMBER) => Some(MAX_METADATA_BYTES),
-            _ => None,
+        let held = match role {
+            Role::Manifest => Some(MAX_MANIFEST_BYTES),
+            Role::Metadata => Some(MAX_METADATA_BYTES),
+            Role::Format | Role::Image | Role::Other => None,
         };
         let mut buffered = Vec::new();
         let mut member = Member {
@@ -352,19 +419,15 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         };
         archive = member.archive;
 
-        match name.as_str() {
-            FORMAT_MEMBER => scan.marked = true,
-            MANIFEST_MEMBER => scan.manifest = buffered,
-            // A `.sig` is a member like any other here: it is digested by the
-            // Manifest and never read as a signature.
-            _ if name.starts_with(IMAGE_MEMBER) && !name.ends_with(".sig") => {
-                scan.image = full.clone();
-            }
-            _ if name.starts_with(METADATA_MEMBER) && !name.ends_with(".sig") => {
+        match role {
+            Role::Format => scan.marked = true,
+            Role::Manifest => scan.manifest = buffered,
+            Role::Image => scan.has_image = true,
+            Role::Metadata => {
                 scan.metadata = buffered;
                 scan.has_metadata = true;
             }
-            _ => {}
+            Role::Other => {}
         }
         scan.members.push(Seen { name, size, sha512 });
     }
@@ -381,7 +444,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             format!("carries no {MANIFEST_MEMBER}, so nothing vouches for its members"),
         ));
     }
-    if scan.image.is_empty() || !scan.has_metadata {
+    if !scan.has_image || !scan.has_metadata {
         return Err(container(
             path,
             "carries no image archive or no metadata archive",
@@ -392,12 +455,13 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
 
 /// Splits a member path into its directory prefix and the name below it.
 ///
-/// A member is exactly one level down. A path with no separator, or with more
-/// than one, is not a member of a gpkg container.
+/// A member is exactly one level down, and both halves are ordinary path
+/// components. A path with no separator or with more than one, or a half that
+/// is empty, `.` or `..`, is not a member of a gpkg container.
 fn split_member(path: &[u8]) -> Option<(&[u8], &[u8])> {
     let at = path.iter().position(|byte| *byte == b'/')?;
     let (prefix, rest) = (&path[..at], &path[at + 1..]);
-    if prefix.is_empty() || rest.is_empty() || rest.contains(&b'/') {
+    if !path::is_ordinary_component(prefix) || !path::is_ordinary_component(rest) {
         return None;
     }
     Some((prefix, rest))
@@ -467,12 +531,14 @@ impl Manifest {
             // several. SHA-512 is the one read; a pair whose algorithm this
             // layer does not know is stepped over rather than refused, since a
             // Manifest gaining an algorithm is not a Manifest this layer stops
-            // being able to read.
+            // being able to read. The value is taken as written and held to
+            // the algorithm's own lowercase alphabet below, as every digest in
+            // the crate is, so a comparison with it is a plain `==`.
             let mut sha512 = None;
             let mut fields = fields.peekable();
             while let (Some(algorithm), Some(hex)) = (fields.next(), fields.next()) {
-                if algorithm.eq_ignore_ascii_case("SHA512") {
-                    sha512 = Some(hex.to_ascii_lowercase());
+                if algorithm == SHA512 {
+                    sha512 = Some(hex.to_string());
                 }
             }
             let Some(sha512) = sha512.filter(|hex| Algorithm::Sha512.is_hex(hex)) else {
@@ -568,7 +634,7 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
             let Some(name) = std::str::from_utf8(&entry.path)
                 .ok()
                 .and_then(|name| name.strip_prefix(METADATA_DIR))
-                .filter(|name| !name.is_empty() && !name.contains('/'))
+                .filter(|name| path::is_ordinary_component(name.as_bytes()))
             else {
                 // Anything that is not a plain file directly under
                 // `metadata/` is not a metadata file, and the layer writes
@@ -685,7 +751,7 @@ pub(super) mod fixture {
     pub(in crate::provision::gentoo) const CPV: &str = "sys-libs/zlib-1.3.2";
 
     /// A tar archive of `entries`, each a name and its bytes.
-    fn tarball(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    pub(in crate::provision::gentoo) fn tarball(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut out = Vec::new();
         for (name, body) in entries {
             let typeflag = if name.ends_with('/') { b'5' } else { b'0' };
@@ -800,6 +866,12 @@ pub(super) mod fixture {
         pub corrupt: Option<&'static str>,
         /// Whether the image ships a named pipe beside its ordinary files.
         pub fifo: bool,
+        /// Members added after the ordinary ones and before the Manifest, each
+        /// a name and its bytes, listed in the Manifest unless `unlisted`
+        /// names them.
+        pub extra: Vec<(&'static str, Vec<u8>)>,
+        /// Whether the Manifest spells its SHA-512 digests in uppercase.
+        pub uppercase: bool,
     }
 
     impl Built {
@@ -813,6 +885,8 @@ pub(super) mod fixture {
                 marked: true,
                 corrupt: None,
                 fifo: false,
+                extra: Vec::new(),
+                uppercase: false,
             }
         }
 
@@ -826,6 +900,9 @@ pub(super) mod fixture {
             members.push(("metadata.tar.sig".to_string(), b"not read\n".to_vec()));
             members.push(("image.tar".to_string(), image(self.fifo)));
             members.push(("image.tar.sig".to_string(), b"not read\n".to_vec()));
+            for (name, body) in self.extra {
+                members.push((name.to_string(), body));
+            }
 
             let mut manifest = String::new();
             for (name, body) in &members {
@@ -835,6 +912,9 @@ pub(super) mod fixture {
                 let mut sha512 = Algorithm::Sha512.hex_of(body);
                 if self.corrupt == Some(name.as_str()) {
                     sha512 = hex(&[0u8; 64]);
+                }
+                if self.uppercase {
+                    sha512 = sha512.to_ascii_uppercase();
                 }
                 manifest.push_str(&format!(
                     "DATA {name} {} SHA512 {sha512} BLAKE2B {}\n",
@@ -1076,6 +1156,109 @@ mod tests {
         )
         .expect_err("a missing member is refused");
         assert!(err.to_string().contains("is missing"), "{err}");
+    }
+
+    #[test]
+    fn a_member_present_twice_is_refused_whatever_the_manifest_says() {
+        // The Manifest has one line per name, so a second copy of a member is
+        // one nothing vouches for separately; and a second image archive under
+        // another name is one each pass could take for the image.
+        for (extra, reason) in [
+            ("image.tar", "holds the member image.tar twice"),
+            ("metadata.tar", "holds the member metadata.tar twice"),
+            ("Manifest", "holds the member Manifest twice"),
+            (
+                "image.tar.zst",
+                "holds a second image archive, image.tar.zst",
+            ),
+            (
+                "metadata.tar.gz",
+                "holds a second metadata archive, metadata.tar.gz",
+            ),
+        ] {
+            let built = Built {
+                extra: vec![(extra, b"listed in the signed Manifest".to_vec())],
+                ..Built::ordinary()
+            };
+            let err = open(extra, built, &planned(CPV, 1)).expect_err("the container is refused");
+            assert!(
+                matches!(err, GentooError::Container { .. }),
+                "{extra}: {err:?}"
+            );
+            assert!(err.to_string().contains(reason), "{extra}: {err}");
+        }
+        // A member of no role the layer reads, listed in the Manifest, is
+        // digested like any other and is not a second anything.
+        let built = Built {
+            extra: vec![("NOTES", b"listed in the signed Manifest".to_vec())],
+            ..Built::ordinary()
+        };
+        open("other-member", built, &planned(CPV, 1)).expect("an extra listed member is read");
+    }
+
+    #[test]
+    fn a_member_name_that_is_not_one_path_component_is_refused() {
+        // Listed in the signed Manifest, so nothing but the name's own shape
+        // stands against it.
+        for name in ["..", "."] {
+            let built = Built {
+                extra: vec![(name, b"listed".to_vec())],
+                ..Built::ordinary()
+            };
+            let err =
+                open("odd-member", built, &planned(CPV, 1)).expect_err("the member is refused");
+            assert!(
+                err.to_string()
+                    .contains("not a member of a single directory"),
+                "{name:?}: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_metadata_file_whose_name_is_not_one_path_component_is_not_read() {
+        // Its name becomes the leaf of a database entry's path, so only an
+        // ordinary component is a metadata file at all.
+        let metadata = super::fixture::tarball(&[
+            ("metadata/", Vec::new()),
+            ("metadata/CATEGORY", b"sys-libs\n".to_vec()),
+            ("metadata/PF", b"zlib-1.3.2\n".to_vec()),
+            ("metadata/BUILD_ID", b"1".to_vec()),
+            ("metadata/..", b"not a metadata file".to_vec()),
+        ]);
+        let package = open(
+            "dotdot-metadata",
+            Built {
+                metadata,
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+        )
+        .expect("the container opens");
+        assert_eq!(
+            package
+                .metadata_files()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            ["BUILD_ID", "CATEGORY", "PF"],
+        );
+    }
+
+    #[test]
+    fn a_manifest_digest_is_read_exactly_as_it_is_spelled() {
+        // Lowercase hex is the one spelling every digest in the crate is held
+        // to, so a comparison is a plain `==`. A Manifest spelling another is
+        // not one this layer reads, rather than one it quietly rewrites.
+        let err = open(
+            "uppercase",
+            Built {
+                uppercase: true,
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+        )
+        .expect_err("an uppercase digest is refused");
+        assert!(err.to_string().contains("no usable SHA-512"), "{err}");
     }
 
     #[test]
