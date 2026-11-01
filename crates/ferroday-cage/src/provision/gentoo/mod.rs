@@ -73,6 +73,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use super::openpgp::Expiry;
 pub use index::Catalogue;
 pub use installed::{Installed, InstalledPackage, installed};
 pub use plan::{Plan, PlannedPackage};
@@ -565,8 +566,8 @@ pub struct CertificateHorizon {
     /// it carries none that is UTF-8, or none this crate can verify the
     /// certificate's own key certified.
     pub user_id: Option<String>,
-    /// The epoch at which the certificate's authority lapses, or `None` when
-    /// nothing bounds it.
+    /// When the certificate's authority lapses: at an epoch, or
+    /// [`Expiry::Never`] where nothing bounds it.
     ///
     /// Where the certificate can sign, this is the last moment at which a
     /// signature from it would still be accepted — which is not simply the
@@ -576,11 +577,11 @@ pub struct CertificateHorizon {
     /// whether or not that ever mattered: the primary's expiry, or a
     /// self-signature's own where that comes first.
     ///
-    /// A certificate that cannot sign also reports `None` where no date of it
-    /// can be established, because this crate cannot verify the
+    /// A certificate that cannot sign reports [`Expiry::Unknown`] where no date
+    /// of it can be established, because this crate cannot verify the
     /// self-signatures that state one. Gentoo's 2004 DSA-1024 release key is
     /// such a certificate, and reports no user id either.
-    pub expires: Option<i64>,
+    pub expires: Expiry,
     /// Whether any key under the certificate could make a signature this crate
     /// would accept.
     ///
@@ -2861,7 +2862,7 @@ mod tests {
             .iter()
             .find(|held| held.fingerprint == "13EBBDBEDE7A12775DFDB1BABB572E0E2D182910")
             .expect("the Automated Weekly Release Key is in the vendored keyring");
-        assert_eq!(releng.expires, Some(1_846_022_400), "2028-07-01");
+        assert_eq!(releng.expires, Expiry::At(1_846_022_400), "2028-07-01");
         assert!(releng.signs);
         assert_eq!(
             releng.user_id.as_deref(),
@@ -2875,9 +2876,13 @@ mod tests {
         // rather than passing over. The one a date cannot be read from is the
         // 2004 DSA release key, whose self-signatures this crate cannot verify,
         // so neither its expiry nor its user id is established.
+        assert!(
+            horizon.iter().all(|held| held.expires != Expiry::Never),
+            "Gentoo publishes no perpetual key",
+        );
         let unread: Vec<&CertificateHorizon> = horizon
             .iter()
-            .filter(|held| held.expires.is_none())
+            .filter(|held| held.expires == Expiry::Unknown)
             .collect();
         assert_eq!(
             unread.len(),
@@ -2932,17 +2937,19 @@ mod tests {
         // Which certificate the archive signs with is not something the keyring
         // records, so no reduction over this list can be the one to act on.
         let horizon = gentoo().keyring_horizon();
-        let mut dates: Vec<Option<i64>> = horizon.iter().map(|held| held.expires).collect();
+        let mut dates: Vec<i64> = horizon
+            .iter()
+            .filter_map(|held| held.expires.epoch())
+            .collect();
         dates.sort_unstable();
         dates.dedup();
         assert_eq!(
             dates,
             [
-                None,                // the 2004 DSA release key, unread
-                Some(1_795_718_963), // 2026-11-26, Gentoo Infra (finch)
-                Some(1_795_719_147), // 2026-11-26, Gentoo Infra (petrel)
-                Some(1_814_427_500), // 2027-07-01, GLSAMaker
-                Some(1_846_022_400), // 2028-07-01, the remaining seven
+                1_795_718_963, // 2026-11-26, Gentoo Infra (finch)
+                1_795_719_147, // 2026-11-26, Gentoo Infra (petrel)
+                1_814_427_500, // 2027-07-01, GLSAMaker
+                1_846_022_400, // 2028-07-01, the remaining seven
             ],
         );
     }

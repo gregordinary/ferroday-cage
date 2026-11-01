@@ -709,6 +709,19 @@ pub fn ferroday_cage::provision::debian::build_depend_names(&str, &str) -> alloc
 pub fn ferroday_cage::provision::debian::foreign_interpreter(&str) -> core::option::Option<ferroday_cage::provision::debian::Interpreter>
 pub fn ferroday_cage::provision::debian::host_architecture() -> alloc::string::String
 pub mod ferroday_cage::provision::gentoo
+#[non_exhaustive] pub enum ferroday_cage::provision::gentoo::Expiry
+pub ferroday_cage::provision::gentoo::Expiry::At(i64)
+pub ferroday_cage::provision::gentoo::Expiry::Never
+pub ferroday_cage::provision::gentoo::Expiry::Unknown
+impl ferroday_cage::provision::gentoo::Expiry
+pub fn ferroday_cage::provision::gentoo::Expiry::epoch(self) -> core::option::Option<i64>
+impl core::marker::Freeze for ferroday_cage::provision::gentoo::Expiry
+impl core::marker::Send for ferroday_cage::provision::gentoo::Expiry
+impl core::marker::Sync for ferroday_cage::provision::gentoo::Expiry
+impl core::marker::Unpin for ferroday_cage::provision::gentoo::Expiry
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Expiry
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Expiry
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Expiry
 #[non_exhaustive] pub enum ferroday_cage::provision::gentoo::GentooError
 pub ferroday_cage::provision::gentoo::GentooError::Cancelled
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Config
@@ -828,7 +841,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::provision::gentoo::Catalogue
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gentoo::Catalogue
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Catalogue
 #[non_exhaustive] pub struct ferroday_cage::provision::gentoo::CertificateHorizon
-pub ferroday_cage::provision::gentoo::CertificateHorizon::expires: core::option::Option<i64>
+pub ferroday_cage::provision::gentoo::CertificateHorizon::expires: ferroday_cage::provision::gentoo::Expiry
 pub ferroday_cage::provision::gentoo::CertificateHorizon::fingerprint: alloc::string::String
 pub ferroday_cage::provision::gentoo::CertificateHorizon::signs: bool
 pub ferroday_cage::provision::gentoo::CertificateHorizon::user_id: core::option::Option<alloc::string::String>

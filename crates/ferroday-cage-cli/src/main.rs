@@ -6092,7 +6092,7 @@ fn gentoo_installed(root: &Path) -> ExitCode {
 /// Prints what each certificate of the vendored Gentoo keyring can still be
 /// trusted to do, and until when.
 fn gentoo_keyring_horizon() -> ExitCode {
-    use ferroday_cage::provision::gentoo::Gentoo;
+    use ferroday_cage::provision::gentoo::{Expiry, Gentoo};
 
     // The architecture is a coordinate the keyring knows nothing about, and a
     // listing reads no archive, so any well-formed one names the same keyring.
@@ -6108,8 +6108,13 @@ fn gentoo_keyring_horizon() -> ExitCode {
                 "{}\t{}\t{}\t{}",
                 held.fingerprint,
                 if held.signs { "signs" } else { "cannot-sign" },
-                held.expires
-                    .map_or_else(|| "never".to_string(), |at| at.to_string()),
+                match held.expires {
+                    Expiry::At(at) => at.to_string(),
+                    Expiry::Never => "never".to_string(),
+                    // No date established, and any reading added later that
+                    // is not one.
+                    _ => "unknown".to_string(),
+                },
                 held.user_id.as_deref().unwrap_or(""),
             )?;
         }
@@ -6122,7 +6127,7 @@ fn gentoo_keyring_horizon() -> ExitCode {
         // certificate lines above are the answer, and this says how far apart
         // they run so a reader knows whether reading them matters.
         let signing = horizon.iter().filter(|held| held.signs).count();
-        let mut dated = horizon.iter().filter_map(|held| held.expires);
+        let mut dated = horizon.iter().filter_map(|held| held.expires.epoch());
         let bounds = dated.next().map(|first| {
             dated.fold((first, first), |(low, high), at| {
                 (low.min(at), high.max(at))

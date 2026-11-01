@@ -440,10 +440,12 @@ consumer upgrading can skip it.
   differently.
 - The guide's recipe for a reproducible provenance record declares the procfs a
   container needs, and the doctests run it. As written it failed `build`.
-- `Gentoo::keyring_horizon`, and so `fcage --gentoo-keyring-horizon`, reports
-  neither an expiry nor a user id for a certificate whose self-signatures this
-  crate cannot verify, as for Gentoo's 2004 DSA-1024 release key. It reported
-  both.
+- **Breaking.** `CertificateHorizon::expires` is a `gentoo::Expiry`: a date,
+  `Expiry::Never` where nothing bounds the certificate, or `Expiry::Unknown`
+  where no date of it can be established. A certificate whose self-signatures
+  this crate cannot verify, as for Gentoo's 2004 DSA-1024 release key, reports
+  `Expiry::Unknown` and no user id, where it reported both.
+  `fcage --gentoo-keyring-horizon` prints `unknown` for such a certificate.
 
 ### Fixed
 

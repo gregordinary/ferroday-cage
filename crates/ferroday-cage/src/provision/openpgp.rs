@@ -230,8 +230,7 @@ pub(crate) struct Horizon {
     /// it carries none this crate can read: none that is UTF-8, or none whose
     /// certification by the certificate's own key irongall can verify.
     pub(crate) user_id: Option<String>,
-    /// The epoch at which the certificate's authority lapses, or `None` when
-    /// nothing bounds it.
+    /// When the certificate's authority lapses.
     ///
     /// Where the certificate can sign, this is the last moment at which a
     /// signature from it would still be accepted: the latest lapse among the
@@ -243,10 +242,8 @@ pub(crate) struct Horizon {
     ///
     /// Where it cannot sign -- [`signs`](Self::signs) is `false` -- this is
     /// when the certificate itself lapses, whether or not that ever mattered,
-    /// or `None` where the certificate grants nothing at all, so that no date of
-    /// it is established: one whose primary key irongall does not verify with,
-    /// or with no self-signature in force.
-    pub(crate) expires: Option<i64>,
+    /// or [`Expiry::Unknown`] where the certificate grants nothing at all.
+    pub(crate) expires: Expiry,
     /// Whether any key under the certificate could make a signature
     /// [`Keyring::verify`] would accept.
     pub(crate) signs: bool,
@@ -268,11 +265,11 @@ impl Horizon {
         // what makes an unbounded lapse win outright rather than compare as a
         // number. With none, what is left to report is the certificate's own.
         let expires = if lapses.is_empty() {
-            authority.lapse().ok().flatten()
+            authority.lapse().map_or(Expiry::Unknown, Expiry::of)
         } else if lapses.contains(&None) {
-            None
+            Expiry::Never
         } else {
-            lapses.iter().copied().flatten().max()
+            Expiry::of(lapses.iter().copied().flatten().max())
         };
         Horizon {
             fingerprint: authority.certificate().primary().fingerprint().to_string(),
@@ -280,8 +277,46 @@ impl Horizon {
                 .primary_user_id()
                 .and_then(|user_id| std::str::from_utf8(user_id.value()).ok())
                 .map(str::to_string),
-            expires: expires.and_then(|epoch| i64::try_from(epoch).ok()),
+            expires,
             signs: !lapses.is_empty(),
+        }
+    }
+}
+
+/// When a certificate's authority lapses, as
+/// [`CertificateHorizon::expires`](crate::provision::gentoo::CertificateHorizon::expires)
+/// reports it.
+#[cfg(feature = "gentoo")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Expiry {
+    /// At this epoch, in seconds since the Unix epoch.
+    At(i64),
+    /// Never: nothing bounds it.
+    Never,
+    /// Not known. A certificate that grants nothing at all states no date this
+    /// crate can rest on: one whose self-signatures it cannot verify, such as a
+    /// DSA key's, one that is revoked, or one no self-signature in force binds.
+    Unknown,
+}
+
+#[cfg(feature = "gentoo")]
+impl Expiry {
+    /// The epoch, where the expiry is one.
+    pub fn epoch(self) -> Option<i64> {
+        match self {
+            Expiry::At(epoch) => Some(epoch),
+            Expiry::Never | Expiry::Unknown => None,
+        }
+    }
+
+    /// The expiry of a lapse irongall reports: at its epoch, or never where
+    /// nothing bounds it.
+    fn of(lapse: Option<u64>) -> Expiry {
+        match lapse.map(i64::try_from) {
+            Some(Ok(epoch)) => Expiry::At(epoch),
+            // An epoch past `i64::MAX` is one no clock reaches.
+            Some(Err(_)) | None => Expiry::Never,
         }
     }
 }
