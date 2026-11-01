@@ -357,9 +357,10 @@ impl RepositoryBuilder {
     ///
     /// The posture is repository-wide: it relaxes freshness for every mirror,
     /// which a live-plus-snapshot repository wants because the snapshot's
-    /// release is expired by design. The signature is still verified. It has no
-    /// effect on a [`trust_unsigned`](Self::trust_unsigned) repository, which is
-    /// never freshness-checked.
+    /// release is expired by design. The signature is still verified, and the
+    /// key that made it must still be in force. It has no effect on a
+    /// [`trust_unsigned`](Self::trust_unsigned) repository, which is never
+    /// freshness-checked.
     pub fn allow_stale_release(mut self, allow: bool) -> Self {
         self.allow_stale = allow;
         self
@@ -442,8 +443,10 @@ impl RepositoryBuilder {
 ///
 /// The keyring is parsed again for every release it verifies, so parsing it here
 /// decides nothing on its own. What it buys is the moment of the refusal: a file
-/// that is not a keyring, or one whose every key is revoked, fails the build that
-/// named it rather than the first fetch, after a release has been downloaded.
+/// that is not a keyring, or one holding no key whose signatures can be verified,
+/// fails the build that named it rather than the first fetch, after a release has
+/// been downloaded. A revoked key is judged only when it signs, so a keyring of
+/// nothing else fails at that first fetch, naming the revocation.
 ///
 /// `op` names the read in the error a failure to read the file reports.
 pub(crate) fn read_keyring(path: &Path, op: &'static str) -> Result<Vec<u8>, DebianError> {

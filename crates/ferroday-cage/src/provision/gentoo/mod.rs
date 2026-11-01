@@ -562,7 +562,8 @@ pub struct CertificateHorizon {
     /// OpenPGP tools present one.
     pub fingerprint: String,
     /// The certificate's primary user id, as it spells itself, or `None` where
-    /// it carries none that is UTF-8.
+    /// it carries none that is UTF-8, or none this crate can verify the
+    /// certificate's own key certified.
     pub user_id: Option<String>,
     /// The epoch at which the certificate's authority lapses, or `None` when
     /// nothing bounds it.
@@ -571,8 +572,14 @@ pub struct CertificateHorizon {
     /// signature from it would still be accepted — which is not simply the
     /// primary's own expiry, since a subkey's binding may lapse first and a
     /// certificate whose primary may not sign is worth only what its subkeys
-    /// are. Where it cannot sign, this is the primary's expiry, which is when
-    /// the certificate lapses whether or not that ever mattered.
+    /// are. Where it cannot sign, this is when the certificate itself lapses,
+    /// whether or not that ever mattered: the primary's expiry, or a
+    /// self-signature's own where that comes first.
+    ///
+    /// A certificate that cannot sign also reports `None` where no date of it
+    /// can be established, because this crate cannot verify the
+    /// self-signatures that state one. Gentoo's 2004 DSA-1024 release key is
+    /// such a certificate, and reports no user id either.
     pub expires: Option<i64>,
     /// Whether any key under the certificate could make a signature this crate
     /// would accept.
@@ -873,6 +880,11 @@ impl Gentoo {
     /// could sign, never which one the archive signs with. A caller acting on a
     /// single number takes it from the certificate that verified a document it
     /// actually read.
+    ///
+    /// The judgement is made as of the system clock. One that reads before the
+    /// Unix epoch judges every certificate as of the epoch, before any of them
+    /// existed, so each reports that it cannot sign; on such a clock every
+    /// document's verification is refused.
     pub fn keyring_horizon(&self) -> Vec<CertificateHorizon> {
         self.keyring
             .horizon()
@@ -2834,7 +2846,7 @@ mod tests {
     fn the_vendored_keyring_parses_whole() {
         // `Keyring::parse` fails the entire keyring if one certificate fails,
         // by deliberate design, so this asserts every certificate Gentoo
-        // publishes is one rPGP reads. The count is the shape of the published
+        // publishes is one irongall reads. The count is the shape of the published
         // set: a refresh that changes it is a change worth seeing in a diff.
         assert_eq!(gentoo().keyring_horizon().len(), 11);
     }
@@ -2858,11 +2870,27 @@ mod tests {
             ),
         );
 
-        // Every certificate is bounded: Gentoo publishes no perpetual key, and
-        // one appearing would be worth noticing rather than passing over.
-        assert!(
-            horizon.iter().all(|held| held.expires.is_some()),
-            "every Gentoo certificate carries an expiry",
+        // Every certificate a date can be read from is bounded: Gentoo
+        // publishes no perpetual key, and one appearing would be worth noticing
+        // rather than passing over. The one a date cannot be read from is the
+        // 2004 DSA release key, whose self-signatures this crate cannot verify,
+        // so neither its expiry nor its user id is established.
+        let unread: Vec<&CertificateHorizon> = horizon
+            .iter()
+            .filter(|held| held.expires.is_none())
+            .collect();
+        assert_eq!(
+            unread.len(),
+            1,
+            "every other Gentoo certificate carries an expiry"
+        );
+        assert_eq!(
+            unread[0].fingerprint,
+            "D99EAC7379A850BCE47DA5F29E6438C817072058"
+        );
+        assert_eq!(
+            (unread[0].user_id.as_deref(), unread[0].signs),
+            (None, false)
         );
     }
 
@@ -2872,8 +2900,9 @@ mod tests {
         // signing key is DSA-1024, which the public-key floor refuses. The
         // other six are certify-only primaries with no signing subkey: the
         // authority keys, and the two infrastructure keys whose only subkeys
-        // encrypt. Each one's expiry reads like every other certificate's, so
-        // without this flag it is indistinguishable from a working anchor.
+        // encrypt. Each of the six reports an expiry like every other
+        // certificate's, so without this flag it is indistinguishable from a
+        // working anchor.
         let horizon = gentoo().keyring_horizon();
         let unusable: Vec<&str> = horizon
             .iter()
@@ -2909,10 +2938,11 @@ mod tests {
         assert_eq!(
             dates,
             [
+                None,                // the 2004 DSA release key, unread
                 Some(1_795_718_963), // 2026-11-26, Gentoo Infra (finch)
                 Some(1_795_719_147), // 2026-11-26, Gentoo Infra (petrel)
                 Some(1_814_427_500), // 2027-07-01, GLSAMaker
-                Some(1_846_022_400), // 2028-07-01, the remaining eight
+                Some(1_846_022_400), // 2028-07-01, the remaining seven
             ],
         );
     }

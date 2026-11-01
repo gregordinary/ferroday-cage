@@ -39,12 +39,6 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 # `#![forbid(unsafe_code)]`, which is the property being selected for, and a
 # `tarball` build reaches gzip through this crate alone.
 #
-# A `debian` build resolves differently and cannot be made to do otherwise:
-# `pgp` requires `flate2/zlib-rs`, features unify across the graph, and flate2
-# prefers zlib-rs wherever both are selected. Such a build therefore compiles
-# `miniz_oxide` unreachably and decodes through zlib-rs. That is the price of
-# the OpenPGP dependency, not of this line, and it leaves the narrower
-# configurations on a backend that forbids unsafe outright.
 flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
 lzma-rust2 = { version = "0.24", optional = true, default-features = false, features = ["std", "xz"] }
 # `hash` is what computes a frame's content checksum while it decodes, which the
@@ -54,22 +48,13 @@ lzma-rust2 = { version = "0.24", optional = true, default-features = false, feat
 # the window cap does not bound (RUSTSEC-2026-0344).
 ruzstd = { version = "0.9.1", optional = true, default-features = false, features = ["std", "hash"] }
 # The Debian and Gentoo userland add-on: OpenPGP verification of the archive's
-# signed documents (pure Rust, no C backend), and the hashing their trust chains
-# are defined over -- SHA-256 for Debian's release chain, SHA-512 for Gentoo's
-# digest documents.
-#
-# A `debian` or `gentoo` build carries two `sha2` lines: this one, which
-# `lzma-rust2`'s `xz` feature also selects, and 0.10, which rPGP still depends
-# on. They cannot be unified from here. Holding this line at 0.10 would leave
-# the xz decoder's copy on 0.11 regardless, and rPGP moves only with its own
-# `digest` 0.11 release. Nothing in this crate hashes through rPGP's copy, so
-# the cost is one more SHA-2 implementation compiled, not a second answer.
-pgp = { version = "0.21", optional = true, default-features = false }
+# signed documents (safe Rust, no dependencies), and the hashing their trust
+# chains are defined over -- SHA-256 for Debian's release chain, SHA-512 for
+# Gentoo's digest documents.
+irongall = { version = "0.1", optional = true }
 sha2 = { version = "0.11", optional = true }
 # The Alpine userland add-on: RSA PKCS#1 v1.5 verification of the apk signature
 # (pure Rust, no C backend) and the SHA-1 the apk v2 chain is defined over.
-# Both were already in the graph transitively through rPGP, so an `alpine`
-# feature adds nothing to a `debian`-enabled build.
 #
 # `sha1`'s `oid` feature is not on by default and is required: the digest type
 # reaches `Pkcs1v15Sign::new` for its DER prefix, not to hash.
@@ -79,9 +64,7 @@ sha1 = { version = "0.10", optional = true, features = ["oid"] }
 # database -- an installed package's `CONTENTS` records one per file so portage
 # can tell an edited file from a merged one, and its `BINPKGMD5` records the
 # binary package's own. Bookkeeping rather than trust: nothing in this crate
-# compares an MD5 to decide whether to accept bytes. It was already in the graph
-# transitively through rPGP, so a `gentoo` build gains no crate by taking it
-# directly -- the same argument `sha1` and `rsa` carry for the Alpine layer.
+# compares an MD5 to decide whether to accept bytes.
 md-5 = { version = "0.10", optional = true }
 # The hardening add-on: seccomp-BPF compilation, pure Rust (the syscall conduit
 # it installs through is the always-present `syscalls` above).
@@ -109,7 +92,7 @@ tarball = ["dep:flate2", "dep:lzma-rust2", "dep:ruzstd"]
 # The Debian userland provisioner: bootstrap a suite/architecture rootfs and
 # install packages, talking to the archive directly. Builds on the tarball
 # extractor for the packages' data members.
-debian = ["tarball", "dep:pgp", "dep:sha2"]
+debian = ["tarball", "dep:irongall", "dep:sha2"]
 # The Alpine userland provisioner: bootstrap a release/architecture rootfs from
 # an apk repository, and postmarketOS's repositories beside it. Builds on the
 # tarball extractor for the packages' data segments.
@@ -118,7 +101,7 @@ alpine = ["tarball", "dep:rsa", "dep:sha1", "dep:sha2"]
 # tarball. It selects the same dependencies the Debian layer does, which is what
 # it costs to add: OpenPGP for the signed pointer and digest documents, and the
 # SHA-512 those record. Builds on the tarball extractor for the stage3 itself.
-gentoo = ["tarball", "dep:pgp", "dep:sha2", "dep:md-5"]
+gentoo = ["tarball", "dep:irongall", "dep:sha2", "dep:md-5"]
 # The hardening layer: opt-in Landlock filesystem rules, seccomp syscall
 # filters, and capability drops applied to the sandboxed command.
 hardening = ["dep:seccompiler"]
@@ -317,7 +300,8 @@ toml = "1.1"
 libc = "0.2"
 # The provisioning tests generate compressed fixtures.
 lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "encoder"] }
-# The Debian signature tests generate a throwaway signing key and sign an
-# InRelease with it, to exercise the verification path adversarially. rPGP is
-# already pulled in by the `debian` feature; this adds the RNG it needs.
+# The signature tests generate throwaway signing keys and sign documents with
+# them, to exercise the verification path adversarially: irongall verifies but
+# cannot sign. rPGP signs, with the RNG it needs.
+pgp = { version = "0.21", default-features = false }
 rand = "0.8"

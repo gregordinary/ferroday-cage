@@ -79,8 +79,9 @@ consumer upgrading can skip it.
 - The network stack refuses AWS's IPv6 instance-service block, `fd00:ec2::/32`,
   whose metadata service at `fd00:ec2::254` serves the instance role's
   credentials. The IPv4 metadata service was already refused as link-local.
-- The `pgp` dependency moves to 0.21 and the `ruzstd` floor to 0.9.1. rPGP 0.20
-  parsed nested embedded signatures by unbounded recursion, so a signed document
+- irongall verifies OpenPGP signatures in place of `pgp`, and the `ruzstd` floor
+  moves to 0.9.1. rPGP 0.20 parsed nested embedded signatures by unbounded
+  recursion, so a signed document
   fetched from a mirror (a Debian `InRelease`, a Gentoo pointer, digest document
   or binary package Manifest) could exhaust the stack and abort the process
   before any signature was checked. ruzstd 0.9.0 let a crafted zstd block decode
@@ -92,15 +93,15 @@ consumer upgrading can skip it.
   build without tail-call optimization. The unsigned Gentoo binary-package index
   reached it.
 - Verifying a signed document is bounded before it is parsed: at most one
-  mebibyte, 8,192 lines, and 16 signatures. Framing a cleartext document and
-  checking each signature against each key cost more than the document's length,
-  so a mirror serving a crafted `InRelease`, Gentoo pointer, digest document or
-  binary package Manifest could make the host spend minutes of CPU before any
-  signature was accepted. A Debian `InRelease`, and the `Release` of a mirror
-  trusted unsigned, is fetched under the same one-mebibyte ceiling, where
-  nothing bounded it but the bundled client's body limit. The Gentoo pointer
-  document's ceiling drops from one mebibyte to 64 KiB, and a binary package's
-  Manifest from four mebibytes to one.
+  mebibyte and 16 signatures. A cleartext document is framed in time linear in
+  its length. Framing one and checking each signature against each key cost more
+  than the document's length, so a mirror serving a crafted `InRelease`, Gentoo
+  pointer, digest document or binary package Manifest could make the host spend
+  minutes of CPU before any signature was accepted. A Debian `InRelease`, and the
+  `Release` of a mirror trusted unsigned, is fetched under the same one-mebibyte
+  ceiling, where nothing bounded it but the bundled client's body limit. The
+  Gentoo pointer document's ceiling drops from one mebibyte to 64 KiB, and a
+  binary package's Manifest from four mebibytes to one.
 - A certificate's primary key verifies a document only where the certificate's
   own self-signatures grant it the signing capability, and a self-signature that
   states no key flags grants none. A certify-only primary, as several of
@@ -260,6 +261,31 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking.** irongall verifies OpenPGP signatures in place of `pgp`. It
+  accepts keys of Ed25519, and of RSA from 2048 to 8192 bits, over SHA-2 and
+  SHA-3 digests. A signature by an ECDSA or Ed448 key no longer verifies. A
+  caller's keyring holding no other key is refused by `DebianBuilder::build`
+  and `debian::RepositoryBuilder::build`. A signature naming such a key as its
+  issuer is refused as one, naming the key.
+- A signature dated more than 30 minutes after the host's clock is refused, and
+  on a host whose clock reads before 1970 every signature is. A future-dated
+  signature was accepted, and a clock before 1970 skipped the expiration checks.
+- A signature by a key that has since expired is refused, though it is dated
+  within the key's lifetime. It was accepted, so `allow_stale_release` could
+  resolve a historical archive state whose signing keys had all expired; apt
+  refuses it. Installing a kept plan verifies no release, and is unaffected.
+- A certificate whose governing self-signature rests on SHA-1 and was made on
+  or after 1 February 2023 verifies nothing. One made over SHA-1 before that
+  date still grants what it states, as every SHA-1 self-signature did.
+- Where a release carries several acceptable signatures, a Debian plan's
+  `Signed-By` and `Signing-Key` record the first in the order the release
+  carries them. They recorded the signature of the first certificate in the
+  keyring that had made one. A plan for Debian 12 names its archive automatic
+  signing key, where it named its stable release key.
+- A `debian` build depends on 23 crates, counting this one, where it depended on
+  163, and a `gentoo` build on 28: irongall has no dependencies of its own. Both
+  decode gzip through `miniz_oxide` alone, where `pgp` had selected `flate2`'s
+  zlib-rs backend.
 - **Breaking.** A terminal launch allocates its pseudoterminal inside the
   sandbox, from the `/dev/ptmx` the command sees, rather than on the host before
   the fork. `ttyname` now names the terminal, so `tty`, `who`, and `GPG_TTY`
@@ -394,8 +420,14 @@ consumer upgrading can skip it.
   `PATH`, `APK_SCRIPT` and `APK_PACKAGE`, plus `SOURCE_DATE_EPOCH` where one is
   set. It also received `HOME=/root`.
 - `DebianBuilder::build` and `debian::RepositoryBuilder::build` parse a caller's
-  keyring and refuse one holding no usable key with `DebianError::Config`. A bad
-  keyring failed only after the first release had been fetched.
+  keyring and refuse one holding no key whose signatures can be verified, such
+  as one of DSA keys alone, with `DebianError::Config`. A bad keyring failed only
+  after the first release had been fetched.
+- A signature by a revoked certificate is refused with the revocation and the
+  key named. The certificate was dropped as the keyring was read, so the refusal
+  said only that no key in the keyring had made a signature. A caller's keyring
+  whose every certificate is revoked passes `build`, and the first verification
+  refuses it.
 - `DebianBuilder::build` refuses `extract_only` alongside `base_layer`.
   `stage_layer` configured the increment regardless, so the setting was ignored.
 - `provision::file_url` percent-encodes every byte outside the unreserved set
@@ -408,6 +440,10 @@ consumer upgrading can skip it.
   differently.
 - The guide's recipe for a reproducible provenance record declares the procfs a
   container needs, and the doctests run it. As written it failed `build`.
+- `Gentoo::keyring_horizon`, and so `fcage --gentoo-keyring-horizon`, reports
+  neither an expiry nor a user id for a certificate whose self-signatures this
+  crate cannot verify, as for Gentoo's 2004 DSA-1024 release key. It reported
+  both.
 
 ### Fixed
 
@@ -679,11 +715,9 @@ consumer upgrading can skip it.
   decode runs through that reader, and the reader this crate wrote over the
   sans-I/O decoder to apply the limit is gone. The cap, and what an archive over
   it does, are unchanged.
-- Dependencies refreshed within their ranges. The manifest states why a
-  `debian` or `gentoo` build carries two `sha2` lines: `lzma-rust2` selects 0.11,
-  and `pgp` still depends on 0.10. The `alpine` feature no longer enables
-  `rsa`'s `std` feature, so an Alpine-only build carries neither `getrandom` nor
-  `libc`.
+- Dependencies refreshed within their ranges. The `alpine` feature no longer
+  enables `rsa`'s `std` feature, so an Alpine-only build carries neither
+  `getrandom` nor `libc`.
 - `tools/rust_source.py` is the one reading of a source file the census tools
   take: every comment and every test-only item removed. `tools/check-seam.py`
   expands grouped imports and resolves `super::` paths, and finds 38 reaches
@@ -705,6 +739,11 @@ consumer upgrading can skip it.
 - The profile-format pin covers every key the format can carry, a pin of the
   resolved provenance record's serialized keys covers every key the record can
   carry, and `NetStackBuilder`'s keys have a pin of their own.
+- `provision::openpgp`'s tests hold what the module adds over irongall: the
+  bound on a document's size and signatures, the split between keyring and
+  signature errors, the fields of `Verified`, the freshness flag, the refusal of
+  a keyring that could vouch for nothing, and the policy choices the module
+  makes. The acceptance rules are tested in irongall, which states them.
 
 ## [0.4.5] - 2026-09-26
 

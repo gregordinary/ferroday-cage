@@ -1293,7 +1293,9 @@ impl DebianBuilder {
     /// way.) Setting this relaxes the freshness check entirely while still
     /// verifying the signature, for the legitimate case of pinning a
     /// historical archive state — for example a `snapshot.debian.org` suite,
-    /// whose `Valid-Until` has deliberately passed. It has no effect on a
+    /// whose `Valid-Until` has deliberately passed. The key that made the
+    /// signature must still be in force: a state signed only by keys that
+    /// have since expired is refused. It has no effect on a
     /// [`trust_unsigned`](Self::trust_unsigned) mirror, which is never
     /// freshness-checked.
     pub fn allow_stale_release(mut self, allow: bool) -> Self {
@@ -3984,8 +3986,8 @@ mod tests {
     #[test]
     fn the_embedded_keyring_parses() {
         // The vendored keyring must be a valid binary OpenPGP keyring that
-        // rPGP can read; parsing succeeds only with at least one usable
-        // (unrevoked) key.
+        // irongall reads; parsing succeeds only with at least one key whose
+        // signatures can be verified.
         Keyring::parse(EMBEDDED_KEYRING).expect("the embedded keyring parses");
     }
 

@@ -32,8 +32,7 @@ today becoming public because a separate crate would need them.
 
 Two things would settle it. A userland needing a breaking change the rest of the
 library does not is the direct one. So is a consumer who wants one archive
-format without the others' dependency weight: the Debian layer pulls
-`flate2/zlib-rs` in through `pgp`, which every build that enables it carries.
+format without the others' dependency weight.
 
 What keeps the decision cheap in the meantime is that the layers already sit on
 a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared

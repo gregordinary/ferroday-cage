@@ -134,8 +134,8 @@ pub(super) fn identity_of_hex(spelled: &str) -> Option<String> {
 /// padded.
 ///
 /// Written here rather than taken from a crate because it is twenty lines and
-/// this is the workspace's only caller — the OpenPGP side hands its base64 to
-/// `rpgp`, and every other digest the crate renders is hexadecimal.
+/// this is the workspace's only caller — irongall decodes the OpenPGP side's
+/// armor itself, and every other digest the crate renders is hexadecimal.
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

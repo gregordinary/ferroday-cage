@@ -703,7 +703,9 @@ rather than an omission.
 entry is named by, and the one to pin a repository against. `signing_key` is the
 component key that actually made the signature. Debian's archive keys sign with
 a dedicated signing subkey, so the two normally differ. Only `signed_by` stays
-put when an archive rotates that subkey.
+put when an archive rotates that subkey. A release signed by several archive
+keys records the first acceptable signature in the order the release carries
+them.
 
 `package.archive` indexes into `plan.archives`. Resolution is
 highest-version-wins across the merged repositories. With more than one
@@ -1331,9 +1333,9 @@ signature.
 
 Nothing signed states how large the `InRelease` is, so it is held to a ceiling
 of one mebibyte, four times the largest an archive serves. Verification also
-refuses a document of more than 8,192 lines or 16 signatures. Each bound keeps a
-mirror from choosing how much work checking its answer costs. A release past
-one is refused, never read short.
+refuses a document carrying more than 16 signatures. Each bound keeps a mirror
+from choosing how much work checking its answer costs. A release past one is
+refused, never read short.
 
 A different keyring is supplied with [`keyring`]. `build` reads and parses it, so
 a file that holds no usable key is refused there, before anything is fetched.
@@ -1357,10 +1359,13 @@ answering a request for one suite with a genuine, validly-signed release for
 another.
 
 Key validity is enforced beyond the cryptographic check, which on its own
-accepts a signature from any key whose material fits. A revoked archive key is
-dropped from the keyring. A signature made outside its signing key's validity
-window is rejected, whether before the key existed or after it expired. A
-retired key therefore cannot vouch for a release.
+accepts a signature from any key whose material fits. A signature by a revoked
+archive key is refused, and the refusal names the revocation and the key. A
+signature made outside its signing key's validity window is rejected, whether
+before the key existed or after it expired. So is one by a key that has expired
+since, though dated within the window: the date is the signer's claim. A retired
+key therefore cannot vouch for a release. A host whose clock reads before 1970
+refuses every release, since no window can be judged against it.
 
 Debian's archive keys sign with a dedicated signing subkey rather than the
 primary. A subkey is admitted only on the terms OpenPGP sets for one. The primary must have bound it with the
@@ -1387,11 +1392,12 @@ is acceptable.
 
 Beyond the key, the signature itself has to be worth resting a decision on. It
 is a text signature, the type a cleartext-signed document carries. It carries a
-creation time, every check being relative to it. Its digest is not
-MD5, SHA-1 or RIPEMD-160, whose collisions are within reach. Neither the signing
-key nor the certificate behind it is DSA or an RSA key narrower than 2048 bits.
-A signature is worth no more than the weaker of the digest it covers and the key
-material that binds it.
+creation time, every check being relative to it, no more than 30 minutes ahead
+of the host's clock. Its digest is SHA-2 or SHA-3, never MD5, SHA-1 or
+RIPEMD-160, whose collisions are within reach. The signing key and the
+certificate behind it are each Ed25519, or RSA of 2048 bits or more. A signature
+is worth no more than the weaker of the digest it covers and the key material
+that binds it.
 
 It also carries no critical subpacket that cannot be interpreted, which RFC 9580
 requires a verifier meeting one to treat as invalidating. Only the signed part
@@ -1409,8 +1415,8 @@ as apt accepts it. The Debian stable suite does exactly that, so its release
 does not expire between point releases. [`allow_stale_release`] relaxes the
 freshness check entirely, the signature still being verified. It is for the
 legitimate case of pinning a historical archive state, such as a
-`snapshot.debian.org` suite. A `trust_unsigned` mirror is never
-freshness-checked.
+`snapshot.debian.org` suite. A key that signed that state must still be in
+force. A `trust_unsigned` mirror is never freshness-checked.
 
 The transport is a trait. The built-in fetcher speaks plain HTTP and `file://`,
 addressing a mirror by DNS name, IPv4 literal, or bracketed IPv6 literal

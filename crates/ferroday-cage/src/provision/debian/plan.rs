@@ -135,8 +135,9 @@ pub struct ResolvedArchive {
     /// Empty for a repository configured as
     /// [`trust_unsigned`](super::RepositoryBuilder::trust_unsigned), where
     /// nothing was verified. A release may carry several signatures;
-    /// verification stops at the first valid one, so this names the key that
-    /// was actually used rather than every key that could have been.
+    /// verification stops at the first acceptable one in the order the release
+    /// carries them, so this names the key that was actually used rather than
+    /// every key that could have been.
     pub signed_by: Vec<String>,
     /// The fingerprint of the component key that made the signature, uppercase
     /// hex.

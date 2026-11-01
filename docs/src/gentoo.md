@@ -645,10 +645,11 @@ say the keyring is nearly stale while the certificate the archive currently
 signs with is good for years.
 
 `signs` separates a second case. Seven of the eleven certificates can sign
-nothing, though each one's expiry reads like every other's. One is a DSA-1024
-release key from 2004, which the public-key floor refuses. The other six are
+nothing. One is a DSA-1024 release key from 2004, which the public-key floor
+refuses, and whose expiry and user id this crate cannot read. The other six are
 certify-only primaries with no signing subkey: the authority keys and two
-infrastructure keys. A primary signs a document only where its own
+infrastructure keys. Each of the six reports an expiry like every other
+certificate's. A primary signs a document only where its own
 self-signatures grant it the signing flag, as GnuPG and Sequoia require.
 
 What rules out a reduction is that every certificate in the keyring is an
