@@ -25,8 +25,20 @@
 //! with all of them named. A caller correcting an install list wants the whole
 //! list of what the archive cannot give them; learning them one run at a time
 //! turns one correction into as many bootstraps as there are mistakes.
+//!
+//! # Which version of a name
+//!
+//! Each name resolves to one version, chosen as apt chooses one. By default
+//! that is the index's candidate, ranked by each release's
+//! [`ReleasePriority`](super::release::ReleasePriority). An install list entry
+//! written `name/release` asks for the name from that release instead, and the
+//! versioned dependencies its candidates cannot meet are taken from the same
+//! release where that meets them, as apt's `pkgDepCache::SetCandidateRelease`
+//! does. A layered resolve takes a name its base has installed at the
+//! installed version, and upgrades it only where a dependency needs a newer
+//! one and apt would take that newer one over the installed one.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use super::index::{DepAtom, Dependency, Index, Package};
@@ -56,6 +68,13 @@ pub(crate) enum Refusal {
     ExcludedAndIncluded {
         /// The contradicted name.
         name: String,
+    },
+    /// A caller asked for a package from a release that does not carry it.
+    NotInRelease {
+        /// The install list's entry, `name/release`, as written.
+        entry: String,
+        /// The release named.
+        release: String,
     },
     /// An excluded package is the only thing that satisfies a hard dependency
     /// of a selected package, so honoring the exclusion would leave the
@@ -92,6 +111,7 @@ impl Refusal {
     pub(crate) fn requirement(&self) -> &str {
         match self {
             Refusal::PackageNotFound { name } | Refusal::ExcludedAndIncluded { name } => name,
+            Refusal::NotInRelease { entry, .. } => entry,
             Refusal::ExcludedButRequired { package, .. } => package,
             Refusal::Unsatisfiable { requirement, .. } => requirement,
         }
@@ -101,9 +121,9 @@ impl Refusal {
     /// [`THE_INSTALL_LIST`] where the caller asked directly.
     pub(crate) fn required_by(&self) -> &str {
         match self {
-            Refusal::PackageNotFound { .. } | Refusal::ExcludedAndIncluded { .. } => {
-                THE_INSTALL_LIST
-            }
+            Refusal::PackageNotFound { .. }
+            | Refusal::ExcludedAndIncluded { .. }
+            | Refusal::NotInRelease { .. } => THE_INSTALL_LIST,
             Refusal::ExcludedButRequired { required_by, .. }
             | Refusal::Unsatisfiable { required_by, .. } => required_by,
         }
@@ -115,6 +135,9 @@ impl Refusal {
         match self {
             Refusal::PackageNotFound { .. } => "it is not in the index".to_string(),
             Refusal::ExcludedAndIncluded { .. } => "it is both included and excluded".to_string(),
+            Refusal::NotInRelease { release, .. } => {
+                format!("no repository publishing {release} offers it")
+            }
             Refusal::ExcludedButRequired { .. } => "it is excluded".to_string(),
             Refusal::Unsatisfiable { available, .. } => match available {
                 Some(available) => format!("nothing satisfies it (available: {available})"),
@@ -182,7 +205,8 @@ impl Refusals {
 ///
 /// `base` names (the essential/priority seed and `apt`) are trusted to
 /// exist; a missing one is skipped. Each caller `include` must resolve to a
-/// real package or a provided virtual, or the resolution fails naming it. An
+/// real package or a provided virtual, or the resolution fails naming it; one
+/// written `name/release` must be a real package that release carries. An
 /// excluded package is never selected: it is dropped from the seed, and skipped
 /// as a dependency alternative so a later alternative satisfies the group
 /// instead. A hard dependency an exclusion leaves unsatisfiable refuses the
@@ -195,7 +219,7 @@ pub(crate) fn resolve(
     includes: &[String],
     excludes: &[String],
 ) -> (Vec<Package>, Refusals) {
-    resolve_seeded(index, base, includes, excludes, &InstalledSet::new())
+    resolve_seeded(index, base, includes, excludes, &InstalledSet::default())
 }
 
 /// Resolves the install closure while treating `assume_installed` as
@@ -203,15 +227,16 @@ pub(crate) fn resolve(
 ///
 /// This is [`resolve`] with one additive input. `assume_installed` holds the
 /// names a base layer already supplies — every package configured in it, plus
-/// the virtual packages those packages `Provides` — expanded into one set. A
-/// name in that set is skipped as a seed, satisfies any dependency group naming
-/// it, and is never re-selected, so the resolution closes only over the
-/// packages the base does not already carry. A caller `include` the base
-/// already supplies is likewise satisfied by the base rather than pulled again.
-/// [`resolve`] passes an empty set, so a full bootstrap is unaffected. Because a
-/// configured base is dependency-complete, the transitive dependencies of an
-/// assumed package are themselves assumed, so declining to walk them omits
-/// nothing the increment needs.
+/// the virtual packages those packages `Provides`. A name in that set is
+/// skipped as a seed, satisfies any dependency group naming it at a version
+/// the group accepts, and is otherwise re-selected only as an upgrade, so the
+/// resolution closes only over what the base does not already carry. A caller
+/// `include` the base already supplies is likewise satisfied by the base rather
+/// than pulled again, unless it names a release whose version the base does
+/// not hold. [`resolve`] passes an empty set, so a full bootstrap is
+/// unaffected. Because a configured base is dependency-complete, the
+/// transitive dependencies of an assumed package are themselves assumed, so
+/// declining to walk them omits nothing the increment needs.
 ///
 /// # Refusals
 ///
@@ -230,11 +255,12 @@ pub(crate) fn resolve(
 /// which is the fact rather than noise: both have to change.
 ///
 /// A contradiction in the caller's own arguments — a name that is neither a
-/// package nor a virtual, a name both included and excluded — is collected
-/// alongside the rest rather than returned immediately. It is discovered
-/// before the closure walk rather than during it, but a caller correcting an
-/// install list of twenty names wants all four mistakes, not the first, and
-/// that is the same reason the walk collects.
+/// package nor a virtual, a name both included and excluded, a release that
+/// does not carry the name asked of it — is collected alongside the rest rather
+/// than returned immediately. It is discovered before the closure walk rather
+/// than during it, but a caller correcting an install list of twenty names
+/// wants all four mistakes, not the first, and that is the same reason the walk
+/// collects.
 pub(crate) fn resolve_seeded(
     index: &Index,
     base: &[String],
@@ -243,52 +269,99 @@ pub(crate) fn resolve_seeded(
     assume_installed: &InstalledSet,
 ) -> (Vec<Package>, Refusals) {
     let excluded: HashSet<&str> = excludes.iter().map(String::as_str).collect();
+    let mut candidates = Candidates {
+        index,
+        installed: assume_installed,
+        targeted: HashMap::new(),
+    };
     let mut selected: BTreeMap<String, Package> = BTreeMap::new();
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut refusals = Refusals::default();
+
+    // The entries naming a release switch their names' candidates before
+    // anything is selected, as apt switches them when it reads the command
+    // line: a base package one of them needs a newer version of is then seeded
+    // at that version rather than at the one it would replace.
+    let mut asked: Vec<Option<&str>> = Vec::with_capacity(includes.len());
+    for entry in includes {
+        let (name, release) = split_release(entry);
+        if excluded.contains(name) {
+            // Asking for a package and excluding it in the same breath is a
+            // contradiction, reported rather than silently resolved either way.
+            refusals.push(Refusal::ExcludedAndIncluded {
+                name: entry.clone(),
+            });
+            asked.push(None);
+            continue;
+        }
+        let Some(release) = release else {
+            asked.push(Some(name));
+            continue;
+        };
+        let Some(package) = index.in_release(name, release) else {
+            refusals.push(Refusal::NotInRelease {
+                entry: entry.clone(),
+                release: release.to_string(),
+            });
+            asked.push(None);
+            continue;
+        };
+        // The base holding that very version answers the entry already.
+        if assume_installed
+            .installed(name)
+            .is_some_and(|version| super::version::compare(version, &package.version).is_eq())
+        {
+            asked.push(None);
+            continue;
+        }
+        candidates.target(package, release, &excluded);
+        asked.push(Some(name));
+    }
 
     // Seed the whole base set before closing over anything, so a virtual
     // dependency encountered during the closure sees every base package as an
     // already-selected candidate provider. An excluded base package is simply
     // not seeded, and one the layer already carries is left to the base.
     for name in base {
-        if excluded.contains(name.as_str()) || assume_installed.contains_key(name) {
+        if excluded.contains(name.as_str()) || assume_installed.contains(name) {
             continue;
         }
-        if let Some(package) = index.get(name) {
+        if let Some(package) = candidates.of(name) {
             add(&mut selected, &mut queue, package);
         }
     }
-    for name in includes {
-        // Asking for a package and excluding it in the same breath is a
-        // contradiction, reported rather than silently resolved either way.
-        if excluded.contains(name.as_str()) {
-            refusals.push(Refusal::ExcludedAndIncluded { name: name.clone() });
+    for (entry, name) in includes.iter().zip(asked) {
+        let Some(name) = name else {
+            continue;
+        };
+        // A requested package the base already supplies is satisfied by the
+        // base and needs no re-selection into the increment, unless the entry
+        // switched it to a version the base does not hold.
+        if assume_installed.contains(name) && !candidates.is_targeted(name) {
             continue;
         }
-        // A requested package the base already supplies is satisfied by the base
-        // and needs no re-selection into the increment.
-        if assume_installed.contains_key(name) {
-            continue;
-        }
-        if let Some(package) = index.get(name) {
+        if let Some(package) = candidates.of(name) {
             add(&mut selected, &mut queue, package);
         } else if let Some(provider) =
             // A caller `include` names a package, never a constrained version,
             // so it asks the unversioned question.
             first_available_provider(
-                index,
+                &candidates,
                 &DepAtom {
-                    name: name.clone(),
+                    name: name.to_string(),
                     constraint: None,
                 },
                 &excluded,
             )
         {
-            let package = index.get(&provider).expect("a provider is a real package");
+            let package = candidates
+                .of(&provider)
+                .expect("a provider is a real package");
             add(&mut selected, &mut queue, package);
         } else {
-            refusals.push(Refusal::PackageNotFound { name: name.clone() });
+            refusals.push(Refusal::PackageNotFound {
+                name: entry.clone(),
+            });
         }
     }
 
@@ -303,10 +376,9 @@ pub(crate) fn resolve_seeded(
             .collect();
         for group in &relations {
             if let Some(refusal) = resolve_group(
-                index,
+                &candidates,
                 group,
                 &excluded,
-                assume_installed,
                 &name,
                 &mut selected,
                 &mut queue,
@@ -317,6 +389,135 @@ pub(crate) fn resolve_seeded(
     }
 
     (selected.into_values().collect(), refusals)
+}
+
+/// Splits an install list entry into the package it names and the release it
+/// names it from, where it is written `name/release`.
+///
+/// A Debian package name holds no `/`, so the first one ends the name and
+/// everything after it is the release, which may itself name a subtree.
+pub(super) fn split_release(entry: &str) -> (&str, Option<&str>) {
+    match entry.split_once('/') {
+        Some((name, release)) => (name, Some(release)),
+        None => (entry, None),
+    }
+}
+
+/// Which version each name resolves to in one resolution.
+///
+/// The index's candidate, unless an install list entry named a release for the
+/// name or for something that needed it, or the base layer has the name
+/// installed, in which case only an upgrade apt would take is a version to
+/// select at all.
+struct Candidates<'a> {
+    index: &'a Index,
+    installed: &'a InstalledSet,
+    /// The versions an entry written `name/release` switched to: its own, and
+    /// those of the versioned dependencies it switched to the same release.
+    targeted: HashMap<String, Package>,
+}
+
+impl<'a> Candidates<'a> {
+    /// The version `name` resolves to where it has to be selected, or `None`
+    /// where no version is to be: a name nothing offers, or one the base has
+    /// installed that apt would not upgrade.
+    fn of(&self, name: &str) -> Option<&Package> {
+        if let Some(package) = self.targeted.get(name) {
+            return Some(package);
+        }
+        match self.installed.installed(name) {
+            Some(version) => self.index.upgrade_over(name, version),
+            None => self.index.get(name),
+        }
+    }
+
+    /// Whether an install list entry switched `name` to a release's version.
+    fn is_targeted(&self, name: &str) -> bool {
+        self.targeted.contains_key(name)
+    }
+
+    /// Switches `package`'s name to that version, then each versioned
+    /// dependency of it that nothing else meets to the version `release`
+    /// offers, where that one meets it, and that version's dependencies the
+    /// same way: apt's handling of `name/release`.
+    ///
+    /// A dependency group is left alone where the base meets it, or a
+    /// candidate or a provider does and can itself be installed as things
+    /// stand ([`installable`](Self::installable)). So a release is reached
+    /// into only as far as the entry needs it, and a candidate that meets the
+    /// constraint but needs the release's versions in turn is walked as a
+    /// switch would be: a backports kernel metapackage names an image only
+    /// backports carries, and that image needs a newer `linux-base`. A switch
+    /// can only help a versioned dependency, so the search through a group's
+    /// alternatives stops at the first unversioned one, as apt's does. A
+    /// version already switched to is not walked again, which is what ends a
+    /// cycle.
+    fn target(&mut self, package: &'a Package, release: &str, excluded: &HashSet<&str>) {
+        self.targeted.insert(package.name.clone(), package.clone());
+        let groups: Vec<&Dependency> = package
+            .pre_depends
+            .iter()
+            .chain(package.depends.iter())
+            .collect();
+        for group in groups {
+            let met = group.iter().any(|atom| {
+                base_satisfies(self.installed, atom)
+                    || self.of(&atom.name).is_some_and(|candidate| {
+                        meets(atom.constraint.as_ref(), &candidate.version)
+                            && self.installable(candidate, excluded)
+                    })
+                    || first_available_provider(self, atom, excluded).is_some_and(|provider| {
+                        self.of(&provider)
+                            .is_some_and(|candidate| self.installable(candidate, excluded))
+                    })
+            });
+            if met {
+                continue;
+            }
+            for atom in group {
+                let Some(constraint) = atom.constraint.as_ref() else {
+                    break;
+                };
+                if excluded.contains(atom.name.as_str()) {
+                    continue;
+                }
+                let Some(version) = self.index.in_release(&atom.name, release) else {
+                    continue;
+                };
+                if !constraint.satisfied_by(&version.version) {
+                    continue;
+                }
+                let switched = self.targeted.get(&atom.name).is_some_and(|held| {
+                    held.origin == version.origin && held.version == version.version
+                });
+                if !switched {
+                    self.target(version, release, excluded);
+                }
+                break;
+            }
+        }
+    }
+
+    /// Whether every dependency group of `package` has an answer as things
+    /// stand: the base, a candidate at a version the group accepts, or a
+    /// provider. One level deep, as the question apt asks before it leaves a
+    /// candidate alone is (its `DepCandMin`).
+    fn installable(&self, package: &Package, excluded: &HashSet<&str>) -> bool {
+        package
+            .pre_depends
+            .iter()
+            .chain(package.depends.iter())
+            .all(|group| {
+                group.iter().any(|atom| {
+                    base_satisfies(self.installed, atom)
+                        || (!excluded.contains(atom.name.as_str())
+                            && self.of(&atom.name).is_some_and(|candidate| {
+                                meets(atom.constraint.as_ref(), &candidate.version)
+                            }))
+                        || first_available_provider(self, atom, excluded).is_some()
+                })
+            })
+    }
 }
 
 /// Satisfies one dependency group (a set of alternatives) of `required_by`.
@@ -339,18 +540,19 @@ pub(crate) fn resolve_seeded(
 /// check verifies the packages that *were* selected, and a dropped dependency
 /// never is.
 ///
-/// A group whose satisfier the base layer already supplies (`assume_installed`)
-/// is satisfied by the base and pulls nothing, provided the base supplies it at
-/// a version the constraint accepts.
+/// A group whose satisfier the base layer already supplies is satisfied by the
+/// base and pulls nothing, provided the base supplies it at a version the
+/// constraint accepts. Where it does not, the name is upgraded into the
+/// increment only as [`Candidates::of`] allows.
 fn resolve_group(
-    index: &Index,
+    candidates: &Candidates<'_>,
     group: &Dependency,
     excluded: &HashSet<&str>,
-    assume_installed: &InstalledSet,
     required_by: &str,
     selected: &mut BTreeMap<String, Package>,
     queue: &mut VecDeque<String>,
 ) -> Option<Refusal> {
+    let index = candidates.index;
     // An excluded package is never added to `selected`, so a satisfied check
     // over `selected` already ignores exclusions. The base's map carries both
     // its real names and the virtuals those packages provide, so one lookup
@@ -358,7 +560,7 @@ fn resolve_group(
     // so a constrained group is answered by the version actually there rather
     // than by the name being present.
     for atom in group {
-        if base_satisfies(assume_installed, atom) || selected_satisfies(index, selected, atom) {
+        if base_satisfies(candidates.installed, atom) || selected_satisfies(index, selected, atom) {
             return None;
         }
     }
@@ -368,29 +570,29 @@ fn resolve_group(
     // unsatisfied solely by exclusion can be reported against it.
     let mut blocked: Option<String> = None;
     for atom in group {
-        match index.get(&atom.name) {
-            Some(package) if !excluded.contains(atom.name.as_str()) => {
-                // The archive's candidate counts only if it actually meets the
-                // constraint. When it does not, this alternative is no answer
-                // and the search continues — a provider may still supply the
-                // name at a version that is, and a later alternative may too.
-                if meets(atom.constraint.as_ref(), &package.version) {
-                    add(selected, queue, package);
-                    return None;
-                }
-            }
-            // The real package is excluded. One name can be both a real package
-            // and a virtual that others provide, so a provider may still
-            // satisfy the group — which is what apt's own deselection does.
-            // Fall through to the provider lookup, remembering the exclusion in
-            // case nothing else answers.
-            Some(_) => {
+        if excluded.contains(atom.name.as_str()) {
+            // The real package is excluded. One name can be both a real
+            // package and a virtual that others provide, so a provider may
+            // still satisfy the group — which is what apt's own deselection
+            // does. Fall through to the provider lookup, remembering the
+            // exclusion in case nothing else answers.
+            if index.get(&atom.name).is_some() {
                 blocked.get_or_insert_with(|| atom.name.clone());
             }
-            None => {}
+        } else if let Some(package) = candidates.of(&atom.name) {
+            // The candidate counts only if it actually meets the constraint.
+            // When it does not, this alternative is no answer and the search
+            // continues — a provider may still supply the name at a version
+            // that is, and a later alternative may too.
+            if meets(atom.constraint.as_ref(), &package.version) {
+                add(selected, queue, package);
+                return None;
+            }
         }
-        if let Some(provider) = first_available_provider(index, atom, excluded) {
-            let package = index.get(&provider).expect("a provider is a real package");
+        if let Some(provider) = first_available_provider(candidates, atom, excluded) {
+            let package = candidates
+                .of(&provider)
+                .expect("a provider is a real package");
             add(selected, queue, package);
             return None;
         }
@@ -417,7 +619,7 @@ fn resolve_group(
         None => Some(Refusal::Unsatisfiable {
             requirement: render_group(group),
             required_by: required_by.to_string(),
-            available: describe_available(index, assume_installed, group),
+            available: describe_available(candidates, group),
         }),
     }
 }
@@ -435,7 +637,7 @@ fn meets(constraint: Option<&Constraint>, version: &str) -> bool {
 /// dependency: Policy 7.5 gives an unversioned provide no version to compare,
 /// so it cannot answer a versioned question.
 fn base_satisfies(assume_installed: &InstalledSet, atom: &DepAtom) -> bool {
-    let Some(versions) = assume_installed.get(&atom.name) else {
+    let Some(versions) = assume_installed.supplied(&atom.name) else {
         return false;
     };
     match atom.constraint.as_ref() {
@@ -493,22 +695,36 @@ fn render_group(group: &Dependency) -> String {
 }
 
 /// What is actually available for a group's names, for the error's evidence
-/// line: the archive's version, or the base's, whichever exists.
+/// line: what the archives offer, and what the base has.
 ///
 /// This is what separates the two failures a reader has to tell apart — a name
-/// no archive carries, and a name carried at the wrong version. `None` when the
-/// group's names are simply absent everywhere.
-fn describe_available(
-    index: &Index,
-    assume_installed: &InstalledSet,
-    group: &Dependency,
-) -> Option<String> {
+/// no archive carries, and a name carried at the wrong version. A version a
+/// release other than the candidate's offers is named with its release, since
+/// that is the one an install list entry written `name/release` would take.
+/// `None` when the group's names are simply absent everywhere.
+fn describe_available(candidates: &Candidates<'_>, group: &Dependency) -> Option<String> {
+    let index = candidates.index;
     let mut found: Vec<String> = Vec::new();
     for atom in group {
-        if let Some(package) = index.get(&atom.name) {
-            found.push(format!("{} {} in the archive", atom.name, package.version));
+        let offers = index.offers(&atom.name);
+        if let Some((candidate, others)) = offers.split_first() {
+            found.push(format!(
+                "{} {} in the archive",
+                atom.name, candidate.version
+            ));
+            for other in others
+                .iter()
+                .filter(|other| other.version != candidate.version)
+            {
+                found.push(format!(
+                    "{} {} in {}",
+                    atom.name,
+                    other.version,
+                    index.suite(other.origin)
+                ));
+            }
         }
-        if let Some(versions) = assume_installed.get(&atom.name) {
+        if let Some(versions) = candidates.installed.supplied(&atom.name) {
             let rendered: Vec<&str> = versions
                 .iter()
                 .map(|v| v.as_deref().unwrap_or("no version"))
@@ -523,22 +739,23 @@ fn describe_available(
     (!found.is_empty()).then(|| found.join("; "))
 }
 
-/// The first provider of `atom`'s virtual name that is not excluded and that
-/// supplies it at a version the constraint accepts, or `None` when no provider
-/// qualifies. Providers are held in sorted order, so the choice is
+/// The first provider of `atom`'s virtual name that is not excluded and whose
+/// version supplies it at a version the constraint accepts, or `None` when no
+/// provider qualifies. Providers are held in sorted order, so the choice is
 /// deterministic.
 fn first_available_provider(
-    index: &Index,
+    candidates: &Candidates<'_>,
     atom: &DepAtom,
     excluded: &HashSet<&str>,
 ) -> Option<String> {
-    index
+    candidates
+        .index
         .providers(&atom.name)
         .iter()
         .find(|provider| {
             !excluded.contains(provider.as_str())
-                && index
-                    .get(provider)
+                && candidates
+                    .of(provider)
                     .is_some_and(|package| provides_satisfies(package, atom))
         })
         .cloned()
@@ -800,20 +1017,19 @@ mod tests {
     /// `1.0` — the version the test stanzas use, so an unconstrained test reads
     /// exactly as it did before versions were enforced.
     fn assumed(names: &[&str]) -> InstalledSet {
-        names
-            .iter()
-            .map(|name| ((*name).to_string(), vec![Some("1.0".to_string())]))
-            .collect()
+        let mut set = InstalledSet::default();
+        for name in names {
+            set.install(name, Some("1.0"));
+        }
+        set
     }
 
     /// Builds an assume-installed set from explicit `(name, version)` pairs,
     /// for the cases where the base's version is the thing under test.
     fn assumed_at(entries: &[(&str, &str)]) -> InstalledSet {
-        let mut set = InstalledSet::new();
+        let mut set = InstalledSet::default();
         for (name, version) in entries {
-            set.entry((*name).to_string())
-                .or_default()
-                .push(Some((*version).to_string()));
+            set.install(name, Some(version));
         }
         set
     }
@@ -1149,6 +1365,278 @@ mod tests {
             ),
             "the sentence is composed from the parts, not written twice",
         );
+    }
+
+    /// An index over trixie (origin 0), its backports (origin 1), and
+    /// experimental (origin 2), each ranked as its release marks it.
+    fn ranked(primary: &str, backports: &str, experimental: &str) -> Index {
+        use super::super::index::Source;
+        use super::super::release::ReleasePriority;
+        Index::merge(
+            [
+                Source {
+                    origin: 0,
+                    suite: "trixie",
+                    priority: ReleasePriority::Default,
+                    text: primary,
+                },
+                Source {
+                    origin: 1,
+                    suite: "trixie-backports",
+                    priority: ReleasePriority::AutomaticUpgrades,
+                    text: backports,
+                },
+                Source {
+                    origin: 2,
+                    suite: "experimental",
+                    priority: ReleasePriority::NotAutomatic,
+                    text: experimental,
+                },
+            ],
+            "amd64",
+            &super::super::pin::Pins::none(),
+        )
+    }
+
+    /// Each selected package's name, version, and origin.
+    fn chosen(packages: &[Package]) -> Vec<(String, String, usize)> {
+        packages
+            .iter()
+            .map(|p| (p.name.clone(), p.version.clone(), p.origin))
+            .collect()
+    }
+
+    /// An archive where experimental carries a newer `app` that needs a newer
+    /// `libfoo` than trixie's, a `libc6` trixie's already satisfies, and an
+    /// unversioned `helper`.
+    fn experimental_app() -> Index {
+        ranked(
+            &format!(
+                "{}{}{}{}",
+                stanza_at("app", "1.0", "libfoo (>= 1.0)", ""),
+                stanza_at("libfoo", "1.0", "", ""),
+                stanza_at("libc6", "2.41", "", ""),
+                stanza_at("helper", "0.5", "", ""),
+            ),
+            "",
+            &format!(
+                "{}{}{}{}{}",
+                stanza_at("app", "2.0", "libfoo (>= 2.0), libc6 (>= 2.30), helper", ""),
+                stanza_at("libfoo", "2.0", "", ""),
+                stanza_at("libc6", "2.43", "", ""),
+                stanza_at("helper", "0.9", "", ""),
+                stanza_at("newtool", "1.0", "libfoo (>= 2.0)", ""),
+            ),
+        )
+    }
+
+    #[test]
+    fn a_name_resolves_to_the_release_that_outranks_the_rest() {
+        // Without a release named, experimental supplies nothing trixie offers.
+        let selected = resolve(&experimental_app(), &[], &["app".into()], &[]).into_packages();
+        assert_eq!(
+            chosen(&selected),
+            [
+                ("app".into(), "1.0".into(), 0),
+                ("libfoo".into(), "1.0".into(), 0)
+            ],
+        );
+    }
+
+    #[test]
+    fn a_release_named_in_the_install_list_supplies_what_it_needs_and_no_more() {
+        // apt's `app/experimental`: the entry's own version, and each
+        // versioned dependency the candidate cannot meet from the same
+        // release. libc6 2.41 meets `>= 2.30` and stays trixie's; `helper` is
+        // unversioned, which a switch cannot help, and stays trixie's.
+        let selected =
+            resolve(&experimental_app(), &[], &["app/experimental".into()], &[]).into_packages();
+        assert_eq!(
+            chosen(&selected),
+            [
+                ("app".into(), "2.0".into(), 2),
+                ("helper".into(), "0.5".into(), 0),
+                ("libc6".into(), "2.41".into(), 0),
+                ("libfoo".into(), "2.0".into(), 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_switched_dependency_is_seeded_at_its_switched_version() {
+        // The switch happens before anything is selected, as apt makes it when
+        // it reads the command line, so a base package the entry needs newer is
+        // seeded once, at the version the entry needs.
+        let selected = resolve(
+            &experimental_app(),
+            &["libfoo".into()],
+            &["app/experimental".into()],
+            &[],
+        )
+        .into_packages();
+        let libfoo = selected.iter().find(|p| p.name == "libfoo").unwrap();
+        assert_eq!((libfoo.version.as_str(), libfoo.origin), ("2.0", 2));
+    }
+
+    #[test]
+    fn a_candidate_that_meets_the_constraint_but_needs_the_release_is_walked() {
+        // The backports kernel's shape: the metapackage names an image only
+        // backports carries, so that image's candidate already meets the
+        // exact constraint, and the image needs a newer linux-base than the
+        // default release's. A candidate that cannot be installed as things
+        // stand is no answer, so it is walked as a switch is.
+        let index = ranked(
+            &stanza_at("linux-base", "4.12", "", ""),
+            &format!(
+                "{}{}{}",
+                stanza_at(
+                    "linux-image-amd64",
+                    "7.2",
+                    "linux-image-7.2-amd64 (= 7.2)",
+                    ""
+                ),
+                stanza_at("linux-image-7.2-amd64", "7.2", "linux-base (>= 4.17~)", ""),
+                stanza_at("linux-base", "4.17~bpo", "", ""),
+            ),
+            "",
+        );
+        let selected = resolve(
+            &index,
+            &[],
+            &["linux-image-amd64/trixie-backports".into()],
+            &[],
+        )
+        .into_packages();
+        assert_eq!(
+            chosen(&selected),
+            [
+                ("linux-base".into(), "4.17~bpo".into(), 1),
+                ("linux-image-7.2-amd64".into(), "7.2".into(), 1),
+                ("linux-image-amd64".into(), "7.2".into(), 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_lower_ranked_package_needing_more_than_the_candidates_names_the_release() {
+        // A name only experimental offers is its to supply, but its
+        // dependencies resolve to their candidates, as apt's would. The refusal
+        // says which release has the version that would do, which is what an
+        // entry naming that release takes.
+        let rendered = unsatisfiable(resolve(&experimental_app(), &[], &["newtool".into()], &[]));
+        assert!(rendered.contains("libfoo 1.0 in the archive"), "{rendered}");
+        assert!(
+            rendered.contains("libfoo 2.0 in experimental"),
+            "{rendered}"
+        );
+        let selected = resolve(
+            &experimental_app(),
+            &[],
+            &["newtool/experimental".into()],
+            &[],
+        )
+        .into_packages();
+        assert_eq!(names(&selected), ["libfoo", "newtool"]);
+    }
+
+    #[test]
+    fn a_release_that_does_not_carry_the_name_is_refused() {
+        let refusal = resolve(
+            &experimental_app(),
+            &[],
+            &["libfoo/trixie-backports".into()],
+            &[],
+        )
+        .into_refusal();
+        assert!(matches!(
+            &refusal,
+            Refusal::NotInRelease { entry, release }
+                if entry == "libfoo/trixie-backports" && release == "trixie-backports"
+        ));
+        assert_eq!(refusal.required_by(), THE_INSTALL_LIST);
+    }
+
+    #[test]
+    fn a_layer_takes_a_release_named_for_a_name_its_base_holds_older() {
+        // The base has trixie's libfoo 1.0. The entry needs 2.0, which the base
+        // does not meet, so experimental's is switched to and installed into
+        // the increment; the entry naming exactly what the base holds would
+        // select nothing.
+        let selected = resolve_seeded(
+            &experimental_app(),
+            &[],
+            &["app/experimental".into()],
+            &[],
+            &assumed_at(&[("libfoo", "1.0"), ("libc6", "2.41"), ("helper", "0.5")]),
+        )
+        .into_packages();
+        assert_eq!(
+            chosen(&selected),
+            [
+                ("app".into(), "2.0".into(), 2),
+                ("libfoo".into(), "2.0".into(), 2)
+            ],
+        );
+        let held = resolve_seeded(
+            &experimental_app(),
+            &[],
+            &["libfoo/trixie".into()],
+            &[],
+            &assumed_at(&[("libfoo", "1.0")]),
+        )
+        .into_packages();
+        assert!(held.is_empty(), "{:?}", names(&held));
+    }
+
+    #[test]
+    fn a_layer_upgrades_what_its_base_holds_only_as_apt_would() {
+        // Where an increment needs a newer version of something its base has
+        // installed, the version taken is the one apt would upgrade to: never
+        // experimental's, backports' only for a package backports supplied, and
+        // a default release's whenever it is newer. Nothing is downgraded.
+        let index = ranked(
+            &format!(
+                "{}{}{}",
+                stanza_at("from-main", "1.0", "", ""),
+                stanza_at("from-bpo", "0.9", "", ""),
+                stanza_at(
+                    "app",
+                    "1.0",
+                    "from-main (>= 1.1~), from-bpo (>= 1.1~), old (<< 2.0)",
+                    ""
+                ),
+            ),
+            &format!(
+                "{}{}",
+                stanza_at("from-main", "1.1~bpo", "", ""),
+                stanza_at("from-bpo", "1.1~bpo", "", ""),
+            ),
+            &format!(
+                "{}{}",
+                stanza_at("from-main", "2.0", "", ""),
+                stanza_at("old", "1.0", "", ""),
+            ),
+        );
+        let (packages, refusals) = resolve_seeded(
+            &index,
+            &[],
+            &["app".into()],
+            &[],
+            &assumed_at(&[
+                ("from-main", "1.0"),
+                ("from-bpo", "1.0~bpo"),
+                ("old", "2.0"),
+            ]),
+        );
+        assert_eq!(
+            chosen(&packages),
+            [
+                ("app".into(), "1.0".into(), 0),
+                ("from-bpo".into(), "1.1~bpo".into(), 1)
+            ],
+        );
+        let refused: Vec<&str> = refusals.iter().map(Refusal::requirement).collect();
+        assert_eq!(refused, ["from-main (>= 1.1~)", "old (<< 2.0)"]);
     }
 
     #[test]

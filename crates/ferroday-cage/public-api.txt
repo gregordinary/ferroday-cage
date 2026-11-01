@@ -390,6 +390,7 @@ pub ferroday_cage::provision::debian::DebianError::Digest::subject: alloc::strin
 pub ferroday_cage::provision::debian::DebianError::Fetch(ferroday_cage::provision::FetchError)
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Index
 pub ferroday_cage::provision::debian::DebianError::Index::reason: alloc::string::String
+pub ferroday_cage::provision::debian::DebianError::Index::source: core::option::Option<core::io::error::Error>
 pub ferroday_cage::provision::debian::DebianError::Index::subject: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Io
 pub ferroday_cage::provision::debian::DebianError::Io::op: &'static str
@@ -960,10 +961,16 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::gento
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::gentoo::Plan
 #[non_exhaustive] pub struct ferroday_cage::provision::gentoo::PlannedPackage
 pub ferroday_cage::provision::gentoo::PlannedPackage::build_id: u64
+pub ferroday_cage::provision::gentoo::PlannedPackage::build_time: i64
+pub ferroday_cage::provision::gentoo::PlannedPackage::iuse: alloc::string::String
 pub ferroday_cage::provision::gentoo::PlannedPackage::md5: alloc::string::String
 pub ferroday_cage::provision::gentoo::PlannedPackage::name: alloc::string::String
 pub ferroday_cage::provision::gentoo::PlannedPackage::path: alloc::string::String
+pub ferroday_cage::provision::gentoo::PlannedPackage::pdepend: alloc::string::String
+pub ferroday_cage::provision::gentoo::PlannedPackage::rdepend: alloc::string::String
 pub ferroday_cage::provision::gentoo::PlannedPackage::size: u64
+pub ferroday_cage::provision::gentoo::PlannedPackage::slot: alloc::string::String
+pub ferroday_cage::provision::gentoo::PlannedPackage::use_flags: alloc::string::String
 pub ferroday_cage::provision::gentoo::PlannedPackage::version: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::gentoo::PlannedPackage
 impl core::marker::Send for ferroday_cage::provision::gentoo::PlannedPackage

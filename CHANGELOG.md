@@ -154,6 +154,15 @@ consumer upgrading can skip it.
   time linear in the line's length. A few tens of kilobytes of parentheses from
   a mirror overflowed the stack and aborted the host process, and a line of
   hyphens cost the square of its length.
+- Ordering a Gentoo install takes memory linear in the resolution. An unsigned
+  binhost index could make it quadratic: a chain closed by a two-package loop
+  made every round report every package still waiting as a cycle, 1.8 GB for
+  8,000 index records. Each cycle is now found once, and
+  `GentooEvent::DependencyCycle` names its members once, in name order. A cycle
+  is broken only where it waits on nothing outside itself, and a runtime
+  dependency orders its dependent after the build that answered it. One
+  resolution chooses at most 16,384 builds, past twice every package slot the
+  archive publishes, and refuses an index that asks for more.
 - An Alpine bootstrap matches a trigger's path pattern in time bounded by the
   pattern's and the path's lengths. A pattern of many `*`s, from a package's
   signed metadata or a layered base's `triggers` file, could hold the bootstrap
@@ -173,10 +182,24 @@ consumer upgrading can skip it.
   `cache_dir` no longer serve each other's builds: an `x86-64-v3` build could
   reach an `x86-64` root. Containers cached under the previous layout are not
   read again and can be deleted.
+- A Gentoo binary package is held, once its Manifest verifies, to the root it
+  merges into and to what the resolution read about it. Its signed `CHOST` must
+  be one the root's own packages were built for. A root whose database states
+  none takes the first package's, so a replayed plan naming two targets merges
+  nothing. Its `SLOT`, `USE`, `IUSE`, `RDEPEND`, `PDEPEND` and `BUILD_TIME` must
+  be what the unsigned index stated, and its MD5 the index's. A mirror could
+  substitute another architecture's or C library's genuine build, or describe a
+  build other than the one it served. Binhosts sharing a target, such as
+  `x86-64` and `x86-64-v3`, cannot be told apart by anything Gentoo signs, and
+  the guide states that limit.
+- A Gentoo binary package holding more than 16 entries is refused as the
+  entries arrive, before its Manifest is read. A mirror could make the scan
+  that precedes verification spend hours of CPU on millions of empty members.
 - A Debian bootstrap with a `cache_dir` installs from a copy of each package in
   a directory only the run writes, so dpkg reads the bytes the extraction
   verified. It re-read each package from the shared cache, by path, minutes
-  after verifying it.
+  after verifying it. A `cache_dir` that is that directory itself, under
+  whatever path names it, is used as it stands and kept.
 - A Debian bootstrap initializes the dpkg database through the tree's own root,
   so a package that ships `var/lib/dpkg` or `var/lib/dpkg/status` as a symbolic
   link out of the tree cannot make the bootstrap create files on the host.
@@ -304,6 +327,14 @@ consumer upgrading can skip it.
   `.available()` return when the observer cancels. They stop at each mirror the
   release and index walks ask, and a bootstrap also stops before each dpkg wave.
 - `debian::Priority::ALL`, every Debian priority band, most essential first.
+- The Debian provisioner recognizes `loong64`: a `loongarch64` host maps to it,
+  a foreign bootstrap's preflight looks for the `qemu-loongarch64` handler, and
+  the root gets the `/lib64` link the architecture's loader lives under.
+- A Gentoo provision keeps the stage3's signed digest document beside the
+  tarball in `cache_dir`. A resolution reads that copy before asking the
+  archive, and verifies it at every use. A pinned build id then provisions from
+  a populated cache after the archive has dropped the build, for as long as the
+  key that signed the document is in force.
 
 ### Changed
 
@@ -316,10 +347,13 @@ consumer upgrading can skip it.
 - A signature dated more than 30 minutes after the host's clock is refused, and
   on a host whose clock reads before 1970 every signature is. A future-dated
   signature was accepted, and a clock before 1970 skipped the expiration checks.
-- A signature by a key that has since expired is refused, though it is dated
-  within the key's lifetime. It was accepted, so `allow_stale_release` could
-  resolve a historical archive state whose signing keys had all expired; apt
-  refuses it. Installing a kept plan verifies no release, and is unaffected.
+- **Breaking.** A signature by a key that has since expired is refused, though it
+  is dated within the key's lifetime. It was accepted, so `allow_stale_release`
+  could resolve a historical archive state whose signing keys had all expired;
+  apt refuses it. Installing a kept Debian plan verifies no release, and is
+  unaffected. A Gentoo plan, a pinned stage3, and a cached binary package are
+  verified at every use, and stop verifying once the key that signed them
+  lapses.
 - A certificate whose governing self-signature rests on SHA-1 and was made on
   or after 1 February 2023 verifies nothing. One made over SHA-1 before that
   date still grants what it states, as every SHA-1 self-signature did.
@@ -376,13 +410,34 @@ consumer upgrading can skip it.
   the archive's key rotation; a root without it gets the embedded keyring at the
   `fcage-archive-keyring` path. An additional repository whose keyring would
   take either path is refused.
+- **Breaking.** A Debian root carries no apt source, and no keyring, for a
+  repository whose first mirror is a `file://` URL. A sandbox rooted at the tree
+  does not see that host path, and a `file://` primary leaves no `sources.list`.
+  A repository allowing a stale release writes `check-valid-until=no` into its
+  source, so the root's apt accepts the release the bootstrap accepted. The
+  guide shows how to make a local pool visible to the root's apt.
+- **Breaking.** `DebianBuilder::build` and `debian::RepositoryBuilder::build`
+  refuse a keyring named together with `trust_unsigned(true)`, with
+  `DebianError::Config`. The keyring was ignored.
+- **Breaking.** A Debian resolution ranks repositories as apt does by default. A
+  release marked `NotAutomatic`, such as `experimental`, or `NotAutomatic` with
+  `ButAutomaticUpgrades`, such as a backports suite, supplies a package only
+  where no higher-ranked repository offers it. It supplied one wherever its
+  version was higher. An `include` entry written `name/release`, in
+  `fcage --debian-include` as well, installs the package from the repository
+  configured with that suite, with the versioned dependencies it needs. `build`
+  refuses an entry naming a suite no repository is configured with. The base
+  system is seeded from the primary repository alone, and a layered build
+  upgrades what its base holds only as apt would, never downgrading it.
 - **Breaking.** `debian::DebianError::HashMismatch { path, .. }` is
   `DebianError::Digest { subject, expected, actual }`, the shape the Alpine and
   Gentoo errors use: `subject` is the URL the bytes were fetched from, or the
   path of a cached package. `Signature`, `Release`, and `Index` gain a
   `subject`, the URL of the release or of the index. A release that lists no
   index for a component is reported as `Release`, and an index that does not
-  decompress as `Index` rather than `Io`.
+  decompress as `Index` rather than `Io`, with the decoder's failure as its
+  `source`. An index that expands past its stated length is reported apart from
+  one that does not decode.
 - **Breaking.** A host failure on the download path, in staging, writing,
   reading back, or publishing a download, and a package cache that cannot be
   created, are `ProvisionError::Io` in every layer. Gentoo reported both, and
@@ -416,9 +471,22 @@ consumer upgrading can skip it.
   `Available::variants`.
 - **Breaking.** `debian::build_depend_names` takes the architecture the root is
   built for, and evaluates each alternative's architecture restriction against
-  it: literal names, `any`, `<os>-any`, and `any-<cpu>`. It chooses the first
-  alternative that applies. The restrictions were ignored, so a control file
-  with a `[hurd-any]` dependency failed to resolve.
+  it: literal names, `any`, `<os>-any`, and `any-<cpu>`. It takes each
+  alternative that applies, in order, up to the first that no build profile
+  restricts, so its answer covers every profile selection. The restrictions were
+  ignored, so a control file with a `[hurd-any]` dependency failed to resolve. A
+  comment line in `debian/control` is skipped rather than read as a field.
+- **Breaking.** `gentoo::PlannedPackage` gains `slot`, `use_flags`, `iuse`,
+  `rdepend`, `pdepend` and `build_time`, which a plan document records as
+  `Slot`, `Use`, `Iuse`, `Rdepend`, `Pdepend` and `Build-Time`. A plan document
+  without `Slot` and `Build-Time` is refused; resolve it again. A merged
+  package's `BINPKGMD5` is the container's own MD5 rather than the index's.
+- **Breaking.** An archive coordinate holding a character a URL path cannot
+  carry as written, such as `%`, `?`, `#`, or one outside ASCII, is refused at
+  `build`. That covers a Debian or Alpine suite, release, component or
+  architecture, a pool's coordinates, and a Gentoo architecture, build id or
+  binhost. Such a value passed the builder and then failed every fetch, or
+  reached the server decoded as something else.
 - **Breaking.** `ConfigError::OverlayUpperIsRoot` is
   `ConfigError::OverlayLayerIsRoot`, which names the layer, so a work directory
   at `/` is no longer reported as an upper. It also covers a layer path ending
@@ -469,10 +537,17 @@ consumer upgrading can skip it.
 - An Alpine install script runs with exactly the environment `apk` gives one:
   `PATH`, `APK_SCRIPT` and `APK_PACKAGE`, plus `SOURCE_DATE_EPOCH` where one is
   set. It also received `HOME=/root`.
+- A Debian bootstrap and a layered build replace `start-stop-daemon` with a
+  stand-in that starts nothing while packages configure, as debootstrap does,
+  and restore it afterwards. A maintainer script that starts its daemon
+  directly no longer runs it during the build.
 - `DebianBuilder::build` and `debian::RepositoryBuilder::build` parse a caller's
   keyring and refuse one holding no key whose signatures can be verified, such
-  as one of DSA keys alone, with `DebianError::Config`. A bad keyring failed only
-  after the first release had been fetched.
+  as one of DSA keys alone, with `DebianError::Config`. A bad keyring failed
+  only after the first release had been fetched. A certificate the verifier
+  cannot read, such as a version 3 or 5 key or an exported secret key, is passed
+  over, as `gpgv` passes it over, and a refusal names the first one passed over.
+  A keyring whose packet framing is damaged is refused whole.
 - A signature by a revoked certificate is refused with the revocation and the
   key named. The certificate was dropped as the keyring was read, so the refusal
   said only that no key in the keyring had made a signature. A caller's keyring
@@ -484,10 +559,10 @@ consumer upgrading can skip it.
   and `/`, so a path holding a space, a newline, or a non-UTF-8 byte names one
   URL, and the bundled fetcher decodes it back. It no longer fails for a
   non-UTF-8 path.
-- A plan document's numbers are read as the writer spells them: digits, with a
-  sign only where the field can be negative. A `Size` of `+5`, or an archive or
-  index stanza numbered `+1`, is refused rather than read and written back
-  differently.
+- A plan document's numbers are read only as the writer spells them: digits,
+  with no leading zero, and a sign only where the field can be negative. A
+  `Size` of `+5` or `0010`, a `-0`, or an archive or index stanza numbered
+  `+1`, is refused rather than read and written back differently.
 - The guide's recipe for a reproducible provenance record declares the procfs a
   container needs, and the doctests run it. As written it failed `build`.
 - **Breaking.** `CertificateHorizon::expires` is a `gentoo::Expiry`: a date,
@@ -623,6 +698,10 @@ consumer upgrading can skip it.
   entry that is not a directory is refused over a directory the base holds, and
   one beneath a base directory the calling user cannot search fails naming the
   entry.
+- A layered build's `stage_layer`, in all three layers, removes the overlay
+  upper on failure only where the call created it. An upper that already
+  existed is the caller's and stays, holding whatever the failed call wrote into
+  it. Any failure removed it, and the earlier increments it held.
 - A layered Gentoo build reads the base's package database as the overlay shows
   it. An entry the upper whites out, or hides under an opaque directory, no
   longer counts as installed, and an entry a command in the sandbox changed one
@@ -663,6 +742,10 @@ consumer upgrading can skip it.
   `ensure` checks after taking the lock that the lock file it holds is still the
   one at the path. A removal running beside a publication of the same
   destination could let two provisioners run at once.
+- `provision::ensure` removes its staging tree when the tree cannot be synced or
+  published, as it does when the provisioner fails. Its final rename no longer
+  replaces an empty directory another process made at the destination after the
+  check: the publication fails and leaves that directory in place.
 - The Debian package pool's publish lock is close-on-exec, so a process spawned
   during a publish no longer keeps the pool locked after the publish returns.
   The export's internal duplicate of its frame stream is close-on-exec as well.
@@ -679,6 +762,11 @@ consumer upgrading can skip it.
   same run, as an Alpine one already was. A corrupt `.deb` the batched prefetch
   did not deliver was kept, and every later run failed extracting it; a Gentoo
   stage3 or binary package failed the run.
+- A write the package cache refuses while a download arrives, such as on a full
+  disk, is reported as `ProvisionError::Io` naming the staging file, and stops
+  the mirror walk. It was reported as the mirror's failure, so each mirror in
+  turn downloaded as much as fitted and the last was blamed. A batched download
+  stops at the same failure.
 - A `DebianObserver` or `AlpineObserver` bound with `observe` stops a
   provisioning run when its `cancelled` answers true. A Debian run consulted only
   the `Provision` observer, and an Alpine one only for a layered build. A Debian
@@ -687,6 +775,12 @@ consumer upgrading can skip it.
   still stops at the batch's end.
 - `DebianEvent::Downloading` counts the packages being downloaded rather than the
   plan's, as `AlpineEvent::Downloading` does.
+- A Debian repository whose release declares `Acquire-By-Hash` is read from a
+  mirror or a proxy that serves only the named index files, as apt reads it. An
+  index the by-hash path does not serve is asked for by name, and one served
+  there with the wrong digest is still refused.
+- `Debian::stage_layer` lays the pre-configure overlay into an increment that
+  installs nothing, as it does into any other.
 - A Debian or Alpine pin holding a version two repositories offer over different
   bytes selects the repository recording the pinned bytes. Debian took the
   earlier repository's copy and Alpine the later one's, and refused the pin
@@ -712,10 +806,29 @@ consumer upgrading can skip it.
   `GentooEvent::Conflict` gains `stated_in_root`. A root whose database holds a
   runtime dependency class that does not parse is refused by
   `gentoo::installed`.
-- A Gentoo root whose merge counter cannot take another ordinal is refused
-  before anything is merged, rather than panicking or wrapping.
+- A Gentoo any-of dependency is taken as portage takes it. An alternative that
+  lists several packages together, such as `virtual/zlib`'s zlib-ng with
+  minizip-ng, is satisfied only by all of them, rather than by any one. An
+  alternative that would take a slot the root or the resolution already holds
+  gives way to the next, rather than refusing the group.
+- Replaying a Gentoo plan holds it to the root it installs into. A package the
+  root already has at the planned version is skipped. The rest are verified,
+  and their signed metadata is checked for an occupied slot and for blockers
+  either way, before anything is merged. A plan replayed over a newer stage3
+  registered two versions of one package in one slot.
+- A Gentoo merge continues the merge ordinal from the greater of the root's
+  counter file and every ordinal its package database records, as portage does.
+  A removed or rolled-back counter file reissued an ordinal. A root whose
+  counter cannot take another ordinal is refused before anything is merged,
+  rather than panicking or wrapping.
 - A Gentoo binary package holding a member twice, or two image or metadata
-  archives, is refused.
+  archives, is refused. So is one whose metadata archive inflates past 16 MiB,
+  whichever of its entries hold the bytes. A symbolic link whose target is not
+  UTF-8 is refused rather than recorded with the target altered.
+- A Gentoo binary package that is cut short, or that ships a path its database
+  entry cannot record, is reported as `GentooError::Container` naming the
+  package. It was reported as a host I/O failure, or as the root's database
+  being unreadable.
 - A mirror that redirects to an `https://` URL, which the bundled client cannot
   follow, is a mirror that could not serve the request, so a walk over several
   mirrors asks the next one. It ended the walk as a malformed URL. The refusal
@@ -730,6 +843,18 @@ consumer upgrading can skip it.
   read as a list in which only one `chunked` is accepted, and a folded header
   line continues the field before it rather than starting a new one. The tar
   reader refuses a pax number with a sign.
+- The bundled HTTP client keeps a connection after a refusal whose page is
+  framed and small, such as a 404, as it already did after a redirect. Falling
+  back to another index encoding on one mirror no longer opens a new connection.
+  A server may answer `408 Request Timeout` as it closes an idle connection. On a
+  reused connection the request is then retried once on a fresh one, where the
+  mirror was reported as failed.
+- `HttpFetch::timeouts` takes a zero timeout as none, for connecting or for each
+  read, where it failed every connection. Every step is also held to the
+  fetch's `request_timeout`, which now bounds a fetch's total time.
+- `HttpFetch::fetch_all` no longer panics when the host refuses to start a
+  worker thread, as a task limit does. It fetches with the workers that started,
+  and on the calling thread where none did.
 - An xz block that chains more than one filter before LZMA2 decodes. Since
   0.4.2 such a block was refused. `xz` writes at most one such filter, so no
   archive it produced was affected.
@@ -761,6 +886,10 @@ consumer upgrading can skip it.
 - `ErrorChain` is the one walk of an error's causes, recorded in the idiom
   census, and every place the library turns one of its own errors into a text
   reason renders it through `ErrorChain`.
+- `path::parent_of` names the directory a path's final component is in, `.` for
+  a bare name. A publication and its lock, a removal, the staging file, a cache
+  entry, the export, an overlay layer, and a build layer's upper ask it. The
+  idiom census records it.
 - The host side's reading and writing of a tree is `provision::containment` and
   `provision::rooted`. `containment::create_dirs` creates a chain of missing
   directories for the extractor and `Rooted` alike, and `containment::copy_up`
@@ -770,6 +899,8 @@ consumer upgrading can skip it.
   both bootstraps ask. `containment::open_typed_file` opens a file a walk just
   inspected for `Rooted`, the export child and `CopyIn`, and `open_created_fifo`
   opens a named pipe just created for the extractor and the copy-in child.
+- `provision::layer::Staging` takes a build layer's upper for the `stage_layer`
+  of all three layers, and removes it on failure only where it created it.
 - `provision::cache` holds the package cache: `PackageCache`, the one way a
   cache directory is created, the one way an entry is opened, and the one
   staged, verified download path, mirror walk and batch alike, for all three
@@ -792,6 +923,8 @@ consumer upgrading can skip it.
   bootstraps share, and `binfmt::preflight` the one refusal of a foreign
   bootstrap. `provision::fetch::percent_decode`, moved out of the Debian index
   reader, decodes a URL's escapes for that reader and the bundled fetcher alike.
+- `provision::debian::bootstrap::is_configured` is the one reading of a dpkg
+  `Status` field, for a bootstrap's verification and a layer's view of its base.
 - `mechanism::overlay_options` composes an overlay's mount options for a build
   and for the host probe, `spec::validate_command` validates the command for both
   builders, and `MountAction::arrival` reads what a mount op brings to rest on
@@ -822,8 +955,8 @@ consumer upgrading can skip it.
   trait as the SHA-2 ones.
 - `tools/rust_source.py` is the one reading of a source file the census tools
   take: every comment and every test-only item removed. `tools/check-seam.py`
-  expands grouped imports and resolves `super::` paths, and finds 38 reaches
-  past the provisioning seam, ten of them internal. `tools/check-parity.py`
+  expands grouped imports and resolves `super::` paths, and finds 40 reaches
+  past the provisioning seam, twelve of them internal. `tools/check-parity.py`
   finds every builder in the API snapshot rather than a list of them, which
   brings it to 23. `tools/check-keyrings.py` reports a keyring Debian adds.
   `tests/stability.rs` fails on a public enum or struct variant without

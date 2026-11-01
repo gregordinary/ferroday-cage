@@ -404,6 +404,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What can a configured absolute path contain? | `path::absolute_components` |
 | What can a path naming something inside a tree contain? | `path::tree_components` |
 | What can one path component contain? | `path::is_ordinary_component` |
+| What directory is a path's final component named in, as a path an `open` takes? | `path::parent_of` |
 | Resolve a path the kernel keeps inside a tree, retrying a raced walk | `mechanism::resolve::openat2` |
 | Open a directory inside a tree being provisioned | `provision::containment::open_dir`, or `containment::open_dir_path` after a fork |
 | Create the missing directories of a chain inside a tree | `provision::containment::create_dirs` |
@@ -417,6 +418,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Remove or empty a file in such a tree only where what holds the name is approved | `Rooted::remove_if`, `Rooted::truncate_if`, judged by `Rooted::is_file_with_content` or `Rooted::is_whiteout` |
 | Rewrite a file in place, keeping the owner and mode a script gave it | `Rooted::overwrite` |
 | Lay a host tree into a root | `provision::CopyIn`, or `extract::overlay_tree` between configure waves |
+| Stage a layer into an overlay upper, removing the upper on failure only where this call created it | `provision::layer::Staging` |
 | Remove a tree a sandbox wrote, however deep | `provision::remove_tree`, which `provision::Remove` reaches from outside the crate, over the walk in `mechanism::delete_tree` |
 | Take a lock file | `provision::lock_exclusive` |
 | Write a file beside its destination and publish it by rename | `provision::Staged`, or `provision::write_atomically` for bytes in hand |
@@ -425,10 +427,12 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `alpine::version::Constraint::satisfied_by`, `debian::version::Constraint::satisfied_by` |
 | What version does a `Provides`-style entry supply a name at? | `provision::alpine::version::Constraint::exact_version`, `debian::version::Constraint::exact_version` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
+| Which targets does a Gentoo root accept a binary package built for? | `provision::gentoo::Installed::targets`, held by `gpkg::check_target` |
 | Which slot does a `slot/subslot` value name? | `provision::gentoo::installed::slot_of` |
 | Where does a Gentoo `name-version` end its name? | `provision::gentoo::version::version_hyphen` |
 | What did one resolution refuse, and how does it read? | `provision::gentoo::resolve::Refusals`, `debian::resolve::Refusals` |
 | What does a finished root not keep of the bootstrap that built it? | `provision::debian::bootstrap::clear_run_state`, `alpine::bootstrap::clear_run_state` |
+| Does a dpkg `Status` field mean the package is present and configured? | `provision::debian::bootstrap::is_configured` |
 | Read or rewrite the days a bootstrap's account tools recorded in `/etc/shadow` | `provision::accounts` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag`, `atom::use_flag` |
@@ -450,7 +454,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Is this failure one to ask the next mirror about? | `provision::Failover` |
 | Name a local path as a `file://` URL | `provision::file_url` |
 | Decode a URL's percent escapes | `provision::fetch::percent_decode` |
-| Where does a run keep its downloads, and is that directory its own? | `provision::cache::PackageCache` |
+| Where does a run keep its downloads, and is that directory its own? | `provision::cache::PackageCache`, and `PackageCache::is_derived` for whether a directory a caller named is the run's own |
 | Download into a package cache, checked before it is published there | `provision::cache::download`, or `cache::prefetch` for a batch |
 | Create a package cache, or open what it holds at a name | `provision::cache::create`, `cache::open_entry` |
 | What time is it, as a Unix timestamp? | `provision::now_epoch` |

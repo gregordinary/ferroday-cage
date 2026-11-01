@@ -17,16 +17,20 @@
 //! Each caller needs a different error type, so a refusal is reported as a
 //! value the caller maps into its own vocabulary.
 //!
+//! One question about a path's shape rather than its contents is answered here
+//! too, since every module that places a file beside a path asks it:
+//! [`parent_of`], the directory a path's final component is named in.
+//!
 //! # What is not here
 //!
 //! Two other kinds of path check live elsewhere, each for a reason:
 //!
 //! - **An archive coordinate** — a release, a component, or an architecture —
 //!   is checked by `provision::coordinate`, which additionally refuses
-//!   whitespace and control characters. Those refusals are about the release
-//!   format's whitespace-delimited lists and about the HTTP request line every
-//!   fetch interpolates the value into, neither of which a mount target has
-//!   anything to do with.
+//!   whitespace, control characters, and any other character a URL path cannot
+//!   carry as written. Those refusals are about the release format's
+//!   whitespace-delimited lists and about the URL every fetch interpolates the
+//!   value into, neither of which a mount target has anything to do with.
 //! - **A network interface name** is checked by `netstack`, against the
 //!   kernel's own `dev_valid_name`: `IFNAMSIZ` is a hard 16-byte ceiling that
 //!   belongs to no other path.
@@ -166,6 +170,24 @@ pub(crate) fn tree_components(path: &[u8], leading: LeadingSlash) -> Result<Vec<
 /// applies before sending it.
 pub(crate) fn is_ordinary_component(name: &[u8]) -> bool {
     !matches!(name, b"" | b"." | b"..") && !name.contains(&b'/') && !name.contains(&0)
+}
+
+/// The directory `path`'s final component is named in, as a path an `open`
+/// takes: its parent, or `.` for a bare relative name.
+///
+/// [`Path::parent`] answers a bare name's parent as the empty path, which
+/// names nothing the kernel will open, create, or probe, and joining a sibling
+/// onto it drops the directory altogether. Every caller that opens a path's
+/// directory, creates it, or places a file beside the path asks this instead.
+///
+/// A path with no parent at all, the root or the empty path, answers `.` as
+/// well. A caller that needs the final component refuses such a path for
+/// lacking one, before it asks.
+pub(crate) fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +335,22 @@ mod tests {
                 .iter()
                 .all(|component| is_ordinary_component(component.as_bytes())),
         );
+    }
+
+    #[test]
+    fn a_bare_name_is_named_in_the_working_directory() {
+        // The empty parent `Path::parent` gives a bare name is no path the
+        // kernel opens, so it is answered as `.`.
+        for (path, parent) in [
+            ("rootfs", "."),
+            ("./rootfs", "."),
+            ("var/rootfs", "var"),
+            ("/var/lib/rootfs", "/var/lib"),
+            ("/rootfs", "/"),
+            ("/", "."),
+            ("", "."),
+        ] {
+            assert_eq!(parent_of(Path::new(path)), Path::new(parent), "{path:?}");
+        }
     }
 }

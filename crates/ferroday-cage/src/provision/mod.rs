@@ -1070,13 +1070,19 @@ impl Remove {
 /// after publication cannot leave truncated files behind the completed
 /// rename.
 ///
+/// The rename replaces nothing. A process that does not take the lock may
+/// create `dest` after the check, and the publication then fails and leaves
+/// what it made in place. A filesystem that does not support
+/// `RENAME_NOREPLACE`, such as NFS, takes a plain rename instead, which
+/// replaces such a directory if it is empty.
+///
 /// # Errors
 ///
 /// Returns [`ProvisionError::DestUnusable`] when `dest` cannot host a
 /// rootfs directory, any error of the provisioner itself, and
 /// [`ProvisionError::Io`] for failures of the publication machinery. When
-/// the provisioner fails, the staging directory is removed and `dest` is
-/// left absent.
+/// the provisioner fails, or the tree it built cannot be synced or published,
+/// the staging directory is removed and `dest` is left as it was.
 ///
 /// The two cleanups — the failed run's staging tree, and a previous run's stale
 /// one — escalate with [`IdentityMap::Subordinate`](crate::IdentityMap::Subordinate)
@@ -1110,18 +1116,16 @@ fn ensure_inner(
         Err(_) => {}
     }
 
-    let Some(name) = dest.file_name() else {
+    // A path with no final component names no directory to publish, and has
+    // no lock beside it.
+    let (Some(name), Some(lock_path)) = (dest.file_name(), lock_path(dest)) else {
         return Err(ProvisionError::DestUnusable {
             path: dest.to_path_buf(),
         });
     };
-    let parent = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    let parent = crate::path::parent_of(dest);
     fs::create_dir_all(parent).map_err(|err| ProvisionError::io("creating", parent, err))?;
 
-    let lock_path = parent.join(lock_name(name));
     // Held until this function returns, on the failure paths as on success.
     let _lock =
         lock_exclusive(&lock_path).map_err(|err| ProvisionError::io("locking", &lock_path, err))?;
@@ -1165,20 +1169,13 @@ fn ensure_inner(
         }
         None => provisioner.provision(&ProvisionRequest::new(&staging)),
     };
-    if let Err(err) = outcome {
+    // A tree that failed to provision, or that could not be published, is
+    // removed rather than left beside the destination. It may be a whole root
+    // owned by subordinate ids, which the caller could not remove by hand.
+    if let Err(err) = outcome.and_then(|()| publish(&staging, dest)) {
         let _ = remove_tree(&staging, &crate::IdentityMap::Subordinate, None);
         return Err(err);
     }
-
-    // Sync the staging tree's filesystem before the rename, so the rename
-    // cannot become durable ahead of the data it publishes.
-    let staging_dir =
-        fs::File::open(&staging).map_err(|err| ProvisionError::io("opening", &staging, err))?;
-    rustix::fs::syncfs(&staging_dir)
-        .map_err(|errno| ProvisionError::io("syncing", &staging, errno.into()))?;
-    drop(staging_dir);
-
-    fs::rename(&staging, dest).map_err(|err| ProvisionError::io("publishing", dest, err))?;
 
     let parent_dir =
         fs::File::open(parent).map_err(|err| ProvisionError::io("opening", parent, err))?;
@@ -1187,6 +1184,39 @@ fn ensure_inner(
         .map_err(|err| ProvisionError::io("syncing", parent, err))?;
 
     Ok(Provisioned::Created)
+}
+
+/// Publishes the complete tree at `staging` as `dest`, by a rename that
+/// replaces nothing.
+///
+/// The staging tree's filesystem is synced first, so the rename cannot become
+/// durable ahead of the data it publishes.
+///
+/// [`ensure`] found nothing at `dest` under the lock, but the lock binds only
+/// callers that take it. A plain `rename(2)` would replace an empty directory
+/// another process made there since, so the rename is `RENAME_NOREPLACE`, and
+/// whatever is at `dest` by then is left as it is. A filesystem that cannot
+/// promise that, such as NFS, refuses the flag with `EINVAL`. There the
+/// rename is a plain one, which still refuses a non-empty directory.
+fn publish(staging: &Path, dest: &Path) -> Result<(), ProvisionError> {
+    let staging_dir =
+        fs::File::open(staging).map_err(|err| ProvisionError::io("opening", staging, err))?;
+    rustix::fs::syncfs(&staging_dir)
+        .map_err(|errno| ProvisionError::io("syncing", staging, errno.into()))?;
+    drop(staging_dir);
+
+    let cwd = rustix::fs::CWD;
+    let renamed = match rustix::fs::renameat_with(
+        cwd,
+        staging,
+        cwd,
+        dest,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Err(Errno::INVAL) => fs::rename(staging, dest),
+        renamed => renamed.map_err(io::Error::from),
+    };
+    renamed.map_err(|err| ProvisionError::io("publishing", dest, err))
 }
 
 /// Removes a rootfs directory, including one a range-mapped sandbox has
@@ -1313,11 +1343,7 @@ fn lock_name(name: &std::ffi::OsStr) -> OsString {
 /// final component, which [`ensure`] refuses to publish at.
 fn lock_path(dest: &Path) -> Option<PathBuf> {
     let name = dest.file_name()?;
-    let parent = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    Some(parent.join(lock_name(name)))
+    Some(crate::path::parent_of(dest).join(lock_name(name)))
 }
 
 /// How many times [`lock_exclusive`] takes its lock again after the file it
@@ -1462,10 +1488,7 @@ fn parent_and_leaf(dest: &Path) -> Result<(&Path, std::ffi::CString), ProvisionE
             path: dest.to_path_buf(),
         });
     };
-    let parent = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    let parent = crate::path::parent_of(dest);
     let leaf = std::ffi::CString::new(leaf.as_bytes()).map_err(|_| {
         ProvisionError::io(
             "removing",
@@ -1604,7 +1627,7 @@ impl Staged {
     /// and checked through the descriptor that wrote it, before it is
     /// published, rather than through a second open of a name.
     pub(crate) fn beside(dest: &Path) -> io::Result<(Staged, fs::File)> {
-        let dir = dest.parent().unwrap_or(Path::new("."));
+        let dir = crate::path::parent_of(dest);
         let name = dest.file_name().unwrap_or(dest.as_os_str());
         let mut staging = OsString::from(".");
         staging.push(name);
@@ -1655,8 +1678,9 @@ impl Drop for Staged {
 /// Writes bytes to `dest` atomically, through a [`Staged`] file renamed onto
 /// it.
 ///
-/// For bytes already in hand, such as a pool's index files. What arrives as a
-/// stream is staged the same way at the point it is written to disk.
+/// For bytes already in hand, such as a pool's index files or a digest document
+/// a cache keeps. What arrives as a stream is staged the same way at the point
+/// it is written to disk.
 ///
 /// The staging file is not synced before the rename. What a reader takes from
 /// these files is verified against a digest, so a file left short by a crash is
@@ -1665,7 +1689,7 @@ impl Drop for Staged {
 ///
 /// Errors name the staging file only when the failure is the staging file's
 /// own; the caller wraps them against the destination it asked for.
-#[cfg(feature = "debian")]
+#[cfg(any(feature = "debian", feature = "gentoo"))]
 pub(crate) fn write_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
@@ -2050,6 +2074,56 @@ mod tests {
         fs::write(&dest, b"file in the way").unwrap();
         let err = ensure(&dest, &mut Touch).unwrap_err();
         assert!(matches!(err, ProvisionError::DestUnusable { .. }), "{err}");
+    }
+
+    /// A provisioner that succeeds having made `dest` itself, as a process that
+    /// takes no lock could while the tree is built, with `occupant` in it where
+    /// one is named.
+    struct Preempted {
+        dest: PathBuf,
+        occupant: Option<&'static str>,
+    }
+
+    impl Provisioner for Preempted {
+        fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
+            fs::write(request.staging().join("marker"), b"provisioned").unwrap();
+            fs::create_dir(&self.dest).unwrap();
+            if let Some(occupant) = self.occupant {
+                fs::write(self.dest.join(occupant), b"theirs").unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_publication_replaces_nothing_and_leaves_no_staging_behind() {
+        // The lock binds only the callers that take it. A directory another
+        // process made at the destination after the check stays as it is,
+        // empty or not, and the tree that could not be published goes rather
+        // than staying beside it.
+        for occupant in [None, Some("theirs")] {
+            let dir = Scratch::for_test("provision", "preempted");
+            let dest = dir.join("rootfs");
+            let mut provisioner = Preempted {
+                dest: dest.clone(),
+                occupant,
+            };
+            let err = ensure(&dest, &mut provisioner).expect_err("the destination was taken");
+            assert!(matches!(err, ProvisionError::Io { .. }), "{err}");
+            let held: Vec<_> = fs::read_dir(&dest)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                held,
+                occupant.into_iter().map(OsString::from).collect::<Vec<_>>(),
+                "what was made at the destination is left as it was",
+            );
+            assert!(
+                !dir.join(".rootfs.staging").exists(),
+                "the staging tree is removed",
+            );
+        }
     }
 
     #[test]

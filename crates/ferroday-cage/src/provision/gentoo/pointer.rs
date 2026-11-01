@@ -13,8 +13,8 @@
 //! Gentoo publishes no deadline of any kind: no `Valid-Until`, and no
 //! expiration on the signature itself. Without a bound, a mirror serving a
 //! genuinely signed but months-old pointer and its matching digest document
-//! passes every check there is — the signature verifies, the key was valid when
-//! it signed, the digest matches the bytes — which is a rollback, and the
+//! passes every check there is — the signature verifies, the key that made it is
+//! still in force, the digest matches the bytes — which is a rollback, and the
 //! standard attack on a chain with no deadline.
 //!
 //! The document closes it itself. Inside the signed body, above the entries:

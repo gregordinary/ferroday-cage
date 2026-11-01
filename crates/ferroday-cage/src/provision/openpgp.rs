@@ -107,24 +107,41 @@ impl Keyring {
     /// revocation and the key. So is an expired one, even for a signature
     /// dated while it was in force: the date is its signer's claim.
     ///
+    /// A certificate irongall refuses to read is passed over, and the rest of
+    /// the keyring read without it, as `gpgv` does. A primary key of a version
+    /// irongall does not read, such as 3 or 5, is one. A secret key exported
+    /// beside the public ones is another, as is a certificate holding a packet
+    /// no certificate holds. Each refuses only itself, so a vendor's export that
+    /// still carries an old version 3 key verifies with the certificates beside
+    /// it.
+    ///
+    /// The packet framing is not passed over. A failure there leaves nothing
+    /// after it locatable, and might cut a certificate short of its
+    /// revocations, so a keyring whose framing fails anywhere is refused whole.
+    /// Such bytes are damaged rather than exotic: a packaging or transport
+    /// fault, worth telling the caller about where it happened rather than
+    /// later, as an archive whose signature does not verify.
+    ///
     /// A keyring holding no key whose signatures can be verified at all is
     /// refused: one that is empty, or whose every key is of an algorithm
     /// irongall does not verify with, such as DSA, could vouch for nothing.
     /// That is a property of the keys alone, so asking it verifies no
-    /// signature.
-    ///
-    /// One certificate that fails to parse fails the whole keyring, where `gpg`
-    /// would skip the bad entry and use the rest. irongall already reads a key
-    /// of a version or algorithm it does not implement as opaque, so an error
-    /// surviving to here means the bytes are damaged rather than exotic. A
-    /// damaged keyring is a packaging or transport fault worth telling the
-    /// caller about directly; continuing with silently fewer trust anchors
-    /// would report it much later, as an archive whose signature does not
-    /// verify.
+    /// signature. The refusal names the first certificate passed over, where
+    /// one was.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Keyring, OpenPgpError> {
+        // The framing is read on its own first. irongall reads on past a
+        // certificate it refuses and stops at a framing failure, yielding each
+        // the same way, so a keyring whose framing reads whole is one in which
+        // every refusal is a single certificate's.
+        irongall::packet::packets(bytes)
+            .try_for_each(|packet| packet.map(drop))
+            .map_err(|err| {
+                OpenPgpError::Keyring(format!("the keyring's packet framing is damaged: {err}"))
+            })?;
+        let mut passed_over = Vec::new();
         let certificates: irongall::keyring::Keyring = cert::certificates(bytes)
-            .collect::<Result<_, _>>()
-            .map_err(|err| OpenPgpError::Keyring(err.to_string()))?;
+            .filter_map(|certificate| certificate.map_err(|err| passed_over.push(err)).ok())
+            .collect();
         let policy = policy(true);
         let verifiable = certificates
             .certificates()
@@ -135,9 +152,15 @@ impl Keyring {
             })
             .any(|key| policy.accepts_key(key));
         if !verifiable {
-            return Err(OpenPgpError::Keyring(
-                "the keyring holds no key whose signatures can be verified".to_string(),
-            ));
+            let unusable = "the keyring holds no key whose signatures can be verified";
+            return Err(OpenPgpError::Keyring(match passed_over.as_slice() {
+                [] => unusable.to_string(),
+                [only] => format!("{unusable}, and one certificate was passed over: {only}"),
+                [first, ..] => format!(
+                    "{unusable}, and {} certificates were passed over, the first: {first}",
+                    passed_over.len(),
+                ),
+            }));
         }
         Ok(Keyring { certificates })
     }
@@ -492,6 +515,13 @@ mod tests {
         // judged per signature at verify time.) This pins the key-validity
         // computation against the real keyring.
         let keyring = Keyring::parse(crate::provision::debian::EMBEDDED_KEYRING).unwrap();
+        // `parse` passes over a certificate irongall cannot read, so this is
+        // what says the vendored keyring lost none of them.
+        assert!(
+            cert::certificates(crate::provision::debian::EMBEDDED_KEYRING)
+                .all(|certificate| certificate.is_ok()),
+            "irongall reads every vendored certificate",
+        );
         let now = now().expect("the clock is after the epoch");
         let certificates = keyring.certificates.certificates();
         assert!(!certificates.is_empty());
@@ -649,10 +679,10 @@ mod tests {
 
     #[test]
     fn a_subkey_signed_release_verifies() {
-        // The regression under test: Debian signs InRelease with a dedicated
-        // signing subkey, not the primary. A release clear-signed by a cert's
-        // signing subkey must verify against a keyring holding that cert — the
-        // whole-archive case the primary-only path used to reject.
+        // Debian signs InRelease with a dedicated signing subkey, not the
+        // primary. A release clear-signed by a cert's signing subkey verifies
+        // against a keyring holding that cert, which is the case every real
+        // Debian release is.
         let archive =
             test_key_with_signing_subkey("archive <archive@test.invalid>", Timestamp::now());
         let subkey_secret = archive.secret_subkeys.first().expect("a signing subkey");
@@ -675,9 +705,8 @@ mod tests {
     fn a_real_subkey_signed_debian_release_verifies() {
         // A frozen, real Debian `forky` InRelease verifies against the embedded
         // archive keyring. Debian signs it with the archive automatic signing
-        // subkeys, not a primary, so this is the exact shape the primary-only
-        // path rejected. Freezing it pins the subkey path against genuine
-        // archive bytes in a way the synthetic tests cannot.
+        // subkeys, not a primary. Freezing it pins the subkey path against
+        // genuine archive bytes in a way the synthetic tests cannot.
         //
         // `require_fresh` is cleared because the snapshot's `Valid-Until` has
         // passed: this exercises the signature path, not the freshness gate. The
@@ -691,10 +720,9 @@ mod tests {
         .expect("read the vendored forky InRelease fixture");
         let keyring = Keyring::parse(crate::provision::debian::EMBEDDED_KEYRING).unwrap();
 
-        // The fixture is signed only by a subkey: the primary-only path that
-        // predated subkey support cannot verify it, so this genuinely exercises
-        // the subkey candidate set rather than passing through a co-signing
-        // primary.
+        // The fixture is signed only by a subkey: no primary key in the
+        // keyring verifies it, so this exercises the subkey candidate set
+        // rather than passing through a co-signing primary.
         let (message, _) = CleartextSignedMessage::from_armor(&inrelease[..]).unwrap();
         let certificates =
             SignedPublicKey::from_bytes_many(crate::provision::debian::EMBEDDED_KEYRING)
@@ -703,7 +731,7 @@ mod tests {
                 .unwrap();
         assert!(
             !certificates.iter().any(|cert| message.verify(cert).is_ok()),
-            "the fixture must be subkey-signed, or it does not exercise the fix",
+            "the fixture must be subkey-signed, or it does not exercise the subkey path",
         );
 
         let verified = keyring
@@ -821,11 +849,11 @@ mod tests {
     const SIGNED_BODY: &str = "Suite: test\nComponents: main\nSHA256:\n abc 10 main/Packages\n";
 
     /// Generates a throwaway RSA signing key of the given modulus size. RSA
-    /// because rPGP refuses to make an Ed25519 signature over a hash it
-    /// considers too weak for the curve, which would stop a SHA-1 fixture being
-    /// built at all; RSA carries no such restriction, and that asymmetry is why
-    /// the hash floor cannot be left to the library. The size is a parameter
-    /// because the public-key floor is expressed in modulus bits.
+    /// because rPGP, which builds the fixtures, refuses to make an Ed25519
+    /// signature over a hash it considers too weak for the curve, which would
+    /// stop a SHA-1 fixture being built at all; RSA carries no such
+    /// restriction. The size is a parameter because the public-key floor is
+    /// expressed in modulus bits.
     #[cfg(test)]
     fn test_rsa_key_of(user_id: &str, bits: u32) -> pgp::composed::SignedSecretKey {
         use pgp::composed::{KeyType, SecretKeyParamsBuilder};
@@ -1247,6 +1275,87 @@ mod tests {
             Keyring::parse(b"this is not a keyring"),
             Err(OpenPgpError::Keyring(_))
         ));
+    }
+
+    /// A version 3 RSA public key and its user ID, as an old vendor export
+    /// still carries one. irongall reads no version 3 key, whose fingerprint is
+    /// taken differently, so the packets are written here: no tool this crate
+    /// builds fixtures with makes one.
+    fn version_3_key() -> Vec<u8> {
+        let mut body = vec![3];
+        // The creation time, and a validity period of zero days, which is none.
+        body.extend_from_slice(&0x3000_0000u32.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.push(1);
+        // The modulus, 1024 bits, then the exponent 65537, each a
+        // multiprecision integer whose length counts its leading set bit.
+        body.extend_from_slice(&1024u16.to_be_bytes());
+        body.push(0xC0);
+        body.extend_from_slice(&[0x55; 127]);
+        body.extend_from_slice(&17u16.to_be_bytes());
+        body.extend_from_slice(&[0x01, 0x00, 0x01]);
+        // A Public Key packet in the legacy format, with a two-octet length.
+        let mut packets = vec![0x99];
+        packets.extend_from_slice(&u16::try_from(body.len()).unwrap().to_be_bytes());
+        packets.extend_from_slice(&body);
+        // A User ID packet in the legacy format, with a one-octet length.
+        let user_id = b"legacy <legacy@test.invalid>";
+        packets.push(0xB4);
+        packets.push(u8::try_from(user_id.len()).unwrap());
+        packets.extend_from_slice(user_id);
+        packets
+    }
+
+    #[test]
+    fn a_certificate_irongall_cannot_read_is_passed_over_and_the_rest_kept() {
+        // A vendor's export may still carry a version 3 key, and one made
+        // carelessly carries a secret key. Each refuses only itself, as it does
+        // for `gpgv`, so the certificate beside them still verifies.
+        let archive = test_key("archive <archive@test.invalid>");
+        let mut bytes = version_3_key();
+        pgp::ser::Serialize::to_writer(&test_key("secret <secret@test.invalid>"), &mut bytes)
+            .expect("serializing the secret key");
+        bytes.extend_from_slice(&fixture::binary([archive.to_public_key()]));
+
+        let Ok(keyring) = Keyring::parse(&bytes) else {
+            panic!("the certificate irongall reads is kept");
+        };
+        assert_eq!(
+            keyring.certificates.certificates().len(),
+            1,
+            "only the readable certificate is held",
+        );
+        keyring
+            .verify(clearsign(&archive, SIGNED_BODY).as_bytes(), false)
+            .expect("the certificate beside the unreadable ones verifies");
+
+        // Alone, the version 3 key leaves nothing to verify with, and the
+        // refusal says what was passed over and why.
+        let Err(OpenPgpError::Keyring(reason)) = Keyring::parse(&version_3_key()) else {
+            panic!("a keyring of nothing irongall reads is refused");
+        };
+        assert!(
+            reason.contains("one certificate was passed over")
+                && reason.contains(&PacketErrorKind::UnsupportedVersion.to_string()),
+            "{reason}",
+        );
+    }
+
+    #[test]
+    fn a_keyring_whose_framing_is_damaged_is_refused_whole() {
+        // A framing failure leaves nothing after it locatable, and may cut a
+        // certificate short of its revocations, so it is never passed over as
+        // one certificate's refusal.
+        let whole = fixture::binary([test_key("archive <archive@test.invalid>").to_public_key()]);
+        let truncated = &whole[..whole.len() - 1];
+        // A header whose first octet lacks the bit every header sets.
+        let trailed = [whole.as_slice(), &[0x00]].concat();
+        for damaged in [truncated, trailed.as_slice()] {
+            let Err(OpenPgpError::Keyring(reason)) = Keyring::parse(damaged) else {
+                panic!("a keyring whose framing fails is refused");
+            };
+            assert!(reason.contains("framing"), "{reason}");
+        }
     }
 
     #[test]

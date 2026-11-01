@@ -11,7 +11,10 @@
 //!    admits, keep those at the highest version among them, and rank the rest.
 //! 4. Queue the chosen build's `RDEPEND` and `PDEPEND`.
 //! 5. An `|| ( ... )` group with a satisfied alternative is done; otherwise its
-//!    first alternative with a viable candidate is taken.
+//!    first alternative is taken whose every atom is answered, or answered by a
+//!    build that takes no slot anything already holds. An alternative is what
+//!    the group lists together, so `|| ( a ( b c ) )` takes `b` and `c` both or
+//!    neither.
 //! 6. A blocker is checked against the finished set, and a match is a conflict.
 //!    That is a blocker a chosen build states against the root or the
 //!    resolution, and one a package the root already has states against the
@@ -57,12 +60,19 @@
 //! over the same four hundred seeds, and the conflicts that remain are ones
 //! portage refuses too — a desktop stack asked for in a root built against the
 //! other init system. Backtracking is additive if measurement later disagrees.
+//!
+//! An any-of group passing over an alternative whose build would take an
+//! occupied slot is not backtracking. The slot is held before the group is
+//! read, so the group chooses among its alternatives with that already known,
+//! and no choice made earlier is revisited.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
-use super::atom::{self, Atom, Dependency, Unmet};
+use super::atom::{self, Atom, Candidate, Dependency, Unmet};
 use super::index::{Index, Record};
 use super::installed::{Installed, InstalledPackage, slot_of};
+use super::plan::PlannedPackage;
 use super::version;
 
 /// A USE flag the caller would rather a build carried, or rather it did not.
@@ -106,8 +116,8 @@ impl Preference {
 pub(super) struct Resolved {
     /// The chosen builds, in the order they merge.
     pub packages: Vec<Record>,
-    /// Where a runtime-dependency cycle was broken, each naming the packages
-    /// that formed it.
+    /// Every runtime-dependency cycle the order broke, each naming the
+    /// packages that form it, in name order.
     pub cycles: Vec<Vec<String>>,
 }
 
@@ -177,17 +187,29 @@ pub(super) struct Refusals {
     pub unsatisfied: Vec<Unsatisfied>,
     pub conflicts: Vec<Conflict>,
     pub occupied: Vec<Occupied>,
+    /// Whether the closure grew past [`MAX_CLOSURE`], which stopped the
+    /// resolution where it stood.
+    pub closure_exceeded: bool,
 }
 
 impl Refusals {
     /// Whether the resolution can be acted on.
     pub(super) fn is_empty(&self) -> bool {
-        self.unsatisfied.is_empty() && self.conflicts.is_empty() && self.occupied.is_empty()
+        self.unsatisfied.is_empty()
+            && self.conflicts.is_empty()
+            && self.occupied.is_empty()
+            && !self.closure_exceeded
     }
 
     /// The whole refusal as one sentence a caller reads.
     pub(super) fn describe(&self) -> String {
         let mut parts = Vec::new();
+        if self.closure_exceeded {
+            parts.push(format!(
+                "the closure grew past {MAX_CLOSURE} builds, more than twice every package slot \
+                 the archive publishes, so the index is not one this layer resolves against",
+            ));
+        }
         for unmet in &self.unsatisfied {
             parts.push(format!(
                 "{} requires {}, and no build {}",
@@ -237,130 +259,456 @@ impl Refusals {
 struct Pending {
     dependency: Dependency,
     wanted_by: String,
+    /// The chosen build whose merge this dependency orders, where it orders
+    /// one: a plain atom of that build's `RDEPEND`.
+    ///
+    /// `None` for the caller's own atoms, for a `PDEPEND`, and for an any-of
+    /// group, whose alternatives were resolved as a choice rather than as a
+    /// requirement of the build that states them.
+    orders: Option<usize>,
 }
+
+/// The most builds one resolution chooses before it refuses the index it is
+/// resolving against.
+///
+/// A closure holds at most one build in each slot of each package, and the
+/// archive publishes about seven and a half thousand package slots in all
+/// (7,440 when this was measured), so a resolution reaching this has chosen
+/// more than twice the whole archive. A real closure is far smaller: over the
+/// four hundred sampled package names above, the p90 is 126.
+///
+/// What it bounds is what an index nothing signs can make a run spend before
+/// any signature is consulted: a package cache directory created for every
+/// chosen build, a download scheduled for each, and a plan and an install
+/// order holding them all.
+const MAX_CLOSURE: usize = 16_384;
 
 /// Resolves `wanted` against `index` and what `installed` already holds.
 ///
 /// Reports every refusal rather than stopping at the first: a caller fixing an
 /// install list wants the whole list of what the archive cannot give them, and
-/// an atom nothing answers only stops the branch below it.
+/// an atom nothing answers only stops the branch below it. The one exception is
+/// a closure past [`MAX_CLOSURE`], which stops the resolution where it stands.
 pub(super) fn resolve(
     index: &Index,
     installed: &Installed,
     wanted: &[Atom],
     prefer: &[Preference],
 ) -> (Resolved, Refusals) {
-    let mut queue: Vec<Pending> = wanted
-        .iter()
-        .map(|atom| Pending {
-            dependency: Dependency::One(atom.clone()),
-            wanted_by: "the install list".to_string(),
-        })
-        .collect();
+    let mut run = Resolution {
+        index,
+        installed,
+        prefer,
+        queue: wanted
+            .iter()
+            .map(|atom| Pending {
+                dependency: Dependency::One(atom.clone()),
+                wanted_by: "the install list".to_string(),
+                orders: None,
+            })
+            .collect(),
+        chosen: Builds::default(),
+        needs: Vec::new(),
+        blockers: Vec::new(),
+        refusals: Refusals::default(),
+    };
     // Reversed so the queue pops in the order the caller wrote them, which is
     // what makes a resolution reproducible from an install list rather than
     // from a set.
-    queue.reverse();
+    run.queue.reverse();
 
-    let mut chosen: Vec<Record> = Vec::new();
-    let mut refusals = Refusals::default();
-    // Blockers are collected and checked at the end rather than as they arrive:
-    // a blocker met early would pass against a set the resolution had not
-    // finished choosing, and the package it refuses may be chosen later.
-    let mut blockers: Vec<(Atom, String)> = Vec::new();
-
-    while let Some(pending) = queue.pop() {
-        let alternatives: Vec<&Atom> = match &pending.dependency {
-            Dependency::One(atom) => vec![atom],
-            Dependency::AnyOf(atoms) => atoms.iter().collect(),
-        };
-        if let Some(atom) = alternatives.iter().find(|atom| atom.blocker().is_some()) {
-            // A blocker inside an any-of group is one alternative among
-            // several, and the group is satisfied by any of them; a blocker on
-            // its own is a refusal to record.
-            if alternatives.len() == 1 {
-                blockers.push(((*atom).clone(), pending.wanted_by.clone()));
-            }
-            continue;
+    while !run.refusals.closure_exceeded
+        && let Some(pending) = run.queue.pop()
+    {
+        match &pending.dependency {
+            Dependency::One(atom) => run.require(atom, &pending.wanted_by, pending.orders),
+            Dependency::AnyOf(alternatives) => run.any_of(alternatives, &pending.wanted_by),
         }
-        // Already answered, by the root or by something chosen: the whole
-        // reason resolution here starts from a populated root.
-        if alternatives
-            .iter()
-            .any(|atom| satisfied(atom, installed, &chosen))
-        {
-            continue;
-        }
-        // The first alternative anything can answer. A group of one is the
-        // plain-atom case, so both go through one path.
-        let picked = alternatives
-            .iter()
-            .find_map(|atom| select(index, atom, prefer));
-        let Some(record) = picked else {
-            refusals.unsatisfied.push(Unsatisfied {
-                atom: alternatives
-                    .iter()
-                    .map(|atom| atom.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" or "),
-                wanted_by: pending.wanted_by,
-                reason: wall(index, installed, &alternatives),
-            });
-            continue;
-        };
-        // One instance per slot, which is the invariant portage's own database
-        // keeps: the atom is answered neither by what is already chosen nor by
-        // the root -- that was asked two steps above -- so anything sharing the
-        // picked build's slot is a second version of one package in one slot.
-        // Merging both would lay two images down with the second overwriting
-        // the first's shared paths, and leave a `/var/db/pkg` portage reads as
-        // a conflict.
-        //
-        // The root holds a slot as firmly as the resolution does. A merge
-        // registers its entry beside what is already there and unmerges
-        // nothing, so a same-slot upgrade over a stage3 is the same defect
-        // reached from the other side: the caller's answer is a root whose
-        // version the atom admits, not a second copy of the package.
-        //
-        // Reported rather than resolved around, which is the module's stance on
-        // a conflict generally: nothing here backtracks, and the caller's atoms
-        // are what would have to change.
-        let taken = chosen
-            .iter()
-            .find(|held| held.name == record.name && slot_of(&held.slot) == slot_of(&record.slot))
-            .map(|held| (describe_build(held), false))
-            .or_else(|| {
-                installed
-                    .under(&record.name)
-                    .find(|held| slot_of(held.slot()) == slot_of(&record.slot))
-                    .map(|held| (format!("{}-{}", held.name(), held.version()), true))
-            });
-        if let Some((held, installed)) = taken {
-            refusals.occupied.push(Occupied {
-                name: record.name.clone(),
-                slot: slot_of(&record.slot).to_string(),
-                held,
-                installed,
-                second: describe_build(&record),
-                atom: alternatives
-                    .iter()
-                    .map(|atom| atom.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" or "),
-                wanted_by: pending.wanted_by,
-            });
-            continue;
-        }
-        let wanted_by = record.cpv();
-        for dependency in record.rdepend.iter().chain(&record.pdepend) {
-            queue.push(Pending {
-                dependency: dependency.clone(),
-                wanted_by: wanted_by.clone(),
-            });
-        }
-        chosen.push(record);
     }
 
+    conflicts(&run.blockers, installed, &run.chosen, &mut run.refusals);
+    let (packages, cycles) = order(run.chosen.all, run.needs);
+    (Resolved { packages, cycles }, run.refusals)
+}
+
+/// One resolution part way through.
+struct Resolution<'a> {
+    index: &'a Index,
+    installed: &'a Installed,
+    prefer: &'a [Preference],
+    /// The dependencies still to settle, popped from the end.
+    queue: Vec<Pending>,
+    /// The builds chosen so far, in the order they were chosen.
+    chosen: Builds<Record>,
+    /// `needs[i]`: the chosen builds `chosen[i]` merges after, which are the
+    /// ones that answered its runtime atoms.
+    ///
+    /// Recorded as each atom is answered rather than worked out again from the
+    /// atoms afterwards. The resolution has already said which build answers
+    /// an atom, and an order that asked again of every build the atom admits
+    /// would hold an edge for each pair of them: a set that grows with the
+    /// square of the closure, for an index that publishes many builds an atom
+    /// admits.
+    needs: Vec<Vec<usize>>,
+    /// Every blocker met, and who stated it.
+    ///
+    /// Collected and checked at the end rather than as they arrive: a blocker
+    /// met early would pass against a set the resolution had not finished
+    /// choosing, and the package it refuses may be chosen later.
+    blockers: Vec<(Atom, String)>,
+    refusals: Refusals,
+}
+
+/// Where one atom stands against a resolution so far.
+enum Answer {
+    /// Answered already: by the root, or by the chosen build at this index.
+    Held(Option<usize>),
+    /// Answered by this build the index publishes, which takes no slot
+    /// anything already holds.
+    Free(Record),
+    /// The build the index would answer it with takes a slot something already
+    /// holds: the build, what holds the slot as a refusal names it, and whether
+    /// that is in the root.
+    Taken(Record, String, bool),
+    /// Nothing the index publishes answers it.
+    Unmet,
+}
+
+impl Resolution<'_> {
+    /// What already answers `atom`: the root (`Some(None)`), the chosen build
+    /// at an index, or nothing.
+    ///
+    /// The root first, which is the whole reason resolution here starts from a
+    /// populated root.
+    fn held(&self, atom: &Atom) -> Option<Option<usize>> {
+        if self
+            .installed
+            .under(atom.name())
+            .any(|package| atom.matches(package))
+        {
+            return Some(None);
+        }
+        self.chosen.answering(atom).map(Some)
+    }
+
+    /// Where `atom` stands: answered, answerable, or not.
+    ///
+    /// One instance per slot is the invariant portage's own database keeps, so
+    /// a build sharing a slot with anything already chosen or installed is not
+    /// an answer: the atom is answered by neither -- [`held`](Self::held) asked
+    /// that first -- so the two would be two versions of one package in one
+    /// slot. Merging both would lay two images down with the second overwriting
+    /// the first's shared paths, and leave a `/var/db/pkg` portage reads as a
+    /// conflict.
+    ///
+    /// The root holds a slot as firmly as the resolution does. A merge
+    /// registers its entry beside what is already there and unmerges nothing,
+    /// so a same-slot upgrade over a stage3 is the same defect reached from the
+    /// other side: the caller's answer is a root whose version the atom admits,
+    /// not a second copy of the package.
+    fn answer(&self, atom: &Atom) -> Answer {
+        if let Some(at) = self.held(atom) {
+            return Answer::Held(at);
+        }
+        let Some(record) = select(self.index, atom, self.prefer) else {
+            return Answer::Unmet;
+        };
+        match occupant(&record, &self.chosen, self.installed) {
+            Some((held, installed)) => Answer::Taken(record, held, installed),
+            None => Answer::Free(record),
+        }
+    }
+
+    /// Settles one plain atom `wanted_by` asked for: records it as a blocker,
+    /// or answers it, choosing a build where nothing chosen or installed
+    /// already does.
+    ///
+    /// `orders` is the chosen build that merges after whatever answers it,
+    /// where the atom is one of that build's runtime dependencies.
+    ///
+    /// A collision with an occupied slot is reported rather than resolved
+    /// around, which is the module's stance on a conflict generally: nothing
+    /// here backtracks, and the caller's atoms are what would have to change.
+    fn require(&mut self, atom: &Atom, wanted_by: &str, orders: Option<usize>) {
+        if atom.blocker().is_some() {
+            self.blockers.push((atom.clone(), wanted_by.to_string()));
+            return;
+        }
+        match self.answer(atom) {
+            Answer::Held(at) => self.order_after(orders, at),
+            Answer::Free(record) => {
+                let at = self.choose(record);
+                self.order_after(orders, at);
+            }
+            Answer::Taken(record, held, installed) => {
+                self.refuse_occupied(&record, held, installed, atom.to_string(), wanted_by);
+            }
+            Answer::Unmet => self.refusals.unsatisfied.push(Unsatisfied {
+                atom: atom.to_string(),
+                wanted_by: wanted_by.to_string(),
+                reason: wall(self.index, self.installed, &[atom]),
+            }),
+        }
+    }
+
+    /// Settles an any-of group `wanted_by` asked for.
+    ///
+    /// A group of one alternative asks for exactly that alternative's atoms,
+    /// blockers included, which is the plain-atom case. In a group of several,
+    /// a blocker is one alternative among several and binds nothing on its
+    /// own, so an alternative is satisfied when every atom in it that names
+    /// something to install is.
+    ///
+    /// A group with a satisfied alternative is done. Otherwise its first
+    /// alternative is taken whose every atom is answered or answerable without
+    /// taking an occupied slot: an alternative that would collide is passed
+    /// over for the next, which is a choice the group offers rather than
+    /// backtracking.
+    fn any_of(&mut self, alternatives: &[Vec<Atom>], wanted_by: &str) {
+        if let [only] = alternatives {
+            for atom in only {
+                self.require(atom, wanted_by, None);
+            }
+            return;
+        }
+        let installs = |atom: &&Atom| atom.blocker().is_none();
+        if alternatives.iter().any(|together| {
+            together
+                .iter()
+                .filter(installs)
+                .all(|atom| self.held(atom).is_some())
+        }) {
+            return;
+        }
+        let mut taken = None;
+        let mut unmet = Vec::new();
+        for together in alternatives {
+            let mut answerable = true;
+            for atom in together.iter().filter(installs) {
+                match self.answer(atom) {
+                    Answer::Held(_) | Answer::Free(_) => {}
+                    Answer::Taken(record, held, installed) => {
+                        answerable = false;
+                        taken.get_or_insert((record, held, installed));
+                    }
+                    Answer::Unmet => {
+                        answerable = false;
+                        unmet.push(atom);
+                    }
+                }
+            }
+            if answerable {
+                for atom in together.iter().filter(installs) {
+                    self.require(atom, wanted_by, None);
+                }
+                return;
+            }
+        }
+        // Nothing answers the group. A build that was there and collided is
+        // the wall a caller can act on, so it is reported over the atoms
+        // nothing publishes.
+        let written = written(alternatives);
+        match taken {
+            Some((record, held, installed)) => {
+                self.refuse_occupied(&record, held, installed, written, wanted_by);
+            }
+            None => self.refusals.unsatisfied.push(Unsatisfied {
+                atom: written,
+                wanted_by: wanted_by.to_string(),
+                reason: wall(self.index, self.installed, &unmet),
+            }),
+        }
+    }
+
+    /// Chooses `record`, queueing its own dependencies, and returns where it
+    /// sits, or `None` where the closure has reached [`MAX_CLOSURE`].
+    fn choose(&mut self, record: Record) -> Option<usize> {
+        if self.chosen.all.len() >= MAX_CLOSURE {
+            self.refusals.closure_exceeded = true;
+            return None;
+        }
+        let wanted_by = record.cpv();
+        let at = self.chosen.push(record);
+        self.needs.push(Vec::new());
+        let record = &self.chosen.all[at];
+        for dependency in &record.rdepend {
+            self.queue.push(Pending {
+                dependency: dependency.clone(),
+                wanted_by: wanted_by.clone(),
+                orders: matches!(dependency, Dependency::One(_)).then_some(at),
+            });
+        }
+        for dependency in &record.pdepend {
+            self.queue.push(Pending {
+                dependency: dependency.clone(),
+                wanted_by: wanted_by.clone(),
+                orders: None,
+            });
+        }
+        Some(at)
+    }
+
+    /// Records that the chosen build `dependent` merges after the chosen build
+    /// `needed`, where both are chosen builds and they are not one build.
+    fn order_after(&mut self, dependent: Option<usize>, needed: Option<usize>) {
+        if let (Some(dependent), Some(needed)) = (dependent, needed)
+            && dependent != needed
+        {
+            self.needs[dependent].push(needed);
+        }
+    }
+
+    /// Records that `record`, which `atom` asked for on behalf of `wanted_by`,
+    /// would take a slot `held` already holds.
+    fn refuse_occupied(
+        &mut self,
+        record: &Record,
+        held: String,
+        installed: bool,
+        atom: String,
+        wanted_by: &str,
+    ) {
+        self.refusals.occupied.push(Occupied {
+            name: record.name.clone(),
+            slot: slot_of(&record.slot).to_string(),
+            held,
+            installed,
+            second: record.describe(),
+            atom,
+            wanted_by: wanted_by.to_string(),
+        });
+    }
+}
+
+/// How a refusal names an any-of group: its alternatives, `or` between them,
+/// and an alternative of several atoms in parentheses with `and` between
+/// those.
+fn written(alternatives: &[Vec<Atom>]) -> String {
+    alternatives
+        .iter()
+        .map(|together| match together.as_slice() {
+            [one] => one.to_string(),
+            several => format!(
+                "({})",
+                several
+                    .iter()
+                    .map(Atom::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// A build a resolution or a replayed plan would install, as a refusal names
+/// it.
+trait Build: Candidate {
+    /// Its `CPV` and which build of it.
+    ///
+    /// The build id is part of the name here where it is not elsewhere,
+    /// because the two builds a slot collision names can be two builds of one
+    /// version -- and a message naming them both `dev-vcs/git-2.54.0` would read
+    /// as a bug in the refusal rather than as the collision it is.
+    fn describe(&self) -> String;
+}
+
+impl Build for Record {
+    fn describe(&self) -> String {
+        format!("{} build {}", self.cpv(), self.build_id)
+    }
+}
+
+/// Builds about to be installed, found by package name.
+///
+/// Every question asked of them is about one name -- does anything chosen
+/// answer this atom, hold this slot, match this blocker -- so it is asked of
+/// that name's builds rather than of every build. Asked of every build, each
+/// question costs the whole set, and a closure's cost grows with its square.
+struct Builds<C> {
+    /// The builds, in the order they arrived.
+    all: Vec<C>,
+    /// Where each package name's builds sit in [`all`](Self::all).
+    by_name: HashMap<String, Vec<usize>>,
+}
+
+impl<C> Default for Builds<C> {
+    fn default() -> Self {
+        Builds {
+            all: Vec::new(),
+            by_name: HashMap::new(),
+        }
+    }
+}
+
+impl<C: Candidate> Builds<C> {
+    /// Adds `build`, returning where it sits.
+    fn push(&mut self, build: C) -> usize {
+        let at = self.all.len();
+        self.by_name
+            .entry(build.name().to_string())
+            .or_default()
+            .push(at);
+        self.all.push(build);
+        at
+    }
+
+    /// Every build published under `name`, with where it sits.
+    fn under(&self, name: &str) -> impl Iterator<Item = (usize, &C)> {
+        self.by_name
+            .get(name)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|&at| (at, &self.all[at]))
+    }
+
+    /// Where the first build that answers `atom` sits, if one does.
+    fn answering(&self, atom: &Atom) -> Option<usize> {
+        self.under(atom.name())
+            .find(|(_, build)| atom.matches(*build))
+            .map(|(at, _)| at)
+    }
+}
+
+/// What already holds the slot `build` would occupy, as a refusal names it,
+/// and whether that is in the root rather than among `chosen`.
+///
+/// The one-instance-per-slot check, asked the same way of a build a resolution
+/// would choose and of one a replayed plan names.
+fn occupant<C: Build>(
+    build: &impl Candidate,
+    chosen: &Builds<C>,
+    installed: &Installed,
+) -> Option<(String, bool)> {
+    let slot = slot_of(build.slot());
+    chosen
+        .under(build.name())
+        .find(|(_, held)| slot_of(held.slot()) == slot)
+        .map(|(_, held)| (held.describe(), false))
+        .or_else(|| {
+            installed
+                .under(build.name())
+                .find(|held| slot_of(held.slot()) == slot)
+                .map(|held| (held.cpv(), true))
+        })
+}
+
+/// Records every conflict `blockers`, and the root's own, make with the root
+/// and with `chosen`.
+///
+/// `blockers` are the ones the builds being installed state, each with who
+/// stated it; they bind against the root and against each other. The root
+/// states blockers too, and a build being installed is as blocked by one as by
+/// its own: portage will not merge a package an installed one refuses to share
+/// the root with. Those are held to `chosen` only, since what the root's own
+/// packages say of each other is the state it arrived in rather than something
+/// this install did.
+fn conflicts<C: Candidate>(
+    blockers: &[(Atom, String)],
+    installed: &Installed,
+    chosen: &Builds<C>,
+    refusals: &mut Refusals,
+) {
     for (blocker, stated_by) in blockers {
         for package in installed.under(blocker.name()) {
             if blocker.matches(package) {
@@ -368,66 +716,136 @@ pub(super) fn resolve(
                     atom: blocker.to_string(),
                     stated_by: stated_by.clone(),
                     stated_in_root: false,
-                    blocks: format!("{}-{}", package.name(), package.version()),
+                    blocks: package.cpv(),
                     installed: true,
                 });
             }
         }
-        for record in chosen.iter().filter(|record| record.name == blocker.name()) {
-            if blocker.matches(record) {
+        for (_, build) in chosen.under(blocker.name()) {
+            if blocker.matches(build) {
                 refusals.conflicts.push(Conflict {
                     atom: blocker.to_string(),
                     stated_by: stated_by.clone(),
                     stated_in_root: false,
-                    blocks: record.cpv(),
+                    blocks: build.cpv(),
                     installed: false,
                 });
             }
         }
     }
-    // The root states blockers too, and a build this resolution chose is as
-    // blocked by one as by its own: portage will not merge a package an
-    // installed one refuses to share the root with. Held to the chosen builds
-    // only, since what the root's own packages say of each other is the state
-    // it arrived in rather than something this resolution did.
     for package in installed.packages() {
         for blocker in package.blockers() {
-            for record in chosen.iter().filter(|record| record.name == blocker.name()) {
-                if blocker.matches(record) {
+            for (_, build) in chosen.under(blocker.name()) {
+                if blocker.matches(build) {
                     refusals.conflicts.push(Conflict {
                         atom: blocker.to_string(),
-                        stated_by: format!("{}-{}", package.name(), package.version()),
+                        stated_by: package.cpv(),
                         stated_in_root: true,
-                        blocks: record.cpv(),
+                        blocks: build.cpv(),
                         installed: false,
                     });
                 }
             }
         }
     }
-
-    let (packages, cycles) = order(chosen);
-    (Resolved { packages, cycles }, refusals)
 }
 
-/// How a refusal names one build: its `CPV` and which build of it.
+/// A build a replayed plan names, as its own verified metadata describes it.
+pub(super) struct Arriving {
+    /// What the root's database will say of it once it is merged.
+    pub package: InstalledPackage,
+    /// Which build of its version it is, so a refusal names it as a
+    /// resolution's refusal would.
+    pub build_id: u64,
+}
+
+impl Candidate for Arriving {
+    fn name(&self) -> &str {
+        self.package.name()
+    }
+
+    fn version(&self) -> &str {
+        self.package.version()
+    }
+
+    fn slot(&self) -> &str {
+        self.package.slot()
+    }
+
+    fn use_flag(&self, flag: &str) -> Option<bool> {
+        self.package.use_flag(flag)
+    }
+}
+
+impl Build for Arriving {
+    fn describe(&self) -> String {
+        format!("{} build {}", self.cpv(), self.build_id)
+    }
+}
+
+/// The packages of a plan that replaying it over `installed` would install:
+/// every one but those the root already has at exactly the version named.
 ///
-/// The build id is part of the name here where it is not elsewhere, because the
-/// two builds a slot collision names can be two builds of one version -- and a
-/// message naming them both `dev-vcs/git-2.54.0` would read as a bug in the
-/// refusal rather than as the collision it is.
-fn describe_build(record: &Record) -> String {
-    format!("{} build {}", record.cpv(), record.build_id)
+/// A plan names the builds a resolution chose against one root, and it is
+/// replayed over another -- normally a newer stage3, since the autobuilds tree
+/// keeps a build about five weeks. The resolver's first question of an atom is
+/// whether the root answers it already, and a package the root holds at the
+/// plan's own version answers the plan's, so it is skipped as a resolution
+/// would skip it.
+pub(super) fn missing(installed: &Installed, planned: &[PlannedPackage]) -> Vec<PlannedPackage> {
+    planned
+        .iter()
+        .filter(|planned| {
+            !installed.under(&planned.name).any(|held| {
+                version::compare(held.version(), &planned.version)
+                    == Some(std::cmp::Ordering::Equal)
+            })
+        })
+        .cloned()
+        .collect()
 }
 
-/// Whether anything already answers `atom`.
-fn satisfied(atom: &Atom, installed: &Installed, chosen: &[Record]) -> bool {
-    installed
-        .under(atom.name())
-        .any(|package| atom.matches(package))
-        || chosen
-            .iter()
-            .any(|record| record.name == atom.name() && atom.matches(record))
+/// Holds the builds a replayed plan names to the root they are about to be
+/// merged into, with the checks a resolution holds its own choices to.
+///
+/// A plan carries no slot, no USE and no dependencies, so `arriving` describes
+/// each build from its verified metadata: the files a merge writes out as its
+/// database entry. Each is refused where something in the root or earlier in
+/// the plan holds its slot, and the blockers each states, and those the root
+/// states, are held to the rest. Without this a plan resolved against one stage3
+/// and replayed over a newer one registers its version beside the newer
+/// version of the same package in one slot, and reports success.
+pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals {
+    let mut refusals = Refusals::default();
+    let mut admitted = Builds::default();
+    let mut blockers = Vec::new();
+    for build in arriving {
+        if let Some((held, in_root)) = occupant(&build, &admitted, installed) {
+            refusals.occupied.push(Occupied {
+                name: build.name().to_string(),
+                slot: slot_of(build.slot()).to_string(),
+                held,
+                installed: in_root,
+                second: build.describe(),
+                // The atom a plan's entry amounts to: this package, at
+                // exactly this version.
+                atom: format!("={}", build.cpv()),
+                wanted_by: "the plan".to_string(),
+            });
+            continue;
+        }
+        let stated_by = build.cpv();
+        blockers.extend(
+            build
+                .package
+                .blockers()
+                .iter()
+                .map(|blocker| (blocker.clone(), stated_by.clone())),
+        );
+        admitted.push(build);
+    }
+    conflicts(&blockers, installed, &admitted, &mut refusals);
+    refusals
 }
 
 /// The build to install for `atom`, or `None` where the index publishes none it
@@ -529,87 +947,211 @@ fn unserved(installed: &Installed, name: &str) -> String {
 
 /// Puts the chosen builds in an order each can be merged in.
 ///
-/// A topological sort over runtime dependencies alone. `PDEPEND` is left out on
-/// purpose: it is what portage satisfies *after* a package is merged, so it
-/// belongs to the closure and not to the order, and treating it as an edge
-/// would manufacture cycles the archive deliberately avoids.
+/// A topological sort over runtime dependencies alone, each build merging after
+/// the chosen builds that answered its `RDEPEND` atoms (`needs`). `PDEPEND` is
+/// left out on purpose: it is what portage satisfies *after* a package is
+/// merged, so it belongs to the closure and not to the order, and treating it
+/// as an edge would manufacture cycles the archive deliberately avoids.
+///
+/// Of the builds ready to merge, the first in name order goes next, so the
+/// order is the same every time.
 ///
 /// Where a real cycle remains — Gentoo's runtime graph has them, and portage
-/// breaks them too — the lexicographically first package still waiting is
-/// emitted and the cycle is reported. That rule is stable, so a cycle broken in
-/// one run is broken the same way in the next.
-fn order(chosen: Vec<Record>) -> (Vec<Record>, Vec<Vec<String>>) {
-    // Every index a name was chosen at, rather than one. A closure legitimately
-    // holds two slots of a package -- `dev-lang/python:3.11` and `:3.12`, two
-    // `llvm` or `gcc` slots -- which the archive publishes and Gentoo installs
-    // side by side, and a map keeping only the last index would drop the edge to
-    // whichever slot lost. The dependent would then be free to merge before the
-    // slot it names.
-    let mut at: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (index_of, record) in chosen.iter().enumerate() {
-        at.entry(record.name.as_str()).or_default().push(index_of);
+/// breaks them too — it is broken once nothing else can merge, and only inside
+/// a cycle that waits on nothing outside itself: the first of its packages in
+/// name order goes next, ahead of what it needs from the rest of the cycle. An
+/// edge a cycle does not hold is never broken, so a package that merely
+/// depends on a cycle still merges after it.
+///
+/// A cycle is reported once, naming its members: the packages that depend on
+/// each other, directly or through one another, which are the graph's strongly
+/// connected components. The whole sort is linear in the closure and its
+/// edges, apart from a heap's logarithm.
+fn order(chosen: Vec<Record>, mut needs: Vec<Vec<usize>>) -> (Vec<Record>, Vec<Vec<String>>) {
+    let count = chosen.len();
+    // Two atoms answered by one build are one edge.
+    for edges in &mut needs {
+        edges.sort_unstable();
+        edges.dedup();
     }
-    // `needs[i]` is what package `i` must be merged after.
-    let mut needs: Vec<Vec<usize>> = vec![Vec::new(); chosen.len()];
-    for (index_of, record) in chosen.iter().enumerate() {
-        for dependency in &record.rdepend {
-            let Dependency::One(atom) = dependency else {
-                // An any-of group's alternatives were resolved as a choice
-                // rather than as a requirement of this package, so the chosen
-                // one carries no edge back here.
-                continue;
-            };
-            if atom.blocker().is_some() {
-                continue;
-            }
-            // An edge to every chosen build the atom admits. At most one per
-            // slot survives resolution, but a `:*` or an unconstrained atom
-            // legitimately names two slots, and a dependent on both needs both.
-            for &needed in at.get(atom.name()).map_or(&[][..], Vec::as_slice) {
-                if needed != index_of && atom.matches(&chosen[needed]) {
-                    needs[index_of].push(needed);
-                }
+    // Each build's place in name order, which is the order the heaps below
+    // yield in. The sort is stable, so two builds of one name -- two slots --
+    // keep the order they were chosen in.
+    let mut by_name: Vec<usize> = (0..count).collect();
+    by_name.sort_by(|a, b| chosen[*a].name.cmp(&chosen[*b].name));
+    let mut rank = vec![0; count];
+    for (place, &at) in by_name.iter().enumerate() {
+        rank[at] = place;
+    }
+
+    let component = components(&needs);
+    let components = component.iter().max().map_or(0, |last| last + 1);
+    // Each component's members, in name order.
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); components];
+    for &at in &by_name {
+        members[component[at]].push(at);
+    }
+
+    // What each build still waits on, split by whether the build it waits on
+    // is in its own component, and what each component still waits on from
+    // outside itself. A cycle may be broken only once that last reaches zero.
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut inside = vec![0_usize; count];
+    let mut outside = vec![0_usize; count];
+    let mut waiting = vec![0_usize; components];
+    for (at, edges) in needs.iter().enumerate() {
+        for &needed in edges {
+            dependents[needed].push(at);
+            if component[needed] == component[at] {
+                inside[at] += 1;
+            } else {
+                outside[at] += 1;
+                waiting[component[at]] += 1;
             }
         }
     }
+    let cyclic = |of: usize| members[of].len() > 1;
 
-    let mut merged = Vec::with_capacity(chosen.len());
-    let mut done = vec![false; chosen.len()];
+    // Both heaps hold places in name order, smallest first. `ready` holds the
+    // builds waiting on nothing; `breakable` the members of cycles waiting on
+    // nothing outside themselves, which may hold builds already merged.
+    let mut ready: BinaryHeap<Reverse<usize>> = (0..count)
+        .filter(|&at| needs[at].is_empty())
+        .map(|at| Reverse(rank[at]))
+        .collect();
+    let mut breakable: BinaryHeap<Reverse<usize>> = (0..components)
+        .filter(|&of| cyclic(of) && waiting[of] == 0)
+        .flat_map(|of| members[of].iter().map(|&at| Reverse(rank[at])))
+        .collect();
+
+    let mut merged = Vec::with_capacity(count);
+    let mut done = vec![false; count];
+    let mut reported = vec![false; components];
     let mut cycles = Vec::new();
-    // The candidates in name order, so a round that has several ready emits
-    // them the same way every time.
-    let mut by_name: Vec<usize> = (0..chosen.len()).collect();
-    by_name.sort_by(|a, b| chosen[*a].name.cmp(&chosen[*b].name));
-
-    while merged.len() < chosen.len() {
-        let ready = by_name
-            .iter()
-            .copied()
-            .find(|at| !done[*at] && needs[*at].iter().all(|needed| done[*needed]));
-        let next = match ready {
-            Some(next) => next,
+    while merged.len() < count {
+        let next = match ready.pop() {
+            Some(Reverse(place)) => by_name[place],
             None => {
-                // Nothing is ready and something is left: a cycle. The first
-                // remaining package in name order goes next, and the cycle is
-                // reported with everything still in it.
-                let stuck: Vec<usize> = by_name.iter().copied().filter(|at| !done[*at]).collect();
-                cycles.push(stuck.iter().map(|at| chosen[*at].cpv()).collect());
-                stuck[0]
+                // Nothing is ready and something is left, so something left is
+                // in a cycle. Of what is left, the components nothing outside
+                // them holds back form at least one cycle -- a graph of
+                // components has one waiting on no other -- and their members
+                // are what `breakable` holds.
+                let next = std::iter::from_fn(|| breakable.pop())
+                    .map(|Reverse(place)| by_name[place])
+                    .find(|&at| !done[at])
+                    .expect("a cycle waiting on nothing outside itself remains");
+                let of = component[next];
+                if !reported[of] {
+                    reported[of] = true;
+                    cycles.push(members[of].iter().map(|&at| chosen[at].cpv()).collect());
+                }
+                next
             }
         };
         done[next] = true;
         merged.push(next);
+        for &dependent in &dependents[next] {
+            let of = component[dependent];
+            if of == component[next] {
+                inside[dependent] -= 1;
+            } else {
+                outside[dependent] -= 1;
+                waiting[of] -= 1;
+                if waiting[of] == 0 && cyclic(of) {
+                    breakable.extend(members[of].iter().map(|&at| Reverse(rank[at])));
+                }
+            }
+            // A member of a cycle broken ahead of it has merged already.
+            if !done[dependent] && inside[dependent] == 0 && outside[dependent] == 0 {
+                ready.push(Reverse(rank[dependent]));
+            }
+        }
     }
+    let mut chosen: Vec<Option<Record>> = chosen.into_iter().map(Some).collect();
     (
-        merged.into_iter().map(|at| chosen[at].clone()).collect(),
+        merged
+            .into_iter()
+            .filter_map(|at| chosen[at].take())
+            .collect(),
         cycles,
     )
+}
+
+/// Each node's strongly connected component in the graph `needs` describes:
+/// the sets in which every node reaches every other.
+///
+/// Tarjan's algorithm, with its recursion held in a stack of its own. The
+/// depth it recurses to is the length of the longest dependency chain, which
+/// an index nothing signs decides, and a chain long enough would overflow the
+/// thread's stack, which aborts the process rather than failing the call.
+///
+/// Components are numbered from zero, in the order they are completed.
+fn components(needs: &[Vec<usize>]) -> Vec<usize> {
+    const UNSEEN: usize = usize::MAX;
+    let count = needs.len();
+    // When each node was first reached, and the earliest node still on the
+    // stack it reaches.
+    let mut reached = vec![UNSEEN; count];
+    let mut low = vec![0; count];
+    let mut on_stack = vec![false; count];
+    let mut stack = Vec::new();
+    let mut component = vec![UNSEEN; count];
+    let mut next_reached = 0;
+    let mut next_component = 0;
+    // The walk's own call stack: a node, and how many of its edges it has
+    // followed.
+    let mut walk: Vec<(usize, usize)> = Vec::new();
+    for start in 0..count {
+        if reached[start] != UNSEEN {
+            continue;
+        }
+        reached[start] = next_reached;
+        low[start] = next_reached;
+        next_reached += 1;
+        stack.push(start);
+        on_stack[start] = true;
+        walk.push((start, 0));
+        while let Some(&(node, followed)) = walk.last() {
+            if let Some(&next) = needs[node].get(followed) {
+                let top = walk.len() - 1;
+                walk[top].1 += 1;
+                if reached[next] == UNSEEN {
+                    reached[next] = next_reached;
+                    low[next] = next_reached;
+                    next_reached += 1;
+                    stack.push(next);
+                    on_stack[next] = true;
+                    walk.push((next, 0));
+                } else if on_stack[next] {
+                    low[node] = low[node].min(reached[next]);
+                }
+                continue;
+            }
+            walk.pop();
+            if let Some(&(caller, _)) = walk.last() {
+                low[caller] = low[caller].min(low[node]);
+            }
+            if low[node] == reached[node] {
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component[member] = next_component;
+                    if member == node {
+                        break;
+                    }
+                }
+                next_component += 1;
+            }
+        }
+    }
+    component
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provision::gentoo::atom;
+    use crate::provision::gentoo::plan::Plan;
 
     /// The fixture archive every test below resolves against.
     ///
@@ -1159,6 +1701,380 @@ USE: amd64
             described.contains("is published by this binhost at all"),
             "{described}"
         );
+    }
+
+    /// An index publishing `a/p000001` to `a/p{count}`, each depending on the
+    /// next, and the last on `closing` where a cycle is wanted.
+    fn chain(count: usize, closing: Option<usize>) -> Index {
+        let mut text = String::from("TIMESTAMP: 1\n\n");
+        for at in 1..=count {
+            let next = if at < count { Some(at + 1) } else { closing };
+            let rdepend = next.map_or(String::new(), |next| format!("RDEPEND: a/p{next:06}\n"));
+            text.push_str(&format!(
+                "BUILD_ID: 1\nCPV: a/p{at:06}-1\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+                 PATH: a/p{at:06}/p{at:06}-1-1.gpkg.tar\n{rdepend}SIZE: 1\nUSE: amd64\n\n"
+            ));
+        }
+        Index::parse(&text)
+    }
+
+    /// Resolves `atoms` against `index` over an empty root.
+    #[track_caller]
+    fn run_over(index: &Index, installed: &Installed, atoms: &[&str]) -> (Resolved, Refusals) {
+        let parsed: Vec<Atom> = atoms
+            .iter()
+            .map(|text| atom::parse(text).expect("a fixture atom"))
+            .collect();
+        resolve(index, installed, &parsed, &[])
+    }
+
+    #[test]
+    fn a_long_chain_closed_by_a_two_member_loop_reports_the_loop_and_nothing_else() {
+        // `a/p0001 -> ... -> a/pN`, with `a/pN` depending back on the package
+        // before it. Only those two depend on each other. A sort that reported
+        // everything still waiting whenever it was stuck reported every package
+        // left, once per package, which over an unsigned index is memory
+        // growing with the square of the closure.
+        const COUNT: usize = 10_000;
+        let (resolved, refusals) = run_over(
+            &chain(COUNT, Some(COUNT - 1)),
+            &Installed::default(),
+            &["a/p000001"],
+        );
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(
+            resolved.cycles,
+            [vec![
+                format!("a/p{:06}-1", COUNT - 1),
+                format!("a/p{COUNT:06}-1"),
+            ]],
+        );
+        // Every package merges once, and after the package it needs, but for
+        // the one edge the loop forced the order to break.
+        let order = installing(&resolved);
+        assert_eq!(order.len(), COUNT);
+        let position: HashMap<&str, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(at, cpv)| (cpv.as_str(), at))
+            .collect();
+        for at in 1..COUNT {
+            let dependent = format!("a/p{at:06}-1");
+            let needed = format!("a/p{:06}-1", at + 1);
+            if at + 1 == COUNT {
+                // The loop's own edge is the one broken: the first of its two
+                // members in name order goes first.
+                assert!(position[dependent.as_str()] < position[needed.as_str()]);
+            } else {
+                assert!(
+                    position[needed.as_str()] < position[dependent.as_str()],
+                    "{dependent} merged before {needed}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_package_that_needs_a_cycle_merges_after_it_rather_than_being_broken_into_it() {
+        // `a/p000001` needs the loop and is not part of it. It is first in
+        // name order, so a rule that took the first package left whenever
+        // nothing was ready would merge it ahead of what it needs.
+        let (resolved, refusals) =
+            run_over(&chain(3, Some(2)), &Installed::default(), &["a/p000001"]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(
+            installing(&resolved),
+            ["a/p000002-1", "a/p000001-1", "a/p000003-1"],
+        );
+        assert_eq!(resolved.cycles, [vec!["a/p000002-1", "a/p000003-1"]]);
+    }
+
+    #[test]
+    fn a_chain_deeper_than_any_stack_is_ordered_without_recursing_down_it() {
+        // The components are found by a walk whose depth is the chain's
+        // length. Recursing down it would overflow the stack, which aborts the
+        // process, so the walk keeps a stack of its own.
+        const COUNT: usize = 1_000_000;
+        let needs: Vec<Vec<usize>> = (0..COUNT)
+            .map(|at| {
+                if at + 1 < COUNT {
+                    vec![at + 1]
+                } else {
+                    vec![0]
+                }
+            })
+            .collect();
+        let component = components(&needs);
+        assert!(component.iter().all(|&of| of == component[0]), "one cycle");
+        let chain: Vec<Vec<usize>> = (0..COUNT)
+            .map(|at| {
+                if at + 1 < COUNT {
+                    vec![at + 1]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let component = components(&chain);
+        // Completed from the far end of the chain back.
+        assert_eq!(component[COUNT - 1], 0);
+        assert_eq!(component[0], COUNT - 1);
+    }
+
+    #[test]
+    fn a_closure_past_the_bound_is_refused_where_it_stands() {
+        let (resolved, refusals) = run_over(
+            &chain(MAX_CLOSURE + 1, None),
+            &Installed::default(),
+            &["a/p000001"],
+        );
+        assert!(refusals.closure_exceeded);
+        assert!(!refusals.is_empty());
+        assert!(
+            refusals
+                .describe()
+                .contains(&format!("grew past {MAX_CLOSURE} builds")),
+            "{}",
+            refusals.describe(),
+        );
+        assert_eq!(resolved.packages.len(), MAX_CLOSURE);
+        // One short of it resolves.
+        let (_, refusals) = run_over(
+            &chain(MAX_CLOSURE, None),
+            &Installed::default(),
+            &["a/p000001"],
+        );
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+    }
+
+    /// The archive `virtual/zlib` resolves against: zlib built without the
+    /// flag the virtual asks for, and the zlib-ng pair that answers together.
+    const ZLIB_VIRTUAL: &str = "\
+TIMESTAMP: 1
+
+BUILD_ID: 1
+CPV: virtual/zlib-1.3.1
+MD5: 1fea75aab3015c66c56ca3efe50f0b9b
+PATH: virtual/zlib/zlib-1.3.1-1.gpkg.tar
+RDEPEND: || ( >=sys-libs/zlib-1.3.1[minizip] ( sys-libs/zlib-ng[compat] sys-libs/minizip-ng[compat] ) )
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+CPV: sys-libs/zlib-1.3.1
+IUSE: minizip
+MD5: 2fea75aab3015c66c56ca3efe50f0b9b
+PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+CPV: sys-libs/zlib-ng-2.2.5
+IUSE: compat
+MD5: 3fea75aab3015c66c56ca3efe50f0b9b
+PATH: sys-libs/zlib-ng/zlib-ng-2.2.5-1.gpkg.tar
+SIZE: 10
+USE: amd64 compat
+
+BUILD_ID: 1
+CPV: sys-libs/minizip-ng-4.0.10
+IUSE: compat
+MD5: 4fea75aab3015c66c56ca3efe50f0b9b
+PATH: sys-libs/minizip-ng/minizip-ng-4.0.10-1.gpkg.tar
+SIZE: 10
+USE: amd64 compat
+";
+
+    #[test]
+    fn an_alternative_of_several_atoms_is_taken_whole_or_not_at_all() {
+        // The shape the live index publishes for `virtual/zlib`. Read as three
+        // alternatives, zlib-ng alone would satisfy the group and minizip-ng
+        // would never be installed; it is one alternative, both together.
+        let index = Index::parse(ZLIB_VIRTUAL);
+        let (resolved, refusals) = run_over(&index, &Installed::default(), &["virtual/zlib"]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        let mut installed = installing(&resolved);
+        installed.sort();
+        assert_eq!(
+            installed,
+            [
+                "sys-libs/minizip-ng-4.0.10",
+                "sys-libs/zlib-ng-2.2.5",
+                "virtual/zlib-1.3.1",
+            ],
+        );
+
+        // A root that already has zlib-ng has half of the alternative, which is
+        // not the alternative: minizip-ng is still installed.
+        let root = Installed::of(vec![(
+            "sys-libs/zlib-ng".to_string(),
+            "2.2.5".to_string(),
+            "0".to_string(),
+            "amd64 compat".to_string(),
+        )]);
+        let (resolved, refusals) = run_over(&index, &root, &["virtual/zlib"]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(
+            installing(&resolved),
+            ["sys-libs/minizip-ng-4.0.10", "virtual/zlib-1.3.1"],
+        );
+
+        // With nothing to answer it, the refusal names the alternatives as the
+        // group states them.
+        let bare = Index::parse(
+            &ZLIB_VIRTUAL[..ZLIB_VIRTUAL
+                .find("\nBUILD_ID: 1\nCPV: sys-libs/zlib-1.3.1")
+                .unwrap()],
+        );
+        let (_, refusals) = run_over(&bare, &Installed::default(), &["virtual/zlib"]);
+        assert_eq!(refusals.unsatisfied.len(), 1, "{}", refusals.describe());
+        assert_eq!(
+            refusals.unsatisfied[0].atom,
+            ">=sys-libs/zlib-1.3.1[minizip] or (sys-libs/zlib-ng[compat] and \
+             sys-libs/minizip-ng[compat])",
+        );
+    }
+
+    #[test]
+    fn an_alternative_that_would_take_an_occupied_slot_gives_way_to_the_next() {
+        // `|| ( >=sys-libs/zlib-1.3.2 app-crypt/gnupg )` over a root holding
+        // zlib 1.3.1: the first alternative's build would be a second zlib in
+        // slot 0, and the group offers another.
+        let index = Index::parse(&format!(
+            "{ARCHIVE}\nBUILD_ID: 1\nCPV: app-misc/either-1.0\n\
+             MD5: 7a61f698748c7323c87081584f383b3d\nPATH: app-misc/either/either-1.0-1.gpkg.tar\n\
+             RDEPEND: || ( >=sys-libs/zlib-1.3.2 app-crypt/gnupg )\nSIZE: 10\nUSE: amd64\n",
+        ));
+        let root = root(&["sys-libs/zlib-1.3.1"]);
+        let (resolved, refusals) = run_over(&index, &root, &["app-misc/either"]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(
+            installing(&resolved),
+            ["app-crypt/gnupg-2.4.9", "app-misc/either-1.0"],
+        );
+
+        // Where no alternative is left, the collision is the refusal, naming
+        // the whole group.
+        let index = Index::parse(&format!(
+            "{ARCHIVE}\nBUILD_ID: 1\nCPV: app-misc/either-1.0\n\
+             MD5: 7a61f698748c7323c87081584f383b3d\nPATH: app-misc/either/either-1.0-1.gpkg.tar\n\
+             RDEPEND: || ( >=sys-libs/zlib-1.3.2 app-misc/jq )\nSIZE: 10\nUSE: amd64\n",
+        ));
+        let (_, refusals) = run_over(&index, &root, &["app-misc/either"]);
+        assert_eq!(refusals.occupied.len(), 1, "{}", refusals.describe());
+        assert_eq!(
+            refusals.occupied[0].atom,
+            ">=sys-libs/zlib-1.3.2 or app-misc/jq"
+        );
+        assert!(refusals.occupied[0].installed);
+        assert!(refusals.unsatisfied.is_empty(), "{}", refusals.describe());
+    }
+
+    /// A package a plan names, as its metadata files describe it.
+    fn arriving(cpv: &str, build_id: u64, files: &[(&str, &str)]) -> Arriving {
+        let (category, package, version) = version::split_cpv(cpv).expect("a fixture CPV");
+        let files: HashMap<&str, &[u8]> = files
+            .iter()
+            .map(|(name, text)| (*name, text.as_bytes()))
+            .collect();
+        Arriving {
+            package: InstalledPackage::from_metadata(
+                &format!("{category}/{package}"),
+                version,
+                |name| files.get(name).copied(),
+            )
+            .expect("fixture metadata"),
+            build_id,
+        }
+    }
+
+    #[test]
+    fn a_replayed_plan_skips_what_the_root_has_at_the_version_it_names() {
+        let plan = Plan::project("amd64", "x86-64", None, archive().records());
+        let root = root(&["sys-libs/zlib-1.3.2", "dev-vcs/git-2.54.0"]);
+        let missing: Vec<String> = missing(&root, &plan.packages)
+            .iter()
+            .map(|planned| format!("{}-{}", planned.name, planned.version))
+            .collect();
+        // zlib 1.3.2 is skipped and 1.3.1 is not: one version of a package is
+        // not another. Both builds of git 2.54.0 are skipped, since the root
+        // records a version and not which build it came from.
+        assert!(!missing.contains(&"sys-libs/zlib-1.3.2".to_string()));
+        assert!(missing.contains(&"sys-libs/zlib-1.3.1".to_string()));
+        assert!(!missing.iter().any(|cpv| cpv.starts_with("dev-vcs/git")));
+        assert_eq!(missing.len(), plan.packages.len() - 3);
+    }
+
+    #[test]
+    fn a_replayed_plan_is_held_to_the_slots_and_blockers_of_the_root_it_lands_in() {
+        // A plan resolved against one stage3 and replayed over a newer one: the
+        // root holds zlib 1.3.3 in the slot the plan's 1.3.2 would take.
+        let root = root(&["sys-libs/zlib-1.3.3", "sys-apps/openrc-0.62"])
+            .blocking("sys-apps/openrc", &["!app-editors/vim"]);
+        let refusals = admit(
+            &root,
+            vec![
+                arriving("sys-libs/zlib-1.3.2", 1, &[("SLOT", "0/1\n")]),
+                arriving(
+                    "app-misc/tool-1.0",
+                    2,
+                    &[
+                        ("SLOT", "0\n"),
+                        ("RDEPEND", "!sys-apps/openrc >=sys-libs/zlib-1.3\n"),
+                    ],
+                ),
+                arriving("app-editors/vim-9.1", 3, &[("SLOT", "0\n")]),
+                arriving("app-misc/tool-1.1", 4, &[("SLOT", "0\n")]),
+                // A second slot of a package is a second package.
+                arriving("app-misc/tool-2.0", 5, &[("SLOT", "2\n")]),
+            ],
+        );
+        assert_eq!(refusals.occupied.len(), 2, "{}", refusals.describe());
+        let zlib = &refusals.occupied[0];
+        assert_eq!(zlib.held, "sys-libs/zlib-1.3.3");
+        assert!(zlib.installed);
+        assert_eq!(zlib.second, "sys-libs/zlib-1.3.2 build 1");
+        assert_eq!(zlib.atom, "=sys-libs/zlib-1.3.2");
+        assert_eq!(zlib.wanted_by, "the plan");
+        // An earlier entry of the plan holds a slot as the root does.
+        let tool = &refusals.occupied[1];
+        assert_eq!(tool.held, "app-misc/tool-1.0 build 2");
+        assert!(!tool.installed);
+
+        let mut conflicts: Vec<(String, String, bool)> = refusals
+            .conflicts
+            .iter()
+            .map(|conflict| {
+                (
+                    conflict.stated_by.clone(),
+                    conflict.blocks.clone(),
+                    conflict.stated_in_root,
+                )
+            })
+            .collect();
+        conflicts.sort();
+        assert_eq!(
+            conflicts,
+            [
+                (
+                    "app-misc/tool-1.0".to_string(),
+                    "sys-apps/openrc-0.62".to_string(),
+                    false,
+                ),
+                (
+                    "sys-apps/openrc-0.62".to_string(),
+                    "app-editors/vim-9.1".to_string(),
+                    true,
+                ),
+            ],
+        );
+
+        // Over a root that holds none of it, the same plan is admitted.
+        let refusals = admit(
+            &Installed::default(),
+            vec![arriving("sys-libs/zlib-1.3.2", 1, &[("SLOT", "0/1\n")])],
+        );
+        assert!(refusals.is_empty(), "{}", refusals.describe());
     }
 
     #[test]

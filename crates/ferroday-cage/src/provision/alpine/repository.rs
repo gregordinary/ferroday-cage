@@ -269,10 +269,12 @@ impl RepositoryBuilder {
     /// Returns [`AlpineError::Config`] when no mirror was set, when no keys
     /// were, when the key set is empty, or when the release or a component is
     /// one the repository cannot be addressed by: an empty value, one carrying
-    /// whitespace or a control character, or one that would resolve outside the
-    /// mirror root through a leading `/`, a `..` segment, or an empty or `.`
-    /// segment. Either may otherwise contain slashes, since both may name a
-    /// subtree — postmarketOS publishes an `extra-repos` tree of releases.
+    /// whitespace, a control character, or another character a URL path cannot
+    /// carry as written (such as `%`, `?`, `#`, or one outside ASCII), or one
+    /// that would resolve outside the mirror root through a leading `/`, a `..`
+    /// segment, or an empty or `.` segment. Either may otherwise contain
+    /// slashes, since both may name a subtree — postmarketOS publishes an
+    /// `extra-repos` tree of releases.
     pub fn build(self) -> Result<Repository, AlpineError> {
         let Some(primary) = self.mirror else {
             return Err(AlpineError::Config {

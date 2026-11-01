@@ -240,7 +240,7 @@ impl fmt::Display for UnheldPin {
 
 #[cfg(test)]
 mod tests {
-    use super::super::index::Package;
+    use super::super::index::{Package, sources};
     use super::*;
 
     /// A one-package index stanza at `version` with `sha256`.
@@ -287,7 +287,7 @@ mod tests {
         // published 2.0 since the pin was taken, and the pin still resolves 1.0.
         let text = format!("{}{}", stanza("p", "1.0", A), stanza("p", "2.0", B));
         let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+        let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         assert_eq!(index.get("p").expect("p is in the index").version, "1.0");
         pins.check(&index).expect("the pinned version is offered");
@@ -298,7 +298,11 @@ mod tests {
         let text = format!("{}{}", stanza("p", "1.0", A), stanza("q", "2.0", B));
         let higher = stanza("q", "3.0", A);
         let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
-        let index = Index::merge([(0, text.as_str()), (1, higher.as_str())], "amd64", &pins);
+        let index = Index::merge(
+            sources([(0, text.as_str()), (1, higher.as_str())]),
+            "amd64",
+            &pins,
+        );
 
         assert_eq!(index.get("p").expect("p is pinned").version, "1.0");
         assert_eq!(index.get("q").expect("q is not pinned").version, "3.0");
@@ -311,7 +315,7 @@ mod tests {
         for order in [["1.0", "2.0"], ["2.0", "1.0"]] {
             let text = format!("{}{}", stanza("p", order[0], A), stanza("p", order[1], A));
             let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
-            let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+            let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
             assert_eq!(
                 index.get("p").expect("p is in the index").version,
                 "1.0",
@@ -324,7 +328,7 @@ mod tests {
     fn a_version_the_archives_have_moved_past_names_what_they_offer() {
         let text = stanza("p", "2.0", A);
         let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+        let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         // The fallback keeps the highest so the failure can say what is there,
         // and the check refuses before anything resolves against it.
@@ -348,7 +352,7 @@ mod tests {
     fn a_package_the_archives_dropped_is_reported_as_absent() {
         let text = stanza("q", "1.0", A);
         let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+        let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         match pins.check(&index) {
             Err(DebianError::Pin { unheld }) => {
@@ -366,7 +370,7 @@ mod tests {
         // the digest says so.
         let text = stanza("p", "1.0", B);
         let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+        let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         match pins.check(&index) {
             Err(DebianError::Pin { unheld }) => {
@@ -395,7 +399,7 @@ mod tests {
             [(0, rebuilt.as_str()), (1, original.as_str())],
             [(0, original.as_str()), (1, rebuilt.as_str())],
         ] {
-            let index = Index::merge(inputs, "amd64", &pins);
+            let index = Index::merge(sources(inputs), "amd64", &pins);
             let kept = index.get("p").expect("p is in the index");
             assert_eq!(kept.sha256, A, "offered as {inputs:?}");
             pins.check(&index)
@@ -407,7 +411,7 @@ mod tests {
         // than another version.
         let higher = stanza("p", "2.0", A);
         let index = Index::merge(
-            [(0, higher.as_str()), (1, rebuilt.as_str())],
+            sources([(0, higher.as_str()), (1, rebuilt.as_str())]),
             "amd64",
             &pins,
         );
@@ -442,7 +446,7 @@ mod tests {
         // are the same version, and a hand-written pin may spell either.
         let text = stanza("p", "1.0", A);
         let pins = Pins::of(&plan_of(&[("p", "0:1.0", A)])).expect("the plan has no duplicate");
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+        let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         assert_eq!(index.get("p").expect("p is in the index").version, "1.0");
         pins.check(&index).expect("the epoch is not a difference");
@@ -459,7 +463,7 @@ mod tests {
             ("b", "1.0", A),
         ]))
         .expect("the plan has no duplicate");
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+        let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         match pins.check(&index) {
             Err(DebianError::Pin { unheld }) => {
@@ -497,7 +501,7 @@ mod tests {
     fn no_pin_leaves_the_resolution_alone() {
         let text = format!("{}{}", stanza("p", "1.0", A), stanza("p", "2.0", B));
         let pins = Pins::none();
-        let index = Index::merge([(0, text.as_str())], "amd64", &pins);
+        let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         assert_eq!(index.get("p").expect("p is in the index").version, "2.0");
         pins.check(&index).expect("an empty pin holds vacuously");

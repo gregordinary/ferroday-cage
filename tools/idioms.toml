@@ -351,3 +351,17 @@ how the layers join and which repeated cause to drop."""
 path = "crates/ferroday-cage/src/failure.rs"
 count = 2
 why = "The answer."
+
+[[idiom]]
+name = "a path's directory, or `.` for a bare name"
+pattern = 'Path::new\("\."\)'
+answer = """\
+`path::parent_of`. `Path::parent` answers a bare name's parent as the empty \
+path, which the kernel neither opens nor creates, and a sibling joined onto it \
+loses the directory. A caller that places a lock, a staging file, or a probe \
+beside a path asks this rather than choosing the fallback itself."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/path.rs"
+count = 1
+why = "The answer."

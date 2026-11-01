@@ -33,9 +33,10 @@ holds a complete root filesystem, never a partial one:
   made, so a destination created ahead of time is never provisioned into.
 - Otherwise the provisioner fills a staging directory beside the
   destination, the staging tree's filesystem is synced, and a single
-  `rename` publishes it. An interrupted run leaves no destination for a
-  later caller to trust, and a crash cannot leave truncated files behind a
-  completed rename.
+  `rename` publishes it. The rename replaces nothing, so a directory made at
+  the destination meanwhile fails the run and stays as it was. An interrupted
+  run leaves no destination for a later caller to trust, and a crash cannot
+  leave truncated files behind a completed rename.
 - Concurrent calls, including from other processes, serialize on a
   `<name>.lock` file beside the destination: exactly one provisions, the
   rest observe the published result. Locking uses `flock`, so the
@@ -616,12 +617,13 @@ has been read, because a publication is durable. A stream taken for a complete
 archive of nothing would publish an empty tree. Every later `ensure` then
 returns that as `Provisioned::Existing` without consulting the source again.
 
-The stream is read to its end, past the archive's end marker. Each compression
-carries integrity checks: a CRC per gzip member, a check per xz block, a
-checksum per zstd frame. The last of them follows the end marker, and reading on
-is what compares it. A damaged final block therefore fails the run rather than
-extracting. More than a mebibyte after the marker is refused, which leaves room
-for the record padding `tar` writes.
+The stream is read to its end, past the archive's end marker. A gzip member
+always ends with a CRC. An xz block and a zstd frame carry a check where the
+encoder wrote one, as the `xz` and `zstd` tools do by default. The last check
+follows the end marker, and reading on is what compares it. A damaged final
+block that a check covers therefore fails the run rather than extracting. More
+than a mebibyte after the marker is refused, which leaves room for the record
+padding `tar` writes.
 
 Extraction is unprivileged and designed for archives that describe a root
 filesystem:

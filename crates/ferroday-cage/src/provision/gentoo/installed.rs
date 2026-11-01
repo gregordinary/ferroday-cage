@@ -72,6 +72,9 @@ const IUSE_EFFECTIVE_FILE: &str = "IUSE_EFFECTIVE";
 /// no `IUSE_EFFECTIVE`.
 const IUSE_FILE: &str = "IUSE";
 
+/// The file inside an entry naming the target triple the package was built for.
+const CHOST_FILE: &str = "CHOST";
+
 /// The two files holding an entry's runtime dependencies, the classes whose
 /// blockers bind for as long as the package is installed.
 ///
@@ -79,6 +82,9 @@ const IUSE_FILE: &str = "IUSE";
 /// USE-evaluated, as the index publishes them, so they are read with the same
 /// grammar.
 const RUNTIME_DEPENDENCY_FILES: [&str; 2] = ["RDEPEND", "PDEPEND"];
+
+/// The file inside an entry holding the ordinal its merge was stamped with.
+const COUNTER_FILE: &str = "COUNTER";
 
 /// The prefix portage gives an entry it is part way through merging.
 ///
@@ -119,6 +125,20 @@ pub struct InstalledPackage {
     /// among several and binds nothing on its own, so only the plain ones are
     /// kept, which is the reading the resolver gives a chosen build's own.
     blockers: Vec<Atom>,
+    /// The ordinal its merge was stamped with, where the entry records one
+    /// that parses.
+    ///
+    /// Not exposed: it is the root's bookkeeping rather than anything about
+    /// the package, and the one question asked of it is which is greatest; see
+    /// [`Installed::last_counter`].
+    counter: Option<u64>,
+    /// The target triple the package was built for, from its `CHOST` file,
+    /// where the entry carries one.
+    ///
+    /// Not exposed, for the reason [`iuse`](Self::iuse) is not: it is what a
+    /// binary package merged into the root is held to, through
+    /// [`Installed::targets`].
+    chost: Option<String>,
 }
 
 impl InstalledPackage {
@@ -210,12 +230,49 @@ impl Installed {
         self.packages.is_empty()
     }
 
-    /// Every installed package published under `name`, which is more than one
-    /// where the root holds several slots of it.
-    pub(super) fn under(&self, name: &str) -> impl Iterator<Item = &InstalledPackage> {
+    /// The target triples the root's packages were built for: every `CHOST`
+    /// its database states, which a stage3's states as one.
+    ///
+    /// What a binary package merged into the root is held to. A root built for
+    /// one target holds packages built for it, and a package built for another
+    /// is one its programs cannot run beside. Empty for a root whose database
+    /// states none.
+    pub(super) fn targets(&self) -> BTreeSet<String> {
         self.packages
             .iter()
-            .filter(move |package| package.name == name)
+            .filter_map(|package| package.chost.clone())
+            .collect()
+    }
+
+    /// Every installed package published under `name`, which is more than one
+    /// where the root holds several slots of it.
+    ///
+    /// Found by halving rather than by a walk, since the packages are held in
+    /// name order: the resolver asks this of every atom it meets, and a walk
+    /// would make each question cost the whole root.
+    pub(super) fn under(&self, name: &str) -> impl Iterator<Item = &InstalledPackage> {
+        let first = self
+            .packages
+            .partition_point(|package| package.name.as_str() < name);
+        self.packages[first..]
+            .iter()
+            .take_while(move |package| package.name == name)
+    }
+
+    /// The greatest ordinal any entry records a merge was stamped with, or zero
+    /// where none records one.
+    ///
+    /// Half of where a merge's own ordinal continues from, the root's counter
+    /// file being the other: portage takes the greater of the two, because a
+    /// counter file that was removed or rolled back would otherwise reissue
+    /// ordinals the database already holds. An entry recording none, or one
+    /// that does not parse, is passed over, as portage passes it over.
+    pub(super) fn last_counter(&self) -> u64 {
+        self.packages
+            .iter()
+            .filter_map(|package| package.counter)
+            .max()
+            .unwrap_or(0)
     }
 
     /// A set of packages spelled out, for a test that needs a root without a
@@ -236,6 +293,8 @@ impl Installed {
                     iuse: use_flags.clone(),
                     use_flags,
                     blockers: Vec::new(),
+                    counter: None,
+                    chost: None,
                 })
                 .collect(),
         )
@@ -265,8 +324,11 @@ impl Installed {
     /// reaching the third key differ only in version — but a root holding
     /// `1.9` and `1.10` of one package in one slot is a root portage can
     /// produce, and reporting them the wrong way round would be a listing a
-    /// reader has to distrust. A version the format does not define falls back
-    /// to text, which orders it stably rather than losing it.
+    /// reader has to distrust.
+    ///
+    /// Every version here is one the comparator orders: an entry's version is
+    /// what [`version::split_cpv`] split off its directory name, and that split
+    /// is made only where what follows parses as a version.
     fn sorted(mut packages: Vec<InstalledPackage>) -> Installed {
         packages.sort_by(|a, b| {
             a.name
@@ -274,7 +336,7 @@ impl Installed {
                 .then_with(|| a.slot.cmp(&b.slot))
                 .then_with(|| {
                     version::compare(&a.version, &b.version)
-                        .unwrap_or_else(|| a.version.cmp(&b.version))
+                        .expect("an installed version is one split_cpv found to parse")
                 })
         });
         Installed { packages }
@@ -425,24 +487,115 @@ fn read_entry(
             format!("{dir} does not name a package and a version"),
         ));
     };
-    let name = format!("{category}/{package}");
     // Each file of an entry is one of a binary package's metadata files, which
     // a container holds to `MAX_METADATA_BYTES` together; one past that alone
     // is not one portage wrote.
     let field = |file: &str| -> Result<Option<String>, GentooError> {
         layers
             .read(&format!("{dir}/{file}"))
-            .map(|bytes| bytes.map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string()))
+            .map(|bytes| bytes.as_deref().map(field_text))
             .map_err(|err| GentooError::io("reading a package database entry", at, err))
     };
+    read_package(
+        format!("{category}/{package}"),
+        version,
+        field,
+        |unreadable| {
+            GentooError::database(
+                at,
+                match unreadable {
+                    Unreadable::NoSlot => {
+                        format!("{dir} names a package but carries no {SLOT_FILE} file")
+                    }
+                    Unreadable::Dependencies { file, reason } => {
+                        format!("{dir}/{file} cannot be read: {reason}")
+                    }
+                },
+            )
+        },
+    )
+}
+
+impl InstalledPackage {
+    /// The package a binary package's own metadata describes: what the root's
+    /// database will say of `name` at `version` once the package is merged.
+    ///
+    /// The merge writes a container's metadata files out as the entry
+    /// verbatim, so the entry [`installed`] would read back afterwards is these
+    /// files read the same way, with no merge ordinal yet. That is what lets a
+    /// plan's packages be held to the root before any of them is merged.
+    ///
+    /// `file` answers a metadata file's bytes by its name. `name` and `version`
+    /// are the plan's, which the container's own `CATEGORY` and `PF` were held
+    /// to as it was read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason where the metadata states no `SLOT`, or a runtime
+    /// dependency class that does not parse, in the sentence "the package at
+    /// `<path>` ..." that [`GentooError::Container`] renders.
+    pub(super) fn from_metadata<'f>(
+        name: &str,
+        version: &str,
+        file: impl Fn(&str) -> Option<&'f [u8]>,
+    ) -> Result<InstalledPackage, String> {
+        let field =
+            |name: &str| -> Result<Option<String>, String> { Ok(file(name).map(field_text)) };
+        read_package(
+            name.to_string(),
+            version,
+            field,
+            |unreadable| match unreadable {
+                Unreadable::NoSlot => {
+                    format!(
+                        "states no {SLOT_FILE} in its metadata, so it names no slot to merge into"
+                    )
+                }
+                Unreadable::Dependencies { file, reason } => {
+                    format!("states a {file} in its metadata that cannot be read: {reason}")
+                }
+            },
+        )
+    }
+}
+
+/// One file of an entry or of a container's metadata, as the value it holds:
+/// its text, with the surrounding whitespace and the trailing newline dropped.
+fn field_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+/// Why a set of metadata files does not describe a package.
+enum Unreadable {
+    /// No `SLOT`: what tells an entry from something merely shaped like one.
+    NoSlot,
+    /// A runtime dependency class that does not parse.
+    Dependencies {
+        /// Which of [`RUNTIME_DEPENDENCY_FILES`].
+        file: &'static str,
+        /// Why the grammar refused it.
+        reason: String,
+    },
+}
+
+/// Reads the package `name` at `version` out of its metadata files, each asked
+/// of `field` by name, reporting files that do not describe one through
+/// `refuse`.
+///
+/// The one reading of a package's files, whether they sit in a root's database
+/// or in a binary package not yet merged: the merge writes the second out as the
+/// first, so two readings would be two answers to what one set of files says.
+fn read_package<E>(
+    name: String,
+    version: &str,
+    field: impl Fn(&str) -> Result<Option<String>, E>,
+    refuse: impl Fn(Unreadable) -> E,
+) -> Result<InstalledPackage, E> {
     // A missing `SLOT` is what tells an entry directory from something else
     // that happens to be shaped like one: portage writes the file for every
     // package it merges, and so does this layer.
     let Some(slot) = field(SLOT_FILE)? else {
-        return Err(GentooError::database(
-            at,
-            format!("{dir} names a package but carries no {SLOT_FILE} file"),
-        ));
+        return Err(refuse(Unreadable::NoSlot));
     };
     // A package with no runtime dependencies may carry neither file, so their
     // absence is no blockers. One that does not parse is a gap in what the
@@ -450,9 +603,8 @@ fn read_entry(
     let mut blockers = Vec::new();
     for file in RUNTIME_DEPENDENCY_FILES {
         let class = field(file)?.unwrap_or_default();
-        let parsed = atom::parse_class(&class).map_err(|reason| {
-            GentooError::database(at, format!("{dir}/{file} cannot be read: {reason}"))
-        })?;
+        let parsed = atom::parse_class(&class)
+            .map_err(|reason| refuse(Unreadable::Dependencies { file, reason }))?;
         blockers.extend(
             parsed
                 .into_iter()
@@ -475,6 +627,8 @@ fn read_entry(
             None => field(IUSE_FILE)?.unwrap_or_default(),
         },
         blockers,
+        counter: field(COUNTER_FILE)?.and_then(|text| text.parse().ok()),
+        chost: field(CHOST_FILE)?.filter(|chost| !chost.is_empty()),
     })
 }
 
@@ -837,6 +991,119 @@ mod tests {
     }
 
     /// The names `merged` reports, in its order.
+    #[test]
+    fn the_last_counter_is_the_greatest_any_entry_records() {
+        // Portage continues its merge ordinal from the greater of its counter
+        // file and every entry's own, so a counter file that was removed does
+        // not reissue an ordinal the database already holds. An entry with no
+        // ordinal, or one that does not parse, is passed over.
+        let dir = stage3("counter");
+        let at = |pf: &str| dir.join(DB_DIR).join(pf);
+        std::fs::write(at("sys-libs/zlib-1.3.1-r1").join("COUNTER"), "391").unwrap();
+        std::fs::write(at("sys-apps/util-linux-2.41.2").join("COUNTER"), "17").unwrap();
+        std::fs::write(at("app-crypt/pinentry-1.3.2-r1").join("COUNTER"), "x").unwrap();
+        assert_eq!(installed(&*dir).expect("read").last_counter(), 391);
+        assert_eq!(
+            installed(&*stage3("no-counter"))
+                .expect("read")
+                .last_counter(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_package_reads_the_same_from_its_metadata_as_from_the_entry_it_becomes() {
+        // The merge writes a container's metadata out as the entry, so the two
+        // are one reading of one set of files.
+        let files: [(&str, &[u8]); 4] = [
+            ("SLOT", b"0/1\n"),
+            ("USE", b"amd64 minizip\n"),
+            ("IUSE", b"minizip static-libs\n"),
+            (
+                "RDEPEND",
+                b"!sys-libs/zlib-ng[compat] >=sys-libs/glibc-2.40\n",
+            ),
+        ];
+        let lookup = |name: &str| {
+            files
+                .iter()
+                .find(|(held, _)| *held == name)
+                .map(|(_, b)| *b)
+        };
+        let from_metadata = InstalledPackage::from_metadata("sys-libs/zlib", "1.3.2", lookup)
+            .expect("the metadata describes a package");
+
+        let dir = Scratch::for_test("gentoo-installed", "from-metadata");
+        let entry = dir.join(DB_DIR).join("sys-libs/zlib-1.3.2");
+        std::fs::create_dir_all(&entry).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(entry.join(name), bytes).unwrap();
+        }
+        let from_entry = installed(&*dir)
+            .expect("the entry reads")
+            .packages()
+            .next()
+            .expect("one package")
+            .clone();
+        assert_eq!(from_metadata, from_entry);
+        assert_eq!(from_metadata.slot(), "0/1");
+        assert_eq!(from_metadata.use_flag("static-libs"), Some(false));
+        assert_eq!(from_metadata.blockers().len(), 1);
+
+        // Metadata naming no slot names nothing to merge into.
+        let reason = InstalledPackage::from_metadata("sys-libs/zlib", "1.3.2", |_| None)
+            .expect_err("no SLOT is refused");
+        assert!(reason.contains("SLOT"), "{reason}");
+        let reason = InstalledPackage::from_metadata("sys-libs/zlib", "1.3.2", |name| match name {
+            "SLOT" => Some(&b"0"[..]),
+            "PDEPEND" => Some(&b"|| ( a-b/c"[..]),
+            _ => None,
+        })
+        .expect_err("an unreadable class is refused");
+        assert!(reason.contains("PDEPEND"), "{reason}");
+    }
+
+    #[test]
+    fn the_packages_under_a_name_are_that_name_s_and_no_neighbour_s() {
+        // Found by halving the name-ordered list, so the names on either side
+        // -- one a prefix of the asked-for name, one extending it -- are what
+        // would show a boundary taken one place off.
+        let installed = Installed::of(
+            [
+                ("dev-lang/python", "3.11.14", "3.11"),
+                ("dev-lang/python", "3.12.12", "3.12"),
+                ("dev-lang/python-exec", "2.4.10", "2"),
+                ("dev-lang/pytho", "1", "0"),
+                ("dev-lang/perl", "5.42", "0"),
+            ]
+            .into_iter()
+            .map(|(name, version, slot)| {
+                (
+                    name.to_string(),
+                    version.to_string(),
+                    slot.to_string(),
+                    String::new(),
+                )
+            })
+            .collect(),
+        );
+        let under = |name: &str| -> Vec<String> {
+            installed.under(name).map(|package| package.cpv()).collect()
+        };
+        assert_eq!(
+            under("dev-lang/python"),
+            ["dev-lang/python-3.11.14", "dev-lang/python-3.12.12"],
+        );
+        assert_eq!(
+            under("dev-lang/python-exec"),
+            ["dev-lang/python-exec-2.4.10"]
+        );
+        assert_eq!(under("dev-lang/pytho"), ["dev-lang/pytho-1"]);
+        assert!(under("dev-lang/pyth").is_empty());
+        assert!(under("dev-lang/ruby").is_empty());
+        assert!(under("a/a").is_empty());
+    }
+
     fn names(installed: &Installed) -> Vec<&str> {
         installed.packages().map(InstalledPackage::name).collect()
     }

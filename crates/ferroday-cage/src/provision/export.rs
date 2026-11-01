@@ -332,10 +332,7 @@ impl<'a> Export<'a> {
     /// ```
     pub fn write_to_path(self, path: impl AsRef<Path>) -> Result<(), ProvisionError> {
         let path = path.as_ref();
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
+        let parent = crate::path::parent_of(path);
         refuse_dest_inside(&self.rootfs, path, parent)?;
 
         // Unique to this call, so two exports to one destination -- two

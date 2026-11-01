@@ -194,17 +194,20 @@ pub(crate) fn required(value: Option<&str>, field: &str, at: &str) -> Result<Str
 /// that came back missing a line it was given is the one failure the carried
 /// fields exist to prevent.
 ///
-/// A number is ASCII digits, after a `-` for a type that has negatives, and
-/// nothing else. That is how the writer spells one. Rust's own integer parser
-/// also takes a leading `+`, and a document read that way would be written back
-/// without it, as a document other than the one that was read.
+/// A number is read only as the writer spells one: ASCII digits with no
+/// leading zero, after a `-` for a negative value of a type that has them.
+/// Rust's own integer parser also takes a leading `+`, leading zeros, and
+/// `-0`. A document read that way would be written back without them, as a
+/// document other than the one that was read, and a committed plan's digest
+/// would change with nothing in it changed. So a value is read only where
+/// writing the number back gives the same text.
 ///
 /// # Errors
 ///
 /// Returns the reason where the field is present and is not a number of type
-/// `T`, one out of its range included. Each layer wraps it in its own document
-/// failure, as [`required`]'s.
-pub(crate) fn number<T: std::str::FromStr>(
+/// `T` in that spelling, one out of its range included. Each layer wraps it in
+/// its own document failure, as [`required`]'s.
+pub(crate) fn number<T: std::str::FromStr + fmt::Display>(
     value: Option<&str>,
     field: &str,
     at: &str,
@@ -212,16 +215,12 @@ pub(crate) fn number<T: std::str::FromStr>(
     let Some(value) = value else {
         return Ok(None);
     };
-    let digits = value.strip_prefix('-').unwrap_or(value);
-    if !digits.is_empty()
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
-        && let Ok(number) = value.parse()
-    {
-        return Ok(Some(number));
+    match value.parse::<T>() {
+        Ok(number) if number.to_string() == value => Ok(Some(number)),
+        _ => Err(format!(
+            "{at} has a {field} of {value:?}, which is not a number"
+        )),
     }
-    Err(format!(
-        "{at} has a {field} of {value:?}, which is not a number"
-    ))
 }
 
 /// Reads a space-separated list field, absent or empty giving no entries.
@@ -464,10 +463,13 @@ mod tests {
             "absent is no value"
         );
 
-        // Rust's parser takes a leading `+`, which the writer never writes, so a
-        // document reading it would not write back as itself.
+        // Rust's parser takes a leading `+` and leading zeros, neither of which
+        // the writer writes, so a document reading them would not write back as
+        // itself.
         for refused in [
             "+5",
+            "0010",
+            "00",
             "",
             "-",
             "5 ",
@@ -489,5 +491,11 @@ mod tests {
         assert_eq!(signed(&i64::MIN.to_string()), Ok(Some(i64::MIN)));
         assert!(signed("+42").is_err());
         assert!(signed("--42").is_err());
+        // Zero has one spelling, and a negative number none with a leading
+        // zero.
+        assert_eq!(signed("0"), Ok(Some(0)));
+        for refused in ["-0", "-042", "007"] {
+            assert!(signed(refused).is_err(), "{refused}");
+        }
     }
 }

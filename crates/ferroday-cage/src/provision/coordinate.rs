@@ -31,10 +31,10 @@ pub(crate) enum Nesting {
 /// index, reporting the reason it is refused.
 ///
 /// The check refuses a value that would resolve outside the tree it belongs to,
-/// that the release format cannot name, or that a request line cannot carry. It
-/// is deliberately narrow: it refuses traversal rather than the separator,
-/// because a slashed suite and a slashed component are both legitimate layouts
-/// and apt reads them.
+/// that the release format cannot name, or that a URL path cannot carry as
+/// written. It is deliberately narrow: it refuses traversal rather than the
+/// separator, because a slashed suite and a slashed component are both
+/// legitimate layouts and apt reads them.
 ///
 /// What is refused, and why each one is not merely unusual:
 ///
@@ -56,6 +56,14 @@ pub(crate) enum Nesting {
 /// - An ASCII control character, for the same reason a newline cannot appear in
 ///   an index field without ending it — and, in a request line, without
 ///   starting a header of its own.
+/// - Any other character a URL path does not carry as itself. A coordinate is
+///   written into a URL's path verbatim, so it is held to RFC 3986's `pchar`
+///   without its percent escapes: ASCII letters and digits, `-._~`, and
+///   `!$&'()*+,;=:@`. A `%` would begin an escape the server decodes, so a
+///   component spelled `%2e%2e` would reach it as `..`. A `?` or a `#` would
+///   end the path, and a character outside ASCII is one the bundled client
+///   refuses to write into a request line at all. Accepting one here would
+///   only defer the refusal to every fetch, under a reason about the URL.
 ///
 /// `what` names the coordinate in the refusal, in the possessive form the
 /// message reads with: `the pool's suite`, `the repository's component`.
@@ -69,6 +77,14 @@ pub(crate) fn check(what: &str, value: &str, nesting: Nesting) -> Result<(), Str
     }
     if value.chars().any(char::is_whitespace) {
         return refuse("contains whitespace, which a release field cannot name");
+    }
+    if let Some(character) = value
+        .chars()
+        .find(|&character| character != '/' && !is_path_character(character))
+    {
+        return refuse(&format!(
+            "contains {character:?}, which a URL path cannot carry as written"
+        ));
     }
     if value.starts_with('/') {
         return refuse("is an absolute path, which would resolve outside the archive");
@@ -85,6 +101,16 @@ pub(crate) fn check(what: &str, value: &str, nesting: Nesting) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// Whether a URL path segment carries `character` as itself: RFC 3986's
+/// `pchar`, without the percent escape.
+///
+/// This judges a value a caller wrote. [`file_url`](super::file_url) composes
+/// a URL instead, and escapes the sub-delimiters this accepts as well, since
+/// escaping a character a path could carry costs a URL it writes nothing.
+fn is_path_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@".contains(character)
 }
 
 #[cfg(test)]
@@ -127,6 +153,43 @@ mod tests {
         for value in ["my main", "a\nSuite: b", "p.deb\r\nX-Injected: 1", "a\tb"] {
             refusal(value, Nesting::Nested);
         }
+    }
+
+    #[test]
+    fn a_character_a_url_path_cannot_carry_as_written_is_refused() {
+        // A `%` begins an escape the server decodes, so `%2e%2e` would reach it
+        // as `..`; a `?` or a `#` ends the path; a character outside ASCII is
+        // one the client refuses to write into a request line at all.
+        for value in [
+            "%2e%2e",
+            "main%2fcontrib",
+            "main?x=1",
+            "main#x",
+            "caf\u{e9}",
+            "a\"b",
+            "a<b>",
+            "a\\b",
+            "a^b",
+            "a`b",
+            "a{b}",
+            "a|b",
+            "a[b]",
+        ] {
+            let reason = refusal(value, Nesting::Nested);
+            assert!(reason.contains("URL path"), "{value:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn every_character_a_url_path_carries_as_itself_is_accepted() {
+        // RFC 3986's `pchar` without the escape: none of these needs one, so a
+        // value spelled with them reaches the server as it was written.
+        check(
+            "the archive's component",
+            "a-b.c_d~e!f$g&h'i(j)k*l+m,n;o=p:q@r",
+            Nesting::Nested,
+        )
+        .expect("every unreserved and sub-delimiting character is accepted");
     }
 
     #[test]

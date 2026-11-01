@@ -76,12 +76,13 @@
 //! gentoo-binhost --rootfs ./elsewhere --plan-file binhost.plan -- git --version
 //! ```
 //!
-//! A plan carries the build id, path, size and digest of every package and the
-//! order they merge in, so the replay fetches no index and makes no choice. The
-//! binhost keeps a published version far longer than the five weeks the stage3
-//! autobuilds tree keeps a build, so a plan replays for as long as the archive
-//! carries what it names. It supersedes `--install` and `--prefer-use`, which
-//! describe a resolution that no longer happens.
+//! A plan carries the build id, path, size and MD5 of every package, what the
+//! index stated about each build, and the order they merge in, so the replay
+//! fetches no index and makes no choice. The binhost keeps a published version
+//! far longer than the five weeks the stage3 autobuilds tree keeps a build, so a
+//! plan replays for as long as the archive carries what it names and the key
+//! that signs its containers is in force. It supersedes `--install` and
+//! `--prefer-use`, which describe a resolution that no longer happens.
 //!
 //! ```text
 //! --rootfs DIR         Where the root filesystem lives (required)
@@ -390,7 +391,8 @@ Options:
   --plan               Resolve against --rootfs, print the plan, and exit
   --plan-file FILE     Install exactly what this plan names, resolving nothing.
                        The other half of --plan: a plan replays for as long as
-                       the binhost carries what it names
+                       the binhost carries what it names and its signing key
+                       is in force
   --help               Print this help and exit",
     );
 }

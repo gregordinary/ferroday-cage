@@ -42,10 +42,10 @@ A bootstrap runs in three steps:
    vendored keyring. That document is cleartext-signed. It lists every stage3
    the architecture currently offers, with the build each points at and the
    exact size of its tarball.
-2. **The signed digest.** It matches the configured variant against that list,
-   then fetches the `.DIGESTS` document beside the chosen build, cleartext-
-   signed by the same key. From it the layer reads the SHA-512 recorded for the
-   tarball.
+2. **The signed digest.** It matches the configured variant against that list.
+   Then it reads the `.DIGESTS` document beside the chosen build, from the
+   archive or from [the cache](#the-cache), cleartext-signed by the same key.
+   From it the layer reads the SHA-512 recorded for the tarball.
 3. **Download and verify.** It downloads the tarball into a cache, bounded by the
    size the enumeration recorded, checks it against that SHA-512, and only then
    extracts it. The bytes are never streamed into the extractor unverified. An
@@ -116,11 +116,18 @@ digest document beside that build is what vouches for the tarball.
 
 **A pin is not indefinite.** The autobuilds tree holds about five weeks of
 builds and Gentoo publishes no equivalent of `snapshot.debian.org`. A build id
-therefore resolves against the archive for roughly a month, and against a
-populated cache for as long as the cache lives. Past that the archive answers
-a 404 instead. The Debian and Alpine layers differ here, because their plan documents
-replay against a snapshot service or a repository that keeps old versions. That
-is a property of the archive rather than of this layer.
+therefore resolves against the archive for roughly a month, and the archive
+answers a 404 after that. A provision keeps the build's digest document beside
+its tarball in `cache_dir`. A pin resolves from that copy once the archive has
+dropped the build, for as long as the cache keeps it.
+
+Neither outlives the key that signed the document. The copy is verified at
+every use, against the keyring and at the current time, as a fetched document
+is. A pin therefore stops resolving when the signing key lapses, which for the
+subkey Gentoo signs with today is 2028-07-01. The Debian and Alpine layers
+differ here, because their plan documents replay against a snapshot service or
+a repository that keeps old versions. That is a property of the archive rather
+than of this layer.
 
 Within one process, a resolution carries over whole:
 
@@ -343,6 +350,12 @@ Since nothing backtracks, the resolution keeps the build it chose first and
 reports what could not join it. The order is a resolution's own and is stable,
 so the same install list is refused the same way every time.
 
+An any-of group is the one place a collision is passed over rather than
+refused, because the group offers a choice. An alternative whose build would
+take an occupied slot gives way to the group's next alternative. The group is
+refused only when no alternative is left. An alternative is what the group lists
+together: `|| ( a ( b c ) )` takes `a`, or `b` and `c` both.
+
 The root holds a slot as firmly as the resolution does. Merging registers a
 database entry beside what is already installed and unmerges nothing. So an atom
 answered only by a version later than the root's own in that slot is refused the
@@ -377,11 +390,19 @@ let mut replay = Gentoo::builder("amd64").binhost("x86-64").plan(kept).build()?;
 # }
 ```
 
-A plan names each package's build id, path, size and digest, and the order they
-merge in. It is worth serializing where a `Stage3` is not, and for the opposite
+A plan names each package's build id, path, size and MD5, and the order they
+merge in. It also records what the index stated about each build: its slot, USE
+flags, dependencies and build time. Nothing signs the index, and those fields
+are what the resolution decided from. Each container's signed metadata is held
+to them when the plan is installed. A replay therefore installs the resolution
+the plan records, or refuses.
+
+A plan is worth serializing where a `Stage3` is not, and for the opposite
 reason. The autobuilds tree keeps about five weeks of stage3 builds, while the
-binhost keeps a published version far longer. A plan therefore replays for as
-long as the archive carries what it names.
+binhost keeps a published version far longer. A plan replays for as long as the
+archive carries what it names and the key that signs its containers is in
+force. Each `Manifest` is verified at the time of the install, so a plan stops
+replaying when that key lapses.
 
 A plan also names the architecture and the binhost it was resolved for, and
 `build()` refuses one that does not agree with the builder. The builder above
@@ -390,6 +411,21 @@ architecture would compose its own with the plan's binhost. It would fetch a
 directory neither of them names, and report a 404 against a correctly spelled
 mirror. A builder that names no binhost takes the plan's, which is what it
 resolved against.
+
+A plan is normally replayed over a newer root than it was resolved against,
+since a stage3 build leaves the archive in five weeks. So the replay is held to
+the root it installs into:
+
+- A package the root already has at the version the plan names is skipped, as a
+  resolution would skip it.
+- The rest are verified before anything is merged. Each one's own signed
+  metadata then supplies the slot and blockers the plan does not record.
+- A package whose slot the root or an earlier entry already holds is refused, as
+  is a blocker either side states against the other. Nothing is merged.
+
+A plan resolved against a stage3 with no `dev-libs/foo`, replayed over one that
+ships `foo-1.1`, therefore refuses rather than registering `foo-1.0` beside it.
+Resolve the plan again against the newer root.
 
 The stanza order *is* the install order, which is where this format departs from
 the other two layers' plans. That order is a resolution's own output, a
@@ -406,7 +442,9 @@ Portage would rebuild what is present, and `--depclean` would remove it.
 An entry is the container's own metadata directory plus the three files portage
 computes at merge, `CONTENTS`, `COUNTER` and `BINPKGMD5`. That is exactly what a
 stage3's own entries turn out to be. The merge ordinal continues the root's
-sequence rather than starting again.
+sequence rather than starting again. It continues from the greater of the root's
+counter file and every ordinal its database records, as portage does. A counter
+file that was removed then reissues no ordinal an entry already carries.
 
 `CONTENTS` uses portage's own line types:
 
@@ -474,7 +512,9 @@ for version in catalogue.versions("dev-vcs/git") {
 `provision::ensure` reports a directory that already exists as `Existing` and
 does not touch it. So the way to add packages to a root you already have is a
 layered build. The base stays pristine, and the increment lives in an overlay
-upper that the returned handle removes when dropped.
+upper that the returned handle removes when dropped. A call that fails removes
+an upper it created. An upper that already existed is yours, and a failure
+leaves it in place.
 
 ```rust,no_run
 use ferroday_cage::provision::gentoo::Gentoo;
@@ -525,8 +565,14 @@ machinery the [Debian layer](debian.md#trust) uses for an `InRelease`. Three
 things must hold:
 
 - The signature verifies against a certificate in the keyring.
-- The key was within its validity window when it signed.
+- The key that made it is in force now. A key that has since expired or been
+  revoked vouches for nothing, whenever it signed.
 - The algorithms involved are ones this crate rests a trust decision on.
+
+Verification runs at the current time, so every signed document this layer
+reads stops verifying when its signing key lapses. That includes a pointer from
+an archived mirror, a digest document the cache kept, and every cached or
+planned container's `Manifest`.
 
 Gentoo signs with a dedicated signing subkey of its Automated Weekly Release
 Key. The subkey's binding is verified back to the primary before the signature
@@ -592,14 +638,36 @@ claim.
 
 Put together, that is a real substitution. A mirror answering a request for one
 package with a genuine, correctly signed *other* package passes every signature
-check there is. The layer closes it after verification, from the metadata inside
-the container: `CATEGORY`, `PF` and `BUILD_ID` compared against the record the
-resolution chose. A mismatch is a refusal, not a warning.
+check there is. So once the `Manifest` verifies, the container's signed metadata
+is held to the plan entry the resolution chose:
+
+| Signed field | Held to |
+| --- | --- |
+| `CATEGORY`, `PF`, `BUILD_ID` | The package and the build the entry names |
+| `CHOST` | A target the root's own packages were built for |
+| `SLOT`, `USE`, `IUSE`, `RDEPEND`, `PDEPEND`, `BUILD_TIME` | What the index stated, which the resolution acted on |
+
+The container's MD5 must also be the one the index stated, as portage requires
+of a binary package it downloads. A disagreement is a refusal, not a warning. A
+root whose database states no `CHOST` takes the first package's. That is what
+its database states once that package is registered.
+
+**One substitution stays open, and it is the archive's.** Nothing Gentoo signs
+names the binhost. Binhosts of one architecture that share a target differ only
+in compiler flags, and in no uniform way. `x86-64` builds with `-march=x86-64`
+and `x86-64-v3` with `-march=x86-64-v3`, while `x86-64_hardened` and
+`x86-64_llvm` name no level at all. A mirror serving one such binhost's index
+and containers in place of another's passes every check a live resolution
+makes. A plan resolved from the right binhost is not open to it, because the
+MD5s it records are that binhost's.
 
 The `Manifest` is the container's last member, so the digests arrive after the
 bytes they cover and a single forward pass cannot verify before extracting. The
 container is already in a cache, so this costs a second pass over a local file
 rather than a second fetch. Nothing is decompressed before its digest matches.
+The first pass refuses a container of more than 16 entries as they arrive, since
+nothing yet vouches for any of them. GLEP 78 defines six and leaves room for
+more.
 
 The two detached `.sig` members go unread for the reason the stage3's `.asc`
 does: the cleartext-signed `Manifest` binds the same bytes. They are digested by
@@ -680,8 +748,8 @@ Gentoo publishes no deadline of any kind. There is no `Valid-Until` above the
 documents and no expiration on the signatures themselves, which leaves a gap the
 first two layers do not have. A mirror serving a genuinely signed but months-old
 pointer, with its matching digest document, passes every other check there is.
-The signature verifies, the key was valid when it signed, and the digest matches
-the bytes. That is a rollback, and it is the standard attack on a chain with no
+The signature verifies, the key that made it is still in force, and the digest
+matches the bytes. That is a rollback, and it is the standard attack on a chain with no
 deadline.
 
 The pointer closes it itself. Inside its signed body, above the entries:
@@ -720,18 +788,23 @@ let gentoo = Gentoo::builder("amd64")
 
 Clearing the bound gives up the only defense against a replayed pointer, and it
 accepts an undated one too. It is the right answer for an archived mirror and
-the wrong one for a live network.
+the wrong one for a live network. It does not relax the signature: the key that
+signed an archived pointer must still be in force when the pointer is read.
 
 ## The cache
 
-`cache_dir` names a directory downloads are kept in across runs: the stage3
-tarball, and the binary packages an install merges. A stage3 is hundreds of
+`cache_dir` names a directory downloads are kept in across runs. It holds the
+stage3 tarball and the digest document that vouches for it, and the binary
+packages an install merges. A stage3 is hundreds of
 megabytes, so a caller provisioning more than one root from the same build wants
 one. Without it the downloads land beside the tree being built and are removed
 with it.
 
 The tarball is kept under its file name, which names the variant and the build.
-A binary package is kept under the path the archive publishes it at:
+Its digest document sits beside it under the same name with `.DIGESTS` added. A
+resolution reads that copy rather than fetching the document again, which is
+what lets [a pin](#pinning-a-build) outlive the archive's five weeks. A binary
+package is kept under the path the archive publishes it at:
 
 ```text
 <cache_dir>/releases/amd64/binpackages/23.0/x86-64/dev-vcs/git/git-2.54.0-5.gpkg.tar
@@ -740,10 +813,14 @@ A binary package is kept under the path the archive publishes it at:
 That path names the architecture, the generation and the binhost as well as the
 package, and it has to. Two binhosts publish builds of one package under one
 relative path. The same key signs every `Manifest`, and each binhost numbers its
-builds on its own. An `x86-64-v3` container therefore passes every check under
-the `x86-64` name. A cache keyed by the relative path alone would merge code
-built for newer processors into a root meant for older ones. Keyed this way, one
-directory serves several architectures and binhosts.
+builds on its own. An `x86-64-v3` container therefore passes the signature,
+identity and target checks under the `x86-64` name. Only the MD5 and build time a
+plan records tell the two apart.
+
+A cache keyed by the relative path alone would hold one binhost's build where
+the other's is asked for. Every switch between the two would discard it and
+fetch again. Keyed this way, one directory serves several architectures and
+binhosts.
 
 A cached entry is verified on the read, not trusted for having been verified
 once. What sits at a cache path is bytes on a disk this crate does not own. A
@@ -825,7 +902,7 @@ let mut gentoo = Gentoo::builder("amd64")
 let mut sink = |event: GentooEvent<'_>| match event {
     GentooEvent::Conflict { atom, blocks, .. } => eprintln!("{atom} blocks {blocks}"),
     GentooEvent::DependencyCycle { packages, .. } => {
-        eprintln!("cycle: {}", packages.join(" -> "));
+        eprintln!("cycle among: {}", packages.join(", "));
     }
     _ => {}
 };
@@ -934,7 +1011,7 @@ Every difference is one the archive itself makes.
 | The coordinate | a suite or release, plus an architecture | an architecture, plus a variant |
 | Where resolution starts | an empty root | a root with 296 packages already in it |
 | Replay | a plan document, versioned and portable | the build id and variant for the stage3, a plan document for the packages |
-| How long a pin lasts | as long as the archive or a snapshot service keeps the versions | about five weeks against the archive |
+| How long a pin lasts | as long as the archive or a snapshot service keeps the versions | about five weeks against the archive, then from a populated cache while the signing key is in force |
 | Freshness | `Valid-Until`, or an index refetched every run | the pointer's own signed regeneration timestamp |
 | What runs during a bootstrap | maintainer or install scripts, in a sandbox | nothing, since phase functions are not run |
 

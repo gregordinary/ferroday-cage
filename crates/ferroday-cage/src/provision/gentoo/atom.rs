@@ -148,6 +148,12 @@ pub(super) trait Candidate {
     /// was written with, and an atom routinely asks about one another package
     /// defines.
     fn use_flag(&self, flag: &str) -> Option<bool>;
+
+    /// The candidate as `category/name-version`, which is how a refusal or a
+    /// report names it, whichever side of resolution it comes from.
+    fn cpv(&self) -> String {
+        format!("{}-{}", self.name(), self.version())
+    }
 }
 
 impl fmt::Display for Atom {
@@ -607,7 +613,8 @@ pub(super) fn use_flag(flags: &str, iuse: &str, flag: &str) -> Option<bool> {
     }
 }
 
-/// One dependency in a class: a plain atom, or an any-of group of them.
+/// One dependency in a class: a plain atom, or an any-of group of
+/// alternatives.
 ///
 /// The index publishes no other shape. It is USE-evaluated, so no conditional
 /// group survives into it, and `RDEPEND`/`PDEPEND` were confirmed over the
@@ -616,17 +623,20 @@ pub(super) fn use_flag(flags: &str, iuse: &str, flag: &str) -> Option<bool> {
 pub(super) enum Dependency {
     /// One atom, which must be satisfied.
     One(Atom),
-    /// `|| ( a b c )`: any one of these satisfies it.
+    /// `|| ( a ( b c ) )`: any one alternative satisfies it, and an alternative
+    /// is satisfied when every atom in it is — `a` alone, or `b` and `c`
+    /// together.
     ///
-    /// Never empty: an any-of group with no alternatives asks for nothing and is
-    /// dropped where it is parsed, so a resolver reading one of these has an
-    /// alternative to consider.
+    /// Never empty, and no alternative is empty: a group with nothing in it, or
+    /// with an alternative that has nothing in it, asks for nothing and is
+    /// dropped where it is parsed. A resolver reading one of these has an
+    /// alternative to consider, and each alternative names an atom.
     ///
     /// A group nested inside another of its own kind is flattened away by the
-    /// parser, since it means the same as its contents spliced in. One nested
-    /// inside a group of the other kind is refused rather than flattened; see
-    /// [`parse_group`].
-    AnyOf(Vec<Atom>),
+    /// parser, since it means the same as its contents spliced in. An all-of
+    /// group inside this one is an alternative of its own, and an any-of group
+    /// inside that is refused; see [`parse_any_of`].
+    AnyOf(Vec<Vec<Atom>>),
 }
 
 /// How deeply one group may nest inside others in a dependency class.
@@ -634,11 +644,11 @@ pub(super) enum Dependency {
 /// The index is USE-evaluated, so the conditionals that would nest one group in
 /// another are gone by the time it is written: no `RDEPEND` or `PDEPEND` in the
 /// live index nests deeper than two, an all-of inside an any-of. The bound is
-/// far above that and far below the depth at which [`parse_group`]'s recursion
-/// would exhaust the stack. Nothing
-/// signs the index, and a stack overflow aborts the process rather than
-/// returning a failure: without the bound, forty kilobytes of parentheses in one
-/// stanza are enough to take down whatever embeds this crate.
+/// far above that and far below the depth at which the parser's recursion would
+/// exhaust the stack. Nothing signs the index, and a stack overflow aborts the
+/// process rather than returning a failure: without the bound, forty kilobytes
+/// of parentheses in one stanza are enough to take down whatever embeds this
+/// crate.
 const MAX_GROUP_DEPTH: usize = 16;
 
 /// Parses a whole dependency class — an `RDEPEND` or a `PDEPEND` value.
@@ -646,10 +656,11 @@ const MAX_GROUP_DEPTH: usize = 16;
 /// # Errors
 ///
 /// Returns the reason where a token is not an atom, where an `||` is not
-/// followed by a group, where the parentheses do not balance, or where groups
-/// nest more than [`MAX_GROUP_DEPTH`] deep.
+/// followed by a group, where the parentheses do not balance, where an all-of
+/// group holds an `||` group, or where groups nest more than
+/// [`MAX_GROUP_DEPTH`] deep.
 pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
-    let mut tokens = text.split_ascii_whitespace().peekable();
+    let mut tokens = text.split_ascii_whitespace();
     let mut out = Vec::new();
     while let Some(token) = tokens.next() {
         match token {
@@ -657,23 +668,22 @@ pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
                 if tokens.next() != Some("(") {
                     return Err("an `||` is not followed by a group".to_string());
                 }
-                let alternatives = parse_group(&mut tokens, Grouping::AnyOf, 1)?;
-                // A group with nothing in it asks for nothing, exactly as the
-                // empty all-of group below does: that arm splices its contents,
-                // and an empty one contributes none. Kept, this would reach the
+                // A group that asks for nothing is dropped, exactly as the
+                // empty all-of group below is: that arm splices its contents,
+                // and an empty one contributes none. Kept, it would reach the
                 // resolver as a dependency with no alternative to try, refusing
                 // the whole run over an atom with no name in the message.
                 //
                 // The index is USE-evaluated, so a group whose every
                 // alternative was conditioned out is how an empty one arrives.
-                if !alternatives.is_empty() {
+                if let Some(alternatives) = parse_any_of(&mut tokens, 1)? {
                     out.push(Dependency::AnyOf(alternatives));
                 }
             }
             // A bare group with no operator is an all-of group, which means
             // the same as its contents written out, so it is spliced in.
             "(" => {
-                for atom in parse_group(&mut tokens, Grouping::AllOf, 1)? {
+                for atom in parse_all_of(&mut tokens, 1)? {
                     out.push(Dependency::One(atom));
                 }
             }
@@ -684,48 +694,85 @@ pub(super) fn parse_class(text: &str) -> Result<Vec<Dependency>, String> {
     Ok(out)
 }
 
-/// What a group's contents mean to the group holding them.
+/// Reads the alternatives of an `|| ( ... )` group up to its closing
+/// parenthesis, or `None` where the group asks for nothing.
 ///
-/// The two directions a flattening can be wrong in are not the same, so the
-/// parser has to know which group it is inside; see [`parse_group`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Grouping {
-    /// `|| ( ... )`: any one of the contents satisfies it.
-    AnyOf,
-    /// `( ... )`: all of the contents are required.
-    AllOf,
-}
-
-/// Reads the atoms of a group up to its closing parenthesis.
+/// A group nested inside it keeps the meaning the archive wrote:
 ///
-/// A nested group is spliced into the one holding it, with one exception, and
-/// the exception is why this takes the kind of group it is reading.
+/// - `|| ( a || ( b c ) )` — an any-of inside an any-of. Its alternatives are
+///   spliced in, which is exact: either way any one of `a`, `b` and `c` is
+///   enough.
+/// - `|| ( a ( b c ) )` — an all-of inside an any-of. It is one alternative,
+///   `b` and `c` together. Splicing it would offer `b` alone, which satisfies
+///   the group and leaves `c` uninstalled although nothing asked for less than
+///   both.
+/// - `|| ( a ( b || ( c d ) ) )` — an any-of inside that all-of. Refused, as
+///   [`parse_all_of`] refuses one anywhere.
 ///
-/// - `( a ( b c ) )` — an all-of inside an all-of. Splicing is exact: both mean
-///   everything is required.
-/// - `|| ( a || ( b c ) )` — an any-of inside an any-of. Exact for the same
-///   reason.
-/// - `|| ( a ( b c ) )` — an all-of inside an any-of. Splicing *loosens* it,
-///   offering three alternatives where the archive asked for `a`, or for `b`
-///   and `c` together. What that costs is a closure larger than the archive
-///   asked for, and it is accepted.
-/// - `( a || ( b c ) )` — an any-of inside an all-of. Splicing would *tighten*
-///   it, making `b` and `c` both required where the archive asked for either,
-///   and that direction manufactures an unsatisfiable atom out of a satisfiable
-///   one. It is refused.
+/// Of these shapes the index publishes the second, and rarely, in two of its
+/// `RDEPEND`s: `virtual/zlib` offers `sys-libs/zlib`, or `zlib-ng` and
+/// `minizip-ng` together, and `media-gfx/evoluspencil` offers `at-spi2-core`, or
+/// `at-spi2-atk` and `atk` together. The index is USE-evaluated, so the
+/// conditionals that would produce the third are gone by the time it is
+/// written.
 ///
-/// Of these shapes the index publishes one, and rarely: an all-of inside an
-/// any-of, in two of its `RDEPEND`s (`virtual/zlib` offers `sys-libs/zlib`, or
-/// `zlib-ng` and `minizip-ng` together). The index is USE-evaluated, so the
-/// conditionals that would produce the rest are gone by the time it is written.
-/// Refusing the one that would be wrong is what turns a future archive
-/// publishing it into a diagnostic instead of a silently different meaning.
+/// A group with no alternatives asks for nothing, and so does one holding an
+/// alternative with nothing in it: an empty all-of is satisfied by anything,
+/// so the group holding it is too.
 ///
 /// `depth` is how many groups are open, this one included, and a group past
 /// [`MAX_GROUP_DEPTH`] is refused before anything inside it is read.
-fn parse_group<'t>(
-    tokens: &mut std::iter::Peekable<impl Iterator<Item = &'t str>>,
-    grouping: Grouping,
+fn parse_any_of<'t>(
+    tokens: &mut impl Iterator<Item = &'t str>,
+    depth: usize,
+) -> Result<Option<Vec<Vec<Atom>>>, String> {
+    if depth > MAX_GROUP_DEPTH {
+        return Err(format!("its groups nest more than {MAX_GROUP_DEPTH} deep"));
+    }
+    let mut alternatives = Vec::new();
+    // Read to the closing parenthesis whatever is found, so the rest of the
+    // class is parsed from where this group ends.
+    let mut asks_nothing = false;
+    loop {
+        match tokens.next() {
+            None => return Err("a group is opened that nothing closes".to_string()),
+            Some(")") => break,
+            Some("(") => {
+                let together = parse_all_of(tokens, depth + 1)?;
+                if together.is_empty() {
+                    asks_nothing = true;
+                } else {
+                    alternatives.push(together);
+                }
+            }
+            Some("||") => {
+                if tokens.next() != Some("(") {
+                    return Err("an `||` is not followed by a group".to_string());
+                }
+                match parse_any_of(tokens, depth + 1)? {
+                    Some(nested) => alternatives.extend(nested),
+                    None => asks_nothing = true,
+                }
+            }
+            Some(token) => alternatives.push(vec![parse(token)?]),
+        }
+    }
+    Ok((!asks_nothing && !alternatives.is_empty()).then_some(alternatives))
+}
+
+/// Reads the atoms of an all-of group up to its closing parenthesis.
+///
+/// An all-of group nested inside it is spliced in, which is exact: both mean
+/// everything is required. An any-of group nested inside it is refused. Its
+/// meaning, `( a || ( b c ) )` asking for `a` and either of the others, is not
+/// a list of atoms all of which are required, and splicing it would make `b` and
+/// `c` both required: an unsatisfiable atom manufactured out of a satisfiable
+/// one. The index publishes no such shape, and refusing it turns an archive that
+/// ever does into a diagnostic rather than a silently different meaning.
+///
+/// `depth` is counted as [`parse_any_of`] counts it.
+fn parse_all_of<'t>(
+    tokens: &mut impl Iterator<Item = &'t str>,
     depth: usize,
 ) -> Result<Vec<Atom>, String> {
     if depth > MAX_GROUP_DEPTH {
@@ -736,21 +783,12 @@ fn parse_group<'t>(
         match tokens.next() {
             None => return Err("a group is opened that nothing closes".to_string()),
             Some(")") => return Ok(atoms),
-            // A bare group nested in either kind is spliced. Inside an all-of
-            // that is exact; inside an any-of it is the loosening described
-            // above.
-            Some("(") => atoms.extend(parse_group(tokens, grouping, depth + 1)?),
+            Some("(") => atoms.extend(parse_all_of(tokens, depth + 1)?),
             Some("||") => {
-                if tokens.next() != Some("(") {
-                    return Err("an `||` is not followed by a group".to_string());
-                }
-                if grouping == Grouping::AllOf {
-                    return Err(
-                        "an all-of group holds an `||` group, which cannot be flattened into it"
-                            .to_string(),
-                    );
-                }
-                atoms.extend(parse_group(tokens, Grouping::AnyOf, depth + 1)?);
+                return Err(
+                    "an all-of group holds an `||` group, which cannot be flattened into it"
+                        .to_string(),
+                );
             }
             Some(token) => atoms.push(parse(token)?),
         }
@@ -1150,14 +1188,29 @@ mod tests {
     /// alternatives.
     #[track_caller]
     fn alternatives(class: &str, count: usize) {
-        match &parse_class(class).expect("a class")[0] {
-            Dependency::AnyOf(atoms) => assert_eq!(atoms.len(), count, "{class}"),
-            other => panic!("expected an any-of group from {class}, got {other:?}"),
+        assert_eq!(any_of(class).len(), count, "{class}");
+    }
+
+    /// The alternatives of the any-of group `class` reads as, each the names of
+    /// the atoms it requires together.
+    #[track_caller]
+    fn any_of(class: &str) -> Vec<Vec<String>> {
+        match &parse_class(class).expect("a class")[..] {
+            [Dependency::AnyOf(alternatives)] => alternatives
+                .iter()
+                .map(|together| {
+                    together
+                        .iter()
+                        .map(|atom| atom.name().to_string())
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected one any-of group from {class}, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_nested_group_is_flattened_where_that_is_exact_and_refused_where_it_is_not() {
+    fn a_nested_group_keeps_the_meaning_the_archive_wrote() {
         // A group inside one of its own kind means its contents written out, so
         // both directions of that are flattened and neither changes meaning.
         let all_of = parse_class("( a-b/c ( d-e/f g-h/i ) )").expect("an all-of in an all-of");
@@ -1165,10 +1218,34 @@ mod tests {
         assert!(all_of.iter().all(|dep| matches!(dep, Dependency::One(_))));
         alternatives("|| ( a-b/c || ( d-e/f g-h/i ) )", 3);
 
-        // An all-of inside an any-of loosens: three alternatives where the
-        // archive asked for one, or for two together. Accepted, and it costs a
-        // closure larger than the archive asked for rather than a wrong answer.
-        alternatives("|| ( a-b/c ( d-e/f g-h/i ) )", 3);
+        // An all-of inside an any-of is one alternative: `a`, or `d` and `g`
+        // together. Flattened it would offer `d` alone, which satisfies the
+        // group and leaves `g` uninstalled.
+        assert_eq!(
+            any_of("|| ( a-b/c ( d-e/f g-h/i ) )"),
+            [vec!["a-b/c"], vec!["d-e/f", "g-h/i"]],
+        );
+        // The shape the live index publishes, for `virtual/zlib`: the
+        // compatibility build of zlib-ng answers only together with
+        // minizip-ng's.
+        assert_eq!(
+            any_of(
+                "|| ( >=sys-libs/zlib-1.3.1[abi_x86_64(-),minizip] \
+                 ( sys-libs/zlib-ng[abi_x86_64(-),compat] \
+                 sys-libs/minizip-ng[abi_x86_64(-),compat] ) )",
+            ),
+            [
+                vec!["sys-libs/zlib"],
+                vec!["sys-libs/zlib-ng", "sys-libs/minizip-ng"],
+            ],
+        );
+        // An all-of inside that alternative is spliced into it, and an any-of
+        // inside the all-of is refused there too.
+        assert_eq!(
+            any_of("|| ( a-b/c ( d-e/f ( g-h/i ) ) )"),
+            [vec!["a-b/c"], vec!["d-e/f", "g-h/i"]],
+        );
+        assert!(parse_class("|| ( a-b/c ( d-e/f || ( g-h/i j-k/l ) ) )").is_err());
 
         // An any-of inside an all-of would tighten -- both required where the
         // archive asked for either -- which manufactures an unsatisfiable atom
@@ -1180,5 +1257,20 @@ mod tests {
             refused.contains("all-of group holds an `||` group"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn an_any_of_group_holding_an_alternative_that_asks_for_nothing_asks_for_nothing() {
+        // An empty all-of is satisfied by anything, so a group offering one is
+        // satisfied too, and an empty any-of nested in another is the same.
+        // Dropping only the empty alternative would turn `a` from one choice
+        // among two into a requirement.
+        for class in ["|| ( a-b/c ( ) )", "|| ( a-b/c || ( ) )", "|| ( ( ) )"] {
+            assert!(parse_class(class).expect("a class").is_empty(), "{class}");
+        }
+        // Read to its end all the same, so what follows it is still read.
+        let after = parse_class("|| ( ( ) a-b/c ) d-e/f").expect("a class");
+        assert_eq!(after.len(), 1);
+        assert!(matches!(&after[0], Dependency::One(atom) if atom.name() == "d-e/f"));
     }
 }

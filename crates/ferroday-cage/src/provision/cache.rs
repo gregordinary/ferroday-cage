@@ -97,11 +97,34 @@ impl PackageCache {
     /// `suffix`.
     ///
     /// Answered on its own so a caller can tell whether a directory it was
-    /// handed is that one, which the run would remove as its own.
+    /// handed is that one, which the run would remove as its own; see
+    /// `is_derived`, which asks it of the directory rather than of a spelling.
     pub(crate) fn derived(tree: &Path, suffix: &str) -> PathBuf {
         let mut sibling = tree.as_os_str().to_os_string();
         sibling.push(suffix);
         PathBuf::from(sibling)
+    }
+
+    /// Whether `dir` is the directory [`derived`](Self::derived) names for
+    /// `tree`, the one a run would remove as its own.
+    ///
+    /// Asked of the directories rather than of their spellings, by device and
+    /// inode: `./root.fcage-debs` and `root.fcage-debs` name one directory, as
+    /// does a path through a symbolic link, and a comparison of the paths calls
+    /// them two. A run that took a caller's cache for a directory of its own
+    /// would remove it. Where either does not exist they are not one directory.
+    ///
+    /// Only the Debian layer copies out of a caller's cache, so only it asks.
+    #[cfg(feature = "debian")]
+    pub(crate) fn is_derived(tree: &Path, suffix: &str, dir: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        match (
+            fs::metadata(PackageCache::derived(tree, suffix)),
+            fs::metadata(dir),
+        ) {
+            (Ok(own), Ok(dir)) => own.dev() == dir.dev() && own.ino() == dir.ino(),
+            _ => false,
+        }
     }
 
     /// The directory itself, to download into and to read back from.
@@ -154,11 +177,7 @@ pub(crate) fn open_entry(path: &Path) -> io::Result<File> {
             format!("{} names no cache entry", path.display()),
         ));
     };
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    Rooted::open(dir)?.reader(name)
+    Rooted::open(crate::path::parent_of(path))?.reader(name)
 }
 
 /// What a download reports to, and asks whether to go on.
@@ -238,13 +257,91 @@ impl<E: From<FetchError>> Failure<E> {
 /// to the staging file.
 const WRITE_BUFFER: usize = 64 * 1024;
 
-/// The sink a body is written into: buffered onto the staging file, and failing
-/// the write that would carry it past `size`.
-fn sink(file: &mut File, size: Option<u64>) -> LimitedWriter<BufWriter<&mut File>> {
+/// The sink a body is written into: held to its size, then the staging file's
+/// failures recorded, then buffered onto the staging file.
+type Sink<'f> = LimitedWriter<Recording<BufWriter<&'f mut File>>>;
+
+/// The sink a body is written into: buffered onto the staging file, keeping the
+/// first failure the file reports, and failing the write that would carry it
+/// past `size`.
+fn sink(file: &mut File, size: Option<u64>) -> Sink<'_> {
     LimitedWriter::new(
-        BufWriter::with_capacity(WRITE_BUFFER, file),
+        Recording {
+            inner: BufWriter::with_capacity(WRITE_BUFFER, file),
+            failed: None,
+        },
         size.unwrap_or(u64::MAX),
     )
+}
+
+/// The staging file's writer, keeping the first failure it reports.
+///
+/// A body's writes run inside the transport, which meets a failure to write the
+/// staging file as one more write failure and reports it as its own. That is a
+/// [`FetchError`], which a walk over mirrors advances past: a full disk would be
+/// asked of every mirror in turn, each downloading as much as fits, and the
+/// failure reported would blame the last of them. What the disk said is
+/// therefore recorded here, as it happens, for the reason [`Stoppable`]
+/// records a cancellation, and reported as the host failure it is.
+///
+/// It sits beneath the [`LimitedWriter`], which refuses a body past its size
+/// before the bytes reach here. That refusal is the mirror's, and stays a
+/// transport failure.
+struct Recording<W> {
+    inner: W,
+    /// The first failure the writer beneath reported.
+    failed: Option<io::Error>,
+}
+
+impl<W> Recording<W> {
+    /// Keeps `err` as the file's failure, if it is the first, and answers the
+    /// copy the transport is handed in its place.
+    ///
+    /// `Interrupted` is not kept. It asks for the write to be made again, which
+    /// `write_all` and `io::copy` do, so it is not a failure of the file.
+    fn record(&mut self, err: io::Error) -> io::Error {
+        if err.kind() == io::ErrorKind::Interrupted {
+            return err;
+        }
+        let copy = match err.raw_os_error() {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(err.kind(), err.to_string()),
+        };
+        self.failed.get_or_insert(err);
+        copy
+    }
+}
+
+impl<W: Write> Write for Recording<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf).map_err(|err| self.record(err))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush().map_err(|err| self.record(err))
+    }
+}
+
+/// What the staging file made of a body once the transport has finished with
+/// it: the first write the file refused while the body arrived, or, for a body
+/// that `arrived` whole, the outcome of writing what is still buffered.
+///
+/// The buffered tail is discarded rather than written where the file has
+/// already refused a write, or where the body did not arrive. Neither is
+/// published, and the staging file goes with it.
+fn finish(sink: Sink<'_>, arrived: bool) -> io::Result<()> {
+    let Recording { inner, failed } = sink.into_inner();
+    match failed {
+        Some(failed) => {
+            drop(inner.into_parts());
+            Err(failed)
+        }
+        None if arrived => flush(inner),
+        None => {
+            drop(inner.into_parts());
+            Ok(())
+        }
+    }
 }
 
 /// A request for `url`, stating `size` where one is known.
@@ -263,8 +360,8 @@ fn request(url: &str, size: Option<u64>) -> FetchRequest<'_> {
 /// short file and refused as the wrong package: an authenticity answer to a
 /// local write failure, which is the wrong thing to tell a caller and the wrong
 /// thing for them to act on.
-fn flush(sink: LimitedWriter<BufWriter<&mut File>>) -> io::Result<()> {
-    sink.into_inner()
+fn flush(buffered: BufWriter<&mut File>) -> io::Result<()> {
+    buffered
         .into_inner()
         .map(|_| ())
         .map_err(io::IntoInnerError::into_error)
@@ -279,8 +376,9 @@ fn flush(sink: LimitedWriter<BufWriter<&mut File>>) -> io::Result<()> {
 ///
 /// The stop is recorded here rather than read back out of the [`io::Error`] the
 /// transport returns: a [`Fetch`] implementation is a caller's own and may
-/// report a failed write however it likes, and this is the one thing about it
-/// this crate knows first-hand.
+/// report a failed write however it likes, and a stop is something this crate
+/// knows first-hand. So is a failure of the staging file, which [`Recording`]
+/// keeps the same way.
 struct Stoppable<'a, S, W: ?Sized> {
     inner: S,
     watch: &'a mut W,
@@ -370,7 +468,8 @@ fn fetch<T, E, W: Watch + ?Sized>(
             stopped: false,
         };
         let fetched = fetcher.fetch(&request(url, entry.size), &mut body);
-        (fetched, body.stopped, flush(body.inner))
+        let written = finish(body.inner, fetched.is_ok());
+        (fetched, body.stopped, written)
     };
 
     // A stopped write reaches the transport as a write failure, which is what
@@ -380,7 +479,10 @@ fn fetch<T, E, W: Watch + ?Sized>(
     if stopped {
         return Err(Failure::Cancelled);
     }
-    fetched.map_err(Failure::Fetch)?;
+    // The same holds for a write the staging file refused, which comes back
+    // from the transport as the transport's failure: it is this host's disk,
+    // and the next mirror would meet it too. So it is answered before the
+    // transport's outcome is.
     written.map_err(|err| {
         Failure::Io(ProvisionError::io(
             "writing a download to",
@@ -388,6 +490,7 @@ fn fetch<T, E, W: Watch + ?Sized>(
             err,
         ))
     })?;
+    fetched.map_err(Failure::Fetch)?;
     file.rewind().map_err(|err| {
         Failure::Io(ProvisionError::io(
             "reading back a download at",
@@ -435,6 +538,10 @@ pub(crate) struct Job<'a> {
 /// would have published, a body that arrived complete within its size and that
 /// `verify` accepted; `verify` is handed it rewound, with the job's index.
 ///
+/// A staging file that refuses a write is the one failure that ends the call.
+/// A full disk is the same whichever mirror the walk asks, so leaving each job
+/// to the walk would download as much of every one as fits, and fail anyway.
+///
 /// `watch` hears each URL as its job is staged, and is asked before each batch.
 /// It is not asked while a batch's bodies arrive: a transport that fetches
 /// several at once writes each body from a thread of its own, and a watch is a
@@ -446,7 +553,8 @@ pub(crate) struct Job<'a> {
 /// # Errors
 ///
 /// Returns [`Failure::Cancelled`] where the run was cancelled before a batch,
-/// and nothing else.
+/// and [`Failure::Io`] where a job's staging file refused a write, once the
+/// batch it was in has finished. Nothing of that batch is published.
 pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
     fetcher: &mut dyn Fetch,
     jobs: &[Job<'_>],
@@ -466,10 +574,12 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
             })
             .collect();
 
-        // Whether each job's body arrived whole and reached the disk.
+        // Whether each job's body arrived whole and reached the disk, and the
+        // first job whose staging file refused a write.
         let mut arrived = vec![false; batch.len()];
+        let mut refused = None;
         {
-            let mut sinks: Vec<(usize, LimitedWriter<BufWriter<&mut File>>)> = staged
+            let mut sinks: Vec<(usize, Sink<'_>)> = staged
                 .iter_mut()
                 .enumerate()
                 .filter_map(|(at, slot)| {
@@ -488,8 +598,28 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
                 fetcher.fetch_all(&mut fetching)
             };
             for ((at, sink), outcome) in sinks.into_iter().zip(outcomes) {
-                arrived[at] = outcome.is_ok() && flush(sink).is_ok();
+                match finish(sink, outcome.is_ok()) {
+                    Ok(()) => arrived[at] = outcome.is_ok(),
+                    Err(err) => {
+                        refused.get_or_insert((at, err));
+                    }
+                }
             }
+        }
+
+        // A write the staging file refused is this host's disk rather than
+        // the job's mirror, so the walk would meet it at its first mirror. The
+        // batch stops here rather than leaving each job to find that out, and
+        // every staging file of the batch goes unpublished.
+        if let Some((at, err)) = refused {
+            let path = staged[at]
+                .as_ref()
+                .map_or(batch[at].entry.path, |(staged, _)| staged.path());
+            return Err(Failure::Io(ProvisionError::io(
+                "writing a download to",
+                path,
+                err,
+            )));
         }
 
         // A job that did not arrive, or that its check refuses, drops its
@@ -611,6 +741,15 @@ mod tests {
         ]
     }
 
+    /// Two mirrors that both serve the entry, so a walk that reaches the second
+    /// shows it advanced past the first.
+    fn serving_mirrors() -> Vec<String> {
+        vec![
+            "http://first.example".to_string(),
+            "http://second.example".to_string(),
+        ]
+    }
+
     fn unserved() -> FetchError {
         FetchError::not_found("the entry")
     }
@@ -687,9 +826,10 @@ mod tests {
         let dir = Scratch::new("cache-capped");
         let path = dir.join("package");
         let body = [b'x'; 4096];
+        let mut fetcher = Canned::new(&body);
         let err = download(
-            &mut Canned::new(&body),
-            &["http://serves.example".to_string()],
+            &mut fetcher,
+            &serving_mirrors(),
             |mirror| format!("{mirror}/package"),
             Entry {
                 path: &path,
@@ -704,6 +844,9 @@ mod tests {
             matches!(&err, Failure::Fetch(FetchError::Io { .. })),
             "{err:?}"
         );
+        // A body past its size is what that mirror served, so the walk asks
+        // the next one.
+        assert_eq!(fetcher.asked.len(), 2, "{:?}", fetcher.asked);
         assert!(
             entries_of(&dir).is_empty(),
             "left behind: {:?}",
@@ -761,6 +904,124 @@ mod tests {
             "left behind: {:?}",
             entries_of(&dir)
         );
+    }
+
+    /// The marker the file-size test's child process finds its cache by.
+    const FILE_SIZE_LIMITED: &str = "FERRODAY_CAGE_TEST_CACHE_FILE_SIZE";
+
+    /// The file size the child process is limited to, well under one write
+    /// buffer, so the staging file refuses a write part way through a body.
+    const FILE_SIZE_LIMIT: u64 = 4096;
+
+    #[test]
+    fn a_staging_file_that_refuses_a_write_is_a_host_failure() {
+        // The body's writes run inside the transport, which reports a write the
+        // disk refused as its own failure. Read that way, a full disk sends the
+        // walk to every mirror in turn and blames the last. The refusal here is
+        // the kernel's own: the child process runs under a file-size limit, a
+        // real write failure that, unlike a full disk, a test can arrange
+        // without a filesystem of its own. The limit is the child's, so no
+        // other test's writes are held to it.
+        if let Some(dir) = std::env::var_os(FILE_SIZE_LIMITED) {
+            // A write past the limit raises `SIGXFSZ`, which ends the process
+            // by default; ignored, the write fails with `EFBIG` instead.
+            crate::mechanism::sys::set_disposition(
+                rustix::process::Signal::XFSZ,
+                crate::mechanism::sys::Disposition::Ignore,
+            )
+            .expect("SIGXFSZ can be ignored");
+            let limit = rustix::process::Rlimit {
+                current: Some(FILE_SIZE_LIMIT),
+                maximum: Some(FILE_SIZE_LIMIT),
+            };
+            rustix::process::setrlimit(rustix::process::Resource::Fsize, limit)
+                .expect("the file-size limit lowers");
+            refused_writes_stop_the_download(Path::new(&dir));
+            fs::write(Path::new(&dir).join("done"), b"").expect("the marker is written");
+            return;
+        }
+
+        let dir = Scratch::new("cache-refused-write");
+        // The child's output goes to pipes, which the limit does not cover. An
+        // inherited standard output may be a file already past it, and the
+        // harness's own report would then fail to be written.
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "provision::cache::tests::a_staging_file_that_refuses_a_write_is_a_host_failure",
+            "--test-threads=1",
+        ])
+        .env(FILE_SIZE_LIMITED, dir.path())
+        .output()
+        .expect("the child test process runs");
+        assert!(
+            child.status.success(),
+            "the child process failed: {}\n{}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        // A child that matched no test would succeed having asserted nothing.
+        assert_eq!(entries_of(&dir), ["done"], "the child ran the test");
+    }
+
+    /// The child's half of the file-size test, in a cache under `dir`.
+    fn refused_writes_stop_the_download(dir: &Path) {
+        // Several write buffers' worth, in pieces, so the staging file is
+        // written while the body is still arriving rather than only once it
+        // has.
+        let body = vec![b'x'; 4 * WRITE_BUFFER];
+        let file_too_large = Some(rustix::io::Errno::FBIG.raw_os_error());
+
+        let path = dir.join("package");
+        let mut fetcher = Canned::new(&body);
+        fetcher.chunk = 4096;
+        let err = download(
+            &mut fetcher,
+            &serving_mirrors(),
+            |mirror| format!("{mirror}/package"),
+            Entry {
+                path: &path,
+                size: None,
+            },
+            &mut Watching::patient(),
+            holding(&body),
+            unserved,
+        )
+        .expect_err("the staging file refuses the body");
+        let Failure::Io(ProvisionError::Io { source, .. }) = &err else {
+            panic!("a refused write is a host failure: {err:?}");
+        };
+        assert_eq!(source.raw_os_error(), file_too_large, "{source}");
+        assert_eq!(
+            fetcher.asked,
+            ["http://first.example/package"],
+            "the walk stops at the first mirror",
+        );
+        assert!(entries_of(dir).is_empty(), "left: {:?}", entries_of(dir));
+
+        // A batch stops at the same failure rather than leaving each job to
+        // the walk, which would meet it again.
+        let paths = [dir.join("one"), dir.join("two")];
+        let jobs: Vec<Job<'_>> = paths
+            .iter()
+            .map(|path| Job {
+                url: "http://first.example/package".to_string(),
+                entry: Entry { path, size: None },
+            })
+            .collect();
+        let mut fetcher = Canned::new(&body);
+        fetcher.chunk = 4096;
+        let outcome = prefetch(&mut fetcher, &jobs, &mut Watching::patient(), |_, _| {
+            Ok::<(), ()>(())
+        });
+        let Err(Failure::Io(ProvisionError::Io { source, .. })) = &outcome else {
+            panic!("a refused write ends the batch: {outcome:?}");
+        };
+        assert_eq!(source.raw_os_error(), file_too_large, "{source}");
+        assert!(entries_of(dir).is_empty(), "left: {:?}", entries_of(dir));
     }
 
     #[test]

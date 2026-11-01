@@ -13,6 +13,19 @@
 //! keeps a version far longer than that, and the plan is the reproducibility
 //! story for a root built from binaries.
 //!
+//! A plan is not a signed document and does not outlive the key that signs the
+//! containers it names. Each container's `Manifest` is verified when the plan
+//! is installed, at the current time, so a plan stops replaying when that key
+//! lapses, as it does when the binhost drops a build it names.
+//!
+//! # A plan records what the resolution read
+//!
+//! Each package's stanza names the container, and states what the index said
+//! about the build: its slot, USE flags, dependencies and build time. Nothing
+//! signs the index, and those are what the resolution decided from. The
+//! container's signed metadata is held to them when it is installed, so a
+//! replay installs the resolution the plan records or refuses.
+//!
 //! The format is the Gentoo layer's own, sharing only the syntax with the
 //! Debian and Alpine layers'. Its fields describe a binhost and its version
 //! numbering is independent, so neither can be read as the other and neither
@@ -54,7 +67,20 @@ const FORMAT: &str = "ferroday-cage-gentoo-plan 1";
 const HEADER_FIELDS: &[&str] = &["Format", "Architecture", "Binhost", "Index-Timestamp"];
 
 /// The package-stanza fields this version writes and reads.
-const PACKAGE_FIELDS: &[&str] = &["Package", "Version", "Build-Id", "Path", "Size", "MD5"];
+const PACKAGE_FIELDS: &[&str] = &[
+    "Package",
+    "Version",
+    "Build-Id",
+    "Path",
+    "Size",
+    "MD5",
+    "Slot",
+    "Use",
+    "Iuse",
+    "Rdepend",
+    "Pdepend",
+    "Build-Time",
+];
 
 /// What a [`Gentoo`](super::Gentoo) run would install from the binhost, and in
 /// what order.
@@ -64,10 +90,14 @@ const PACKAGE_FIELDS: &[&str] = &["Package", "Version", "Build-Id", "Path", "Siz
 /// installs exactly what it names and resolves nothing.
 ///
 /// Every package is index-resolved: it names a container the archive published,
-/// with the size that bounds its download and the MD5 portage records for it.
-/// None of that is what makes the package trustworthy — each container carries
-/// a cleartext-signed `Manifest` of its own, verified as it is opened, and the
-/// identity check against these fields is what binds the two together.
+/// with the size that bounds its download, the container's MD5, and what the
+/// index stated about the build that the resolution acted on. None of that is
+/// what makes the package trustworthy. Each container carries a
+/// cleartext-signed `Manifest` of its own, verified as it is opened, and its
+/// signed metadata is then held to these fields: the package and build they
+/// name, and everything the resolution read from the index about it. A
+/// container that disagrees with its plan entry is refused, so a plan replays
+/// as the resolution it records or not at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Plan {
@@ -112,11 +142,31 @@ pub struct PlannedPackage {
     pub size: u64,
     /// The MD5 the index records for the container, lowercase hex.
     ///
-    /// Portage's own bookkeeping, written into a merged package's `BINPKGMD5`
-    /// so its database says which binary package the files came from. It is
-    /// never a trust decision: what holds a container's bytes to Gentoo is the
-    /// cleartext-signed `Manifest` inside it, over SHA-512.
+    /// The container's MD5 is held to it, as portage holds a downloaded binary
+    /// package to its index's digests, and is what a merged package's
+    /// `BINPKGMD5` records. It pins the plan to the exact container the
+    /// resolution named. It is not what makes the container trustworthy: that
+    /// is the cleartext-signed `Manifest` inside it, over SHA-512.
     pub md5: String,
+    /// The slot the index states for the build, `slot` or `slot/subslot`.
+    ///
+    /// This field and the five after it are what the resolution read from the
+    /// index about the build, which nothing signs. The container's own signed
+    /// metadata is held to each of them before anything of it is merged.
+    pub slot: String,
+    /// The USE flags the index states the build was compiled with,
+    /// space-separated.
+    pub use_flags: String,
+    /// The flags the index states the package knows, space-separated, each
+    /// possibly carrying the `+` or `-` that states the ebuild's own default.
+    pub iuse: String,
+    /// The runtime dependencies the index states, as it writes them.
+    pub rdepend: String,
+    /// The post-merge dependencies the index states, as it writes them.
+    pub pdepend: String,
+    /// When the index states the build was made, in seconds since the epoch,
+    /// or zero where it states nothing.
+    pub build_time: i64,
     /// Fields this package's stanza carried that this version does not know.
     carried: Carried,
 }
@@ -135,6 +185,12 @@ impl PlannedPackage {
             path: record.path.clone(),
             size: record.size,
             md5: record.md5.clone(),
+            slot: record.slot.clone(),
+            use_flags: record.use_flags.clone(),
+            iuse: record.iuse.clone(),
+            rdepend: record.rdepend_text.clone(),
+            pdepend: record.pdepend_text.clone(),
+            build_time: record.build_time,
             carried: Carried::new(),
         }
     }
@@ -173,6 +229,19 @@ impl PlannedPackage {
                 "the plan states an MD5 of {:?} for {}, which is not one this format writes",
                 self.md5, self.name,
             ));
+        }
+        if self.slot.is_empty() {
+            return Some(format!("the plan states no slot for {}", self.name));
+        }
+        // Held to the grammar the index reader holds a record's dependency
+        // classes to, since a plan states them where an index would have.
+        for (class, text) in [("runtime", &self.rdepend), ("post-merge", &self.pdepend)] {
+            if let Err(reason) = atom::parse_class(text) {
+                return Some(format!(
+                    "the plan states {class} dependencies for {} that cannot be read: {reason}",
+                    self.name,
+                ));
+            }
         }
         None
     }
@@ -250,6 +319,14 @@ impl Plan {
             // the document's digest reads that as the plan having changed.
             stanza.put("Size", &package.size.to_string());
             stanza.put("MD5", &package.md5);
+            // What the resolution read from the index. A field that is empty
+            // is left out, as the index leaves it out, and reads back empty.
+            stanza.put("Slot", &package.slot);
+            stanza.put_optional("Use", non_empty(&package.use_flags));
+            stanza.put_optional("Iuse", non_empty(&package.iuse));
+            stanza.put_optional("Rdepend", non_empty(&package.rdepend));
+            stanza.put_optional("Pdepend", non_empty(&package.pdepend));
+            stanza.put("Build-Time", &package.build_time.to_string());
             stanza.put_carried(&package.carried);
             render(&stanza, &mut out)?;
         }
@@ -270,9 +347,10 @@ impl Plan {
     /// version this library does not read, a stanza missing a field the plan
     /// cannot do without, a malformed number, or a package this layer could not
     /// address — a name that is not a package, a version this format does not
-    /// define, a path that would not stay inside the archive, or an MD5 that is
-    /// not one. The document is the only thing behind a plan read this way, so
-    /// the shape an index would have guaranteed is checked here.
+    /// define, a path that would not stay inside the archive, an MD5 that is
+    /// not one, or dependencies the index reader could not have read. The
+    /// document is the only thing behind a plan read this way, so the shape an
+    /// index would have guaranteed is checked here.
     pub fn parse_document(text: &str) -> Result<Plan, GentooError> {
         let stanzas = document::parse(text);
         let (header, rest) = document::header(&stanzas, FORMAT).map_err(plan_document)?;
@@ -308,6 +386,13 @@ impl Plan {
                 size: number::<u64>(stanza.get("Size"), "Size", &at)?
                     .ok_or_else(|| plan_document(format!("{at} states no Size")))?,
                 md5: required(stanza.get("MD5"), "MD5", &at)?,
+                slot: required(stanza.get("Slot"), "Slot", &at)?,
+                use_flags: stanza.get("Use").unwrap_or_default().to_string(),
+                iuse: stanza.get("Iuse").unwrap_or_default().to_string(),
+                rdepend: stanza.get("Rdepend").unwrap_or_default().to_string(),
+                pdepend: stanza.get("Pdepend").unwrap_or_default().to_string(),
+                build_time: number::<i64>(stanza.get("Build-Time"), "Build-Time", &at)?
+                    .ok_or_else(|| plan_document(format!("{at} states no Build-Time")))?,
                 carried: document::carried(stanza, PACKAGE_FIELDS),
             };
             if let Some(reason) = package.unusable() {
@@ -339,6 +424,11 @@ impl Plan {
     }
 }
 
+/// `value`, or `None` where it is empty.
+fn non_empty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
 /// Renders one stanza, reporting a value the format cannot carry.
 fn render(stanza: &Draft, out: &mut String) -> Result<(), GentooError> {
     stanza.render(out).map_err(plan_document)
@@ -354,7 +444,7 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Gentoo
 ///
 /// The rule is [`document::number`]'s; only whose document the refusal is
 /// about belongs here.
-fn number<T: std::str::FromStr>(
+fn number<T: std::str::FromStr + std::fmt::Display>(
     value: Option<&str>,
     field: &str,
     at: &str,
@@ -387,6 +477,12 @@ mod tests {
                     path: "sys-libs/zlib/zlib-1.3.2-1.gpkg.tar".to_string(),
                     size: 204_800,
                     md5: "b3ae71ef373f5aa4405e637a2d263f51".to_string(),
+                    slot: "0/1".to_string(),
+                    use_flags: "amd64 minizip".to_string(),
+                    iuse: "minizip static-libs".to_string(),
+                    rdepend: ">=sys-libs/glibc-2.38-r13".to_string(),
+                    pdepend: String::new(),
+                    build_time: 1_714_470_376,
                     carried: Carried::new(),
                 },
                 PlannedPackage {
@@ -396,6 +492,12 @@ mod tests {
                     path: "dev-vcs/git/git-2.54.0-5.gpkg.tar".to_string(),
                     size: 8_192_000,
                     md5: "6a539af72c5577fdce267834d3dfd2f1".to_string(),
+                    slot: "0".to_string(),
+                    use_flags: "amd64 curl perl".to_string(),
+                    iuse: "+curl keyring +perl".to_string(),
+                    rdepend: "dev-libs/openssl:0/3= || ( dev-lang/perl virtual/perl )".to_string(),
+                    pdepend: "app-eselect/eselect-git".to_string(),
+                    build_time: 1_783_070_070,
                     carried: Carried::new(),
                 },
             ],
@@ -531,9 +633,12 @@ mod tests {
             ("Package: zlib", "not a package"),
             ("Version: not-a-version", "not a version"),
             ("MD5: nothex", "not one this format writes"),
+            ("Slot:", "empty Slot"),
+            ("Rdepend: || ( dev-libs/a", "cannot be read"),
+            ("Build-Time: recently", "not a number"),
         ];
         for (line, why) in cases {
-            let (field, _) = line.split_once(": ").expect("a fixture line");
+            let (field, _) = line.split_once(':').expect("a fixture line");
             let mut document = plan().to_document().expect("the plan renders");
             let existing = document
                 .lines()
@@ -544,6 +649,37 @@ mod tests {
             let err = Plan::parse_document(&document).expect_err(why);
             assert!(err.to_string().contains(why), "{why}: {err}");
         }
+    }
+
+    #[test]
+    fn a_plan_records_what_the_resolution_read_and_leaves_out_what_is_empty() {
+        // The fields the container's signed metadata is held to. One the index
+        // left out is left out here too, and reads back as empty.
+        let document = plan().to_document().expect("the plan renders");
+        for line in [
+            "Slot: 0/1",
+            "Use: amd64 minizip",
+            "Iuse: +curl keyring +perl",
+            "Rdepend: dev-libs/openssl:0/3= || ( dev-lang/perl virtual/perl )",
+            "Pdepend: app-eselect/eselect-git",
+            "Build-Time: 1714470376",
+        ] {
+            assert!(
+                document.lines().any(|held| held == line),
+                "{line} in {document}"
+            );
+        }
+        let zlib = document
+            .split("\n\n")
+            .find(|stanza| stanza.contains("sys-libs/zlib"))
+            .expect("zlib's stanza");
+        assert!(!zlib.contains("Pdepend:"), "{zlib}");
+
+        // A stanza that does not say where the build is installed was not
+        // written by this version, and is refused rather than read as slot 0.
+        let unslotted = document.replacen("Slot: 0/1\n", "", 1);
+        let err = Plan::parse_document(&unslotted).expect_err("a stanza with no slot");
+        assert!(err.to_string().contains("no Slot"), "{err}");
     }
 
     #[test]

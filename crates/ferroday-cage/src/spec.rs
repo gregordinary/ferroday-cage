@@ -3325,19 +3325,14 @@ fn layer_path(
 ) -> Result<LayerPath, Error> {
     // A path with no file name is `/` or one ending in `..`; neither names a
     // directory this can create inside a parent.
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+    let Some(name) = path.file_name() else {
         return Err(ConfigError::OverlayLayerIsRoot {
             layer,
             path: path.to_path_buf(),
         }
         .into());
     };
-    // An empty parent means a bare relative name: the working directory.
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
+    let parent = crate::path::parent_of(path);
     created
         .create_all(parent)
         .map_err(|err| overlay_io(layer, parent, err))?;

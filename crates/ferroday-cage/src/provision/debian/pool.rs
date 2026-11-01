@@ -333,8 +333,8 @@ impl Pool {
     /// Writes or updates the pool from a set of freshly-built `.deb`s.
     ///
     /// The index keeps the highest version of each package name across what the
-    /// pool already held and the newly-added `.deb`s — the same
-    /// highest-version-wins rule resolution applies — so the pool a caller
+    /// pool already held and the newly-added `.deb`s — the rule resolution
+    /// applies within one repository — so the pool a caller
     /// writes and the set the resolver later draws from it cannot disagree. A
     /// `.deb` republished at the same version replaces its own entry, so
     /// re-running the call over a superset of a prior run is well-defined.
@@ -391,10 +391,12 @@ impl Pool {
     /// Returns [`DebianError::Config`] when no suite was set, or when the suite,
     /// component, or architecture is one the pool cannot write: an empty value,
     /// one containing whitespace or a control character — neither of which a
-    /// release field can name — or one that would resolve outside the pool
-    /// through a leading `/`, a `..` segment, or an empty or `.` segment. The
-    /// suite and the component may otherwise contain slashes, since both may
-    /// name a subtree; the architecture may not.
+    /// release field can name — or another character a URL path cannot carry
+    /// as written (such as `%`, `?`, `#`, or one outside ASCII), or one that
+    /// would resolve outside the pool through a leading `/`, a `..` segment, or
+    /// an empty or `.` segment. The suite and the component may otherwise
+    /// contain slashes, since both may name a subtree; the architecture may
+    /// not.
     ///
     /// [`origin`](Self::origin), [`label`](Self::label), and
     /// [`description`](Self::description) are free text and take a space, but
@@ -740,9 +742,9 @@ const APPENDED_FIELDS: [&str; 3] = ["Filename", "Size", "SHA256"];
 /// emitted whole, with the appended fields landing on the second — which then
 /// reads back as the index entry, under whatever name and version that paragraph
 /// declares, while the dedupe that placed it keyed on the first. A pool is
-/// consumed as `[trusted=yes]` and resolution is highest-version-wins across
-/// repositories, so an entry a package chose for itself supersedes the primary
-/// archive's.
+/// consumed as `[trusted=yes]` and ranks alongside the primary archive, where
+/// the higher version wins, so an entry a package chose for itself supersedes
+/// the primary archive's.
 ///
 /// The failure is a bare reason, which the caller attributes to whichever file
 /// it read the stanza from.
@@ -1081,7 +1083,8 @@ fn stage(dest: &Path, source: &mut File) -> Result<(Staged, File), DebianError> 
 
 /// Inserts an entry, keeping the higher version when the name recurs. A
 /// same-version re-insertion replaces the prior entry, so republishing a `.deb`
-/// refreshes its stanza; this matches the resolver's highest-version-wins.
+/// refreshes its stanza; this matches the resolver, which keeps the highest
+/// version of a name within one repository.
 fn insert_highest(by_name: &mut BTreeMap<String, Entry>, entry: Entry) {
     match by_name.get(&entry.name) {
         Some(existing)

@@ -21,7 +21,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::Delegate;
+use super::{Delegate, ProvisionError};
 use crate::{Cage, CageBuilder, IdMapper, IdentityMap};
 
 /// Where a wave of a provisioning run is rooted.
@@ -186,23 +186,110 @@ impl BuildLayer {
 impl Drop for BuildLayer {
     /// Removes the upper and the overlay work directory beside it, through the
     /// map the increment was staged under and the delegate that established it.
-    ///
-    /// That map rather than the subordinate default: an explicit range map
-    /// allocates ids the bundled chain would not, and a removal the calling
-    /// user is refused has to re-enter the map the tree's ownership was written
-    /// in, through the delegate that wrote it. Under the single map the ids are
-    /// the caller's own, and the
-    /// escalation is for the mode-`0` directory the overlay leaves in its work
-    /// area, should anything be left inside it.
-    ///
-    /// The publication lock is not touched: an upper is a directory a caller
-    /// named as a build layer, not a published rootfs, so `<upper>.lock` is a
-    /// path this never created and may not delete.
     fn drop(&mut self) {
-        let _ = crate::provision::Remove::overlay_upper(&self.upper)
-            .identity_map(self.identity_map.clone())
-            .shared_id_mapper(self.id_mapper.clone())
-            .run();
+        dispose(&self.upper, &self.identity_map, self.id_mapper.as_ref());
+    }
+}
+
+/// Removes `upper` and the overlay work directory beside it, through
+/// `identity_map` and the delegate that established it.
+///
+/// That map rather than the subordinate default: an explicit range map
+/// allocates ids the bundled chain would not, and a removal the calling user is
+/// refused has to re-enter the map the tree's ownership was written in, through
+/// the delegate that wrote it. Under the single map the ids are the caller's
+/// own, and the escalation is for the mode-`0` directory the overlay leaves in
+/// its work area, should anything be left inside it.
+///
+/// The publication lock is not touched: an upper is a directory a caller named
+/// as a build layer, not a published root filesystem, so `<upper>.lock` is a
+/// path this never created and may not delete.
+///
+/// Best-effort, since both callers are drops and a drop cannot report an
+/// error.
+fn dispose(upper: &Path, identity_map: &IdentityMap, id_mapper: Option<&Arc<dyn IdMapper>>) {
+    let _ = crate::provision::Remove::overlay_upper(upper)
+        .identity_map(identity_map.clone())
+        .shared_id_mapper(id_mapper.cloned())
+        .run();
+}
+
+/// An increment being staged into an overlay upper, and what a failure leaves
+/// of the upper.
+///
+/// A staging that fails hands its caller no [`BuildLayer`] to drop, so this is
+/// what disposes of the upper instead. It disposes only of an upper the staging
+/// itself created. An upper that was already there is the caller's and may hold
+/// earlier work, so a failure leaves it in place, holding whatever the staging
+/// wrote into it before failing.
+///
+/// [`finish`](Self::finish) hands the upper to the [`BuildLayer`] a staging
+/// returns, which owns it whichever way it arrived.
+pub(crate) struct Staging {
+    /// The upper the increment is installed into.
+    upper: PathBuf,
+    /// The identity map the increment is configured under.
+    identity_map: IdentityMap,
+    /// The delegate that map is established through, where the caller
+    /// supplied one.
+    id_mapper: Option<Arc<dyn IdMapper>>,
+    /// Whether this staging created the upper, which is what makes removing
+    /// it on failure its own to do.
+    created: bool,
+    /// Whether the staging finished, handing the upper to a [`BuildLayer`].
+    finished: bool,
+}
+
+impl Staging {
+    /// Begins staging into `upper`, creating it and its missing parents where
+    /// nothing holds its name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvisionError::Io`] where `upper` or a parent cannot be
+    /// created, or where `upper` names something other than a directory.
+    pub(crate) fn begin(
+        upper: &Path,
+        identity_map: IdentityMap,
+        id_mapper: Option<Arc<dyn IdMapper>>,
+    ) -> Result<Staging, ProvisionError> {
+        let creating = |err| ProvisionError::io("creating the overlay upper", upper, err);
+        std::fs::create_dir_all(crate::path::parent_of(upper)).map_err(creating)?;
+        // Created here or found there, decided by the one call that would
+        // create it: a name another process takes between a check and a
+        // creation is then the other process's, and is left alone.
+        let created = match std::fs::create_dir(upper) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && upper.is_dir() => false,
+            Err(err) => return Err(creating(err)),
+        };
+        Ok(Staging {
+            upper: upper.to_path_buf(),
+            identity_map,
+            id_mapper,
+            created,
+            finished: false,
+        })
+    }
+
+    /// Ends a staging that succeeded, handing the upper to the layer that owns
+    /// it from here on.
+    pub(crate) fn finish(mut self) -> BuildLayer {
+        self.finished = true;
+        BuildLayer::new(
+            &self.upper,
+            self.identity_map.clone(),
+            self.id_mapper.clone(),
+        )
+    }
+}
+
+impl Drop for Staging {
+    /// Disposes of an upper this staging created, where it did not finish.
+    fn drop(&mut self) {
+        if self.created && !self.finished {
+            dispose(&self.upper, &self.identity_map, self.id_mapper.as_ref());
+        }
     }
 }
 
@@ -266,6 +353,65 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read(&sibling).unwrap(), b"someone else's");
+    }
+
+    #[test]
+    fn a_failed_staging_removes_an_upper_it_created_and_nothing_else() {
+        // A staging that fails hands back no layer, so its own guard is what
+        // disposes of the upper -- and only of one it created. An upper the
+        // caller already had may hold an earlier increment, and losing it to a
+        // failure in a later one would be the failure destroying work it never
+        // did.
+        let dir = Scratch::for_test("layer", "staging-failed");
+
+        let fresh = dir.join("nested/fresh");
+        let staging =
+            Staging::begin(&fresh, IdentityMap::Single, None).expect("the upper is created");
+        assert!(fresh.is_dir(), "the upper and its parents are created");
+        std::fs::write(fresh.join("partial"), b"x").unwrap();
+        drop(staging);
+        assert!(!fresh.exists(), "an upper the staging created is removed");
+
+        let kept = dir.join("kept");
+        std::fs::create_dir_all(kept.join("usr/bin")).unwrap();
+        std::fs::write(kept.join("usr/bin/earlier"), b"earlier work").unwrap();
+        let staging = Staging::begin(&kept, IdentityMap::Single, None).expect("the upper is found");
+        std::fs::write(kept.join("partial"), b"x").unwrap();
+        drop(staging);
+        assert_eq!(
+            std::fs::read(kept.join("usr/bin/earlier")).expect("the earlier work survives"),
+            b"earlier work",
+        );
+        assert!(
+            kept.join("partial").exists(),
+            "what the failed staging wrote stays in the caller's upper",
+        );
+    }
+
+    #[test]
+    fn a_finished_staging_hands_the_upper_to_the_layer_however_it_arrived() {
+        let dir = Scratch::for_test("layer", "staging-finished");
+        for (name, existing) in [("fresh", false), ("kept", true)] {
+            let upper = dir.join(name);
+            if existing {
+                std::fs::create_dir_all(&upper).unwrap();
+            }
+            let staging = Staging::begin(&upper, IdentityMap::Single, None).expect("staged");
+            let layer = staging.finish();
+            assert!(upper.is_dir(), "{name}: finishing removes nothing");
+            assert_eq!(layer.path(), upper.as_path());
+            drop(layer);
+            assert!(!upper.exists(), "{name}: the layer owns the upper");
+        }
+    }
+
+    #[test]
+    fn a_staging_refuses_an_upper_that_is_not_a_directory() {
+        let dir = Scratch::for_test("layer", "staging-file");
+        let upper = dir.join("upper");
+        std::fs::write(&upper, b"a file").unwrap();
+        assert!(Staging::begin(&upper, IdentityMap::Single, None).is_err());
+        assert_eq!(std::fs::read(&upper).unwrap(), b"a file", "left alone");
     }
 
     /// A delegate that records the map it is asked for and refuses it.

@@ -316,8 +316,8 @@ mod tests {
     #[test]
     fn a_digest_writer_reports_what_passed_through_it() {
         // The write side has to agree with the read side byte for byte, since
-        // a download digests at the sink and is then verified against a source
-        // that digested the same bytes on the way in.
+        // a segment digested as a copy moves it is compared against a digest
+        // its source took of the same bytes.
         let bytes: Vec<u8> = (0..CHUNK + 3).map(|i| (i % 251) as u8).collect();
         for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
             let mut received = Vec::new();

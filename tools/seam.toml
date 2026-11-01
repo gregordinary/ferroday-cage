@@ -97,6 +97,15 @@ count = 1
 kind = "internal"
 why = "`roster::roster_enum!`, which declares `Priority` and its roster."
 
+[[layer.reach]]
+name = "path"
+count = 1
+kind = "internal"
+why = """\
+`path::parent_of`, the directory beside a build layer's upper that the overlay \
+preflight probes, where `Path::parent` would answer a bare name with the empty \
+path."""
+
 [[layer]]
 name = "alpine"
 
@@ -165,6 +174,12 @@ name = "roster"
 count = 1
 kind = "internal"
 why = "`roster::roster_enum!`, which declares `ScriptKind` and its roster."
+
+[[layer.reach]]
+name = "path"
+count = 1
+kind = "internal"
+why = "`path::parent_of`, as in the Debian layer, for the same preflight."
 
 [[layer]]
 name = "gentoo"

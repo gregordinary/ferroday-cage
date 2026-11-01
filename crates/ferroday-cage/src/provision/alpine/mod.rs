@@ -69,7 +69,7 @@ use super::digest::Algorithm;
 use super::extract::{Extraction, Placement};
 // `super::layer` is the shared one; this module has a `layer` of its own, which
 // reads a provisioned base rather than describing how a cage is rooted on it.
-use super::layer::Rooting;
+use super::layer::{Rooting, Staging};
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
@@ -467,12 +467,14 @@ impl Alpine {
     /// full bootstrap, and [`extract_only`](AlpineBuilder::extract_only) stages
     /// the increment's files and registers them without running a script.
     ///
-    /// A call that fails leaves nothing behind: the upper and its work directory
-    /// are disposed of exactly as dropping the returned layer would dispose of
-    /// them, since a failure hands the caller no handle to drop. So is the
-    /// package cache, unless the builder named a
+    /// A call that fails and created `upper` leaves nothing behind: the upper
+    /// and its work directory are disposed of exactly as dropping the returned
+    /// layer would dispose of them, since a failure hands the caller no handle
+    /// to drop. An `upper` that already existed is the caller's, and a failure
+    /// leaves it in place, holding whatever the call wrote into it. The package
+    /// cache goes with the call either way, unless the builder named a
     /// [`cache_dir`](AlpineBuilder::cache_dir), which is the caller's and
-    /// survives either way.
+    /// survives.
     ///
     /// # What the merged root records
     ///
@@ -525,13 +527,12 @@ impl Alpine {
         preflight(self).map_err(wrap)?;
         let base = self.read_base_layer("stage_layer").map_err(wrap)?;
 
-        std::fs::create_dir_all(upper)
-            .map_err(|err| ProvisionError::io("creating the overlay upper", upper, err))?;
-        // The handle that owns the upper is taken as soon as the upper exists,
-        // not on the way out, so a failure below disposes of a partly-installed
-        // increment instead of orphaning it: there is no handle in an `Err` for
-        // the caller to drop.
-        let layer = BuildLayer::new(upper, self.identity_map.clone(), self.id_mapper.clone());
+        // The guard is taken as the upper is created, not on the way out, so a
+        // failure below disposes of a partly-installed increment instead of
+        // orphaning it: there is no handle in an `Err` for the caller to drop.
+        // It disposes only of an upper this call created; one that was already
+        // there is the caller's.
+        let staging = Staging::begin(upper, self.identity_map.clone(), self.id_mapper.clone())?;
         // Refuse a host that cannot establish an unprivileged overlay on the
         // upper's filesystem before any download — the preflight the primitive
         // would make at cage-build time, hoisted ahead of the work. The probe
@@ -542,10 +543,7 @@ impl Alpine {
         // cage of its own, for the same reason `preflight` skips the identity
         // map and the interpreter there. A caller who goes on to root a build
         // cage on the result meets the primitive's own check.
-        let scratch = upper
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+        let scratch = crate::path::parent_of(upper);
         if !self.extract_only
             && let Some(blocker) = crate::host::overlay_blocker(scratch)
         {
@@ -555,7 +553,7 @@ impl Alpine {
         }
 
         install(self, upper, Some(&base), observer)?;
-        Ok(layer)
+        Ok(staging.finish())
     }
 }
 
@@ -4077,6 +4075,25 @@ mod tests {
         assert!(
             !upper.exists(),
             "the upper it created went with the failure"
+        );
+
+        // An upper that was already there is the caller's, and a failure
+        // leaves it, and the earlier work it holds, in place.
+        std::fs::create_dir_all(upper.join("usr/bin")).expect("the upper is laid out");
+        std::fs::write(upper.join("usr/bin/earlier"), b"earlier work").expect("written");
+        Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .base_layer(&base)
+            .include(["systemd"])
+            .extract_only(true)
+            .build()
+            .expect("the bootstrap configures")
+            .stage_layer(&upper)
+            .expect_err("Alpine publishes no systemd");
+        assert_eq!(
+            std::fs::read(upper.join("usr/bin/earlier")).expect("the caller's upper survives"),
+            b"earlier work",
         );
     }
 

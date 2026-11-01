@@ -20,20 +20,73 @@ use super::DebianError;
 use super::index::parse_provides;
 use crate::provision::document;
 
-/// What a base layer supplies, as the resolver has to ask about it: a name
-/// mapped to every version that name is available at.
+/// What a base layer supplies, as the resolver has to ask about it.
 ///
-/// One name can carry more than one version because a name can be supplied more
-/// than one way — as a real package, and as a virtual that one or more packages
-/// `Provides`. A `None` version is a bare `Provides`, which Debian Policy 7.5
-/// says satisfies only an unversioned dependency; a real package always
-/// contributes `Some`, since the status database records its version.
+/// Two questions, so two maps. *Does the base supply this name, at a version a
+/// dependency accepts?* is asked of every name, real or virtual, each mapped
+/// to every version it is available at. One name can carry more than one
+/// version because a name can be supplied more than one way — as a real
+/// package, and as a virtual that one or more packages `Provides`. A `None`
+/// version is a bare `Provides`, which Debian Policy 7.5 says satisfies only
+/// an unversioned dependency.
+///
+/// *Which version of this package is installed?* is asked of real packages
+/// alone, since it decides what a dependency the base does not meet may
+/// upgrade the package to, and a virtual name is not a package to upgrade.
 ///
 /// The versions matter because a base is provisioned once and resolved against
 /// later: `libc6 (>= 2.43)` is not answered by "the base has a libc6", and
 /// treating it as though it were is what lets an aged base pass a resolve and
 /// fail the compile.
-pub(super) type InstalledSet = HashMap<String, Vec<Option<String>>>;
+#[derive(Debug, Default)]
+pub(super) struct InstalledSet {
+    supplies: HashMap<String, Vec<Option<String>>>,
+    installed: HashMap<String, String>,
+}
+
+impl InstalledSet {
+    /// Records the real package `name` installed at `version`, which it also
+    /// supplies. A stanza with no `Version` is malformed rather than
+    /// versionless, and is recorded as a bare supply: it still satisfies
+    /// unversioned dependencies, no versioned one silently, and is no version
+    /// to upgrade from.
+    pub(super) fn install(&mut self, name: &str, version: Option<&str>) {
+        self.supply(name, version);
+        if let Some(version) = version {
+            self.installed.insert(name.to_string(), version.to_string());
+        }
+    }
+
+    /// Records that the base supplies `name` at `version`, `None` for a bare
+    /// `Provides`.
+    pub(super) fn supply(&mut self, name: &str, version: Option<&str>) {
+        self.supplies
+            .entry(name.to_string())
+            .or_default()
+            .push(version.map(str::to_string));
+    }
+
+    /// Whether the base supplies `name` at all, by a real package or a virtual.
+    pub(super) fn contains(&self, name: &str) -> bool {
+        self.supplies.contains_key(name)
+    }
+
+    /// Every version the base supplies `name` at, or `None` where it supplies
+    /// no such name.
+    pub(super) fn supplied(&self, name: &str) -> Option<&[Option<String>]> {
+        self.supplies.get(name).map(Vec::as_slice)
+    }
+
+    /// The version of the real package `name` the base has installed.
+    pub(super) fn installed(&self, name: &str) -> Option<&str> {
+        self.installed.get(name).map(String::as_str)
+    }
+
+    /// Whether the base supplies nothing at all.
+    pub(super) fn is_empty(&self) -> bool {
+        self.supplies.is_empty()
+    }
+}
 
 /// Reads a base layer's already-installed set: every configured package and the
 /// virtual packages those packages provide, each with the version it supplies.
@@ -45,8 +98,8 @@ pub(super) type InstalledSet = HashMap<String, Vec<Option<String>>>;
 /// files the base actually holds in agreement, and requiring the caller to
 /// thread nothing.
 ///
-/// Only packages the status database records as installed and error-free count —
-/// `install ok installed`, and the held `hold ok installed` alongside it. The
+/// Only packages the status database records as installed and error-free count,
+/// as [`is_configured`](super::bootstrap::is_configured) reads the field. The
 /// base must be a fully configured bootstrap, so a base whose status database is
 /// absent or lists nothing installed — an `extract_only` tree — is rejected
 /// rather than treated as an empty base, which would draw the whole base system
@@ -79,30 +132,23 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
         }
     };
 
-    let mut installed = InstalledSet::new();
+    let mut installed = InstalledSet::default();
     for stanza in document::parse(&text) {
         let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status")) else {
             continue;
         };
         // Anything short of present-and-configured is not a dependency the
         // increment may assume satisfied.
-        if !is_configured(status) {
+        if !super::bootstrap::is_configured(status) {
             continue;
         }
-        // A stanza with no `Version` is malformed rather than versionless, and
-        // recording it as a bare supply is the conservative reading: it still
-        // satisfies unversioned dependencies, and no versioned one silently.
-        let version = stanza.get("Version").map(str::to_string);
-        installed.entry(name.to_string()).or_default().push(version);
+        installed.install(name, stanza.get("Version"));
         // A package's provided virtuals satisfy dependencies named against them,
         // so folding them into the same map lets one lookup in the resolver
         // cover a base that satisfies a group either by real name or by virtual.
         if let Some(provides) = stanza.get("Provides") {
             for provided in parse_provides(provides) {
-                installed
-                    .entry(provided.name)
-                    .or_default()
-                    .push(provided.version);
+                installed.supply(&provided.name, provided.version.as_deref());
             }
         }
     }
@@ -117,21 +163,6 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
         });
     }
     Ok(installed)
-}
-
-/// Whether a dpkg `Status` field describes a package present and configured in
-/// the tree.
-///
-/// The field is three words, `<want> <error flag> <state>`. Only the last two
-/// speak to what is on disk: the state must be `installed` — not `unpacked`,
-/// `half-configured`, or `config-files` — and the error flag must be `ok`, since
-/// a package awaiting reinstallation cannot be assumed whole. The want is the
-/// administrator's intention rather than the tree's contents, so a held package
-/// (`hold ok installed`) counts exactly as an `install ok installed` one does.
-fn is_configured(status: &str) -> bool {
-    let mut words = status.split_ascii_whitespace();
-    let (_want, flag, state) = (words.next(), words.next(), words.next());
-    words.next().is_none() && flag == Some("ok") && state == Some("installed")
 }
 
 #[cfg(test)]
@@ -157,13 +188,16 @@ mod tests {
              Package: half\nStatus: install ok unpacked\nVersion: 1.0\n",
         );
         let set = read_installed_set(&dir).expect("the status database reads");
-        assert_eq!(set.get("libc6").unwrap(), &[Some("2.41".to_string())]);
-        assert_eq!(set.get("mawk").unwrap(), &[Some("1.3".to_string())]);
+        assert_eq!(set.supplied("libc6").unwrap(), &[Some("2.41".to_string())]);
+        assert_eq!(set.supplied("mawk").unwrap(), &[Some("1.3".to_string())]);
         // The virtual is present, and bare: `Provides: awk` names no version,
-        // so it answers an unversioned dependency and no versioned one.
-        assert_eq!(set.get("awk").unwrap(), &[None]);
+        // so it answers an unversioned dependency and no versioned one. It is
+        // no installed package, so nothing upgrades it.
+        assert_eq!(set.supplied("awk").unwrap(), &[None]);
+        assert_eq!(set.installed("awk"), None);
+        assert_eq!(set.installed("libc6"), Some("2.41"));
         assert!(
-            !set.contains_key("half"),
+            !set.contains("half"),
             "a package not `install ok installed` is not assumed",
         );
     }
@@ -177,8 +211,12 @@ mod tests {
              Provides: libfoo (= 1.4)\n",
         );
         let set = read_installed_set(&dir).expect("the status database reads");
-        assert_eq!(set.get("libfoo1").unwrap(), &[Some("1.4-2".to_string())]);
-        assert_eq!(set.get("libfoo").unwrap(), &[Some("1.4".to_string())]);
+        assert_eq!(
+            set.supplied("libfoo1").unwrap(),
+            &[Some("1.4-2".to_string())]
+        );
+        assert_eq!(set.supplied("libfoo").unwrap(), &[Some("1.4".to_string())]);
+        assert_eq!(set.installed("libfoo"), None);
     }
 
     #[test]

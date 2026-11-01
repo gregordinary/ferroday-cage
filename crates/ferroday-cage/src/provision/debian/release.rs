@@ -22,11 +22,39 @@ use crate::provision::{document, now_epoch};
 /// that URL.
 pub(crate) type Refusal = String;
 
+/// How a release's versions rank against another release's when a resolution
+/// picks one version of a name: the default pin priority apt gives the release,
+/// as `apt_preferences(5)` states it.
+///
+/// The order is the rank's. A version from a higher-ranked release is taken
+/// over one from a lower-ranked release whatever the two versions are, and the
+/// higher version wins only between releases of one rank. A release marks its
+/// own rank, with `NotAutomatic` and `ButAutomaticUpgrades`, so a repository
+/// added to reach a few packages does not replace everything else it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ReleasePriority {
+    /// `NotAutomatic: yes` alone, as `experimental` is marked: apt's
+    /// priority of 1. Its version of a name is taken only where no other
+    /// release offers the name, and never in place of a version the base has
+    /// installed.
+    NotAutomatic,
+    /// `NotAutomatic: yes` and `ButAutomaticUpgrades: yes`, as a backports
+    /// suite is marked: apt's priority 100. An installed version stands at
+    /// this rank too, so such a release upgrades a package it supplied itself
+    /// and no package a default release supplied.
+    AutomaticUpgrades,
+    /// Every other release: apt's priority 500.
+    Default,
+}
+
 /// A parsed `Release` body: the index digests and the release's own claims.
 pub(crate) struct Release {
     /// Index path (relative to `dists/<suite>/`) to `(size, sha256)`.
     hashes: HashMap<String, (u64, String)>,
     acquire_by_hash: bool,
+    /// How the release ranks its versions, from its `NotAutomatic` and
+    /// `ButAutomaticUpgrades` fields.
+    priority: ReleasePriority,
     architectures: Vec<String>,
     components: Vec<String>,
     valid_until: Option<String>,
@@ -82,11 +110,22 @@ impl Release {
             }
         }
 
+        let marked = |field: &str| {
+            stanza
+                .get(field)
+                .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+        };
+        // `ButAutomaticUpgrades` qualifies `NotAutomatic` and means nothing on
+        // its own: a release that is not marked lower stays at the default.
+        let priority = match (marked("NotAutomatic"), marked("ButAutomaticUpgrades")) {
+            (true, true) => ReleasePriority::AutomaticUpgrades,
+            (true, false) => ReleasePriority::NotAutomatic,
+            (false, _) => ReleasePriority::Default,
+        };
         Ok(Release {
             hashes,
-            acquire_by_hash: stanza
-                .get("Acquire-By-Hash")
-                .is_some_and(|value| value.eq_ignore_ascii_case("yes")),
+            acquire_by_hash: marked("Acquire-By-Hash"),
+            priority,
             architectures: split_ws(stanza.get("Architectures")),
             components: split_ws(stanza.get("Components")),
             valid_until: stanza.get("Valid-Until").map(str::to_string),
@@ -110,6 +149,11 @@ impl Release {
     /// The SHA-256 of the verified body, lowercase hex.
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    /// How the release ranks its versions against another release's.
+    pub(crate) fn priority(&self) -> ReleasePriority {
+        self.priority
     }
 
     /// Checks that the release binds to the requested `suite`, offers
@@ -171,12 +215,12 @@ impl Release {
     /// failure rather than a silent skip, and a passed deadline is a rejection
     /// — so a stale (but validly-signed) release cannot be replayed to deliver
     /// superseded, potentially vulnerable packages, and a format quirk cannot
-    /// quietly disable the check. When the deadline cannot be evaluated because
-    /// the system clock is before the epoch, the release is rejected rather
-    /// than trusted blind. That is the opposite of what [`check_signature_fresh`]
-    /// does with the same clock, and deliberately so: this is the deadline the
-    /// archive publishes when it wants a bound, so it is the one that must never
-    /// be evaluated blind.
+    /// quietly disable the check. A clock before the epoch cannot evaluate the
+    /// deadline, and the release is rejected rather than trusted blind. Only a
+    /// signed release is held to a deadline, and verifying its signature
+    /// already refuses such a clock, so in a bootstrap that branch is never
+    /// reached. It stays because this check's answer should not depend on what
+    /// its caller happened to check first.
     ///
     /// An *absent* `Valid-Until` is accepted, as `apt` accepts it: the Debian
     /// stable suite deliberately omits the field so its release does not expire
@@ -468,6 +512,33 @@ SHA256:
                 .check("stable", "amd64", &["nonfree".to_string()], false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_release_ranks_itself_by_its_automatic_fields() {
+        let rank = |fields: &str| {
+            Release::parse(&format!("Suite: x\n{fields}"))
+                .unwrap()
+                .priority()
+        };
+        assert_eq!(rank(""), ReleasePriority::Default);
+        // experimental's marking.
+        assert_eq!(rank("NotAutomatic: yes\n"), ReleasePriority::NotAutomatic);
+        // A backports suite's marking.
+        assert_eq!(
+            rank("NotAutomatic: yes\nButAutomaticUpgrades: yes\n"),
+            ReleasePriority::AutomaticUpgrades,
+        );
+        // The qualifier alone, and a value other than yes, leave the default.
+        assert_eq!(
+            rank("ButAutomaticUpgrades: yes\n"),
+            ReleasePriority::Default
+        );
+        assert_eq!(rank("NotAutomatic: no\n"), ReleasePriority::Default);
+        assert_eq!(rank("NotAutomatic: Yes\n"), ReleasePriority::NotAutomatic);
+        // The ranks order as apt's priorities do: 1, 100, 500.
+        assert!(ReleasePriority::NotAutomatic < ReleasePriority::AutomaticUpgrades);
+        assert!(ReleasePriority::AutomaticUpgrades < ReleasePriority::Default);
     }
 
     #[test]

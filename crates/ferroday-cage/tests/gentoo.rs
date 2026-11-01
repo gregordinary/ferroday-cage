@@ -348,6 +348,35 @@ fn a_plan_replays_what_a_resolution_chose() {
         .expect("the document reads back");
     assert_eq!(kept, plan);
 
+    // Replayed as an increment over the root it was resolved against, the plan
+    // installs what it names: every container verifies, and the slots and
+    // blockers its own metadata states agree with the root it lands in.
+    let upper = root.with_file_name("upper");
+    let mut replay = Gentoo::builder(ARCHITECTURE)
+        .binhost(BINHOST)
+        .plan(kept)
+        .base_layer(&root)
+        .cache_dir(common::download_cache("gentoo"))
+        .build()
+        .expect("the builder accepts the plan it resolved");
+    let layer = replay
+        .stage_layer(&upper)
+        .expect("the plan replays over the root it was resolved against");
+    let git = plan.packages.last().expect("a package");
+    assert!(
+        upper
+            .join(format!("var/db/pkg/{}-{}", git.name, git.version))
+            .is_dir(),
+        "the replay registers what it merged",
+    );
+    // Over a view that already holds every package it names, the same plan
+    // installs nothing.
+    let again = replay
+        .stage_layer(&upper)
+        .expect("a plan the root already holds replays as nothing");
+    drop(again);
+    drop(layer);
+
     provision::remove(&root).expect("the root removes");
 }
 

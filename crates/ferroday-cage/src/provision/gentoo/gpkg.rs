@@ -25,9 +25,24 @@
 //! package with a genuine, correctly signed *other* package passes every
 //! signature check there is: the bytes were signed by Gentoo, and nothing in
 //! the signed material says which package was asked for. So identity is
-//! established after verification, from the metadata inside — `CATEGORY`, `PF`
-//! and `BUILD_ID` — against the index record the resolution chose. A mismatch
-//! is a refusal rather than a warning.
+//! established after verification, from the metadata inside, against the plan
+//! entry the resolution chose:
+//!
+//! - `CATEGORY`, `PF` and `BUILD_ID` name the package and the build.
+//! - `CHOST` names the target it was built for, which must be one the root's
+//!   own packages were built for.
+//! - `SLOT`, `USE`, `IUSE`, `RDEPEND`, `PDEPEND` and `BUILD_TIME` are what the
+//!   resolution read from the index, which nothing signs, and must say the
+//!   same.
+//!
+//! The container's own MD5 must be the one the index stated, too, which pins a
+//! plan to the containers it resolved. A mismatch is a refusal rather than a
+//! warning.
+//!
+//! What the metadata cannot establish is which binhost a build came from.
+//! Every binhost of an architecture is signed by one key, none is named in
+//! what is signed, and binhosts that share a target differ only in compiler
+//! flags. [`check_target`] says why the binding stops at the target.
 //!
 //! This is the same question `debian/index.rs` answers when it checks a pool
 //! path out of an already-signed index rather than trusting the signature to
@@ -46,7 +61,9 @@
 //! the Manifest is verified and compared against what that pass recorded. The
 //! second extracts the image, which by then is bytes a signed document vouched
 //! for. Nothing is decompressed before its digest matches, which is what GLEP
-//! 78 asks of a reader that finds a bad signature.
+//! 78 asks of a reader that finds a bad signature. A pass ahead of both takes
+//! the container's MD5, which covers the whole file where the member reader
+//! stops at the archive's end.
 //!
 //! # One descriptor, both passes
 //!
@@ -77,12 +94,12 @@
 //! agreeing with the first buys nothing the first does not already give, and
 //! BLAKE2B is not otherwise in this crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::path::Path;
 
 use super::plan::PlannedPackage;
-use super::{GentooError, MAX_METADATA_BYTES};
+use super::{GentooError, MAX_METADATA_BYTES, atom};
 use crate::ErrorChain;
 use crate::path;
 use crate::provision::compress;
@@ -167,9 +184,11 @@ impl Role {
 /// A verified container: its metadata, and where its image sits.
 ///
 /// Holding one means the Manifest verified against the vendored keyring, every
-/// member matched the size and SHA-512 it recorded, the member set was exactly
-/// the one it lists, and the metadata inside names the package the index record
-/// named.
+/// member matched the size and SHA-512 it recorded, and the member set was
+/// exactly the one it lists. It also means the metadata inside names the
+/// package and build the plan named, was built for a target the root runs, and
+/// states what the plan says the index stated about it, and that the container
+/// is the one whose MD5 the plan records.
 ///
 /// The rendering names its members rather than holding them out: the metadata
 /// is a couple of dozen small files and the image is the whole package.
@@ -191,6 +210,11 @@ pub(super) struct Package {
     /// that was verified the file that is extracted, which is the answer the
     /// Alpine layer's `Acquired` gives by carrying its own.
     container: std::fs::File,
+    /// The container's MD5, lowercase hex, which a merged package's
+    /// `BINPKGMD5` records.
+    md5: String,
+    /// The target triple the package was built for, from its `CHOST`.
+    chost: String,
 }
 
 impl Package {
@@ -203,6 +227,11 @@ impl Package {
     /// an install go through a plan: one resolved here, and one a caller kept
     /// and handed back.
     ///
+    /// `targets` are the `CHOST`s the root's own packages were built for, which
+    /// the container's must be one of; an empty set is a root that states none
+    /// yet, and holds the container to nothing. See [`check_target`] for why
+    /// the target is what is bound and the binhost is not.
+    ///
     /// The descriptor is the caller's, so the container checked is the one the
     /// caller holds: a cache entry it opened, or a download not yet published.
     ///
@@ -210,26 +239,65 @@ impl Package {
     ///
     /// Returns [`GentooError::Signature`] where the Manifest does not verify,
     /// [`GentooError::Digest`] where a member is not the bytes it vouched for,
+    /// and [`GentooError::Io`] where the file could not be read. Returns
     /// [`GentooError::Container`] for a container that is not one this layer
-    /// can read — no format marker, a member the Manifest does not list or one
-    /// it lists that is absent, no image or metadata archive, or metadata that
-    /// names a different package — and [`GentooError::Io`] where the file could
-    /// not be read.
+    /// can read: cut short, more entries than the format has room for, no
+    /// format marker, a member the Manifest does not list or one it lists that
+    /// is absent, or no image or metadata archive. It also
+    /// reports one whose signed metadata disagrees with the plan, naming a
+    /// different package or build, a target the root does not run, or a slot,
+    /// flags or dependencies other than the index stated, and one whose MD5 is
+    /// not the plan's.
     pub(super) fn read(
         mut container: std::fs::File,
         path: &Path,
         planned: &PlannedPackage,
+        targets: &BTreeSet<String>,
         keyring: &Keyring,
     ) -> Result<Package, GentooError> {
+        // A pass of its own over the file, ahead of the one that reads the
+        // members: the MD5 is over the whole container, padding included, and
+        // the tar reader stops at the archive's end.
+        let (md5, _) = digest::stream(Algorithm::Md5, &mut container)
+            .map_err(GentooError::at("digesting the container", path))?;
+        io::Seek::rewind(&mut container)
+            .map_err(GentooError::at("rewinding the container", path))?;
         let scan = scan(path, &mut container)?;
         let manifest = Manifest::verify(path, &scan, keyring)?;
         manifest.hold(path, &scan)?;
         let metadata = read_metadata(path, &scan)?;
         check_identity(path, planned, &metadata)?;
+        let chost = check_target(path, &metadata, targets)?;
+        check_record(path, planned, &metadata)?;
+        // Last, because every refusal above says more about what arrived than
+        // this one does: a container that is a different package, or no
+        // package at all, also has a different MD5.
+        if md5 != planned.md5 {
+            return Err(GentooError::container(
+                path,
+                format!(
+                    "has the MD5 {md5}, and the index states {} for the container it named; the \
+                     signature holds and the container is not the one the plan records",
+                    planned.md5,
+                ),
+            ));
+        }
         Ok(Package {
             metadata,
             container,
+            md5,
+            chost,
         })
+    }
+
+    /// The container's MD5, lowercase hex.
+    pub(super) fn md5(&self) -> &str {
+        &self.md5
+    }
+
+    /// The target triple the package was built for, from its signed `CHOST`.
+    pub(super) fn chost(&self) -> &str {
+        &self.chost
     }
 
     /// Every metadata file, by name, in name order.
@@ -257,7 +325,7 @@ impl Package {
         let mut archive = TarReader::new(io::BufReader::new(file));
         while let Some(entry) = archive
             .next_entry()
-            .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?
+            .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?
         {
             let is_image = entry.typeflag != b'5'
                 && split_member(&entry.path)
@@ -270,13 +338,15 @@ impl Package {
                 archive,
                 left: entry.size,
             };
+            // As in the first pass, a failure under the member is the tar
+            // reader's, and says the container is cut short or unreadable.
             let head = compress::sniff_head(&mut member)
-                .map_err(GentooError::at("reading the image archive", path))?;
+                .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
             let inner = compress::decompress(&head, member)
-                .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
+                .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
             return Ok(TarReader::new(inner));
         }
-        Err(container(
+        Err(GentooError::container(
             path,
             "the image archive is no longer in the container it was verified in",
         ))
@@ -285,9 +355,12 @@ impl Package {
 
 /// A container's members as one pass over it saw them.
 struct Scan {
-    /// Each member's name, its length, and the SHA-512 of its bytes, in
-    /// container order.
-    members: Vec<Seen>,
+    /// Each member's length and the SHA-512 of its bytes, by its name.
+    ///
+    /// Keyed by the name because every question asked of the set is one of
+    /// membership: whether a name has been seen already, and whether a name the
+    /// Manifest lists is present.
+    members: BTreeMap<String, Seen>,
     /// The Manifest's bytes.
     manifest: Vec<u8>,
     /// Whether an image archive was seen. Its bytes are not held: an image
@@ -306,14 +379,22 @@ struct Scan {
     marked: bool,
 }
 
-/// One member as the scan saw it.
+/// One member as the scan saw it, under the name inside the container's
+/// directory, which is what the Manifest spells.
 struct Seen {
-    /// The name inside the container's directory, which is what the Manifest
-    /// spells.
-    name: String,
     size: u64,
     sha512: String,
 }
+
+/// The most entries a container may hold.
+///
+/// The first pass reads every entry before anything vouches for one, and the
+/// index's `SIZE`, which is all that bounds the download, admits millions of
+/// empty entries in a gigabyte. So the count is bounded as the entries arrive.
+/// GLEP 78 defines six members, and says the format may gain more that a reader
+/// should pass over, so the bound leaves room for that rather than being six.
+/// Directory entries count too: GLEP 78 says a container carries none.
+const MAX_ENTRIES: usize = 16;
 
 /// Reads the whole container once, digesting every member.
 ///
@@ -323,7 +404,7 @@ struct Seen {
 fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
     let mut archive = TarReader::new(io::BufReader::new(file));
     let mut scan = Scan {
-        members: Vec::new(),
+        members: BTreeMap::new(),
         manifest: Vec::new(),
         has_image: false,
         metadata: Vec::new(),
@@ -331,10 +412,18 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         marked: false,
     };
     let mut prefix: Option<Vec<u8>> = None;
+    let mut entries = 0usize;
     while let Some(entry) = archive
         .next_entry()
-        .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?
+        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?
     {
+        entries += 1;
+        if entries > MAX_ENTRIES {
+            return Err(GentooError::container(
+                path,
+                format!("holds more than {MAX_ENTRIES} entries, where GLEP 78 defines six"),
+            ));
+        }
         // Directory entries describe the container's own layout rather than
         // being members of it, and the Manifest does not list them.
         if entry.typeflag == b'5' {
@@ -342,7 +431,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         }
         let full = entry.path.clone();
         let Some((held, name)) = split_member(&full) else {
-            return Err(container(
+            return Err(GentooError::container(
                 path,
                 format!(
                     "holds {:?}, which is not a member of a single directory",
@@ -354,7 +443,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             None => prefix = Some(held.to_vec()),
             Some(first) if first == held => {}
             Some(first) => {
-                return Err(container(
+                return Err(GentooError::container(
                     path,
                     format!(
                         "holds members under two directories, {:?} and {:?}",
@@ -365,7 +454,10 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             }
         }
         let Ok(name) = std::str::from_utf8(name) else {
-            return Err(container(path, "holds a member whose name is not UTF-8"));
+            return Err(GentooError::container(
+                path,
+                "holds a member whose name is not UTF-8",
+            ));
         };
         let name = name.to_string();
         // One member per name, since the Manifest has one line per name and
@@ -373,8 +465,11 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         // metadata archive, whatever their compression suffixes: a second image
         // is one the two passes could each take for the image.
         let role = Role::of(&name);
-        if scan.members.iter().any(|seen| seen.name == name) {
-            return Err(container(path, format!("holds the member {name} twice")));
+        if scan.members.contains_key(&name) {
+            return Err(GentooError::container(
+                path,
+                format!("holds the member {name} twice"),
+            ));
         }
         let repeated = match role {
             Role::Image if scan.has_image => Some("image"),
@@ -382,7 +477,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             _ => None,
         };
         if let Some(archive) = repeated {
-            return Err(container(
+            return Err(GentooError::container(
                 path,
                 format!("holds a second {archive} archive, {name}"),
             ));
@@ -403,9 +498,9 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             // held, and never cut at the ceiling: a member that fits is read
             // whole and one past it is refused as what it is.
             Some(limit) => {
-                buffered = archive
-                    .read_entry(limit)
-                    .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
+                buffered = archive.read_entry(limit).map_err(|err| {
+                    GentooError::container(path, ErrorChain::new(&err).to_string())
+                })?;
                 (Algorithm::Sha512.hex_of(&buffered), buffered.len() as u64)
             }
             None => {
@@ -413,8 +508,12 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
                     archive,
                     left: entry.size,
                 };
-                let digested = digest::stream(Algorithm::Sha512, &mut member)
-                    .map_err(GentooError::at("digesting a container member", path))?;
+                // What fails here is the tar reader under the member, which
+                // reports a container cut short or unreadable the way the
+                // entry headers above report one.
+                let digested = digest::stream(Algorithm::Sha512, &mut member).map_err(|err| {
+                    GentooError::container(path, ErrorChain::new(&err).to_string())
+                })?;
                 archive = member.archive;
                 digested
             }
@@ -430,23 +529,23 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             }
             Role::Other => {}
         }
-        scan.members.push(Seen { name, size, sha512 });
+        scan.members.insert(name, Seen { size, sha512 });
     }
 
     if !scan.marked {
-        return Err(container(
+        return Err(GentooError::container(
             path,
             format!("carries no {FORMAT_MEMBER} member, so it is not a gpkg container"),
         ));
     }
     if scan.manifest.is_empty() {
-        return Err(container(
+        return Err(GentooError::container(
             path,
             format!("carries no {MANIFEST_MEMBER}, so nothing vouches for its members"),
         ));
     }
     if !scan.has_image || !scan.has_metadata {
-        return Err(container(
+        return Err(GentooError::container(
             path,
             "carries no image archive or no metadata archive",
         ));
@@ -523,7 +622,7 @@ impl Manifest {
                 continue;
             };
             let Ok(size) = size.parse::<u64>() else {
-                return Err(container(
+                return Err(GentooError::container(
                     path,
                     format!("states a length of {size:?} for {name}, which is not a number"),
                 ));
@@ -543,7 +642,7 @@ impl Manifest {
                 }
             }
             let Some(sha512) = sha512.filter(|hex| Algorithm::Sha512.is_hex(hex)) else {
-                return Err(container(
+                return Err(GentooError::container(
                     path,
                     format!("states no usable SHA-512 for the member {name}"),
                 ));
@@ -551,7 +650,7 @@ impl Manifest {
             entries.insert(name.to_string(), (size, sha512));
         }
         if entries.is_empty() {
-            return Err(container(
+            return Err(GentooError::container(
                 path,
                 "has a Manifest that verified and vouches for no member",
             ));
@@ -566,41 +665,38 @@ impl Manifest {
     /// one that was taken away; either is a container that is not the one the
     /// Manifest was written for.
     fn hold(&self, path: &Path, scan: &Scan) -> Result<(), GentooError> {
-        for seen in &scan.members {
+        for (name, seen) in &scan.members {
             // The Manifest does not vouch for itself: it is the thing the
             // signature covers.
-            if seen.name == MANIFEST_MEMBER {
+            if name == MANIFEST_MEMBER {
                 continue;
             }
-            let Some((size, sha512)) = self.entries.get(&seen.name) else {
-                return Err(container(
+            let Some((size, sha512)) = self.entries.get(name) else {
+                return Err(GentooError::container(
                     path,
-                    format!(
-                        "holds a member {} that its Manifest does not list",
-                        seen.name
-                    ),
+                    format!("holds a member {name} that its Manifest does not list"),
                 ));
             };
             if seen.size != *size {
-                return Err(container(
+                return Err(GentooError::container(
                     path,
                     format!(
-                        "holds a member {} of {} bytes where its Manifest states {size}",
-                        seen.name, seen.size,
+                        "holds a member {name} of {} bytes where its Manifest states {size}",
+                        seen.size,
                     ),
                 ));
             }
             if seen.sha512 != *sha512 {
                 return Err(GentooError::Digest {
-                    subject: format!("the member {} of {}", seen.name, path.display()),
+                    subject: format!("the member {name} of {}", path.display()),
                     expected: sha512.clone(),
                     actual: seen.sha512.clone(),
                 });
             }
         }
         for name in self.entries.keys() {
-            if !scan.members.iter().any(|seen| seen.name == *name) {
-                return Err(container(
+            if !scan.members.contains_key(name) {
+                return Err(GentooError::container(
                     path,
                     format!("is missing the member {name} that its Manifest lists"),
                 ));
@@ -619,35 +715,35 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
     let mut files = BTreeMap::new();
     let mut compressed = scan.metadata.as_slice();
     let head = compress::sniff_head(&mut compressed)
-        .map_err(GentooError::at("reading the metadata archive", path))?;
+        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
     let inner = compress::decompress(&head, compressed)
-        .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
+        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
     let mut inner = TarReader::new(inner);
-    // What the files may hold between them, which is what each is read under:
-    // the metadata is one budget, however the archive divides it.
+    // What the entries may hold between them, which is what each is read
+    // under: the metadata is one budget, however the archive divides it. An
+    // entry the layer does not keep is read under it too, since decompressing
+    // it costs what decompressing a kept one does.
     let mut left = MAX_METADATA_BYTES;
     while let Some(entry) = inner
         .next_entry()
-        .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?
+        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?
     {
         if entry.typeflag == b'5' {
             continue;
         }
-        let Some(name) = std::str::from_utf8(&entry.path)
+        let bytes = inner
+            .read_entry(left)
+            .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
+        left -= bytes.len() as u64;
+        // Anything that is not a plain file directly under `metadata/` is not a
+        // metadata file, and the layer writes out only what it recognizes.
+        if let Some(name) = std::str::from_utf8(&entry.path)
             .ok()
             .and_then(|name| name.strip_prefix(METADATA_DIR))
             .filter(|name| path::is_ordinary_component(name.as_bytes()))
-        else {
-            // Anything that is not a plain file directly under `metadata/` is
-            // not a metadata file, and the layer writes out only what it
-            // recognizes.
-            continue;
-        };
-        let bytes = inner
-            .read_entry(left)
-            .map_err(|err| container(path, ErrorChain::new(&err).to_string()))?;
-        left -= bytes.len() as u64;
-        files.insert(name.to_string(), bytes);
+        {
+            files.insert(name.to_string(), bytes);
+        }
     }
     Ok(files)
 }
@@ -661,15 +757,12 @@ fn check_identity(
     planned: &PlannedPackage,
     metadata: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), GentooError> {
-    let field = |name: &str| {
-        metadata
-            .get(name)
-            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
-    };
-    let (Some(category), Some(pf), Some(build_id)) =
-        (field("CATEGORY"), field("PF"), field("BUILD_ID"))
-    else {
-        return Err(container(
+    let (Some(category), Some(pf), Some(build_id)) = (
+        field(metadata, "CATEGORY"),
+        field(metadata, "PF"),
+        field(metadata, "BUILD_ID"),
+    ) else {
+        return Err(GentooError::container(
             path,
             "carries no CATEGORY, PF or BUILD_ID, so it cannot say which package it is",
         ));
@@ -698,7 +791,7 @@ fn check_identity(
                 && build_id.parse::<u64>() == Ok(planned.build_id)
         });
     if !matched {
-        return Err(container(
+        return Err(GentooError::container(
             path,
             format!(
                 "is {named}, and what was asked for is {wanted}; the signature holds and the \
@@ -709,12 +802,136 @@ fn check_identity(
     Ok(())
 }
 
-/// A container that is not one this layer can read.
-fn container(path: &Path, reason: impl Into<String>) -> GentooError {
-    GentooError::Container {
-        subject: path.display().to_string(),
-        reason: reason.into(),
+/// One metadata file's value, as its single line, or `None` where the
+/// container carries no such file.
+fn field(metadata: &BTreeMap<String, Vec<u8>>, name: &str) -> Option<String> {
+    metadata
+        .get(name)
+        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+}
+
+/// Holds the container's signed `CHOST` to the targets the root's packages were
+/// built for, returning it.
+///
+/// The target triple names the instruction set, the byte order, the ABI and the
+/// C library: `x86_64-pc-linux-gnu`, `x86_64-pc-linux-musl`,
+/// `x86_64-pc-linux-gnux32`, `aarch64-unknown-linux-gnu`. Every architecture's
+/// containers are signed by one key, so without this a mirror could answer for
+/// one architecture or C library with another's genuine build, and the root
+/// would gain programs it cannot run. Portage refuses the same mismatch, holding
+/// a binary package's `CHOST` to the system's own.
+///
+/// It is the target that is bound and not the binhost, because nothing Gentoo
+/// signs names the binhost. Binhosts that share a target differ only in their
+/// compiler flags, and in no uniform way: `x86-64` builds with
+/// `-march=x86-64`, `x86-64-v3` with `-march=x86-64-v3`, and `x86-64_hardened`
+/// and `x86-64_llvm` with neither. A container from one of those in place of
+/// another is genuine, signed and built for this root's target, and nothing in
+/// it says it came from a different directory than the one asked for.
+///
+/// An empty `targets` is a root whose database states no `CHOST`, which binds
+/// nothing yet.
+fn check_target(
+    path: &Path,
+    metadata: &BTreeMap<String, Vec<u8>>,
+    targets: &BTreeSet<String>,
+) -> Result<String, GentooError> {
+    let Some(chost) = field(metadata, "CHOST").filter(|chost| !chost.is_empty()) else {
+        return Err(GentooError::container(
+            path,
+            "carries no CHOST, so it cannot say what it was built for",
+        ));
+    };
+    if !targets.is_empty() && !targets.contains(&chost) {
+        let root = targets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(GentooError::container(
+            path,
+            format!(
+                "was built for {chost}, and the root's packages were built for {root}; the \
+                 signature holds and the package is not one this root can run",
+            ),
+        ));
     }
+    Ok(chost)
+}
+
+/// Holds the container's signed metadata to what the plan says the index
+/// stated about the build.
+///
+/// The index is what the resolution read, and nothing signs it: the slot that
+/// decided which installed package a build would sit beside, the flags a USE
+/// dependency was answered from, the dependencies that decided the closure and
+/// the order, and the build time that ranked one build above another. Each is
+/// in the container's metadata too, where the Manifest vouches for it. A
+/// disagreement is an index that described a different build than the one it
+/// pointed at, and the resolution acted on that description, so it is
+/// refused.
+///
+/// Each value is read as the index reader reads its own: a slot as one string,
+/// flags as a sequence of tokens, dependencies through the dependency grammar,
+/// and a build time as a number, zero where it is absent or unreadable.
+fn check_record(
+    path: &Path,
+    planned: &PlannedPackage,
+    metadata: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), GentooError> {
+    let text = |name: &str| field(metadata, name).unwrap_or_default();
+    let differs = |what: &str, signed: &str, stated: &str| {
+        GentooError::container(
+            path,
+            format!(
+                "states {what} {signed:?}, and the index stated {stated:?}; the signature holds \
+                 and the index described another build than the one it named",
+            ),
+        )
+    };
+
+    let Some(slot) = field(metadata, "SLOT").filter(|slot| !slot.is_empty()) else {
+        return Err(GentooError::container(
+            path,
+            "carries no SLOT, so it cannot say where it is installed",
+        ));
+    };
+    if slot != planned.slot {
+        return Err(differs("the slot", &slot, &planned.slot));
+    }
+    for (what, name, stated) in [
+        ("the USE flags", "USE", &planned.use_flags),
+        ("the IUSE", "IUSE", &planned.iuse),
+    ] {
+        let signed = text(name);
+        if !signed
+            .split_ascii_whitespace()
+            .eq(stated.split_ascii_whitespace())
+        {
+            return Err(differs(what, &signed, stated));
+        }
+    }
+    for (what, name, stated) in [
+        ("the runtime dependencies", "RDEPEND", &planned.rdepend),
+        ("the post-merge dependencies", "PDEPEND", &planned.pdepend),
+    ] {
+        let signed = text(name);
+        let read = atom::parse_class(&signed).map_err(|reason| {
+            GentooError::container(path, format!("states {what} that cannot be read: {reason}"))
+        })?;
+        if atom::parse_class(stated) != Ok(read) {
+            return Err(differs(what, &signed, stated));
+        }
+    }
+    let built = text("BUILD_TIME").parse::<i64>().unwrap_or(0);
+    if built != planned.build_time {
+        return Err(differs(
+            "the build time",
+            &built.to_string(),
+            &planned.build_time.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Building a container, for the tests of this module and of the merge that
@@ -734,6 +951,26 @@ pub(super) mod fixture {
 
     /// The package every container below claims to be.
     pub(in crate::provision::gentoo) const CPV: &str = "sys-libs/zlib-1.3.2";
+
+    /// The target every container below was built for.
+    pub(in crate::provision::gentoo) const CHOST: &str = "x86_64-pc-linux-gnu";
+
+    /// What every container below states about its build, and the plan's
+    /// fixture entry states it as.
+    const SLOT: &str = "0/1";
+    const USE: &str = "amd64 minizip";
+    const RDEPEND: &str = ">=sys-libs/glibc-2.40 || ( app-arch/xz-utils app-arch/zstd )";
+    const BUILD_TIME: &str = "1700000000";
+
+    /// The metadata files besides the identity that every container below
+    /// carries, each a name and its value.
+    const RECORD: [(&str, &str); 5] = [
+        ("CHOST", CHOST),
+        ("SLOT", SLOT),
+        ("USE", USE),
+        ("RDEPEND", RDEPEND),
+        ("BUILD_TIME", BUILD_TIME),
+    ];
 
     /// A tar archive of `entries`, each a name and its bytes.
     pub(in crate::provision::gentoo) fn tarball(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
@@ -770,14 +1007,74 @@ pub(super) mod fixture {
         pf: &str,
         build_id: &str,
     ) -> Vec<u8> {
-        tarball(&[
-            ("metadata/", Vec::new()),
-            ("metadata/CATEGORY", format!("{category}\n").into_bytes()),
-            ("metadata/PF", format!("{pf}\n").into_bytes()),
-            ("metadata/BUILD_ID", build_id.as_bytes().to_vec()),
-            ("metadata/SLOT", b"0/1\n".to_vec()),
-            ("metadata/USE", b"amd64 minizip\n".to_vec()),
-        ])
+        metadata_archive(&files_named(category, pf, build_id))
+    }
+
+    /// The metadata files naming `category`, `pf` and `build_id`, each a name
+    /// inside `metadata/` and its contents.
+    fn files_named(category: &str, pf: &str, build_id: &str) -> Vec<(String, String)> {
+        let mut files = vec![
+            ("CATEGORY".to_string(), format!("{category}\n")),
+            ("PF".to_string(), format!("{pf}\n")),
+            ("BUILD_ID".to_string(), build_id.to_string()),
+        ];
+        files.extend(
+            RECORD
+                .iter()
+                .map(|(name, value)| (name.to_string(), format!("{value}\n"))),
+        );
+        files
+    }
+
+    /// The fixture package's metadata archive with some files changed: each a
+    /// name and its new value, or `None` to leave the file out.
+    ///
+    /// What a test of the checks against the plan needs: one field of the
+    /// signed metadata saying something other than the plan does.
+    pub(in crate::provision::gentoo) fn metadata_with(changes: &[(&str, Option<&str>)]) -> Vec<u8> {
+        let (category, package, version) =
+            super::super::version::split_cpv(CPV).expect("a fixture CPV");
+        let mut files = files_named(category, &format!("{package}-{version}"), "1");
+        for (name, value) in changes {
+            files.retain(|(held, _)| held != name);
+            if let Some(value) = value {
+                files.push((name.to_string(), format!("{value}\n")));
+            }
+        }
+        metadata_archive(&files)
+    }
+
+    /// A metadata archive holding `files` under `metadata/`, each a name and
+    /// its contents.
+    fn metadata_archive(files: &[(String, String)]) -> Vec<u8> {
+        metadata_archive_beside(files, &[])
+    }
+
+    /// The same, followed by `beside`, each an archive path and its contents.
+    fn metadata_archive_beside(files: &[(String, String)], beside: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let named: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|(name, value)| (format!("{METADATA_DIR}{name}"), value.clone().into_bytes()))
+            .collect();
+        let mut entries: Vec<(&str, Vec<u8>)> = vec![(METADATA_DIR, Vec::new())];
+        entries.extend(
+            named
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone())),
+        );
+        entries.extend(beside.iter().map(|(name, value)| (*name, value.clone())));
+        tarball(&entries)
+    }
+
+    /// The fixture package's metadata archive with `beside` added, each an
+    /// archive path outside `metadata/` and its contents.
+    pub(in crate::provision::gentoo) fn metadata_beside(beside: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let (category, package, version) =
+            super::super::version::split_cpv(CPV).expect("a fixture CPV");
+        metadata_archive_beside(
+            &files_named(category, &format!("{package}-{version}"), "1"),
+            beside,
+        )
     }
 
     /// The image archive a container carries: one directory, one file, one
@@ -793,7 +1090,10 @@ pub(super) mod fixture {
     /// The aliased paths are the ones a merged-usr root holds as links into
     /// `usr`, which the binhost's own packages still ship (lvm2's
     /// `lib64/libdevmapper.so.1.02` and `sbin/dmsetup`).
-    fn image(fifo: bool, aliased: bool) -> Vec<u8> {
+    ///
+    /// `raw` are entries added after those, each a path, a type and a link
+    /// target spelled as bytes, for what no string can spell.
+    fn image(fifo: bool, aliased: bool, raw: &[RawEntry]) -> Vec<u8> {
         let mut out = ferroday_cage_testkit::tar::Tar::new().stamped(1_700_000_000);
         let mut entries: Vec<(&str, &str, u32, u64, u8)> = vec![
             ("image/", "", 0o755, 0u64, b'5'),
@@ -817,8 +1117,15 @@ pub(super) mod fixture {
             let body: &[u8] = if size > 0 { b"ELF\n" } else { b"" };
             out.entry(name, typeflag, mode, 0, 0, target, body);
         }
+        for (name, typeflag, target) in raw {
+            out.header(name, *typeflag, 0o644, 0, 1_700_000_000, target);
+        }
         out.finish()
     }
+
+    /// An image entry spelled as bytes: its path, its type, and its link
+    /// target.
+    pub(in crate::provision::gentoo) type RawEntry = (&'static [u8], u8, &'static [u8]);
 
     /// How a container is put together, so a test can bend one part of it.
     pub(in crate::provision::gentoo) struct Built {
@@ -845,6 +1152,8 @@ pub(super) mod fixture {
         pub extra: Vec<(&'static str, Vec<u8>)>,
         /// Whether the Manifest spells its SHA-512 digests in uppercase.
         pub uppercase: bool,
+        /// Entries the image carries after its ordinary ones, spelled as bytes.
+        pub raw: Vec<RawEntry>,
     }
 
     impl Built {
@@ -861,6 +1170,7 @@ pub(super) mod fixture {
                 aliased: false,
                 extra: Vec::new(),
                 uppercase: false,
+                raw: Vec::new(),
             }
         }
 
@@ -872,7 +1182,10 @@ pub(super) mod fixture {
             }
             members.push(("metadata.tar".to_string(), self.metadata));
             members.push(("metadata.tar.sig".to_string(), b"not read\n".to_vec()));
-            members.push(("image.tar".to_string(), image(self.fifo, self.aliased)));
+            members.push((
+                "image.tar".to_string(),
+                image(self.fifo, self.aliased, &self.raw),
+            ));
             members.push(("image.tar.sig".to_string(), b"not read\n".to_vec()));
             for (name, body) in self.extra {
                 members.push((name.to_string(), body));
@@ -917,37 +1230,76 @@ pub(super) mod fixture {
     }
 
     /// The plan entry a container is checked against.
+    ///
+    /// It states what every fixture container's metadata states, and an MD5
+    /// that is no container's: [`planned_for`] is the entry for one container
+    /// in particular.
     pub(in crate::provision::gentoo) fn planned(cpv: &str, build_id: u64) -> PlannedPackage {
         let (category, package, version) =
             super::super::version::split_cpv(cpv).expect("a fixture CPV");
         let mut plan = super::super::Plan::parse_document(&format!(
             "Format: ferroday-cage-gentoo-plan 1\nArchitecture: amd64\nBinhost: x86-64\n\n\
              Package: {category}/{package}\nVersion: {version}\nBuild-Id: {build_id}\n\
-             Path: a/b/c.gpkg.tar\nSize: 1\nMD5: 3a61f698748c7323c87081584f383b3c\n",
+             Path: a/b/c.gpkg.tar\nSize: 1\nMD5: 3a61f698748c7323c87081584f383b3c\n\
+             Slot: {SLOT}\nUse: {USE}\nRdepend: {RDEPEND}\nBuild-Time: {BUILD_TIME}\n",
         ))
         .expect("a fixture plan");
         plan.packages.remove(0)
+    }
+
+    /// The same entry, naming the container at `container` by its MD5.
+    pub(in crate::provision::gentoo) fn planned_for(
+        cpv: &str,
+        build_id: u64,
+        container: &Path,
+    ) -> PlannedPackage {
+        let bytes = std::fs::read(container).expect("the container reads");
+        let mut planned = planned(cpv, build_id);
+        planned.md5 = Algorithm::Md5.hex_of(&bytes);
+        planned
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{Built, CPV, metadata_named, planned};
+    use super::fixture::{
+        Built, CHOST, CPV, metadata_beside, metadata_named, metadata_with, planned, planned_for,
+    };
     use super::*;
     use crate::provision::openpgp::fixture;
     use crate::scratch::Scratch;
 
-    /// Opens `built` and reports what happened.
+    /// The targets of a root the fixture containers were built for.
+    fn root_targets() -> BTreeSet<String> {
+        BTreeSet::from([CHOST.to_string()])
+    }
+
+    /// Opens `built` and reports what happened, as the plan entry `wanted`
+    /// naming the container by its MD5 would.
     #[track_caller]
     fn open(tag: &str, built: Built, wanted: &PlannedPackage) -> Result<Package, GentooError> {
+        open_into(tag, built, wanted, &root_targets())
+    }
+
+    /// The same, for a root built for `targets`.
+    #[track_caller]
+    fn open_into(
+        tag: &str,
+        built: Built,
+        wanted: &PlannedPackage,
+        targets: &BTreeSet<String>,
+    ) -> Result<Package, GentooError> {
         let dir = Scratch::for_test("gentoo-gpkg", tag);
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let path = dir.join("package.gpkg.tar");
         built.write(&path, &key);
+        let mut wanted = wanted.clone();
+        wanted.md5 = Algorithm::Md5.hex_of(&std::fs::read(&path).expect("the container reads"));
         Package::read(
             std::fs::File::open(&path).expect("the container opens"),
             &path,
-            wanted,
+            &wanted,
+            targets,
             &fixture::keyring(&key),
         )
     }
@@ -961,7 +1313,16 @@ mod tests {
                 .metadata_files()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>(),
-            ["BUILD_ID", "CATEGORY", "PF", "SLOT", "USE"],
+            [
+                "BUILD_ID",
+                "BUILD_TIME",
+                "CATEGORY",
+                "CHOST",
+                "PF",
+                "RDEPEND",
+                "SLOT",
+                "USE"
+            ],
         );
         assert_eq!(
             package
@@ -986,7 +1347,8 @@ mod tests {
         let package = Package::read(
             std::fs::File::open(&path).expect("the container opens"),
             &path,
-            &planned(CPV, 1),
+            &planned_for(CPV, 1, &path),
+            &root_targets(),
             &keyring,
         )
         .expect("the container verifies");
@@ -1031,6 +1393,29 @@ mod tests {
         built.metadata = vec![b'm'; MAX_METADATA_BYTES as usize + 1];
         let err = open("gpkg-over-ceiling", built, &planned(CPV, 1))
             .expect_err("a member past the ceiling is refused");
+        assert!(err.to_string().contains("more than"), "{err}");
+    }
+
+    #[test]
+    fn what_the_metadata_archive_inflates_to_is_one_budget_kept_or_not() {
+        // An entry outside `metadata/` is not written out, and is decompressed
+        // all the same, so it is read under the budget the kept files are. A
+        // few kilobytes of gzip here inflate past it.
+        let archive = metadata_beside(&[("padding", vec![0u8; MAX_METADATA_BYTES as usize + 1])]);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        io::Write::write_all(&mut gzip, &archive).expect("gzip accepts it");
+        let compressed = gzip.finish().expect("the member closes");
+        assert!((compressed.len() as u64) < MAX_METADATA_BYTES / 64);
+        let err = open(
+            "metadata-budget",
+            Built {
+                metadata: compressed,
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+        )
+        .expect_err("an archive inflating past the budget is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
         assert!(err.to_string().contains("more than"), "{err}");
     }
 
@@ -1181,6 +1566,224 @@ mod tests {
     }
 
     #[test]
+    fn a_container_holding_more_entries_than_the_format_has_room_for_is_refused() {
+        // The scan reads every entry before the Manifest says anything, and the
+        // index's SIZE admits millions of empty ones in a gigabyte. The count
+        // is refused as the entries arrive, so this one stops at the bound
+        // rather than reading on to find there is no format marker.
+        let dir = Scratch::for_test("gentoo-gpkg", "many-entries");
+        let path = dir.join("package.gpkg.tar");
+        let names: Vec<String> = (0..5_000)
+            .map(|at| format!("zlib-1.3.2-1/m{at:05}"))
+            .collect();
+        let entries: Vec<(&str, Vec<u8>)> = names
+            .iter()
+            .map(|name| (name.as_str(), Vec::new()))
+            .collect();
+        std::fs::write(&path, super::fixture::tarball(&entries)).expect("the container is written");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let err = Package::read(
+            std::fs::File::open(&path).expect("the container opens"),
+            &path,
+            &planned_for(CPV, 1, &path),
+            &root_targets(),
+            &fixture::keyring(&key),
+        )
+        .expect_err("a container of thousands of entries is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains(&format!("more than {MAX_ENTRIES} entries")),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn room_is_left_for_members_the_format_may_gain() {
+        // GLEP 78 defines six members and says a reader should pass over ones
+        // it does not know, so the bound sits above six. Members past it are
+        // refused however the Manifest lists them.
+        const EXTRA: [&str; MAX_ENTRIES - 5] = [
+            "e00", "e01", "e02", "e03", "e04", "e05", "e06", "e07", "e08", "e09", "e10",
+        ];
+        let listed = |count: usize| Built {
+            extra: EXTRA[..count]
+                .iter()
+                .map(|name| (*name, b"listed in the signed Manifest".to_vec()))
+                .collect(),
+            ..Built::ordinary()
+        };
+        open("room", listed(MAX_ENTRIES - 6), &planned(CPV, 1))
+            .expect("a container of exactly the bound opens");
+        let err = open("no-room", listed(MAX_ENTRIES - 5), &planned(CPV, 1))
+            .expect_err("one entry past the bound is refused");
+        assert!(err.to_string().contains("more than"), "{err}");
+    }
+
+    #[test]
+    fn a_container_cut_short_is_the_containers_failure_and_not_the_hosts() {
+        // Cut inside the image archive, which the first pass streams through
+        // a digest rather than holding: what fails there is the tar reader
+        // under the member, and it says what the container is.
+        let dir = Scratch::for_test("gentoo-gpkg", "cut-short");
+        let path = dir.join("package.gpkg.tar");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        Built::ordinary().write(&path, &key);
+        let bytes = std::fs::read(&path).expect("the container reads");
+        let image = bytes
+            .windows(b"zlib-1.3.2-1/image.tar\0".len())
+            .position(|window| window == b"zlib-1.3.2-1/image.tar\0")
+            .expect("the container holds the image archive");
+        std::fs::write(&path, &bytes[..image + 512 + 100]).expect("the container is cut");
+        let err = Package::read(
+            std::fs::File::open(&path).expect("the container opens"),
+            &path,
+            &planned_for(CPV, 1, &path),
+            &root_targets(),
+            &fixture::keyring(&key),
+        )
+        .expect_err("a container cut short is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_container_built_for_another_target_than_the_roots_is_refused() {
+        // One key signs every architecture's containers, so a genuine build for
+        // another one passes every signature check. The root's own packages
+        // say what it runs.
+        let arm = "aarch64-unknown-linux-gnu".to_string();
+        let err = open_into(
+            "other-target",
+            Built::ordinary(),
+            &planned(CPV, 1),
+            &BTreeSet::from([arm.clone()]),
+        )
+        .expect_err("a build for another target is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("not one this root can run"),
+            "{err}"
+        );
+
+        // A root whose packages state several targets admits a build for any
+        // of them, and one whose database states none binds nothing yet.
+        open_into(
+            "either-target",
+            Built::ordinary(),
+            &planned(CPV, 1),
+            &BTreeSet::from([arm, CHOST.to_string()]),
+        )
+        .expect("a build for one of the root's targets opens");
+        let package = open_into(
+            "no-target",
+            Built::ordinary(),
+            &planned(CPV, 1),
+            &BTreeSet::new(),
+        )
+        .expect("a root that states no target binds nothing");
+        assert_eq!(package.chost(), CHOST);
+
+        // A container that does not say what it was built for is refused
+        // whatever the root states.
+        let err = open_into(
+            "unstated-target",
+            Built {
+                metadata: metadata_with(&[("CHOST", None)]),
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+            &BTreeSet::new(),
+        )
+        .expect_err("a container stating no target is refused");
+        assert!(err.to_string().contains("no CHOST"), "{err}");
+    }
+
+    #[test]
+    fn a_container_whose_signed_metadata_is_not_what_the_index_described_is_refused() {
+        // The resolution acted on what the index stated, and nothing signs the
+        // index. Each field it read is in the container's metadata too, where
+        // the Manifest vouches for it.
+        for (at, (name, value, why)) in [
+            ("SLOT", Some("0/2"), "the slot"),
+            ("SLOT", None, "no SLOT"),
+            ("USE", Some("amd64"), "the USE flags"),
+            ("IUSE", Some("minizip"), "the IUSE"),
+            (
+                "RDEPEND",
+                Some(">=sys-libs/glibc-2.40"),
+                "the runtime dependencies",
+            ),
+            ("RDEPEND", Some("|| ("), "cannot be read"),
+            (
+                "PDEPEND",
+                Some("app-misc/other"),
+                "the post-merge dependencies",
+            ),
+            ("BUILD_TIME", Some("1700000001"), "the build time"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let err = open(
+                &format!("record-{at}"),
+                Built {
+                    metadata: metadata_with(&[(name, value)]),
+                    ..Built::ordinary()
+                },
+                &planned(CPV, 1),
+            )
+            .expect_err(why);
+            assert!(
+                matches!(err, GentooError::Container { .. }),
+                "{why}: {err:?}"
+            );
+            assert!(err.to_string().contains(why), "{why}: {err}");
+        }
+
+        // What is compared is what the resolution read, so a field spelled with
+        // other whitespace is the same field.
+        open(
+            "respelled",
+            Built {
+                metadata: metadata_with(&[
+                    ("USE", Some("amd64   minizip")),
+                    (
+                        "RDEPEND",
+                        Some(">=sys-libs/glibc-2.40\t||  (  app-arch/xz-utils app-arch/zstd  )"),
+                    ),
+                ]),
+                ..Built::ordinary()
+            },
+            &planned(CPV, 1),
+        )
+        .expect("a field spelled with other whitespace is the same field");
+    }
+
+    #[test]
+    fn a_container_that_is_not_the_one_the_plan_records_is_refused_by_its_md5() {
+        // Everything else about it holds: the right package, built for this
+        // root, stating what the index stated. The plan named one container by
+        // its MD5 and this is another.
+        let dir = Scratch::for_test("gentoo-gpkg", "md5");
+        let path = dir.join("package.gpkg.tar");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        Built::ordinary().write(&path, &key);
+        let err = Package::read(
+            std::fs::File::open(&path).expect("the container opens"),
+            &path,
+            &planned(CPV, 1),
+            &root_targets(),
+            &fixture::keyring(&key),
+        )
+        .expect_err("another container is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("not the one the plan records"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_member_name_that_is_not_one_path_component_is_refused() {
         // Listed in the signed Manifest, so nothing but the name's own shape
         // stands against it.
@@ -1203,13 +1806,7 @@ mod tests {
     fn a_metadata_file_whose_name_is_not_one_path_component_is_not_read() {
         // Its name becomes the leaf of a database entry's path, so only an
         // ordinary component is a metadata file at all.
-        let metadata = super::fixture::tarball(&[
-            ("metadata/", Vec::new()),
-            ("metadata/CATEGORY", b"sys-libs\n".to_vec()),
-            ("metadata/PF", b"zlib-1.3.2\n".to_vec()),
-            ("metadata/BUILD_ID", b"1".to_vec()),
-            ("metadata/..", b"not a metadata file".to_vec()),
-        ]);
+        let metadata = metadata_with(&[("..", Some("not a metadata file"))]);
         let package = open(
             "dotdot-metadata",
             Built {
@@ -1224,7 +1821,16 @@ mod tests {
                 .metadata_files()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>(),
-            ["BUILD_ID", "CATEGORY", "PF"],
+            [
+                "BUILD_ID",
+                "BUILD_TIME",
+                "CATEGORY",
+                "CHOST",
+                "PF",
+                "RDEPEND",
+                "SLOT",
+                "USE"
+            ],
         );
     }
 
@@ -1282,7 +1888,8 @@ mod tests {
         let err = Package::read(
             std::fs::File::open(&path).expect("the container opens"),
             &path,
-            &planned(CPV, 1),
+            &planned_for(CPV, 1, &path),
+            &root_targets(),
             &fixture::keyring(&trusted),
         )
         .expect_err("a forged Manifest is refused");
@@ -1298,7 +1905,8 @@ mod tests {
         let package = Package::read(
             std::fs::File::open(&path).expect("the container opens"),
             &path,
-            &planned(CPV, 1),
+            &planned_for(CPV, 1, &path),
+            &root_targets(),
             &fixture::keyring(&key),
         )
         .expect("the container opens");

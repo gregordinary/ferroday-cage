@@ -1302,9 +1302,10 @@ fn hermetic_resolve_layer_requires_a_configured_base() {
 fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
     // When every requested package is already in the base, the increment is
     // empty: stage_layer installs nothing, launches no dpkg wave, and returns a
-    // build layer over an empty upper. This exercises the empty-increment path
-    // hermetically — it runs no cage — so it needs no network or real dpkg; it
-    // skips only where the overlay preflight reports the host cannot overlay.
+    // build layer whose upper holds only the pre-configure overlay. This
+    // exercises the empty-increment path hermetically — it runs no cage — so it
+    // needs no network or real dpkg; it skips only where the overlay preflight
+    // reports the host cannot overlay.
     let dir = common::scratch_dir("debian-empty-layer");
     if !common::require::overlay(&dir) {
         return;
@@ -1330,6 +1331,12 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
     )
     .unwrap();
 
+    // The caller's configuration of the build root, which applies whether or
+    // not anything needed installing.
+    let overlay = dir.join("overlay");
+    std::fs::create_dir_all(overlay.join("etc")).unwrap();
+    std::fs::write(overlay.join("etc/build.conf"), b"jobs=4\n").unwrap();
+
     let upper = dir.join("upper");
     let layer = {
         let mut debian = Debian::builder("trixie")
@@ -1338,6 +1345,7 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
             .trust_unsigned(true)
             .base_layer(&base_dir)
             .include(["base"])
+            .pre_configure_overlay(&overlay)
             .build()
             .expect("the builder validates");
         debian
@@ -1349,6 +1357,13 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
         upper.is_dir(),
         "the upper exists even for an empty increment"
     );
+    assert_eq!(
+        std::fs::read(upper.join("etc/build.conf")).unwrap(),
+        b"jobs=4\n",
+        "the overlay is laid into an empty increment as into any other",
+    );
+    // Nothing a wave writes is there: no package was installed.
+    assert!(!upper.join("var/lib/dpkg").exists());
     drop(layer);
     assert!(
         !upper.exists(),
@@ -1769,9 +1784,9 @@ fn hermetic_a_deb_cannot_write_its_own_index_entry() {
     // route: the appended fields land on the last, which is then the paragraph
     // that reads back as the entry — under whatever name and version it
     // declares, while the dedupe that placed it keyed on the first. A pool is
-    // consumed as [trusted=yes] and resolution is highest-version-wins across
-    // repositories, so an entry a package wrote for itself supersedes the
-    // primary archive's.
+    // consumed as [trusted=yes] and ranks alongside the primary archive, where
+    // the higher version wins, so an entry a package wrote for itself
+    // supersedes the primary archive's.
     let dir = common::scratch_dir("debian-pool-shadowing");
     let pool = dir.join("pool");
     let data = Tar::new().file("./usr/bin/x", 0o755, b"ok\n").finish();
@@ -2025,6 +2040,83 @@ fn extract_only_bootstraps_a_trixie_tree() {
 }
 
 #[test]
+fn backports_supplies_only_what_is_asked_of_it_by_release() {
+    // The real archive's own markings: trixie-backports is NotAutomatic and
+    // ButAutomaticUpgrades, so beside trixie it supplies nothing a resolution
+    // does not ask of it by name and release, as apt resolves the pair.
+    if !network_enabled() {
+        return;
+    }
+    let keyring = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/provision/debian/keyring/debian-archive-keyring.gpg"
+    );
+    let backports = || {
+        Repository::builder("trixie-backports")
+            .mirror("http://deb.debian.org/debian")
+            .keyring(keyring)
+            .name("backports")
+            .build()
+            .expect("the backports repository validates")
+    };
+
+    // A package trixie carries that backports carries too: the kernel's
+    // metapackage, or one of the long-lived backports otherwise.
+    let offered = Debian::builder("trixie-backports")
+        .build()
+        .expect("the builder validates")
+        .available()
+        .expect("the backports index is read");
+    let kernel = format!(
+        "linux-image-{}",
+        ferroday_cage::provision::debian::host_architecture()
+    );
+    let name = [
+        kernel.as_str(),
+        "systemd",
+        "git",
+        "curl",
+        "cockpit",
+        "golang-go",
+    ]
+    .into_iter()
+    .find(|name| offered.contains(name))
+    .expect("trixie-backports carries one of the usual backports");
+
+    let plan = Debian::builder("trixie")
+        .repository(backports())
+        .include([name])
+        .build()
+        .expect("the builder validates")
+        .resolve()
+        .expect("the merged plan resolves");
+    let from_backports: Vec<&str> = plan
+        .packages
+        .iter()
+        .filter(|package| package.archive == 1)
+        .map(|package| package.name.as_str())
+        .collect();
+    assert!(
+        from_backports.is_empty(),
+        "backports supplied what nothing asked of it: {from_backports:?}",
+    );
+
+    let plan = Debian::builder("trixie")
+        .repository(backports())
+        .include([format!("{name}/trixie-backports")])
+        .build()
+        .expect("the builder validates")
+        .resolve()
+        .expect("the merged plan resolves");
+    let asked = plan
+        .packages
+        .iter()
+        .find(|package| package.name == name)
+        .expect("the package asked for is in the plan");
+    assert_eq!(asked.archive, 1, "{name} comes from backports");
+}
+
+#[test]
 fn full_bootstrap_configures_a_runnable_trixie() {
     if !network_enabled() {
         return;
@@ -2083,6 +2175,27 @@ fn full_bootstrap_configures_a_runnable_trixie() {
         verify.status.success() && verify.stdout.is_empty(),
         "debian-archive-keyring's files are the package's own: {}",
         String::from_utf8_lossy(&verify.stdout),
+    );
+
+    // The daemon launcher was a stand-in while packages configured, and the
+    // real one is back: dpkg finds its own file unchanged, and no stand-in or
+    // saved copy is left.
+    let verify = ferroday_cage::Cage::builder()
+        .rootfs(&rootfs)
+        .command("/usr/bin/dpkg")
+        .args(["--verify", "dpkg"])
+        .build()
+        .expect("the cage builds")
+        .output()
+        .expect("dpkg runs in the finished rootfs");
+    assert!(
+        verify.status.success() && verify.stdout.is_empty(),
+        "dpkg's files, start-stop-daemon among them, are the package's own: {}",
+        String::from_utf8_lossy(&verify.stdout),
+    );
+    assert!(
+        std::fs::symlink_metadata(rootfs.join("usr/sbin/start-stop-daemon.fcage-real")).is_err(),
+        "no saved copy of the launcher is left",
     );
 
     // Every base package reached the installed state; run dpkg in the cage
@@ -2818,7 +2931,7 @@ fn a_plan_records_the_mirror_that_served_rather_than_the_one_configured_first() 
 
 #[test]
 fn a_plan_indexes_each_package_to_the_archive_its_version_came_from() {
-    // Resolution is highest-version-wins across the merged repositories, so
+    // Each name resolves to one version across the merged repositories, so
     // with more than one configured the archive index is the only thing that
     // says where a package will actually be fetched from.
     let dir = common::scratch_dir("debian-plan-multirepo");

@@ -9,8 +9,8 @@
 //! `pigz` and a plain `cat` of two `.gz` files produce), concatenated xz
 //! streams, and multi-frame zstd (as `pzstd` emits, including a leading
 //! skippable frame). `ruzstd`'s `StreamingDecoder` decodes a single frame, so
-//! [`ZstdReader`] drives one decoder per frame, and compares each frame's
-//! content checksum as the frame ends.
+//! [`ZstdReader`] drives one decoder per frame, and compares a frame's
+//! content checksum, where the frame carries one, as the frame ends.
 //!
 //! Two of the three formats let a hostile archive name its own memory cost, in
 //! a header far smaller than the allocation it asks for. A zstd frame declares

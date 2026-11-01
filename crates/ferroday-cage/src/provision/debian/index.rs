@@ -8,10 +8,12 @@
 //! written in as well; [`Index`] is the package set built from a `Packages`
 //! file, deduplicated to the highest version of each name.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
 use super::pin::{PinMatch, Pins};
+use super::release::ReleasePriority;
 use super::version::{self, Constraint};
 use crate::provision::Available;
 use crate::provision::digest::Algorithm;
@@ -317,82 +319,126 @@ fn is_safe_pool_shape(path: &[u8]) -> bool {
             .any(|component| component == b"..")
 }
 
-/// The package set of one suite: the highest version of each real name, plus
-/// a virtual-package index mapping each provided name to its providers.
+/// One repository's part of a merged index: its place in the configured list,
+/// the release it publishes, and one component's `Packages` text.
+pub(crate) struct Source<'a> {
+    /// The repository's index in the configured list, the primary at zero,
+    /// which every package it supplies is tagged with.
+    pub(crate) origin: usize,
+    /// The suite the repository is configured with, which an install list
+    /// entry written `name/release` names it by.
+    pub(crate) suite: &'a str,
+    /// How the release ranks its versions against another release's.
+    pub(crate) priority: ReleasePriority,
+    /// The `Packages` text.
+    pub(crate) text: &'a str,
+}
+
+/// The package set the configured repositories offer: every version kept of
+/// each real name, at most one per repository, with the one a resolution takes
+/// by default first; plus a virtual-package index mapping each provided name to
+/// its providers.
+///
+/// The first version of a name is its *candidate*, chosen as apt chooses one
+/// for a system that has nothing installed: the highest [`ReleasePriority`],
+/// then the highest version, then the earlier repository. The others are kept
+/// because an install list may ask for a name from a particular release, and a
+/// layered build may upgrade a name its base has installed, and each of those
+/// can settle on a version other than the candidate.
 pub(crate) struct Index {
-    by_name: HashMap<String, Package>,
+    by_name: HashMap<String, Vec<Package>>,
     providers: HashMap<String, Vec<String>>,
+    /// The suite and the rank of each repository, by origin.
+    releases: HashMap<usize, (String, ReleasePriority)>,
 }
 
 impl Index {
     /// Parses a single `Packages` index, keeping the highest version of each
     /// name and filtering to the requested architecture plus `all`. Every
-    /// package is tagged with origin zero.
+    /// package is tagged with origin zero, of a default-ranked release.
     #[cfg(test)]
     pub(crate) fn parse(text: &str, architecture: &str) -> Index {
-        Index::merge(std::iter::once((0, text)), architecture, &Pins::none())
+        Index::merge(sources([(0, text)]), architecture, &Pins::none())
     }
 
     /// Parses and merges several repositories' `Packages` indexes into one set,
-    /// keeping the highest version of each name across the union and tagging
-    /// each retained package with the origin it came from.
+    /// tagging each retained package with the origin it came from.
     ///
-    /// The inputs are `(origin, text)` pairs, one per repository component,
-    /// yielded in repository-then-component order. Resolution is
-    /// highest-version-wins, extended across repositories; an exact-version tie
-    /// resolves to the first repository in that order, since the earlier origin
-    /// is retained when a later one does not compare greater.
+    /// The sources are yielded one per repository component. Within one
+    /// repository the highest version of a name is kept. Across repositories
+    /// each name's versions are ranked for its candidate: the higher
+    /// [`ReleasePriority`] first, then the higher version, and an exact tie
+    /// resolves to the repository that comes first in the configured list.
     ///
-    /// A name `pins` holds selects the pinned version instead of the highest,
-    /// preferring a repository that records the pinned bytes for it and
-    /// otherwise taking the first repository that offers it. Where no
-    /// repository offers the pinned version the highest is kept, so
-    /// [`Pins::check`] can report what the archives carry rather than only
-    /// that something is missing; that check runs before anything resolves
-    /// against the index.
+    /// A name `pins` holds selects the pinned version instead, whatever the
+    /// rank of the release offering it, preferring a repository that records
+    /// the pinned bytes for it and otherwise taking the first repository that
+    /// offers it. Where no repository offers the pinned version the ranking
+    /// above decides, so [`Pins::check`] can report what the archives carry
+    /// rather than only that something is missing; that check runs before
+    /// anything resolves against the index.
     pub(crate) fn merge<'a>(
-        inputs: impl IntoIterator<Item = (usize, &'a str)>,
+        sources: impl IntoIterator<Item = Source<'a>>,
         architecture: &str,
         pins: &Pins,
     ) -> Index {
-        let mut by_name: HashMap<String, Package> = HashMap::new();
-        for (origin, text) in inputs {
-            for stanza in document::parse(text) {
+        let mut by_name: HashMap<String, Vec<Package>> = HashMap::new();
+        let mut releases = HashMap::new();
+        for source in sources {
+            releases.insert(source.origin, (source.suite.to_string(), source.priority));
+            for stanza in document::parse(source.text) {
                 let Some(mut package) = Package::from_stanza(&stanza) else {
                     continue;
                 };
                 if package.architecture != architecture && package.architecture != "all" {
                     continue;
                 }
-                package.origin = origin;
-                let higher = |candidate: &Package, existing: &Package| {
-                    version::compare(&candidate.version, &existing.version)
-                        == std::cmp::Ordering::Greater
-                };
-                let keep = match by_name.get(&package.name) {
-                    None => true,
-                    // The entry closest to the pin is kept: the pinned version
-                    // with the pinned bytes, then the pinned version, then the
-                    // highest. A later repository displaces an earlier one only
-                    // by being closer, so among equals the first is kept, as an
-                    // unpinned tie keeps it.
-                    Some(existing) if pins.names(&package.name) => {
-                        let (offered, held) = (pins.matching(&package), pins.matching(existing));
-                        offered > held
-                            || (offered == PinMatch::Neither
-                                && held == PinMatch::Neither
-                                && higher(&package, existing))
+                package.origin = source.origin;
+                let offers = by_name.entry(package.name.clone()).or_default();
+                match offers.iter_mut().find(|held| held.origin == package.origin) {
+                    None => offers.push(package),
+                    // One repository, so one rank: the entry closest to the
+                    // pin is kept, and otherwise the higher version.
+                    Some(held) => {
+                        if pin_closer(pins, &package, held)
+                            .unwrap_or_else(|| higher(&package, held))
+                        {
+                            *held = package;
+                        }
                     }
-                    Some(existing) => higher(&package, existing),
-                };
-                if keep {
-                    by_name.insert(package.name.clone(), package);
                 }
             }
         }
 
+        let rank = |package: &Package| {
+            releases
+                .get(&package.origin)
+                .map_or(ReleasePriority::Default, |(_, priority)| *priority)
+        };
+        for offers in by_name.values_mut() {
+            // Repository order first, so a tie below goes to the earlier one
+            // and the versions after the candidate read in a stable order.
+            offers.sort_by_key(|package| package.origin);
+            let candidate = (1..offers.len()).fold(0, |best, at| {
+                let (offered, held) = (&offers[at], &offers[best]);
+                // The entry closest to the pin is the candidate whatever its
+                // rank: the pinned version with the pinned bytes, then the
+                // pinned version. A later repository displaces an earlier one
+                // only by being closer, so among equals the first is kept.
+                let displaces = pin_closer(pins, offered, held)
+                    .unwrap_or_else(|| outranks((rank(offered), offered), (rank(held), held)));
+                if displaces { at } else { best }
+            });
+            let candidate = offers.remove(candidate);
+            offers.insert(0, candidate);
+        }
+
+        // Every version's provides, not only the candidates': a version an
+        // install list asks for by release can provide what its candidate does
+        // not. The resolver asks each provider's own version whether it
+        // supplies the name, so listing a name here promises nothing.
         let mut providers: HashMap<String, Vec<String>> = HashMap::new();
-        for package in by_name.values() {
+        for package in by_name.values().flatten() {
             for provided in &package.provides {
                 providers
                     .entry(provided.name.clone())
@@ -405,19 +451,93 @@ impl Index {
         // a stable order for a deterministic selection across runs.
         for names in providers.values_mut() {
             names.sort();
+            names.dedup();
         }
 
-        Index { by_name, providers }
+        Index {
+            by_name,
+            providers,
+            releases,
+        }
     }
 
-    /// The package with `name`, if it is a real package in this index.
+    /// The candidate for `name`, if it is a real package in this index: the
+    /// version a resolution takes when nothing asks for another.
     pub(crate) fn get(&self, name: &str) -> Option<&Package> {
-        self.by_name.get(name)
+        self.by_name.get(name).and_then(|offers| offers.first())
     }
 
-    /// The real packages that provide the virtual package `name`.
+    /// Every version kept of `name`, the candidate first and then the others
+    /// in repository order. Empty for a name no repository offers.
+    pub(crate) fn offers(&self, name: &str) -> &[Package] {
+        self.by_name.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// The real packages whose versions provide the virtual package `name`.
     pub(crate) fn providers(&self, name: &str) -> &[String] {
         self.providers.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// The suite the repository at `origin` publishes, as configured.
+    pub(crate) fn suite(&self, origin: usize) -> &str {
+        self.releases
+            .get(&origin)
+            .map_or("", |(suite, _)| suite.as_str())
+    }
+
+    /// The highest version of `name` that a repository publishing the suite
+    /// `release` offers, as apt's `name/release` selects it.
+    pub(crate) fn in_release(&self, name: &str, release: &str) -> Option<&Package> {
+        self.offers(name)
+            .iter()
+            .filter(|package| self.suite(package.origin) == release)
+            .fold(None, |best: Option<&Package>, package| match best {
+                Some(held) if !higher(package, held) => Some(held),
+                _ => Some(package),
+            })
+    }
+
+    /// The version a name installed at `installed` is upgraded to, where a
+    /// dependency the installed version does not meet asks for one, or `None`
+    /// where apt would keep the installed version.
+    ///
+    /// apt never downgrades without a pin above 1000, so only versions above
+    /// the installed one are considered, ranked as a candidate is. The installed
+    /// version stands at [`ReleasePriority::AutomaticUpgrades`], or at the rank
+    /// of a release still offering it where that is higher, and is replaced
+    /// only by a version ranked at least as high. A default release's newer
+    /// version therefore replaces it. A backports suite's replaces it only
+    /// where no default release offers the installed version, which is a
+    /// package backports supplied. An `experimental` version never does.
+    pub(crate) fn upgrade_over(&self, name: &str, installed: &str) -> Option<&Package> {
+        let offers = self.offers(name);
+        let standing = offers
+            .iter()
+            .filter(|package| version::compare(&package.version, installed).is_eq())
+            .map(|package| self.priority(package.origin))
+            .fold(ReleasePriority::AutomaticUpgrades, Ord::max);
+        offers
+            .iter()
+            .filter(|package| version::compare(&package.version, installed) == Ordering::Greater)
+            .fold(None, |best: Option<&Package>, package| match best {
+                Some(held)
+                    if !outranks(
+                        (self.priority(package.origin), package),
+                        (self.priority(held.origin), held),
+                    ) =>
+                {
+                    Some(held)
+                }
+                _ => Some(package),
+            })
+            .filter(|best| self.priority(best.origin) >= standing)
+    }
+
+    /// The rank of the release the repository at `origin` publishes.
+    fn priority(&self, origin: usize) -> ReleasePriority {
+        self.releases
+            .get(&origin)
+            .map_or(ReleasePriority::Default, |(_, priority)| *priority)
     }
 
     /// Projects the index into the names it offers, consuming it.
@@ -425,28 +545,94 @@ impl Index {
     /// The parsed packages go: what a caller asking about availability wants is
     /// the name set and the provider map, and retaining tens of megabytes of
     /// relation vectors to back a membership question would be the wrong trade.
+    /// A virtual name is offered where a candidate provides it, since a name
+    /// asked for without a release resolves to its candidate.
     pub(crate) fn into_available(self) -> Available {
-        Available::new(self.by_name.into_keys().collect(), self.providers)
+        let mut providers: HashMap<String, Vec<String>> = HashMap::new();
+        for package in self.by_name.values().filter_map(|offers| offers.first()) {
+            for provided in &package.provides {
+                providers
+                    .entry(provided.name.clone())
+                    .or_default()
+                    .push(package.name.clone());
+            }
+        }
+        for names in providers.values_mut() {
+            names.sort();
+        }
+        Available::new(self.by_name.into_keys().collect(), providers)
     }
 
     /// The base seed: every essential package and every package whose priority
-    /// is at least `floor` (that is, at least as essential as it). With the
-    /// default floor [`Priority::Required`] this is `debootstrap`'s minbase set;
-    /// a less essential floor such as [`Priority::Important`] additionally seeds
-    /// that band, matching the corresponding bootstrap variant. `apt` and the
+    /// is at least `floor` (that is, at least as essential as it), as the
+    /// primary repository describes them. With the default floor
+    /// [`Priority::Required`] this is `debootstrap`'s minbase set; a less
+    /// essential floor such as [`Priority::Important`] additionally seeds that
+    /// band, matching the corresponding bootstrap variant. `apt` and the
     /// caller's includes are added on top by the caller.
+    ///
+    /// The primary is origin zero, and only its stanzas are read, as
+    /// `debootstrap` seeds from one archive: a pool or a vendor repository
+    /// marking a package essential or required does not draw it into every
+    /// bootstrap that names the repository. A seeded name still resolves to its
+    /// candidate, so a higher version another repository ships of it is the
+    /// one installed.
     pub(crate) fn base_seed(&self, floor: Priority) -> Vec<String> {
         let mut seed: Vec<String> = self
             .by_name
-            .values()
-            .filter(|package| {
-                package.essential || package.priority_band().is_some_and(|band| band <= floor)
+            .iter()
+            .filter(|(_, offers)| {
+                offers
+                    .iter()
+                    .find(|package| package.origin == 0)
+                    .is_some_and(|package| {
+                        package.essential
+                            || package.priority_band().is_some_and(|band| band <= floor)
+                    })
             })
-            .map(|package| package.name.clone())
+            .map(|(name, _)| name.clone())
             .collect();
         seed.sort();
         seed
     }
+}
+
+/// Whether `offered` is a higher version than `held`.
+fn higher(offered: &Package, held: &Package) -> bool {
+    version::compare(&offered.version, &held.version) == Ordering::Greater
+}
+
+/// Whether `offered`, from a release of the given rank, is preferred to `held`
+/// as a name's candidate: a higher rank, or the same rank and a higher
+/// version. Neither is preferred in an exact tie, so the one held stays.
+fn outranks(offered: (ReleasePriority, &Package), held: (ReleasePriority, &Package)) -> bool {
+    offered.0 > held.0 || (offered.0 == held.0 && higher(offered.1, held.1))
+}
+
+/// Whether `offered` answers a pin on its name more closely than `held`, or
+/// `None` where the pin does not decide: a name it does not hold, or two
+/// entries neither of which is at the pinned version.
+fn pin_closer(pins: &Pins, offered: &Package, held: &Package) -> Option<bool> {
+    if !pins.names(&offered.name) {
+        return None;
+    }
+    let (offered, held) = (pins.matching(offered), pins.matching(held));
+    (offered != PinMatch::Neither || held != PinMatch::Neither).then_some(offered > held)
+}
+
+/// The sources of single-component, default-ranked repositories, from
+/// `(origin, text)` pairs, for a test that is about something other than
+/// ranking.
+#[cfg(test)]
+pub(crate) fn sources<'a>(
+    texts: impl IntoIterator<Item = (usize, &'a str)>,
+) -> impl Iterator<Item = Source<'a>> {
+    texts.into_iter().map(|(origin, text)| Source {
+        origin,
+        suite: "",
+        priority: ReleasePriority::Default,
+        text,
+    })
 }
 
 /// Parses a `Depends`/`Pre-Depends` value into a list of relationships.
@@ -540,8 +726,11 @@ fn parse_constraint(text: &str) -> Option<Constraint> {
 ///
 /// Parses the `Build-Depends`, `Build-Depends-Arch`, and `Build-Depends-Indep`
 /// fields of the control text's first stanza — the source stanza — and returns
-/// one package name per relationship. Names are returned in field order and
-/// deduplicated, keeping the first appearance.
+/// the package names each relationship may need. Names are returned in field
+/// order and deduplicated, keeping the first appearance. A line beginning with
+/// `#` is a comment, as Debian Policy 5.1 allows in this file alone: it is
+/// dropped before the fields are read, so it neither becomes a field nor ends
+/// the continuation it interrupts.
 ///
 /// Each alternative's architecture restriction is evaluated against
 /// `architecture`, as Debian Policy 7.1 defines it: an alternative whose list
@@ -551,10 +740,14 @@ fn parse_constraint(text: &str) -> Option<Constraint> {
 /// literal architecture name, `any`, or an `<os>-<cpu>` wildcard with either
 /// half `any` (`linux-any`, `any-amd64`). A term this does not recognize —
 /// a three- or four-part wildcard naming an ABI or a C library — keeps the
-/// alternative rather than dropping it. Version constraints, architecture
-/// qualifiers (`:native`), and build-profile restrictions are stripped, and
-/// profiles are not evaluated, so what remains of the result is a superset
-/// that is safe to install into a build environment.
+/// alternative rather than dropping it.
+///
+/// Build profiles are not evaluated, since which ones a build activates is not
+/// in the control file, so the result is a superset that is safe to install
+/// into a build environment. An alternative carrying a profile restriction
+/// (`<!nocheck>`) is returned, and because some build may exclude it, so is the
+/// alternative after it, up to the first that carries none. Version
+/// constraints and architecture qualifiers (`:native`) are stripped.
 ///
 /// The names are meant for
 /// [`DebianBuilder::include`](crate::provision::debian::DebianBuilder::include),
@@ -564,7 +757,15 @@ fn parse_constraint(text: &str) -> Option<Constraint> {
 /// the source lives — a working tree, a git checkout, or an archive `Sources`
 /// stanza — so the source of the metadata is the caller's to choose.
 pub fn build_depend_names(control: &str, architecture: &str) -> Vec<String> {
-    let stanzas = document::parse(control);
+    // The comment rule is this file's alone: an archive's `Packages` and
+    // `Release` documents, which the shared reader also reads, have no
+    // comments, and a line there beginning with `#` is a field like any other.
+    let uncommented: String = control
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    let stanzas = document::parse(&uncommented);
     let Some(source) = stanzas.first() else {
         return Vec::new();
     };
@@ -575,18 +776,40 @@ pub fn build_depend_names(control: &str, architecture: &str) -> Vec<String> {
             continue;
         };
         for group in value.split(',') {
-            let chosen = group
+            let alternatives = group
                 .split('|')
-                .filter(|alternative| applies_to(alternative, architecture))
-                .find_map(parse_atom);
-            if let Some(atom) = chosen
-                && seen.insert(atom.name.clone())
-            {
-                names.push(atom.name);
+                .filter(|alternative| applies_to(alternative, architecture));
+            for alternative in alternatives {
+                let Some(atom) = parse_atom(alternative) else {
+                    continue;
+                };
+                if seen.insert(atom.name.clone()) {
+                    names.push(atom.name);
+                }
+                // An alternative no profile can exclude is the one a build
+                // takes whenever it gets this far, so nothing after it is.
+                if !restricts_profiles(alternative) {
+                    break;
+                }
             }
         }
     }
     names
+}
+
+/// Whether a relationship alternative carries a build-profile restriction, a
+/// `<...>` formula that a build may not satisfy.
+///
+/// The formula follows the version clause, whose own relations (`<<`, `<=`)
+/// are not one, so only what lies outside the parentheses is looked at.
+fn restricts_profiles(alternative: &str) -> bool {
+    let after_version = match (alternative.find('('), alternative.find(')')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{}{}", &alternative[..open], &alternative[close + 1..])
+        }
+        _ => alternative.to_string(),
+    };
+    after_version.contains('<')
 }
 
 /// Whether a relationship alternative's architecture restriction admits
@@ -1026,7 +1249,7 @@ Architecture: amd64
 Filename: pool/newer_2.0.deb
 SHA256: 652d6e6577657200000000000000000000000000000000000000000000000000
 ";
-        let index = Index::merge([(0, primary), (1, extra)], "amd64", &Pins::none());
+        let index = Index::merge(sources([(0, primary), (1, extra)]), "amd64", &Pins::none());
         // The tie retains origin 0's package (the primary), by its digest.
         let shared = index.get("shared").unwrap();
         assert_eq!(shared.origin, 0);
@@ -1057,10 +1280,170 @@ Architecture: amd64
 Filename: pool/pkg_2.0.deb
 SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
 ";
-        let index = Index::merge([(0, primary), (1, extra)], "amd64", &Pins::none());
+        let index = Index::merge(sources([(0, primary), (1, extra)]), "amd64", &Pins::none());
         let pkg = index.get("pkg").unwrap();
         assert_eq!(pkg.version, "2.0");
         assert_eq!(pkg.origin, 1);
+    }
+
+    /// A one-stanza index offering `name` at `version`, with `extra` fields.
+    fn offer(name: &str, version: &str, extra: &str) -> String {
+        let extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("{extra}\n")
+        };
+        let mut sha256: String = format!("{name}{version}")
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        sha256.truncate(64);
+        while sha256.len() < 64 {
+            sha256.push('0');
+        }
+        format!(
+            "Package: {name}\nVersion: {version}\nArchitecture: amd64\n\
+             Filename: pool/{name}_{version}.deb\nSHA256: {sha256}\n{extra}\n"
+        )
+    }
+
+    /// An index over the primary trixie (origin 0) and, at origins 1 and 2, a
+    /// backports suite and experimental, ranked as their releases mark them.
+    fn ranked(primary: &str, backports: &str, experimental: &str) -> Index {
+        Index::merge(
+            [
+                Source {
+                    origin: 0,
+                    suite: "trixie",
+                    priority: ReleasePriority::Default,
+                    text: primary,
+                },
+                Source {
+                    origin: 1,
+                    suite: "trixie-backports",
+                    priority: ReleasePriority::AutomaticUpgrades,
+                    text: backports,
+                },
+                Source {
+                    origin: 2,
+                    suite: "experimental",
+                    priority: ReleasePriority::NotAutomatic,
+                    text: experimental,
+                },
+            ],
+            "amd64",
+            &Pins::none(),
+        )
+    }
+
+    #[test]
+    fn a_lower_ranked_release_does_not_supersede_a_higher_one() {
+        // apt's default priorities: experimental's 1 and backports' 100 lose
+        // to a default release's 500 whatever the versions, so adding either to
+        // reach one package does not upgrade everything it carries.
+        let index = ranked(
+            &format!(
+                "{}{}",
+                offer("libc6", "2.41-1", ""),
+                offer("gcc", "14.2-1", "")
+            ),
+            &offer("gcc", "15.1-1~bpo13+1", ""),
+            &format!(
+                "{}{}{}",
+                offer("libc6", "2.43-1", ""),
+                offer("gcc", "16.0-1", ""),
+                offer("only-experimental", "1.0", ""),
+            ),
+        );
+        assert_eq!(index.get("libc6").unwrap().version, "2.41-1");
+        assert_eq!(index.get("libc6").unwrap().origin, 0);
+        assert_eq!(index.get("gcc").unwrap().version, "14.2-1");
+        // A name nothing else offers is the lower release's to supply.
+        assert_eq!(index.get("only-experimental").unwrap().origin, 2);
+        // The other versions are kept, the candidate first, for a request that
+        // names a release.
+        let gcc: Vec<_> = index.offers("gcc").iter().map(|p| p.origin).collect();
+        assert_eq!(gcc, [0, 1, 2]);
+        assert_eq!(
+            index.in_release("gcc", "experimental").unwrap().version,
+            "16.0-1"
+        );
+        assert!(index.in_release("libc6", "trixie-backports").is_none());
+    }
+
+    #[test]
+    fn backports_outranks_experimental_where_neither_is_outranked() {
+        let index = ranked("", &offer("tool", "1.0~bpo", ""), &offer("tool", "2.0", ""));
+        assert_eq!(index.get("tool").unwrap().version, "1.0~bpo");
+    }
+
+    #[test]
+    fn the_base_is_seeded_from_the_primary_alone() {
+        // debootstrap seeds from one archive. A pool or a vendor repository
+        // marking a package required does not draw it into every bootstrap
+        // that names the repository; a seeded name still resolves to the
+        // version that wins it.
+        let primary = format!(
+            "{}{}",
+            offer("base-files", "13.8", "Priority: required"),
+            offer("dpkg", "1.22", "Essential: yes"),
+        );
+        let vendor = format!(
+            "{}{}",
+            offer("vendor-agent", "1.0", "Priority: required"),
+            offer("base-files", "13.9", "Priority: optional"),
+        );
+        let index = Index::merge(
+            sources([(0, primary.as_str()), (1, vendor.as_str())]),
+            "amd64",
+            &Pins::none(),
+        );
+        assert_eq!(index.base_seed(Priority::Required), ["base-files", "dpkg"]);
+        assert_eq!(index.get("base-files").unwrap().origin, 1);
+    }
+
+    #[test]
+    fn an_installed_version_is_upgraded_only_as_apt_would() {
+        // An installed version stands at 100, or higher where a release still
+        // offers it, and nothing below it is ever taken.
+        let index = ranked(
+            &format!(
+                "{}{}{}",
+                offer("from-main", "1.0", ""),
+                offer("from-bpo", "0.9", ""),
+                offer("newer-in-main", "3.0", ""),
+            ),
+            &format!(
+                "{}{}{}",
+                offer("from-main", "1.1~bpo", ""),
+                offer("from-bpo", "1.1~bpo", ""),
+                offer("newer-in-main", "2.5~bpo", ""),
+            ),
+            &format!(
+                "{}{}",
+                offer("from-bpo", "2.0", ""),
+                offer("from-experimental", "2.0", ""),
+            ),
+        );
+        // Installed from main, which still offers it at 500: backports' newer
+        // version at 100 does not replace it.
+        assert!(index.upgrade_over("from-main", "1.0").is_none());
+        // Installed from backports, which no default release offers: it stands
+        // at 100, and backports' newer version, at 100 too, is the upgrade.
+        // experimental's higher one at 1 is not.
+        assert_eq!(
+            index.upgrade_over("from-bpo", "1.0~bpo").unwrap().version,
+            "1.1~bpo"
+        );
+        // experimental never replaces what is installed.
+        assert!(index.upgrade_over("from-experimental", "1.0").is_none());
+        // A default release's newer version always does, over backports'.
+        assert_eq!(
+            index.upgrade_over("newer-in-main", "2.0").unwrap().version,
+            "3.0"
+        );
+        // Nothing below the installed version is a candidate: no downgrade.
+        assert!(index.upgrade_over("newer-in-main", "4.0").is_none());
     }
 
     #[test]
@@ -1155,6 +1538,46 @@ Build-Depends: libhurd-dev [hurd-any] | libbsd-dev,
                 "gcc-multilib",
                 "libfuture",
             ],
+        );
+    }
+
+    #[test]
+    fn a_comment_line_neither_becomes_a_field_nor_ends_a_continuation() {
+        // Policy 5.1: a line starting `#` in debian/control is a comment, and
+        // is ignored even between two continuation lines. Read as a field, it
+        // would take the continuation after it and lose that dependency. Only
+        // a comment holding a colon reads as a field, which prose often does.
+        let control = "\
+# The toolchain the build needs.
+Source: hello
+Build-Depends: debhelper-compat (= 13),
+# Note: needed for the test suite only.
+ libcheck-dev,
+ texinfo
+#Build-Depends-Indep: not-a-field
+";
+        assert_eq!(
+            build_depend_names(control, "amd64"),
+            ["debhelper-compat", "libcheck-dev", "texinfo"],
+        );
+    }
+
+    #[test]
+    fn an_alternative_a_profile_may_exclude_brings_the_next_one_too() {
+        // Profiles are not evaluated, so the result is a superset: a build
+        // without `stage1` skips `foo` and takes `bar`, and a build with it
+        // takes `foo`. Every alternative up to the first unrestricted one may
+        // be the one taken. A version clause's own `<<` is not a profile.
+        let control = "\
+Source: p
+Build-Depends: foo <stage1> | bar | baz,
+ one <!nocheck> | two <nocheck> | three,
+ old (<< 2.0) | newer,
+ gcc-hurd [hurd-any] <stage1> | gcc
+";
+        assert_eq!(
+            build_depend_names(control, "amd64"),
+            ["foo", "bar", "one", "two", "three", "old", "gcc"],
         );
     }
 

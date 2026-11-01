@@ -311,6 +311,11 @@ mod tests {
                         os_error(),
                     ))),
                     Box::new(DebianError::io("reading", "/srv/staging", os_error())),
+                    Box::new(DebianError::Index {
+                        subject: "http://mirror.invalid/Packages.xz".to_string(),
+                        reason: "it does not decompress".to_string(),
+                        source: Some(os_error()),
+                    }),
                     Box::new(ProvisionError::other(DebianError::Fetch(fetch()))),
                 ]);
             }

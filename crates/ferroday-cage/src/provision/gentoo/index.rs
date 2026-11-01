@@ -98,25 +98,28 @@ pub(super) struct Record {
     /// after the package is merged rather than before, so it belongs to the
     /// closure and not to the install order.
     pub pdepend: Vec<Dependency>,
+    /// `RDEPEND` as the index writes it.
+    ///
+    /// Kept beside the parsed form for the plan, which records what the
+    /// resolution read so that the container's signed metadata can be held to
+    /// it, and which states it as text.
+    pub rdepend_text: String,
+    /// `PDEPEND` as the index writes it, for the same reason.
+    pub pdepend_text: String,
     /// The container's path under the binhost directory, from `PATH`.
     pub path: String,
     /// The container's length in bytes, from `SIZE`, which bounds its download.
     pub size: u64,
     /// The container's MD5, from `MD5`, lowercase hex.
     ///
-    /// Not a trust decision and never used as one: it is what portage records
-    /// as a merged package's `BINPKGMD5`, its own bookkeeping note of which
-    /// binary package a database entry came from. What holds the bytes to the
-    /// archive is the signed `Manifest` inside the container.
+    /// The container is held to it as portage holds a downloaded binary
+    /// package to its index's digests, which pins a plan to the containers it
+    /// resolved. It is not what makes the bytes trustworthy: that is the signed
+    /// `Manifest` inside the container.
     pub md5: String,
 }
 
 impl Record {
-    /// The `CPV` the archive publishes this build under.
-    pub(super) fn cpv(&self) -> String {
-        format!("{}-{}", self.name, self.version)
-    }
-
     /// How many flags the build was compiled with, which is the resolver's
     /// default preference among the builds of one version.
     pub(super) fn use_count(&self) -> usize {
@@ -283,7 +286,9 @@ impl Index {
             // builds differ in USE rather than in what they are a version of,
             // and choosing among them is the resolver's question rather than a
             // reader's.
-            published.sort_by(|a, b| version::compare(a, b).unwrap_or_else(|| a.cmp(b)));
+            published.sort_by(|a, b| {
+                version::compare(a, b).expect("a record's version is one split_cpv found to parse")
+            });
             published.dedup();
             names.push(name.clone());
             versions.insert(name, published);
@@ -322,12 +327,11 @@ fn read_record(stanza: &Stanza) -> Option<Record> {
     if !atom::is_package(&name) {
         return None;
     }
-    // The `BINPKGMD5` a merge records and the `MD5` a plan document carries:
-    // bookkeeping rather than a trust decision, as `Record::md5` says. Held to
-    // the algorithm's own alphabet here, where the record is built, because
-    // `Plan::parse_document` refuses a value outside it, so a plan projected
-    // from such a record would be a document this crate emits and will not
-    // read back.
+    // The MD5 a plan document carries and a container is held to, as
+    // `Record::md5` says. Held to the algorithm's own alphabet here, where the
+    // record is built, because `Plan::parse_document` refuses a value outside
+    // it, so a plan projected from such a record would be a document this
+    // crate emits and will not read back.
     let md5 = stanza.get("MD5")?;
     if !Algorithm::Md5.is_hex(md5) {
         return None;
@@ -348,6 +352,8 @@ fn read_record(stanza: &Stanza) -> Option<Record> {
         iuse: stanza.get("IUSE").unwrap_or_default().to_string(),
         rdepend: atom::parse_class(stanza.get("RDEPEND").unwrap_or_default()).ok()?,
         pdepend: atom::parse_class(stanza.get("PDEPEND").unwrap_or_default()).ok()?,
+        rdepend_text: stanza.get("RDEPEND").unwrap_or_default().to_string(),
+        pdepend_text: stanza.get("PDEPEND").unwrap_or_default().to_string(),
         path: stanza.get("PATH")?.to_string(),
         size: stanza.get("SIZE")?.parse().ok()?,
         md5: md5.to_string(),
@@ -559,6 +565,8 @@ REPO: gentoo
 
     #[test]
     fn a_stanza_becomes_a_build_with_its_version_split_out() {
+        use super::atom::Candidate as _;
+
         let index = Index::parse(FIXTURE);
         assert_eq!(index.records().len(), 4);
         assert_eq!(index.skipped(), 0);

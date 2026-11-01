@@ -23,11 +23,13 @@ use std::time::{Duration, Instant};
 
 use super::fetch::{Fetch, FetchError, FetchJob, FetchRequest};
 
-/// The ceiling on a single response body, buffered in memory before its digest
-/// is checked. It sits far above any Debian index or `.deb`, so it never bites
-/// a legitimate fetch, and bounds the memory a hostile mirror can drive a
-/// caller to buffer by announcing a huge framing or never closing the stream.
-/// A consumer that must fetch something larger supplies their own [`Fetch`].
+/// The ceiling on a single response body, for a request that states no size of
+/// its own. The body streams to the caller's sink, which may be memory or a
+/// staging file, and its digest is checked only once the bytes are spent. It
+/// sits far above any Debian index or `.deb`, so it never bites a legitimate
+/// fetch, and bounds what a hostile mirror can make a caller write by
+/// announcing a huge framing or never closing the stream. A consumer that must
+/// fetch something larger supplies their own [`Fetch`].
 const MAX_BODY: u64 = 2 * 1024 * 1024 * 1024;
 
 /// How many interim (`1xx`) responses are read past before the peer is treated
@@ -35,11 +37,13 @@ const MAX_BODY: u64 = 2 * 1024 * 1024 * 1024;
 /// and each costs a round trip's worth of parsing.
 const MAX_INTERIM_RESPONSES: u32 = 8;
 
-/// How much of a redirect's own body is read off so the connection can serve
+/// How much of a response's own body is read off, where the response is a
+/// redirect or a refusal rather than the resource, so the connection can serve
 /// the next request. Nothing here reads it, so the only question the number
 /// answers is how large a page is worth keeping a connection for; a redirect
-/// page is a few hundred bytes of HTML and this is far above any of them.
-const MAX_REDIRECT_BODY: u64 = 64 * 1024;
+/// or error page is a few hundred bytes of HTML and this is far above any of
+/// them.
+const MAX_SET_ASIDE_BODY: u64 = 64 * 1024;
 
 /// The ceiling on a single framing line — the status line, a header line, or a
 /// chunk-size line. Real ones are a few hundred bytes at most; a larger one is
@@ -62,8 +66,11 @@ const TLS_REMEDY: &str =
 /// The default HTTP and `file://` fetcher.
 #[derive(Debug)]
 pub struct HttpFetch {
-    connect_timeout: Duration,
-    io_timeout: Duration,
+    /// How long one connection attempt may wait, or `None` for no bound of
+    /// its own.
+    connect_timeout: Option<Duration>,
+    /// How long one read or write may wait, or `None` for no bound of its own.
+    io_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     max_redirects: u32,
     cross_host_redirects: bool,
@@ -94,7 +101,7 @@ pub struct HttpFetch {
 struct Kept {
     host: String,
     port: u16,
-    reader: BufReader<DeadlineReader<TcpStream>>,
+    reader: BufReader<DeadlineReader>,
 }
 
 impl Clone for HttpFetch {
@@ -118,8 +125,8 @@ impl Default for HttpFetch {
     fn default() -> Self {
         HttpFetch {
             idle: None,
-            connect_timeout: Duration::from_secs(30),
-            io_timeout: Duration::from_secs(120),
+            connect_timeout: Some(Duration::from_secs(30)),
+            io_timeout: Some(Duration::from_secs(120)),
             // A whole-request wall-clock ceiling. The per-read timeout alone
             // does not bound total time: a mirror that trickles the body one
             // byte just under each read timeout resets the clock indefinitely.
@@ -142,10 +149,18 @@ impl HttpFetch {
         HttpFetch::default()
     }
 
-    /// Sets the connection and per-read timeouts.
+    /// Sets the connection and per-read timeouts. The defaults are 30 seconds
+    /// to connect and two minutes for each read or write.
+    ///
+    /// A timeout of zero is no timeout, as zero is for the kernel's own socket
+    /// timeouts: a wait that ended before it began could never succeed, so it
+    /// is not a value anything asks for on purpose. Either step is still held
+    /// to the [`request_timeout`](Self::request_timeout), which bounds every
+    /// connection attempt and every read whether or not a timeout of its own
+    /// does.
     pub fn timeouts(mut self, connect: Duration, io: Duration) -> Self {
-        self.connect_timeout = connect;
-        self.io_timeout = io;
+        self.connect_timeout = (!connect.is_zero()).then_some(connect);
+        self.io_timeout = (!io.is_zero()).then_some(io);
         self
     }
 
@@ -256,6 +271,14 @@ impl Fetch for HttpFetch {
     /// keeps its own connection open across the jobs it takes. This fetcher's
     /// own connection is not shared with them: one socket carrying two
     /// interleaved responses is not HTTP.
+    ///
+    /// A worker the host will not start a thread for is one fewer at once. The
+    /// process's or the service's task limit (`RLIMIT_NPROC`, a cgroup's
+    /// `pids.max`) refuses a thread with `EAGAIN`, and a batch is an
+    /// optimization that has no business failing a run over it. The calling
+    /// thread then takes jobs too, in the place of the workers that did not
+    /// start, so a host that starts none still fetches every job, one at a
+    /// time.
     fn fetch_all(&mut self, jobs: &mut [FetchJob<'_>]) -> Vec<Result<(), FetchError>> {
         let workers = self.concurrency.min(jobs.len());
         if workers <= 1 {
@@ -280,25 +303,19 @@ impl Fetch for HttpFetch {
         );
 
         thread::scope(|scope| {
+            let mut started = 0;
             for _ in 0..workers {
                 let queue = &queue;
-                let settings = self.clone();
-                scope.spawn(move || {
-                    let mut fetcher = settings;
-                    loop {
-                        // The lock is held only long enough to take the next
-                        // job, never across a fetch.
-                        let next = queue
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .next();
-                        let Some((job, outcome)) = next else {
-                            return;
-                        };
-                        let (request, sink) = job.parts();
-                        *outcome = Some(fetcher.fetch(request, sink));
-                    }
-                });
+                let mut fetcher = self.clone();
+                let worker = thread::Builder::new()
+                    .spawn_scoped(scope, move || take_jobs(&mut fetcher, queue));
+                if worker.is_err() {
+                    break;
+                }
+                started += 1;
+            }
+            if started < workers {
+                take_jobs(self, &queue);
             }
         });
 
@@ -306,6 +323,30 @@ impl Fetch for HttpFetch {
             .into_iter()
             .map(|outcome| outcome.expect("every job was taken by a worker"))
             .collect()
+    }
+}
+
+/// Fetches the jobs `queue` holds with `fetcher` until none is left, recording
+/// each outcome in the slot that came with its job.
+///
+/// What each worker of a batch runs, and the calling thread too when the host
+/// would not start every worker.
+fn take_jobs<'j, 'a: 'j, Q>(fetcher: &mut HttpFetch, queue: &Mutex<Q>)
+where
+    Q: Iterator<Item = (&'j mut FetchJob<'a>, &'j mut Option<Result<(), FetchError>>)>,
+{
+    loop {
+        // The lock is held only long enough to take the next job, never across
+        // a fetch.
+        let next = queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next();
+        let Some((job, outcome)) = next else {
+            return;
+        };
+        let (request, sink) = job.parts();
+        *outcome = Some(fetcher.fetch(request, sink));
     }
 }
 
@@ -324,7 +365,8 @@ enum Step {
 /// only where nothing has reached the caller's sink yet, since a retry cannot
 /// unwrite what was already delivered.
 enum Exchange {
-    /// The request was not answered: nothing has been written to the sink.
+    /// The request was not answered, or was answered only by the `408` a
+    /// closing connection sends: nothing has been written to the sink.
     BeforeBody(FetchError),
     /// The response had begun, so a retry would deliver a second copy of
     /// whatever the first attempt already wrote.
@@ -371,10 +413,12 @@ impl HttpFetch {
     ///
     /// Reuses the connection the last request left open where it goes to the
     /// same host and port. A peer is free to close an idle connection at any
-    /// time and says nothing when it does, so a reused connection that fails
-    /// before the body has begun is retried once on a fresh one -- which is the
-    /// whole of what makes reuse safe, since that failure is indistinguishable
-    /// from a peer that closed while the request was in flight.
+    /// time and usually says nothing when it does, so a reused connection that
+    /// fails before the body has begun is retried once on a fresh one -- which
+    /// is the whole of what makes reuse safe, since that failure is
+    /// indistinguishable from a peer that closed while the request was in
+    /// flight. A peer that does say so, with a `408` sent as it closes, is
+    /// retried the same way.
     fn request(
         &mut self,
         url: &str,
@@ -413,8 +457,10 @@ impl HttpFetch {
         let mut reader = match kept {
             Some(mut kept) => {
                 // The deadline is this fetch's, not the one the connection was
-                // opened under.
-                kept.reader.get_mut().deadline = deadline;
+                // opened under, and the timeout is this fetcher's as it stands.
+                let held = kept.reader.get_mut();
+                held.deadline = deadline;
+                held.io_timeout = self.io_timeout;
                 kept.reader
             }
             None => {
@@ -439,20 +485,15 @@ impl HttpFetch {
                 BufReader::new(DeadlineReader {
                     inner: stream,
                     deadline,
+                    io_timeout: self.io_timeout,
                 })
             }
         };
-        {
-            let stream = &reader.get_ref().inner;
-            stream
-                .set_read_timeout(Some(self.io_timeout))
-                .map_err(io("connecting"))
-                .map_err(Exchange::BeforeBody)?;
-            stream
-                .set_write_timeout(Some(self.io_timeout))
-                .map_err(io("connecting"))
-                .map_err(Exchange::BeforeBody)?;
-        }
+        // Each read sets its own timeout; the request's write is the one write.
+        step_timeout(self.io_timeout, deadline)
+            .and_then(|timeout| reader.get_ref().inner.set_write_timeout(timeout))
+            .map_err(io("sending the request"))
+            .map_err(Exchange::BeforeBody)?;
 
         let host_header = if parsed.port == 80 {
             parsed.authority_host().into_owned()
@@ -538,31 +579,45 @@ impl HttpFetch {
                     .clone()
                     .ok_or_else(|| FetchError::status(url, status.code))
                     .map_err(Exchange::AfterBody)?;
-                // A redirect carries a body of its own, framed like any other,
-                // and the connection is only reusable once it has been read
-                // off. It is not the resource, so it is neither delivered nor
-                // held to the resource's cap: a request for a signed index of a
-                // few hundred bytes would otherwise be failed by the mirror's
-                // own redirect page. A page past even the generous cap here
-                // costs the connection and nothing more, since a reader left
-                // part way through a body cannot serve the next request —
-                // the redirect is still followed, on a connection of its own.
-                if framed {
-                    let mut discard = io::sink();
-                    if read_body(&mut reader, &headers, &mut discard, MAX_REDIRECT_BODY).is_ok() {
-                        keep(reader);
-                    }
+                // Its page is not held to the resource's cap: a request for a
+                // signed index of a few hundred bytes would otherwise be failed
+                // by the mirror's own redirect page. One past even the cap
+                // `set_aside` holds it to costs the connection and nothing
+                // more, and the redirect is still followed.
+                if persistent && set_aside(&mut reader, status.code, &headers) {
+                    keep(reader);
                 }
                 let next = resolve_redirect(url, &location);
                 self.check_redirect(url, &next)
                     .map_err(Exchange::AfterBody)?;
                 return Ok(Step::Redirect(next));
             }
-            404 => {
-                return Err(Exchange::AfterBody(FetchError::not_found(url)));
+            // A server closing a connection it held idle may first send a
+            // `408 Request Timeout` nobody asked for (RFC 9110 section
+            // 15.5.9), and a request sent down that connection reads it as its
+            // answer. It says the connection went stale rather than anything
+            // about the resource, and nothing has reached the sink, so it is
+            // the failure a reused connection is retried for.
+            408 => {
+                return Err(Exchange::BeforeBody(FetchError::status(url, 408)));
             }
+            // `101` says the connection has left HTTP/1.1, so nothing more is
+            // asked of it.
+            101 => {
+                return Err(Exchange::AfterBody(FetchError::status(url, 101)));
+            }
+            // A refusal's page is read off as a redirect's is. A missing
+            // resource is the refusal a layer answers by asking the same host
+            // for another spelling of it, a by-hash path or another
+            // compression, so it is the common one to keep a connection for.
             other => {
-                return Err(Exchange::AfterBody(FetchError::status(url, other)));
+                if persistent && set_aside(&mut reader, other, &headers) {
+                    keep(reader);
+                }
+                return Err(Exchange::AfterBody(match other {
+                    404 => FetchError::not_found(url),
+                    other => FetchError::status(url, other),
+                }));
             }
         }
 
@@ -601,12 +656,13 @@ impl HttpFetch {
     ) -> Result<TcpStream, FetchError> {
         let mut last = None;
         for addr in addrs {
-            let timeout = match remaining(deadline) {
-                Some(Duration::ZERO) => return Err(deadline_elapsed("connecting", url)),
-                Some(left) => self.connect_timeout.min(left),
-                None => self.connect_timeout,
+            let timeout = step_timeout(self.connect_timeout, deadline)
+                .map_err(FetchError::at("connecting", url))?;
+            let attempt = match timeout {
+                Some(timeout) => TcpStream::connect_timeout(&addr, timeout),
+                None => TcpStream::connect(addr),
             };
-            match TcpStream::connect_timeout(&addr, timeout) {
+            match attempt {
                 Ok(stream) => return Ok(stream),
                 Err(source) => last = Some(source),
             }
@@ -883,17 +939,19 @@ fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
 /// interpolates the parsed path verbatim into `GET <path> HTTP/1.1`, and every
 /// other URL this crate composes has already passed a check of its own —
 /// `coordinate::check` for a layer's own coordinates, `is_safe_pool_path` for a
-/// pool path, `Algorithm::is_hex` for a digest. A redirect `Location` has passed
-/// none: it is a hostile mirror's string, and one holding a CR or an LF would
-/// otherwise write headers of its own into the follow-up request. Refusing here
-/// covers the whole URL rather than the path alone, since the host reaches the
+/// pool path, `Algorithm::is_hex` for a digest. `coordinate::check` holds a
+/// coordinate to a subset of what this accepts, so a value it accepts reaches
+/// the server as it was written. A redirect `Location` has passed none: it is
+/// a hostile mirror's string, and one holding a CR or an LF would otherwise
+/// write headers of its own into the follow-up request. Refusing here covers
+/// the whole URL rather than the path alone, since the host reaches the
 /// request line too, through the `Host:` header.
 fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
     let bad = |reason: &str| reason.to_string();
     if !url.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(bad(
-            "the URL carries a space or a control character, which no part of a request line \
-             can hold",
+            "the URL carries a space, a control character, or a character outside ASCII, none \
+             of which a request line can hold as written",
         ));
     }
     let rest = strip_scheme(url, "http://")
@@ -1182,7 +1240,26 @@ fn read_trailers<R: BufRead>(reader: &mut R) -> io::Result<()> {
     read_field_section(reader, "trailer", |_| Ok(()))
 }
 
-/// Copies exactly `length` bytes from `reader` to `sink`.
+/// Reads off the body of a response that is not the resource, a redirect or a
+/// refusal, answering whether the connection it came on can serve the next
+/// request.
+///
+/// Such a body is framed like any other, and the connection is reusable only
+/// once it has been read: a reader left part way through a body reads the next
+/// response from the middle of this one. It is neither delivered nor held to
+/// the resource's cap, only to [`MAX_SET_ASIDE_BODY`], and a longer one costs
+/// the connection and nothing more.
+///
+/// A `204` or a `304` carries no body whatever its framing headers say (RFC
+/// 9112 section 6.3), so there is nothing to read. Reading the length a `304`
+/// states would wait on bytes the server never sends.
+fn set_aside<R: BufRead>(reader: &mut R, code: u16, headers: &Headers) -> bool {
+    match code {
+        204 | 304 => true,
+        _ => read_body(reader, headers, &mut io::sink(), MAX_SET_ASIDE_BODY).is_ok(),
+    }
+}
+
 /// Reads one response body, however it is framed, into `sink`.
 ///
 /// `cap` is what this resource may weigh -- the signed length where one is
@@ -1219,6 +1296,8 @@ fn read_body<R: BufRead>(
     }
 }
 
+/// Copies exactly `length` bytes from `reader` to `sink`, refusing a stream
+/// that ends before them as a truncated body.
 fn read_sized<R: Read>(reader: &mut R, length: u64, sink: &mut dyn Write) -> io::Result<()> {
     let copied = io::copy(&mut reader.take(length), sink)?;
     if copied != length {
@@ -1269,23 +1348,58 @@ fn read_chunked<R: BufRead>(reader: &mut R, sink: &mut dyn Write) -> io::Result<
     }
 }
 
-/// A reader that fails once a wall-clock deadline passes, bounding the total
-/// time a response may take regardless of how a mirror trickles bytes to keep
-/// the per-read timeout from firing. The deadline is checked before each read,
-/// so total time is bounded by the deadline plus one read timeout. `None`
-/// removes the bound.
+/// A connection's reader, holding each read to the fetch's wall-clock deadline
+/// as well as to the per-read timeout.
+///
+/// The per-read timeout alone does not bound a response: a mirror that trickles
+/// bytes just inside it keeps every read alive. So each read waits at most
+/// whichever is nearer, the timeout or what is left of the deadline, and one
+/// started after the deadline fails at once. Total time is therefore bounded
+/// by the deadline, with or without a timeout of the read's own. `None` for
+/// either removes that bound.
 #[derive(Debug)]
-struct DeadlineReader<R> {
-    inner: R,
+struct DeadlineReader {
+    inner: TcpStream,
     deadline: Option<Instant>,
+    io_timeout: Option<Duration>,
 }
 
-impl<R: Read> Read for DeadlineReader<R> {
+impl Read for DeadlineReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if expired(self.deadline) {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED));
+        let timeout = step_timeout(self.io_timeout, self.deadline)?;
+        self.inner.set_read_timeout(timeout)?;
+        match self.inner.read(buf) {
+            // A read the deadline cut short reports the deadline, in the words
+            // every other step it bounds uses, rather than the bare `EAGAIN` a
+            // socket timeout reads as.
+            Err(err) if is_timeout(&err) && expired(self.deadline) => {
+                Err(io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED))
+            }
+            read => read,
         }
-        self.inner.read(buf)
+    }
+}
+
+/// Whether a socket operation failed because its timeout ran out, which Linux
+/// reports as `EAGAIN` for a read and `std` may report as either kind.
+fn is_timeout(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// How long one step of a fetch may wait: its own timeout or what is left of
+/// the fetch's deadline, whichever is nearer, or `None` where neither bounds
+/// it.
+///
+/// A deadline already reached fails the step before it starts, since it could
+/// not finish inside it. The failure is the one [`deadline_elapsed`] reports.
+fn step_timeout(own: Option<Duration>, deadline: Option<Instant>) -> io::Result<Option<Duration>> {
+    match (own, remaining(deadline)) {
+        (_, Some(Duration::ZERO)) => Err(io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED)),
+        (Some(own), Some(left)) => Ok(Some(own.min(left))),
+        (own, left) => Ok(own.or(left)),
     }
 }
 
@@ -1477,7 +1591,7 @@ mod tests {
                         match request.read_line(&mut line) {
                             Ok(0) => continue 'accept,
                             Ok(_) => {}
-                            Err(error) if would_block(&error) => match stopping() {
+                            Err(error) if is_timeout(&error) => match stopping() {
                                 true => return,
                                 false => continue,
                             },
@@ -1520,15 +1634,6 @@ mod tests {
                 let _ = served.join();
             }
         }
-    }
-
-    /// Whether a read failed because nothing had arrived within its timeout,
-    /// which a socket reports as either of two kinds depending on the platform.
-    fn would_block(error: &io::Error) -> bool {
-        matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-        )
     }
 
     /// Fetches `url` `times` over one fetcher, asserting each answer.
@@ -1651,6 +1756,43 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_timeout_is_no_timeout() {
+        // `std` refuses a zero socket timeout, so taken as written it failed
+        // every connection, on every mirror in turn.
+        let served = Serving::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst".to_vec());
+        let mut fetcher = HttpFetch::new().timeouts(Duration::ZERO, Duration::ZERO);
+        fetch_repeatedly(&mut fetcher, &served.url, 2, b"first");
+        drop(fetcher);
+    }
+
+    #[test]
+    fn a_read_with_no_timeout_of_its_own_is_held_to_the_deadline() {
+        // A peer that accepts the request and never answers. With no per-read
+        // timeout, the read waits on the fetch's deadline alone, which has to
+        // end it: one checked only between reads would wait forever.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback listener binds");
+        let url = format!(
+            "http://{}/x",
+            listener.local_addr().expect("the listener is bound"),
+        );
+        let (done, waited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut fetcher = HttpFetch::new()
+                .timeouts(Duration::ZERO, Duration::ZERO)
+                .request_timeout(Some(Duration::from_millis(200)));
+            let outcome = fetcher.fetch(&FetchRequest::new(&url), &mut Vec::new());
+            let _ = done.send(outcome.map_err(|err| ErrorChain::new(&err).to_string()));
+        });
+        let outcome = waited
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the fetch ended at its deadline rather than waiting on the peer");
+        let err = outcome.expect_err("the peer never answers");
+        assert!(err.contains(DEADLINE_ELAPSED), "{err}");
+        drop(listener);
+    }
+
+    #[test]
     fn a_second_fetch_reuses_the_connection_the_first_left_open() {
         // The win this buys: a bootstrap fetches a few hundred resources from
         // one host, and a connection per resource is a few hundred handshakes
@@ -1743,6 +1885,89 @@ mod tests {
         served.join().expect("the server thread ends");
     }
 
+    /// Serves `refusal` and then the resource, down whatever connection the
+    /// client keeps, and asserts the client asked both of one connection.
+    fn the_connection_survives(refusal: &[u8]) -> FetchError {
+        let refusal = refusal.to_vec();
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst".to_vec();
+        let served = Serving::answering(move |answered| {
+            Some(if answered == 0 {
+                refusal.clone()
+            } else {
+                ok.clone()
+            })
+        });
+        // Short timeouts, so a client that waits on a body the server never
+        // sends fails here in seconds rather than minutes.
+        let mut fetcher = HttpFetch::new().timeouts(Duration::from_secs(5), Duration::from_secs(5));
+        let err = fetcher
+            .fetch(&FetchRequest::new(&served.url), &mut Vec::new())
+            .expect_err("the first answer is a refusal");
+        fetch_repeatedly(&mut fetcher, &served.url, 1, b"first");
+        assert_eq!(served.connections(), 1, "the refusal kept its connection");
+        drop(fetcher);
+        err
+    }
+
+    #[test]
+    fn a_refusal_with_a_framed_page_leaves_the_connection_reusable() {
+        // A missing index encoding is answered by asking the same host for
+        // the next one, so the connection the 404 came on is worth keeping
+        // once its page has been read off.
+        let err = the_connection_survives(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found",
+        );
+        assert!(matches!(err, FetchError::NotFound { .. }), "{err}");
+        let err = the_connection_survives(
+            b"HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\n\r\n\
+              4\r\nbusy\r\n0\r\n\r\n",
+        );
+        assert!(matches!(err, FetchError::Status { code: 503, .. }), "{err}");
+    }
+
+    #[test]
+    fn a_304_is_read_as_carrying_no_body() {
+        // The length a `304` states is its representation's, not a body that
+        // follows; reading it would wait on bytes the server never sends.
+        let err =
+            the_connection_survives(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1234\r\n\r\n");
+        assert!(matches!(err, FetchError::Status { code: 304, .. }), "{err}");
+    }
+
+    #[test]
+    fn a_408_on_a_reused_connection_is_retried_on_a_fresh_one() {
+        // A server closing a connection it held idle may send a `408` nobody
+        // asked for, which the next request on that connection reads as its
+        // answer. It is the stale connection speaking, so the request is asked
+        // again on a fresh one.
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst".to_vec();
+        let served = Serving::answering(move |answered| {
+            Some(match answered {
+                1 => b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+                _ => ok.clone(),
+            })
+        });
+        let mut fetcher = HttpFetch::new();
+        fetch_repeatedly(&mut fetcher, &served.url, 2, b"first");
+        assert_eq!(
+            served.connections(),
+            2,
+            "the retry took a connection of its own"
+        );
+
+        // On a connection opened for the request, a `408` is that request's
+        // answer, and it is reported as one.
+        let timed_out =
+            Serving::new(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new(&timed_out.url), &mut Vec::new())
+            .expect_err("a fresh connection's 408 is its answer");
+        assert!(matches!(err, FetchError::Status { code: 408, .. }), "{err}");
+        assert_eq!(timed_out.connections(), 1, "and is not retried");
+        drop(fetcher);
+    }
+
     #[test]
     fn a_batch_fetches_several_at_once() {
         // The property, measured rather than asserted structurally: the server
@@ -1825,6 +2050,74 @@ mod tests {
             "the server released the workers only once all four had asked",
         );
         served.join().expect("the server thread ends");
+    }
+
+    /// The marker the task-limit test's child process finds its files by.
+    const TASK_LIMITED: &str = "FERRODAY_CAGE_TEST_HTTP_TASK_LIMIT";
+
+    #[test]
+    fn a_batch_the_host_starts_no_thread_for_still_fetches_every_job() {
+        // A task limit refuses a new thread with `EAGAIN`. A batch is an
+        // optimization, so a host that starts no worker has every job fetched
+        // on the calling thread instead. The limit counts every task the user
+        // runs, so it is lowered in a child process of its own, where nothing
+        // else this suite runs is held to it.
+        if let Some(dir) = std::env::var_os(TASK_LIMITED) {
+            let dir = std::path::PathBuf::from(dir);
+            let limit = rustix::process::Rlimit {
+                current: Some(1),
+                maximum: Some(1),
+            };
+            rustix::process::setrlimit(rustix::process::Resource::Nproc, limit)
+                .expect("the task limit lowers");
+            if std::thread::Builder::new().spawn(|| ()).is_ok() {
+                ferroday_cage_testkit::require::premise_unmet(
+                    "the task limit does not hold this caller, as it does not hold root",
+                );
+                std::fs::write(dir.join("unheld"), b"").expect("the marker is written");
+                return;
+            }
+            let urls: Vec<String> = (0..3)
+                .map(|at| file_url(&dir.join(format!("body-{at}"))).expect("the URL is built"))
+                .collect();
+            let mut bodies = vec![Vec::new(); urls.len()];
+            let outcomes = {
+                let mut jobs: Vec<FetchJob<'_>> = urls
+                    .iter()
+                    .zip(bodies.iter_mut())
+                    .map(|(url, body)| FetchJob::new(FetchRequest::new(url), body))
+                    .collect();
+                HttpFetch::new().concurrency(4).fetch_all(&mut jobs)
+            };
+            assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+            for (at, body) in bodies.iter().enumerate() {
+                assert_eq!(body, format!("body {at}").as_bytes());
+            }
+            std::fs::write(dir.join("done"), b"").expect("the marker is written");
+            return;
+        }
+
+        let dir = Scratch::new("http-task-limit");
+        for at in 0..3 {
+            std::fs::write(dir.join(format!("body-{at}")), format!("body {at}")).unwrap();
+        }
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "provision::http::tests::a_batch_the_host_starts_no_thread_for_still_fetches_every_job",
+            "--test-threads=1",
+        ])
+        .env(TASK_LIMITED, dir.path())
+        .status()
+        .expect("the child test process runs");
+        assert!(status.success(), "the child process failed: {status}");
+        // A child that matched no test would succeed having asserted nothing.
+        assert!(
+            dir.join("done").exists() || dir.join("unheld").exists(),
+            "the child ran the test",
+        );
     }
 
     #[test]
@@ -2125,6 +2418,37 @@ mod tests {
         let injected =
             resolve_redirect("http://mirror.example/debian/x", "/pool/y\r\nX-Injected: 1");
         assert!(parse_http_url(&injected).is_err());
+    }
+
+    #[test]
+    fn a_coordinate_the_check_accepts_reaches_the_request_line_as_written() {
+        // The two boundaries answer one question between them: a coordinate
+        // `check` accepts is one this client writes into the request line
+        // unchanged, and one this client would refuse never gets past `check`.
+        use super::super::coordinate::{Nesting, check};
+        let accepted = [
+            "trixie",
+            "buster/updates",
+            "main/debian-installer",
+            "extra-repos/systemd",
+            "dev-libs/libsigc++/libsigc++-2.12.1-1.gpkg.tar",
+            "a-b.c_d~e!f$g&h'i(j)k*l+m,n;o=p:q@r",
+        ];
+        for value in accepted {
+            check("the archive's component", value, Nesting::Nested)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            let url = super::super::mirror_url("http://mirror.example/debian", value);
+            let parsed = parse_http_url(&url).unwrap_or_else(|reason| panic!("{url}: {reason}"));
+            assert_eq!(parsed.path, format!("/debian/{value}"));
+        }
+        for value in ["caf\u{e9}", "a b", "a\u{7f}"] {
+            let url = super::super::mirror_url("http://mirror.example/debian", value);
+            assert!(parse_http_url(&url).is_err(), "{value:?}");
+            assert!(
+                check("the archive's component", value, Nesting::Nested).is_err(),
+                "{value:?}",
+            );
+        }
     }
 
     #[test]
@@ -2706,9 +3030,14 @@ mod tests {
     fn a_passed_deadline_fails_the_read() {
         // A reader whose deadline is already in the past fails before touching
         // the inner stream, so a trickling body cannot outlast the deadline.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback listener binds");
+        let stream = TcpStream::connect(listener.local_addr().expect("the listener is bound"))
+            .expect("the loopback connection is made");
         let mut reader = DeadlineReader {
-            inner: &b"unused"[..],
+            inner: stream,
             deadline: Some(Instant::now() - Duration::from_secs(1)),
+            io_timeout: None,
         };
         let mut buf = [0u8; 8];
         let err = reader.read(&mut buf).unwrap_err();

@@ -6,8 +6,9 @@
 //! setters, so a single-mirror bootstrap needs no repository at all — and any
 //! further ones are merged in through
 //! [`DebianBuilder::repository`](super::DebianBuilder::repository). Each carries
-//! its own trust anchor and freshness posture, so multiplying repositories
-//! repeats the same authenticity checks per source rather than weakening them.
+//! its own trust anchor and freshness posture, so every authenticity check runs
+//! once per source. The package names are shared, though: any repository can
+//! supersede any name, so each one configured is trusted with the whole root.
 //!
 //! One repository can list several mirror URLs. They are interchangeable views
 //! of the *same* source — a live mirror and a `snapshot.debian.org` backstop,
@@ -129,22 +130,15 @@ impl Repository {
     ///
     /// The primary owns `sources.list` and the canonical keyring path rather
     /// than a named `sources.list.d` entry, so it carries no name. Its trust
-    /// anchor is the caller's keyring where `keyring` holds one, and the
-    /// embedded archive keyring where it is `None`, unless the caller trusts it
-    /// unsigned.
+    /// anchor is settled by [`trust_anchor`], with the embedded archive keyring
+    /// where the caller named none.
     pub(crate) fn primary(
         suite: String,
         mirrors: Vec<String>,
         components: Vec<String>,
-        keyring: Option<Vec<u8>>,
-        trust_unsigned: bool,
+        trust: Trust,
         allow_stale: bool,
     ) -> Result<Repository, DebianError> {
-        let trust = match keyring {
-            _ if trust_unsigned => Trust::Unsigned,
-            Some(keyring) => Trust::Signed(keyring),
-            None => Trust::Archive,
-        };
         let repository = Repository {
             mirrors,
             suite,
@@ -333,7 +327,9 @@ impl RepositoryBuilder {
     ///
     /// A signed repository must declare a keyring: unlike the primary, an
     /// additional repository has no embedded default, since its signing key is
-    /// its own.
+    /// its own. A keyring alongside
+    /// [`trust_unsigned`](Self::trust_unsigned) is refused at
+    /// [`build`](Self::build).
     pub fn keyring(mut self, path: impl AsRef<Path>) -> Self {
         self.keyring_path = Some(path.as_ref().to_path_buf());
         self
@@ -347,7 +343,8 @@ impl RepositoryBuilder {
     /// remote one. With no signature, authenticity rests on the transport
     /// alone, so [`build`](Self::build) requires one that supplies some: every
     /// mirror must be `file://` or `https://`, and any other scheme —
-    /// `http://` included — is refused.
+    /// `http://` included — is refused. So is a [`keyring`](Self::keyring)
+    /// named alongside it.
     pub fn trust_unsigned(mut self, trust: bool) -> Self {
         self.trust_unsigned = trust;
         self
@@ -360,7 +357,9 @@ impl RepositoryBuilder {
     /// release is expired by design. The signature is still verified, and the
     /// key that made it must still be in force. It has no effect on a
     /// [`trust_unsigned`](Self::trust_unsigned) repository, which is never
-    /// freshness-checked.
+    /// freshness-checked. The repository's source in the finished rootfs
+    /// carries `check-valid-until=no`, so the root's `apt` accepts what the
+    /// bootstrap accepted.
     pub fn allow_stale_release(mut self, allow: bool) -> Self {
         self.allow_stale = allow;
         self
@@ -368,7 +367,8 @@ impl RepositoryBuilder {
 
     /// Names the repository, for its `/etc/apt/sources.list.d/<name>.list`
     /// entry and, when signed, its `/usr/share/keyrings/<name>.gpg` trust
-    /// anchor in the finished rootfs.
+    /// anchor in the finished rootfs. A repository reached through a `file://`
+    /// mirror writes neither, since the root cannot see the host path it names.
     ///
     /// The name must be a portable file-name stem — ASCII letters, digits, and
     /// `.`, `-`, `_` — so it cannot escape those directories. Without one, a
@@ -386,13 +386,15 @@ impl RepositoryBuilder {
     /// Returns a [`DebianError::Config`] when no mirror was set, when a mirror
     /// URL carries whitespace or a control character, when a signed repository
     /// names no keyring, when the keyring is not an OpenPGP keyring holding a
-    /// usable key, when an unsigned repository is reached over `http://`, when
+    /// usable key, when a keyring is named for a repository trusted unsigned,
+    /// when an unsigned repository is reached over `http://`, when
     /// a supplied name is not a portable file-name stem, or when the suite or a
     /// component is one the repository cannot be addressed by: an empty value,
-    /// one carrying whitespace or a control character, or one that would
-    /// resolve outside the mirror root through a leading `/`, a `..` segment,
-    /// or an empty or `.` segment. Either may otherwise contain slashes, since
-    /// both may name a subtree.
+    /// one carrying whitespace, a control character, or another character a
+    /// URL path cannot carry as written (such as `%`, `?`, `#`, or one outside
+    /// ASCII), or one that would resolve outside the mirror root through a
+    /// leading `/`, a `..` segment, or an empty or `.` segment. Either may
+    /// otherwise contain slashes, since both may name a subtree.
     ///
     /// Returns [`DebianError::Io`] when the keyring cannot be read.
     pub fn build(self) -> Result<Repository, DebianError> {
@@ -415,16 +417,18 @@ impl RepositoryBuilder {
             validate_name(name)?;
         }
 
-        let trust = if self.trust_unsigned {
-            Trust::Unsigned
-        } else {
-            let path = self.keyring_path.ok_or_else(|| DebianError::Config {
-                reason: "a signed repository needs a keyring; set one with keyring(), or trust it \
-                     unsigned with trust_unsigned(true)"
-                    .to_string(),
-            })?;
-            Trust::Signed(read_keyring(&path, "reading the repository keyring")?)
-        };
+        let trust = trust_anchor(
+            self.keyring_path.as_deref(),
+            self.trust_unsigned,
+            "reading the repository keyring",
+            || {
+                Err(DebianError::Config {
+                    reason: "a signed repository needs a keyring; set one with keyring(), or \
+                             trust it unsigned with trust_unsigned(true)"
+                        .to_string(),
+                })
+            },
+        )?;
 
         let repository = Repository {
             mirrors,
@@ -436,6 +440,37 @@ impl RepositoryBuilder {
         };
         repository.validate()?;
         Ok(repository)
+    }
+}
+
+/// Settles a repository's trust anchor from what its builder was given: the
+/// path of a keyring, the decision to trust it unsigned, or neither.
+///
+/// Both at once is a contradiction, and is refused before the keyring is read
+/// rather than resolved by letting one silently win: a caller who named a
+/// keyring expects the release to be verified against it. `neither` answers for
+/// an anchor the caller left unstated, which is the embedded archive keyring
+/// for the primary and a refusal for an additional repository, whose signing
+/// key is its own.
+///
+/// `op` names the read in the error a failure to read the keyring reports.
+pub(crate) fn trust_anchor(
+    keyring: Option<&Path>,
+    trust_unsigned: bool,
+    op: &'static str,
+    neither: impl FnOnce() -> Result<Trust, DebianError>,
+) -> Result<Trust, DebianError> {
+    match keyring {
+        Some(path) if trust_unsigned => Err(DebianError::Config {
+            reason: format!(
+                "the keyring {} and trust_unsigned(true) were both given, so it is not clear \
+                 whether the release is to be verified; drop one of the two",
+                path.display()
+            ),
+        }),
+        Some(path) => Ok(Trust::Signed(read_keyring(path, op)?)),
+        None if trust_unsigned => Ok(Trust::Unsigned),
+        None => neither(),
     }
 }
 
@@ -690,6 +725,26 @@ mod tests {
             Repository::builder("trixie").trust_unsigned(true).build(),
             Err(DebianError::Config { .. })
         ));
+    }
+
+    #[test]
+    fn a_keyring_named_for_a_repository_trusted_unsigned_is_refused() {
+        // A caller who named a keyring expects the release to be verified
+        // against it, so trusting the repository unsigned as well is a
+        // contradiction rather than a precedence. It is refused before the
+        // keyring is read, so a path that does not exist reports the
+        // contradiction rather than the missing file.
+        let err = Repository::builder("trixie")
+            .mirror("file:///srv/debs")
+            .keyring("/nonexistent/vendor.gpg")
+            .trust_unsigned(true)
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(&err, DebianError::Config { reason }
+                if reason.contains("trust_unsigned") && reason.contains("vendor.gpg")),
+            "{err}",
+        );
     }
 
     #[test]

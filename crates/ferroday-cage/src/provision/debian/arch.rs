@@ -63,6 +63,7 @@ fn debian_architecture(machine: &str) -> &str {
         "ppc64le" => "ppc64el",
         "s390x" => "s390x",
         "riscv64" => "riscv64",
+        "loongarch64" => "loong64",
         other => other,
     }
 }
@@ -82,6 +83,10 @@ pub(crate) fn merged_usr_dirs(architecture: &str) -> Vec<&'static str> {
         "i386" => &["lib64", "libx32"][..],
         "ppc64el" => &["lib64"][..],
         "s390x" => &["lib32"][..],
+        // The LoongArch ABI's dynamic loader is
+        // `/lib64/ld-linux-loongarch-lp64d.so.1`, which libc6 ships under
+        // `/usr/lib64`, so the root needs the link for anything to run.
+        "loong64" => &["lib64"][..],
         _ => &[][..],
     });
     dirs
@@ -98,6 +103,7 @@ fn qemu_interpreter(architecture: &str) -> Option<&'static str> {
         "ppc64el" => "ppc64le",
         "s390x" => "s390x",
         "riscv64" => "riscv64",
+        "loong64" => "loongarch64",
         _ => return None,
     })
 }
@@ -269,6 +275,16 @@ mod tests {
         );
         assert_eq!(merged_usr_dirs("arm64"), ["bin", "sbin", "lib"]);
         assert_eq!(merged_usr_dirs("ppc64el"), ["bin", "sbin", "lib", "lib64"]);
+    }
+
+    #[test]
+    fn loong64_is_named_mapped_and_linked_as_its_port_is() {
+        // A Debian release architecture from forky on. The kernel calls the
+        // machine loongarch64, as qemu names its handler, and the port is
+        // loong64; its loader lives under /lib64.
+        assert_eq!(debian_architecture("loongarch64"), "loong64");
+        assert_eq!(qemu_interpreter("loong64"), Some("loongarch64"));
+        assert_eq!(merged_usr_dirs("loong64"), ["bin", "sbin", "lib", "lib64"]);
     }
 
     #[test]

@@ -22,11 +22,11 @@
 //! of that one type:
 //!
 //! - **Distinct sources.** The primary mirror and each `--local-repo` are
-//!   separate repositories, merged into one dependency resolution. Resolution is
-//!   highest-version-wins across every repository, so a package a local pool
-//!   ships supersedes the mirror's copy when its version is higher, and a
-//!   package only the pool ships is pulled from it while its dependencies close
-//!   against the mirror.
+//!   separate repositories, merged into one dependency resolution. Neither
+//!   release marks itself `NotAutomatic`, so the two rank alike and the higher
+//!   version wins: a package a local pool ships supersedes the mirror's copy
+//!   when its version is higher, and a package only the pool ships is pulled
+//!   from it while its dependencies close against the mirror.
 //! - **Interchangeable URLs.** `--snapshot` adds a backstop URL to the *primary*
 //!   repository, tried when the live mirror reports a resource missing — a
 //!   version that has rotated off the live pool. It is the same source reached a
@@ -43,9 +43,12 @@
 //! the provisioner requires one that supplies some — `file://` or `https://` —
 //! and a `file://` pool under the caller's control is exactly its intended use.
 //!
-//! Each additional repository writes its own
-//! `/etc/apt/sources.list.d/<name>.list` into the finished rootfs, so an
-//! in-cage `apt` sees the same sources the bootstrap resolved against.
+//! A `--local-repo` writes no source into the finished rootfs. Its `file://` URL
+//! names a directory on the host, which a cage rooted at the tree does not see,
+//! and an unreachable source would fail every `apt-get update` there. The
+//! primary mirror's source is written, so an in-cage `apt` reads the archive the
+//! bootstrap resolved against; with `--snapshot` it carries
+//! `check-valid-until=no`, the posture the bootstrap verified the release under.
 //!
 //! # Usage
 //!

@@ -14,7 +14,7 @@
 //! configured archives offer at all — the question a resolve cannot answer,
 //! since it reports a closure rather than a catalogue. Beyond the read half,
 //! [`DebianBuilder::pre_configure_overlay`] lays caller configuration into the
-//! rootfs before its maintainer scripts run, and [`Pool`] writes a local
+//! rootfs before the configure wave runs, and [`Pool`] writes a local
 //! trusted pool a later bootstrap resolves against.
 //!
 //! No `.deb` is ever held in memory. A download is written to a staging file as
@@ -70,6 +70,7 @@ use super::coordinate::{self, Nesting};
 use super::digest::{self, Algorithm};
 use super::document::Carried;
 use super::extract::{Extraction, Placement};
+use super::layer::Staging;
 use super::rooted::Rooted;
 use super::{
     Available, BuildLayer, Delegate, Failover, Fetch, FetchError, FetchRequest, HttpFetch,
@@ -86,7 +87,7 @@ use pin::Pins;
 /// The suffix a run-owned `.deb` cache takes on the tree it is building.
 const DEB_CACHE: &str = ".fcage-debs";
 use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
-use release::Release;
+use release::{Release, ReleasePriority};
 
 /// The mode a bootstrapped rootfs's own root directory takes.
 ///
@@ -258,6 +259,49 @@ pub(super) fn check_coordinate(
     nesting: Nesting,
 ) -> Result<(), DebianError> {
     coordinate::check(what, value, nesting).map_err(|reason| DebianError::Config { reason })
+}
+
+/// Refuses an install list entry naming a release no repository publishes,
+/// and an exclusion naming a release at all.
+///
+/// An entry written `name/release` asks for the name from the repository
+/// configured with that suite, so a release none is configured with is a
+/// mistake the configuration already shows, refused before anything is
+/// fetched. An exclusion removes a name from the closure whichever release
+/// would have supplied it, so a release in one would be read as part of a name
+/// no package has, and would quietly exclude nothing.
+fn validate_selection(
+    includes: &[String],
+    excludes: &[String],
+    repositories: &[Repository],
+) -> Result<(), DebianError> {
+    for entry in includes {
+        let (name, release) = resolve::split_release(entry);
+        let Some(release) = release else {
+            continue;
+        };
+        if name.is_empty()
+            || !repositories
+                .iter()
+                .any(|repository| repository.suite == release)
+        {
+            return Err(DebianError::Config {
+                reason: format!(
+                    "the include {entry:?} asks for a package from the release {release:?}, and \
+                     no configured repository publishes that suite"
+                ),
+            });
+        }
+    }
+    if let Some(entry) = excludes.iter().find(|entry| entry.contains('/')) {
+        return Err(DebianError::Config {
+            reason: format!(
+                "the exclude {entry:?} names a release, and an exclusion removes a package \
+                 whichever release would supply it; name the package alone"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Refuses a plan handed to `plan()` that contradicts the rest of the
@@ -606,12 +650,14 @@ impl Debian {
     /// pre-configure overlay configured on the builder all apply, exactly as to a
     /// full bootstrap; the map must match the one the base was built under.
     ///
-    /// A call that fails leaves nothing behind: the upper and its work directory
-    /// are disposed of exactly as dropping the returned layer would dispose of
-    /// them, since a failure hands the caller no handle to drop. So is the
-    /// package cache, unless the builder named a
+    /// A call that fails and created `upper` leaves nothing behind: the upper
+    /// and its work directory are disposed of exactly as dropping the returned
+    /// layer would dispose of them, since a failure hands the caller no handle
+    /// to drop. An `upper` that already existed is the caller's, and a failure
+    /// leaves it in place, holding whatever the call wrote into it. The package
+    /// cache goes with the call either way, unless the builder named a
     /// [`cache_dir`](DebianBuilder::cache_dir), which is the caller's and
-    /// survives either way.
+    /// survives.
     ///
     /// # Preconditions
     ///
@@ -671,17 +717,13 @@ impl Debian {
         // overlay preflight the primitive would make at cage-build time, hoisted
         // ahead of the work. The probe runs on the upper's parent, its own
         // filesystem, so its scratch files land beside the upper.
-        std::fs::create_dir_all(upper)
-            .map_err(|err| ProvisionError::io("creating the overlay upper", upper, err))?;
-        // The handle that owns the upper is taken as soon as the upper exists,
-        // not on the way out, so a failure below disposes of a partly-installed
-        // increment instead of orphaning it: there is no handle in an `Err` for
-        // the caller to drop.
-        let layer = BuildLayer::new(upper, self.identity_map.clone(), self.id_mapper.clone());
-        let scratch = upper
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+        // The guard is taken as the upper is created, not on the way out, so a
+        // failure below disposes of a partly-installed increment instead of
+        // orphaning it: there is no handle in an `Err` for the caller to drop.
+        // It disposes only of an upper this call created; one that was already
+        // there is the caller's.
+        let staging = Staging::begin(upper, self.identity_map.clone(), self.id_mapper.clone())?;
+        let scratch = crate::path::parent_of(upper);
         if let Some(blocker) = crate::host::overlay_blocker(scratch) {
             return Err(wrap(DebianError::Config {
                 reason: format!("an overlay-rooted build layer cannot be established: {blocker}"),
@@ -713,11 +755,18 @@ impl Debian {
             }
         };
         // An empty increment — every requested package already in the base, or a
-        // plan that names none — needs no download or configuration; the build
-        // root is the base as it stands. Skipping here also keeps dpkg from
-        // being handed an empty unpack wave, which it refuses.
+        // plan that names none — needs no download and no dpkg wave, which
+        // also keeps dpkg from being handed an empty unpack, which it refuses.
+        // The pre-configure overlay is still the caller's configuration of the
+        // build root, and is laid exactly where a wave would have found it:
+        // whether the packages asked for were already in the base is no reason
+        // for the root to differ.
         if wanted.is_empty() {
-            return Ok(layer);
+            if let Some(source) = config.overlay {
+                super::extract::overlay_tree(upper, source, Some(&base))
+                    .map_err(|err| wrap(DebianError::Overlay(err)))?;
+            }
+            return Ok(staging.finish());
         }
         let installables = acquire_debs(
             fetcher,
@@ -754,7 +803,7 @@ impl Debian {
         // not the launch's to take.
         let _ = std::fs::remove_dir(upper.join(bootstrap::ARCHIVES.trim_start_matches('/')));
 
-        Ok(layer)
+        Ok(staging.finish())
     }
 }
 
@@ -878,13 +927,36 @@ impl DebianBuilder {
     /// Adds a [`Repository`] merged into the resolution alongside the primary.
     ///
     /// An additional repository is a distinct source — a local trusted `.deb`
-    /// pool, a signed feature repository — contributing packages to one merged
-    /// closure. Resolution is highest-version-wins across every repository, so a
-    /// package a feature repository ships at a higher version supersedes the
-    /// primary's, and a package only one repository ships is pulled from it; an
-    /// exact-version tie resolves to the earlier repository, the primary first.
+    /// pool, a signed feature repository, a backports suite — contributing
+    /// packages to one merged closure. Each name resolves to one version across
+    /// every repository, chosen as apt chooses one by default. Each release
+    /// ranks its own versions: one marked `NotAutomatic`, as `experimental` is,
+    /// ranks lowest, and one also marked `ButAutomaticUpgrades`, as a backports
+    /// suite is, ranks above that and below every other release. A version from
+    /// a higher-ranked release is taken over one from a lower-ranked release
+    /// whatever the versions are, so adding `experimental` to reach one package
+    /// changes nothing else. Between releases of one rank the higher version
+    /// wins, so a package a feature repository ships at a higher version
+    /// supersedes the primary's. An exact tie resolves to the earlier
+    /// repository, the primary first. A package only one repository ships is
+    /// pulled from it, whatever its rank. To take a package from a
+    /// lower-ranked release, name it with the release in
+    /// [`include`](Self::include).
+    ///
+    /// The base system is seeded from the primary alone: a repository marking
+    /// a package essential or required adds nothing to the seed, though a
+    /// seeded name resolves to whichever repository's version wins.
+    ///
+    /// Every configured repository is trusted with the whole root. Each
+    /// release is verified against its own repository's anchor, but the names
+    /// are shared: any repository that wins a name supplies that package,
+    /// `debian-archive-keyring` included, and with it the keys the primary's
+    /// source in the finished rootfs trusts.
+    ///
     /// Each additional repository writes its own
-    /// `/etc/apt/sources.list.d/<name>.list` into the finished rootfs.
+    /// `/etc/apt/sources.list.d/<name>.list` into the finished rootfs, unless
+    /// its mirror is a `file://` URL: that names a host path the finished root
+    /// cannot see, so no source is written for it.
     pub fn repository(mut self, repository: Repository) -> Self {
         self.repositories.push(repository);
         self
@@ -903,7 +975,8 @@ impl DebianBuilder {
     /// Sets the least essential [`Priority`] band the base system seeds from.
     ///
     /// The base system is every essential package plus every package at least
-    /// as essential as this floor. The default, [`Priority::Required`], is
+    /// as essential as this floor, as the primary repository marks them. The
+    /// default, [`Priority::Required`], is
     /// `debootstrap`'s minbase: essential and required packages only. A less
     /// essential floor such as [`Priority::Important`] additionally seeds that
     /// band — `cron`, `logrotate`, and the like — matching the corresponding
@@ -917,6 +990,22 @@ impl DebianBuilder {
     }
 
     /// Adds packages to install beyond the base system.
+    ///
+    /// A name resolves to the version the repositories rank first, as
+    /// [`repository`](Self::repository) describes. An entry written
+    /// `name/release` asks for the name from the repository configured with the
+    /// suite `release`, apt's own `name/release` request: that repository's
+    /// highest version of the name is installed, whatever its rank. Each
+    /// versioned dependency of it that the base, the selection, and the
+    /// candidates cannot meet is taken from the same release where that release
+    /// meets it, and that version's dependencies likewise. This is how a
+    /// package is taken from a release ranked below the rest, such as
+    /// `linux-image-amd64/trixie-backports`, without the release supplying
+    /// anything nothing asked of it.
+    ///
+    /// An entry naming a release no repository is configured with is refused
+    /// at [`build`](Self::build) with [`DebianError::Config`], and one naming a
+    /// package the release does not carry fails the resolution.
     pub fn include<I, S>(mut self, packages: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1069,6 +1158,10 @@ impl DebianBuilder {
     /// that only the excluded package can satisfy fails the bootstrap rather
     /// than producing a broken closure, as does excluding a package that is
     /// also an [`include`](Self::include).
+    ///
+    /// An exclusion names a package alone. One written with a release is
+    /// refused at [`build`](Self::build) with [`DebianError::Config`], since an
+    /// exclusion removes the package whichever release would supply it.
     pub fn exclude<I, S>(mut self, packages: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1162,7 +1255,7 @@ impl DebianBuilder {
     }
 
     /// Lays a directory tree into the rootfs after the packages are unpacked
-    /// and before their maintainer scripts run.
+    /// and before the configure wave runs their configuration scripts.
     ///
     /// The source is a rootfs-shaped directory: its contents are copied into
     /// the staging root — `source/etc/locale.gen` becomes `/etc/locale.gen` —
@@ -1173,13 +1266,19 @@ impl DebianBuilder {
     /// merge. Entries land owned by the calling user, which the identity map
     /// presents as root inside.
     ///
-    /// The overlay is placed after every package is unpacked and before the
-    /// configuration wave runs any maintainer script, so a script observes the
-    /// injected configuration — a debconf pre-seed, a hardware-probe guard.
-    /// The base system's own packages are configured earlier, so the overlay
-    /// governs the configuration of the non-essential packages. It applies only
-    /// to a full bootstrap; [`extract_only`](Self::extract_only) configures
-    /// nothing and ignores it.
+    /// The overlay is placed once every package is unpacked and before the one
+    /// wave that configures them, so their `postinst` scripts observe the
+    /// injected configuration — a debconf pre-seed, a hardware-probe guard —
+    /// essential packages' included. Two kinds of script run earlier and do not
+    /// see it. Unpacking runs every package's `preinst`. A full bootstrap also
+    /// installs and configures its core packages first, one at a time:
+    /// `base-passwd`, `base-files`, `dpkg`, `libc6`, `perl-base`, and `mawk`.
+    ///
+    /// A layered build lays the overlay into its increment the same way, after
+    /// the increment is unpacked and before it is configured, and lays it even
+    /// when the increment installs nothing, so the build root does not depend
+    /// on whether the base already held what was asked for.
+    /// [`extract_only`](Self::extract_only) configures nothing and ignores it.
     pub fn pre_configure_overlay(mut self, source: impl AsRef<Path>) -> Self {
         self.overlay = Some(source.as_ref().to_path_buf());
         self
@@ -1264,6 +1363,10 @@ impl DebianBuilder {
 
     /// Overrides the embedded archive keyring with one read from `path` (a
     /// binary OpenPGP keyring).
+    ///
+    /// A keyring alongside [`trust_unsigned`](Self::trust_unsigned) is refused
+    /// at [`build`](Self::build) with [`DebianError::Config`]: one asks for the
+    /// release to be verified and the other for it not to be.
     pub fn keyring(mut self, path: impl AsRef<Path>) -> Self {
         self.keyring_path = Some(path.as_ref().to_path_buf());
         self
@@ -1277,7 +1380,8 @@ impl DebianBuilder {
     /// drops the only authenticity check, authenticity rests on the transport
     /// alone, so [`build`](Self::build) requires one that supplies some: every
     /// mirror must be `file://` or `https://`, and any other scheme —
-    /// `http://` included — is refused.
+    /// `http://` included — is refused. So is a [`keyring`](Self::keyring)
+    /// named alongside it.
     pub fn trust_unsigned(mut self, trust: bool) -> Self {
         self.trust_unsigned = trust;
         self
@@ -1298,6 +1402,10 @@ impl DebianBuilder {
     /// have since expired is refused. It has no effect on a
     /// [`trust_unsigned`](Self::trust_unsigned) mirror, which is never
     /// freshness-checked.
+    ///
+    /// The finished rootfs's source for the repository carries the same
+    /// posture, `check-valid-until=no`, so the root's `apt` reads the release
+    /// the root was built from.
     pub fn allow_stale_release(mut self, allow: bool) -> Self {
         self.allow_stale = allow;
         self
@@ -1325,14 +1433,19 @@ impl DebianBuilder {
     /// [`base_layer`](Self::base_layer) — for a negative
     /// [`source_date_epoch`](Self::source_date_epoch), and for a suite,
     /// component, or architecture the archive cannot be addressed by: an empty
-    /// value, one carrying whitespace or a control character, or one that would
-    /// resolve outside the mirror root through a leading `/`, a `..` segment,
-    /// or an empty or `.` segment. The suite and the component may otherwise
-    /// contain slashes, since both may name a subtree; the architecture may not.
+    /// value, one carrying whitespace, a control character, or another
+    /// character a URL path cannot carry as written (such as `%`, `?`, `#`, or
+    /// one outside ASCII), or one that would resolve outside the mirror root
+    /// through a leading `/`, a `..` segment, or an empty or `.` segment. The
+    /// suite and the component may otherwise contain slashes, since both may
+    /// name a subtree; the architecture may not.
     ///
     /// The same refusal covers a keyring named by [`keyring`](Self::keyring)
-    /// that is not an OpenPGP keyring holding a usable key, and a mirror URL
-    /// carrying whitespace or a control character.
+    /// that is not an OpenPGP keyring holding a usable key, a keyring named
+    /// alongside [`trust_unsigned`](Self::trust_unsigned), a mirror URL
+    /// carrying whitespace or a control character, an
+    /// [`include`](Self::include) naming a release no repository publishes,
+    /// and an [`exclude`](Self::exclude) naming a release at all.
     ///
     /// Returns [`DebianError::Io`] when a keyring named by
     /// [`keyring`](Self::keyring) cannot be read.
@@ -1379,22 +1492,24 @@ impl DebianBuilder {
             &architecture,
             Nesting::Single,
         )?;
-        let keyring = self
-            .keyring_path
-            .as_ref()
-            .map(|path| repository::read_keyring(path, "reading the keyring"))
-            .transpose()?;
+        // The primary's anchor: the caller's keyring, the decision to trust it
+        // unsigned, or the embedded archive keyring where the caller named
+        // neither. Naming both is refused before the keyring is read.
+        let trust = repository::trust_anchor(
+            self.keyring_path.as_deref(),
+            self.trust_unsigned,
+            "reading the keyring",
+            || Ok(repository::Trust::Archive),
+        )?;
         let components = if self.components.is_empty() {
             vec!["main".to_string()]
         } else {
             self.components
         };
         // The primary repository: its mirror list is the configured mirror
-        // followed by any snapshot backstops, and its trust anchor is the
-        // caller's keyring, or the embedded one where the caller names none,
-        // unless the caller trusts it unsigned. Repository
-        // construction rejects an unsigned http:// mirror, the same refusal the
-        // flattened configuration made.
+        // followed by any snapshot backstops, and its trust anchor is the one
+        // settled above. Repository construction rejects an unsigned http://
+        // mirror, the same refusal the flattened configuration made.
         let primary_mirror = self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string());
         let mut mirrors = Vec::with_capacity(1 + self.mirror_fallbacks.len());
         mirrors.push(primary_mirror);
@@ -1403,8 +1518,7 @@ impl DebianBuilder {
             self.suite.clone(),
             mirrors,
             components,
-            keyring,
-            self.trust_unsigned,
+            trust,
             self.allow_stale,
         )?;
 
@@ -1412,6 +1526,7 @@ impl DebianBuilder {
         repositories.push(primary);
         repositories.extend(self.repositories);
         repository::validate_distinct_entries(&repositories)?;
+        validate_selection(&self.includes, &self.excludes, &repositories)?;
 
         if let Some(plan) = &self.plan {
             validate_plan(
@@ -1696,9 +1811,10 @@ fn bootstrap_suite(
 /// cannot drift apart. Each repository's release is verified against that
 /// repository's own keyring and bound to its own suite; freshness is enforced
 /// per repository unless it trusts unsigned or pins a historical snapshot. The
-/// per-component indexes are tagged with their repository's index and merged
-/// highest-version-wins across the union, so the resolved set draws each
-/// package from the repository that ships its winning version.
+/// per-component indexes are tagged with their repository's index and merged,
+/// each name ranked across the union as [`Index::merge`] ranks it, so the
+/// resolved set draws each package from the repository that ships its winning
+/// version. The base system is seeded from the primary's index alone.
 fn resolve_packages(
     config: &Bootstrap<'_>,
     fetcher: &mut dyn Fetch,
@@ -1803,8 +1919,8 @@ fn resolve_delta(
 /// [`resolve_packages`] and the layered-build [`resolve_delta`] so both draw
 /// from an identically built and verified index. Each repository's release is
 /// verified against its own keyring and bound to its own suite; the per-component
-/// indexes are tagged with their repository's index and merged
-/// highest-version-wins across the union.
+/// indexes are tagged with their repository's index and the rank its release
+/// marks itself with, and merged into one ranked set.
 fn merged_index(
     fetcher: &mut dyn Fetch,
     repositories: &[Repository],
@@ -1813,8 +1929,9 @@ fn merged_index(
     observer: &mut dyn DebianObserver,
 ) -> Result<(Index, Vec<ResolvedArchive>), DebianError> {
     // Each repository contributes one text block per component, tagged with the
-    // repository's index so the merged index knows where each package came from.
-    let mut index_inputs: Vec<(usize, String)> = Vec::new();
+    // repository's index so the merged index knows where each package came from,
+    // and with how its release ranks its versions.
+    let mut index_inputs: Vec<(usize, ReleasePriority, String)> = Vec::new();
     // The archive state, in repository order, so a package's origin tag indexes
     // straight into it.
     let mut archives: Vec<ResolvedArchive> = Vec::new();
@@ -1851,13 +1968,18 @@ fn merged_index(
             carried: Carried::new(),
         });
         let text = fetch_index(fetcher, repository, architecture, &release, &url, observer)?;
-        index_inputs.push((origin, text));
+        index_inputs.push((origin, release.priority(), text));
     }
 
     let index = Index::merge(
         index_inputs
             .iter()
-            .map(|(origin, text)| (*origin, text.as_str())),
+            .map(|(origin, priority, text)| index::Source {
+                origin: *origin,
+                suite: &repositories[*origin].suite,
+                priority: *priority,
+                text,
+            }),
         architecture,
         pins,
     );
@@ -2050,6 +2172,13 @@ fn append_component(merged: &mut String, text: &str) {
 /// fetched index is verified against the release digest — a mismatch is fatal,
 /// not a reason to try another mirror — and decompressed.
 ///
+/// Where the release declares `Acquire-By-Hash`, each compression is asked for
+/// by its digest first and by its name second, the order apt queues the two
+/// in. A partial mirror or a caching proxy may carry the named index and not
+/// the by-hash copies, and it serves the index all the same. The name is asked
+/// only when the digest path failed to serve: bytes that arrived and do not
+/// match the digest stop the walk there, as they do everywhere else.
+///
 /// `release_url` is where `release` came from, which a release listing no index
 /// for the component is reported against.
 fn fetch_component_index(
@@ -2094,12 +2223,14 @@ fn fetch_component_index(
     // What an exhausted walk reports, as `fetch_from_mirrors` reports one: the
     // resource below the mirror rather than a URL on any one of them.
     let unserved = format!("dists/{suite}/{component}/binary-{architecture}/Packages");
-    // Two walks, one inside the other: the encodings within one mirror, and the
-    // mirrors. A mirror that serves none of the encodings has failed over as
-    // surely as one that answered nothing, so the inner walk's last failure is
-    // what advances the outer one -- and both `exhausted` closures are
-    // unreachable, the empty candidate list having been refused above and a
-    // repository with no mirror at construction.
+    // Three walks, each inside the next: the locations of one encoding (its
+    // by-hash path, then its name), the encodings within one mirror, and the
+    // mirrors. A walk that ends without an answer has failed over as surely as
+    // a fetch that answered nothing, so its last failure is what advances the
+    // walk around it -- and every `exhausted` closure is unreachable, a
+    // location list never being empty, the empty candidate list having been
+    // refused above, and a repository with no mirror at construction.
+    let not_served = || DebianError::Fetch(FetchError::not_found(&unserved));
     walk_mirrors(
         &repository.mirrors,
         |mirror| {
@@ -2112,26 +2243,32 @@ fn fetch_component_index(
             walk_mirrors(
                 &candidates,
                 |(rel, size, digest)| {
-                    let url = if release.acquire_by_hash() {
-                        mirror_url(
+                    let mut locations = Vec::with_capacity(2);
+                    if release.acquire_by_hash() {
+                        locations.push(mirror_url(
                             mirror,
                             &format!(
                                 "dists/{suite}/{component}/binary-{architecture}/by-hash/SHA256/\
                                  {digest}"
                             ),
-                        )
-                    } else {
-                        mirror_url(mirror, &format!("dists/{suite}/{rel}"))
-                    };
-                    observer.progress(DebianEvent::Fetching { url: &url });
-                    let bytes = fetch_bytes(fetcher, &url, Some(*size))?;
-                    verify_digest(&url, &bytes, digest)?;
-                    decompress_index(&url, &bytes, expanded)
+                        ));
+                    }
+                    locations.push(mirror_url(mirror, &format!("dists/{suite}/{rel}")));
+                    walk_mirrors(
+                        &locations,
+                        |url| {
+                            observer.progress(DebianEvent::Fetching { url });
+                            let bytes = fetch_bytes(fetcher, url, Some(*size))?;
+                            verify_digest(url, &bytes, digest)?;
+                            decompress_index(url, &bytes, expanded)
+                        },
+                        not_served,
+                    )
                 },
-                || DebianError::Fetch(FetchError::not_found(&unserved)),
+                not_served,
             )
         },
-        || DebianError::Fetch(FetchError::not_found(&unserved)),
+        not_served,
     )
 }
 
@@ -2355,7 +2492,9 @@ fn verify_deb(
 /// The directory is the one a run without a cache of its own downloads into,
 /// beside the tree being built, and it goes with the run however the run ends.
 /// A caller who named that very directory as their cache is the one case left
-/// alone: it is theirs to keep, and the run treats it as its own already.
+/// alone: it is theirs to keep, and the run treats it as its own already. That
+/// is asked of the directory, whatever path names it, since a copy into the
+/// caller's cache under another spelling would remove the cache with the copy.
 fn private_copy(
     tree: &Path,
     cache_dir: Option<&Path>,
@@ -2364,7 +2503,7 @@ fn private_copy(
     let Some(cache_dir) = cache_dir else {
         return Ok(None);
     };
-    if PackageCache::derived(tree, DEB_CACHE) == cache_dir {
+    if PackageCache::is_derived(tree, DEB_CACHE, cache_dir) {
         return Ok(None);
     }
     let private = PackageCache::beside(tree, None, DEB_CACHE);
@@ -2655,7 +2794,7 @@ fn fetch_bytes(
     let request = FetchRequest::new(url);
     let result = match size {
         Some(size) => {
-            let mut sink = super::LimitedWriter::new(&mut bytes, size);
+            let mut sink = LimitedWriter::new(&mut bytes, size);
             fetcher.fetch(&request.sized(size), &mut sink)
         }
         None => fetcher.fetch(&request, &mut bytes),
@@ -2698,27 +2837,41 @@ const MAX_UNSIZED_INDEX: u64 = 256 * 1024 * 1024;
 /// [`MAX_UNSIZED_INDEX`] where it states none. Every failure is the index's,
 /// named by the URL it was fetched from: the bytes are already in memory and
 /// verified, so nothing here is a host I/O operation.
+///
+/// A stream the decoder refuses and a stream that decodes past `limit` are told
+/// apart. The decoder's own failure is the cause of the first, carried as the
+/// error's source; the second has no cause beyond the length. The decoder is
+/// therefore read one byte past the limit rather than through a writer that
+/// fails at it, since a writer's refusal and a decoder's arrive as the same
+/// kind of error.
 fn decompress_index(url: &str, bytes: &[u8], limit: u64) -> Result<String, DebianError> {
-    let unusable = |reason: String| DebianError::Index {
+    let unusable = |reason: &str, source: Option<io::Error>| DebianError::Index {
         subject: url.to_string(),
-        reason,
+        reason: reason.to_string(),
+        source,
     };
     let mut cursor = io::Cursor::new(bytes);
     let head = super::compress::sniff_head(&mut cursor)
-        .map_err(|err| unusable(format!("its header cannot be read: {err}")))?;
-    let mut reader = super::compress::decompress(&head, cursor).map_err(|err| {
-        unusable(format!(
-            "it is not a stream this library decompresses: {}",
-            ErrorChain::new(&err)
-        ))
+        .map_err(|err| unusable("its header cannot be read", Some(err)))?;
+    let reader = super::compress::decompress(&head, cursor).map_err(|err| {
+        unusable(
+            "it is not a stream this library decompresses",
+            Some(io::Error::other(err)),
+        )
     })?;
     let mut text = Vec::new();
-    io::copy(&mut reader, &mut LimitedWriter::new(&mut text, limit)).map_err(|err| {
-        unusable(format!(
-            "it does not decompress within the {limit} bytes it may expand to: {err}"
-        ))
-    })?;
-    String::from_utf8(text).map_err(|_| unusable("it is not UTF-8 text".to_string()))
+    io::Read::read_to_end(
+        &mut io::Read::take(reader, limit.saturating_add(1)),
+        &mut text,
+    )
+    .map_err(|err| unusable("it does not decompress", Some(err)))?;
+    if text.len() as u64 > limit {
+        return Err(unusable(
+            &format!("it expands past the {limit} bytes it may expand to"),
+            None,
+        ));
+    }
+    String::from_utf8(text).map_err(|_| unusable("it is not UTF-8 text", None))
 }
 
 /// Joins path components into an absolute path for a statoverride line.
@@ -3018,6 +3171,11 @@ pub enum DebianError {
         subject: String,
         /// What is wrong with the index.
         reason: String,
+        /// The decoder's own failure, where the index is a stream it refused.
+        /// `None` where nothing beneath the reason failed: an index that
+        /// decodes past its stated length, or decodes to something other than
+        /// text.
+        source: Option<io::Error>,
     },
     /// A package shipped an entry whose path cannot be represented safely in
     /// the dpkg metadata derived from it.
@@ -3078,7 +3236,8 @@ pub enum DebianError {
     /// Packages were not left in the installed state after configuration.
     #[non_exhaustive]
     NotConfigured {
-        /// The packages that did not reach `install ok installed`.
+        /// The packages the status database does not record as installed and
+        /// configured: in a state short of `installed`, or flagged in error.
         packages: Vec<String>,
     },
     /// Launching a cage for a configuration wave failed.
@@ -3142,7 +3301,9 @@ impl fmt::Display for DebianError {
             DebianError::Release { subject, reason } => {
                 write!(f, "the release {subject} is unusable: {reason}")
             }
-            DebianError::Index { subject, reason } => {
+            DebianError::Index {
+                subject, reason, ..
+            } => {
                 write!(f, "the index {subject} is unusable: {reason}")
             }
             DebianError::MalformedEntry { path } => {
@@ -3210,6 +3371,10 @@ impl std::error::Error for DebianError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DebianError::Fetch(err) => Some(err),
+            DebianError::Index {
+                source: Some(source),
+                ..
+            } => Some(source),
             DebianError::Launch(err) => Some(err),
             DebianError::Overlay(err) => Some(err),
             DebianError::Io { source, .. } => Some(source),
@@ -3701,9 +3866,10 @@ mod tests {
 
         let err = decompress_index(url, &compressed, text.len() as u64 - 1)
             .expect_err("an index longer than stated is refused");
+        // Nothing failed beneath the length, so there is no cause to carry.
         assert!(
-            matches!(&err, DebianError::Index { subject, reason }
-                if subject == url && reason.contains("does not decompress within")),
+            matches!(&err, DebianError::Index { subject, reason, source: None }
+                if subject == url && reason.contains("expands past")),
             "{err}",
         );
         assert_eq!(
@@ -3712,6 +3878,255 @@ mod tests {
                 .as_bytes(),
             &text[..],
         );
+    }
+
+    /// A release declaring `Acquire-By-Hash` whose one index is `index`, and a
+    /// transport answering the release and whatever `serve` adds.
+    fn by_hash_archive(
+        index: &[u8],
+        serve: &[(String, Vec<u8>)],
+    ) -> (Debian, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let release = format!(
+            "Suite: trixie\nArchitectures: amd64\nComponents: main\nAcquire-By-Hash: yes\n\
+             SHA256:\n {} {} main/binary-amd64/Packages\n",
+            Algorithm::Sha256.hex_of(index),
+            index.len(),
+        );
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut bodies: std::collections::HashMap<String, Vec<u8>> =
+            serve.iter().cloned().collect();
+        bodies.insert(
+            "https://mirror.example/debian/dists/trixie/Release".to_string(),
+            release.into_bytes(),
+        );
+        let fetcher = Table {
+            bodies,
+            asked: std::sync::Arc::clone(&asked),
+        };
+        let debian = Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror("https://mirror.example/debian")
+            .trust_unsigned(true)
+            .fetcher(fetcher)
+            .build()
+            .expect("the builder validates");
+        (debian, asked)
+    }
+
+    #[test]
+    fn a_mirror_without_the_by_hash_copies_serves_the_index_by_name() {
+        // A partial mirror or a caching proxy carries the named index and not
+        // the by-hash copies. apt asks for the digest first and the name last,
+        // and so does this.
+        let index = b"Package: p\nVersion: 1\nArchitecture: amd64\nFilename: pool/p.deb\n\
+                      SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+        let named = "https://mirror.example/debian/dists/trixie/main/binary-amd64/Packages";
+        let by_hash = format!(
+            "https://mirror.example/debian/dists/trixie/main/binary-amd64/by-hash/SHA256/{}",
+            Algorithm::Sha256.hex_of(index),
+        );
+        let (mut debian, asked) = by_hash_archive(index, &[(named.to_string(), index.to_vec())]);
+        let available = debian.available().expect("the index is served by name");
+        assert!(available.contains("p"));
+        assert_eq!(
+            asked.lock().unwrap()[1..],
+            [by_hash.clone(), named.to_string()],
+            "the digest path first, the name last",
+        );
+
+        // Bytes that arrive at the digest path and do not match it are a
+        // refusal, not a reason to ask elsewhere: the name is never asked.
+        let (mut debian, asked) = by_hash_archive(
+            index,
+            &[
+                (by_hash.clone(), b"something else".to_vec()),
+                (named.to_string(), index.to_vec()),
+            ],
+        );
+        let err = debian.available().expect_err("the by-hash bytes are wrong");
+        assert!(matches!(err, DebianError::Digest { .. }), "{err}");
+        assert!(
+            !asked.lock().unwrap().iter().any(|url| url == named),
+            "{:?}",
+            asked.lock().unwrap(),
+        );
+    }
+
+    /// One index stanza for `name` at `version`, its digest standing in for a
+    /// package nothing downloads, with `extra` fields.
+    fn index_stanza(name: &str, version: &str, extra: &str) -> String {
+        format!(
+            "Package: {name}\nVersion: {version}\nArchitecture: amd64\n\
+             Filename: pool/{name}_{version}.deb\nSHA256: {}\n{extra}\n",
+            Algorithm::Sha256.hex_of(format!("{name}{version}").as_bytes()),
+        )
+    }
+
+    /// The release body of `suite`, offering one uncompressed index `index`,
+    /// with `extra` fields.
+    fn release_of(suite: &str, extra: &str, index: &str) -> String {
+        format!(
+            "Suite: {suite}\nArchitectures: amd64\nComponents: main\n{extra}SHA256:\n \
+             {} {} main/binary-amd64/Packages\n",
+            Algorithm::Sha256.hex_of(index.as_bytes()),
+            index.len(),
+        )
+    }
+
+    /// A trixie primary, and an `experimental` repository whose release is
+    /// signed by a key of the test's and marked as `experimental` is marked.
+    fn trixie_with_experimental(scratch: &Scratch) -> DebianBuilder {
+        use crate::provision::openpgp::fixture;
+        let primary = format!(
+            "{}{}",
+            index_stanza("base-files", "13.8", "Priority: required\n"),
+            index_stanza("libc6", "2.41", "Priority: required\n"),
+        );
+        let experimental = format!(
+            "{}{}{}",
+            index_stanza("libc6", "2.43", "Priority: required\n"),
+            index_stanza("tool", "2.0", "Depends: libc6 (>= 2.43)\n"),
+            index_stanza("vendor-required", "1.0", "Priority: required\n"),
+        );
+        let key = fixture::signing_key("experimental <archive@test.invalid>");
+        let keyring = scratch.join("experimental.gpg");
+        std::fs::write(&keyring, fixture::binary([key.to_public_key()]))
+            .expect("the keyring is writable");
+        let signed = fixture::clearsign(
+            &key,
+            &release_of("experimental", "NotAutomatic: yes\n", &experimental),
+        );
+        let fetcher = Table {
+            bodies: [
+                (
+                    "https://deb.example/debian/dists/trixie/Release".to_string(),
+                    release_of("trixie", "", &primary).into_bytes(),
+                ),
+                (
+                    "https://deb.example/debian/dists/trixie/main/binary-amd64/Packages"
+                        .to_string(),
+                    primary.into_bytes(),
+                ),
+                (
+                    "https://exp.example/debian/dists/experimental/InRelease".to_string(),
+                    signed.into_bytes(),
+                ),
+                (
+                    "https://exp.example/debian/dists/experimental/main/binary-amd64/Packages"
+                        .to_string(),
+                    experimental.into_bytes(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            asked: std::sync::Arc::default(),
+        };
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror("https://deb.example/debian")
+            .trust_unsigned(true)
+            .repository(
+                Repository::builder("experimental")
+                    .mirror("https://exp.example/debian")
+                    .keyring(&keyring)
+                    .build()
+                    .expect("the repository builds"),
+            )
+            .fetcher(fetcher)
+    }
+
+    /// Each planned package's name, version, and the archive it came from.
+    fn planned(plan: &Plan) -> Vec<(String, String, usize)> {
+        plan.packages
+            .iter()
+            .map(|p| (p.name.clone(), p.version.clone(), p.archive))
+            .collect()
+    }
+
+    #[test]
+    fn a_release_marked_not_automatic_supplies_only_what_it_is_asked_for() {
+        // experimental carries a newer libc6 and marks a package of its own
+        // required. Named alongside the primary, it supplies neither: its
+        // marking ranks it below trixie, and the base is seeded from the
+        // primary alone.
+        let scratch = Scratch::new("debian-not-automatic");
+        let plan = trixie_with_experimental(&scratch)
+            .build()
+            .expect("the builder validates")
+            .resolve()
+            .expect("the merged plan resolves");
+        assert_eq!(
+            planned(&plan),
+            [
+                ("base-files".into(), "13.8".into(), 0),
+                ("libc6".into(), "2.41".into(), 0)
+            ],
+        );
+
+        // Asked for by release, experimental supplies the package and the
+        // libc6 it needs, which trixie's cannot satisfy.
+        let plan = trixie_with_experimental(&scratch)
+            .include(["tool/experimental"])
+            .build()
+            .expect("the builder validates")
+            .resolve()
+            .expect("the merged plan resolves");
+        assert_eq!(
+            planned(&plan),
+            [
+                ("base-files".into(), "13.8".into(), 0),
+                ("libc6".into(), "2.43".into(), 1),
+                ("tool".into(), "2.0".into(), 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_release_the_selection_names_must_be_one_a_repository_publishes() {
+        let scratch = Scratch::new("debian-named-release");
+        let refused = trixie_with_experimental(&scratch)
+            .include(["tool/sid"])
+            .build();
+        assert!(
+            matches!(&refused, Err(DebianError::Config { reason }) if reason.contains("\"sid\"")),
+            "{refused:?}",
+        );
+        let refused = trixie_with_experimental(&scratch)
+            .exclude(["libc6/experimental"])
+            .build();
+        assert!(
+            matches!(&refused, Err(DebianError::Config { reason }) if reason.contains("exclude")),
+            "{refused:?}",
+        );
+    }
+
+    #[test]
+    fn a_stream_the_decoder_refuses_is_not_reported_as_too_long() {
+        // A corrupt stream and an over-long one are different faults with
+        // different remedies, so they read differently, and the decoder's own
+        // refusal is the cause rather than a string folded into the reason.
+        use std::io::Write as _;
+        let text = b"Package: p\nVersion: 1\n".repeat(64);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&text).unwrap();
+        let mut corrupt = encoder.finish().unwrap();
+        // Past the ten-byte header, inside the deflate stream.
+        for byte in &mut corrupt[12..20] {
+            *byte ^= 0xff;
+        }
+        let url = "https://mirror.example/debian/dists/trixie/main/binary-amd64/Packages.gz";
+
+        let err = decompress_index(url, &corrupt, MAX_UNSIZED_INDEX)
+            .expect_err("a corrupt stream is refused");
+        match &err {
+            DebianError::Index {
+                reason,
+                source: Some(_),
+                ..
+            } => assert!(!reason.contains("expands past"), "{err}"),
+            other => panic!("expected the decoder's refusal as the cause, got {other:?}"),
+        }
+        assert!(std::error::Error::source(&err).is_some());
     }
 
     #[test]
@@ -4111,6 +4526,44 @@ mod tests {
     }
 
     #[test]
+    fn a_keyring_named_for_a_primary_trusted_unsigned_is_refused() {
+        // One setting asks for the release to be verified and the other for it
+        // not to be, and neither may quietly win. The keyring is not read: the
+        // path named here does not exist, and the refusal is the contradiction
+        // rather than the missing file.
+        let refused = Debian::builder("trixie")
+            .mirror("file:///srv/debs")
+            .keyring("/nonexistent/keyring.gpg")
+            .trust_unsigned(true)
+            .build();
+        assert!(
+            matches!(&refused, Err(DebianError::Config { reason })
+                if reason.contains("trust_unsigned") && reason.contains("keyring.gpg")),
+            "{refused:?}",
+        );
+        // Either alone is a configuration.
+        assert!(
+            Debian::builder("trixie")
+                .mirror("file:///srv/debs")
+                .trust_unsigned(true)
+                .build()
+                .is_ok()
+        );
+        let scratch = Scratch::new("debian-primary-keyring");
+        let keyring = scratch.join("archive-keyring.gpg");
+        std::fs::write(&keyring, EMBEDDED_KEYRING).expect("the keyring is writable");
+        let mut debian = Debian::builder("trixie")
+            .keyring(&keyring)
+            .build()
+            .expect("a keyring alone is a configuration");
+        let (config, _) = debian.split();
+        assert!(matches!(
+            config.repositories[0].trust,
+            repository::Trust::Signed(_)
+        ));
+    }
+
+    #[test]
     fn a_negative_source_date_epoch_is_refused() {
         // The account tools read the variable as unsigned and date from the
         // clock when it is negative, so the setting would silently do nothing.
@@ -4446,8 +4899,22 @@ mod tests {
         // directory already, and nothing is copied.
         assert!(private_copy(&tree, None, &install).unwrap().is_none());
         // Nor when the caller named that very directory, which stays theirs.
+        // The download has created it by the time the copy is asked about.
         let own = PackageCache::derived(&tree, DEB_CACHE);
-        assert!(private_copy(&tree, Some(&own), &install).unwrap().is_none());
+        let in_own = installables(&own, &[("one", deb_of(&data_tar(&[])))]);
+        assert!(private_copy(&tree, Some(&own), &in_own).unwrap().is_none());
+        // The same directory spelled another way is the same directory: taken
+        // for a copy of the run's own, it would go with the run, and the
+        // caller's cache with it.
+        std::os::unix::fs::symlink(".", dir.join("via")).expect("the link is creatable");
+        let aliased = dir.join(format!("via/tree{DEB_CACHE}"));
+        assert_ne!(aliased, own, "the spellings differ");
+        assert!(
+            private_copy(&tree, Some(&aliased), &in_own)
+                .unwrap()
+                .is_none()
+        );
+        assert!(own.join(&name).is_file(), "the caller's cache stays");
     }
 
     /// A plan installing one package, `pool/one.deb` at `sha256`, from one

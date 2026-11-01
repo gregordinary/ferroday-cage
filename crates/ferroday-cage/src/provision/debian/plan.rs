@@ -177,9 +177,10 @@ pub struct PlannedPackage {
     /// Which of [`Plan::archives`] this package's winning version came from,
     /// as an index into that list.
     ///
-    /// Resolution is highest-version-wins across the merged repositories, so
-    /// with more than one configured this is the only thing that says where a
-    /// package will actually be fetched from.
+    /// Each name resolves to one version across the merged repositories,
+    /// ranked by the release that offers it and then by version, so with more
+    /// than one configured this is the only thing that says where a package
+    /// will actually be fetched from.
     pub archive: usize,
     /// The archive's estimate of the space this package occupies once
     /// installed, in kibibytes, when the archive states one.
@@ -542,7 +543,7 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Debian
 /// Reads an optional numeric field, reporting a refusal the same way.
 ///
 /// The rule is [`document::number`]'s.
-fn number<T: std::str::FromStr>(
+fn number<T: std::str::FromStr + std::fmt::Display>(
     value: Option<&str>,
     field: &str,
     at: &str,

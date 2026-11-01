@@ -118,6 +118,19 @@ const CMETHOPT: &str = "var/lib/dpkg/cmethopt";
 /// half-built.
 const POLICY_RC_D: &str = "usr/sbin/policy-rc.d";
 
+/// The daemon launcher a maintainer script reaches when it starts a service
+/// directly rather than through `invoke-rc.d`, which [`POLICY_RC_D`] therefore
+/// does not stop. Policy forbids the shortcut and some scripts take it, so
+/// `debootstrap` and `mmdebstrap` both replace the launcher while packages
+/// configure, and so does this.
+const START_STOP_DAEMON: &str = "usr/sbin/start-stop-daemon";
+
+/// The launcher's stand-in: it starts nothing and succeeds, saying so, in the
+/// words `debootstrap`'s stand-in uses. Also the marker that identifies a file
+/// as the stand-in this bootstrap wrote.
+const START_STOP_DAEMON_STUB: &str =
+    "#!/bin/sh\necho\necho \"Warning: Fake start-stop-daemon called, doing nothing\"\n";
+
 /// The temporary `awk` the core install resolves the virtual dependency
 /// through, before the real mawk is configured.
 const AWK: &str = "usr/bin/awk";
@@ -389,12 +402,16 @@ pub(crate) fn configure(
     if single {
         install_ownership_stubs(&tree)?;
     }
+    // After the unpack wave, which lays dpkg's real launcher again, and before
+    // the configure wave whose scripts might call it, as debootstrap does.
+    stub_out(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
 
-    // Every package is now unpacked and no maintainer script has run. Lay the
-    // caller's pre-configure overlay here, so it overwrites the packages' just-
-    // unpacked files — a shipped conffile among them — and the configuration
-    // wave's scripts read the injected values. Placing it before the unpack
-    // wave instead would leave the files for dpkg to treat as conffile
+    // Every package is now unpacked, so every preinst has run, and the core
+    // packages above are configured; no other package's postinst has run. Lay
+    // the caller's pre-configure overlay here, so it overwrites the packages'
+    // just-unpacked files — a shipped conffile among them — and the configure
+    // wave's postinst scripts read the injected values. Placing it before the
+    // unpack wave instead would leave the files for dpkg to treat as conffile
     // conflicts; placing it after configuration would be too late to steer it.
     if let Some(overlay) = overlay {
         super::super::extract::overlay_tree(staging, overlay, None)
@@ -420,6 +437,7 @@ pub(crate) fn configure(
     if single {
         restore_ownership_stubs(&tree)?;
     }
+    restore_stubbed(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
     remove_policy_rc_d(&tree)?;
     clear_run_state(&tree)?;
     if let (Some(epoch), Some(found)) = (source_date_epoch, &found) {
@@ -520,6 +538,10 @@ pub(crate) fn configure_delta(
         observer,
     )?;
 
+    // The base's launcher is shadowed by the stand-in for the configure wave,
+    // after the unpack, which may lay a newer real one into the upper.
+    write_script(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
+
     // The caller's pre-configure overlay, after unpack so it overwrites the
     // just-unpacked files — a shipped conffile among them — and before configure
     // so the maintainer scripts read the injected values.
@@ -550,6 +572,7 @@ pub(crate) fn configure_delta(
     if single {
         restore_delta_ownership_stubs(&tree)?;
     }
+    unshadow(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
     remove_policy_rc_d(&tree)?;
     clear_run_state(&tree)?;
     if let (Some(epoch), Some(found)) = (source_date_epoch, &found) {
@@ -588,7 +611,7 @@ fn install_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
 /// tools through the overlay again.
 ///
 /// Conditional on the file still holding the stub body, for the reason
-/// [`restore_ownership_stubs`]'s deletion is: the increment's own unpack wave
+/// [`restore_stubbed`]'s deletion is: the increment's own unpack wave
 /// runs after the stubs are written, so a package it installs — or the caller's
 /// pre-configure overlay — may have laid a real tool over one. Removing that
 /// would delete a file the merged database says the increment installed, and
@@ -597,10 +620,20 @@ fn install_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
 /// reason.
 fn restore_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        let path = format!("usr/bin/{tool}");
-        if is_ownership_stub(upper, &path) {
-            remove_if_present(upper, &path)?;
-        }
+        unshadow(upper, &format!("usr/bin/{tool}"), OWNERSHIP_STUB)?;
+    }
+    Ok(())
+}
+
+/// Removes the stand-in `stub` that shadows a base's program at `path` in an
+/// upper, revealing the base's own again, where the file still holds `stub`.
+///
+/// A file holding anything else is left: the increment's unpack wave, or the
+/// caller's pre-configure overlay, laid it after the stand-in was written, and
+/// the merged database may say the increment installed it.
+fn unshadow(upper: &Rooted, path: &str, stub: &str) -> Result<(), DebianError> {
+    if holds_stub(upper, path, stub) {
+        remove_if_present(upper, path)?;
     }
     Ok(())
 }
@@ -837,8 +870,8 @@ fn run_dpkg(
     }
 }
 
-/// The packages the tree's dpkg status database records as `install ok
-/// installed`.
+/// The packages the tree's dpkg status database records as present and
+/// configured, as [`is_configured`] reads a `Status` field.
 fn installed_packages(tree: &Rooted) -> Result<HashSet<String>, DebianError> {
     let text = read_text(tree, STATUS, MAX_STATUS).map_err(at(
         "reading the dpkg status database",
@@ -848,7 +881,7 @@ fn installed_packages(tree: &Rooted) -> Result<HashSet<String>, DebianError> {
     let mut installed = HashSet::new();
     for stanza in document::parse(&text) {
         if let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status"))
-            && status == "install ok installed"
+            && is_configured(status)
         {
             installed.insert(name.to_string());
         }
@@ -856,7 +889,27 @@ fn installed_packages(tree: &Rooted) -> Result<HashSet<String>, DebianError> {
     Ok(installed)
 }
 
-/// Verifies every selected package reached `install ok installed`.
+/// Whether a dpkg `Status` field describes a package present and configured in
+/// the tree.
+///
+/// The field is three words, `<want> <error flag> <state>`. Only the last two
+/// speak to what is on disk: the state must be `installed` — not `unpacked`,
+/// `half-configured`, or `config-files` — and the error flag must be `ok`, since
+/// a package awaiting reinstallation cannot be assumed whole. The want is the
+/// administrator's intention rather than the tree's contents, so a held package
+/// (`hold ok installed`) counts exactly as an `install ok installed` one does.
+///
+/// The one reading for every question this layer puts to a status database:
+/// whether a bootstrap's packages reached the installed state, whether a root
+/// holds the archive keyring package, and what a base layer already supplies.
+pub(super) fn is_configured(status: &str) -> bool {
+    let mut words = status.split_ascii_whitespace();
+    let (_want, flag, state) = (words.next(), words.next(), words.next());
+    words.next().is_none() && flag == Some("ok") && state == Some("installed")
+}
+
+/// Verifies every selected package reached the installed state, as
+/// [`is_configured`] reads it.
 fn verify_installed(tree: &Rooted, selected: &[String]) -> Result<(), DebianError> {
     let installed = installed_packages(tree)?;
     let mut missing: Vec<String> = selected
@@ -950,65 +1003,78 @@ fn remove_policy_rc_d(tree: &Rooted) -> Result<(), DebianError> {
     remove_if_present(tree, POLICY_RC_D)
 }
 
-/// Replaces the ownership tools with stubs that succeed.
-///
-/// The real tool is preserved beside the stub on first call; a second call
-/// (after an unpack wave re-lays the real tool) only rewrites the stub.
-///
-/// Presence is asked of the name rather than of what it resolves to, so a
-/// symbolic link occupying either path counts as the tool being there and is
-/// moved aside as one, never followed.
+/// Replaces the ownership tools with stubs that succeed, as [`stub_out`]
+/// replaces a program.
 fn install_ownership_stubs(tree: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        let path = format!("usr/bin/{tool}");
-        let saved = format!("{path}.fcage-real");
-        if tree.exists(&path).map_err(at("inspecting", tree, &path))?
-            && !tree
-                .exists(&saved)
-                .map_err(at("inspecting", tree, &saved))?
-        {
-            tree.rename(&path, &saved)
-                .map_err(at("moving aside", tree, &path))?;
-        }
-        write_script(tree, &path, OWNERSHIP_STUB)?;
+        stub_out(tree, &format!("usr/bin/{tool}"), OWNERSHIP_STUB)?;
     }
     Ok(())
 }
 
-/// Restores the real ownership tools and removes the bootstrap-only copies.
+/// Restores the real ownership tools and removes the bootstrap-only copies, as
+/// [`restore_stubbed`] restores a program.
 ///
-/// A tool the rootfs never carried has nothing to restore, so its stub is
-/// deleted rather than left behind: a `chown` that silently succeeds is a
-/// worse outcome in a finished rootfs than no `chown` at all. The deletion is
-/// conditional on the file still holding the stub body, so a real tool that
-/// arrived after the last stub was written survives — as does anything the read
-/// refuses to follow, a symbolic link at the path among them.
+/// A `chown` that silently succeeds is a worse outcome in a finished rootfs
+/// than no `chown` at all, which is why a stub with no real tool to put back is
+/// deleted rather than left.
 fn restore_ownership_stubs(tree: &Rooted) -> Result<(), DebianError> {
     for tool in OWNERSHIP_TOOLS {
-        let path = format!("usr/bin/{tool}");
-        let saved = format!("{path}.fcage-real");
-        if tree
-            .exists(&saved)
-            .map_err(at("inspecting", tree, &saved))?
-        {
-            tree.rename(&saved, &path)
-                .map_err(at("restoring", tree, &path))?;
-        } else if is_ownership_stub(tree, &path) {
-            remove_if_present(tree, &path)?;
-        }
+        restore_stubbed(tree, &format!("usr/bin/{tool}"), OWNERSHIP_STUB)?;
     }
     Ok(())
 }
 
-/// Whether the file at `path` still holds the ownership stub's body.
+/// Replaces the program at `path` with the script `stub` for the configure
+/// waves, keeping the real one beside it under a `.fcage-real` suffix.
+///
+/// The real program is moved aside on the first call only; a second call,
+/// after an unpack wave re-lays the real program, only rewrites the stub.
+/// Presence is asked of the name rather than of what it resolves to, so a
+/// symbolic link occupying either path counts as the program being there and
+/// is moved aside as one, never followed.
+fn stub_out(tree: &Rooted, path: &str, stub: &str) -> Result<(), DebianError> {
+    let saved = format!("{path}.fcage-real");
+    if tree.exists(path).map_err(at("inspecting", tree, path))?
+        && !tree
+            .exists(&saved)
+            .map_err(at("inspecting", tree, &saved))?
+    {
+        tree.rename(path, &saved)
+            .map_err(at("moving aside", tree, path))?;
+    }
+    write_script(tree, path, stub)
+}
+
+/// Puts back the program [`stub_out`] moved aside from `path`, or removes the
+/// stub where there is no real program to put back.
+///
+/// The removal is conditional on the file still holding `stub`, so a real
+/// program that arrived after the stub was written survives — as does anything
+/// the read refuses to follow, a symbolic link at the path among them.
+fn restore_stubbed(tree: &Rooted, path: &str, stub: &str) -> Result<(), DebianError> {
+    let saved = format!("{path}.fcage-real");
+    if tree
+        .exists(&saved)
+        .map_err(at("inspecting", tree, &saved))?
+    {
+        tree.rename(&saved, path)
+            .map_err(at("restoring", tree, path))?;
+    } else if holds_stub(tree, path, stub) {
+        remove_if_present(tree, path)?;
+    }
+    Ok(())
+}
+
+/// Whether the file at `path` still holds `stub`.
 ///
 /// Read no further than the stub's own length: a file longer than that is not
 /// the stub, whatever it holds, and the read refuses it rather than holding it.
 /// Anything the read refuses, a symbolic link at the path among them, is not
 /// the stub either.
-fn is_ownership_stub(tree: &Rooted, path: &str) -> bool {
-    tree.read(path, OWNERSHIP_STUB.len() as u64)
-        .is_ok_and(|body| body == OWNERSHIP_STUB.as_bytes())
+fn holds_stub(tree: &Rooted, path: &str, stub: &str) -> bool {
+    tree.read(path, stub.len() as u64)
+        .is_ok_and(|body| body == stub.as_bytes())
 }
 
 /// Points `/usr/bin/awk` at mawk for the core install, so the base packages'
@@ -1049,8 +1115,25 @@ fn write_dselect_method(tree: &Rooted) -> Result<(), DebianError> {
 /// rotates to, which a copy written now would never learn. A root that does
 /// not hold the package, which is one without `apt`, gets the embedded keyring
 /// at [`TRUST_ANCHOR_STEM`], so its line still verifies.
+///
+/// Each line carries the posture the bootstrap verified its repository under,
+/// so the root's `apt` accepts what the bootstrap accepted. A repository that
+/// [allows a stale release](Repository::allow_stale) gets `check-valid-until=no`,
+/// which is what lets `apt-get update` read a snapshot's expired release.
+///
+/// A repository whose primary mirror is a `file://` URL gets no source at all,
+/// nor a keyring. The URL names a path on the host the bootstrap ran on, which
+/// a sandbox rooted at the finished tree does not see, and an unreachable
+/// source fails every `apt-get update` in the root. A caller who binds the pool
+/// into such a sandbox adds the line for the path it is bound at.
 fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Result<(), DebianError> {
     for (index, repository) in repositories.iter().enumerate() {
+        // The primary mirror; a snapshot backstop is not carried into the
+        // installed system's apt configuration.
+        let mirror = &repository.mirrors[0];
+        if names_host_path(mirror) {
+            continue;
+        }
         let (list_path, anchor_path) = if index == 0 {
             (
                 "etc/apt/sources.list".to_string(),
@@ -1067,32 +1150,39 @@ fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Resul
             )
         };
 
-        let options = match &repository.trust {
+        let mut options = match &repository.trust {
             Trust::Archive if ships_archive_keyring(tree)? => {
-                format!("[signed-by={}]", keyring_path(PACKAGE_KEYRING_STEM))
+                format!("signed-by={}", keyring_path(PACKAGE_KEYRING_STEM))
             }
             Trust::Archive => {
                 write_keyring(tree, &anchor_path, super::EMBEDDED_KEYRING)?;
-                format!("[signed-by={anchor_path}]")
+                format!("signed-by={anchor_path}")
             }
             Trust::Signed(keyring) => {
                 write_keyring(tree, &anchor_path, keyring)?;
-                format!("[signed-by={anchor_path}]")
+                format!("signed-by={anchor_path}")
             }
-            Trust::Unsigned => "[trusted=yes]".to_string(),
+            Trust::Unsigned => "trusted=yes".to_string(),
         };
+        if repository.allow_stale {
+            options.push_str(" check-valid-until=no");
+        }
 
-        // The primary mirror; a snapshot backstop is not carried into the
-        // installed system's apt configuration.
-        let mirror = &repository.mirrors[0];
         let line = format!(
-            "deb {options} {mirror} {} {}\n",
+            "deb [{options}] {mirror} {} {}\n",
             repository.suite,
             repository.components.join(" "),
         );
         write_sources_file(tree, &list_path, &line)?;
     }
     Ok(())
+}
+
+/// Whether `mirror` names a path on the host rather than a server: a `file://`
+/// URL, scheme matched case-insensitively as RFC 3986 has it.
+fn names_host_path(mirror: &str) -> bool {
+    crate::provision::fetch::scheme_of(mirror)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
 }
 
 /// Whether the tree holds the archive keyring [`ARCHIVE_KEYRING_PACKAGE`]
@@ -1102,6 +1192,15 @@ fn write_repository_sources(tree: &Rooted, repositories: &[Repository]) -> Resul
 /// says whether the package is installed, and the package's file list says
 /// whether it owns the path: a file a script left there, or one a later
 /// release of the package stops shipping, is not one an upgrade keeps current.
+///
+/// It is asked of the package whichever repository supplied it. Any configured
+/// repository can supersede the package by offering a higher version at the
+/// primary's rank, and the keys its version installs are then the ones the
+/// primary's source trusts. That is the trust a repository is given by being
+/// configured at all, as [`DebianBuilder::repository`] documents, and the same
+/// trust apt gives a source of equal priority.
+///
+/// [`DebianBuilder::repository`]: super::DebianBuilder::repository
 fn ships_archive_keyring(tree: &Rooted) -> Result<bool, DebianError> {
     if !installed_packages(tree)?.contains(ARCHIVE_KEYRING_PACKAGE) {
         return Ok(false);
@@ -1268,6 +1367,53 @@ mod tests {
     }
 
     #[test]
+    fn the_daemon_launcher_is_a_stand_in_only_while_packages_configure() {
+        // A maintainer script that starts its service with start-stop-daemon
+        // rather than invoke-rc.d is not stopped by policy-rc.d, so the launcher
+        // itself starts nothing until the configure wave is over, as under
+        // debootstrap and mmdebstrap.
+        let (staging, tree) = rooted_tree("start-stop-daemon");
+        let real = b"\x7fELF the real start-stop-daemon\n";
+        tree.write(START_STOP_DAEMON, real).unwrap();
+
+        stub_out(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("diverted");
+        assert_eq!(
+            fs::read_to_string(staging.join(START_STOP_DAEMON)).unwrap(),
+            START_STOP_DAEMON_STUB,
+        );
+        restore_stubbed(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("restored");
+        assert_eq!(fs::read(staging.join(START_STOP_DAEMON)).unwrap(), real);
+        assert!(
+            !staging
+                .join(format!("{START_STOP_DAEMON}.fcage-real"))
+                .exists()
+        );
+
+        // A root that never carried the launcher is not given the stand-in.
+        let (staging, tree) = rooted_tree("start-stop-daemon-absent");
+        stub_out(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("diverted");
+        restore_stubbed(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("restored");
+        assert!(fs::symlink_metadata(staging.join(START_STOP_DAEMON)).is_err());
+    }
+
+    #[test]
+    fn an_increment_reveals_the_bases_launcher_unless_it_laid_its_own() {
+        // In an upper the stand-in shadows the base's launcher, and removing it
+        // reveals the base's again. One the increment laid over the stand-in is
+        // the increment's, and stays.
+        let (upper, tree) = rooted_tree("delta-start-stop-daemon");
+        write_script(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).unwrap();
+        unshadow(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("unshadowed");
+        assert!(!upper.join(START_STOP_DAEMON).exists());
+
+        write_script(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).unwrap();
+        tree.write(START_STOP_DAEMON, b"\x7fELF a newer dpkg's\n")
+            .unwrap();
+        unshadow(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("unshadowed");
+        assert!(upper.join(START_STOP_DAEMON).is_file());
+    }
+
+    #[test]
     fn a_cancelled_bootstrap_stops_before_the_next_wave() {
         // A wave runs for minutes and is not interrupted once begun, so the
         // boundary before one is where a cancelled bootstrap stops, and it stops
@@ -1413,6 +1559,45 @@ mod tests {
     }
 
     #[test]
+    fn a_status_reads_as_configured_by_its_flag_and_state_alone() {
+        // The want is the administrator's intention, not the tree's contents:
+        // a held package is as present as an installed one. Every reader of
+        // the database answers with this one rule, so a bootstrap's own check
+        // and a layered build's reading of its base cannot disagree.
+        for status in [
+            "install ok installed",
+            "hold ok installed",
+            "deinstall ok installed",
+        ] {
+            assert!(is_configured(status), "{status}");
+        }
+        for status in [
+            "install ok unpacked",
+            "install ok half-configured",
+            "deinstall ok config-files",
+            "install reinstreq installed",
+            "install ok",
+            "install ok installed extra",
+        ] {
+            assert!(!is_configured(status), "{status}");
+        }
+
+        // A bootstrap's verification asks the same question of the database.
+        let (_staging, tree) = rooted_tree("status-held");
+        tree.write(
+            STATUS,
+            b"Package: held\nStatus: hold ok installed\n\n\
+              Package: broken\nStatus: install reinstreq installed\n",
+        )
+        .unwrap();
+        verify_installed(&tree, &["held".to_string()]).expect("a held package is installed");
+        assert!(matches!(
+            verify_installed(&tree, &["broken".to_string()]),
+            Err(DebianError::NotConfigured { packages }) if packages == ["broken"],
+        ));
+    }
+
+    #[test]
     fn a_default_primary_without_the_keyring_package_gets_the_embedded_keyring() {
         // A root without apt holds no keyring package, or dpkg's records do not
         // say it ships the file a line would name. The embedded keyring is then
@@ -1541,7 +1726,7 @@ mod tests {
             None,
         );
         let local = Repository {
-            mirrors: vec!["file:///srv/local-debs".to_string()],
+            mirrors: vec!["https://debs.example/local".to_string()],
             suite: "trixie".to_string(),
             components: vec!["main".to_string()],
             trust: Trust::Unsigned,
@@ -1554,11 +1739,93 @@ mod tests {
             .expect("the local entry exists");
         assert_eq!(
             entry,
-            "deb [trusted=yes] file:///srv/local-debs trixie main\n",
+            "deb [trusted=yes] https://debs.example/local trixie main\n",
         );
         assert!(
             !staging.join("usr/share/keyrings/local.gpg").exists(),
             "an unsigned repository writes no keyring",
+        );
+    }
+
+    #[test]
+    fn a_repository_on_a_host_path_writes_no_source() {
+        // A file:// URL names a directory on the host the bootstrap ran on,
+        // which a sandbox rooted at the finished tree does not see, and an
+        // unreachable source fails every apt-get update there. Neither its
+        // line nor its keyring is written; the other sources are.
+        let (staging, tree) = rooted_tree("sources-host-path");
+        let primary = signed_repo(
+            "http://deb.debian.org/debian",
+            "trixie",
+            &["main"],
+            b"archive-keyring",
+            None,
+        );
+        let pool = Repository {
+            mirrors: vec!["file:///srv/local-debs".to_string()],
+            suite: "trixie".to_string(),
+            components: vec!["main".to_string()],
+            trust: Trust::Unsigned,
+            allow_stale: false,
+            name: Some("local".to_string()),
+        };
+        let signed_pool = signed_repo(
+            "FILE:///srv/signed-debs",
+            "trixie",
+            &["main"],
+            b"pool-keyring",
+            Some("signed"),
+        );
+        write_repository_sources(&tree, &[primary, pool, signed_pool])
+            .expect("the sources are written");
+
+        assert!(staging.join("etc/apt/sources.list").is_file());
+        for absent in [
+            "etc/apt/sources.list.d/local.list",
+            "etc/apt/sources.list.d/signed.list",
+            "usr/share/keyrings/signed.gpg",
+        ] {
+            assert!(
+                fs::symlink_metadata(staging.join(absent)).is_err(),
+                "{absent}"
+            );
+        }
+
+        // A primary on a host path leaves the root no sources.list at all.
+        let (staging, tree) = rooted_tree("sources-host-path-primary");
+        let primary = signed_repo("file:///srv/mirror", "trixie", &["main"], b"k", None);
+        write_repository_sources(&tree, &[primary]).expect("the sources are written");
+        assert!(fs::symlink_metadata(staging.join("etc/apt/sources.list")).is_err());
+        assert!(
+            fs::symlink_metadata(
+                staging.join(keyring_path(TRUST_ANCHOR_STEM).trim_start_matches('/'))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_repository_allowing_a_stale_release_lets_the_roots_apt_read_one() {
+        // The bootstrap accepted the snapshot's expired release, so the root's
+        // apt is told to as well, or its first update refuses the release the
+        // root was built from.
+        let (staging, tree) = rooted_tree("sources-stale");
+        let mut primary = signed_repo(
+            "http://snapshot.debian.org/archive/debian/20250101T000000Z",
+            "trixie",
+            &["main"],
+            b"keyring-bytes",
+            None,
+        );
+        primary.allow_stale = true;
+        write_repository_sources(&tree, &[primary]).expect("the sources are written");
+        assert_eq!(
+            fs::read_to_string(staging.join("etc/apt/sources.list")).unwrap(),
+            format!(
+                "deb [signed-by={} check-valid-until=no] \
+                 http://snapshot.debian.org/archive/debian/20250101T000000Z trixie main\n",
+                keyring_path(TRUST_ANCHOR_STEM)
+            ),
         );
     }
 
@@ -1594,7 +1861,13 @@ mod tests {
             std::os::unix::fs::symlink(&victim, &planted).unwrap();
         }
 
-        let primary = signed_repo("file:///srv/pool", "trixie", &["main"], b"anchor", None);
+        let primary = signed_repo(
+            "https://deb.example/debian",
+            "trixie",
+            &["main"],
+            b"anchor",
+            None,
+        );
         write_repository_sources(&tree, &[primary]).expect("the sources are written");
         symlink_awk(&tree).expect("the awk shim is linked");
         remove_policy_rc_d(&tree).expect("the policy is removed");
@@ -1614,7 +1887,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&sources).unwrap(),
             format!(
-                "deb [signed-by={}] file:///srv/pool trixie main\n",
+                "deb [signed-by={}] https://deb.example/debian trixie main\n",
                 keyring_path(TRUST_ANCHOR_STEM)
             ),
         );

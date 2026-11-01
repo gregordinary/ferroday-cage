@@ -15,12 +15,14 @@
 //! | File | What it is | Where it comes from |
 //! | --- | --- | --- |
 //! | `CONTENTS` | every installed path, with a digest and mtime per file | computed while merging |
-//! | `COUNTER` | the global merge ordinal | the root's `/var/cache/edb/counter` |
-//! | `BINPKGMD5` | the MD5 of the container it came from | the index record, verbatim |
+//! | `COUNTER` | the global merge ordinal | the root's `/var/cache/edb/counter`, and every entry's own |
+//! | `BINPKGMD5` | the MD5 of the container it came from | the container, as portage takes it |
 //!
-//! `BINPKGMD5` needs no computation. `CONTENTS` does, and its `obj` lines carry
-//! an MD5 — a bookkeeping checksum portage compares to decide whether a file
-//! has been edited since it was merged, never a trust decision.
+//! `BINPKGMD5` is taken over the container as it was read, which the plan's MD5
+//! has already been held to. `CONTENTS` is computed while merging, and its
+//! `obj` lines carry an MD5 too — a bookkeeping checksum portage compares to
+//! decide whether a file has been edited since it was merged, never a trust
+//! decision.
 //!
 //! # The one deliberate difference
 //!
@@ -124,9 +126,12 @@ enum Laid {
 ///
 /// # Errors
 ///
-/// Returns [`GentooError::Database`] for a container whose metadata does not
-/// name a package, [`GentooError::Io`] where the root could not be written, and
-/// whatever the extractor reports for an image archive it will not unpack.
+/// Returns [`GentooError::Container`] for a container that ships something the
+/// root's database cannot record: a metadata file whose name is not one path
+/// component, more than [`MAX_CONTENTS_ENTRIES`] paths, or a path or a link
+/// target that is not UTF-8. Returns [`GentooError::Io`] where the root could
+/// not be written or a merged file could not be read back, and whatever the
+/// extractor reports for an image archive it will not unpack.
 pub(super) fn merge(
     root: &Path,
     over: Option<&Path>,
@@ -150,9 +155,9 @@ pub(super) fn merge(
         // to one ordinary component; this is the boundary it crosses, so the
         // rule is asked again here.
         if !path::is_ordinary_component(name.as_bytes()) {
-            return Err(GentooError::database(
-                root,
-                format!("the container names a metadata file {name:?}"),
+            return Err(GentooError::container(
+                container,
+                format!("names a metadata file {name:?}, which is not one path component"),
             )
             .into());
         }
@@ -167,7 +172,7 @@ pub(super) fn merge(
     rooted
         .write(
             format!("{entry}/{BINPKGMD5_FILE}"),
-            format!("{}\n", planned.md5).as_bytes(),
+            format!("{}\n", package.md5()).as_bytes(),
         )
         .map_err(|err| GentooError::io("writing a package database entry", root, err))?;
     // Written with no trailing newline, as portage writes it, where every other
@@ -229,29 +234,34 @@ fn extract_image(
             // The extraction stops here rather than at the end: a container
             // that ships more paths than this is not one to keep unpacking
             // into a root while deciding what to do about it.
-            return Err(GentooError::database(
-                root,
-                format!("a container ships more than {MAX_CONTENTS_ENTRIES} paths"),
+            return Err(GentooError::container(
+                container,
+                format!("ships more than {MAX_CONTENTS_ENTRIES} paths"),
             )
             .into());
         }
         // A path is bytes and `CONTENTS` is a text file portage reads line by
         // line, so one that is not UTF-8 cannot be recorded -- and a path in
         // the database that does not describe what is on disk is worse than a
-        // refusal.
+        // refusal. A link's target is recorded on the same line, so it is
+        // held to the same rule.
         let path = String::from_utf8(components.join(&b'/').to_vec()).map_err(|_| {
-            ProvisionError::from(GentooError::database(
-                root,
-                "a container ships a path that is not UTF-8",
+            ProvisionError::from(GentooError::container(
+                container,
+                "ships a path that is not UTF-8",
             ))
         })?;
         laid.push(match entry.typeflag {
             b'5' => Laid::Directory(path),
-            b'2' => Laid::Link(
-                path,
-                String::from_utf8_lossy(&entry.link_target).into_owned(),
-                entry.mtime,
-            ),
+            b'2' => {
+                let target = String::from_utf8(entry.link_target.clone()).map_err(|_| {
+                    ProvisionError::from(GentooError::container(
+                        container,
+                        format!("ships a link at {path} whose target is not UTF-8"),
+                    ))
+                })?;
+                Laid::Link(path, target, entry.mtime)
+            }
             b'6' => Laid::Fifo(path),
             // Regular files, and the unknown typeflags POSIX says to treat as
             // regular files -- which is what the extractor does with them too.
@@ -298,8 +308,8 @@ fn render_contents(root: &Path, rooted: &Rooted, laid: &[Laid]) -> Result<String
     Ok(out)
 }
 
-/// The ordinal the last merge into `root` was stamped with, or zero for a root
-/// nothing has merged into yet.
+/// The ordinal the root's counter file says the last merge into `root` was
+/// stamped with, or zero where it holds none.
 ///
 /// Portage keeps one number per root and hands each merge the next, so the
 /// database records the order things were installed in. A stage3 arrives with
@@ -308,12 +318,17 @@ fn render_contents(root: &Path, rooted: &Rooted, laid: &[Laid]) -> Result<String
 /// packages sharing an ordinal is a database that cannot say which was merged
 /// first.
 ///
-/// A layered build therefore asks this of the base as well as of the upper and
-/// takes the greater, which is the merged view's answer. A value that does not
-/// parse is read as zero rather than refused: it is a bookkeeping ordinal, and
-/// a root whose counter a caller has damaged is better continued from than
-/// refused. A file past [`MAX_COUNTER_BYTES`] is refused, since that is not a
-/// value at all.
+/// The file is half of where the sequence continues from. Portage takes the
+/// greater of it and every ordinal its database's entries record, so a counter
+/// file removed or rolled back does not reissue one, and the install wave does
+/// the same with [`Installed::last_counter`](super::Installed::last_counter).
+/// A layered build asks this of the base as well as of the upper, which is the
+/// merged view's answer.
+///
+/// A value that does not parse is read as zero rather than refused, as portage
+/// reads one: it is a bookkeeping ordinal, and the entries' own still bound
+/// where the sequence continues. A file past [`MAX_COUNTER_BYTES`] is refused,
+/// since that is not a value at all.
 pub(super) fn counter_of(root: &Path, rooted: &Rooted) -> Result<u64, GentooError> {
     match rooted.read_if_present(COUNTER_FILE, MAX_COUNTER_BYTES) {
         Ok(Some(bytes)) => Ok(String::from_utf8_lossy(&bytes).trim().parse().unwrap_or(0)),
@@ -324,7 +339,9 @@ pub(super) fn counter_of(root: &Path, rooted: &Rooted) -> Result<u64, GentooErro
 
 #[cfg(test)]
 mod tests {
-    use super::super::gpkg::fixture::{Built, CPV, planned};
+    use std::collections::BTreeSet;
+
+    use super::super::gpkg::fixture::{Built, CHOST, CPV, planned_for};
     use super::*;
     use crate::provision::openpgp::fixture;
     use crate::scratch::Scratch;
@@ -336,6 +353,13 @@ mod tests {
 
     /// The same, for a container a test has bent.
     fn merged_container(tag: &str, counter: u64, built: Built) -> Scratch {
+        let (dir, merged) = merging(tag, counter, built);
+        merged.expect("the package merges");
+        dir
+    }
+
+    /// Merges a container a test has bent, and reports what happened.
+    fn merging(tag: &str, counter: u64, built: Built) -> (Scratch, Result<(), ProvisionError>) {
         let dir = Scratch::for_test("gentoo-vdb", tag);
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let container = dir.join("package.gpkg.tar");
@@ -343,19 +367,19 @@ mod tests {
         let root = dir.join("root");
         std::fs::create_dir_all(&root).expect("the root is created");
         let rooted = Rooted::open(&root).expect("the root opens");
-        let planned = planned(CPV, 1);
+        let planned = planned_for(CPV, 1, &container);
         let package = Package::read(
             std::fs::File::open(&container).expect("the container opens"),
             &container,
             &planned,
+            &BTreeSet::from([CHOST.to_string()]),
             &fixture::keyring(&key),
         )
         .expect("the container opens");
-        merge(
+        let merged = merge(
             &root, None, &rooted, &container, &package, &planned, counter,
-        )
-        .expect("the package merges");
-        dir
+        );
+        (dir, merged)
     }
 
     /// The entry the fixture package registers.
@@ -403,10 +427,13 @@ mod tests {
             [
                 "BINPKGMD5",
                 "BUILD_ID",
+                "BUILD_TIME",
                 "CATEGORY",
+                "CHOST",
                 "CONTENTS",
                 "COUNTER",
                 "PF",
+                "RDEPEND",
                 "SLOT",
                 "USE",
             ],
@@ -414,12 +441,13 @@ mod tests {
         // The metadata is written through verbatim.
         assert_eq!(read(&dir, "CATEGORY"), "sys-libs\n");
         assert_eq!(read(&dir, "SLOT"), "0/1\n");
-        // BINPKGMD5 carries the index's own value and a trailing newline;
+        // BINPKGMD5 carries the container's MD5 and a trailing newline;
         // COUNTER carries the ordinal and none, which is how portage writes
         // each of them.
+        let container = std::fs::read(dir.join("package.gpkg.tar")).expect("the container");
         assert_eq!(
             read(&dir, "BINPKGMD5"),
-            "3a61f698748c7323c87081584f383b3c\n"
+            format!("{}\n", Algorithm::Md5.hex_of(&container)),
         );
         assert_eq!(read(&dir, "COUNTER"), "42");
         // And the root's own counter advances with it, so the next merge --
@@ -483,6 +511,49 @@ mod tests {
             std::os::unix::fs::FileTypeExt::is_fifo(&laid.file_type()),
             "{laid:?}",
         );
+    }
+
+    #[test]
+    fn a_path_or_a_link_target_the_database_cannot_record_is_the_containers_failure() {
+        // `CONTENTS` is a text file portage reads line by line, and a link's
+        // target is on the same line as its path. Either one that is not UTF-8
+        // is what the container ships, so it is the container that is refused.
+        for (raw, why) in [
+            (
+                (&b"image/usr/lib/libz-\xff"[..], b'0', &b""[..]),
+                "a path that is not UTF-8",
+            ),
+            (
+                (&b"image/usr/lib/libz.so.1"[..], b'2', &b"libz-\xff"[..]),
+                "whose target is not UTF-8",
+            ),
+        ] {
+            let (dir, merged) = merging(
+                why,
+                1,
+                Built {
+                    raw: vec![raw],
+                    ..Built::ordinary()
+                },
+            );
+            let err = merged.expect_err(why);
+            let inner = std::error::Error::source(&err)
+                .and_then(|inner| inner.downcast_ref::<GentooError>());
+            assert!(
+                matches!(inner, Some(GentooError::Container { .. })),
+                "{why}: {err:?}",
+            );
+            assert!(
+                crate::ErrorChain::new(&err).to_string().contains(why),
+                "{why}: {err}"
+            );
+            // Refused before it was laid down, so the root holds no link with
+            // a target the database could not describe.
+            assert!(
+                std::fs::symlink_metadata(dir.join("root/usr/lib/libz.so.1")).is_err(),
+                "{why}",
+            );
+        }
     }
 
     #[test]

@@ -578,7 +578,7 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Alpine
 /// Reads an optional numeric field, reporting a refusal the same way.
 ///
 /// The rule is [`document::number`]'s.
-fn number<T: std::str::FromStr>(
+fn number<T: std::str::FromStr + std::fmt::Display>(
     value: Option<&str>,
     field: &str,
     at: &str,

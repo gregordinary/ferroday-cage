@@ -565,8 +565,8 @@ const FLAGS: &[Flag] = &[
         section: Section::Provisioning,
         placeholder: "DIR",
         help: &[
-            "Overlay DIR onto the root after the files are laid",
-            "out and before any maintainer script runs",
+            "Overlay DIR onto the root after the packages are",
+            "unpacked and before the configure wave runs",
         ],
         take: Take::One(|options, _flag, value| {
             options.debian_pre_configure_overlay = Some(PathBuf::from(value));
@@ -906,8 +906,11 @@ const FLAGS: &[Flag] = &[
             "Install the build in directory ID (e.g.",
             "20260810T204554Z) rather than the current one. The",
             "archive keeps about five weeks of builds, so a pinned",
-            "id resolves against it for roughly a month and against",
-            "a populated --gentoo-cache indefinitely",
+            "id resolves against it for roughly a month, and after",
+            "that from the digest document a provision kept in",
+            "--gentoo-cache. It resolves only while the key that",
+            "signed that document is in force, since every",
+            "signature is checked at the current time",
         ],
         take: Take::One(|options, flag, value| {
             options.gentoo_build_id = Some(into_string(flag, value)?);
@@ -975,9 +978,11 @@ const FLAGS: &[Flag] = &[
         section: Section::Provisioning,
         placeholder: "FILE",
         help: &[
-            "Install exactly the packages FILE names, resolving",
-            "nothing. FILE is a plan document a previous run wrote;",
-            "it supersedes --gentoo-install and --gentoo-prefer-use",
+            "Install the packages FILE names, resolving nothing.",
+            "FILE is a plan document a previous run wrote; it",
+            "supersedes --gentoo-install and --gentoo-prefer-use. A",
+            "package the root has at the planned version is skipped,",
+            "and one whose slot the root already holds is refused",
         ],
         take: Take::One(|options, _flag, value| {
             options.gentoo_plan = Some(PathBuf::from(value));
@@ -1018,8 +1023,8 @@ const FLAGS: &[Flag] = &[
         section: Section::Provisioning,
         placeholder: "DIR",
         help: &[
-            "Cache the downloaded stage3 and binary packages in DIR,",
-            "reused across runs",
+            "Cache the downloaded stage3, its digest document and",
+            "the binary packages in DIR, reused across runs",
         ],
         take: Take::One(|options, _flag, value| {
             options.gentoo_cache = Some(PathBuf::from(value));
@@ -1037,7 +1042,8 @@ const FLAGS: &[Flag] = &[
             "age. Gentoo publishes no expiry of any kind, so this",
             "timestamp is the only thing that says when a document",
             "stopped being current; clearing the bound accepts a",
-            "replayed one, which is what an archived mirror needs",
+            "replayed one, which is what an archived mirror needs.",
+            "The key that signed it must still be in force",
         ],
         take: Take::One(|options, flag, value| {
             options.gentoo_max_pointer_age = Some(parse_pointer_age(&into_string(flag, value)?)?);

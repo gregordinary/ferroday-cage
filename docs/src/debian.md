@@ -39,8 +39,9 @@ A bootstrap runs in stages:
    carries the digest of every package index.
 2. **The package set.** It fetches each component's `Packages` index and
    verifies it against the release digest. It then resolves the install set:
-   the base system (every essential and required package, plus `apt`) together
-   with the packages named by `include`, closed over their dependencies.
+   the base system (every essential and required package the primary
+   repository marks, plus `apt`) together with the packages named by
+   `include`, closed over their dependencies.
 3. **Download and extract.** It downloads each package, verifies its digest,
    and extracts its files into a staging tree with the same kernel-enforced
    containment the tarball provisioner uses. The merged-usr symlink layout is
@@ -63,6 +64,13 @@ A bootstrap runs in stages:
    `/usr/share/keyrings/fcage-archive-keyring.gpg`, a path no package ships, and
    keeping it current is the caller's. A tree without the keyring package gets
    the embedded keyring at that path instead.
+
+   Each line carries the posture its repository was verified under. One that
+   [allows a stale release](#repositories) gets `check-valid-until=no`, so the
+   tree's `apt-get update` reads the expired release it was built from. A
+   repository on a `file://` mirror gets no line and no keyring. Its URL names a
+   directory on the host, which a sandbox rooted at the tree does not see, and an
+   unreachable source fails every update.
 
    Under the single-identity map it also configures apt to run its download
    methods as root. The `_apt` user apt would otherwise drop to is not
@@ -141,8 +149,10 @@ over their dependencies, minus the packages `exclude` removes.
 The base system is chosen by priority, not by an enumerated list.
 `base_priority` sets the least essential `Priority` band it seeds from. The base
 is then every essential package, plus every package at least as essential as the
-floor. The default, `Priority::Required`, is `debootstrap`'s minbase: essential
-and required packages only. A less essential floor seeds more:
+floor. Both are read from the primary repository alone, as `debootstrap` seeds
+from one archive. The default, `Priority::Required`, is `debootstrap`'s
+minbase: essential and required packages only. A less essential floor seeds
+more:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::{Debian, Priority};
@@ -252,11 +262,12 @@ provision::ensure("/var/lib/machines/trixie", &mut debian)?;
 # }
 ```
 
-Resolution is highest-version-wins across every repository. A package a feature
-repository ships at a higher version therefore supersedes the mirror's. A
-package only the local pool ships is pulled from it, while its dependencies
-close against the mirror. An exact-version tie resolves to the earlier
-repository, the primary first.
+Each name resolves to one version across every repository, chosen as apt
+chooses one by default. Between repositories of one
+[rank](#releases-ranked-below-the-rest) the higher version wins. A package a feature repository ships at a higher version therefore
+supersedes the mirror's. A package only the local pool ships is pulled from it,
+while its dependencies close against the mirror. An exact-version tie resolves
+to the earlier repository, the primary first.
 
 The local pool is a `dists/`-structured repository, the layout apt reads and the
 same one the provisioner fetches from a mirror. It is trusted without a
@@ -270,6 +281,11 @@ have to be distinct, so a set in which two additional repositories would write
 the same pair is refused at build time. A repository with no [`name`] takes a
 generated one from its position, which a caller-supplied name must not collide
 with either.
+
+A local pool on a `file://` mirror writes neither file, since the tree cannot
+see the host path. To give a sandbox's `apt` the pool, bind the pool into the
+sandbox read-only. Then write a `deb [trusted=yes] file:///<path>` line naming
+the path it is bound at.
 
 **Interchangeable URLs for one source.** A live mirror with a
 `snapshot.debian.org` backstop is one source reached two ways.
@@ -299,11 +315,64 @@ design. The signature is still verified. The backstop is a fetch-time concern
 only: the finished tree's `sources.list` names the live mirror, not the
 snapshot.
 
-Multiplying repositories does not dilute trust. Every authenticity check simply
-runs once per repository: the signature against that repository's keyring, the
-release bound to its suite, and the transport `trust_unsigned` requires. The
-`deb-multirepo` example provisions a root from the archive mirror plus a local
-trusted pool, auditing the repository builder end to end.
+Every authenticity check runs once per repository: the signature against that
+repository's keyring, the release bound to its suite, and the transport
+`trust_unsigned` requires. Package names are not divided between repositories,
+though. Any configured repository can supersede any package name by offering a
+higher version at the same rank. That includes `debian-archive-keyring`, whose
+keyring the finished tree's primary source names whichever repository supplied
+it. Adding a repository therefore trusts its signer with the whole tree, as
+adding a source to apt does.
+
+The `deb-multirepo` example provisions a root from the archive mirror plus a
+local trusted pool, auditing the repository builder end to end.
+
+### Releases ranked below the rest
+
+A release can rank itself below the others, and apt gives such a release a
+lower priority. `experimental` sets `NotAutomatic`, which apt ranks at 1. A
+backports suite also sets `ButAutomaticUpgrades`, which apt ranks at 100, and
+every other release ranks at 500. A version from a higher-ranked release is
+taken over one from a lower-ranked release, whatever the two versions are. A
+lower-ranked release therefore supplies only the names no other repository
+offers.
+
+Adding `experimental` to reach one package thus changes nothing else in the
+root. To take a package from it, name the release with the package in
+`include`, the way apt's `apt install name/release` does:
+
+```rust,no_run
+use ferroday_cage::provision::debian::{Debian, Repository};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let backports = Repository::builder("trixie-backports")
+    .mirror("http://deb.debian.org/debian")
+    .keyring("/usr/share/keyrings/debian-archive-keyring.gpg")
+    .name("backports")
+    .build()?;
+let debian = Debian::builder("trixie")
+    .repository(backports)
+    .include(["linux-image-amd64/trixie-backports"])
+    .build()?;
+# let _ = debian;
+# Ok(())
+# }
+```
+
+An entry written `name/release` takes the highest version of the name the
+repository configured with that suite offers. A versioned dependency of it that
+the other candidates cannot satisfy is taken from the same release, and so on
+down. That is how apt resolves the same request, so the release supplies what
+the entry needs and nothing else. A release no repository is configured with is
+refused at build time, and a name the release does not carry fails the
+resolution.
+
+A layered build ranks the base's installed packages as apt ranks an installed
+version, at 100. A base package is replaced only where a dependency needs a
+newer version, and only by one apt would upgrade to. A default release's newer
+version replaces it. A backports version replaces it only where no default
+release offers the installed version, meaning backports supplied it. An
+`experimental` version never does, and nothing is downgraded.
 
 ## Publishing a local pool
 
@@ -412,6 +481,10 @@ tree. Each is therefore checked when the repository or the builder is built. A
 a local read. A control character would split the request line the value is
 interpolated into.
 
+Every other character a URL path cannot carry as written is refused too, such
+as `%`, `?`, `#`, or one outside ASCII. A server would decode a component spelled
+`%2e%2e` as `..`.
+
 ### What a published `.deb` must declare
 
 `publish` derives the path a package is stored at, and the `Filename` the index
@@ -434,9 +507,10 @@ naming another package's file.
 
 A second paragraph does the same by another route. The appended fields land on
 the last paragraph, which is then the one that reads back as the entry. It reads
-back under whatever name and version it declares. A pool is consumed as `[trusted=yes]` and
-resolution is highest-version-wins across repositories, so an entry a package
-wrote for itself would supersede the primary archive's.
+back under whatever name and version it declares. A pool is consumed as
+`[trusted=yes]` and ranks alongside the primary archive, where the higher version
+wins. An entry a package wrote for itself would therefore supersede the primary
+archive's.
 
 Both are `DebianError::Deb`, naming the file and what is wrong with it. No
 conforming `.deb` is affected. `dpkg-deb` builds a one-paragraph control file,
@@ -707,10 +781,10 @@ put when an archive rotates that subkey. A release signed by several archive
 keys records the first acceptable signature in the order the release carries
 them.
 
-`package.archive` indexes into `plan.archives`. Resolution is
-highest-version-wins across the merged repositories. With more than one
-configured, this is the only thing that says where a package will actually come
-from.
+`package.archive` indexes into `plan.archives`. Each name resolves to one
+version across the merged repositories, ranked as [Releases ranked below the
+rest](#releases-ranked-below-the-rest) describes. With more than one configured,
+this is the only thing that says where a package will actually come from.
 
 ## Installing a plan without resolving again
 
@@ -1269,8 +1343,9 @@ upper, and a package's `/bin` entry goes wherever the base's own `/bin` leads.
 
 Dropping the `BuildLayer` removes the upper, and the overlay work directory
 beside it, reverting the increment and leaving the base ready for the next
-component. A `stage_layer` that fails disposes of them itself, since it hands
-the caller no handle to drop, so a failed staging leaves nothing behind either.
+component. A `stage_layer` that fails disposes of an upper it created, since it
+hands the caller no handle to drop. An upper that already existed is the
+caller's, and a failure leaves it in place.
 
 The base must be a full, configured bootstrap, not an
 [`extract_only`](#extract-only-and-foreign-architectures) tree. The overlay's
@@ -1293,10 +1368,10 @@ cannot establish one before downloading anything.
 
 ## The pre-configure overlay
 
-[`pre_configure_overlay`] lays a directory of configuration into the tree after
-the packages are unpacked and before their maintainer scripts run. A script
-therefore observes the injected values, whether those are a debconf pre-seed, a
-locale selection, or a hardware-probe guard:
+[`pre_configure_overlay`] lays a directory of configuration into the tree once
+every package is unpacked and before the configure wave. The configuration
+scripts that wave runs therefore observe the injected values, whether those are
+a debconf pre-seed, a locale selection, or a hardware-probe guard:
 
 ```rust,no_run
 use ferroday_cage::provision::{self, debian::Debian};
@@ -1314,9 +1389,15 @@ The source is a root-shaped tree, so `./rootfs-config/etc/locale.gen` becomes
 `/etc/locale.gen`. File modes and symlinks are preserved. A file replaces the
 package's own copy of the same path, which is how a shipped conffile is
 overridden. The tree is laid with the same kernel-enforced containment as
-package extraction, so nothing in it can be written outside the destination. The
-overlay applies only to a full bootstrap. Because the base system is configured
-first, it governs the configuration of the non-essential packages.
+package extraction, so nothing in it can be written outside the destination.
+
+The overlay does not reach every script. Unpacking runs each package's
+`preinst`, so every `preinst` has run before the overlay is laid. A full
+bootstrap also installs and configures six core packages first: `base-passwd`,
+`base-files`, `dpkg`, `libc6`, `perl-base`, and `mawk`. Every other package's
+`postinst` runs after the overlay, essential packages included. A layered build
+lays the overlay into its increment the same way, even when the increment
+installs nothing. An extract-only bootstrap runs no script and ignores it.
 
 Entries land owned by the calling user, which the identity map presents as root
 inside. A tree that has to ship a file owned by some other in-tree id wants
@@ -1395,9 +1476,16 @@ is a text signature, the type a cleartext-signed document carries. It carries a
 creation time, every check being relative to it, no more than 30 minutes ahead
 of the host's clock. Its digest is SHA-2 or SHA-3, never MD5, SHA-1 or
 RIPEMD-160, whose collisions are within reach. The signing key and the
-certificate behind it are each Ed25519, or RSA of 2048 bits or more. A signature
+certificate behind it are each Ed25519, or RSA of 2048 to 8192 bits. A signature
 is worth no more than the weaker of the digest it covers and the key material
 that binds it.
+
+A certificate's own signatures rest on the same digests. A subkey's binding and
+its counter-signature always do. One exception is a self-signature over the
+primary key made before 1 February 2023, which is also accepted over SHA-1.
+Archive keys of that age were self-signed over SHA-1 alone, and GnuPG accepts
+them too. From that date, the one from which Sequoia refuses SHA-1 there, the
+self-signature rests on SHA-2 or SHA-3.
 
 It also carries no critical subpacket that cannot be interpreted, which RFC 9580
 requires a verifier meeting one to treat as invalidating. Only the signed part
