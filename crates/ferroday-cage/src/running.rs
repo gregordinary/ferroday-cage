@@ -1,20 +1,26 @@
 //! The running-sandbox handle: wait, deadline, terminate, kill.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
+use rustix::fs::{FlockOperation, Stat};
 use rustix::io::Errno;
 use rustix::net::SendFlags;
 use rustix::process;
 use rustix::process::Signal;
 
 use crate::error::Error;
-use crate::mechanism::{self, CONTROL_TERMINATE, LaunchPlan, ManagedPlaceholders};
+use crate::mechanism::{
+    self, CONTROL_TERMINATE, CreatedTarget, LaunchPlan, ManagedPlaceholders, MountOp,
+    wait_syscall_error,
+};
 use crate::observer::Observer;
 use crate::poll;
 use crate::provision::rooted::Rooted;
@@ -37,9 +43,11 @@ const PUMP_BUF: usize = 8192;
 ///
 /// Dropping the handle without waiting neither kills the sandbox (unless
 /// [`stop_with_caller`] is set, whose tie the drop severs) nor collects its
-/// outcome; without a PID namespace the supervisor process then remains a
-/// zombie child process of the caller until the caller exits. Prefer waiting —
-/// including after a kill.
+/// outcome. Without a PID namespace the launch stage, the command's parent
+/// outside the sandbox, then remains a zombie child process of the caller
+/// until the caller exits. A file the launch created in the root as a file
+/// bind's target stays there too, since removing it would unmount the running
+/// sandbox's bind. Prefer waiting — including after a kill.
 ///
 /// The escalation recipe, for callers that need a bounded stop:
 ///
@@ -98,6 +106,9 @@ pub struct Running<'obs> {
     /// child process. A pidfd rather than a raw pid so the reap cannot alias a
     /// recycled pid.
     reap: Option<OwnedFd>,
+    /// Whether the supervisor has been seen to exit; see
+    /// [`awaiting_supervisor`](Self::awaiting_supervisor).
+    supervisor_exited: bool,
     /// The pump's read buffer, allocated once when capturing.
     buf: Vec<u8>,
     /// Held only for its `Drop`: it removes the mount targets the launch
@@ -114,8 +125,12 @@ enum Watch {
     Stdout,
     /// The captured standard error.
     Stderr,
-    /// The status pipe the supervisor writes the outcome to.
+    /// The status pipe the outcome arrives on: written by the init, or
+    /// without a PID namespace by the launch stage.
     Status,
+    /// The supervisor's pidfd, once the outcome is known and only until the
+    /// supervisor has exited; see [`Running::awaiting_supervisor`].
+    Supervisor,
     /// A waiter's own descriptor; see [`Running::wait_or_readable`].
     Wake,
 }
@@ -143,26 +158,24 @@ impl<'obs> Running<'obs> {
         if observe {
             check_capture_composes(plan)?;
         }
-        // The guard is built before the spawn, not after it. `spawn` reports
-        // every setup step through its return, and the mount ops run well
-        // before the last of them: a launch that creates `/etc/resolv.conf` and
-        // then fails at the pivot, the working-directory change, or the exec —
-        // the case a caller getting a configuration right hits repeatedly —
-        // would otherwise leave that file behind, which is the residue this
-        // mechanism exists to prevent. Built here, the `?` below drops the
-        // guard and takes the placeholders with it.
-        let placeholders = PlaceholderGuard {
-            placeholders: plan.managed_placeholders.clone(),
-        };
         // The progress sink borrows the observer only for the launch; the
         // borrow ends with the statement, leaving the observer to move into
         // the handle for the output pump.
-        let (launched, primary) = mechanism::spawn(plan, observe, None, &mut |event| {
-            if let Some(observer) = observer.as_deref_mut() {
-                observer.progress(event);
-            }
-        })?;
+        let mut created = Vec::new();
+        let spawned = mechanism::spawn(
+            plan,
+            observe,
+            None,
+            &mut |event| {
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer.progress(event);
+                }
+            },
+            &mut created,
+        );
+        let (launched, primary) = guarded(plan, &created, spawned)?;
         debug_assert!(primary.is_none(), "a launch with no terminal returns none");
+        let placeholders = PlaceholderGuard::new(plan, &created, Some(launched.pidfd.as_fd()));
         Ok(Running::from_launched(launched, observer, placeholders))
     }
 
@@ -176,11 +189,11 @@ impl<'obs> Running<'obs> {
         terminal: &Terminal,
     ) -> Result<(Running<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
-        let placeholders = PlaceholderGuard {
-            placeholders: plan.managed_placeholders.clone(),
-        };
-        let (launched, primary) = mechanism::spawn(plan, false, Some(terminal), &mut |_| {})?;
-        let primary = primary.ok_or_else(|| wait_error(Errno::PROTO))?;
+        let mut created = Vec::new();
+        let spawned = mechanism::spawn(plan, false, Some(terminal), &mut |_| {}, &mut created);
+        let (launched, primary) = guarded(plan, &created, spawned)?;
+        let placeholders = PlaceholderGuard::new(plan, &created, Some(launched.pidfd.as_fd()));
+        let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
         Ok((
             Running::from_launched(launched, None, placeholders),
             Pty::new(primary),
@@ -211,6 +224,7 @@ impl<'obs> Running<'obs> {
             outcome: None,
             kill_sent: Arc::new(AtomicBool::new(false)),
             reap: launched.reap,
+            supervisor_exited: false,
             buf,
             _placeholders: placeholders,
         }
@@ -233,8 +247,12 @@ impl<'obs> Running<'obs> {
     /// Like [`Cage::run`], a non-zero exit is data, not an error. An error
     /// means the library failed to collect the outcome.
     ///
-    /// When output is captured, the wait completes once the command's
-    /// outcome is known and both captured streams have reached end-of-file.
+    /// The wait completes once the command's outcome is known and the
+    /// supervisor has exited, which with a PID namespace is once the kernel
+    /// has torn the namespace down. A process of the sandbox the kernel cannot
+    /// end at once, one in an uninterruptible sleep on an unresponsive
+    /// filesystem, holds that teardown, and the wait with it. When output is
+    /// captured, both captured streams must also have reached end-of-file.
     /// Under the default PID namespace, teardown at command exit closes
     /// the streams promptly. With [`pid_namespace(false)`], a descendant
     /// that outlives the command holds the streams open, and an unbounded
@@ -255,16 +273,17 @@ impl<'obs> Running<'obs> {
             // with no compiler assistance, and a library whose error type is
             // otherwise exhaustive should not answer that with an abort. Same
             // treatment `drain_status` gives a record it cannot decode.
-            None => Err(wait_error(Errno::PROTO)),
+            None => Err(wait_syscall_error(Errno::PROTO)),
         }
     }
 
     /// Waits until the command terminates or the deadline passes.
     ///
-    /// Returns `Ok(None)` when the deadline passes first; the command keeps
-    /// running, output produced before the deadline has been delivered, and
-    /// the wait can be resumed. The deadline does not kill anything —
-    /// escalation is the caller's, per the recipe above.
+    /// Returns `Ok(None)` when the deadline passes first; the sandbox keeps
+    /// running, or is still being torn down, output produced before the
+    /// deadline has been delivered, and the wait can be resumed. The deadline
+    /// does not kill anything — escalation is the caller's, per the recipe
+    /// above.
     pub fn wait_deadline(&mut self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         self.pump(Some(deadline), None)
     }
@@ -347,18 +366,45 @@ impl<'obs> Running<'obs> {
 
     /// Returns a handle that can terminate or kill the sandbox from another
     /// thread, while this handle blocks in a wait.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KillHandle`] where the handle's descriptors cannot be
+    /// duplicated, typically because the process has run out of them.
     pub fn kill_handle(&self) -> Result<KillHandle, Error> {
+        let duplicate = |fd: &OwnedFd| {
+            fd.try_clone()
+                .map_err(|source| Error::KillHandle { source })
+        };
         Ok(KillHandle {
-            pidfd: self.pidfd.try_clone().map_err(clone_error)?,
-            control: self.control.try_clone().map_err(clone_error)?,
+            pidfd: duplicate(&self.pidfd)?,
+            control: duplicate(&self.control)?,
             kill_sent: Arc::clone(&self.kill_sent),
         })
     }
 
-    /// Whether every channel has settled: the streams at end-of-file and
-    /// the status record or its end-of-file received.
+    /// Whether every channel has settled: the streams at end-of-file, the
+    /// status record or its end-of-file received, and, where the outcome is
+    /// known, the supervisor exited.
     fn settled(&self) -> bool {
-        self.status.is_none() && self.stdout.is_none() && self.stderr.is_none()
+        self.status.is_none()
+            && self.stdout.is_none()
+            && self.stderr.is_none()
+            && !self.awaiting_supervisor()
+    }
+
+    /// Whether the outcome is known and the supervisor has not yet been seen
+    /// to exit.
+    ///
+    /// A known outcome, a status record or a kill, means the supervisor is
+    /// ending, and the wait lasts until it has ended. With a PID namespace its
+    /// exit follows the kernel's teardown of the namespace, after which no
+    /// process of the sandbox remains to hold a bind onto a file the launch
+    /// created in the root, and the handle's drop can remove it. An unknown
+    /// outcome is a lost supervisor, reported as one without waiting on a
+    /// process that need never exit.
+    fn awaiting_supervisor(&self) -> bool {
+        !self.supervisor_exited && (self.outcome.is_some() || self.kill_sent.load(Ordering::SeqCst))
     }
 
     /// The fused outcome once every channel has settled.
@@ -369,9 +415,9 @@ impl<'obs> Running<'obs> {
     /// outcome is termination by SIGKILL. Unprovoked, it is an error.
     fn resolve(&mut self) -> Result<ExitStatus, Error> {
         if let Some(pidfd) = self.reap.take() {
-            // Reap the supervisor through its pidfd, so the wait targets
+            // Reap the launch stage through its pidfd, so the wait targets
             // exactly that process and cannot alias a pid a concurrent reaper
-            // freed and the OS recycled. Best-effort: the supervisor exits
+            // freed and the OS recycled. Best-effort: the launch stage exits
             // right after the status write, and an application-wide child
             // reaper may even have collected it first.
             let _ = mechanism::reap_via_pidfd(pidfd.as_fd());
@@ -420,17 +466,23 @@ impl<'obs> Running<'obs> {
             // Only the live channels are polled: each is gathered to the front
             // of a fixed array, so the hot loop allocates nothing, and the
             // slice handed to `poll` ends where they do. A retired channel
-            // left in it would be ready on every pass (see `poll`). The
-            // entries past the live ones are never polled; they hold the pidfd
-            // only because every entry of the array needs a descriptor.
-            let mut watched = [Watch::Stdout; 4];
-            let mut pollfds: [PollFd<'_>; 4] =
+            // left in it would be ready on every pass (see `poll`), the
+            // supervisor's pidfd above all once its process is reaped, so it is
+            // watched only until it is first seen ready. The entries past the
+            // live ones are never polled; they hold the pidfd only because
+            // every entry of the array needs a descriptor.
+            let mut watched = [Watch::Stdout; 5];
+            let mut pollfds: [PollFd<'_>; 5] =
                 std::array::from_fn(|_| PollFd::new(&self.pidfd, PollFlags::empty()));
             let mut live = 0;
             for (watch, fd) in [
                 (Watch::Stdout, self.stdout.as_ref().map(AsFd::as_fd)),
                 (Watch::Stderr, self.stderr.as_ref().map(AsFd::as_fd)),
                 (Watch::Status, self.status.as_ref().map(AsFd::as_fd)),
+                (
+                    Watch::Supervisor,
+                    self.awaiting_supervisor().then(|| self.pidfd.as_fd()),
+                ),
                 (Watch::Wake, wake),
             ] {
                 if let Some(fd) = fd {
@@ -444,10 +496,10 @@ impl<'obs> Running<'obs> {
                 Ok(0) => return Ok(None),
                 Ok(_) => {}
                 Err(Errno::INTR) => continue,
-                Err(errno) => return Err(wait_error(errno)),
+                Err(errno) => return Err(wait_syscall_error(errno)),
             }
 
-            let mut ready = [false; 4];
+            let mut ready = [false; 5];
             for (&watch, fd) in watched[..live].iter().zip(&pollfds) {
                 ready[watch as usize] = !fd.revents().is_empty();
             }
@@ -459,6 +511,9 @@ impl<'obs> Running<'obs> {
             }
             if ready[Watch::Status as usize] {
                 self.drain_status()?;
+            }
+            if ready[Watch::Supervisor as usize] {
+                self.supervisor_exited = true;
             }
             // The waiter's channel is answered after this pass's own reads,
             // so an outcome that arrived beside it is reported rather than
@@ -491,7 +546,7 @@ impl<'obs> Running<'obs> {
         // library defect, reported the way `drain_status` reports a record it
         // cannot decode.
         let Some(observer) = self.observer.as_deref_mut() else {
-            return Err(wait_error(Errno::PROTO));
+            return Err(wait_syscall_error(Errno::PROTO));
         };
         match rustix::io::read(&*fd, &mut self.buf) {
             Ok(0) => {
@@ -505,7 +560,7 @@ impl<'obs> Running<'obs> {
                 }
             }
             Err(Errno::INTR) => {}
-            Err(errno) => return Err(wait_error(errno)),
+            Err(errno) => return Err(wait_syscall_error(errno)),
         }
         Ok(())
     }
@@ -530,7 +585,7 @@ impl<'obs> Running<'obs> {
                     // library, not a caller error, but the decode still must
                     // not panic: EPROTO retires the pipe and fails the wait.
                     let Some(status) = mechanism::decode_status(self.record) else {
-                        return Err(wait_error(Errno::PROTO));
+                        return Err(wait_syscall_error(Errno::PROTO));
                     };
                     self.outcome = Some(status);
                 } else {
@@ -540,7 +595,7 @@ impl<'obs> Running<'obs> {
             Err(Errno::INTR) => self.status = Some(fd),
             Err(errno) => {
                 self.status = Some(fd);
-                return Err(wait_error(errno));
+                return Err(wait_syscall_error(errno));
             }
         }
         Ok(())
@@ -556,7 +611,24 @@ impl fmt::Debug for Running<'_> {
     }
 }
 
-/// Removes the mount targets it holds when it goes out of scope.
+/// The guard for what a launch created, given its outcome.
+///
+/// A launch that failed has ended every process of its own whose targets it
+/// reports, so the guard built here, holding no supervisor, removes them as the
+/// `?` it is used with drops it: a launch that creates `/etc/resolv.conf` and
+/// then fails at the pivot, the working-directory change, or the exec, the case
+/// a caller getting a configuration right hits repeatedly, leaves nothing
+/// behind.
+fn guarded<T>(
+    plan: &LaunchPlan,
+    created: &[CreatedTarget],
+    spawned: Result<T, Error>,
+) -> Result<T, Error> {
+    spawned.inspect_err(|_| drop(PlaceholderGuard::new(plan, created, None)))
+}
+
+/// Removes the file-bind targets a launch created in the root, once the
+/// sandbox that bound onto them is gone.
 ///
 /// A guard of its own, rather than a [`Drop`] on the handles that carry it,
 /// because a type implementing `Drop` keeps every borrow it holds live until
@@ -564,63 +636,170 @@ impl fmt::Debug for Running<'_> {
 /// there would stop a caller from reading its own observer after waiting — the
 /// ordinary way to collect captured output. The guard borrows nothing, so
 /// dropping it observes nothing.
+///
+/// What it removes is what the setup reported creating, and only once the
+/// supervisor has exited. A bind holds the name it was made over, not only the
+/// file: unlinking the name unmounts every mount on it, in every mount
+/// namespace, the sandbox's nested one included. Removed while the sandbox
+/// runs, a target would take the sandbox's bind with it: its
+/// `/etc/resolv.conf`, or a writable file bind whose later writes would land in
+/// the root instead. With a PID namespace the supervisor's exit is the whole
+/// sandbox's. Without one it is the command's, and a descendant that outlives
+/// the command is beyond the library's reach here as everywhere.
+///
+/// Two sandboxes on one root can share a target: the first creates it, and the
+/// second finds it already there. Each holds a shared lock on it, and a removal
+/// takes an exclusive one first, so the first's teardown leaves a target the
+/// second still holds; see [`remove_placeholder`]. That target then stays in
+/// the root for good, since the second did not create it and removes nothing
+/// it did not create. Without a PID namespace the second holds its lock only
+/// until its command executes, and from then on the first's teardown can
+/// unmount the second's bind.
+#[derive(Default)]
 pub(crate) struct PlaceholderGuard {
-    /// The root and the root-relative paths to remove; taken when they are
-    /// handed on instead.
-    pub(crate) placeholders: ManagedPlaceholders,
+    /// The root's writable layer, which every path below is relative to.
+    root: PathBuf,
+    /// The targets the launch created and the caller side can name.
+    created: Vec<Placeholder>,
+    /// The supervisor, whose exit frees them; `None` where no process of the
+    /// launch is left.
+    supervisor: Option<OwnedFd>,
 }
 
-impl Drop for PlaceholderGuard {
-    fn drop(&mut self) {
-        if self.placeholders.is_empty() {
-            return;
-        }
-        // One descriptor for the root, which every path below is resolved
-        // against; nothing here walks the host's own tree.
-        let Ok(root) = Rooted::open(&self.placeholders.root) else {
-            return;
+/// One target a launch created: where it is, which file it is, and whether
+/// creating it replaced an overlay whiteout that removing it puts back.
+struct Placeholder {
+    /// The path, relative to the guard's root.
+    path: PathBuf,
+    /// The created file's inode number; see [`CreatedTarget`].
+    ino: u64,
+    /// Whether the upper held a whiteout at the path before the launch.
+    whiteout: bool,
+}
+
+impl PlaceholderGuard {
+    /// The guard for the targets `created` reports of a launch of `plan`,
+    /// freed by the exit of `supervisor`, or at once where there is none.
+    pub(crate) fn new(
+        plan: &LaunchPlan,
+        created: &[CreatedTarget],
+        supervisor: Option<BorrowedFd<'_>>,
+    ) -> PlaceholderGuard {
+        PlaceholderGuard::of(&plan.managed_placeholders, &plan.ops, created, supervisor)
+    }
+
+    /// [`new`](Self::new), from the two parts of the plan it reads.
+    ///
+    /// A report names the mount op that created a target, and `managed` says
+    /// which of those the caller side can name in the root's writable layer: a
+    /// target under an earlier mount is that mount's, not the root's. A
+    /// supervisor whose pidfd cannot be duplicated cannot be watched, so its
+    /// targets are kept rather than removed early.
+    pub(crate) fn of(
+        managed: &ManagedPlaceholders,
+        ops: &[MountOp],
+        created: &[CreatedTarget],
+        supervisor: Option<BorrowedFd<'_>>,
+    ) -> PlaceholderGuard {
+        let supervisor = match supervisor.map(|fd| fd.try_clone_to_owned()) {
+            None => None,
+            Some(Ok(fd)) => Some(fd),
+            Some(Err(_)) => return PlaceholderGuard::default(),
         };
-        for path in &self.placeholders.paths {
-            remove_managed_placeholder(&root, path);
-        }
-        // A target created over an overlay whiteout replaced it; the whiteout
-        // goes back once the target is gone. One that is still occupied, by a
-        // target that was not removed or one the launch never created, refuses
-        // the whiteout, and is left as it is.
-        for path in &self.placeholders.whiteouts {
-            let _ = root.whiteout(path);
+        let created = created
+            .iter()
+            .filter_map(|target| {
+                let file = ops.get(target.op)?.create_file.as_ref()?;
+                let path = PathBuf::from(OsStr::from_bytes(file.to_bytes()));
+                managed.paths.contains(&path).then(|| Placeholder {
+                    whiteout: managed.whiteouts.contains(&path),
+                    path,
+                    ino: target.ino,
+                })
+            })
+            .collect();
+        PlaceholderGuard {
+            root: managed.root.clone(),
+            created,
+            supervisor,
         }
     }
 }
 
-/// Removes a mount target the launch created in the root, once the sandbox
-/// that needed it is gone.
+impl Drop for PlaceholderGuard {
+    fn drop(&mut self) {
+        if self.created.is_empty() {
+            return;
+        }
+        if let Some(supervisor) = &self.supervisor
+            && !mechanism::has_exited(supervisor.as_fd())
+        {
+            return;
+        }
+        // One descriptor for the root, which every path below is resolved
+        // against; nothing here walks the host's own tree.
+        let Ok(root) = Rooted::open(&self.root) else {
+            return;
+        };
+        for placeholder in &self.created {
+            remove_placeholder(&root, placeholder);
+            // A target created over an overlay whiteout replaced it; the
+            // whiteout goes back once the target is gone. A name still
+            // occupied, by a target that was not removed, refuses the
+            // whiteout, and is left as it is.
+            if placeholder.whiteout {
+                let _ = root.whiteout(&placeholder.path);
+            }
+        }
+    }
+}
+
+/// Removes one target the launch created in the root, if the name still holds
+/// the file it created and no other sandbox is bound onto it.
 ///
-/// `path` is relative to `root` and is resolved against it by [`Rooted`], with
-/// `openat2` and `RESOLVE_IN_ROOT` — the containment the sandbox stage gives
-/// every mount target, for the same reason. A rootfs is entitled to hold an
-/// absolute symbolic link (`./etc -> /etc` in an unpacked tarball, an
-/// `/etc/resolv.conf` pointing into a resolver's runtime directory), and joining
-/// the two into one host path would have that link resolve against the *host's*
-/// root on this side of the fork, which is where the unlink below would then
-/// land.
+/// The path is relative to `root` and is resolved against it by [`Rooted`],
+/// with `openat2` and `RESOLVE_IN_ROOT` — the containment the sandbox stage
+/// gives every mount target, for the same reason. A root filesystem is entitled
+/// to hold an absolute symbolic link (`./etc -> /etc` in an unpacked tarball, an
+/// `/etc/resolv.conf` pointing into a resolver's runtime directory), and
+/// joining the two into one host path would have that link resolve against the
+/// *host's* root on this side of the fork, which is where the unlink would
+/// then land.
 ///
-/// Only an empty regular file is removed. The placeholder a launch creates is
-/// empty and stays that way — the bind covers it for the sandbox's whole life,
-/// and the mount is confined to the sandbox's own namespace, so nothing can
-/// write through it. Anything with content, or anything that is no longer a
-/// plain file, arrived between the build and here and belongs to whoever put it
-/// there.
+/// Only an empty regular file with the inode number the setup reported is
+/// removed.
+/// The target a launch creates is empty and stays that way: the bind covers it
+/// for the sandbox's whole life, and the mount is confined to the sandbox's own
+/// namespace, so nothing can write through it. Anything else at the name
+/// arrived from elsewhere and belongs to whoever put it there.
 ///
-/// Safe while the sandbox is still running, which a handle dropped without
-/// waiting leaves it: the bind is established inside the sandbox's own mount
-/// namespace, over its own root, so it holds the inode rather than this name.
-/// Unlinking here leaves the running sandbox's `/etc/resolv.conf` intact.
+/// The file is opened and locked before it is removed. Every sandbox that binds
+/// onto a regular file holds a shared lock on it: the init for the sandbox's
+/// whole life, and, without a PID namespace, the command process only until it
+/// executes. On a root two sandboxes share, a target this launch created and
+/// the other then bound onto refuses the exclusive lock here while the other
+/// holds it, and stays in the root rather than unmounting the other's bind.
 ///
 /// Best-effort, like the teardown around it. A failure leaves a file the rootfs
 /// did not ship, which is untidy but not a failure of the launch itself.
-fn remove_managed_placeholder(root: &Rooted, path: &Path) {
-    let _ = root.remove_if(path, Rooted::is_empty_file);
+fn remove_placeholder(root: &Rooted, placeholder: &Placeholder) {
+    let ours = |stat: &Stat| Rooted::is_empty_file(stat) && stat.st_ino == placeholder.ino;
+    let Ok(file) = root.reader(&placeholder.path) else {
+        return;
+    };
+    match rustix::fs::fstat(&file) {
+        Ok(stat) if ours(&stat) => {}
+        _ => return,
+    }
+    // A lock on the target itself rather than a lock file, so not
+    // `provision::lock_exclusive`'s to take: it is only tried, through the
+    // descriptor whose inode was just checked, and a refusal is an answer.
+    #[expect(clippy::disallowed_methods)]
+    let unheld = rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive);
+    if unheld.is_err() {
+        return;
+    }
+    let _ = root.remove_if(&placeholder.path, ours);
 }
 
 /// A detached signaling handle for a running sandbox.
@@ -657,8 +836,8 @@ impl KillHandle {
 /// seam.
 ///
 /// Returned by [`Cage::spawn_pending`] and [`Cage::spawn_pending_with`]. The
-/// sandbox's namespaces exist and its supervisor is published, but the command
-/// is held at a gate just before `execve`. [`netns_pid`](Self::netns_pid) is a
+/// sandbox's namespaces and mounts are in place and its supervisor is
+/// published, but the command is held at a gate just before `execve`. [`netns_pid`](Self::netns_pid) is a
 /// host pid of a process in the sandbox's network namespace, the target a
 /// userspace network stack (`pasta`, `slirp4netns`) joins through
 /// `/proc/<pid>/ns/net`; the process is alive until the handle is consumed or
@@ -668,7 +847,7 @@ impl KillHandle {
 ///
 /// Dropping a `Pending` without proceeding tears the launch down: the
 /// supervisor is killed and the launch stage reaped, so no sandbox is left
-/// running.
+/// running. The drop returns once the supervisor has exited.
 ///
 /// ```no_run
 /// # fn main() -> ferroday_cage::Result<()> {
@@ -693,7 +872,8 @@ pub struct Pending<'obs> {
     /// The observer bound at spawn, carried into the [`Running`] handle.
     observer: Option<&'obs mut dyn Observer>,
     /// The mount targets the launch created in the root, handed to the
-    /// [`Running`] this becomes, or removed here if it never proceeds.
+    /// [`Running`] this becomes, or removed here once a launch that never
+    /// proceeds is gone.
     placeholders: PlaceholderGuard,
 }
 
@@ -707,17 +887,21 @@ impl<'obs> Pending<'obs> {
         if observe {
             check_capture_composes(plan)?;
         }
-        // Built before the spawn so a setup failure after the mount ops takes
-        // the placeholders with it; see `Running::launch`.
-        let placeholders = PlaceholderGuard {
-            placeholders: plan.managed_placeholders.clone(),
-        };
-        let (inner, primary) = mechanism::spawn_pending(plan, observe, None, &mut |event| {
-            if let Some(observer) = observer.as_deref_mut() {
-                observer.progress(event);
-            }
-        })?;
+        let mut created = Vec::new();
+        let spawned = mechanism::spawn_pending(
+            plan,
+            observe,
+            None,
+            &mut |event| {
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer.progress(event);
+                }
+            },
+            &mut created,
+        );
+        let (inner, primary) = guarded(plan, &created, spawned)?;
         debug_assert!(primary.is_none(), "a launch with no terminal returns none");
+        let placeholders = PlaceholderGuard::new(plan, &created, Some(inner.supervisor()));
         Ok(Pending {
             inner: Some(inner),
             observer,
@@ -737,11 +921,12 @@ impl<'obs> Pending<'obs> {
         terminal: &Terminal,
     ) -> Result<(Pending<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
-        let placeholders = PlaceholderGuard {
-            placeholders: plan.managed_placeholders.clone(),
-        };
-        let (inner, primary) = mechanism::spawn_pending(plan, false, Some(terminal), &mut |_| {})?;
-        let primary = primary.ok_or_else(|| wait_error(Errno::PROTO))?;
+        let mut created = Vec::new();
+        let spawned =
+            mechanism::spawn_pending(plan, false, Some(terminal), &mut |_| {}, &mut created);
+        let (inner, primary) = guarded(plan, &created, spawned)?;
+        let placeholders = PlaceholderGuard::new(plan, &created, Some(inner.supervisor()));
+        let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
         Ok((
             Pending {
                 inner: Some(inner),
@@ -771,12 +956,13 @@ impl<'obs> Pending<'obs> {
 
     /// Releases the gated command and returns a handle to it.
     ///
-    /// Blocks until the command is executing, so a setup failure that occurred
-    /// after the namespaces were created — a refused mount, a failed pivot —
-    /// is reported here as the same typed [`Error`] a direct
-    /// [`spawn`](crate::Cage::spawn) would return. The command runs with the
-    /// standard streams the pending launch was configured for; the returned
-    /// [`Running`] waits for, signals, or kills it.
+    /// Blocks until the command is executing, so a setup failure past the gate
+    /// — the identity switch, the hardening, the exec — is reported here as
+    /// the same typed [`Error`] a direct [`spawn`](crate::Cage::spawn) would
+    /// return. A failure before the gate was the pending launch's own. The
+    /// command runs with the standard streams the pending launch was
+    /// configured for; the returned [`Running`] waits for, signals, or kills
+    /// it.
     pub fn proceed(mut self) -> Result<Running<'obs>, Error> {
         let inner = self
             .inner
@@ -791,9 +977,7 @@ impl<'obs> Pending<'obs> {
         Ok(Running::from_launched(
             launched,
             observer,
-            PlaceholderGuard {
-                placeholders: std::mem::take(&mut self.placeholders.placeholders),
-            },
+            std::mem::take(&mut self.placeholders),
         ))
     }
 }
@@ -896,20 +1080,10 @@ fn send_kill(pidfd: &OwnedFd, kill_sent: &AtomicBool) -> Result<(), Error> {
     }
 }
 
-fn wait_error(errno: Errno) -> Error {
-    Error::Wait {
-        source: errno.into(),
-    }
-}
-
 fn signal_error(errno: Errno) -> Error {
     Error::Signal {
         source: errno.into(),
     }
-}
-
-fn clone_error(err: std::io::Error) -> Error {
-    Error::Signal { source: err }
 }
 
 #[cfg(test)]
@@ -918,7 +1092,104 @@ mod tests {
     use rustix::process::{Pid, PidfdFlags};
 
     use super::*;
+    use crate::mechanism::MountAction;
     use crate::observer::Progress;
+    use crate::scratch::Scratch;
+
+    /// A pidfd for `child`, a process this test started.
+    fn pidfd_of(child: &std::process::Child) -> OwnedFd {
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid fits"))
+            .expect("a process id is not zero");
+        process::pidfd_open(pid, PidfdFlags::empty()).expect("a pidfd")
+    }
+
+    #[test]
+    fn a_placeholder_goes_once_its_sandbox_is_gone_and_no_other_holds_it() {
+        // Unlinking a name unmounts every bind onto it, in every mount
+        // namespace, so a target goes only once the supervisor has exited and
+        // no other sandbox holds the shared lock a bind onto it takes, and only
+        // while the name still holds the file the launch created.
+        let dir = Scratch::new("placeholder-guard");
+        std::fs::create_dir(dir.join("etc")).expect("the scratch tree is writable");
+        let target = dir.join("etc/target");
+        let managed = ManagedPlaceholders {
+            root: dir.path().to_path_buf(),
+            paths: vec![PathBuf::from("etc/target")],
+            whiteouts: Vec::new(),
+        };
+        let ops = [MountOp {
+            dirs: Vec::new(),
+            create_file: Some(c"etc/target".to_owned()),
+            action: MountAction::Bind {
+                source: c"/etc/hostname".to_owned(),
+                target: c"etc/target".to_owned(),
+                read_only: true,
+            },
+        }];
+        let created_now = |path: &std::path::Path| {
+            let file = rustix::fs::stat(path).expect("the target exists");
+            [CreatedTarget {
+                op: 0,
+                ino: file.st_ino,
+            }]
+        };
+        std::fs::write(&target, b"").expect("the target is creatable");
+        let created = created_now(&target);
+
+        // The supervisor still runs.
+        let mut supervisor = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a process to stand for the supervisor");
+        let pidfd = pidfd_of(&supervisor);
+        drop(PlaceholderGuard::of(
+            &managed,
+            &ops,
+            &created,
+            Some(pidfd.as_fd()),
+        ));
+        assert!(target.exists(), "removed while the supervisor ran");
+
+        // The supervisor is gone, and another sandbox is bound onto the target.
+        supervisor.kill().expect("the stand-in is killed");
+        supervisor.wait().expect("the stand-in is reaped");
+        let other = std::fs::File::open(&target).expect("the target opens");
+        // The shared lock a sandbox bound onto the target holds, which is
+        // what is under test rather than a lock file.
+        #[expect(clippy::disallowed_methods)]
+        let shared = rustix::fs::flock(&other, FlockOperation::LockShared);
+        shared.expect("the lock is taken");
+        drop(PlaceholderGuard::of(
+            &managed,
+            &ops,
+            &created,
+            Some(pidfd.as_fd()),
+        ));
+        assert!(target.exists(), "removed while another sandbox held it");
+        drop(other);
+
+        // Another file has taken the name: created before the old one went, so
+        // it cannot reuse its inode.
+        std::fs::write(dir.join("etc/replacement"), b"").expect("the scratch tree is writable");
+        std::fs::rename(dir.join("etc/replacement"), &target).expect("the rename succeeds");
+        drop(PlaceholderGuard::of(
+            &managed,
+            &ops,
+            &created,
+            Some(pidfd.as_fd()),
+        ));
+        assert!(target.exists(), "removed a file the launch did not create");
+
+        // The file the launch created, its sandbox gone and nobody holding it.
+        let created = created_now(&target);
+        drop(PlaceholderGuard::of(
+            &managed,
+            &ops,
+            &created,
+            Some(pidfd.as_fd()),
+        ));
+        assert!(!target.exists(), "the launch's own target was left behind");
+    }
 
     /// How many clock ticks a wait may use over the window below while it
     /// blocks. A spinning wait uses the whole window, a hundred and more.
@@ -974,9 +1245,7 @@ mod tests {
                 reap: None,
             },
             Some(&mut observer),
-            PlaceholderGuard {
-                placeholders: ManagedPlaceholders::default(),
-            },
+            PlaceholderGuard::default(),
         );
 
         let thread = rustix::thread::gettid().as_raw_nonzero().get();

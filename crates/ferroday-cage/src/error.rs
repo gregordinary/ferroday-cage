@@ -1003,20 +1003,29 @@ pub enum Error {
         /// The error the kernel returned for namespace creation.
         source: io::Error,
     },
-    /// The host's user-namespace budget is exhausted, so the command could not
-    /// enter the nested user namespace that locks the sandbox's mount flags.
+    /// The kernel refused to create a namespace because a namespace limit is
+    /// reached.
     ///
-    /// A user namespace is charged against `user.max_user_namespaces` at every
-    /// level up to the initial namespace, and a launch holds two: the sandbox's
-    /// own, and the nested one the command enters. A host whose ceiling admits
-    /// the first and not the second reports this rather than a bare `ENOSPC`.
+    /// The limits are a family: a per-user count of each kind of namespace, set
+    /// by the `user.max_*_namespaces` sysctls under `/proc/sys/user`, and the
+    /// nesting depth of user and PID namespaces, 32 levels each. A namespace
+    /// is charged against its count at every level of user namespace up to the
+    /// initial one, and a launch holds two user namespaces and two mount
+    /// namespaces: the sandbox's own, and the nested ones the command enters.
+    /// The kernel's `ENOSPC` names none of them, so this is reported rather
+    /// than a bare "No space left on device".
     ///
-    /// Distinct from [`UsernsUnavailable`](Self::UsernsUnavailable), which is a
-    /// host that permits no user namespace at all: here the sandbox was built
-    /// and only the second namespace was refused.
+    /// `step` says which creation was refused:
+    /// [`Unshare`](SetupStep::Unshare) for the sandbox's own namespaces, and
+    /// [`NestedUnshare`](SetupStep::NestedUnshare) for the command's nested
+    /// ones, where a host whose ceiling admits one user namespace and not two
+    /// fails. Distinct from [`UsernsUnavailable`](Self::UsernsUnavailable),
+    /// which is a host that permits no user namespace at all.
     #[non_exhaustive]
-    NestedUsernsBudgetExhausted {
-        /// The error the kernel returned for the nested namespace, `ENOSPC`.
+    NamespaceLimitReached {
+        /// The creation that was refused.
+        step: SetupStep,
+        /// The error the kernel returned, `ENOSPC`.
         source: io::Error,
     },
     /// The calling user's kernel key quota is exhausted, so the sandbox could
@@ -1083,6 +1092,14 @@ pub enum Error {
     #[non_exhaustive]
     Signal {
         /// The error from the signaling machinery.
+        source: io::Error,
+    },
+    /// A [`KillHandle`](crate::KillHandle) could not be made: duplicating the
+    /// handle's descriptors failed, typically because the process has run out
+    /// of them. Nothing was signaled.
+    #[non_exhaustive]
+    KillHandle {
+        /// The error from duplicating a descriptor.
         source: io::Error,
     },
     /// The identity-map delegate failed to establish the range map.
@@ -1212,11 +1229,13 @@ impl fmt::Display for Error {
                 "the kernel denied user namespace creation (a seccomp filter or an LSM policy \
                  may be blocking unprivileged user namespaces)",
             ),
-            Error::NestedUsernsBudgetExhausted { .. } => f.write_str(
-                "the sandbox could not enter its nested user namespace, because the host's \
-                 user namespace budget is exhausted (every launch holds two user namespaces; \
-                 raise user.max_user_namespaces, or reduce the number of namespaces already \
-                 live)",
+            Error::NamespaceLimitReached { step, .. } => write!(
+                f,
+                "sandbox setup failed while {step}, because a namespace limit is reached (a \
+                 count under /proc/sys/user such as user.max_user_namespaces or \
+                 user.max_mnt_namespaces, of which every launch takes two, or the nesting \
+                 depth of 32 user or PID namespaces; raise the count, or reduce the number of \
+                 namespaces already live)"
             ),
             Error::KeyQuotaExhausted { .. } => f.write_str(
                 "the sandbox could not be given a session keyring of its own, because the \
@@ -1238,6 +1257,7 @@ impl fmt::Display for Error {
                 f.write_str("the sandbox supervisor exited without reporting the command's outcome")
             }
             Error::Signal { .. } => f.write_str("could not signal the sandbox"),
+            Error::KillHandle { .. } => f.write_str("could not make a kill handle for the sandbox"),
             Error::IdentityMap(_) => f.write_str("could not establish the identity map"),
             Error::Terminal { .. } => f.write_str("a pseudoterminal operation failed"),
             Error::TerminalsExhausted { .. } => f.write_str(
@@ -1267,12 +1287,13 @@ impl std::error::Error for Error {
             Error::Config(err) => Some(err),
             Error::IdentityMap(err) => Some(err),
             Error::UsernsUnavailable { source, .. }
-            | Error::NestedUsernsBudgetExhausted { source }
+            | Error::NamespaceLimitReached { source, .. }
             | Error::KeyQuotaExhausted { source }
             | Error::Setup { source, .. }
             | Error::Spawn { source }
             | Error::Wait { source }
             | Error::Signal { source }
+            | Error::KillHandle { source }
             | Error::Terminal { source }
             | Error::TerminalsExhausted { source } => Some(source),
             Error::SupervisorLost | Error::StreamIsDirectory { .. } => None,

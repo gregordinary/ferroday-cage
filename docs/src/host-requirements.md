@@ -46,7 +46,7 @@ The namespace budget is the clearest case of that. A ceiling of `1` is
 reportable, because it cannot admit the two namespaces a launch holds; a
 ceiling of four with three namespaces already live cannot be, because only the
 launch can know how many are in use. That one surfaces at launch as
-`Error::NestedUsernsBudgetExhausted`, which names the sysctl.
+`Error::NamespaceLimitReached`, which names the limits.
 
 The kernel key quota is a second budget of the same kind. Every running sandbox
 holds a session keyring of its own (see [The session
@@ -136,8 +136,9 @@ one cage rather than one cage each avoids the condition at no cost.
 
 ## Architecture
 
-Namespaces, `pivot_root`, and the identity maps are architecture-independent;
-ferroday-cage runs on any architecture the Rust Linux targets support. The
+ferroday-cage builds for x86_64, x86, aarch64, 32-bit arm, and riscv64 Linux.
+The launch issues its own system calls after the fork without libc, and those
+are the architectures it states them for. The build fails on any other. The
 binaries inside the rootfs must be ones the host CPU executes — its own
 architecture, or one it runs natively, such as i386 on an amd64 host — or a
 matching `qemu-user` binfmt handler must be registered for them.

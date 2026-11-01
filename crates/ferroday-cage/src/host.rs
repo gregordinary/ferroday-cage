@@ -42,7 +42,7 @@ pub enum UsernsBlocker {
     /// The condition is necessary and not sufficient, as every blocker here is:
     /// a host whose ceiling is four with three namespaces already live fails
     /// the same way, and only the launch can know that. It surfaces there as
-    /// [`Error::NestedUsernsBudgetExhausted`](crate::Error::NestedUsernsBudgetExhausted).
+    /// [`Error::NamespaceLimitReached`](crate::Error::NamespaceLimitReached).
     MaxUserNamespacesBelowNesting,
     /// The `kernel.apparmor_restrict_unprivileged_userns` sysctl is `1`.
     ///

@@ -227,7 +227,10 @@ mod tests {
                 blocker: Some(crate::host::UsernsBlocker::MaxUserNamespacesIsZero),
                 source: os_error(),
             }),
-            Box::new(Error::NestedUsernsBudgetExhausted { source: os_error() }),
+            Box::new(Error::NamespaceLimitReached {
+                step: SetupStep::NestedUnshare,
+                source: os_error(),
+            }),
             Box::new(Error::KeyQuotaExhausted { source: os_error() }),
             Box::new(Error::Setup {
                 step: SetupStep::BindMount,
@@ -242,6 +245,7 @@ mod tests {
             Box::new(Error::Spawn { source: os_error() }),
             Box::new(Error::Wait { source: os_error() }),
             Box::new(Error::Signal { source: os_error() }),
+            Box::new(Error::KillHandle { source: os_error() }),
             Box::new(Error::IdentityMap(IdMapError::map_write(
                 "gid_map",
                 os_error(),

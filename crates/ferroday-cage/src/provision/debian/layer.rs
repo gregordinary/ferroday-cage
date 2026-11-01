@@ -139,15 +139,15 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
         };
         // Anything short of present-and-configured is not a dependency the
         // increment may assume satisfied.
-        if !super::bootstrap::is_configured(status) {
+        if !super::bootstrap::is_configured(&status) {
             continue;
         }
-        installed.install(name, stanza.get("Version"));
+        installed.install(&name, stanza.get("Version").as_deref());
         // A package's provided virtuals satisfy dependencies named against them,
         // so folding them into the same map lets one lookup in the resolver
         // cover a base that satisfies a group either by real name or by virtual.
         if let Some(provides) = stanza.get("Provides") {
-            for provided in parse_provides(provides) {
+            for provided in parse_provides(&provides) {
                 installed.supply(&provided.name, provided.version.as_deref());
             }
         }

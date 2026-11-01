@@ -1099,6 +1099,8 @@ pub ferroday_cage::provision::ProvisionError::Io::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::Io::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::Other
 pub ferroday_cage::provision::ProvisionError::Other::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
+#[non_exhaustive] pub ferroday_cage::provision::ProvisionError::RemoveDestInvalid
+pub ferroday_cage::provision::ProvisionError::RemoveDestInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::RemoveUnprivileged
 pub ferroday_cage::provision::ProvisionError::RemoveUnprivileged::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::RemoveUnprivileged::reason: alloc::string::String
@@ -1634,8 +1636,11 @@ pub ferroday_cage::Error::Config(ferroday_cage::ConfigError)
 pub ferroday_cage::Error::IdentityMap(ferroday_cage::IdMapError)
 #[non_exhaustive] pub ferroday_cage::Error::KeyQuotaExhausted
 pub ferroday_cage::Error::KeyQuotaExhausted::source: core::io::error::Error
-#[non_exhaustive] pub ferroday_cage::Error::NestedUsernsBudgetExhausted
-pub ferroday_cage::Error::NestedUsernsBudgetExhausted::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::Error::KillHandle
+pub ferroday_cage::Error::KillHandle::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::Error::NamespaceLimitReached
+pub ferroday_cage::Error::NamespaceLimitReached::source: core::io::error::Error
+pub ferroday_cage::Error::NamespaceLimitReached::step: ferroday_cage::SetupStep
 #[non_exhaustive] pub ferroday_cage::Error::Setup
 pub ferroday_cage::Error::Setup::detail: core::option::Option<alloc::string::String>
 pub ferroday_cage::Error::Setup::source: core::io::error::Error
@@ -2755,6 +2760,7 @@ pub fn ferroday_cage::SeccompRules::errno(&str) -> core::option::Option<u16>
 pub fn ferroday_cage::SeccompRules::errno_for(self, i64, u16) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::listed_action(self, ferroday_cage::SeccompAction) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::rule<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::SeccompArg>>(self, i64, I) -> ferroday_cage::SeccompRules
+pub fn ferroday_cage::SeccompRules::syscall(&str) -> core::option::Option<i64>
 impl core::marker::Freeze for ferroday_cage::SeccompRules
 impl core::marker::Send for ferroday_cage::SeccompRules
 impl core::marker::Sync for ferroday_cage::SeccompRules

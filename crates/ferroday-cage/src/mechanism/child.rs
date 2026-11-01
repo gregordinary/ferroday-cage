@@ -63,7 +63,7 @@
 use std::convert::Infallible;
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{self, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags};
@@ -165,12 +165,20 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     let plan = context.plan;
 
     // Scrub the inherited signal state first: every disposition back to the
-    // default and an empty mask. The caller's ignored dispositions would
-    // survive exec into the command (a Rust caller ignores SIGPIPE, for
-    // one), and an inherited signal handler running inside these
-    // no-allocation processes would violate their constraints. After the
-    // reset, neither can happen.
-    reset_signals().map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
+    // default. The caller's ignored dispositions would survive exec into the
+    // command (a Rust caller ignores SIGPIPE, for one), and an inherited signal
+    // handler running inside these no-allocation processes would violate their
+    // constraints. The fork left every signal blocked until here, so neither
+    // can happen.
+    //
+    // Every signal the outside supervisor ignores stays blocked. This process
+    // is in the caller's process group, and without a PID namespace it
+    // outlives the setup as the command's supervisor, which must not end
+    // because a signal was sent to that group. Blocked from the fork on, a
+    // signal that arrives waits until the supervisor ignores it, which
+    // discards it; see `ignore_outside_signals`.
+    reset_signals(&SigSet::all().without(&SUPERVISOR_KEEPS))
+        .map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
 
     // New namespaces, owned by the new user namespace, over which this
     // process holds full capabilities: the sandbox setup below is
@@ -242,6 +250,7 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // only, per this module's constraints, and never returns.
     match unsafe { sys::fork() }.map_err(|errno| (fork_step, errno, 0))? {
         sys::Fork::Child => {
+            unblock_signals().map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
             if plan.pid_namespace {
                 stage_init(context)
             } else {
@@ -299,7 +308,7 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                 // this stage's work is done.
                 sys::exit_group(0)
             } else {
-                supervisor_hygiene(context);
+                supervisor_hygiene(context, Role::Outside);
                 supervise(context, pidfd.as_fd(), child, Role::Outside)
             }
         }
@@ -436,6 +445,10 @@ fn stage_init(context: &Context<'_>) -> ! {
             sys::exit_group(127)
         }
         Ok(sys::Fork::Child) => {
+            if let Err(errno) = unblock_signals() {
+                report(context.report_fd, SetupStep::ResetSignals, errno, 0);
+                sys::exit_group(127)
+            }
             // The command keeps its own end of the gate and drops the
             // delegate's side of the seam, which is not its to hold.
             let gate = seam.map(|seam| {
@@ -480,20 +493,27 @@ fn stage_init(context: &Context<'_>) -> ! {
                     sys::exit_group(127)
                 }
             }
-            supervisor_hygiene(context);
+            supervisor_hygiene(context, Role::Init);
             supervise(context, pidfd.as_fd(), command, Role::Init)
         }
     }
 }
 
 /// Kills and collects the command after the delegate failed to establish its
-/// nested identity map.
+/// nested identity map, or after its supervisor could not be published.
 ///
 /// Killed rather than released by closing the gate: the command would see
-/// end-of-file and report a failure of its own, and two records in a pipe whose
-/// protocol is one record is a report the caller cannot decode. The command is
-/// blocked at the gate, before it has run anything of the caller's, so nothing
-/// is lost by ending it here.
+/// end-of-file and report a failure of its own, and a second failure in a pipe
+/// whose protocol ends at the first is a report the caller cannot decode. The
+/// command is blocked at the gate, or has not reached it, before it has run
+/// anything of the caller's, so nothing is lost by ending it here.
+///
+/// The caller side's [`abandon_gated_child`](super::abandon_gated_child) does
+/// the same for its own children, and is not reached for from here because its
+/// reap goes through [`wait_for_exit`](super::wait_for_exit), whose
+/// `unreachable!` is a panic path this process must not have. The pid needs no
+/// pidfd: the command is this process's unreaped child process until the wait
+/// below, so the number names nothing else.
 fn abandon_command(command: Pid) {
     let _ = process::kill_process(command, Signal::KILL);
     let _ = frame::retry_on_intr!(process::waitpid(Some(command), WaitOptions::empty()));
@@ -569,19 +589,23 @@ fn exec_command(
     // stack is attached to the sandbox's network namespace — the caller holds
     // the command here, joins the namespace and brings up its tap, then
     // proceeds. The wait is before the hardening layer so a seccomp filter
-    // cannot deny the read that releases it.
-    if let Some(proceed) = context.proceed_fd
-        && let Err((step, errno)) = await_proceed(proceed)
-    {
-        report(context.report_fd, step, errno, 0);
-        sys::exit_group(127)
+    // cannot deny the read that releases it. The caller is told the command is
+    // here first: every namespace and mount is in place by now, so the
+    // process it attaches to is the one the sandbox will run in.
+    if let Some(proceed) = context.proceed_fd {
+        report_held(context.report_fd);
+        if let Err((step, errno)) = await_proceed(proceed) {
+            report(context.report_fd, step, errno, 0);
+            sys::exit_group(127)
+        }
     }
 
-    // The resource limits, applied before the hardening layer: the command
-    // still holds its in-namespace capabilities here, so raising a hard limit
-    // within the caller's own is permitted, and no seccomp filter is installed
-    // yet that could deny the call. Each limit is inherited across `execve` and
-    // by every process the command starts.
+    // The resource limits, applied before the hardening layer, so no seccomp
+    // filter is installed yet that could deny the call. A soft limit may move
+    // anywhere up to its hard limit, and a hard limit may only come down:
+    // raising one needs CAP_SYS_RESOURCE in the initial user namespace, which
+    // no sandbox holds. Each limit is inherited across `execve` and by every
+    // process the command starts.
     if let Err((step, errno, detail)) = apply_rlimits(context) {
         report(context.report_fd, step, errno, detail);
         sys::exit_group(127)
@@ -739,13 +763,11 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 /// channels: a caller that had already closed one of 0, 1 and 2 when it called
 /// `spawn` would have the report pipe, the status pipe, the control socket or
 /// the nested identity map's gate land there, and the `dup2`s below would
-/// clobber it in the command process. A
-/// `std` program cannot start in that state — the runtime's startup opens
-/// `/dev/null` over any standard descriptor that is closed — so this is
-/// reachable only for a consumer that closes one at runtime, and it is
-/// pre-existing rather than something the terminal introduced. What a terminal
-/// launch changes is the breadth: it wires all three, where a capturing launch
-/// wires at most two.
+/// clobber it in the command process. A `std` program cannot start in that
+/// state — the runtime's startup opens `/dev/null` over any standard descriptor
+/// that is closed — so this is reachable only for a consumer that closes one at
+/// runtime. A terminal launch is the widest exposure, since it wires all three
+/// streams where a capturing launch wires at most two.
 fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result<(), Errno> {
     /// The highest standard stream number: the ceiling a source must be above
     /// before anything is wired, and the floor it is moved to.
@@ -1003,7 +1025,8 @@ pub(super) fn enter_mapped_namespace(
     duty: MapDuty<'_>,
     gate: Option<BorrowedFd<'_>>,
 ) -> Result<(), MapFailure> {
-    reset_signals().map_err(|errno| MapFailure::Step(MapStep::ResetSignals, errno))?;
+    reset_signals(&SigSet::empty())
+        .map_err(|errno| MapFailure::Step(MapStep::ResetSignals, errno))?;
     ignore_sigpipe().map_err(|errno| MapFailure::Step(MapStep::ResetSignals, errno))?;
     sweep_fds_keeping(keep).map_err(|errno| MapFailure::Step(MapStep::SweepFds, errno))?;
     // SAFETY: the flags never include the descriptor table, and this process
@@ -1435,7 +1458,8 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     // tree is mounted until the pivot), and every target resolves inside
     // the new root.
     for (index, op) in plan.ops.iter().enumerate() {
-        execute_op(newroot.as_fd(), op).map_err(|(step, errno)| (step, errno, index as u32 + 1))?;
+        execute_op(newroot.as_fd(), op, index, context.report_fd)
+            .map_err(|(step, errno)| (step, errno, index as u32 + 1))?;
     }
 
     // The procfs the command's nested identity map will be written through,
@@ -1474,7 +1498,8 @@ enum Role {
     /// PID 1 inside the sandbox's PID namespace. Its own exit tears the
     /// namespace down.
     Init,
-    /// Stage A outside the sandbox, when no PID namespace was requested.
+    /// The launch stage outside the sandbox, when no PID namespace was
+    /// requested: the command's parent, which collects its outcome.
     Outside,
 }
 
@@ -1485,7 +1510,9 @@ enum Role {
 /// must not pin a caller resource for the sandbox's lifetime), stdio repoints
 /// at `/dev/null` (a pipeline reading the caller's stdout must not wait for the
 /// supervisor), and SIGPIPE becomes ignored so a status write after the handle
-/// is dropped fails with `EPIPE` instead of killing the supervisor.
+/// is dropped fails with `EPIPE` instead of killing the supervisor. Outside the
+/// sandbox, every signal the supervisor does not need becomes ignored too; see
+/// [`ignore_outside_signals`].
 ///
 /// A terminal launch's replica is not among these. The only supervisor that
 /// ever held one is the init, which allocated it and drops it itself before it
@@ -1497,7 +1524,7 @@ enum Role {
 /// Everything here is best-effort: past this point there is no report pipe
 /// to fail through, and none of these operations can fail in a way that
 /// compromises supervision.
-fn supervisor_hygiene(context: &Context<'_>) {
+fn supervisor_hygiene(context: &Context<'_>, role: Role) {
     // SAFETY: these raw descriptors are this process's own copies of the
     // launch channels, closed exactly once here and never used again in
     // this process.
@@ -1532,6 +1559,91 @@ fn supervisor_hygiene(context: &Context<'_>) {
     // closed exactly once and never used again in this process.
     unsafe { rustix::io::close(context.null_fd.as_raw_fd()) };
     let _ = ignore_sigpipe();
+    if role == Role::Outside {
+        let _ = ignore_outside_signals();
+    }
+}
+
+/// The signals the outside supervisor leaves at their defaults, where it
+/// ignores every other.
+///
+/// `SIGCHLD`, because its disposition decides who reaps the supervisor's
+/// children: ignored, the kernel would collect the command itself, and the
+/// supervisor's wait would never see its status. And the signals that report
+/// this process's own failure: the faults the kernel raises on an instruction
+/// it executes, which it delivers whatever the disposition, and `SIGABRT`.
+/// `SIGKILL` and `SIGSTOP` take no disposition at all. Another process can
+/// therefore still end this one by sending it one of these, as it can with
+/// `SIGKILL`.
+const SUPERVISOR_KEEPS: [Signal; 8] = [
+    Signal::CHILD,
+    Signal::SEGV,
+    Signal::BUS,
+    Signal::ILL,
+    Signal::FPE,
+    Signal::TRAP,
+    Signal::SYS,
+    Signal::ABORT,
+];
+
+/// Ignores every signal but [`SUPERVISOR_KEEPS`], then unblocks them all: the
+/// outside supervisor's immunity, the one the init has as PID 1.
+///
+/// The init is immune by construction. A namespace's PID 1 is never sent a
+/// signal it has left at the default, from inside the namespace or above it,
+/// except `SIGKILL` and `SIGSTOP` from above. The launch stage, supervising from
+/// outside, is an ordinary member of the caller's process group, and a signal
+/// sent to that group would end it as it ends the caller: an interrupt typed at
+/// the caller's terminal, a hangup, a shell's `kill %1`. Its command, in a
+/// session of its own whenever it does not inherit the caller's standard input,
+/// would then run on unsupervised: never stopped by
+/// [`stop_with_caller`](crate::CageBuilder::stop_with_caller), and its outcome
+/// never reported.
+///
+/// The library itself never signals this process to make it act. A termination
+/// request and the caller's exit reach it over the control socket, and a kill
+/// goes to the command through the command's pidfd. Only the teardown of a
+/// launch being given up on ends it, with `SIGKILL`, which no disposition
+/// stops.
+///
+/// Ignored only here, after the command was forked, because an ignored
+/// disposition survives `execve` and the command must start with every one at
+/// its default. The launch stage has kept them blocked since its own fork, so
+/// one that arrived meanwhile is pending, and ignoring it discards it: there is
+/// no moment at which one reaches this process at the default.
+fn ignore_outside_signals() -> Result<(), Errno> {
+    for number in 1..=64 {
+        // SAFETY: the numbers are non-zero and within the kernel's signal
+        // range on every architecture.
+        let signal = unsafe { Signal::from_raw_unchecked(number) };
+        if signal == Signal::KILL || signal == Signal::STOP || SUPERVISOR_KEEPS.contains(&signal) {
+            continue;
+        }
+        match sys::set_disposition(signal, Disposition::Ignore) {
+            // Numbers the kernel reserves are skipped, as the reset skips them.
+            Ok(()) | Err(Errno::INVAL) => {}
+            Err(errno) => return Err(errno),
+        }
+    }
+    // SAFETY: every signal unblocked here was just ignored or keeps its
+    // default, so unblocking it runs no handler; the process is
+    // single-threaded.
+    unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::empty())) }?;
+    Ok(())
+}
+
+/// Empties the signal mask of a process the launch stage or the init just
+/// forked.
+///
+/// [`sys::fork`] leaves every signal blocked in the child process. The
+/// dispositions it inherited are its parent process's, which
+/// [`reset_signals`] put back to the default and which nothing has set since,
+/// so unblocking runs nothing: the init and the command start with the empty
+/// mask a process ordinarily has.
+fn unblock_signals() -> Result<(), Errno> {
+    // SAFETY: every disposition is the default, so unblocking runs no handler;
+    // the process is single-threaded and freshly forked.
+    unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::empty())) }.map(|_| ())
 }
 
 /// Ignores `SIGPIPE`, so a write to a channel whose reader is gone fails with
@@ -1690,17 +1802,18 @@ fn report_status(fd: BorrowedFd<'_>, status: WaitStatus) {
     let _ = rustix::io::write(fd, &record);
 }
 
-/// Resets every signal disposition to the default and empties the signal
-/// mask, in that order.
+/// Resets every signal disposition to the default, then replaces the signal
+/// mask with `blocked`.
 ///
-/// The order matters. `fork` clears the pending set but not the mask, and it
-/// carries the caller's handlers into the child. Emptying the mask first would
-/// open a window in which a *newly delivered* signal — a process-group signal, a
+/// The order matters. A fork carries the caller's handlers into the child
+/// process, and [`sys::fork`] hands it a mask that blocks every signal so that
+/// none of them can run before this call. Changing the mask first would open a
+/// window in which a *newly delivered* signal — a process-group signal, a
 /// terminal's `SIGWINCH`, an inherited interval timer — runs one of those
 /// handlers inside a process that must not allocate, take a lock, or panic.
 /// Resetting the dispositions first leaves nothing to run when the mask comes
 /// off.
-pub(super) fn reset_signals() -> Result<(), Errno> {
+pub(super) fn reset_signals(blocked: &SigSet) -> Result<(), Errno> {
     for number in 1..=64 {
         if number == Signal::KILL.as_raw() || number == Signal::STOP.as_raw() {
             continue;
@@ -1715,11 +1828,10 @@ pub(super) fn reset_signals() -> Result<(), Errno> {
             Err(errno) => return Err(errno),
         }
     }
-    // SAFETY: replacing the whole mask with an empty set neither unblocks a
-    // handler-less signal mid-handler nor races other threads; this process
-    // is single-threaded and freshly forked, with no pending set (fork
-    // clears it) and, after the loop above, no inherited handler to run.
-    unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::empty())) }?;
+    // SAFETY: replacing the whole mask neither unblocks a signal mid-handler
+    // nor races other threads; this process is single-threaded and freshly
+    // forked, and after the loop above has no inherited handler to run.
+    unsafe { sys::sigprocmask(How::SetMask, Some(blocked)) }?;
     Ok(())
 }
 
@@ -1915,7 +2027,8 @@ fn create_mount_dir(dir: BorrowedFd<'_>, leaf: &CStr, mode: Mode) -> Result<(), 
 const FILE_TARGET_MODE: fs::RawMode = 0o644;
 
 /// Creates a file bind's target, empty and at exactly `mode`, leaving an entry
-/// the root already ships — of any kind — untouched.
+/// the root already ships — of any kind — untouched. Returns the created file,
+/// or `None` where an entry was already there.
 ///
 /// `O_EXCL` is what keeps the created file at the path the caller side
 /// recorded. `RESOLVE_IN_ROOT` scopes symlink resolution to the root but does
@@ -1933,21 +2046,126 @@ const FILE_TARGET_MODE: fs::RawMode = 0o644;
 /// the root ships is never rewritten.
 ///
 /// [`LaunchPlan::managed_placeholders`]: super::LaunchPlan::managed_placeholders
-fn create_mount_file(root: BorrowedFd<'_>, path: &CStr, mode: Mode) -> Result<(), Errno> {
+fn create_mount_file(
+    root: BorrowedFd<'_>,
+    path: &CStr,
+    mode: Mode,
+) -> Result<Option<OwnedFd>, Errno> {
     match open_in_root_with(
         root,
         path,
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
         mode,
     ) {
-        Ok(file) => fs::fchmod(&file, mode),
-        Err(Errno::EXIST) => Ok(()),
+        Ok(file) => {
+            fs::fchmod(&file, mode)?;
+            Ok(Some(file))
+        }
+        Err(Errno::EXIST) => Ok(None),
         Err(errno) => Err(errno),
     }
 }
 
-/// Executes one frozen mount op against the new root.
-fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errno)> {
+/// How many times [`hold_file_target`] looks again at a target another
+/// sandbox's teardown is removing before it binds without a lock.
+const TARGET_ATTEMPTS: usize = 64;
+
+/// Makes sure a file bind's target exists, reports it to the caller side if
+/// this call created it, and holds a shared lock on a regular-file target for
+/// as long as this process keeps its descriptors.
+///
+/// A target this call creates is the launch's own, and the caller side removes
+/// it once the sandbox is gone; see
+/// [`LaunchPlan::managed_placeholders`](super::LaunchPlan::managed_placeholders).
+/// Its identity goes back with it, so the removal can tell this file from one
+/// that later took its name.
+///
+/// A target already at the path is the root's own, or another sandbox's on a
+/// root two of them share: the first to bind creates it, the second finds it,
+/// and the first's teardown must not remove it while the second can still be
+/// running, since unlinking a name unmounts every bind onto it. The shared lock
+/// is how the second says so. A teardown takes an exclusive lock before it
+/// removes anything and leaves a target any sandbox still holds. One whose lock
+/// is refused here holds an exclusive one and is removing the target, so the
+/// target is created anew once it is gone, a bounded number of times before
+/// the bind goes ahead without a lock.
+///
+/// The lock lasts as long as a descriptor for the file in this process, so the
+/// descriptor is left open. The init keeps it for the sandbox's whole life. The
+/// command process, which sets the sandbox up where there is no PID namespace,
+/// keeps it until it executes: every descriptor here closes on exec, and none
+/// may reach the command.
+///
+/// Post-fork safe: raw syscalls only.
+fn hold_file_target(
+    root: BorrowedFd<'_>,
+    path: &CStr,
+    op: usize,
+    report_fd: BorrowedFd<'_>,
+) -> Result<(), Errno> {
+    for _ in 0..TARGET_ATTEMPTS {
+        if let Some(file) = create_mount_file(root, path, Mode::from_raw_mode(FILE_TARGET_MODE))? {
+            // A file nobody else has opened yet: the lock cannot be refused.
+            let _ = share_target(&file);
+            report_created(report_fd, op, &fs::fstat(&file)?);
+            let _ = file.into_raw_fd();
+            return Ok(());
+        }
+        let found = match open_in_root(root, path, OFlags::PATH) {
+            Ok(found) => found,
+            // A name that leads nowhere: removed since the create found it,
+            // to be created again, or a link to nothing, which is the root's.
+            Err(Errno::NOENT) => match open_in_root(root, path, OFlags::PATH | OFlags::NOFOLLOW) {
+                Err(Errno::NOENT) => continue,
+                _ => return Ok(()),
+            },
+            Err(errno) => return Err(errno),
+        };
+        if fs::FileType::from_raw_mode(fs::fstat(&found)?.st_mode) != fs::FileType::RegularFile {
+            // Not a file a launch creates, so not one a teardown removes.
+            return Ok(());
+        }
+        // Reopened through the descriptor rather than the path, so the file
+        // locked is the file found; an `O_PATH` descriptor takes no lock.
+        let file = fs::open(
+            fd_path(&found).as_cstr(),
+            OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        match share_target(&file) {
+            // Granted after a teardown let go of it, the file may be unlinked
+            // already, and the name then holds nothing of this lock's.
+            Ok(()) if fs::fstat(&file)?.st_nlink == 0 => continue,
+            Ok(()) => {
+                let _ = file.into_raw_fd();
+                return Ok(());
+            }
+            Err(Errno::WOULDBLOCK) => thread::sched_yield(),
+            Err(_) => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// Takes a shared lock on a file-bind target, without waiting.
+///
+/// A lock on the file a bind covers rather than a lock file, so not
+/// `provision::lock_exclusive`'s to take: it is shared among the sandboxes
+/// bound onto the file, never waited for, and taken after the fork, where that
+/// helper's path handling cannot run.
+fn share_target(file: &OwnedFd) -> Result<(), Errno> {
+    #[expect(clippy::disallowed_methods)]
+    let taken = fs::flock(file, fs::FlockOperation::NonBlockingLockShared);
+    taken
+}
+
+/// Executes one frozen mount op, the plan's `index`th, against the new root.
+fn execute_op(
+    root: BorrowedFd<'_>,
+    op: &MountOp,
+    index: usize,
+    report_fd: BorrowedFd<'_>,
+) -> Result<(), (SetupStep, Errno)> {
     // Create missing mount-target directories, one component at a time.
     // The parent directory is resolved in-root first, so a symlinked
     // component is followed only within the rootfs; an existing entry —
@@ -1967,7 +2185,7 @@ fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errn
     // The target of a file bind must exist before a file can be bound onto
     // it; create it empty where the root ships nothing at that path.
     if let Some(file) = &op.create_file {
-        create_mount_file(root, file, Mode::from_raw_mode(FILE_TARGET_MODE))
+        hold_file_target(root, file, index, report_fd)
             .map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
     }
 
@@ -2019,17 +2237,9 @@ fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errn
             target,
             read_only,
         } => {
-            {
-                let target = open_in_root(root, target, OFlags::PATH)
-                    .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-                mount::mount_bind_recursive(source.as_c_str(), fd_path(&target).as_cstr())
-                    .map_err(|errno| (SetupStep::BindMount, errno))?;
-            }
-            if *read_only {
-                remount_read_only(root, target).map_err(|errno| (SetupStep::RemountReadOnly, errno))
-            } else {
-                Ok(())
-            }
+            let target = open_in_root(root, target, OFlags::PATH)
+                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+            bind(source, target.as_fd(), *read_only)
         }
         MountAction::Raw {
             source,
@@ -2064,24 +2274,55 @@ fn execute_op(root: BorrowedFd<'_>, op: &MountOp) -> Result<(), (SetupStep, Errn
     }
 }
 
-/// Remounts the bind mount at `target`, and every mount beneath it,
-/// read-only.
+/// Binds the host tree at `source`, with every mount beneath it, onto the
+/// mount target `target` names, read-only throughout when `read_only` asks.
 ///
-/// The target is re-resolved so the descriptor references the bind mount just
-/// created, now top of the mount stack. `mount_setattr` with `AT_RECURSIVE`
-/// marks the whole subtree read-only in one atomic call and needs no locked-
-/// flag handling, because it only adds a restriction; it is preferred so a
-/// read-only bind of a tree that carries its own submounts leaves those
-/// submounts read-only too. On a kernel without `mount_setattr` (before 5.12)
-/// this falls back to a top-level remount, which covers the bind itself but
-/// leaves any submounts with their own flags.
-fn remount_read_only(root: BorrowedFd<'_>, target: &CStr) -> Result<(), Errno> {
-    let target = open_in_root(root, target, OFlags::PATH)?;
-    match mount_setattr_recursive(target.as_fd(), MOUNT_ATTR_RDONLY) {
-        Ok(()) => Ok(()),
-        Err(Errno::NOSYS) => remount_top(target.as_fd(), MountFlags::RDONLY),
-        Err(errno) => Err(errno),
+/// The tree is cloned detached first (`open_tree` with `OPEN_TREE_CLONE`), made
+/// read-only while detached, and only then attached (`move_mount`) onto the
+/// descriptor the target was resolved to. Nothing between the bind and its
+/// restriction resolves a path again. Remounting by path after an ordinary
+/// bind would: a sandbox sharing a writable root could rename and symlink in
+/// that window, and land the read-only flag on a mount of its choosing while
+/// this bind stayed writable. Restricted before it is attached, the bind is
+/// never anything but read-only where a path can reach it.
+///
+/// `mount_setattr` with `AT_RECURSIVE` marks the whole tree in one call and
+/// needs no locked-flag handling, because it only adds a restriction, so a
+/// read-only bind of a tree that carries its own submounts leaves them
+/// read-only too. A kernel without it (before 5.12) has the restriction made
+/// after the attach instead, as a remount of the mount the tree's descriptor
+/// names, which by then is the bind. No path is resolved again, but the bind
+/// is writable for that moment, and only the bind itself is covered: its
+/// submounts keep their own flags.
+fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (SetupStep, Errno)> {
+    let tree = mount::open_tree(
+        fs::CWD,
+        source,
+        mount::OpenTreeFlags::OPEN_TREE_CLONE
+            | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC
+            | mount::OpenTreeFlags::AT_RECURSIVE,
+    )
+    .map_err(|errno| (SetupStep::BindMount, errno))?;
+    let remount_after = read_only
+        && match mount_setattr_recursive(tree.as_fd(), MOUNT_ATTR_RDONLY) {
+            Ok(()) => false,
+            Err(Errno::NOSYS) => true,
+            Err(errno) => return Err((SetupStep::RemountReadOnly, errno)),
+        };
+    mount::move_mount(
+        tree.as_fd(),
+        c"",
+        target,
+        c"",
+        mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH
+            | mount::MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
+    )
+    .map_err(|errno| (SetupStep::BindMount, errno))?;
+    if remount_after {
+        remount_top(tree.as_fd(), MountFlags::RDONLY)
+            .map_err(|errno| (SetupStep::RemountReadOnly, errno))?;
     }
+    Ok(())
 }
 
 /// Marks the sandbox's root mount, and every mount the rootfs bind carried
@@ -2138,7 +2379,7 @@ const _: () = assert!(size_of::<MountAttr>() == 32);
 /// namespace holds locked.
 ///
 /// Returns `Errno::NOSYS` on a kernel that predates `mount_setattr` (before
-/// 5.12), which the caller handles by falling back to a top-level remount.
+/// 5.12), which each caller answers with a top-level remount.
 fn mount_setattr_recursive(target: BorrowedFd<'_>, attr_set: u64) -> Result<(), Errno> {
     let attr = MountAttr {
         attr_set,
@@ -2146,10 +2387,11 @@ fn mount_setattr_recursive(target: BorrowedFd<'_>, attr_set: u64) -> Result<(), 
         propagation: 0,
         userns_fd: 0,
     };
-    // SAFETY: `target` is an O_PATH descriptor naming the freshly created bind
-    // mount; with AT_EMPTY_PATH and an empty path the call operates on that
-    // mount, and with AT_RECURSIVE on its submounts. The attr pointer and its
-    // size describe a valid `struct mount_attr` for the duration of the call.
+    // SAFETY: `target` is a descriptor naming a mount, the root's bind or a
+    // detached tree; with AT_EMPTY_PATH and an empty path the call operates on
+    // that mount, and with AT_RECURSIVE on its submounts. The attr pointer and
+    // its size describe a valid `struct mount_attr` for the duration of the
+    // call.
     unsafe {
         syscalls::syscall!(
             Sysno::mount_setattr,
@@ -2375,19 +2617,34 @@ pub(super) fn write_file(path: &CStr, data: &[u8]) -> Result<(), Errno> {
     frame::write_whole(fd.as_fd(), data)
 }
 
-/// Writes the 12-byte failure record: the step discriminant, the errno, and
-/// the detail index, all little-endian. At 12 bytes the write is atomic
-/// under `PIPE_BUF`. If it fails the caller is gone and there is no one to
-/// report to.
+/// Writes the failure record: the step discriminant, the errno, and the detail
+/// index, all little-endian. Smaller than `PIPE_BUF`, the write is atomic. If it
+/// fails the caller is gone and there is no one to report to.
 fn report(fd: BorrowedFd<'_>, step: SetupStep, errno: Errno, detail: u32) {
-    let step_bytes = (step as u32).to_le_bytes();
-    let errno_bytes = errno.raw_os_error().to_le_bytes();
-    let detail_bytes = detail.to_le_bytes();
-    let mut record = [0u8; 12];
-    record[0..4].copy_from_slice(&step_bytes);
-    record[4..8].copy_from_slice(&errno_bytes);
-    record[8..12].copy_from_slice(&detail_bytes);
+    let mut record = [0u8; super::REPORT_FAILURE_LEN];
+    record[0..4].copy_from_slice(&(step as u32).to_le_bytes());
+    record[4..8].copy_from_slice(&errno.raw_os_error().to_le_bytes());
+    record[8..12].copy_from_slice(&detail.to_le_bytes());
     let _ = rustix::io::write(fd, &record);
+}
+
+/// Writes the created-target record for the `op`th mount op's file: the tag,
+/// the op index, and the file's inode number, all little-endian. Smaller than
+/// `PIPE_BUF`, the write is atomic. If it fails the caller is gone, and the file
+/// stays in the root for want of anyone to remove it.
+fn report_created(fd: BorrowedFd<'_>, op: usize, file: &fs::Stat) {
+    let mut record = [0u8; super::REPORT_CREATED_LEN];
+    record[0..4].copy_from_slice(&super::REPORT_CREATED.to_le_bytes());
+    record[4..8].copy_from_slice(&u32::try_from(op).unwrap_or(u32::MAX).to_le_bytes());
+    record[8..16].copy_from_slice(&file.st_ino.to_le_bytes());
+    let _ = rustix::io::write(fd, &record);
+}
+
+/// Writes the held record: the command is at its gate, with every setup step
+/// behind it. If the write fails the caller is gone, and the gate's read reports
+/// that next.
+fn report_held(fd: BorrowedFd<'_>) {
+    let _ = rustix::io::write(fd, &super::REPORT_HELD.to_le_bytes());
 }
 
 #[cfg(test)]

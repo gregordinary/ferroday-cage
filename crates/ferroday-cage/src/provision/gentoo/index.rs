@@ -35,7 +35,7 @@
 //! `.sig`, `Manifest` or `.DIGESTS` is published beside it — so a timestamp it
 //! carries says when a mirror claims it was generated and not when it was.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
 
 use super::atom::{self, Dependency};
 use super::version;
@@ -57,6 +57,16 @@ pub(super) const GENERATION: &str = "23.0";
 /// third of the stanzas carry the field and the rest are slot `0`.
 const DEFAULT_SLOT: &str = "0";
 
+/// The longest dependency class a record may state, in bytes.
+///
+/// A class is kept as the index writes it and parsed when a resolution chooses
+/// the build, so reading the index parses each one only to check it. What that
+/// check holds at once is one class's atoms, and the class's length is what
+/// bounds them. The longest the live index states is 3,373 bytes, the `RDEPEND`
+/// of `kde-plasma/plasma-workspace`; this is nineteen times that. A record
+/// stating a longer one is not one this layer can act on.
+pub(super) const MAX_CLASS_BYTES: usize = 64 * 1024;
+
 /// One published build: what the resolver chooses between, and what the merge
 /// needs to fetch and register it.
 ///
@@ -64,71 +74,169 @@ const DEFAULT_SLOT: &str = "0";
 /// more — `LICENSE`, `DESCRIPTION`, `RESTRICT`, the build-time dependency
 /// classes — and the whole index is fifteen thousand of them, so what is not
 /// read is not kept.
+///
+/// # Held compactly
+///
+/// Nothing signs the index, so a mirror decides how many records it holds and
+/// how each is laid out. A record therefore costs its kept text and a fixed few
+/// words, whatever the layout. Its text fields sit end to end in one
+/// allocation, and its dependency classes are kept as the index writes them
+/// and parsed when a resolution chooses the build: a parsed atom is several
+/// times the four bytes `a/b ` takes to write one.
 #[derive(Debug, Clone)]
 pub(super) struct Record {
-    /// `category/name`, as the archive publishes it.
-    pub name: String,
-    /// The version, without the category or the name.
-    pub version: String,
+    /// The text fields, end to end, in the order [`Text`] names them.
+    text: Box<str>,
+    /// Where each text field ends in [`text`](Self::text).
+    ///
+    /// Thirty-two bits, since a record is part of an index held to
+    /// [`MAX_INDEX_BYTES`](super::MAX_INDEX_BYTES).
+    ends: [u32; Text::COUNT],
     /// Which build of that version this is, from `BUILD_ID`.
     pub build_id: u64,
     /// When it was built, from `BUILD_TIME`, seconds since the epoch.
     pub build_time: i64,
+    /// The container's length in bytes, from `SIZE`, which bounds its download.
+    pub size: u64,
+}
+
+/// A record's text fields, in the order [`Record`] holds them.
+#[derive(Clone, Copy)]
+enum Text {
+    Name,
+    Version,
+    Slot,
+    UseFlags,
+    Iuse,
+    Rdepend,
+    Pdepend,
+    Path,
+    Md5,
+}
+
+impl Text {
+    /// How many there are.
+    const COUNT: usize = Text::Md5 as usize + 1;
+}
+
+impl Record {
+    /// Assembles a record from its text fields, in [`Text`]'s order, or `None`
+    /// where they do not fit the offsets it holds them at.
+    fn compose(
+        fields: [&str; Text::COUNT],
+        build_id: u64,
+        build_time: i64,
+        size: u64,
+    ) -> Option<Record> {
+        let mut text = String::with_capacity(fields.iter().map(|field| field.len()).sum());
+        let mut ends = [0; Text::COUNT];
+        for (end, field) in ends.iter_mut().zip(fields) {
+            text.push_str(field);
+            *end = u32::try_from(text.len()).ok()?;
+        }
+        Some(Record {
+            text: text.into_boxed_str(),
+            ends,
+            build_id,
+            build_time,
+            size,
+        })
+    }
+
+    /// One text field.
+    fn field(&self, which: Text) -> &str {
+        let at = which as usize;
+        let start = at.checked_sub(1).map_or(0, |before| self.ends[before]);
+        &self.text[start as usize..self.ends[at] as usize]
+    }
+
+    /// `category/name`, as the archive publishes it.
+    pub(super) fn name(&self) -> &str {
+        self.field(Text::Name)
+    }
+
+    /// The version, without the category or the name.
+    pub(super) fn version(&self) -> &str {
+        self.field(Text::Version)
+    }
+
     /// The slot, `slot` or `slot/subslot`, defaulting to [`DEFAULT_SLOT`].
-    pub slot: String,
+    pub(super) fn slot(&self) -> &str {
+        self.field(Text::Slot)
+    }
+
     /// The flags the build was compiled with, space-separated as the index
     /// writes them.
     ///
     /// Held as the index's own string rather than as a parsed list: the index
     /// carries a quarter of a million flag tokens across its stanzas, and every
     /// question asked of them is membership or a count.
-    pub use_flags: String,
+    pub(super) fn use_flags(&self) -> &str {
+        self.field(Text::UseFlags)
+    }
+
     /// The flags the package knows, space-separated, each possibly carrying the
     /// `+` or `-` prefix that states the ebuild's own default.
     ///
     /// The prefixes are stripped on the way out rather than on the way in, so
     /// what is held is what the archive published.
-    pub iuse: String,
-    /// The runtime dependencies, from `RDEPEND`.
-    pub rdepend: Vec<Dependency>,
-    /// The post-merge dependencies, from `PDEPEND`.
+    pub(super) fn iuse(&self) -> &str {
+        self.field(Text::Iuse)
+    }
+
+    /// `RDEPEND` as the index writes it.
     ///
-    /// Kept apart from [`rdepend`](Self::rdepend) rather than folded into it,
+    /// The plan records it this way, so that the container's signed metadata
+    /// can be held to what the resolution read; [`runtime`](Self::runtime) is
+    /// the parsed form.
+    pub(super) fn rdepend(&self) -> &str {
+        self.field(Text::Rdepend)
+    }
+
+    /// `PDEPEND` as the index writes it, for the same reason.
+    pub(super) fn pdepend(&self) -> &str {
+        self.field(Text::Pdepend)
+    }
+
+    /// The runtime dependencies, from `RDEPEND`, parsed.
+    pub(super) fn runtime(&self) -> Vec<Dependency> {
+        read_class(self.rdepend()).expect("a kept record's dependency classes were read")
+    }
+
+    /// The post-merge dependencies, from `PDEPEND`, parsed.
+    ///
+    /// Kept apart from [`runtime`](Self::runtime) rather than folded into it,
     /// because the distinction is what breaks a cycle: a `PDEPEND` is satisfied
     /// after the package is merged rather than before, so it belongs to the
     /// closure and not to the install order.
-    pub pdepend: Vec<Dependency>,
-    /// `RDEPEND` as the index writes it.
-    ///
-    /// Kept beside the parsed form for the plan, which records what the
-    /// resolution read so that the container's signed metadata can be held to
-    /// it, and which states it as text.
-    pub rdepend_text: String,
-    /// `PDEPEND` as the index writes it, for the same reason.
-    pub pdepend_text: String,
+    pub(super) fn post_merge(&self) -> Vec<Dependency> {
+        read_class(self.pdepend()).expect("a kept record's dependency classes were read")
+    }
+
     /// The container's path under the binhost directory, from `PATH`.
-    pub path: String,
-    /// The container's length in bytes, from `SIZE`, which bounds its download.
-    pub size: u64,
+    pub(super) fn path(&self) -> &str {
+        self.field(Text::Path)
+    }
+
     /// The container's MD5, from `MD5`, lowercase hex.
     ///
     /// The container is held to it as portage holds a downloaded binary
     /// package to its index's digests, which pins a plan to the containers it
     /// resolved. It is not what makes the bytes trustworthy: that is the signed
     /// `Manifest` inside the container.
-    pub md5: String,
-}
+    pub(super) fn md5(&self) -> &str {
+        self.field(Text::Md5)
+    }
 
-impl Record {
     /// How many flags the build was compiled with, which is the resolver's
     /// default preference among the builds of one version.
     pub(super) fn use_count(&self) -> usize {
-        self.use_flags.split_ascii_whitespace().count()
+        self.use_flags().split_ascii_whitespace().count()
     }
 
     /// Whether the build was compiled with `flag`.
     pub(super) fn has_use(&self, flag: &str) -> bool {
-        atom::holds(&self.use_flags, flag)
+        atom::holds(self.use_flags(), flag)
     }
 
     /// Why this record's `PATH` cannot be fetched, or `None` where it can.
@@ -139,26 +247,45 @@ impl Record {
     /// own archive path is, and it must stay under the binhost directory
     /// rather than climbing out of it.
     fn unaddressable(&self) -> Option<String> {
-        coordinate::check("the index's package path", &self.path, Nesting::Nested).err()
+        coordinate::check("the index's package path", self.path(), Nesting::Nested).err()
     }
 }
 
 impl atom::Candidate for Record {
     fn name(&self) -> &str {
-        &self.name
+        Record::name(self)
     }
 
     fn version(&self) -> &str {
-        &self.version
+        Record::version(self)
     }
 
     fn slot(&self) -> &str {
-        &self.slot
+        Record::slot(self)
     }
 
     fn use_flag(&self, flag: &str) -> Option<bool> {
-        atom::use_flag(&self.use_flags, &self.iuse, flag)
+        atom::use_flag(self.use_flags(), self.iuse(), flag)
     }
+}
+
+/// Reads one dependency class as a record states it.
+///
+/// [`atom::parse_class`]'s grammar, held to [`MAX_CLASS_BYTES`] first. A plan
+/// states the classes a record did, so it is held to the same.
+///
+/// # Errors
+///
+/// Returns the reason where the class is longer than [`MAX_CLASS_BYTES`], or
+/// where [`atom::parse_class`] refuses it.
+pub(super) fn read_class(text: &str) -> Result<Vec<Dependency>, String> {
+    if text.len() > MAX_CLASS_BYTES {
+        return Err(format!(
+            "it is {} bytes long, past the {MAX_CLASS_BYTES} a dependency class may run to",
+            text.len(),
+        ));
+    }
+    atom::parse_class(text)
 }
 
 /// What the index's preamble says about itself.
@@ -196,10 +323,11 @@ pub(super) struct Preamble {
 #[derive(Debug)]
 pub(super) struct Index {
     preamble: Preamble,
+    /// Every build kept, in name order, and in index order within a name.
+    ///
+    /// Sorted rather than indexed by a map, so that finding a name's builds is
+    /// a binary search and costs nothing per record beyond the record itself.
     records: Vec<Record>,
-    /// Where each package name's builds sit in [`records`](Self::records), in
-    /// index order.
-    by_name: HashMap<String, Vec<usize>>,
     /// How many stanzas were read but not kept.
     skipped: usize,
 }
@@ -214,28 +342,29 @@ impl Index {
     /// index: an unsigned document is one a mirror composes, and letting a
     /// single stanza refuse fifteen thousand others would make a denial of
     /// service out of a typo.
+    ///
+    /// The stanzas are read one at a time and only the records are kept, so
+    /// what parsing holds beyond the text is the records themselves.
     pub(super) fn parse(text: &str) -> Index {
-        let stanzas = document::parse(text);
-        let (preamble, rest) = match stanzas.split_first() {
-            Some((first, rest)) => (read_preamble(first), rest),
-            None => (Preamble::default(), &[][..]),
-        };
-        let mut records = Vec::with_capacity(rest.len());
+        let mut stanzas = document::parse(text);
+        let preamble = stanzas
+            .next()
+            .map(|first| read_preamble(&first))
+            .unwrap_or_default();
+        let mut records = Vec::new();
         let mut skipped = 0;
-        for stanza in rest {
-            match read_record(stanza) {
+        for stanza in stanzas {
+            match read_record(&stanza) {
                 Some(record) if record.unaddressable().is_none() => records.push(record),
                 _ => skipped += 1,
             }
         }
-        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
-        for (at, record) in records.iter().enumerate() {
-            by_name.entry(record.name.clone()).or_default().push(at);
-        }
+        // Stable, so the builds of one name keep the order the index published
+        // them in.
+        records.sort_by(|a, b| a.name().cmp(b.name()));
         Index {
             preamble,
             records,
-            by_name,
             skipped,
         }
     }
@@ -245,23 +374,17 @@ impl Index {
         &self.preamble
     }
 
-    /// Every build the index publishes, in the order it published them.
+    /// Every build the index publishes, in name order, and in the order the
+    /// index published them within a name.
     pub(super) fn records(&self) -> &[Record] {
         &self.records
     }
 
     /// Every build published under `name`, in index order.
-    pub(super) fn builds(&self, name: &str) -> impl Iterator<Item = &Record> {
-        self.by_name
-            .get(name)
-            .map_or(&[][..], Vec::as_slice)
-            .iter()
-            .map(|at| &self.records[*at])
-    }
-
-    /// Whether the index publishes `name` in any version.
-    pub(super) fn publishes(&self, name: &str) -> bool {
-        self.by_name.contains_key(name)
+    pub(super) fn builds(&self, name: &str) -> &[Record] {
+        let start = self.records.partition_point(|record| record.name() < name);
+        let count = self.records[start..].partition_point(|record| record.name() == name);
+        &self.records[start..start + count]
     }
 
     /// How many stanzas were read but not kept.
@@ -271,16 +394,15 @@ impl Index {
 
     /// Projects the index onto the public discovery surface, consuming it.
     ///
-    /// The dependency vectors go: what a caller asking what is on offer wants
-    /// is the names and their versions, and keeping ninety thousand parsed
-    /// atoms to back a membership question would be the wrong trade.
+    /// What a caller asking what is on offer wants is the names and their
+    /// versions, so that is all the catalogue keeps.
     pub(super) fn into_catalogue(self) -> Catalogue {
-        let mut names: Vec<String> = Vec::with_capacity(self.by_name.len());
-        let mut versions: HashMap<String, Vec<String>> = HashMap::new();
-        for (name, at) in self.by_name {
-            let mut published: Vec<String> = at
-                .into_iter()
-                .map(|at| self.records[at].version.clone())
+        let mut names = Vec::new();
+        let mut versions = Vec::new();
+        for builds in self.records.chunk_by(|a, b| a.name() == b.name()) {
+            let mut published: Vec<String> = builds
+                .iter()
+                .map(|record| record.version().to_string())
                 .collect();
             // One version published as several builds appears once here: the
             // builds differ in USE rather than in what they are a version of,
@@ -290,10 +412,9 @@ impl Index {
                 version::compare(a, b).expect("a record's version is one split_cpv found to parse")
             });
             published.dedup();
-            names.push(name.clone());
-            versions.insert(name, published);
+            names.push(builds[0].name().to_string());
+            versions.push(published);
         }
-        names.sort();
         Catalogue {
             names,
             versions,
@@ -310,19 +431,44 @@ impl Index {
 /// A preamble that says nothing is a preamble that says nothing: none of these
 /// fields decides anything, so an unreadable one is reported as absent rather
 /// than refusing an index whose package stanzas are fine.
-fn read_preamble(stanza: &Stanza) -> Preamble {
+fn read_preamble(stanza: &Stanza<'_>) -> Preamble {
     Preamble {
         generated: stanza.get("TIMESTAMP").and_then(|text| text.parse().ok()),
         ttl: stanza.get("TTL").and_then(|text| text.parse().ok()),
-        chost: stanza.get("CHOST").map(str::to_string),
+        chost: stanza.get("CHOST").map(Cow::into_owned),
         declared: stanza.get("PACKAGES").and_then(|text| text.parse().ok()),
     }
 }
 
 /// Reads one build's stanza, or `None` where it is not one.
-fn read_record(stanza: &Stanza) -> Option<Record> {
-    let cpv = stanza.get("CPV")?;
-    let (category, package, version) = version::split_cpv(cpv)?;
+fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
+    let [
+        cpv,
+        md5,
+        build_id,
+        build_time,
+        slot,
+        use_flags,
+        iuse,
+        rdepend,
+        pdepend,
+        path,
+        size,
+    ] = stanza.get_each([
+        "CPV",
+        "MD5",
+        "BUILD_ID",
+        "BUILD_TIME",
+        "SLOT",
+        "USE",
+        "IUSE",
+        "RDEPEND",
+        "PDEPEND",
+        "PATH",
+        "SIZE",
+    ]);
+    let cpv = cpv?;
+    let (category, package, version) = version::split_cpv(&cpv)?;
     let name = format!("{category}/{package}");
     if !atom::is_package(&name) {
         return None;
@@ -332,32 +478,39 @@ fn read_record(stanza: &Stanza) -> Option<Record> {
     // record is built, because `Plan::parse_document` refuses a value outside
     // it, so a plan projected from such a record would be a document this
     // crate emits and will not read back.
-    let md5 = stanza.get("MD5")?;
-    if !Algorithm::Md5.is_hex(md5) {
+    let md5 = md5?;
+    if !Algorithm::Md5.is_hex(&md5) {
         return None;
     }
-    Some(Record {
-        name,
-        version: version.to_string(),
-        build_id: stanza.get("BUILD_ID")?.parse().ok()?,
-        // Absent or unreadable is the epoch rather than a refusal: the value is
-        // the last of three ranking keys, so a record without one ranks last
-        // among equals instead of not being a candidate.
-        build_time: stanza
-            .get("BUILD_TIME")
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(0),
-        slot: stanza.get("SLOT").unwrap_or(DEFAULT_SLOT).to_string(),
-        use_flags: stanza.get("USE").unwrap_or_default().to_string(),
-        iuse: stanza.get("IUSE").unwrap_or_default().to_string(),
-        rdepend: atom::parse_class(stanza.get("RDEPEND").unwrap_or_default()).ok()?,
-        pdepend: atom::parse_class(stanza.get("PDEPEND").unwrap_or_default()).ok()?,
-        rdepend_text: stanza.get("RDEPEND").unwrap_or_default().to_string(),
-        pdepend_text: stanza.get("PDEPEND").unwrap_or_default().to_string(),
-        path: stanza.get("PATH")?.to_string(),
-        size: stanza.get("SIZE")?.parse().ok()?,
-        md5: md5.to_string(),
-    })
+    let build_id = build_id?.parse().ok()?;
+    // Absent or unreadable is the epoch rather than a refusal: the value is the
+    // last of three ranking keys, so a record without one ranks last among
+    // equals instead of not being a candidate.
+    let build_time = build_time.and_then(|text| text.parse().ok()).unwrap_or(0);
+    let rdepend = rdepend.unwrap_or_default();
+    let pdepend = pdepend.unwrap_or_default();
+    // Read to be checked, and the parsed form dropped: a resolution parses the
+    // classes of the builds it chooses, and those alone.
+    read_class(&rdepend).ok()?;
+    read_class(&pdepend).ok()?;
+    let path = path?;
+    let size = size?.parse().ok()?;
+    Record::compose(
+        [
+            &name,
+            version,
+            slot.as_deref().unwrap_or(DEFAULT_SLOT),
+            &use_flags.unwrap_or_default(),
+            &iuse.unwrap_or_default(),
+            &rdepend,
+            &pdepend,
+            &path,
+            &md5,
+        ],
+        build_id,
+        build_time,
+        size,
+    )
 }
 
 /// The two names the index is published under, in preference order.
@@ -413,9 +566,10 @@ pub(super) fn directory(architecture: &str, sub_architecture: &str) -> String {
 pub struct Catalogue {
     /// Every package name, sorted.
     names: Vec<String>,
-    /// The versions of each name, ordered lowest first and deduplicated across
+    /// The versions of each name, at the name's place in
+    /// [`names`](Self::names), ordered lowest first and deduplicated across
     /// the builds of one version.
-    versions: HashMap<String, Vec<String>>,
+    versions: Vec<Vec<String>>,
     /// How many builds the index published, which exceeds the number of
     /// versions wherever a version is published more than once.
     builds: usize,
@@ -438,16 +592,22 @@ impl Catalogue {
     /// rather than in what version they are, and choosing among them belongs to
     /// a resolution rather than to a listing.
     pub fn versions(&self, name: &str) -> impl Iterator<Item = &str> {
-        self.versions
-            .get(name)
-            .map_or(&[][..], Vec::as_slice)
+        self.place(name)
+            .map_or(&[][..], |at| self.versions[at].as_slice())
             .iter()
             .map(String::as_str)
     }
 
     /// Whether the binhost publishes `name` in any version.
     pub fn contains(&self, name: &str) -> bool {
-        self.versions.contains_key(name)
+        self.place(name).is_some()
+    }
+
+    /// Where `name` sits in [`names`](Self::names), if it is there.
+    fn place(&self, name: &str) -> Option<usize> {
+        self.names
+            .binary_search_by(|held| held.as_str().cmp(name))
+            .ok()
     }
 
     /// The epoch the index states it was generated at, or `None` where it
@@ -573,37 +733,49 @@ REPO: gentoo
 
         let zlib = index
             .builds("sys-libs/zlib")
-            .next()
+            .first()
             .expect("zlib is published");
-        assert_eq!(zlib.version, "1.3.1-r1");
-        assert_eq!(zlib.slot, "0/1");
+        assert_eq!(zlib.version(), "1.3.1-r1");
+        assert_eq!(zlib.slot(), "0/1");
         assert_eq!(zlib.size, 204_800);
         assert_eq!(zlib.build_id, 1);
         assert_eq!(zlib.cpv(), "sys-libs/zlib-1.3.1-r1");
-        assert_eq!(zlib.rdepend.len(), 2);
+        assert_eq!(zlib.path(), "sys-libs/zlib/zlib-1.3.1-r1-1.gpkg.tar");
+        assert_eq!(zlib.md5(), "3a61f698748c7323c87081584f383b3c");
+        assert_eq!(zlib.iuse(), "minizip static-libs");
+        assert_eq!(zlib.use_flags(), "amd64 minizip");
+        assert_eq!(
+            zlib.rdepend(),
+            "!sys-libs/zlib-ng[compat] >=sys-libs/glibc-2.38-r13"
+        );
+        assert_eq!(zlib.runtime().len(), 2);
+        assert!(zlib.post_merge().is_empty());
 
         // A stanza with no SLOT is the default slot rather than no slot.
         let group = index
             .builds("acct-group/3proxy")
-            .next()
+            .first()
             .expect("the group is published");
-        assert_eq!(group.slot, DEFAULT_SLOT);
-        assert!(group.rdepend.is_empty());
+        assert_eq!(group.slot(), DEFAULT_SLOT);
+        assert!(group.runtime().is_empty());
     }
 
     #[test]
     fn one_version_published_twice_is_two_builds() {
         let index = Index::parse(FIXTURE);
-        let builds: Vec<&Record> = index.builds("dev-vcs/git").collect();
+        let builds = index.builds("dev-vcs/git");
         assert_eq!(builds.len(), 2);
-        assert!(builds.iter().all(|build| build.version == "2.54.0"));
+        assert!(builds.iter().all(|build| build.version() == "2.54.0"));
         // The builds differ in USE, and therefore in what they pull in: that is
         // the whole reason the unit here is the build.
         assert_eq!(builds[0].use_count(), 3);
         assert_eq!(builds[1].use_count(), 4);
         assert!(!builds[0].has_use("keyring"));
         assert!(builds[1].has_use("keyring"));
-        assert_ne!(builds[0].rdepend.len(), builds[1].rdepend.len());
+        assert_ne!(builds[0].runtime().len(), builds[1].runtime().len());
+        // In the order the index published them, whatever order the records
+        // are held in.
+        assert_eq!([builds[0].build_id, builds[1].build_id], [5, 7]);
     }
 
     #[test]
@@ -613,7 +785,7 @@ REPO: gentoo
         let index = Index::parse(FIXTURE);
         let git = index
             .builds("dev-vcs/git")
-            .next()
+            .first()
             .expect("git is published");
         // `amd64` is in USE and in no IUSE, so asking IUSE first would report
         // an enabled flag as unknown.
@@ -683,7 +855,7 @@ SIZE: 1
         // document this crate emits and refuses to read back.
         assert_eq!(index.records().len(), 1);
         assert_eq!(index.skipped(), 4);
-        assert!(index.publishes("sys-libs/zlib"));
+        assert_eq!(index.builds("sys-libs/zlib").len(), 1);
     }
 
     #[test]
@@ -712,6 +884,64 @@ SIZE: 1
         let index = Index::parse(&body);
         assert_eq!(index.records().len(), 1);
         assert_eq!(index.skipped(), 2);
+    }
+
+    #[test]
+    fn a_record_costs_its_kept_text_and_a_few_words() {
+        // Nothing signs the index, so a mirror chooses how its records are laid
+        // out, and a record's cost must not depend on that: its text fields
+        // share one allocation and its classes stay text, so the rest of it is
+        // fixed. Ten words, where a field each and parsed classes were forty.
+        assert!(size_of::<Record>() <= 10 * size_of::<usize>());
+        // The builds of a name keep the order the index published them in,
+        // however the names are interleaved.
+        let stanza = |name: &str, build: u64| {
+            format!(
+                "BUILD_ID: {build}\nCPV: {name}-1\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+                 PATH: a/b.gpkg.tar\nSIZE: 1\n\n"
+            )
+        };
+        let index = Index::parse(&format!(
+            "TIMESTAMP: 1\n\n{}{}{}{}",
+            stanza("b/x", 3),
+            stanza("a/y", 1),
+            stanza("b/x", 1),
+            stanza("b/x", 2),
+        ));
+        let builds: Vec<u64> = index
+            .builds("b/x")
+            .iter()
+            .map(|build| build.build_id)
+            .collect();
+        assert_eq!(builds, [3, 1, 2]);
+        assert_eq!(index.builds("a/y").len(), 1);
+        assert!(index.builds("a/x").is_empty());
+        assert!(index.builds("c/z").is_empty());
+    }
+
+    #[test]
+    fn a_dependency_class_past_its_bound_is_left_out_and_counted() {
+        // A class is parsed to be checked as it is read, and what that holds at
+        // once is bounded by the class's length.
+        let stanza = |rdepend: &str| {
+            format!(
+                "BUILD_ID: 1\nCPV: sys-libs/zlib-1.3.1\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+                 PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar\nRDEPEND: {rdepend}\nSIZE: 1\n\n"
+            )
+        };
+        let at_bound = "a/b ".repeat(MAX_CLASS_BYTES / 4);
+        let at_bound = at_bound.trim_end();
+        let past_bound = format!("{at_bound} a/bc");
+        assert!(at_bound.len() <= MAX_CLASS_BYTES && past_bound.len() > MAX_CLASS_BYTES);
+        let index = Index::parse(&format!(
+            "TIMESTAMP: 1\n\n{}{}",
+            stanza(at_bound),
+            stanza(&past_bound),
+        ));
+        assert_eq!(index.records().len(), 1);
+        assert_eq!(index.skipped(), 1);
+        assert_eq!(index.records()[0].runtime().len(), MAX_CLASS_BYTES / 4);
+        assert!(read_class(&past_bound).is_err());
     }
 
     #[test]

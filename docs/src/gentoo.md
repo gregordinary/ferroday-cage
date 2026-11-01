@@ -178,9 +178,9 @@ packages are then resolved against the root that produced, fetched, verified and
 merged into it. A builder that names no package does exactly the first, byte for
 byte.
 
-There is no default sub-architecture. amd64 publishes `x86-64`, `x86-64-v3`,
-`x86-64_hardened` and `x32` today, and the set moves: it published eight not
-long ago. The only thing that enumerates it is an unsigned directory listing.
+There is no default sub-architecture. amd64 publishes trees such as `x86-64`,
+`x86-64-v3` and `x86-64_hardened`, and the set changes over time. The only thing
+that enumerates it is an unsigned directory listing.
 Reading that as discovery would put an unauthenticated document at the head of
 the trust chain, which is the reason the keyring is vendored. So the
 sub-architecture is yours to name, and a wrong one is a 404 rather than a
@@ -412,6 +412,10 @@ directory neither of them names, and report a 404 against a correctly spelled
 mirror. A builder that names no binhost takes the plan's, which is what it
 resolved against.
 
+A plan is a resolution already made, so `build()` also refuses one given with
+`install` or `prefer_use`. Both describe a resolution, and neither has anything
+to shape beside a plan.
+
 A plan is normally replayed over a newer root than it was resolved against,
 since a stage3 build leaves the archive in five weeks. So the replay is held to
 the root it installs into:
@@ -610,11 +614,21 @@ forge the package it then serves.
 
 The index is therefore read as a document a mirror composed. The archive
 publishes it as gzip and as plain text, and a body in any other compression is
-refused before a decoder runs. Decompressed, it is held to 256 MiB, and a larger
-one is refused rather than read as far as the limit. Parsing it costs time in
-proportion to its length, and dependency groups nest at most 16 deep. A stanza
-this layer cannot read is left out and counted rather than failing the whole
-index.
+refused before a decoder runs. Decompressed, it is held to 64 MiB, three times
+the largest index published. A larger one is refused rather than read as far as
+the limit. A stanza this layer cannot read is left out and counted rather than
+failing the whole index.
+
+Reading it costs time and memory in proportion to its length, however a mirror
+lays it out. Stanzas are read one at a time, and a record keeps only the fields
+the layer reads. A dependency class is checked as it is read, up to 64 KiB long
+and 16 groups deep. It is parsed again only for a build a resolution chooses.
+
+A resolution against it is bounded as well, each bound far past what resolving
+the whole archive needs. It chooses at most 16,384 builds and reads at most
+262,144 dependency atoms from them. It holds atoms against at most 4,194,304
+candidate builds, and works out what the index offers for an atom once per
+spelling. Reaching a bound stops the resolution, which refuses the index.
 
 It also decides each download's declared size, which is why the layer keeps a
 ceiling of its own beside it. The index's `SIZE` bounds a fetch, and an

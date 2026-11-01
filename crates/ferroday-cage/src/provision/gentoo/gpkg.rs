@@ -1238,7 +1238,7 @@ pub(super) mod fixture {
         let (category, package, version) =
             super::super::version::split_cpv(cpv).expect("a fixture CPV");
         let mut plan = super::super::Plan::parse_document(&format!(
-            "Format: ferroday-cage-gentoo-plan 1\nArchitecture: amd64\nBinhost: x86-64\n\n\
+            "Format: ferroday-cage-gentoo-plan 2\nArchitecture: amd64\nBinhost: x86-64\n\n\
              Package: {category}/{package}\nVersion: {version}\nBuild-Id: {build_id}\n\
              Path: a/b/c.gpkg.tar\nSize: 1\nMD5: 3a61f698748c7323c87081584f383b3c\n\
              Slot: {SLOT}\nUse: {USE}\nRdepend: {RDEPEND}\nBuild-Time: {BUILD_TIME}\n",

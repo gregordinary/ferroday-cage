@@ -520,6 +520,19 @@ pub enum ProvisionError {
         /// The provisioner's own error.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// A removal's destination names no tree: the path is empty, or has no
+    /// final component, such as `.`, `..` or `/`.
+    ///
+    /// A removal unlinks its destination from the directory above it, so the
+    /// path has to end in a name to unlink. An empty path is refused rather
+    /// than read as one with nothing at it, since it is almost always a
+    /// variable that was never set, and a removal of it would succeed having
+    /// removed nothing.
+    #[non_exhaustive]
+    RemoveDestInvalid {
+        /// The destination as it was given.
+        path: PathBuf,
+    },
     /// A tree could not be removed: it holds files owned through an
     /// identity map, and no delegate can establish that map to act on them.
     ///
@@ -660,6 +673,9 @@ path_io_error! {
 impl fmt::Display for ProvisionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ProvisionError::DestUnusable { path } if path.as_os_str().is_empty() => {
+                f.write_str("cannot publish a rootfs at an empty path")
+            }
             ProvisionError::DestUnusable { path } => write!(
                 f,
                 "cannot publish a rootfs at {}: the path has no final component or is not a directory",
@@ -695,6 +711,14 @@ impl fmt::Display for ProvisionError {
             // The provisioner's own error says what failed; this layer says
             // only that it was provisioning, and leaves the rest to `source`.
             ProvisionError::Other { .. } => f.write_str("provisioning failed"),
+            ProvisionError::RemoveDestInvalid { path } if path.as_os_str().is_empty() => {
+                f.write_str("cannot remove a tree at an empty path")
+            }
+            ProvisionError::RemoveDestInvalid { path } => write!(
+                f,
+                "cannot remove {}: the path has no final component",
+                path.display(),
+            ),
             ProvisionError::RemoveUnprivileged { path, reason, .. } => write!(
                 f,
                 "cannot remove {}: the tree holds ids the caller cannot act on, and no delegate \
@@ -1242,7 +1266,9 @@ fn publish(staging: &Path, dest: &Path) -> Result<(), ProvisionError> {
 /// removal would exhaust the descriptor table or the stack.
 ///
 /// Removing a path that does not exist is not an error, so the call is
-/// idempotent; a path that is not a directory is removed as the file it is.
+/// idempotent; a path that is not a directory is removed as the file it is. A
+/// path that cannot name a tree, an empty one or one with no final component
+/// such as `.`, is refused before anything is touched.
 ///
 /// The `<name>.lock` file [`ensure`] leaves beside the destination goes with
 /// it, so create and destroy round-trip and nothing is left behind. The removal
@@ -1257,6 +1283,7 @@ fn publish(staging: &Path, dest: &Path) -> Result<(), ProvisionError> {
 ///
 /// # Errors
 ///
+/// [`ProvisionError::RemoveDestInvalid`] for a destination that names no tree,
 /// [`ProvisionError::Io`] for an ordinary removal failure, and
 /// [`ProvisionError::RemoveUnprivileged`] when the tree needs the identity
 /// map and no delegate can establish one — the reason names what the host
@@ -1293,6 +1320,9 @@ fn remove_dest(
     mapper: Option<&Arc<dyn crate::idmap::IdMapper>>,
     lock: bool,
 ) -> Result<(), ProvisionError> {
+    // Ahead of the lock and the absence check, so a path that cannot name a
+    // tree is refused whether or not something is there.
+    removal_leaf(dest)?;
     let held = match lock_path(dest).filter(|_| lock) {
         // Nothing at either path is nothing to remove and no lock to delete,
         // so there is no publication to exclude, and no lock file to create in
@@ -1481,16 +1511,22 @@ pub(crate) fn remove_tree(
     )
 }
 
+/// The final component a removal unlinks `dest` by, or
+/// [`ProvisionError::RemoveDestInvalid`] for a path with none: an empty one, or
+/// one such as `.`, `..` or `/`.
+fn removal_leaf(dest: &Path) -> Result<&std::ffi::OsStr, ProvisionError> {
+    dest.file_name()
+        .ok_or_else(|| ProvisionError::RemoveDestInvalid {
+            path: dest.to_path_buf(),
+        })
+}
+
 /// `dest`'s directory and final component, in the shapes the removal walk takes
 /// them: a path to open and a name to resolve against it.
 fn parent_and_leaf(dest: &Path) -> Result<(&Path, std::ffi::CString), ProvisionError> {
     use std::os::unix::ffi::OsStrExt;
 
-    let Some(leaf) = dest.file_name() else {
-        return Err(ProvisionError::DestUnusable {
-            path: dest.to_path_buf(),
-        });
-    };
+    let leaf = removal_leaf(dest)?;
     let parent = crate::path::parent_of(dest);
     let leaf = std::ffi::CString::new(leaf.as_bytes()).map_err(|_| {
         ProvisionError::io(
@@ -1728,6 +1764,66 @@ mod tests {
     fn remove_is_idempotent_on_a_missing_path() {
         let dir = Scratch::for_test("provision", "remove-missing");
         remove(dir.join("never-created")).expect("removing nothing is not an error");
+    }
+
+    #[test]
+    fn a_removal_refuses_a_path_that_names_no_tree() {
+        // An empty path is an unset variable rather than a path with nothing at
+        // it, and a path with no final component has no name to unlink from
+        // its directory. Each is refused as a removal, through every entry
+        // point, whether or not something is there.
+        let dir = Scratch::for_test("provision", "remove-unnamed");
+        let tree = dir.join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("kept"), b"x").unwrap();
+        let removals = |dest: &Path| {
+            [
+                remove(dest),
+                Remove::new(dest).run(),
+                Remove::new(dest).remove_lock(false).run(),
+                Remove::overlay_upper(dest).run(),
+            ]
+        };
+        for dest in [PathBuf::new(), tree.join(".."), dir.join("missing/..")] {
+            for removed in removals(&dest) {
+                let err = removed.expect_err("a path naming no tree is refused");
+                assert!(
+                    matches!(&err, ProvisionError::RemoveDestInvalid { path } if *path == dest),
+                    "{}: {err:?}",
+                    dest.display(),
+                );
+                let message = err.to_string();
+                assert!(message.starts_with("cannot remove "), "{message}");
+            }
+        }
+        assert_eq!(
+            Remove::new("").run().unwrap_err().to_string(),
+            "cannot remove a tree at an empty path",
+        );
+        assert!(
+            tree.join("kept").is_file(),
+            "a refused removal removed something"
+        );
+        // The shapes alone, without a removal that could reach the test's own
+        // directory. A trailing `.` still names the directory before it.
+        for unnamed in ["", ".", "..", "/", "./", "a/..", "/srv/.."] {
+            assert!(
+                matches!(
+                    removal_leaf(Path::new(unnamed)),
+                    Err(ProvisionError::RemoveDestInvalid { .. })
+                ),
+                "{unnamed:?}",
+            );
+        }
+        assert_eq!(removal_leaf(Path::new("roots/a/.")).unwrap(), "a");
+        // A publication keeps its own refusal and its own wording.
+        let err = ensure(dir.join("missing/.."), &mut Touch).unwrap_err();
+        assert!(matches!(err, ProvisionError::DestUnusable { .. }), "{err}");
+        assert!(err.to_string().starts_with("cannot publish"), "{err}");
+        assert_eq!(
+            ensure("", &mut Touch).unwrap_err().to_string(),
+            "cannot publish a rootfs at an empty path",
+        );
     }
 
     #[test]

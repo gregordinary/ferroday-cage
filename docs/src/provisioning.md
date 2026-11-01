@@ -144,7 +144,8 @@ own.
 It is the rootless container runtimes' `unshare rm` pattern as a library call.
 `ensure` uses the same escalation for its own staging cleanup, so a crashed
 range-mapped provisioning run cannot wedge the destination. Removing a path that
-does not exist is not an error.
+does not exist is not an error. A path that names no tree, an empty one or one
+with no final component such as `.`, is refused.
 
 Both attempts walk the tree iteratively and never follow a symbolic link. A walk
 holds a few descriptors whatever the depth, where a recursive removal holds one

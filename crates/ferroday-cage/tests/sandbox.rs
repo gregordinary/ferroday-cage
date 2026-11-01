@@ -8,9 +8,10 @@
 mod common;
 
 use std::path::Path;
+use std::time::Duration;
 
 use ferroday_cage::{
-    Cage, ConfigError, Error, ExitStatus, Network, RawMount, ResolvedMount, SetupStep,
+    Cage, ConfigError, Error, ExitStatus, Network, RawMount, ResolvedMount, SetupStep, Stdio,
 };
 use rustix::io::Errno;
 
@@ -1273,6 +1274,96 @@ fn an_overlay_root_reads_back_through_the_overlay_accessor() {
     assert_eq!(overlay.get_lowers(), [Path::new("/srv/base")]);
     assert_eq!(overlay.get_upper(), Some(Path::new("/srv/scratch/run-1")));
     assert_eq!(overlay.get_work(), None);
+}
+
+#[test]
+fn a_running_sandbox_keeps_its_file_bind_when_its_handle_is_dropped() {
+    let scratch = common::scratch_dir("dropped-handle-bind-io");
+    let source = scratch.join("source");
+    std::fs::write(&source, b"caller content\n").unwrap();
+    let output = scratch.join("output");
+
+    // The bind's target is a file the launch creates in the root. Unlinking it
+    // would unmount the bind in every namespace it is mounted in, so a handle
+    // dropped while the sandbox runs, which the handle allows, must leave it:
+    // the command reads the bind only after the handle is gone. Without a PID
+    // namespace nothing of the sandbox holds the target once the command has
+    // executed, so there the handle has only the supervisor to go by.
+    for pid_namespace in [true, false] {
+        // A root of its own each time: the first run leaves its target behind,
+        // which the second would find rather than create.
+        let Some(rootfs) = common::scratch_rootfs(&format!("dropped-handle-bind-{pid_namespace}"))
+        else {
+            return;
+        };
+        let running = Cage::builder()
+            .rootfs(&rootfs)
+            .pid_namespace(pid_namespace)
+            .bind_ro(&source, "/etc/created")
+            .stdout(Stdio::from_fd(
+                std::fs::File::create(&output).unwrap().into(),
+            ))
+            .command("/bin/sh")
+            .args(["-c", "sleep 1; cat /etc/created"])
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn()
+            .expect("the sandbox launches");
+        let supervisor = running.pid();
+        drop(running);
+        assert!(
+            common::wait_gone(supervisor, Duration::from_secs(30)),
+            "the sandbox did not run to its end (pid_namespace = {pid_namespace})",
+        );
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"caller content\n",
+            "the bind did not outlive the handle (pid_namespace = {pid_namespace})",
+        );
+    }
+}
+
+#[test]
+fn a_file_bind_target_two_sandboxes_share_outlives_its_creator() {
+    let Some(rootfs) = common::scratch_rootfs("shared-bind-target") else {
+        return;
+    };
+    let scratch = common::scratch_dir("shared-bind-target-io");
+    let source = scratch.join("source");
+    std::fs::write(&source, b"caller content\n").unwrap();
+    let output = scratch.join("output");
+
+    // Two sandboxes on one root bind onto one target the root does not ship.
+    // The first creates it, and the second finds it there. The first's
+    // teardown must not remove it while the second runs, since the unlink
+    // would unmount the second's bind.
+    let bound = |command: &str| {
+        Cage::builder()
+            .rootfs(&rootfs)
+            .bind_ro(&source, "/etc/shared")
+            .command("/bin/sh")
+            .args(["-c", command])
+    };
+    let creator = bound("true")
+        .build()
+        .expect("a valid sandbox configuration");
+    let sharer = bound("sleep 1; cat /etc/shared")
+        .stdout(Stdio::from_fd(
+            std::fs::File::create(&output).unwrap().into(),
+        ))
+        .build()
+        .expect("a valid sandbox configuration");
+
+    let mut first = creator.spawn().expect("the creator launches");
+    let mut second = sharer.spawn().expect("the sharer launches");
+    assert!(first.wait().expect("the creator's outcome").success());
+    drop(first);
+    assert!(second.wait().expect("the sharer's outcome").success());
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        b"caller content\n",
+        "the creator's teardown unmounted the sharer's bind",
+    );
 }
 
 #[test]

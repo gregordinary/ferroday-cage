@@ -26,6 +26,33 @@ pub use ferroday_cage_testkit::scratch::{
 };
 pub use ferroday_cage_testkit::tar::Tar;
 
+/// The signals a process can be sent that end or stop it at their default
+/// dispositions, the faults and `SIGABRT` aside: what a process group receives
+/// from a terminal or a shell, and what a supervisor in that group must
+/// outlive.
+pub const GROUP_SIGNALS: [rustix::process::Signal; 17] = {
+    use rustix::process::Signal;
+    [
+        Signal::INT,
+        Signal::QUIT,
+        Signal::HUP,
+        Signal::TSTP,
+        Signal::TTIN,
+        Signal::TTOU,
+        Signal::TERM,
+        Signal::USR1,
+        Signal::USR2,
+        Signal::ALARM,
+        Signal::PIPE,
+        Signal::VTALARM,
+        Signal::PROF,
+        Signal::XCPU,
+        Signal::XFSZ,
+        Signal::IO,
+        Signal::POWER,
+    ]
+};
+
 /// The pinned Alpine minirootfs, provisioned through the library's own tarball
 /// provisioner, or `None` when the sandbox tests should skip.
 #[cfg(feature = "tarball")]

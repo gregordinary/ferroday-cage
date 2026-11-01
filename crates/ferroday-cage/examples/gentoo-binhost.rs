@@ -81,8 +81,13 @@
 //! fetches no index and makes no choice. The binhost keeps a published version
 //! far longer than the five weeks the stage3 autobuilds tree keeps a build, so a
 //! plan replays for as long as the archive carries what it names and the key
-//! that signs its containers is in force. It supersedes `--install` and
-//! `--prefer-use`, which describe a resolution that no longer happens.
+//! that signs its containers is in force.
+//!
+//! A replay is held to the root it lands in, which is normally newer than the
+//! one the plan was resolved against. A package the root already has at the
+//! planned version is skipped, and one whose slot the root already holds
+//! refuses the run before anything is merged. `--install` and `--prefer-use`
+//! describe a resolution, so neither is accepted beside `--plan-file`.
 //!
 //! ```text
 //! --rootfs DIR         Where the root filesystem lives (required)
@@ -94,7 +99,7 @@
 //!                      and without the ones written -flag; repeatable
 //! --cache DIR          Keep the stage3 and the packages here across runs
 //! --plan               Resolve against --rootfs, print the plan, and exit
-//! --plan-file FILE     Install exactly what this plan names, resolving nothing
+//! --plan-file FILE     Install what this plan names, resolving nothing
 //! --help               Print this help and exit
 //! ```
 
@@ -148,8 +153,8 @@ struct Options {
     cache: Option<PathBuf>,
     /// Resolve and print, installing nothing.
     plan_only: bool,
-    /// A plan document to install, where one was named. Supersedes the atoms
-    /// and the preferences, which describe a resolution that no longer happens.
+    /// A plan document to install, where one was named. The atoms and the
+    /// preferences describe a resolution, so neither is given beside one.
     plan_file: Option<PathBuf>,
     /// The command to run in the finished sandbox, where one was given.
     command: Vec<OsString>,
@@ -228,6 +233,16 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, String
     };
     if plan_only && plan_file.is_some() {
         return Err("--plan resolves and --plan-file replays; name one or the other".to_string());
+    }
+    // A plan is a resolution that already happened, so the flags that shape
+    // one have nothing to shape beside it. The library refuses the pair too;
+    // refusing it here makes it the usage error it is.
+    if plan_file.is_some() && !(install.is_empty() && prefer_use.is_empty()) {
+        return Err(
+            "--plan-file replays a resolution, so --install and --prefer-use have nothing to \
+             shape; name one or the other"
+                .to_string(),
+        );
     }
     Ok(Some(Options {
         rootfs,
@@ -389,10 +404,12 @@ Options:
                        unsatisfiable
   --cache DIR          Keep the stage3 and the packages here across runs
   --plan               Resolve against --rootfs, print the plan, and exit
-  --plan-file FILE     Install exactly what this plan names, resolving nothing.
-                       The other half of --plan: a plan replays for as long as
-                       the binhost carries what it names and its signing key
-                       is in force
+  --plan-file FILE     Install what this plan names, resolving nothing. A
+                       package the root has at the planned version is skipped,
+                       and one whose slot the root holds is refused. The other
+                       half of --plan: a plan replays for as long as the
+                       binhost carries what it names and its signing key is in
+                       force. Not accepted with --install or --prefer-use
   --help               Print this help and exit",
     );
 }
@@ -443,6 +460,24 @@ mod tests {
             if let Err(error) = build(line) {
                 panic!("{line:?}: {}", ErrorChain::new(&error));
             }
+        }
+    }
+
+    #[test]
+    fn a_plan_file_is_not_accepted_beside_what_shapes_a_resolution() {
+        for (flag, value) in [("--install", "dev-vcs/git"), ("--prefer-use", "keyring")] {
+            let line = [
+                "--rootfs",
+                "./elsewhere",
+                "--plan-file",
+                "binhost.plan",
+                flag,
+                value,
+            ];
+            let Err(refusal) = parse(line.iter().map(OsString::from)) else {
+                panic!("{flag} beside --plan-file parsed");
+            };
+            assert!(refusal.contains(flag), "{refusal}");
         }
     }
 }

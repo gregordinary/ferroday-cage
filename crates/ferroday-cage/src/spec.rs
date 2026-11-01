@@ -632,6 +632,11 @@ impl Cage {
     /// under [`Network::Host`] the sandbox shares the host's network
     /// namespace and there is nothing to attach.
     ///
+    /// The call returns once the command is at the gate, with every namespace
+    /// and mount in place, so a setup step that fails up to there, a refused
+    /// mount or a failed pivot, is its error. One that fails past the gate, in
+    /// the identity switch, the hardening, or the exec, is `proceed`'s.
+    ///
     /// A caller that needs no pause uses [`spawn`](Self::spawn) instead; this
     /// entry point exists for the attach-then-run sequence.
     pub fn spawn_pending(&self) -> Result<Pending<'static>, Error> {
@@ -702,10 +707,10 @@ impl Cage {
     /// networking. The primary comes back here rather than out of
     /// [`proceed`](Pending::proceed), because the sandbox allocates the
     /// pseudoterminal and sends its primary before the command reaches the
-    /// gate. This waits for it, so a setup step that fails before the terminal
-    /// exists is reported here rather than by `proceed`. Nothing writes to the
-    /// terminal while the launch is held, so the caller attaches its stack and
-    /// proceeds with the primary in hand.
+    /// gate, and this returns once the command is there, so a setup step that
+    /// fails before the gate is reported here rather than by `proceed`. Nothing
+    /// writes to the terminal while the launch is held, so the caller attaches
+    /// its stack and proceeds with the primary in hand.
     pub fn spawn_pending_terminal(
         &self,
         terminal: &Terminal,
@@ -1546,9 +1551,20 @@ impl CageBuilder {
     ///
     /// When enabled, the sandbox is stopped as soon as the calling process
     /// exits — however it exits — or the last handle to the launch (the
-    /// [`Running`] and any [`KillHandle`]s) is dropped. The tie is a pipe
-    /// held open by the handle, not a signal arrangement in the caller, so
-    /// it works from any thread and involves no signal handlers.
+    /// [`Running`] and any [`KillHandle`]s) is dropped. The tie is the launch's
+    /// control socket: the handle holds its caller end, and the supervisor
+    /// stops the sandbox when that end hangs up. It is not a signal
+    /// arrangement in the caller, so it works from any thread and involves no
+    /// signal handlers.
+    ///
+    /// The hangup comes when the last copy of the caller end closes, and a
+    /// process the caller forks without executing holds a copy until it exits
+    /// or executes; the sandbox runs on until then. Without a PID namespace
+    /// the supervisor outside the sandbox is a member of the caller's process
+    /// group. It ignores every signal but `SIGCHLD` and those that report a
+    /// fault (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`, `SIGSYS`,
+    /// `SIGABRT`). One of those, or a `SIGKILL`, sent to the whole group ends it
+    /// as it ends the caller, and the command then runs on unsupervised.
     ///
     /// [`KillHandle`]: crate::KillHandle
     pub fn stop_with_caller(mut self, tie: bool) -> Self {
@@ -6247,10 +6263,25 @@ mod tests {
         assert_eq!(placeholders.paths, [Path::new("etc/shipped")]);
         assert_eq!(placeholders.whiteouts, [Path::new("etc/shipped")]);
 
-        // What the launch does: the target replaces the whiteout.
+        // What the launch does: the target replaces the whiteout, and the
+        // setup reports the file it created.
         std::fs::remove_file(upper.join("etc/shipped")).unwrap();
         std::fs::write(upper.join("etc/shipped"), b"").unwrap();
-        drop(crate::running::PlaceholderGuard { placeholders });
+        let file = rustix::fs::lstat(upper.join("etc/shipped")).unwrap();
+        let created = [crate::mechanism::CreatedTarget {
+            op: lowering
+                .ops
+                .iter()
+                .position(|op| op.create_file.is_some())
+                .expect("the bind creates its target"),
+            ino: file.st_ino,
+        }];
+        drop(crate::running::PlaceholderGuard::of(
+            &placeholders,
+            &lowering.ops,
+            &created,
+            None,
+        ));
         let stat = rustix::fs::lstat(upper.join("etc/shipped")).expect("the name is taken");
         assert!(Rooted::is_whiteout(&stat), "the whiteout is back");
     }

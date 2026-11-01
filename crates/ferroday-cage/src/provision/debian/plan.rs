@@ -10,6 +10,8 @@
 //! [`DebianBuilder::plan`](super::DebianBuilder::plan) covers resolving once
 //! and installing once, and nothing else.
 
+use std::borrow::Cow;
+
 use super::DebianError;
 use super::index::Package;
 use crate::provision::digest::Algorithm;
@@ -369,14 +371,13 @@ impl Plan {
     /// archive the document does not carry, or a package whose pool path or
     /// digest is not one a fetch could be composed from.
     pub fn parse_document(text: &str) -> Result<Plan, DebianError> {
-        let stanzas = document::parse(text);
-        let (header, rest) = document::header(&stanzas, FORMAT).map_err(document)?;
+        let (header, rest) = document::header(document::parse(text), FORMAT).map_err(document)?;
         let mut plan = Plan {
             suite: required(header.get("Suite"), "Suite", "the header")?,
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             packages: Vec::new(),
             archives: Vec::new(),
-            carried: document::carried(header, HEADER_FIELDS),
+            carried: document::carried(&header, HEADER_FIELDS),
         };
 
         for stanza in rest {
@@ -410,9 +411,9 @@ impl Plan {
                     // name: the writer never states a source that matches, so a
                     // document that does was written by hand, and echoing it back
                     // unchanged is what keeps the round trip byte-faithful.
-                    source: stanza.get("Source").map(str::to_string),
+                    source: stanza.get("Source").map(Cow::into_owned),
                     size: number(stanza.get("Size"), "Size", &at_package)?,
-                    carried: document::carried(stanza, PACKAGE_FIELDS),
+                    carried: document::carried(&stanza, PACKAGE_FIELDS),
                 };
                 if let Some(reason) = package.unaddressable() {
                     return Err(document(reason));
@@ -439,17 +440,17 @@ impl Plan {
             plan.archives.push(ResolvedArchive {
                 mirror: required(stanza.get("Mirror"), "Mirror", &at_archive)?,
                 suite: required(stanza.get("Suite"), "Suite", &at_archive)?,
-                components: document::list(stanza.get("Components")),
+                components: document::list(stanza.get("Components").as_deref()),
                 release_sha256: required(
                     stanza.get("Release-SHA256"),
                     "Release-SHA256",
                     &at_archive,
                 )?,
-                date: stanza.get("Date").map(str::to_string),
-                valid_until: stanza.get("Valid-Until").map(str::to_string),
-                signed_by: document::list(stanza.get("Signed-By")),
-                signing_key: document::list(stanza.get("Signing-Key")),
-                carried: document::carried(stanza, ARCHIVE_FIELDS),
+                date: stanza.get("Date").map(Cow::into_owned),
+                valid_until: stanza.get("Valid-Until").map(Cow::into_owned),
+                signed_by: document::list(stanza.get("Signed-By").as_deref()),
+                signing_key: document::list(stanza.get("Signing-Key").as_deref()),
+                carried: document::carried(&stanza, ARCHIVE_FIELDS),
             });
         }
         Ok(plan)
@@ -536,19 +537,19 @@ const PACKAGE_FIELDS: &[&str] = &[
 ///
 /// The rule is [`document::required`]'s and is shared with every other layer;
 /// only whose document the refusal is about belongs here.
-fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, DebianError> {
-    document::required(value, field, at).map_err(document)
+fn required(value: Option<Cow<'_, str>>, field: &str, at: &str) -> Result<String, DebianError> {
+    document::required(value.as_deref(), field, at).map_err(document)
 }
 
 /// Reads an optional numeric field, reporting a refusal the same way.
 ///
 /// The rule is [`document::number`]'s.
 fn number<T: std::str::FromStr + std::fmt::Display>(
-    value: Option<&str>,
+    value: Option<Cow<'_, str>>,
     field: &str,
     at: &str,
 ) -> Result<Option<T>, DebianError> {
-    document::number(value, field, at).map_err(document)
+    document::number(value.as_deref(), field, at).map_err(document)
 }
 
 /// Builds the document error.
@@ -1004,15 +1005,14 @@ Source: local-suite
             };
             for name in known {
                 if let Some(value) = stanza.get(name) {
-                    out.push_str(&line(name, value));
+                    out.push_str(&line(name, &value));
                 }
             }
             for (name, value) in stanza
                 .fields()
-                .iter()
                 .filter(|(name, _)| !known.iter().any(|known| known.eq_ignore_ascii_case(name)))
             {
-                out.push_str(&line(name, value));
+                out.push_str(&line(name, &value));
             }
             out.push('\n');
         }

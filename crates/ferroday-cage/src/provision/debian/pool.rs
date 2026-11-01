@@ -706,7 +706,7 @@ impl Entry {
     /// paragraph missing either field, which is dropped rather than carried
     /// forward malformed.
     fn from_stanza(text: String) -> Option<Entry> {
-        let stanza = document::parse(&text).into_iter().next()?;
+        let stanza = document::parse(&text).next()?;
         Some(Entry {
             name: stanza.get("Package")?.to_string(),
             version: stanza.get("Version")?.to_string(),
@@ -761,17 +761,17 @@ const APPENDED_FIELDS: [&str; 3] = ["Filename", "Size", "SHA256"];
 /// The failure is a bare reason, which the caller attributes to whichever file
 /// it read the stanza from.
 fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
-    let stanzas = document::parse(control);
-    if stanzas.len() > 1 {
-        return Err(format!(
-            "its control file holds {} paragraphs, and a control file is one",
-            stanzas.len(),
-        ));
-    }
+    let mut stanzas = document::parse(control);
     let stanza = stanzas
-        .into_iter()
         .next()
         .ok_or_else(|| "the control file has no stanza".to_string())?;
+    let more = stanzas.count();
+    if more > 0 {
+        return Err(format!(
+            "its control file holds {} paragraphs, and a control file is one",
+            1 + more,
+        ));
+    }
     for appended in APPENDED_FIELDS {
         if stanza.get(appended).is_some() {
             return Err(format!(
@@ -1719,11 +1719,10 @@ mod tests {
     /// The `Date` a release carries, as the Unix timestamp it names.
     fn release_date(release: &str) -> i64 {
         let stanza = document::parse(release)
-            .into_iter()
             .next()
             .expect("the release has a stanza");
         let date = stanza.get("Date").expect("the release carries a Date");
-        release::parse_rfc5322(date).expect("the Date parses as an RFC 5322 date")
+        release::parse_rfc5322(&date).expect("the Date parses as an RFC 5322 date")
     }
 
     #[test]
@@ -1796,7 +1795,6 @@ mod tests {
     /// The section paths a release names, in the order it names them.
     fn release_sections(release: &str) -> Vec<String> {
         let stanza = document::parse(release)
-            .into_iter()
             .next()
             .expect("the release has a stanza");
         stanza
@@ -2039,13 +2037,12 @@ mod tests {
         named.publish::<&Path>([]).expect("the named publish");
         let release = std::fs::read_to_string(named.release_path().unwrap()).unwrap();
         let stanza = document::parse(&release)
-            .into_iter()
             .next()
             .expect("the release has a stanza");
-        assert_eq!(stanza.get("Origin"), Some("Example"));
-        assert_eq!(stanza.get("Label"), Some("Example build pool"));
+        assert_eq!(stanza.get("Origin").as_deref(), Some("Example"));
+        assert_eq!(stanza.get("Label").as_deref(), Some("Example build pool"));
         assert_eq!(
-            stanza.get("Description"),
+            stanza.get("Description").as_deref(),
             Some("Packages built by the example pipeline"),
         );
         // The fields are informational, so nothing the reader checks moves.

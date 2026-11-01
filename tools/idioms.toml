@@ -487,3 +487,19 @@ beside a path asks this rather than choosing the fallback itself."""
 path = "crates/ferroday-cage/src/path.rs"
 count = 1
 why = "The answer."
+
+[[idiom]]
+name = "a syscall's number read from its name"
+# Both spellings of the `syscalls` crate's parse: the method `str::parse` with
+# the type named, and the trait call.
+pattern = 'parse::<(?:syscalls::)?Sysno>|Sysno::from_str\b'
+answer = """\
+`SeccompRules::syscall`, which a profile's syscall names and `fcage`'s \
+seccomp flags both resolve through. The number is the host architecture's, \
+and two readings of the table could disagree on which names a policy accepts, \
+so a name a flag takes would be one a profile refuses."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/hardening.rs"
+count = 1
+why = "The answer."

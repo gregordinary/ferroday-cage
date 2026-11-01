@@ -42,7 +42,9 @@
 //! The order is deterministic, so two renderings of one plan are byte-identical
 //! and a plan that changes shows the change as a diff.
 
-use super::index::Record;
+use std::borrow::Cow;
+
+use super::index::{self, Record};
 use super::{GentooError, atom, version};
 use crate::provision::coordinate::{self, Nesting};
 use crate::provision::digest::Algorithm;
@@ -55,7 +57,13 @@ use crate::provision::document::{self, Carried, Draft};
 /// trusting. The version is bumped only for a change a previous reader would
 /// misread; adding a field is not one, since a reader carries a field it does
 /// not know through untouched rather than refusing the document or dropping it.
-const FORMAT: &str = "ferroday-cage-gentoo-plan 1";
+///
+/// Adding a field every document must carry is one, from the other side, and
+/// version 2 is what one required. A package stanza states the slot and the
+/// build time the index gave, and a container is held to both. A version 1
+/// document states neither, so it is refused for its format, which names what
+/// is wrong, rather than for the first field it happens to lack.
+const FORMAT: &str = "ferroday-cage-gentoo-plan 2";
 
 /// The header fields this version writes and reads.
 ///
@@ -87,7 +95,9 @@ const PACKAGE_FIELDS: &[&str] = &[
 ///
 /// Returned by [`Gentoo::resolve_packages`](super::Gentoo::resolve_packages)
 /// and taken back by [`GentooBuilder::plan`](super::GentooBuilder::plan), which
-/// installs exactly what it names and resolves nothing.
+/// installs what it names and resolves nothing. A replay is held to the root it
+/// installs into: a package that root already has at the planned version is
+/// skipped, and one whose slot it already holds is refused.
 ///
 /// Every package is index-resolved: it names a container the archive published,
 /// with the size that bounds its download, the container's MD5, and what the
@@ -179,17 +189,17 @@ impl PlannedPackage {
     /// it to carry anything from.
     fn resolved(record: &Record) -> PlannedPackage {
         PlannedPackage {
-            name: record.name.clone(),
-            version: record.version.clone(),
+            name: record.name().to_string(),
+            version: record.version().to_string(),
             build_id: record.build_id,
-            path: record.path.clone(),
+            path: record.path().to_string(),
             size: record.size,
-            md5: record.md5.clone(),
-            slot: record.slot.clone(),
-            use_flags: record.use_flags.clone(),
-            iuse: record.iuse.clone(),
-            rdepend: record.rdepend_text.clone(),
-            pdepend: record.pdepend_text.clone(),
+            md5: record.md5().to_string(),
+            slot: record.slot().to_string(),
+            use_flags: record.use_flags().to_string(),
+            iuse: record.iuse().to_string(),
+            rdepend: record.rdepend().to_string(),
+            pdepend: record.pdepend().to_string(),
             build_time: record.build_time,
             carried: Carried::new(),
         }
@@ -233,10 +243,10 @@ impl PlannedPackage {
         if self.slot.is_empty() {
             return Some(format!("the plan states no slot for {}", self.name));
         }
-        // Held to the grammar the index reader holds a record's dependency
-        // classes to, since a plan states them where an index would have.
+        // Held to the rule the index reader holds a record's dependency classes
+        // to, since a plan states them where an index would have.
         for (class, text) in [("runtime", &self.rdepend), ("post-merge", &self.pdepend)] {
-            if let Err(reason) = atom::parse_class(text) {
+            if let Err(reason) = index::read_class(text) {
                 return Some(format!(
                     "the plan states {class} dependencies for {} that cannot be read: {reason}",
                     self.name,
@@ -352,8 +362,8 @@ impl Plan {
     /// document is the only thing behind a plan read this way, so the shape an
     /// index would have guaranteed is checked here.
     pub fn parse_document(text: &str) -> Result<Plan, GentooError> {
-        let stanzas = document::parse(text);
-        let (header, rest) = document::header(&stanzas, FORMAT).map_err(plan_document)?;
+        let (header, rest) =
+            document::header(document::parse(text), FORMAT).map_err(plan_document)?;
         let mut plan = Plan {
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             binhost: required(header.get("Binhost"), "Binhost", "the header")?,
@@ -369,7 +379,7 @@ impl Plan {
                 "the header",
             )?,
             packages: Vec::new(),
-            carried: document::carried(header, HEADER_FIELDS),
+            carried: document::carried(&header, HEADER_FIELDS),
         };
 
         for stanza in rest {
@@ -393,7 +403,7 @@ impl Plan {
                 pdepend: stanza.get("Pdepend").unwrap_or_default().to_string(),
                 build_time: number::<i64>(stanza.get("Build-Time"), "Build-Time", &at)?
                     .ok_or_else(|| plan_document(format!("{at} states no Build-Time")))?,
-                carried: document::carried(stanza, PACKAGE_FIELDS),
+                carried: document::carried(&stanza, PACKAGE_FIELDS),
             };
             if let Some(reason) = package.unusable() {
                 return Err(plan_document(reason));
@@ -435,8 +445,8 @@ fn render(stanza: &Draft, out: &mut String) -> Result<(), GentooError> {
 }
 
 /// Reads a required field, or reports which stanza it was missing from.
-fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, GentooError> {
-    document::required(value, field, at).map_err(plan_document)
+fn required(value: Option<Cow<'_, str>>, field: &str, at: &str) -> Result<String, GentooError> {
+    document::required(value.as_deref(), field, at).map_err(plan_document)
 }
 
 /// Reads an optional numeric field, refusing one that is present and
@@ -445,11 +455,11 @@ fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, Gentoo
 /// The rule is [`document::number`]'s; only whose document the refusal is
 /// about belongs here.
 fn number<T: std::str::FromStr + std::fmt::Display>(
-    value: Option<&str>,
+    value: Option<Cow<'_, str>>,
     field: &str,
     at: &str,
 ) -> Result<Option<T>, GentooError> {
-    document::number(value, field, at).map_err(plan_document)
+    document::number(value.as_deref(), field, at).map_err(plan_document)
 }
 
 /// A document this library cannot read or write.
@@ -594,20 +604,20 @@ mod tests {
             ("", "no stanzas"),
             ("Architecture: amd64\n", "no Format field"),
             (
-                "Format: ferroday-cage-gentoo-plan 2\nArchitecture: amd64\nBinhost: x86-64\n",
+                "Format: ferroday-cage-gentoo-plan 3\nArchitecture: amd64\nBinhost: x86-64\n",
                 "a version this library does not read",
             ),
             (
-                "Format: ferroday-cage-gentoo-plan 1\nBinhost: x86-64\n",
+                "Format: ferroday-cage-gentoo-plan 2\nBinhost: x86-64\n",
                 "a header with no architecture",
             ),
             (
-                "Format: ferroday-cage-gentoo-plan 1\nArchitecture: amd64\nBinhost: x86-64\n\n\
+                "Format: ferroday-cage-gentoo-plan 2\nArchitecture: amd64\nBinhost: x86-64\n\n\
                  Version: 1.0\n",
                 "a stanza naming no package",
             ),
             (
-                "Format: ferroday-cage-gentoo-plan 1\nArchitecture: amd64\nBinhost: x86-64\n\n\
+                "Format: ferroday-cage-gentoo-plan 2\nArchitecture: amd64\nBinhost: x86-64\n\n\
                  Package: sys-libs/zlib\nVersion: 1.3.2\nBuild-Id: x\n\
                  Path: a/b.gpkg.tar\nSize: 1\nMD5: b3ae71ef373f5aa4405e637a2d263f51\n",
                 "a build id that is not a number",
@@ -620,6 +630,19 @@ mod tests {
                 "{why}: {err:?}"
             );
         }
+
+        // A version 1 document states no slot and no build time, which every
+        // container is held to. It is refused for its format, which names what
+        // is wrong with it, before any stanza is read.
+        let first = "Format: ferroday-cage-gentoo-plan 1\nArchitecture: amd64\nBinhost: x86-64\n\n\
+                     Package: sys-libs/zlib\nVersion: 1.3.2\nBuild-Id: 1\n\
+                     Path: sys-libs/zlib/zlib-1.3.2-1.gpkg.tar\nSize: 1\n\
+                     MD5: b3ae71ef373f5aa4405e637a2d263f51\n";
+        let err = Plan::parse_document(first).expect_err("a version 1 document is refused");
+        assert!(
+            err.to_string().contains("\"ferroday-cage-gentoo-plan 1\""),
+            "{err}"
+        );
     }
 
     #[test]
@@ -628,6 +651,10 @@ mod tests {
         // the URL the container is fetched from and of the entry it is cached
         // under, and the bytes land there before the signed Manifest inside
         // them is ever read.
+        let longer_than_a_record_states = format!(
+            "Rdepend: {}",
+            "a/b ".repeat(index::MAX_CLASS_BYTES / 4 + 1).trim_end()
+        );
         let cases = [
             ("Path: ../../../etc/passwd", "outside the archive"),
             ("Package: zlib", "not a package"),
@@ -635,6 +662,7 @@ mod tests {
             ("MD5: nothex", "not one this format writes"),
             ("Slot:", "empty Slot"),
             ("Rdepend: || ( dev-libs/a", "cannot be read"),
+            (longer_than_a_record_states.as_str(), "cannot be read"),
             ("Build-Time: recently", "not a number"),
         ];
         for (line, why) in cases {

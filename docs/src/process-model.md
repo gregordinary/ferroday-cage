@@ -9,8 +9,9 @@ guarantees about lifetimes and signals.
 ```text
 caller
 └── launch stage            resets signal state, unshares the namespaces,
-    (exits immediately)     sweeps descriptors, establishes the identity
-                            map, publishes the supervisor
+    (exits immediately)     sweeps descriptors, replaces the session
+                            keyring, establishes the identity map,
+                            publishes the supervisor
     └── init  (PID 1)       sets the sandbox up, then supervises
         └── command (PID 2) execs the configured command
 ```
@@ -18,7 +19,7 @@ caller
 A launch forks a short-lived stage that creates the namespaces and hands a
 pidfd for the sandbox's supervisor back to the caller before exiting. With
 the default PID namespace, the supervisor is a minimal init running as
-PID 1 inside the namespace; the command runs as PID 2 beneath it.
+PID 1 inside the namespace. The command runs as PID 2 beneath it.
 
 Throughout this guide, and in the library's own errors, *the supervisor* is
 that process: the one the returned handle anchors on, kills, and collects the
@@ -39,7 +40,8 @@ and cannot keep [`run`] from returning.
 
 With [`pid_namespace(false)`], there is no init: the command process is itself
 the supervisor, and the launch stage remains outside the sandbox as its parent
-until the outcome arrives. The command shares the host's PID space, and its
+until the outcome arrives. It collects that outcome and watches the caller's
+handle, as the init would. The command shares the host's PID space, and its
 descendants are ordinary host processes that can outlive it.
 
 ## What the command starts with
@@ -105,21 +107,37 @@ let status = match running.wait_timeout(Duration::from_secs(60))? {
 # }
 ```
 
-Waits are fused — once the outcome is known, every further wait returns it
-— and killing or terminating an already-exited sandbox is not an error.
+Waits are fused: once the outcome is known, every further wait returns it.
+Killing or terminating an already-exited sandbox is not an error. A wait
+returns once the supervisor has exited, which with a PID namespace follows the
+namespace's teardown.
+
 Dropping the handle without waiting does not kill the sandbox and does not
-collect its outcome; prefer waiting, including after a kill, which also
-drains any output produced before it.
+collect its outcome. Prefer waiting, including after a kill, which also drains
+any output produced before it. A file bind's target that the launch created in
+the root goes once the sandbox is gone. A handle dropped while the sandbox runs
+leaves it, since removing it would unmount the running sandbox's bind.
 
 ## Signals and the caller
 
 The library installs no signal handlers — how the embedding application
 responds to its own signals is application policy. The defined behavior:
 
-- **The command shares the caller's process group and session.** A
-  terminal `^C` delivers `SIGINT` to the foreground process group, which
-  includes the command; an interactive command exits with the foreground
-  job, exactly as it would outside the sandbox.
+- **A command that inherits the caller's standard input shares the caller's
+  process group and session.** A terminal `^C` reaches the foreground process
+  group, which includes the command. An interactive command exits with the
+  foreground job, exactly as it would outside the sandbox. Any other standard
+  input, and every terminal launch, gives the sandbox a session of its own. See
+  [Stream dispositions](streaming.md#stream-dispositions).
+- **The library's own processes outlive the signals sent to the caller's
+  process group.** The init is immune to them as PID 1 of its namespace.
+  Without a PID namespace, the launch stage stays in the caller's process group
+  as the command's parent. It ignores every signal but `SIGCHLD` and the
+  faults. A `^C`, a hangup, or a shell's `kill %1` that ends the caller leaves
+  it to collect the outcome and stop the sandbox as asked. `SIGKILL`, or a
+  fault's signal, sent to the group still ends it, and a command in a session
+  of its own then runs on.
+  The command starts with every signal at its default.
 - **A signal delivered to the caller alone does not affect the sandbox.**
   An application that wants its `SIGTERM` to stop the sandbox calls
   [`terminate`]/[`kill`] from its handler path, per the recipe above.
@@ -129,7 +147,9 @@ responds to its own signals is application policy. The defined behavior:
   sandbox. The tie is a descriptor held by the handle, not a signal
   arrangement, so it works from any thread and holds even for `SIGKILL`.
   It is off by default: an abandoned sandbox otherwise runs to completion,
-  supervised, and is torn down when the command exits.
+  supervised, and is torn down when the command exits. A process the caller
+  forks holds a copy of the descriptor until it exits or executes, and the tie
+  waits for that copy too.
 
 ## Reaping and zombies
 
@@ -142,9 +162,9 @@ command exit clears everything. Without a PID namespace, orphaned
 processes reparent to the host's init as usual.
 
 On the caller's side, a launch never leaks a zombie when it is waited: the
-short-lived launch stage is collected during `spawn` (or by `wait`, in the
-supervisor-outside mode), and the in-namespace init is not the caller's
-child process at all.
+short-lived launch stage is collected during `spawn` (or by `wait`, without a
+PID namespace), and the in-namespace init is not the caller's child process
+at all.
 
 [`run`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.run
 [`spawn`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.spawn

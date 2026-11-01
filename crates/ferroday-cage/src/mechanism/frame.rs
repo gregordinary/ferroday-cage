@@ -22,9 +22,10 @@
 //!
 //! End of input is the only axis on which the readers differ, so it is the only
 //! thing their names say: [`read_full`] treats a short read as a truncated
-//! frame, and [`read_full_or_eof`] reports it. The host side of the export
-//! reads through a `std::io::Read` rather than a descriptor and keeps its own
-//! readers, but uses these names for the shapes they share.
+//! frame, [`read_full_or_eof`] reports it, and [`read_full_or_short`] reports
+//! how far the read got before it. The host side of the export reads through a
+//! `std::io::Read` rather than a descriptor and keeps its own readers, but uses
+//! these names for the shapes they share.
 
 use std::mem::MaybeUninit;
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -88,16 +89,26 @@ pub(crate) fn read_full(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<(), Errno>
 /// tag that begins a frame, where the peer may simply have nothing more to say.
 /// Anywhere inside a frame, [`read_full`] is the reader that wants.
 pub(crate) fn read_full_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<bool, Errno> {
+    Ok(read_full_or_short(fd, buf)? == buf.len())
+}
+
+/// Fills `buf`, retrying `EINTR`, and returns how much of it was filled: all
+/// of it, or less where input ended first.
+///
+/// For a reader to whom end of input means one thing before a frame and
+/// another inside one: nothing at all is an ending, and part of a frame is a
+/// conversation cut off. [`read_full_or_eof`] answers both with `false`.
+pub(crate) fn read_full_or_short(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     let mut read = 0;
     while read < buf.len() {
         match rustix::io::read(fd, &mut buf[read..]) {
-            Ok(0) => return Ok(false),
+            Ok(0) => break,
             Ok(n) => read += n,
             Err(Errno::INTR) => continue,
             Err(errno) => return Err(errno),
         }
     }
-    Ok(true)
+    Ok(read)
 }
 
 /// The length of a helper child's outcome record: a step's wire value then an

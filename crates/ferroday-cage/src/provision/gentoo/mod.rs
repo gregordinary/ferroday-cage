@@ -143,11 +143,19 @@ const MAX_DIGESTS_BYTES: u64 = 64 * 1024;
 
 /// The ceiling on a binary-package index, which declares no size of its own.
 ///
-/// Sized against today's 21.5 MB with room for the archive to grow. It applies
-/// to the plain and the compressed form alike -- for the compressed one, to the
-/// decompressed stream too, since that is what a decompression bomb inflates.
-/// An index past it is refused rather than read as far as the ceiling.
-const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+/// The largest binhost's index decompresses to 21 MB, `amd64`'s `x86-64` when
+/// this was measured, and this is three times that, room for the archive to
+/// grow. It applies to the plain and the compressed form alike -- for the
+/// compressed one, to the decompressed stream too, since that is what a
+/// decompression bomb inflates. An index past it is refused rather than read
+/// as far as the ceiling.
+///
+/// Nothing signs the index, so this is also what bounds the memory an index
+/// can make a run spend before any signature is consulted. Reading one holds
+/// its text and the records parsed out of it, and a record holds its own
+/// text and a few words, so that is a small multiple of this however a mirror
+/// lays the text out.
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The ceiling on a binary package's metadata archive, which the container
 /// declares no length for until its Manifest has been read.
@@ -1126,7 +1134,7 @@ impl Gentoo {
             |name| {
                 let suffix = format!("{directory}/{name}");
                 let served = self.read_bytes(&suffix, MAX_INDEX_BYTES, to)?;
-                read_index_body(&served, MAX_INDEX_BYTES)
+                read_index_body(served, MAX_INDEX_BYTES)
             },
             || GentooError::Fetch(no_mirror(&directory)),
         )
@@ -1446,14 +1454,16 @@ struct Fetched {
 /// ceiling is refused rather than cut at it. A cut index parses perfectly as a
 /// smaller archive, and its own package count cannot be relied on to notice,
 /// since the count is optional and the mirror's to write.
-fn read_index_body(served: &Fetched, limit: u64) -> Result<index::Index, GentooError> {
+///
+/// What arrived is let go once it is decompressed, and the text once it is
+/// parsed, so what reading an index holds at once is its text and the records
+/// parsed out of it.
+fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooError> {
+    let Fetched { url, body: served } = served;
     let unreadable = |err: &(dyn std::error::Error + 'static)| {
-        GentooError::index(
-            &served.url,
-            format!("could not be read: {}", ErrorChain::new(err)),
-        )
+        GentooError::index(&url, format!("could not be read: {}", ErrorChain::new(err)))
     };
-    let mut body = served.body.as_slice();
+    let mut body = served.as_slice();
     let head = compress::sniff_head(&mut body).map_err(|err| unreadable(&err))?;
     let refused = match compress::Codec::of(&head) {
         compress::Codec::Gzip | compress::Codec::Plain => None,
@@ -1462,25 +1472,31 @@ fn read_index_body(served: &Fetched, limit: u64) -> Result<index::Index, GentooE
     };
     if let Some(codec) = refused {
         return Err(GentooError::index(
-            &served.url,
+            &url,
             format!(
                 "is compressed with {codec}, and the archive publishes the index only as gzip or \
                  as plain text"
             ),
         ));
     }
-    let mut reader = compress::decompress(&head, body).map_err(|err| unreadable(&err))?;
     let mut bytes = Vec::new();
-    io::copy(&mut reader, &mut LimitedWriter::new(&mut bytes, limit))
-        .map_err(|err| unreadable(&err))?;
+    {
+        let mut reader = compress::decompress(&head, body).map_err(|err| unreadable(&err))?;
+        io::copy(&mut reader, &mut LimitedWriter::new(&mut bytes, limit))
+            .map_err(|err| unreadable(&err))?;
+    }
+    drop(served);
     // Lossy rather than strict: the index is fifteen thousand stanzas of which
     // this layer reads a dozen fields, and one package's description holding a
     // byte sequence that is not UTF-8 is not a reason to refuse the archive.
     // Every field this layer acts on is held to its own grammar afterwards.
-    let parsed = index::Index::parse(&String::from_utf8_lossy(&bytes));
+    let text = String::from_utf8(bytes)
+        .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned());
+    let parsed = index::Index::parse(&text);
+    drop(text);
     if parsed.records().is_empty() {
         return Err(GentooError::index(
-            &served.url,
+            &url,
             "names no package this layer can act on",
         ));
     }
@@ -1494,7 +1510,7 @@ fn read_index_body(served: &Fetched, limit: u64) -> Result<index::Index, GentooE
         && read < declared
     {
         return Err(GentooError::index(
-            &served.url,
+            &url,
             format!("states that it holds {declared} packages and carries {read}"),
         ));
     }
@@ -2546,17 +2562,16 @@ impl GentooBuilder {
         self
     }
 
-    /// Install binary packages from the binhost for this sub-architecture —
-    /// `x86-64`, `x86-64-v3`, `x86-64_hardened`, `x32`.
+    /// Install binary packages from the binhost for this sub-architecture, such
+    /// as `x86-64`, `x86-64-v3` or `x86-64_hardened`.
     ///
     /// The binhost publishes one tree per sub-architecture under the
-    /// architecture's own, and there is no default: the set moves — amd64
-    /// publishes four today where it published eight — and the only thing that
-    /// enumerates it is an unsigned directory listing. Reading that listing as
-    /// discovery would put an unauthenticated document at the head of the trust
-    /// chain, which is the reason the keyring is vendored, so the
-    /// sub-architecture is the caller's and a wrong one is a 404 rather than a
-    /// silently different userland.
+    /// architecture's own, and there is no default: the set changes over time,
+    /// and the only thing that enumerates it is an unsigned directory listing.
+    /// Reading that listing as discovery would put an unauthenticated document
+    /// at the head of the trust chain, which is the reason the keyring is
+    /// vendored, so the sub-architecture is the caller's and a wrong one is a
+    /// 404 rather than a silently different userland.
     ///
     /// This selects the archive to read. What to install from it is
     /// [`install`](Self::install), and a builder that names a binhost and asks
@@ -2663,9 +2678,15 @@ impl GentooBuilder {
     /// already holds, or a blocker either side states against the other, refuses
     /// the run with [`GentooError::Resolve`] and merges nothing.
     ///
-    /// It supersedes [`install`](Self::install) and
-    /// [`prefer_use`](Self::prefer_use), which describe a resolution that no
-    /// longer happens.
+    /// # Errors
+    ///
+    /// [`build`](Self::build) refuses a plan the configuration cannot install,
+    /// with [`GentooError::Config`]: one resolved for another architecture or
+    /// another binhost, and one naming a package no index could have published.
+    /// It also refuses the combinations that would silently drop half of what
+    /// was asked for. [`install`](Self::install) and
+    /// [`prefer_use`](Self::prefer_use) both describe a resolution, and a plan
+    /// is one already.
     pub fn plan(mut self, plan: Plan) -> GentooBuilder {
         self.plan = Some(plan);
         self
@@ -2791,10 +2812,14 @@ impl GentooBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`GentooError::Config`] for an architecture or a build id a
-    /// request line or a path cannot carry, and [`GentooError::Signature`] if
-    /// the keyring the crate vendors does not parse — which is a defect in this
-    /// crate rather than anything a caller did.
+    /// Returns [`GentooError::Config`] for an architecture, a binhost or a build
+    /// id a request line or a path cannot carry, for an install list or a
+    /// preference that does not parse, and for a [`plan`](Self::plan) the
+    /// configuration contradicts: one given with an install list or a
+    /// preference, or one the [`plan`](Self::plan) documentation says cannot be
+    /// installed. Returns [`GentooError::Signature`] if the keyring the crate
+    /// vendors does not parse — which is a defect in this crate rather than
+    /// anything a caller did.
     pub fn build(self) -> Result<Gentoo, GentooError> {
         // Both become directory segments in every URL the layer fetches, so
         // both are checked before they can reach one. The build id is the one
@@ -2840,6 +2865,23 @@ impl GentooBuilder {
             .collect::<Result<Vec<_>, String>>()
             .map_err(GentooError::config)?;
         if let Some(plan) = &self.plan {
+            // A plan describes a resolution that already happened, so a setting
+            // shaping one is a contradiction rather than a refinement, and
+            // letting either win in silence would install something the caller
+            // did not describe. The Debian and Alpine layers refuse their pairs
+            // the same way.
+            if !install.is_empty() {
+                return Err(GentooError::config(
+                    "a plan already names every package to install, so install() has nothing \
+                     to add; drop one of the two",
+                ));
+            }
+            if !prefer_use.is_empty() {
+                return Err(GentooError::config(
+                    "a plan already names the build of every package, so prefer_use() has no \
+                     candidates to rank; drop one of the two",
+                ));
+            }
             if let Some(reason) = plan.unusable() {
                 return Err(GentooError::config(reason));
             }
@@ -3696,10 +3738,10 @@ mod tests {
                 url: binhost_url("Packages"),
                 body,
             };
-            let read = read_index_body(&fetched(served.clone()), ceiling)
+            let read = read_index_body(fetched(served.clone()), ceiling)
                 .expect("an index of exactly the ceiling reads");
             assert_eq!(read.records().len(), 2);
-            let err = read_index_body(&fetched(served), ceiling - 1)
+            let err = read_index_body(fetched(served), ceiling - 1)
                 .expect_err("an index past the ceiling is refused");
             assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
             assert!(err.to_string().contains("exceeded"), "{err}");
@@ -3717,7 +3759,7 @@ mod tests {
         let skippable = [&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0][..], b"x"].concat();
         for (body, codec) in [(xz, "xz"), (zstd, "zstd"), (skippable, "zstd")] {
             let err = read_index_body(
-                &Fetched {
+                Fetched {
                     url: binhost_url("Packages.gz"),
                     body,
                 },
@@ -3771,7 +3813,7 @@ mod tests {
         // of the same name it would not fail at all. The refusal says which
         // pair disagrees, which is what a 404 cannot.
         let plan = Plan::parse_document(
-            "Format: ferroday-cage-gentoo-plan 1\nArchitecture: arm64\nBinhost: arm64\n",
+            "Format: ferroday-cage-gentoo-plan 2\nArchitecture: arm64\nBinhost: arm64\n",
         )
         .expect("a fixture plan");
 
@@ -3802,6 +3844,41 @@ mod tests {
             .plan(plan)
             .build()
             .expect("a plan that agrees with the builder on both builds");
+    }
+
+    #[test]
+    fn a_plan_beside_a_setting_that_shapes_a_resolution_is_refused() {
+        // A plan is a resolution that already happened, so an install list or
+        // a preference beside one describes a resolution that will not happen.
+        // Letting the plan win in silence would drop what the caller asked for.
+        let plan = Plan::parse_document(
+            "Format: ferroday-cage-gentoo-plan 2\nArchitecture: amd64\nBinhost: x86-64\n",
+        )
+        .expect("a fixture plan");
+
+        let err = Gentoo::builder(ARCH)
+            .install(["dev-vcs/git"])
+            .plan(plan.clone())
+            .build()
+            .expect_err("an install list beside a plan is refused");
+        assert!(matches!(err, GentooError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("install()"), "{err}");
+
+        let err = Gentoo::builder(ARCH)
+            .prefer_use(["keyring"])
+            .plan(plan.clone())
+            .build()
+            .expect_err("a preference beside a plan is refused");
+        assert!(matches!(err, GentooError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("prefer_use()"), "{err}");
+
+        // An empty list shapes nothing, so it contradicts nothing.
+        Gentoo::builder(ARCH)
+            .install(Vec::<String>::new())
+            .prefer_use(Vec::<String>::new())
+            .plan(plan)
+            .build()
+            .expect("empty settings beside a plan build");
     }
 
     #[test]
@@ -4163,7 +4240,7 @@ mod tests {
     /// A plan installing the fixture container `container` from `binhost`.
     fn plan_from(binhost: &str, container: &[u8]) -> Plan {
         let mut plan = Plan::parse_document(&format!(
-            "Format: ferroday-cage-gentoo-plan 1\nArchitecture: {ARCH}\nBinhost: {binhost}\n",
+            "Format: ferroday-cage-gentoo-plan 2\nArchitecture: {ARCH}\nBinhost: {binhost}\n",
         ))
         .expect("a fixture plan");
         let mut package = gpkg::fixture::planned(gpkg::fixture::CPV, 1);

@@ -29,10 +29,13 @@
 //! tree). Four channels connect the caller to them, all created here before
 //! the fork:
 //!
-//! - the **report pipe** carries a failed setup step as one 12-byte record —
-//!   step discriminant, errno, detail index, little-endian. A successful
-//!   `execve` closes the last write end, so end-of-file means the command is
-//!   running.
+//! - the **report pipe** carries the setup's account of itself as a stream of
+//!   little-endian records, each opening with a 4-byte tag: one for each
+//!   file-bind target the setup created, one saying a gated command is held at
+//!   its gate, and, when a step fails, that step as the last record — step
+//!   discriminant, errno, detail index. A successful `execve` closes the last
+//!   write end, so end-of-file with no failure means the command is running.
+//!   See [`read_report`].
 //! - the **status pipe** carries the command's wait status as one 8-byte
 //!   record — kind, value, little-endian — written by the supervisor when
 //!   the command terminates.
@@ -420,12 +423,16 @@ pub(crate) struct RunAsPlan {
 /// so a root shipping none gets an empty file created. Left behind, that file is
 /// content the root did not have — a resolver configuration, an empty binary —
 /// which an export carries into whatever is made of the tree. The caller side
-/// removes each one after the launch instead: the sandbox owns what it creates.
+/// removes each one once the sandbox is gone instead: the sandbox owns what it
+/// creates.
 ///
 /// Only the targets the caller side can name are listed: one under an earlier
 /// mount is created inside that mount rather than in the root, and one the root
 /// already ships — an entry of any kind at the path — is not the launch's to
-/// remove.
+/// remove. The list is what a launch *may* create. Which of them it did is what
+/// the setup reports as it creates each one, as a [`CreatedTarget`]: a target
+/// another launch created first, on a root two sandboxes share, is found rather
+/// than created, and is not this launch's.
 ///
 /// The paths are held root-relative, with the root named once, so the removal
 /// can resolve them the way the sandbox stage resolves its mount targets:
@@ -458,6 +465,7 @@ pub(crate) struct ManagedPlaceholders {
 
 impl ManagedPlaceholders {
     /// Whether the launch creates no mount target the caller side has to remove.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
@@ -812,8 +820,9 @@ pub(crate) struct MountOp {
     /// a file bind. An entry the root already ships at that path is left
     /// exactly as it is, whatever kind it is.
     ///
-    /// Unlike a mount point directory, it does not outlive the sandbox: see
-    /// [`LaunchPlan::managed_placeholders`], which the caller side removes.
+    /// Unlike a mount point directory, it does not outlive the sandbox: the
+    /// setup reports each one it creates, and the caller side removes it; see
+    /// [`LaunchPlan::managed_placeholders`].
     pub(crate) create_file: Option<CString>,
     /// The mount action itself.
     pub(crate) action: MountAction,
@@ -1011,6 +1020,46 @@ pub(crate) fn decode_status(record: [u8; 8]) -> Option<ExitStatus> {
     }
 }
 
+/// The tag of a report record saying the setup created a file-bind target:
+/// the mount op's index, then the created file's inode number as a
+/// little-endian `u64`.
+///
+/// Above every step's wire value, which [`wire_enum`](crate::wire::wire_enum)
+/// numbers from zero upward and so never reaches it, as
+/// [`frame::RECORD_DONE`] is for the helper children's records.
+pub(super) const REPORT_CREATED: u32 = u32::MAX;
+/// The tag of a report record saying a gated command is at its gate, with
+/// every setup step behind it. The tag is the whole record.
+pub(super) const REPORT_HELD: u32 = u32::MAX - 1;
+/// The length of a report record's tag, which opens every record.
+const REPORT_TAG_LEN: usize = 4;
+/// The length of a created-target record: the tag, the op index, and the inode
+/// number.
+pub(super) const REPORT_CREATED_LEN: usize = 16;
+/// The length of a failure record: the step's wire value as the tag, the
+/// errno, and the detail index.
+pub(super) const REPORT_FAILURE_LEN: usize = 12;
+
+/// A file-bind target the setup created in the root, as it reported it.
+///
+/// The inode number is the file's, taken through the descriptor the exclusive
+/// create returned, so it names the file this launch made and not one that
+/// took its name later. The caller side removes a target only while the name
+/// still holds that inode.
+///
+/// The inode number is the whole of the identity, without the device, because
+/// an overlay root reports its own device for every file in it. The number of
+/// a file in the upper is the upper's own, whichever filesystems the layers
+/// are on, so it is the one the caller side sees there too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CreatedTarget {
+    /// The index of the mount op whose
+    /// [`create_file`](MountOp::create_file) it is.
+    pub(crate) op: usize,
+    /// The created file's inode number.
+    pub(crate) ino: u64,
+}
+
 /// A launched sandbox, as handed to the running-sandbox handle: the command
 /// is executing and these are the caller's ends of its channels.
 pub(crate) struct Launched {
@@ -1035,11 +1084,40 @@ pub(crate) struct Launched {
     pub(crate) reap: Option<OwnedFd>,
 }
 
-/// The caller's ends of a freshly forked launch: the launch stage's pid and
-/// every channel the caller keeps, returned by [`fork_launch`] in the parent.
+/// The launch stage as the caller holds it.
+///
+/// The pidfd is taken the moment the fork returns, while the stage is an
+/// unreaped child process whose pid can name nothing else. Every later signal
+/// and reap goes through it, so neither can reach a process that took the pid
+/// after an application-wide reaper collected the stage first. The pid is kept
+/// beside it for the identity-map delegate, which names the process it maps by
+/// number and runs while the stage is blocked at the map gate, alive.
+struct LaunchStage {
+    /// The stage's pid, for the delegate.
+    pid: Pid,
+    /// The stage's pidfd, for everything else.
+    pidfd: OwnedFd,
+}
+
+impl LaunchStage {
+    /// Sends the stage `SIGKILL`. A stage that has already exited is not an
+    /// error.
+    fn kill(&self) {
+        let _ = process::pidfd_send_signal(&self.pidfd, Signal::KILL);
+    }
+
+    /// Reaps the stage, blocking until it exits. A stage something else
+    /// already reaped is not an error.
+    fn reap(&self) {
+        let _ = reap_via_pidfd(self.pidfd.as_fd());
+    }
+}
+
+/// The caller's ends of a freshly forked launch: the launch stage and every
+/// channel the caller keeps, returned by [`fork_launch`] in the parent.
 struct ParentSide {
     /// The launch stage (stage A), forked directly from the caller.
-    stage_a: Pid,
+    stage: LaunchStage,
     /// Caller end of the control socket.
     host_sock: OwnedFd,
     /// Read end of the report pipe.
@@ -1375,6 +1453,17 @@ fn fork_launch(
             child::stage_a(&context)
         }
         Ok(Fork::ParentOf(stage_a)) => {
+            // The pidfd first, while the stage is an unreaped child and its
+            // pid names nothing else; the kill and reap below go by pid for
+            // that same reason.
+            let pidfd = match process::pidfd_open(stage_a, PidfdFlags::empty()) {
+                Ok(pidfd) => pidfd,
+                Err(errno) => {
+                    let _ = process::kill_process(stage_a, Signal::KILL);
+                    let _ = wait_for_exit(stage_a);
+                    return Err(spawn_error(errno));
+                }
+            };
             // Close the caller's copies of the sandbox-side ends: from here
             // on, end-of-file on each read side means the sandbox's copies
             // are gone.
@@ -1403,7 +1492,10 @@ fn fork_launch(
                 caller
             });
             Ok(ParentSide {
-                stage_a,
+                stage: LaunchStage {
+                    pid: stage_a,
+                    pidfd,
+                },
                 host_sock,
                 report_read,
                 status_read,
@@ -1433,43 +1525,6 @@ fn receive_primary(channel: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
     }
 }
 
-/// Waits for whichever comes first: the primary on the terminal channel, or
-/// word on the report pipe, and returns the primary when it came.
-///
-/// A held launch has no `execve` to wait for, so the report pipe closes only
-/// when a stage fails. Watching it beside the channel is what lets a failure
-/// before the terminal existed be read at once, rather than when the last copy
-/// of the channel's sandbox end happens to close. `None` means the report pipe
-/// has something to say, or the channel hung up, and the caller reads the
-/// report next.
-///
-/// The wait has no deadline, deliberately, like the launch's other reads of its
-/// own stages: [`read_report`], [`receive_supervisor`], and the identity-map
-/// gate in [`establish_identity_map`]. Every end they wait on belongs to a
-/// process this launch created, which sends what is awaited or exits, and its
-/// exit closes the end. Only a stage blocked in the kernel holds one open, a
-/// mount against an unresponsive server for instance, and the launch then
-/// waits as long as that mount does.
-fn await_primary(channel: &OwnedFd, report: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
-    loop {
-        let mut fds = [
-            PollFd::new(channel, PollFlags::IN),
-            PollFd::new(report, PollFlags::IN),
-        ];
-        match rustix::event::poll(&mut fds, None) {
-            Ok(_) => {}
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(wait_syscall_error(errno)),
-        }
-        if !fds[0].revents().is_empty() {
-            return receive_primary(channel);
-        }
-        if !fds[1].revents().is_empty() {
-            return Ok(None);
-        }
-    }
-}
-
 /// Establishes a range-mapped launch's identity map through its delegate.
 ///
 /// A no-op for the single-identity tier, which carries no gate. For a range
@@ -1477,11 +1532,18 @@ fn await_primary(channel: &OwnedFd, report: &OwnedFd) -> Result<Option<OwnedFd>,
 /// swept), applies the resolved map against stage A's pid, and releases the
 /// stage with the go byte.
 ///
-/// If stage A dies before signalling ready, the report pipe holds the true
-/// cause and is read for it. If the delegate fails, the gate is closed —
-/// stage A sees end-of-file and exits, reporting a gate failure it knows the
-/// caller will not read — and the delegate's own error is returned: the
-/// delegate ran caller-side, so the better diagnostic is already in hand.
+/// If stage A exits before signalling ready, the report pipe holds the true
+/// cause and is read for it. If the delegate fails, stage A is killed and
+/// reaped, and the delegate's own error is returned: the delegate ran
+/// caller-side, so the better diagnostic is already in hand. Either way stage A
+/// had not forked anything yet, so nothing else of the launch exists.
+///
+/// The wait for the ready byte has no deadline, deliberately, like the launch's
+/// other reads of its own stages: [`read_report`] and [`receive_supervisor`].
+/// Every end they wait on belongs to a process this launch created, which sends
+/// what is awaited or exits, and its exit closes the end. Only a stage blocked
+/// in the kernel holds one open, a mount against an unresponsive server for
+/// instance, and the launch then waits as long as that mount does.
 fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<(), Error> {
     let Some(gate) = &parent.map_gate else {
         return Ok(());
@@ -1495,31 +1557,32 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
     match frame::retry_on_intr!(rustix::io::read(gate, &mut byte)) {
         // Stage A is unshared and waiting; the namespace exists.
         Ok(n) if n > 0 => {}
-        // End-of-file: stage A died before reaching the gate. The
-        // report pipe holds the step that failed.
+        // End-of-file: stage A exited before reaching the gate. The report
+        // pipe holds the step that failed, and no target, since nothing that
+        // creates one had been forked.
         Ok(_) => {
-            let report = read_report(&parent.report_read);
-            let _ = wait_for_exit(parent.stage_a);
+            let report = read_report(&parent.report_read, &mut Vec::new(), 0);
+            parent.stage.reap();
             return Err(match report {
                 Ok(Report::SetupFailed {
                     step,
                     errno,
                     detail,
                 }) => setup_error(step, errno, detail, Labels::of(plan)),
-                Ok(Report::ExecSucceeded) => Error::SupervisorLost,
+                Ok(Report::ExecSucceeded | Report::Held) => Error::SupervisorLost,
                 Err(err) => err,
             });
         }
         Err(errno) => {
-            let _ = process::kill_process(parent.stage_a, Signal::KILL);
-            let _ = wait_for_exit(parent.stage_a);
+            parent.stage.kill();
+            parent.stage.reap();
             return Err(wait_syscall_error(errno));
         }
     }
 
     // The map is written against stage A: the process that unshared, so the
     // process whose /proc map files name the new namespace.
-    let pid = parent.stage_a.as_raw_nonzero().get() as u32;
+    let pid = parent.stage.pid.as_raw_nonzero().get() as u32;
     match mapper.apply(pid, map) {
         Ok(()) => {
             // Release the stage. A failed write means it died; the caller's
@@ -1544,9 +1607,9 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
             // execs — the gate is close-on-exec — or exits. The end-of-file
             // stage A waits on is therefore not something this caller can make
             // arrive, and the reap below would block on it.
-            let _ = process::kill_process(parent.stage_a, Signal::KILL);
+            parent.stage.kill();
             parent.map_gate = None;
-            let _ = wait_for_exit(parent.stage_a);
+            parent.stage.reap();
             Err(Error::IdentityMap(err))
         }
     }
@@ -1555,22 +1618,15 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
 /// Decides how the launch stage is reaped for a command that is now running.
 ///
 /// Without a PID namespace the launch stage stays outside as the command's
-/// parent and is reaped by the handle once the status arrives, so it is
+/// parent and is reaped by the handle once the status arrives, so its pidfd is
 /// returned; with one it has already exited and is reaped here, best-effort in
 /// case the application reaps child processes of its own.
-fn reap_after(pid_namespace: bool, stage_a: Pid) -> Option<OwnedFd> {
+fn reap_after(pid_namespace: bool, stage: LaunchStage) -> Option<OwnedFd> {
     if pid_namespace {
-        // The launch stage is short-lived here and reaped now, before its pid
-        // could be reused: it is still an un-reaped child at this point.
-        let _ = wait_for_exit(stage_a);
+        stage.reap();
         None
     } else {
-        // The launch stage outlives spawn here, so the handle reaps it later.
-        // Take a pidfd now, while it is still a child, so that deferred reap
-        // targets exactly this process rather than a raw pid a concurrent
-        // reaper could free and the OS recycle. If it was already reaped,
-        // `pidfd_open` fails and there is nothing left to reap.
-        process::pidfd_open(stage_a, PidfdFlags::empty()).ok()
+        Some(stage.pidfd)
     }
 }
 
@@ -1583,18 +1639,68 @@ pub(crate) fn reap_via_pidfd(pidfd: BorrowedFd<'_>) -> Result<(), Errno> {
     frame::retry_on_intr!(process::waitid(WaitId::PidFd(pidfd), WaitIdOptions::EXITED)).map(|_| ())
 }
 
+/// Blocks until the process a pidfd refers to has exited, retrying `EINTR`.
+///
+/// The process need not be the caller's child, and the namespace init is not,
+/// so its exit is read rather than collected: a pidfd turns readable once its
+/// process has exited, reaped or not.
+pub(crate) fn await_exit(pidfd: BorrowedFd<'_>) -> Result<(), Errno> {
+    loop {
+        let mut fds = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => return Ok(()),
+            Err(Errno::INTR) => continue,
+            Err(errno) => return Err(errno),
+        }
+    }
+}
+
+/// Whether the process a pidfd refers to has exited, asked without waiting.
+///
+/// A failed poll answers `false`: the callers act only on a process known to
+/// be gone.
+pub(crate) fn has_exited(pidfd: BorrowedFd<'_>) -> bool {
+    let mut fds = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
+    matches!(
+        rustix::event::poll(&mut fds, Some(&rustix::event::Timespec::default())),
+        Ok(ready) if ready > 0
+    )
+}
+
+/// Ends a launch this side is giving up on: kills the supervisor and the launch
+/// stage, reaps the stage, and waits for the supervisor to exit.
+///
+/// With a PID namespace the supervisor is the init, whose exit takes every
+/// process of the sandbox with it; without one it is the command process. Once
+/// this returns, the targets the setup reported creating are bound by no
+/// process of this launch, which is what lets the caller remove them.
+fn abort_launch(stage: &LaunchStage, supervisor: &OwnedFd) {
+    let _ = process::pidfd_send_signal(supervisor, Signal::KILL);
+    stage.kill();
+    stage.reap();
+    let _ = await_exit(supervisor.as_fd());
+}
+
 /// Launches the sandbox and blocks until the command is executing.
 ///
 /// Returns once the report pipe settles: end-of-file means every setup step
-/// succeeded and `execve` replaced the command process's image, and a record
-/// means a step failed and is returned as the typed error. A terminal launch
-/// returns the caller's end of the pseudoterminal beside the launched sandbox;
-/// every other launch returns `None` for it.
+/// succeeded and `execve` replaced the command process's image, and a failure
+/// record means a step failed and is returned as the typed error. A terminal
+/// launch returns the caller's end of the pseudoterminal beside the launched
+/// sandbox; every other launch returns `None` for it.
+///
+/// `created` receives the file-bind targets the setup reported creating. After
+/// success they are the running sandbox's, free once its supervisor has exited.
+/// After an error it holds them only where the supervisor is known to have
+/// exited, so what it holds then is free at once: a launch whose supervisor was
+/// never published may have left a process running that this side cannot name,
+/// and its targets are left where they are.
 pub(crate) fn spawn(
     plan: &LaunchPlan,
     observe: bool,
     terminal: Option<&Terminal>,
     progress: &mut dyn FnMut(Progress),
+    created: &mut Vec<CreatedTarget>,
 ) -> Result<(Launched, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
     let mut parent = fork_launch(plan, observe, false, terminal)?;
@@ -1605,7 +1711,7 @@ pub(crate) fn spawn(
     if received.is_ok() {
         progress(Progress::Supervised);
     }
-    let report = read_report(&parent.report_read);
+    let report = read_report(&parent.report_read, created, plan.ops.len());
 
     match (report, received) {
         // The command is running and the supervisor is published. A terminal
@@ -1619,8 +1725,7 @@ pub(crate) fn spawn(
                     // defect in this library rather than a state to hand out,
                     // so the sandbox is torn down with it.
                     outcome => {
-                        let _ = process::pidfd_send_signal(&pidfd, Signal::KILL);
-                        let _ = wait_for_exit(parent.stage_a);
+                        abort_launch(&parent.stage, &pidfd);
                         return Err(match outcome {
                             Err(err) => err,
                             _ => wait_syscall_error(Errno::PROTO),
@@ -1638,41 +1743,70 @@ pub(crate) fn spawn(
                     status: parent.status_read,
                     stdout: parent.stdout,
                     stderr: parent.stderr,
-                    reap: reap_after(plan.pid_namespace, parent.stage_a),
+                    reap: reap_after(plan.pid_namespace, parent.stage),
                 },
                 primary,
             ))
         }
         // A setup step failed. Every stage at or below the failure has
         // exited, and a supervisor above it exits as soon as it observes the
-        // exit, so the launch stage is reapable.
+        // exit, so the launch stage is reapable and the supervisor's exit is
+        // near.
         (
             Ok(Report::SetupFailed {
                 step,
                 errno,
                 detail,
             }),
-            _,
+            received,
         ) => {
-            let _ = wait_for_exit(parent.stage_a);
+            parent.stage.reap();
+            // Unpublished, the supervisor is the launch stage's to have ended,
+            // which it does before reporting its own failure.
+            if let Ok((pidfd, _)) = &received {
+                let _ = await_exit(pidfd.as_fd());
+            }
             Err(setup_error(step, errno, detail, Labels::of(plan)))
         }
         // The report pipe reached end-of-file — every setup step succeeded —
         // but the supervisor was never published: the launch stage exited
-        // before sending it.
+        // before sending it, leaving whatever it forked to run on.
         (Ok(Report::ExecSucceeded), Err(err)) => {
-            let _ = wait_for_exit(parent.stage_a);
+            parent.stage.reap();
+            created.clear();
             Err(err)
         }
-        // The report pipe could not be read. Unsupervisable; tear the launch
-        // down rather than leave it running blind.
+        // An ungated launch holds no command at a gate, so a held record is a
+        // broken protocol, as an unreadable report is. Unsupervisable; tear the
+        // launch down rather than leave it running blind.
+        (Ok(Report::Held), received) => {
+            give_up(&parent.stage, received.as_ref().ok(), created);
+            Err(wait_syscall_error(Errno::PROTO))
+        }
         (Err(err), received) => {
-            if let Ok((pidfd, _)) = received {
-                let _ = process::pidfd_send_signal(&pidfd, Signal::KILL);
-            }
-            let _ = process::kill_process(parent.stage_a, Signal::KILL);
-            let _ = wait_for_exit(parent.stage_a);
+            give_up(&parent.stage, received.as_ref().ok(), created);
             Err(err)
+        }
+    }
+}
+
+/// Tears down a launch whose report could not be trusted, keeping in
+/// `created` only what is free once it is gone.
+///
+/// With the supervisor published, [`abort_launch`] ends the whole launch.
+/// Without it, only the launch stage can be reached, and a process it forked
+/// may run on.
+fn give_up(
+    stage: &LaunchStage,
+    supervisor: Option<&(OwnedFd, u32)>,
+    created: &mut Vec<CreatedTarget>,
+) {
+    match supervisor {
+        Some((pidfd, _)) => abort_launch(stage, pidfd),
+        None => {
+            stage.kill();
+            stage.reap();
+            created.clear();
         }
     }
 }
@@ -1681,17 +1815,17 @@ pub(crate) fn spawn(
 /// caller attaches a userspace network stack to the sandbox's network
 /// namespace.
 ///
-/// The namespaces exist and the supervisor is published, so [`netns_pid`] is a
-/// valid target for `/proc/<pid>/ns/net`; the command has not yet run.
-/// [`proceed`] releases it, and dropping the handle without proceeding tears
-/// the launch down through [`abandon`].
+/// Every setup step is behind the command, and the supervisor is published, so
+/// [`netns_pid`] is a live process and a valid target for `/proc/<pid>/ns/net`;
+/// the command has not yet run. [`proceed`] releases it, and dropping the
+/// handle without proceeding tears the launch down through [`abandon`].
 ///
 /// [`netns_pid`]: PendingLaunch::netns_pid
 /// [`proceed`]: PendingLaunch::proceed
 /// [`abandon`]: PendingLaunch::abandon
 pub(crate) struct PendingLaunch {
     /// The launch stage, reaped at proceed or abandon.
-    stage_a: Pid,
+    stage: LaunchStage,
     /// Pidfd of the supervisor: the kill handle, and the process whose
     /// network namespace a stack attaches to.
     pidfd: OwnedFd,
@@ -1699,7 +1833,7 @@ pub(crate) struct PendingLaunch {
     pid: u32,
     /// Caller end of the control socket.
     host_sock: OwnedFd,
-    /// Read end of the report pipe, read once the command is released.
+    /// Read end of the report pipe, read again once the command is released.
     report_read: OwnedFd,
     /// Read end of the status pipe.
     status_read: OwnedFd,
@@ -1725,16 +1859,23 @@ pub(crate) struct PendingLaunch {
 }
 
 /// Launches the sandbox but holds the command at the gate before `execve`,
-/// returning once the supervisor is published.
+/// returning once the command is there.
 ///
-/// A setup failure before the supervisor is published (a denied `unshare`, a
-/// failed fork) surfaces here as the typed error; a failure after it is
-/// deferred to [`PendingLaunch::proceed`], where the report is read.
+/// The command says it is held only with every setup step behind it: the
+/// namespaces and the mounts are in place, a terminal's primary is sent, and
+/// with a PID namespace the init is supervising. A setup failure before that
+/// (a denied `unshare`, a refused mount) surfaces here as the typed error; one
+/// after it (the identity switch, the hardening, the exec) is deferred to
+/// [`PendingLaunch::proceed`], where the report is read again.
+///
+/// `created` as for [`spawn`]. Every target is reported before the command is
+/// held, so a pending launch has them all.
 pub(crate) fn spawn_pending(
     plan: &LaunchPlan,
     observe: bool,
     terminal: Option<&Terminal>,
     progress: &mut dyn FnMut(Progress),
+    created: &mut Vec<CreatedTarget>,
 ) -> Result<(PendingLaunch, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
     let mut parent = fork_launch(plan, observe, true, terminal)?;
@@ -1745,82 +1886,95 @@ pub(crate) fn spawn_pending(
     establish_identity_map(plan, &mut parent)?;
     let proceed_write = parent
         .proceed_write
+        .take()
         .expect("a gated launch carries a proceed pipe");
 
-    match receive_supervisor(&parent.host_sock) {
-        Ok((pidfd, pid)) => {
-            progress(Progress::Supervised);
-            // The primary comes back here rather than out of `proceed`: the
-            // sandbox allocates the pseudoterminal and sends it before the
-            // command reaches the gate, so the caller attaches its network stack
-            // and proceeds with the primary already in hand. Nothing writes to
-            // the terminal while the launch is held.
-            let primary = match &parent.terminal {
-                Some(channel) => match await_primary(channel, &parent.report_read) {
-                    Ok(Some(primary)) => Some(primary),
-                    // A stage failed before the terminal existed, and the report
-                    // says which. With the proceed pipe still open no command
-                    // has been released, so everything the report can hold is a
-                    // failure.
-                    Ok(None) => {
-                        let report = read_report(&parent.report_read);
-                        let _ = process::pidfd_send_signal(&pidfd, Signal::KILL);
-                        let _ = wait_for_exit(parent.stage_a);
-                        return Err(match report {
-                            Ok(Report::SetupFailed {
-                                step,
-                                errno,
-                                detail,
-                            }) => setup_error(step, errno, detail, Labels::of(plan)),
-                            Ok(Report::ExecSucceeded) => Error::SupervisorLost,
-                            Err(err) => err,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = process::pidfd_send_signal(&pidfd, Signal::KILL);
-                        let _ = wait_for_exit(parent.stage_a);
-                        return Err(err);
-                    }
-                },
-                None => None,
-            };
-            Ok((
-                PendingLaunch {
-                    stage_a: parent.stage_a,
-                    pidfd,
-                    pid,
-                    host_sock: parent.host_sock,
-                    report_read: parent.report_read,
-                    status_read: parent.status_read,
-                    stdout: parent.stdout,
-                    stderr: parent.stderr,
-                    proceed_write,
-                    pid_namespace: plan.pid_namespace,
-                    op_labels: plan.op_labels.clone(),
-                    exec_label: plan.exec_label.clone(),
-                    rlimit_labels: plan.rlimit_labels.clone(),
-                    #[cfg(feature = "hardening")]
-                    landlock_labels: plan.hardening.landlock_labels.clone(),
-                },
-                primary,
-            ))
-        }
+    let (pidfd, pid) = match receive_supervisor(&parent.host_sock) {
+        Ok(supervisor) => supervisor,
         // The supervisor was never published: a setup step failed before the
-        // command reached the gate. The child reported it and exited; read
-        // the record for the precise cause, then reap the launch stage.
+        // command was forked, or the launch stage failed to publish it and
+        // ended what it had forked before saying so. Read the record for the
+        // precise cause, then reap the launch stage.
         Err(err) => {
-            let report = read_report(&parent.report_read);
-            let _ = wait_for_exit(parent.stage_a);
-            match report {
+            let report = read_report(&parent.report_read, created, plan.ops.len());
+            parent.stage.reap();
+            return match report {
                 Ok(Report::SetupFailed {
                     step,
                     errno,
                     detail,
                 }) => Err(setup_error(step, errno, detail, Labels::of(plan))),
-                _ => Err(err),
-            }
+                _ => {
+                    created.clear();
+                    Err(err)
+                }
+            };
+        }
+    };
+    progress(Progress::Supervised);
+
+    match read_report(&parent.report_read, created, plan.ops.len()) {
+        Ok(Report::Held) => {}
+        // With the proceed pipe still open no command has been released, so a
+        // failure is a step before the gate, and the supervisor exits on it.
+        Ok(Report::SetupFailed {
+            step,
+            errno,
+            detail,
+        }) => {
+            parent.stage.reap();
+            let _ = await_exit(pidfd.as_fd());
+            return Err(setup_error(step, errno, detail, Labels::of(plan)));
+        }
+        // Every process of the launch let go of the report without a word: the
+        // command never reached its gate, and nothing says why.
+        Ok(Report::ExecSucceeded) => {
+            abort_launch(&parent.stage, &pidfd);
+            return Err(Error::SupervisorLost);
+        }
+        Err(err) => {
+            abort_launch(&parent.stage, &pidfd);
+            return Err(err);
         }
     }
+
+    // The primary was sent before the command reached its gate, so a held
+    // launch's is already waiting on the channel. Nothing writes to the
+    // terminal while the launch is held, and the caller attaches its network
+    // stack and proceeds with the primary already in hand.
+    let primary = match &parent.terminal {
+        Some(channel) => match receive_primary(channel) {
+            Ok(Some(primary)) => Some(primary),
+            outcome => {
+                abort_launch(&parent.stage, &pidfd);
+                return Err(match outcome {
+                    Err(err) => err,
+                    _ => wait_syscall_error(Errno::PROTO),
+                });
+            }
+        },
+        None => None,
+    };
+    Ok((
+        PendingLaunch {
+            stage: parent.stage,
+            pidfd,
+            pid,
+            host_sock: parent.host_sock,
+            report_read: parent.report_read,
+            status_read: parent.status_read,
+            stdout: parent.stdout,
+            stderr: parent.stderr,
+            proceed_write,
+            pid_namespace: plan.pid_namespace,
+            op_labels: plan.op_labels.clone(),
+            exec_label: plan.exec_label.clone(),
+            rlimit_labels: plan.rlimit_labels.clone(),
+            #[cfg(feature = "hardening")]
+            landlock_labels: plan.hardening.landlock_labels.clone(),
+        },
+        primary,
+    ))
 }
 
 impl PendingLaunch {
@@ -1830,8 +1984,15 @@ impl PendingLaunch {
         self.pid
     }
 
+    /// The supervisor's pidfd.
+    pub(crate) fn supervisor(&self) -> BorrowedFd<'_> {
+        self.pidfd.as_fd()
+    }
+
     /// Releases the gated command and blocks until it is executing, returning
     /// the launched sandbox or the typed setup error.
+    ///
+    /// Once this returns an error, the supervisor has exited.
     pub(crate) fn proceed(self, progress: &mut dyn FnMut(Progress)) -> Result<Launched, Error> {
         // Release the command: any byte is the go signal. A failed write means
         // the command process is already gone; the report read below reports
@@ -1839,7 +2000,9 @@ impl PendingLaunch {
         let _ = frame::retry_on_intr!(rustix::io::write(&self.proceed_write, &[PROCEED_BYTE]));
         drop(self.proceed_write);
 
-        match read_report(&self.report_read) {
+        // Every created target was reported before the command was held, so a
+        // record naming one now is a broken protocol.
+        match read_report(&self.report_read, &mut Vec::new(), 0) {
             Ok(Report::ExecSucceeded) => {
                 progress(Progress::Executing);
                 Ok(Launched {
@@ -1849,7 +2012,7 @@ impl PendingLaunch {
                     status: self.status_read,
                     stdout: self.stdout,
                     stderr: self.stderr,
-                    reap: reap_after(self.pid_namespace, self.stage_a),
+                    reap: reap_after(self.pid_namespace, self.stage),
                 })
             }
             Ok(Report::SetupFailed {
@@ -1857,7 +2020,8 @@ impl PendingLaunch {
                 errno,
                 detail,
             }) => {
-                let _ = wait_for_exit(self.stage_a);
+                self.stage.reap();
+                let _ = await_exit(self.pidfd.as_fd());
                 // Assembled field by field rather than from `&self`: the
                 // proceed pipe was moved out of `self` above, so `self` as a
                 // whole can no longer be borrowed — which is what a helper
@@ -1877,23 +2041,24 @@ impl PendingLaunch {
                     },
                 ))
             }
+            Ok(Report::Held) => {
+                abort_launch(&self.stage, &self.pidfd);
+                Err(wait_syscall_error(Errno::PROTO))
+            }
             Err(err) => {
-                let _ = process::pidfd_send_signal(&self.pidfd, Signal::KILL);
-                let _ = process::kill_process(self.stage_a, Signal::KILL);
-                let _ = wait_for_exit(self.stage_a);
+                abort_launch(&self.stage, &self.pidfd);
                 Err(err)
             }
         }
     }
 
-    /// Tears the pending launch down: kills the supervisor and reaps the
-    /// launch stage. The gated command dies with its supervisor — with a PID
-    /// namespace the kernel tears the namespace down, and without one the
-    /// supervisor pidfd is the command process itself.
+    /// Tears the pending launch down: kills the supervisor, reaps the launch
+    /// stage, and waits for the supervisor to exit. The gated command ends with
+    /// its supervisor — with a PID namespace the kernel tears the namespace
+    /// down, and without one the supervisor pidfd is the command process
+    /// itself.
     pub(crate) fn abandon(self) {
-        let _ = process::pidfd_send_signal(&self.pidfd, Signal::KILL);
-        let _ = process::kill_process(self.stage_a, Signal::KILL);
-        let _ = wait_for_exit(self.stage_a);
+        abort_launch(&self.stage, &self.pidfd);
     }
 }
 
@@ -1950,13 +2115,18 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
             source: std::io::Error::from_raw_os_error(errno),
         };
     }
-    // A user namespace is charged against `user.max_user_namespaces` at every
-    // level up to the initial namespace, and a launch holds two. `ENOSPC` from
-    // the nested entry is that budget and nothing else — no other setup step
-    // reports it — so the error names the sysctl rather than leaving a reader
-    // with "No space left on device" against a step that touched no filesystem.
-    if step == SetupStep::NestedUnshare && errno == Errno::NOSPC.raw_os_error() {
-        return Error::NestedUsernsBudgetExhausted {
+    // Creating a namespace answers `ENOSPC` for a namespace limit and nothing
+    // else: one of the per-user counts under `/proc/sys/user`, each charged at
+    // every level of user namespace up to the initial one, or the nesting depth
+    // of user or PID namespaces. The error names that family rather than
+    // leaving a reader with "No space left on device" against a step that
+    // touched no filesystem. Only these two steps create namespaces; `ENOSPC`
+    // from allocating a terminal means something else, below.
+    if matches!(step, SetupStep::Unshare | SetupStep::NestedUnshare)
+        && errno == Errno::NOSPC.raw_os_error()
+    {
+        return Error::NamespaceLimitReached {
+            step,
             source: std::io::Error::from_raw_os_error(errno),
         };
     }
@@ -2010,11 +2180,14 @@ fn receive_supervisor(sock: &OwnedFd) -> Result<(OwnedFd, u32), Error> {
     }
 }
 
-/// The decoded contents of the report pipe.
+/// What the report pipe has said when its reader stops.
 enum Report {
-    /// The pipe closed empty: `execve` succeeded and the command is
+    /// End of input with no failure: every process that held a write end
+    /// replaced its image or exited without reporting one, so the command is
     /// running.
     ExecSucceeded,
+    /// A gated command is at its gate, with every setup step behind it.
+    Held,
     /// A stage reported a failed setup step and exited. `detail` is the
     /// 1-based index of the step's subject within its own list, or zero; see
     /// [`Labels`].
@@ -2025,44 +2198,74 @@ enum Report {
     },
 }
 
-/// Reads the report pipe to EOF and decodes the record, if any.
+/// Reads the report pipe up to the next record that settles it, appending each
+/// created target on the way to `created`.
 ///
-/// A record is exactly 12 bytes and, being smaller than `PIPE_BUF`, arrives
-/// atomically or not at all. Any other length is a broken report protocol,
-/// surfaced as an error so the caller tears the launch down rather than
-/// trusting a report it cannot decode.
-fn read_report(fd: &OwnedFd) -> Result<Report, Error> {
-    // One byte beyond the record size: a longer read proves corruption
-    // without consuming an unbounded stream.
-    let mut buf = [0u8; 13];
-    let mut len = 0;
-    while len < buf.len() {
-        match rustix::io::read(fd, &mut buf[len..]) {
-            Ok(0) => break,
-            Ok(n) => len += n,
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(wait_syscall_error(errno)),
+/// The records are the setup's account of itself, in the order it acted: a
+/// [`REPORT_CREATED`] record for each file-bind target it created, at most
+/// `ops` of them, then a [`REPORT_HELD`] record where the launch is gated, or a
+/// failure. Each is shorter than `PIPE_BUF`, so each arrives whole however the
+/// writers interleave, and the tag opening it says how long it is.
+///
+/// A failure is the last thing the pipe carries, since the stage that reports
+/// one exits, so the read continues to end of input after it and anything more
+/// is a broken protocol. So is a record cut short, a tag this build never
+/// writes, or more created targets than the plan has mount ops. Each is an
+/// `EPROTO`, which the caller tears the launch down over rather than trusting
+/// a report it cannot decode, and none is a panic.
+fn read_report(
+    fd: &OwnedFd,
+    created: &mut Vec<CreatedTarget>,
+    ops: usize,
+) -> Result<Report, Error> {
+    let fd = fd.as_fd();
+    let broken = || wait_syscall_error(Errno::PROTO);
+    // Inside a record, end of input is a record cut short.
+    let rest = |buf: &mut [u8]| match frame::read_full(fd, buf) {
+        Ok(()) => Ok(()),
+        Err(Errno::PIPE) => Err(broken()),
+        Err(errno) => Err(wait_syscall_error(errno)),
+    };
+    let word = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().expect("slice length is 4"));
+    let wide = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("slice length is 8"));
+    loop {
+        // Between records, end of input is the ending the protocol defines.
+        let mut tag = [0u8; REPORT_TAG_LEN];
+        match frame::read_full_or_short(fd, &mut tag).map_err(wait_syscall_error)? {
+            0 => return Ok(Report::ExecSucceeded),
+            REPORT_TAG_LEN => {}
+            _ => return Err(broken()),
         }
-    }
-    match len {
-        0 => Ok(Report::ExecSucceeded),
-        12 => {
-            let wire = u32::from_le_bytes(buf[0..4].try_into().expect("slice length is 4"));
-            let errno = i32::from_le_bytes(buf[4..8].try_into().expect("slice length is 4"));
-            let detail = u32::from_le_bytes(buf[8..12].try_into().expect("slice length is 4"));
-            // A step this build never writes is a defect, but the reader
-            // still must not panic: EPROTO, as for a malformed length.
-            let step =
-                SetupStep::from_wire(wire).ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
-            Ok(Report::SetupFailed {
-                step,
-                errno,
-                detail,
-            })
+        match u32::from_le_bytes(tag) {
+            REPORT_HELD => return Ok(Report::Held),
+            REPORT_CREATED => {
+                let mut body = [0u8; REPORT_CREATED_LEN - REPORT_TAG_LEN];
+                rest(&mut body)?;
+                if created.len() >= ops {
+                    return Err(broken());
+                }
+                created.push(CreatedTarget {
+                    op: word(&body[0..4]) as usize,
+                    ino: wide(&body[4..12]),
+                });
+            }
+            wire => {
+                // A step this build never writes is a defect, but the reader
+                // still must not panic.
+                let step = SetupStep::from_wire(wire).ok_or_else(broken)?;
+                let mut body = [0u8; REPORT_FAILURE_LEN - REPORT_TAG_LEN];
+                rest(&mut body)?;
+                let mut beyond = [0u8; 1];
+                if frame::read_full_or_short(fd, &mut beyond).map_err(wait_syscall_error)? != 0 {
+                    return Err(broken());
+                }
+                return Ok(Report::SetupFailed {
+                    step,
+                    errno: word(&body[0..4]) as i32,
+                    detail: word(&body[4..8]),
+                });
+            }
         }
-        // A partial or over-length read: the single-writer protocol was
-        // broken. EPROTO, so the failure is typed rather than a panic.
-        _ => Err(wait_syscall_error(Errno::PROTO)),
     }
 }
 
@@ -2128,20 +2331,17 @@ mod tests {
         use std::error::Error as _;
 
         for (step, errno) in [
+            (SetupStep::Unshare, Errno::NOSPC),
             (SetupStep::NestedUnshare, Errno::NOSPC),
             (SetupStep::ReplaceSessionKeyring, Errno::DQUOT),
             (SetupStep::AllocateTerminal, Errno::NOSPC),
         ] {
             let error = setup_error(step, errno.raw_os_error(), 0, labels_with_rules(&[]));
-            assert!(
-                matches!(
-                    error,
-                    Error::NestedUsernsBudgetExhausted { .. }
-                        | Error::KeyQuotaExhausted { .. }
-                        | Error::TerminalsExhausted { .. }
-                ),
-                "{step:?} is recognized: {error:?}",
-            );
+            match &error {
+                Error::NamespaceLimitReached { step: named, .. } => assert_eq!(*named, step),
+                Error::KeyQuotaExhausted { .. } | Error::TerminalsExhausted { .. } => {}
+                other => panic!("{step:?} is not recognized: {other:?}"),
+            }
             let source = error
                 .source()
                 .and_then(|source| source.downcast_ref::<std::io::Error>())

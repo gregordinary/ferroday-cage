@@ -65,9 +65,20 @@
 //! occupied slot is not backtracking. The slot is held before the group is
 //! read, so the group chooses among its alternatives with that already known,
 //! and no choice made earlier is revisited.
+//!
+//! # What an index can make it spend
+//!
+//! Nothing signs the index, so a resolution is bounded in the work it does as
+//! well as in what it chooses. It takes at most [`MAX_CLOSURE`] builds, reads
+//! at most [`MAX_DEPENDENCIES`] atoms from them, and holds atoms against at
+//! most [`MAX_COMPARISONS`] candidates. Each is far past what resolving the
+//! whole archive takes, and reaching one stops the resolution and refuses the
+//! index. What the index offers for an atom is worked out once per spelling,
+//! so a dependency the archive's builds repeat is paid for once.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::rc::Rc;
 
 use super::atom::{self, Atom, Candidate, Dependency, Unmet};
 use super::index::{Index, Record};
@@ -187,9 +198,24 @@ pub(super) struct Refusals {
     pub unsatisfied: Vec<Unsatisfied>,
     pub conflicts: Vec<Conflict>,
     pub occupied: Vec<Occupied>,
-    /// Whether the closure grew past [`MAX_CLOSURE`], which stopped the
-    /// resolution where it stood.
-    pub closure_exceeded: bool,
+    /// The bound the resolution reached, which stopped it where it stood.
+    pub exceeded: Option<Bound>,
+}
+
+/// A bound one resolution reached.
+///
+/// Each bounds what an index nothing signs can make a run spend before any
+/// signature is consulted, and each is set well past what resolving against
+/// the whole archive spends. A resolution reaching one is resolving against an
+/// index this layer does not resolve against, so it stops and refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Bound {
+    /// The closure grew past [`MAX_CLOSURE`] builds.
+    Closure,
+    /// The builds chosen stated more than [`MAX_DEPENDENCIES`] atoms.
+    Dependencies,
+    /// Atoms were held against more than [`MAX_COMPARISONS`] candidates.
+    Comparisons,
 }
 
 impl Refusals {
@@ -198,17 +224,28 @@ impl Refusals {
         self.unsatisfied.is_empty()
             && self.conflicts.is_empty()
             && self.occupied.is_empty()
-            && !self.closure_exceeded
+            && self.exceeded.is_none()
     }
 
     /// The whole refusal as one sentence a caller reads.
     pub(super) fn describe(&self) -> String {
         let mut parts = Vec::new();
-        if self.closure_exceeded {
-            parts.push(format!(
+        match self.exceeded {
+            None => {}
+            Some(Bound::Closure) => parts.push(format!(
                 "the closure grew past {MAX_CLOSURE} builds, more than twice every package slot \
                  the archive publishes, so the index is not one this layer resolves against",
-            ));
+            )),
+            Some(Bound::Dependencies) => parts.push(format!(
+                "the builds chosen state more than {MAX_DEPENDENCIES} dependency atoms, more \
+                 than twice every one the archive publishes, so the index is not one this layer \
+                 resolves against",
+            )),
+            Some(Bound::Comparisons) => parts.push(format!(
+                "the resolution held atoms against more than {MAX_COMPARISONS} candidate builds, \
+                 far more than resolving the whole archive takes, so the index is not one this \
+                 layer resolves against",
+            )),
         }
         for unmet in &self.unsatisfied {
             parts.push(format!(
@@ -258,7 +295,8 @@ impl Refusals {
 /// One atom waiting to be resolved, and who asked for it.
 struct Pending {
     dependency: Dependency,
-    wanted_by: String,
+    /// Who asked for it, shared by every dependency one build states.
+    wanted_by: Rc<str>,
     /// The chosen build whose merge this dependency orders, where it orders
     /// one: a plain atom of that build's `RDEPEND`.
     ///
@@ -283,18 +321,58 @@ struct Pending {
 /// order holding them all.
 const MAX_CLOSURE: usize = 16_384;
 
+/// The most dependency atoms the builds one resolution chooses may state
+/// between them.
+///
+/// The closure bound counts builds, and a build's dependency classes are what
+/// it costs once chosen: each atom is queued to be settled and may be refused,
+/// and a parsed atom is several times the four bytes `a/b ` takes to write
+/// one. Asking for every package name the live index publishes at once, over
+/// an empty root, reads 35,178. The index states 99,201 across all of its
+/// builds, and this is two and a half times that.
+const MAX_DEPENDENCIES: usize = 256 * 1024;
+
+/// The most candidates one resolution holds atoms against.
+///
+/// Every question asked of an atom is asked of the builds published, chosen or
+/// installed under its name, and the index decides how many there are: one
+/// name can carry as many builds as the index has room for, and as many slots
+/// as the closure. An atom nothing answers is not bounded by the closure, so
+/// an index publishing many builds of one name, and many distinct atoms naming
+/// it, would cost their product. Counting each candidate bounds all of that
+/// work, whatever shape the index gives it.
+///
+/// Asking for every package name the live index publishes at once, over an
+/// empty root, holds atoms against 57,231 candidates. This is seventy times
+/// that, and a fraction of a second of matching.
+const MAX_COMPARISONS: usize = 4 * 1024 * 1024;
+
 /// Resolves `wanted` against `index` and what `installed` already holds.
 ///
 /// Reports every refusal rather than stopping at the first: a caller fixing an
 /// install list wants the whole list of what the archive cannot give them, and
 /// an atom nothing answers only stops the branch below it. The one exception is
-/// a closure past [`MAX_CLOSURE`], which stops the resolution where it stands.
+/// a [`Bound`] reached, which stops the resolution where it stands.
 pub(super) fn resolve(
     index: &Index,
     installed: &Installed,
     wanted: &[Atom],
     prefer: &[Preference],
 ) -> (Resolved, Refusals) {
+    let run = settle(index, installed, wanted, prefer);
+    let (packages, cycles) = order(run.chosen.all, run.needs);
+    (Resolved { packages, cycles }, run.refusals)
+}
+
+/// Everything [`resolve`] does but order what it chose: settles every
+/// dependency, and holds every blocker met to what was chosen.
+fn settle<'a>(
+    index: &'a Index,
+    installed: &'a Installed,
+    wanted: &[Atom],
+    prefer: &'a [Preference],
+) -> Resolution<'a> {
+    let caller: Rc<str> = Rc::from("the install list");
     let mut run = Resolution {
         index,
         installed,
@@ -303,13 +381,16 @@ pub(super) fn resolve(
             .iter()
             .map(|atom| Pending {
                 dependency: Dependency::One(atom.clone()),
-                wanted_by: "the install list".to_string(),
+                wanted_by: Rc::clone(&caller),
                 orders: None,
             })
             .collect(),
         chosen: Builds::default(),
         needs: Vec::new(),
         blockers: Vec::new(),
+        offers: HashMap::new(),
+        stated: 0,
+        compared: Comparisons::up_to(MAX_COMPARISONS),
         refusals: Refusals::default(),
     };
     // Reversed so the queue pops in the order the caller wrote them, which is
@@ -317,7 +398,7 @@ pub(super) fn resolve(
     // from a set.
     run.queue.reverse();
 
-    while !run.refusals.closure_exceeded
+    while !run.stopped()
         && let Some(pending) = run.queue.pop()
     {
         match &pending.dependency {
@@ -326,9 +407,17 @@ pub(super) fn resolve(
         }
     }
 
-    conflicts(&run.blockers, installed, &run.chosen, &mut run.refusals);
-    let (packages, cycles) = order(run.chosen.all, run.needs);
-    (Resolved { packages, cycles }, run.refusals)
+    if !run.stopped() {
+        conflicts(
+            &run.blockers,
+            installed,
+            &run.chosen,
+            &mut run.compared,
+            &mut run.refusals,
+        );
+        run.stopped();
+    }
+    run
 }
 
 /// One resolution part way through.
@@ -355,40 +444,113 @@ struct Resolution<'a> {
     /// Collected and checked at the end rather than as they arrive: a blocker
     /// met early would pass against a set the resolution had not finished
     /// choosing, and the package it refuses may be chosen later.
-    blockers: Vec<(Atom, String)>,
+    blockers: Vec<(Atom, Rc<str>)>,
+    /// What the index offers for each atom asked of it, by the atom as written.
+    ///
+    /// An offer depends on nothing the resolution changes as it goes, only on
+    /// the index and the preferences, so it is worked out once per spelling.
+    /// The archive's dependencies repeat: thousands of builds state
+    /// `dev-libs/glib:2`.
+    offers: HashMap<String, Offer<'a>>,
+    /// How many dependency atoms the builds chosen so far state.
+    stated: usize,
+    /// How many candidates atoms have been held against so far.
+    compared: Comparisons,
     refusals: Refusals,
 }
 
+/// What the index offers for one atom.
+#[derive(Clone, Copy)]
+enum Offer<'a> {
+    /// The build to install.
+    Build(&'a Record),
+    /// No build it publishes under the name answers the atom, and the one
+    /// that got furthest failed here.
+    Unmet(Unmet),
+    /// It publishes nothing under the name.
+    Unpublished,
+}
+
+/// How many candidates atoms have been held against, and how many they may be.
+struct Comparisons {
+    made: usize,
+    limit: usize,
+}
+
+impl Comparisons {
+    /// None made yet, and at most `limit` to make.
+    fn up_to(limit: usize) -> Comparisons {
+        Comparisons { made: 0, limit }
+    }
+
+    /// Counts `count` more.
+    fn add(&mut self, count: usize) {
+        self.made = self.made.saturating_add(count);
+    }
+
+    /// Whether more have been made than the limit allows.
+    fn spent(&self) -> bool {
+        self.made > self.limit
+    }
+}
+
 /// Where one atom stands against a resolution so far.
-enum Answer {
+enum Answer<'a> {
     /// Answered already: by the root, or by the chosen build at this index.
     Held(Option<usize>),
     /// Answered by this build the index publishes, which takes no slot
     /// anything already holds.
-    Free(Record),
+    Free(&'a Record),
     /// The build the index would answer it with takes a slot something already
     /// holds: the build, what holds the slot as a refusal names it, and whether
     /// that is in the root.
-    Taken(Record, String, bool),
+    Taken(&'a Record, String, bool),
     /// Nothing the index publishes answers it.
     Unmet,
 }
 
-impl Resolution<'_> {
+impl<'a> Resolution<'a> {
+    /// Whether the resolution has reached a [`Bound`].
+    ///
+    /// The comparisons are counted wherever an atom meets a candidate, so
+    /// their bound is noticed here; the other two are recorded where they are
+    /// reached.
+    fn stopped(&mut self) -> bool {
+        if self.refusals.exceeded.is_none() && self.compared.spent() {
+            self.refusals.exceeded = Some(Bound::Comparisons);
+        }
+        self.refusals.exceeded.is_some()
+    }
+
     /// What already answers `atom`: the root (`Some(None)`), the chosen build
     /// at an index, or nothing.
     ///
     /// The root first, which is the whole reason resolution here starts from a
     /// populated root.
-    fn held(&self, atom: &Atom) -> Option<Option<usize>> {
-        if self
-            .installed
-            .under(atom.name())
-            .any(|package| atom.matches(package))
-        {
-            return Some(None);
+    fn held(&mut self, atom: &Atom) -> Option<Option<usize>> {
+        for package in self.installed.under(atom.name()) {
+            self.compared.add(1);
+            if atom.matches(package) {
+                return Some(None);
+            }
         }
-        self.chosen.answering(atom).map(Some)
+        for (at, build) in self.chosen.under(atom.name()) {
+            self.compared.add(1);
+            if atom.matches(build) {
+                return Some(Some(at));
+            }
+        }
+        None
+    }
+
+    /// What the index offers for `atom`, worked out once per spelling.
+    fn offer(&mut self, atom: &Atom) -> Offer<'a> {
+        if let Some(offer) = self.offers.get(atom.text()) {
+            return *offer;
+        }
+        let offer = offer(self.index, atom, self.prefer, &mut self.compared);
+        self.offers.insert(atom.text().to_string(), offer);
+        offer
     }
 
     /// Where `atom` stands: answered, answerable, or not.
@@ -406,14 +568,14 @@ impl Resolution<'_> {
     /// so a same-slot upgrade over a stage3 is the same defect reached from the
     /// other side: the caller's answer is a root whose version the atom admits,
     /// not a second copy of the package.
-    fn answer(&self, atom: &Atom) -> Answer {
+    fn answer(&mut self, atom: &Atom) -> Answer<'a> {
         if let Some(at) = self.held(atom) {
             return Answer::Held(at);
         }
-        let Some(record) = select(self.index, atom, self.prefer) else {
+        let Offer::Build(record) = self.offer(atom) else {
             return Answer::Unmet;
         };
-        match occupant(&record, &self.chosen, self.installed) {
+        match occupant(record, &self.chosen, self.installed, &mut self.compared) {
             Some((held, installed)) => Answer::Taken(record, held, installed),
             None => Answer::Free(record),
         }
@@ -429,9 +591,9 @@ impl Resolution<'_> {
     /// A collision with an occupied slot is reported rather than resolved
     /// around, which is the module's stance on a conflict generally: nothing
     /// here backtracks, and the caller's atoms are what would have to change.
-    fn require(&mut self, atom: &Atom, wanted_by: &str, orders: Option<usize>) {
+    fn require(&mut self, atom: &Atom, wanted_by: &Rc<str>, orders: Option<usize>) {
         if atom.blocker().is_some() {
-            self.blockers.push((atom.clone(), wanted_by.to_string()));
+            self.blockers.push((atom.clone(), Rc::clone(wanted_by)));
             return;
         }
         match self.answer(atom) {
@@ -441,13 +603,16 @@ impl Resolution<'_> {
                 self.order_after(orders, at);
             }
             Answer::Taken(record, held, installed) => {
-                self.refuse_occupied(&record, held, installed, atom.to_string(), wanted_by);
+                self.refuse_occupied(record, held, installed, atom.to_string(), wanted_by);
             }
-            Answer::Unmet => self.refusals.unsatisfied.push(Unsatisfied {
-                atom: atom.to_string(),
-                wanted_by: wanted_by.to_string(),
-                reason: wall(self.index, self.installed, &[atom]),
-            }),
+            Answer::Unmet => {
+                let reason = self.wall(&[atom]);
+                self.refusals.unsatisfied.push(Unsatisfied {
+                    atom: atom.to_string(),
+                    wanted_by: wanted_by.to_string(),
+                    reason,
+                });
+            }
         }
     }
 
@@ -464,27 +629,43 @@ impl Resolution<'_> {
     /// taking an occupied slot: an alternative that would collide is passed
     /// over for the next, which is a choice the group offers rather than
     /// backtracking.
-    fn any_of(&mut self, alternatives: &[Vec<Atom>], wanted_by: &str) {
+    ///
+    /// A group can be as long as a dependency class, so the resolution's
+    /// bounds are consulted atom by atom rather than only between groups.
+    fn any_of(&mut self, alternatives: &[Vec<Atom>], wanted_by: &Rc<str>) {
         if let [only] = alternatives {
             for atom in only {
+                if self.stopped() {
+                    return;
+                }
                 self.require(atom, wanted_by, None);
             }
             return;
         }
         let installs = |atom: &&Atom| atom.blocker().is_none();
-        if alternatives.iter().any(|together| {
-            together
-                .iter()
-                .filter(installs)
-                .all(|atom| self.held(atom).is_some())
-        }) {
-            return;
+        for together in alternatives {
+            let mut held = true;
+            for atom in together.iter().filter(installs) {
+                if self.stopped() {
+                    return;
+                }
+                if self.held(atom).is_none() {
+                    held = false;
+                    break;
+                }
+            }
+            if held {
+                return;
+            }
         }
         let mut taken = None;
         let mut unmet = Vec::new();
         for together in alternatives {
             let mut answerable = true;
             for atom in together.iter().filter(installs) {
+                if self.stopped() {
+                    return;
+                }
                 match self.answer(atom) {
                     Answer::Held(_) | Answer::Free(_) => {}
                     Answer::Taken(record, held, installed) => {
@@ -510,42 +691,100 @@ impl Resolution<'_> {
         let written = written(alternatives);
         match taken {
             Some((record, held, installed)) => {
-                self.refuse_occupied(&record, held, installed, written, wanted_by);
+                self.refuse_occupied(record, held, installed, written, wanted_by);
             }
-            None => self.refusals.unsatisfied.push(Unsatisfied {
-                atom: written,
-                wanted_by: wanted_by.to_string(),
-                reason: wall(self.index, self.installed, &unmet),
-            }),
+            None => {
+                let reason = self.wall(&unmet);
+                self.refusals.unsatisfied.push(Unsatisfied {
+                    atom: written,
+                    wanted_by: wanted_by.to_string(),
+                    reason,
+                });
+            }
         }
     }
 
     /// Chooses `record`, queueing its own dependencies, and returns where it
-    /// sits, or `None` where the closure has reached [`MAX_CLOSURE`].
-    fn choose(&mut self, record: Record) -> Option<usize> {
+    /// sits, or `None` where that would take the resolution past
+    /// [`MAX_CLOSURE`] or [`MAX_DEPENDENCIES`].
+    ///
+    /// The build's dependency classes are parsed here, for the builds chosen
+    /// and no others, and each dependency is queued once and settled once.
+    fn choose(&mut self, record: &Record) -> Option<usize> {
         if self.chosen.all.len() >= MAX_CLOSURE {
-            self.refusals.closure_exceeded = true;
+            self.refusals.exceeded = Some(Bound::Closure);
             return None;
         }
-        let wanted_by = record.cpv();
-        let at = self.chosen.push(record);
+        let runtime = record.runtime();
+        let post_merge = record.post_merge();
+        self.stated += runtime
+            .iter()
+            .chain(&post_merge)
+            .map(Dependency::atoms)
+            .sum::<usize>();
+        if self.stated > MAX_DEPENDENCIES {
+            self.refusals.exceeded = Some(Bound::Dependencies);
+            return None;
+        }
+        let wanted_by: Rc<str> = Rc::from(record.cpv());
+        let at = self.chosen.push(record.clone());
         self.needs.push(Vec::new());
-        let record = &self.chosen.all[at];
-        for dependency in &record.rdepend {
+        for dependency in runtime {
+            let orders = matches!(dependency, Dependency::One(_)).then_some(at);
             self.queue.push(Pending {
-                dependency: dependency.clone(),
-                wanted_by: wanted_by.clone(),
-                orders: matches!(dependency, Dependency::One(_)).then_some(at),
+                dependency,
+                wanted_by: Rc::clone(&wanted_by),
+                orders,
             });
         }
-        for dependency in &record.pdepend {
+        for dependency in post_merge {
             self.queue.push(Pending {
-                dependency: dependency.clone(),
-                wanted_by: wanted_by.clone(),
+                dependency,
+                wanted_by: Rc::clone(&wanted_by),
                 orders: None,
             });
         }
         Some(at)
+    }
+
+    /// What stopped `alternatives`, in the sentence "no build ...".
+    ///
+    /// The four walls are separated because they call for different answers: a
+    /// name the archive does not publish is a package to install another way,
+    /// a flag no build carries is a build nobody produced, and a slot or a
+    /// version is a request the archive has moved past.
+    ///
+    /// A name the binhost publishes in no version is named with what the root
+    /// has of it, where the root has anything. That is the measured case rather
+    /// than an edge: the stage3 ships packages the binhost publishes in no
+    /// version at all, so an atom on one of them walls on the archive's silence
+    /// *and* on the version the root happens to hold, and the second is the
+    /// half a caller can act on.
+    ///
+    /// Each atom's wall is the one its [`offer`](Self::offer) found, so a wall
+    /// costs no pass over the index of its own.
+    fn wall(&mut self, alternatives: &[&Atom]) -> String {
+        let mut furthest: Option<Unmet> = None;
+        let mut unpublished = Vec::new();
+        for atom in alternatives {
+            match self.offer(atom) {
+                Offer::Unmet(unmet) => {
+                    if furthest.is_none_or(|held| unmet.ordinal() > held.ordinal()) {
+                        furthest = Some(unmet);
+                    }
+                }
+                Offer::Unpublished => unpublished.push(unserved(self.installed, atom.name())),
+                // Not an atom nothing answers, so not one with a wall.
+                Offer::Build(_) => {}
+            }
+        }
+        match furthest {
+            Some(unmet) => format!("published for it {}", unmet.describe()),
+            None => format!(
+                "of {} is published by this binhost at all",
+                unpublished.join(" or "),
+            ),
+        }
     }
 
     /// Records that the chosen build `dependent` merges after the chosen build
@@ -569,8 +808,8 @@ impl Resolution<'_> {
         wanted_by: &str,
     ) {
         self.refusals.occupied.push(Occupied {
-            name: record.name.clone(),
-            slot: slot_of(&record.slot).to_string(),
+            name: record.name().to_string(),
+            slot: slot_of(record.slot()).to_string(),
             held,
             installed,
             second: record.describe(),
@@ -661,13 +900,6 @@ impl<C: Candidate> Builds<C> {
             .iter()
             .map(|&at| (at, &self.all[at]))
     }
-
-    /// Where the first build that answers `atom` sits, if one does.
-    fn answering(&self, atom: &Atom) -> Option<usize> {
-        self.under(atom.name())
-            .find(|(_, build)| atom.matches(*build))
-            .map(|(at, _)| at)
-    }
 }
 
 /// What already holds the slot `build` would occupy, as a refusal names it,
@@ -679,18 +911,22 @@ fn occupant<C: Build>(
     build: &impl Candidate,
     chosen: &Builds<C>,
     installed: &Installed,
+    compared: &mut Comparisons,
 ) -> Option<(String, bool)> {
     let slot = slot_of(build.slot());
-    chosen
-        .under(build.name())
-        .find(|(_, held)| slot_of(held.slot()) == slot)
-        .map(|(_, held)| (held.describe(), false))
-        .or_else(|| {
-            installed
-                .under(build.name())
-                .find(|held| slot_of(held.slot()) == slot)
-                .map(|held| (held.cpv(), true))
-        })
+    for (_, held) in chosen.under(build.name()) {
+        compared.add(1);
+        if slot_of(held.slot()) == slot {
+            return Some((held.describe(), false));
+        }
+    }
+    for held in installed.under(build.name()) {
+        compared.add(1);
+        if slot_of(held.slot()) == slot {
+            return Some((held.cpv(), true));
+        }
+    }
+    None
 }
 
 /// Records every conflict `blockers`, and the root's own, make with the root
@@ -703,18 +939,26 @@ fn occupant<C: Build>(
 /// the root with. Those are held to `chosen` only, since what the root's own
 /// packages say of each other is the state it arrived in rather than something
 /// this install did.
+///
+/// Every blocker is held against each candidate under its name, so the check
+/// stops where `compared` reaches its limit, and the caller reports that.
 fn conflicts<C: Candidate>(
-    blockers: &[(Atom, String)],
+    blockers: &[(Atom, Rc<str>)],
     installed: &Installed,
     chosen: &Builds<C>,
+    compared: &mut Comparisons,
     refusals: &mut Refusals,
 ) {
     for (blocker, stated_by) in blockers {
+        if compared.spent() {
+            return;
+        }
         for package in installed.under(blocker.name()) {
+            compared.add(1);
             if blocker.matches(package) {
                 refusals.conflicts.push(Conflict {
                     atom: blocker.to_string(),
-                    stated_by: stated_by.clone(),
+                    stated_by: stated_by.to_string(),
                     stated_in_root: false,
                     blocks: package.cpv(),
                     installed: true,
@@ -722,10 +966,11 @@ fn conflicts<C: Candidate>(
             }
         }
         for (_, build) in chosen.under(blocker.name()) {
+            compared.add(1);
             if blocker.matches(build) {
                 refusals.conflicts.push(Conflict {
                     atom: blocker.to_string(),
-                    stated_by: stated_by.clone(),
+                    stated_by: stated_by.to_string(),
                     stated_in_root: false,
                     blocks: build.cpv(),
                     installed: false,
@@ -735,7 +980,11 @@ fn conflicts<C: Candidate>(
     }
     for package in installed.packages() {
         for blocker in package.blockers() {
+            if compared.spent() {
+                return;
+            }
             for (_, build) in chosen.under(blocker.name()) {
+                compared.add(1);
                 if blocker.matches(build) {
                     refusals.conflicts.push(Conflict {
                         atom: blocker.to_string(),
@@ -819,8 +1068,12 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
     let mut refusals = Refusals::default();
     let mut admitted = Builds::default();
     let mut blockers = Vec::new();
+    // Nothing here is a mirror's to compose: the plan is the caller's own
+    // document and the blockers are the signed metadata's, so what admitting
+    // them costs is not bounded.
+    let mut compared = Comparisons::up_to(usize::MAX);
     for build in arriving {
-        if let Some((held, in_root)) = occupant(&build, &admitted, installed) {
+        if let Some((held, in_root)) = occupant(&build, &admitted, installed, &mut compared) {
             refusals.occupied.push(Occupied {
                 name: build.name().to_string(),
                 slot: slot_of(build.slot()).to_string(),
@@ -834,42 +1087,71 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
             });
             continue;
         }
-        let stated_by = build.cpv();
+        let stated_by: Rc<str> = Rc::from(build.cpv());
         blockers.extend(
             build
                 .package
                 .blockers()
                 .iter()
-                .map(|blocker| (blocker.clone(), stated_by.clone())),
+                .map(|blocker| (blocker.clone(), Rc::clone(&stated_by))),
         );
         admitted.push(build);
     }
-    conflicts(&blockers, installed, &admitted, &mut refusals);
+    conflicts(
+        &blockers,
+        installed,
+        &admitted,
+        &mut compared,
+        &mut refusals,
+    );
     refusals
 }
 
-/// The build to install for `atom`, or `None` where the index publishes none it
-/// admits.
+/// What `index` offers for `atom`: the build to install, or how far the build
+/// that got furthest got.
 ///
-/// The highest version among the builds the atom admits, then the ranking the
-/// module documentation defends. The atom's own USE dependencies have already
-/// removed what they exclude, since they are part of admitting a build at all.
-fn select(index: &Index, atom: &Atom, prefer: &[Preference]) -> Option<Record> {
-    let admitted: Vec<&Record> = index
-        .builds(atom.name())
-        .filter(|record| atom.matches(*record))
-        .collect();
+/// The build is the highest version among the builds the atom admits, then
+/// the ranking the module documentation defends. The atom's own USE
+/// dependencies have already removed what they exclude, since they are part of
+/// admitting a build at all.
+///
+/// One pass over the name's builds answers both halves, so an atom nothing
+/// answers costs no second pass to say why.
+fn offer<'i>(
+    index: &'i Index,
+    atom: &Atom,
+    prefer: &[Preference],
+    compared: &mut Comparisons,
+) -> Offer<'i> {
+    let builds = index.builds(atom.name());
+    compared.add(builds.len());
+    let mut admitted: Vec<&Record> = Vec::new();
+    let mut furthest: Option<Unmet> = None;
+    for record in builds {
+        match atom.unmet_by(record) {
+            Unmet::Nothing => admitted.push(record),
+            unmet => {
+                if furthest.is_none_or(|held| unmet.ordinal() > held.ordinal()) {
+                    furthest = Some(unmet);
+                }
+            }
+        }
+    }
     let highest = admitted.iter().copied().reduce(|best, candidate| {
-        match version::compare(&candidate.version, &best.version) {
+        match version::compare(candidate.version(), best.version()) {
             Some(std::cmp::Ordering::Greater) => candidate,
             _ => best,
         }
-    })?;
-    admitted
-        .into_iter()
-        .filter(|record| record.version == highest.version)
-        .max_by_key(|record| rank(record, prefer))
-        .cloned()
+    });
+    match (highest, furthest) {
+        (Some(highest), _) => admitted
+            .into_iter()
+            .filter(|record| record.version() == highest.version())
+            .max_by_key(|record| rank(record, prefer))
+            .map_or(Offer::Unpublished, Offer::Build),
+        (None, Some(unmet)) => Offer::Unmet(unmet),
+        (None, None) => Offer::Unpublished,
+    }
 }
 
 /// How good a build is, greater being better.
@@ -893,43 +1175,6 @@ fn rank(record: &Record, prefer: &[Preference]) -> (usize, std::cmp::Reverse<usi
         record.build_time,
         record.build_id,
     )
-}
-
-/// What stopped `alternatives`, in the sentence "no build ...".
-///
-/// The four walls are separated because they call for different answers: a name
-/// the archive does not publish is a package to install another way, a flag no
-/// build carries is a build nobody produced, and a slot or a version is a
-/// request the archive has moved past.
-///
-/// A name the binhost publishes in no version is named with what the root has
-/// of it, where the root has anything. That is the measured case rather than an
-/// edge: the stage3 ships packages the binhost publishes in no version at all,
-/// so an atom on one of them walls on the archive's silence *and* on the
-/// version the root happens to hold, and the second is the half a caller can
-/// act on.
-fn wall(index: &Index, installed: &Installed, alternatives: &[&Atom]) -> String {
-    let mut furthest: Option<Unmet> = None;
-    let mut unpublished = Vec::new();
-    for atom in alternatives {
-        if !index.publishes(atom.name()) {
-            unpublished.push(unserved(installed, atom.name()));
-            continue;
-        }
-        for record in index.builds(atom.name()) {
-            let unmet = atom.unmet_by(record);
-            if furthest.is_none_or(|held| unmet.ordinal() > held.ordinal()) {
-                furthest = Some(unmet);
-            }
-        }
-    }
-    match furthest {
-        Some(unmet) => format!("published for it {}", unmet.describe()),
-        None => format!(
-            "of {} is published by this binhost at all",
-            unpublished.join(" or "),
-        ),
-    }
 }
 
 /// How a refusal names a package the binhost publishes in no version: the name,
@@ -978,7 +1223,7 @@ fn order(chosen: Vec<Record>, mut needs: Vec<Vec<usize>>) -> (Vec<Record>, Vec<V
     // yield in. The sort is stable, so two builds of one name -- two slots --
     // keep the order they were chosen in.
     let mut by_name: Vec<usize> = (0..count).collect();
-    by_name.sort_by(|a, b| chosen[*a].name.cmp(&chosen[*b].name));
+    by_name.sort_by(|a, b| chosen[*a].name().cmp(chosen[*b].name()));
     let mut rank = vec![0; count];
     for (place, &at) in by_name.iter().enumerate() {
         rank[at] = place;
@@ -1150,8 +1395,8 @@ fn components(needs: &[Vec<usize>]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provision::gentoo::atom;
     use crate::provision::gentoo::plan::Plan;
+    use crate::provision::gentoo::{atom, index};
 
     /// The fixture archive every test below resolves against.
     ///
@@ -1480,7 +1725,7 @@ USE: amd64
             resolved
                 .packages
                 .iter()
-                .any(|record| record.name == "dev-vcs/git")
+                .any(|record| record.name() == "dev-vcs/git")
         );
     }
 
@@ -1828,7 +2073,7 @@ USE: amd64
             &Installed::default(),
             &["a/p000001"],
         );
-        assert!(refusals.closure_exceeded);
+        assert_eq!(refusals.exceeded, Some(Bound::Closure));
         assert!(!refusals.is_empty());
         assert!(
             refusals
@@ -1845,6 +2090,115 @@ USE: amd64
             &["a/p000001"],
         );
         assert!(refusals.is_empty(), "{}", refusals.describe());
+    }
+
+    /// An index publishing `builds` builds of `b/q`, one per slot, and a chain
+    /// of `links` packages from `a/p000001`, each depending on the next and on
+    /// whatever `depends(link)` names.
+    fn crowded(builds: usize, links: usize, depends: impl Fn(usize) -> String) -> Index {
+        let mut text = String::from("TIMESTAMP: 1\n\n");
+        for slot in 0..builds {
+            text.push_str(&format!(
+                "BUILD_ID: {slot}\nCPV: b/q-1\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+                 PATH: b/q/q-1-{slot}.gpkg.tar\nSIZE: 1\nSLOT: {slot}\n\n"
+            ));
+        }
+        for link in 1..=links {
+            let next = if link < links {
+                format!("a/p{:06} ", link + 1)
+            } else {
+                String::new()
+            };
+            text.push_str(&format!(
+                "BUILD_ID: 1\nCPV: a/p{link:06}-1\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+                 PATH: a/p{link:06}/p{link:06}-1-1.gpkg.tar\nRDEPEND: {next}{}\nSIZE: 1\n\n",
+                depends(link),
+            ));
+        }
+        Index::parse(&text)
+    }
+
+    #[test]
+    fn an_atom_is_held_against_the_index_once_however_often_it_is_asked() {
+        // Every package of the chain asks for a version of `b/q` none of its
+        // builds is. Asked afresh, each would cost every build of the name, once
+        // to choose and once more to say why nothing was chosen; an atom's offer
+        // depends only on the index and the preferences, so it is worked out
+        // once and the refusals repeat it.
+        const BUILDS: usize = 1_000;
+        const LINKS: usize = 64;
+        let index = crowded(BUILDS, LINKS, |_| ">=b/q-2".to_string());
+        let wanted = [atom::parse("a/p000001").expect("a fixture atom")];
+        let empty = Installed::default();
+        let run = settle(&index, &empty, &wanted, &[]);
+        assert_eq!(run.refusals.exceeded, None);
+        assert_eq!(run.refusals.unsatisfied.len(), LINKS);
+        assert!(
+            run.refusals.unsatisfied[0]
+                .reason
+                .contains("has a version the atom admits"),
+            "{}",
+            run.refusals.describe(),
+        );
+        // The name's builds once, and the chain's one build per link.
+        assert_eq!(run.compared.made, BUILDS + LINKS);
+    }
+
+    #[test]
+    fn a_resolution_past_its_comparisons_is_refused_where_it_stands() {
+        // Distinct atoms on one name, each in a slot none of the name's builds
+        // is in. Nothing is chosen for any of them, so the closure bounds none
+        // of it, and every one costs every build of the name: 8,388,608
+        // comparisons, were the resolution allowed to finish.
+        const BUILDS: usize = 4_096;
+        const LINKS: usize = 64;
+        let index = crowded(BUILDS, LINKS, |link| {
+            (0..32)
+                .map(|at| format!("b/q:x{link}-{at}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let wanted = [atom::parse("a/p000001").expect("a fixture atom")];
+        let empty = Installed::default();
+        let run = settle(&index, &empty, &wanted, &[]);
+        assert_eq!(run.refusals.exceeded, Some(Bound::Comparisons));
+        assert!(
+            run.refusals
+                .describe()
+                .contains(&format!("more than {MAX_COMPARISONS} candidate builds")),
+            "{}",
+            run.refusals.describe(),
+        );
+        // It stops within one name's builds of the bound, having refused only
+        // the atoms it reached.
+        assert!(run.compared.made <= MAX_COMPARISONS + BUILDS);
+        assert!(run.refusals.unsatisfied.len() <= MAX_COMPARISONS / BUILDS + 1);
+    }
+
+    #[test]
+    fn a_closure_stating_more_atoms_than_the_bound_is_refused_where_it_stands() {
+        // Each package of the chain states as many atoms as a class may hold,
+        // every one answered by the root, so nothing is refused and nothing
+        // else is chosen: only the count of what the builds state grows.
+        let per_class = (index::MAX_CLASS_BYTES - 16) / "b/z ".len();
+        let links = MAX_DEPENDENCIES / per_class + 2;
+        let index = crowded(0, links, |_| {
+            "b/z ".repeat(per_class).trim_end().to_string()
+        });
+        let installed = root(&["b/z-1"]);
+        let wanted = [atom::parse("a/p000001").expect("a fixture atom")];
+        let run = settle(&index, &installed, &wanted, &[]);
+        assert_eq!(run.refusals.exceeded, Some(Bound::Dependencies));
+        assert!(run.refusals.unsatisfied.is_empty());
+        assert!(run.chosen.all.len() < links);
+        assert!(run.stated > MAX_DEPENDENCIES);
+        assert!(
+            run.refusals
+                .describe()
+                .contains(&format!("more than {MAX_DEPENDENCIES} dependency atoms")),
+            "{}",
+            run.refusals.describe(),
+        );
     }
 
     /// The archive `virtual/zlib` resolves against: zlib built without the

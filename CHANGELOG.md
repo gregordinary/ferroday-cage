@@ -100,6 +100,12 @@ consumer upgrading can skip it.
   reported against the grant, rather than covering wherever the link points. On
   a root where `/lib` is a link to `usr/lib`, grant `/usr`. A restriction's
   grants are host paths and still follow the host's links.
+- A read-only bind is made read-only before it is attached: the host tree is
+  cloned detached, restricted, and moved onto the target the setup resolved. It
+  was attached and then remounted by path, so a sandbox sharing a writable root
+  could rename between the two and leave the bind writable. Before Linux 5.12
+  the remount still follows the attach, through the bind's own descriptor
+  rather than its path.
 - The network stack refuses AWS's IPv6 instance-service block, `fd00:ec2::/32`,
   whose metadata service at `fd00:ec2::254` serves the instance role's
   credentials. The IPv4 metadata service was already refused as link-local.
@@ -147,22 +153,34 @@ consumer upgrading can skip it.
   release states none, and refuses an index that expands past it. A few
   megabytes of compressed index could expand without bound in memory.
 - The Gentoo binary-package index, which nothing signs, is read only as gzip or
-  plain text, the two forms the archive publishes, and is refused rather than
-  truncated when it decompresses past 256 MiB. Its parser bounds how deeply
-  dependency groups nest, at 16 levels, skipping a stanza that nests deeper as
-  it skips any other unreadable stanza, and splits a `category/name-version` in
-  time linear in the line's length. A few tens of kilobytes of parentheses from
-  a mirror overflowed the stack and aborted the host process, and a line of
-  hyphens cost the square of its length.
+  plain text, the two forms the archive publishes. It is refused rather than
+  truncated when it decompresses past 64 MiB, three times the largest the
+  archive publishes, where the ceiling was 256 MiB. It is read one stanza at a
+  time, in place, and a dependency class is parsed only for a build a
+  resolution chooses; a record whose class runs past 64 KiB is skipped. Reading
+  it cost up to about 47 times its length in memory, some 12 GB at the old
+  ceiling, and now costs at most about three times. Its parser bounds how
+  deeply dependency groups nest, at 16 levels, skipping a stanza that nests
+  deeper as it skips any other unreadable stanza, and splits a
+  `category/name-version` in time linear in the line's length. A few tens of
+  kilobytes of parentheses from a mirror overflowed the stack and aborted the
+  host process, and a line of hyphens cost the square of its length.
 - Ordering a Gentoo install takes memory linear in the resolution. An unsigned
   binhost index could make it quadratic: a chain closed by a two-package loop
   made every round report every package still waiting as a cycle, 1.8 GB for
   8,000 index records. Each cycle is now found once, and
   `GentooEvent::DependencyCycle` names its members once, in name order. A cycle
   is broken only where it waits on nothing outside itself, and a runtime
-  dependency orders its dependent after the build that answered it. One
-  resolution chooses at most 16,384 builds, past twice every package slot the
-  archive publishes, and refuses an index that asks for more.
+  dependency orders its dependent after the build that answered it.
+- A Gentoo resolution is bounded in the work an unsigned index can make it do.
+  An atom nothing answered was matched against every build of its name twice,
+  once to choose and once to explain. Many builds of one package and many
+  distinct atoms naming it cost their product: minutes of CPU for under a
+  megabyte of index. What the index offers an atom is now worked out once per
+  spelling. A resolution refuses an index that makes it choose more than 16,384
+  builds, choose builds stating more than 262,144 dependency atoms, or hold
+  atoms against more than 4,194,304 candidates, each far past what resolving the
+  whole archive takes.
 - An Alpine bootstrap matches a trigger's path pattern in time bounded by the
   pattern's and the path's lengths. A pattern of many `*`s, from a package's
   signed metadata or a layered base's `triggers` file, could hold the bootstrap
@@ -249,6 +267,11 @@ consumer upgrading can skip it.
   `[hardening.seccomp]`; `fcage`: `--seccomp-errno SYSCALL=ERRNO`, which joins
   the seccomp policy the other flags or a profile set, and is refused beside the
   curated one.
+- `SeccompRules::syscall`, which reads a syscall's number on the host
+  architecture from its name, and `SeccompRules::errno`, which reads an errno
+  from its name, in any letter case, or from its number. A profile's seccomp
+  table and `fcage`'s seccomp flags read names the same way. `errno` refuses a
+  value no failed syscall reports, outside 1 to 4095.
 - `CageBuilder::mount` and `CageBuilder::mounts`, which add a `Mount` of either
   kind to the one mount sequence, so a sequence read back through `get_mounts`
   carries over to another builder whole.
@@ -282,6 +305,9 @@ consumer upgrading can skip it.
   delegate's own error, which `source()` now returns.
 - `RangeMapBlocker::NoNewPrivileges`, which `host::range_map_blocker` reports for
   a caller running under `no_new_privs`.
+- `Error::KillHandle`, which `Running::kill_handle` returns where it cannot
+  duplicate the handle's descriptors. It returned `Error::Signal`, though nothing
+  was signalled.
 - `ExitStatus::exited` and `ExitStatus::signaled`, which build the status a
   command would report, for a caller that reports an outcome of its own in the
   same convention.
@@ -311,6 +337,11 @@ consumer upgrading can skip it.
   had named for this, leaves the work directory behind. `fcage`:
   `--remove-overlay-upper DIR`, which takes `--identity-map` as
   `--remove-rootfs` does.
+- `ProvisionError::RemoveDestInvalid`, with which `provision::remove` and
+  `Remove` refuse a destination that names no tree: an empty path, or one with
+  no final component such as `.`. An empty path succeeded having removed
+  nothing, and `.` was refused in a publication's words, "cannot publish a
+  rootfs".
 - `DebianBuilder::id_mapper` and `AlpineBuilder::id_mapper`, which supply the
   delegate that establishes a range identity map: for the preflight, for every
   sandbox the bootstrap's package scripts run in, and for the removal of a
@@ -389,14 +420,26 @@ consumer upgrading can skip it.
   identity. The allocation needs the managed `/dev` or a `devpts` instance the
   caller mounts: a terminal launch with `mount_dev(false)` or
   `managed_mounts(false)`, in a root that ships no `/dev/ptmx`, previously ran
-  on a host pseudoterminal and now fails with `SetupStep::AllocateTerminal`.
-  `spawn_pending_terminal` waits for the terminal, so a setup failure before it
-  exists is reported there rather than from `proceed`. A restriction's terminal
-  still comes from the host's `/dev/ptmx`.
+  on a host pseudoterminal and now fails with `SetupStep::AllocateTerminal`. A
+  restriction's terminal still comes from the host's `/dev/ptmx`.
+- `Cage::spawn_pending`, `spawn_pending_with` and `spawn_pending_terminal`
+  return once the command is at its gate, with every namespace and mount in
+  place. A setup step that fails before the gate is reported by the pending
+  launch rather than by `Pending::proceed`. `Pending::netns_pid` names a process
+  that stays alive until the handle is consumed or dropped.
+- `Running::wait` and its deadline forms return once the supervisor has exited,
+  rather than as soon as the command's status arrives. With a PID namespace that
+  is after the kernel has torn the namespace down.
 - **Breaking.** A working directory, for a sandbox or a restriction, is held to
   the rule every configured absolute path is: a `..` component is refused at
   `build` with `ConfigError::WorkdirNotAbsolute`. Its message now reads "not a
   normal absolute path".
+- **Breaking.** A seccomp policy that answers a syscall with errno 0, or with a
+  number past 4095, is refused at `build` with `ConfigError::SeccompInvalid`.
+  That covers a `SeccompAction::Errno` listed or default action and
+  `SeccompRules::errno_for`. Zero made a syscall report a success it never
+  performed, and the C library reads a larger number as the value the syscall
+  returned.
 - A profile naming `identity-map = "subordinate"` loads in a build without the
   `subid` feature, and `build` decides. A configured `id_mapper` that reports an
   allocation establishes it, and without one the build refuses it, naming the
@@ -496,11 +539,12 @@ consumer upgrading can skip it.
   restricts, so its answer covers every profile selection. The restrictions were
   ignored, so a control file with a `[hurd-any]` dependency failed to resolve. A
   comment line in `debian/control` is skipped rather than read as a field.
-- **Breaking.** `gentoo::PlannedPackage` gains `slot`, `use_flags`, `iuse`,
-  `rdepend`, `pdepend` and `build_time`, which a plan document records as
-  `Slot`, `Use`, `Iuse`, `Rdepend`, `Pdepend` and `Build-Time`. A plan document
-  without `Slot` and `Build-Time` is refused; resolve it again. A merged
-  package's `BINPKGMD5` is the container's own MD5 rather than the index's.
+- **Breaking.** The Gentoo plan document is `ferroday-cage-gentoo-plan 2`.
+  `gentoo::PlannedPackage` gains `slot`, `use_flags`, `iuse`, `rdepend`,
+  `pdepend` and `build_time`, which the document records as `Slot`, `Use`,
+  `Iuse`, `Rdepend`, `Pdepend` and `Build-Time`. A version 1 document is
+  refused for its format; resolve it again. A merged package's `BINPKGMD5` is
+  the container's own MD5 rather than the index's.
 - **Breaking.** An archive coordinate holding a character a URL path cannot
   carry as written, such as `%`, `?`, `#`, or one outside ASCII, is refused at
   `build`. That covers a Debian or Alpine suite, release, component or
@@ -516,9 +560,13 @@ consumer upgrading can skip it.
   `ConfigError::MountFlagsInvalid` names the raw mount's target. A NUL in an
   environment variable's name is `EnvNameInvalid`, and a NUL in the hostname is
   `HostnameInvalid`.
-- **Breaking.** `Error::NestedUsernsBudgetExhausted` and
-  `Error::TerminalsExhausted` carry the kernel's error as `source`, returned from
-  `Error::source`. Match them with `{ .. }`.
+- **Breaking.** `Error::NestedUsernsBudgetExhausted` is
+  `Error::NamespaceLimitReached`, with a `step` naming the creation the kernel
+  refused. It reports `ENOSPC` from creating the sandbox's own namespaces as
+  well as the command's nested ones. It names the limits it can stand for: a
+  `user.max_*_namespaces` count, or the nesting depth of user and PID
+  namespaces. It and `Error::TerminalsExhausted` carry the kernel's error as
+  `source`, returned from `Error::source`. Match them with `{ .. }`.
 - **Breaking.** The struct variants of `ResolvedRoot`, `ResolvedIdentity`,
   `ResolvedHardening`, `ResolvedMount`, and both `UnheldReason`s are
   `#[non_exhaustive]`, as every other struct variant is. A pattern naming their
@@ -530,13 +578,16 @@ consumer upgrading can skip it.
 - **Breaking.** `fcage --no-base-env` no longer passes the host's `TERM`, so the
   command gets only the variables the run names. Pass it with `--setenv` where
   the command needs it.
-- **Breaking.** `fcage` refuses, as a usage error, a plan beside a flag that
-  shapes a resolution. That is `--debian-plan` beside `--debian-include`,
+- **Breaking.** A plan given beside a setting that shapes a resolution is
+  refused. `GentooBuilder::build` refuses a `plan` given with `install` atoms or
+  `prefer_use` preferences, with `GentooError::Config`, as the Debian and Alpine
+  builders refuse theirs; the plan superseded both in silence. `fcage` refuses
+  each such pair as a usage error: `--debian-plan` beside `--debian-include`,
   `--debian-exclude`, `--debian-base-priority` or `--debian-pin`,
   `--alpine-plan` beside `--alpine-include`, `--alpine-exclude` or
   `--alpine-pin`, and `--gentoo-plan` beside `--gentoo-install` or
-  `--gentoo-prefer-use`. A Gentoo plan overrode the two in silence, and the
-  rest failed at `build`, exiting 125.
+  `--gentoo-prefer-use`. The Debian and Alpine pairs failed at `build`, exiting
+  125.
 - `fcage` refuses an `https://` mirror on every mirror flag, as a usage error,
   since it fetches over `http://` and `file://` only.
 - An Alpine or Gentoo fetch failure names the bootstrap it stopped, as a Debian
@@ -609,11 +660,34 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- A foreign-architecture bootstrap's preflight reads `binfmt_misc`'s host-wide
+  switch, and refuses a host where `/proc/sys/fs/binfmt_misc/status` reads
+  `disabled`, before anything is downloaded. Where `binfmt_misc` is not mounted,
+  as in a container that never mounted it, the preflight lets the bootstrap
+  proceed rather than refusing it: the kernel holds the host's registrations
+  either way, and a missing handler fails the first foreign binary with
+  `ENOEXEC`.
 - A launch no longer fails now and then with `SetupStep::OpenMountTarget` and
   `EAGAIN` when a rename or a mount elsewhere on the host races the lookup of a
   mount target reached through a `..` symbolic link, such as `etc/resolv.conf ->
   ../run/systemd/resolve/stub-resolv.conf`. The kernel's request to retry such a
   lookup is honored wherever the crate resolves a path inside a tree.
+- Without a PID namespace, and under every restriction, the launch stage that
+  supervises the command from outside the sandbox ignores signals as a PID
+  namespace's init does. It keeps only `SIGCHLD` and the signals that report a
+  fault. A `^C`, a hangup, or a shell's `kill %1` sent to the caller's process
+  group ended it. The command's outcome was then lost, and a command in a
+  session of its own ran on unsupervised, past `stop_with_caller`. The command
+  still starts with every signal at its default, and `SIGKILL` still ends the
+  launch stage.
+- Every process the library forks starts with every signal blocked, and the
+  caller's signal mask is restored as soon as the fork returns. A signal handler
+  the caller installed could run in a forked child before the child had reset
+  its dispositions.
+- A launch that is torn down signals and reaps its launch stage through a pidfd
+  taken at the fork. In an application that reaps child processes of its own,
+  the launch's `SIGKILL` could reach an unrelated process that had reused the
+  stage's pid.
 - A Landlock grant on a file or a device node, such as `--landlock-ro
   /etc/hostname` or `--landlock-rw /dev/null`, no longer fails every launch with
   `EINVAL`. The grant is narrowed to the rights that act on a file, which are
@@ -647,6 +721,12 @@ consumer upgrading can skip it.
   after the run. The target was judged present because a lower held it, so the
   empty file the launch created was never removed, and it hid the deletion. A
   target created over a deletion has the deletion restored.
+- A file a launch creates in the root as a file bind's target, such as a
+  host-network sandbox's `/etc/resolv.conf`, is removed only once the sandbox is
+  gone. Even then it is removed only while the name still holds that file.
+  Dropping a `Running` while the sandbox ran unmounted the sandbox's bind; the
+  file now stays in the root instead. Two sandboxes on one root that bind onto
+  the same such target no longer unmount each other's bind.
 - With host networking, a bind of a host directory over `/etc` no longer
   receives an empty `resolv.conf` from the launch, and a read-only one no longer
   fails the launch with `EROFS`. The managed bind yields to such a bind as it
@@ -967,9 +1047,14 @@ consumer upgrading can skip it.
   `write_whole` for a file that takes its content in one write, `retry_on_intr!`
   for every single interrupted call, and `encode_record`, `decode_record` and
   `read_record` for the outcome record every helper child sends.
-  `idmap::single_identity_lines` formats the single-identity map's two lines
-  before a fork. A short identity-map write in a sandbox stage reports
-  `EMSGSIZE`, as the host side already did.
+  `frame::read_full_or_short` fills a buffer and reports how much arrived, and
+  `read_full_or_eof` is built on it. `idmap::single_identity_lines` formats the
+  single-identity map's two lines before a fork. A short identity-map write in a
+  sandbox stage reports `EMSGSIZE`, as the host side already did.
+- `mechanism::has_exited` and `mechanism::await_exit` ask whether a process has
+  exited, or wait until it has, through its pidfd, for any process rather than
+  only a child of the caller's. The placeholder guard and every failed launch
+  ask them.
 - Every range identity map passes through `idmap::resolve_delegate`, which takes
   the configured delegate, whose refusal is final, or the bundled chain, and
   validates the request and the delegate's answer: a build, an export, a copy
@@ -1021,8 +1106,10 @@ consumer upgrading can skip it.
   for Debian control files, Alpine metadata members, Gentoo container members and
   tar's own long names. `compress::read_fully` is the one filling read under
   the decoders, and `compress::Codec` names the formats `decompress` recognizes.
-- `provision::document::header` and `document::number` read every plan
-  document's header and number fields, in all three layers.
+- `provision::document::parse` reads every field-and-stanza document, a Debian
+  index, release or status file, the Gentoo binhost index and every plan, one
+  stanza at a time, in place. `document::header` and `document::number` read
+  every plan document's header and number fields, in all three layers.
 - `provision::accounts` is the shadow-file mechanism the Debian and Alpine
   bootstraps share, and `accounts::ids` reads the id a root's `/etc/passwd` or
   `/etc/group` gives a name. `binfmt::preflight` is the one refusal of a foreign
@@ -1046,7 +1133,8 @@ consumer upgrading can skip it.
   polled slice, as the `poll` module states.
 - `fcage` and the examples state their exit codes once each. `fcage`'s
   `output` module makes every write of its own and decides what a reader gone
-  means for it.
+  means for it. `fcage` reads its seccomp flags' syscall names through
+  `SeccompRules::syscall`, and no longer depends on the `syscalls` crate.
 - The `orchestrator`, `gentoo-binhost` and `fetch-sandbox` examples set
   `test = true`, so `cargo test` runs the tests that hold their documented
   invocations to the build.

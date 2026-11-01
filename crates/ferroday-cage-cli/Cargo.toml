@@ -35,9 +35,6 @@ toml = "1.1"
 # Resolves a `--rlimit` resource name through the library's own `Deserialize`,
 # so the flag and a profile's `[rlimit]` keys cannot drift apart.
 serde = "1.0"
-# Resolves seccomp syscall names to numbers for the host architecture, the
-# same crate and native table the library uses.
-syscalls = { version = "0.8", default-features = false }
 # The two ambient readings `--terminal` makes of the terminal `fcage` was
 # started from: whether it is one, and what size it reports. The relay itself is
 # the library's, and needs nothing here. The rest serve the relay for a standard

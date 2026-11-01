@@ -3073,10 +3073,9 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         return Err("the --gentoo-* options require --provision-gentoo".to_string());
     }
     // A plan is a resolution that already happened, so a flag that shapes a
-    // resolution has nothing to shape beside one. The Debian and Alpine layers
-    // refuse such a pair when they are built, and the Gentoo layer lets the
-    // plan win. Refused here, each is the usage error it is, and none of them
-    // is dropped in silence.
+    // resolution has nothing to shape beside one. Every layer refuses such a
+    // pair when it is built. Refused here as well, each is the usage error it
+    // is, named by its flag rather than by the builder method it reaches.
     plan_alone(
         "--debian-plan",
         options.debian_plan.is_some(),
@@ -3321,10 +3320,9 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
 /// The tree a mode flag names, refusing an empty value.
 ///
 /// An empty value is almost always a variable that was never set, as in
-/// `--remove-rootfs "$ROOT"`, and the library reads it as a path that is not
-/// there. A removal would then succeed having removed nothing, and a listing
-/// would answer that nothing is installed, neither of which is about the tree
-/// the caller meant.
+/// `--remove-rootfs "$ROOT"`, and names no tree the caller meant. It is a usage
+/// error here, reported before the mode runs, for a removal and a listing
+/// alike.
 fn tree_value(flag: &str, value: OsString) -> Result<PathBuf, String> {
     if value.is_empty() {
         return Err(format!(
@@ -3339,7 +3337,10 @@ fn tree_value(flag: &str, value: OsString) -> Result<PathBuf, String> {
 ///
 /// Beyond [`tree_value`]'s refusal, a path with no final component, such as
 /// `.`, `..` or `/`, names no tree of its own to remove from its parent, and no
-/// lock file beside one.
+/// lock file beside one. The library's removal refuses both shapes too, as
+/// [`ProvisionError::RemoveDestInvalid`]; checking them here makes them usage
+/// errors, reported before anything runs, as every other malformed flag value
+/// is.
 fn removal_target(flag: &str, value: OsString) -> Result<PathBuf, String> {
     let dest = tree_value(flag, value)?;
     if dest.file_name().is_none() {
@@ -4525,11 +4526,9 @@ fn parse_u64_literal(flag: &str, field: &str, raw: &str) -> Result<u64, String> 
 }
 
 /// Resolves a syscall name to its number for the host architecture, through
-/// the `syscalls` crate, the same table the library uses.
+/// [`SeccompRules::syscall`], the table a profile's names resolve through.
 fn resolve_syscall_name(flag: &str, name: &str) -> Result<i64, String> {
-    name.parse::<syscalls::Sysno>()
-        .map(|sysno| i64::from(sysno.id()))
-        .map_err(|_| format!("{flag}: unknown syscall {name:?}"))
+    SeccompRules::syscall(name).ok_or_else(|| format!("{flag}: unknown syscall {name:?}"))
 }
 
 /// Reconciles the seccomp flags into a single policy, or `None` when none were
@@ -8048,8 +8047,8 @@ mod tests {
 
     #[test]
     fn a_removal_names_a_tree_of_its_own() {
-        // An empty value is an unset variable, and the library reads it as a
-        // path that is not there: the removal would succeed, removing nothing.
+        // An empty value is an unset variable, refused as a usage error before
+        // the removal runs.
         for args in [
             &["--remove-rootfs="][..],
             &["--remove-rootfs", ""],
@@ -8066,8 +8065,20 @@ mod tests {
         }
         // A trailing `/.` still names the directory before it.
         assert!(parse_args(&["--remove-rootfs", "roots/a/."]).is_ok());
-        // A listing of what a root has installed reads the empty value the same
-        // way, and would answer that nothing is.
+        // The library refuses the same values before it touches anything,
+        // which is what makes asking it here harmless; the parse only reports
+        // them earlier.
+        for dest in ["", ".", "..", "/", "a/..", "./"] {
+            assert!(
+                matches!(
+                    ferroday_cage::provision::Remove::new(dest).run(),
+                    Err(ProvisionError::RemoveDestInvalid { .. })
+                ),
+                "{dest:?}"
+            );
+        }
+        // A listing of what a root has installed refuses the empty value the
+        // same way.
         let error = parse_error(&["--gentoo-installed="]);
         assert!(error.contains("empty value"), "{error}");
     }
@@ -8686,6 +8697,23 @@ mod tests {
             ])
             .contains("--seccomp-errno")
         );
+    }
+
+    #[test]
+    fn an_errno_parses_exactly_where_the_library_builds_it() {
+        // A usage error at parse is the library's own refusal at build, met
+        // earlier: both read the range through the library, at each of its
+        // edges.
+        for errno in [0, 1, 4095, 4096, u16::MAX] {
+            let parsed = parse_seccomp_errno("--seccomp-errno", &format!("getpid={errno}"));
+            let built = Restriction::builder()
+                .command("/bin/true")
+                .seccomp(SeccompPolicy::Rules(
+                    SeccompRules::denying([]).errno_for(sysno("getpid"), errno),
+                ))
+                .build();
+            assert_eq!(parsed.is_ok(), built.is_ok(), "errno {errno}");
+        }
     }
 
     /// The rules a composed policy holds, rendered for comparison.

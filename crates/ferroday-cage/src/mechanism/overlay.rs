@@ -17,8 +17,6 @@
 //! The probe and the launch both hand `mount(2)` an option string naming the
 //! layers, and [`overlay_options`] is the one place that string is composed.
 
-#![allow(unsafe_code)]
-
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -98,7 +96,7 @@ fn classify(status: WaitStatus) -> OverlayProbe {
 fn probe_child(merged: &CStr, options: &CStr, uid_line: &[u8], gid_line: &[u8]) -> i32 {
     // Scrub inherited signal dispositions: an inherited handler must not run
     // inside this no-allocation child.
-    if super::child::reset_signals().is_err() {
+    if super::child::reset_signals(&super::sys::SigSet::empty()).is_err() {
         return EXIT_SETUP_FAILED;
     }
 

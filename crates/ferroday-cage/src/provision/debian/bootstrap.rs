@@ -886,9 +886,9 @@ fn installed_packages(tree: &Rooted) -> Result<HashSet<String>, DebianError> {
     let mut installed = HashSet::new();
     for stanza in document::parse(&text) {
         if let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status"))
-            && is_configured(status)
+            && is_configured(&status)
         {
-            installed.insert(name.to_string());
+            installed.insert(name.into_owned());
         }
     }
     Ok(installed)

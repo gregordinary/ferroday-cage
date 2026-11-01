@@ -170,13 +170,13 @@ sandbox created, which the sandbox's user namespace still owns:
 
 ### The host requirement
 
-Every launch now holds two user namespaces rather than one, and a namespace is
-charged against `user.max_user_namespaces` at every level up to the initial
-namespace. [`host::userns_blocker`](host-requirements.md) reports a ceiling of
-`1` as a blocker for that reason. The check is necessary and not sufficient — a
-host whose ceiling is four with three namespaces already live fails the same way
-— so the launch itself reports the exhausted budget as
-`Error::NestedUsernsBudgetExhausted`, naming the sysctl.
+Every launch holds two user namespaces and two mount namespaces, and a namespace
+is charged against its `user.max_*_namespaces` count at every level up to the
+initial namespace. [`host::userns_blocker`](host-requirements.md) reports a
+`user.max_user_namespaces` of `1` as a blocker for that reason. The check is
+necessary and not sufficient. A host whose ceiling is four with three namespaces
+already live fails the same way. The launch itself therefore reports a refused
+namespace as `Error::NamespaceLimitReached`, naming the limits.
 
 ## The session keyring
 
@@ -323,12 +323,25 @@ shipped, rather than one the mount's own mode happened to hide.
 A missing *file* target is content the root never had — an empty
 `/etc/resolv.conf`, an empty file where a binary is bound — present only for
 its mount to cover. It is created at `0644` exactly, independent of the
-launching process's umask, and does not survive the sandbox: the paths are
-recorded at build time, and dropping the handle removes each one, whether the
-sandbox ran to completion or the launch never proceeded. Only an empty regular
-file is removed, so anything that gained content or changed type in the
-meantime belongs to whoever put it there. The rule covers the managed
+launching process's umask. The sandbox reports each file it creates, and the
+handle removes it once the sandbox is gone. That holds whether the sandbox ran
+to completion, failed at launch, or never proceeded. Only that same file, still
+empty and still a regular file, is removed. Anything that took its name or
+gained content belongs to whoever put it there. The rule covers the managed
 `resolv.conf` bind and the caller's own file binds alike.
+
+Removal waits for the sandbox, because unlinking a file a bind covers unmounts
+the bind in every mount namespace. A handle dropped while the sandbox runs
+therefore leaves the file in the root. With a PID namespace the sandbox is gone
+when its init exits. Without one it is gone when the command exits, and a
+descendant still running then loses the bind.
+
+Two sandboxes on one root can bind onto one such target. The first creates it,
+and the second finds it. Each holds a shared lock on the file, and the handle
+removes a file only under an exclusive lock, so neither unmounts the other's
+bind. The file then stays in the root, since the sandbox that found it did not
+create it. Without a PID namespace the second sandbox holds its lock only until
+its command executes, so the protection ends there.
 
 A target the root already ships is never touched, whatever kind of entry it
 is. A symbolic link is one such entry, and it is left as it is rather than
@@ -430,6 +443,12 @@ key the calling user owns, wherever the key's permissions let its owner view it.
 The command possesses none of those keys. It reads the contents only of one whose
 permissions grant its owner reading. See [The session
 keyring](#the-session-keyring).
+
+The init is a third. It is a fork of the calling process that runs no program
+of its own, so `/proc/1/cmdline` and `/proc/1/comm` show the caller's command
+line and name. A secret an application takes as an argument is therefore
+readable inside the sandbox. On a host whose `/proc` has no `hidepid`, every
+local user reads it too. Pass a secret through a file or a descriptor instead.
 
 It is called out because the rest of the crate leans the other way. A
 [`Terminal`](terminal.md) refuses to read the host's window size, `base_env`

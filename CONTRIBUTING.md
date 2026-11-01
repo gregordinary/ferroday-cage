@@ -445,7 +445,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
-| Read or write a plan document, or read its header and its number fields | `provision::document`, `document::header`, `document::number` |
+| Read a field-and-stanza document one stanza at a time, in place, or write a plan document and read its header and its number fields | `provision::document::parse`, `Stanza::get`, `Stanza::get_each`, `document::header`, `document::number` |
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
 | Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
@@ -468,11 +468,12 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Name a filesystem entry no concurrent caller can collide with | `host::unique_hex` |
 | Fill a buffer from the kernel's randomness | `host::fill_random` |
 | Fork, exec, exit, or change signal state without libc | `mechanism::sys` |
+| Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
 | Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |
 | Write a file that takes its content in one write, such as an identity map | `mechanism::frame::write_whole` |
-| Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending |
+| Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending, and `read_full_or_short` where how much arrived matters |
 | Retry one call a signal interrupted | `mechanism::frame::retry_on_intr!` |
 | Encode, decode, or read a helper child's outcome record | `mechanism::frame::encode_record`, `decode_record`, `read_record` |
 | Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd` |
@@ -483,6 +484,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |
 | What does the single-identity map write? | `idmap::single_identity_lines` |
 | Validate the command a sandbox or a restriction executes | `spec::validate_command` |
+| Which syscall number, or which errno, does a name spell for a seccomp policy? | `SeccompRules::syscall`, `SeccompRules::errno` |
 | Can this kernel enforce a Landlock request that is a reach's only bound? | `mechanism::HardeningPlan::ensure_sandbox_enforceable` for a sandbox, and `HardeningPlan::ensure_landlock_enforceable` with `hardening::ensure_scopes_enforceable` for a restriction |
 | Compose an overlay's mount options | `mechanism::overlay_options` |
 | What does a mount op bring to rest on its target, if anything? | `mechanism::MountAction::arrival`, or `Arrival::of_raw` for a raw mount's flags |

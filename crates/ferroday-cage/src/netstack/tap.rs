@@ -54,7 +54,7 @@ use rustix::thread::LinkNameSpaceType;
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
 use crate::mechanism::frame;
 use crate::mechanism::sweep_fds_keeping;
-use crate::mechanism::sys::{self, Fork, How, SigSet};
+use crate::mechanism::sys::{self, Fork};
 use crate::wire::wire_enum;
 
 /// `TUNSETIFF`: create or attach to a tun/tap interface (`_IOW('T', 202, int)`).
@@ -365,14 +365,12 @@ fn helper(context: &HelperContext<'_>) -> ! {
 
 /// The helper's work. Returns only on failure, naming the step.
 fn run_helper(context: &HelperContext<'_>) -> Result<(), (Step, Errno)> {
-    // Block every signal first: the copied address space still names the
-    // caller's signal handlers, which must not run here. Fatal signals
-    // still kill the helper, which the parent observes as a hangup.
-    // SAFETY: replacing the whole mask is safe in a fresh, single-threaded
-    // child; nothing here relies on receiving signals.
-    let _ = unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::all())) };
-
-    // Then the descriptor table, before anything that can block. The fork
+    // Every signal stays blocked, as the fork left it: the copied address
+    // space still names the caller's signal handlers, which must not run here,
+    // and nothing here relies on receiving a signal. `SIGKILL` still ends the
+    // helper, which the parent process observes as a hangup.
+    //
+    // The descriptor table first, before anything that can block. The fork
     // copied the caller's whole table into this process, and an inherited copy
     // is not inert: it holds open a concurrently live sandbox's control socket
     // (which defers the supervisor's hangup detection), a concurrently

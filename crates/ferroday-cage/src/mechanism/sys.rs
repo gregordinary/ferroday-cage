@@ -38,6 +38,16 @@ pub(crate) enum Fork {
 /// order of `clone`'s pointer arguments differs between architectures, and
 /// none of them is read.
 ///
+/// Every signal is blocked across the call, as `posix_spawn` blocks them. The
+/// child process is a copy of one whose handlers are still installed in it,
+/// and a handler that ran there — one that takes a lock, as a logging or
+/// signal-forwarding library's does — would break the post-fork discipline
+/// before the child process's first instruction could prevent it. The child
+/// process therefore starts with every signal blocked, and unblocks none until
+/// it has put the dispositions it inherited back to the default; the caller's
+/// mask is restored in the parent process before this returns there.
+/// `SIGKILL` and `SIGSTOP` cannot be blocked, and need no handler to be safe.
+///
 /// # Safety
 ///
 /// The child is a copy of the calling process that holds only the calling
@@ -46,18 +56,30 @@ pub(crate) enum Fork {
 /// libc, no panic.
 pub(crate) unsafe fn fork() -> Result<Fork, Errno> {
     let exit_signal = Signal::CHILD.as_raw() as usize;
+    // SAFETY: blocking signals runs nothing. The mask is the calling thread's
+    // own, and the previous one is restored below on every path that returns
+    // in this process.
+    let previous = unsafe { sigprocmask(How::SetMask, Some(&SigSet::all())) }?;
     // SAFETY: `clone` with only an exit signal duplicates the process as
     // `fork` does; it reads no pointer argument, so the zeros are never
     // dereferenced. What the child may do afterwards is the caller's contract.
     let pid =
         unsafe { syscalls::syscall!(Sysno::clone, exit_signal, 0usize, 0usize, 0usize, 0usize) }
-            .map_err(errno)?;
+            .map_err(errno);
     // The kernel answers 0 in the child and the child's pid, which is never 0,
     // in the parent.
-    Ok(match Pid::from_raw(pid as i32) {
+    let forked = pid.map(|pid| match Pid::from_raw(pid as i32) {
         Some(child) => Fork::ParentOf(child),
         None => Fork::Child,
-    })
+    });
+    if !matches!(forked, Ok(Fork::Child)) {
+        // SAFETY: `previous` is the mask this thread ran under before the
+        // block above, so restoring it lets run only what could run then. The
+        // call cannot fail with a live set of the kernel's size, and a failure
+        // would leave this thread blocked rather than run anything.
+        let _ = unsafe { sigprocmask(How::SetMask, Some(&previous)) };
+    }
+    forked
 }
 
 /// Replaces the process image, returning only the reason it could not.
@@ -176,21 +198,44 @@ impl SigSet {
         SigSet([0; SIGSET_WORDS])
     }
 
-    /// Every signal. The network stack's tap helper, which blocks them all, is
-    /// the one caller.
-    #[cfg_attr(not(feature = "netstack"), allow(dead_code))]
+    /// Every signal: the mask [`fork`] holds across the call, and leaves in
+    /// force in the child process.
     pub(crate) const fn all() -> SigSet {
         SigSet([!0; SIGSET_WORDS])
     }
 
+    /// Exactly `signals`.
+    pub(crate) const fn of(signals: &[Signal]) -> SigSet {
+        let mut set = SigSet::empty();
+        let mut index = 0;
+        while index < signals.len() {
+            let (word, bit) = SigSet::position(signals[index]);
+            set.0[word] |= bit;
+            index += 1;
+        }
+        set
+    }
+
+    /// This set without `signals`.
+    pub(crate) const fn without(mut self, signals: &[Signal]) -> SigSet {
+        let mut index = 0;
+        while index < signals.len() {
+            let (word, bit) = SigSet::position(signals[index]);
+            self.0[word] &= !bit;
+            index += 1;
+        }
+        self
+    }
+
     /// The word and bit `signal` occupies.
-    fn position(signal: Signal) -> (usize, c_ulong) {
+    const fn position(signal: Signal) -> (usize, c_ulong) {
         let bit = (signal.as_raw() - 1) as usize;
         let width = c_ulong::BITS as usize;
         (bit / width, 1 << (bit % width))
     }
 
     /// Adds `signal`.
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, signal: Signal) {
         let (word, bit) = SigSet::position(signal);
         self.0[word] |= bit;
@@ -366,6 +411,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_fork_blocks_every_signal_in_the_child_and_restores_the_parent() {
+        // On a thread of the test's own, so the runner's threads keep their
+        // masks, and with one signal blocked beforehand, so the parent
+        // process's restoration is told from an emptied mask.
+        std::thread::spawn(|| {
+            let mut usr1 = SigSet::empty();
+            usr1.insert(Signal::USR1);
+            // SAFETY: blocking signals runs nothing.
+            let before = unsafe { sigprocmask(How::Block, Some(&usr1)) }.expect("the mask blocks");
+            // SAFETY: the child process reads its mask and calls `exit_group`,
+            // raw system calls both.
+            match unsafe { fork() }.expect("the fork succeeds") {
+                Fork::Child => {
+                    // SAFETY: reading the mask changes nothing.
+                    let blocked = unsafe { sigprocmask(How::Block, None) };
+                    let every = blocked.is_ok_and(|mask| {
+                        // SAFETY: 64 is a signal number the kernel defines on
+                        // every admitted architecture.
+                        let last = unsafe { Signal::from_raw_unchecked(64) };
+                        [
+                            Signal::INT,
+                            Signal::TERM,
+                            Signal::CHILD,
+                            Signal::WINCH,
+                            last,
+                        ]
+                        .into_iter()
+                        .all(|signal| mask.contains(signal))
+                    });
+                    exit_group(if every { 0 } else { 1 })
+                }
+                Fork::ParentOf(child) => {
+                    let status = rustix::process::waitpid(
+                        Some(child),
+                        rustix::process::WaitOptions::empty(),
+                    )
+                    .expect("the child is collected")
+                    .expect("the child reported a status")
+                    .1;
+                    assert_eq!(status.exit_status(), Some(0), "the child ran unblocked");
+                    // SAFETY: reading the mask changes nothing.
+                    let after = unsafe { sigprocmask(How::Block, None) }.expect("the mask reads");
+                    assert!(
+                        after.contains(Signal::USR1),
+                        "the parent's mask was emptied"
+                    );
+                    assert!(
+                        !after.contains(Signal::INT),
+                        "the parent's mask was left full"
+                    );
+                    // SAFETY: restoring the mask this thread started with.
+                    unsafe { sigprocmask(How::SetMask, Some(&before)) }.expect("the mask restores");
+                }
+            }
+        })
+        .join()
+        .expect("the fork thread ran");
     }
 
     #[test]

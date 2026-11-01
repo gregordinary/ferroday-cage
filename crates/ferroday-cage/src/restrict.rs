@@ -499,9 +499,11 @@ impl RestrictionBuilder {
     ///
     /// As on the cage builder: when enabled, the command is stopped as soon
     /// as the calling process exits — however it exits — or the last handle
-    /// to the launch is dropped. Only the command process itself is stopped;
-    /// without a PID namespace its descendants are beyond the library's
-    /// reach.
+    /// to the launch is dropped, with the exceptions
+    /// [`CageBuilder::stop_with_caller`](crate::CageBuilder::stop_with_caller)
+    /// states for a launch without a PID namespace. Only the command process
+    /// itself is stopped; without a PID namespace its descendants are beyond
+    /// the library's reach.
     pub fn stop_with_caller(mut self, tie: bool) -> Self {
         self.stop_with_caller = tie;
         self

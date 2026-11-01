@@ -8,6 +8,7 @@
 //! written in as well; [`Index`] is the package set built from a `Packages`
 //! file, deduplicated to the highest version of each name.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
@@ -196,10 +197,39 @@ impl std::error::Error for ParsePriorityError {}
 impl Package {
     /// Builds a package from a `Packages` stanza, or `None` when a required
     /// field is missing or malformed.
-    fn from_stanza(stanza: &Stanza) -> Option<Package> {
-        let name = stanza.get("Package")?.to_string();
-        let version = stanza.get("Version")?.to_string();
-        let architecture = stanza.get("Architecture")?.to_string();
+    fn from_stanza(stanza: &Stanza<'_>) -> Option<Package> {
+        let [
+            name,
+            version,
+            architecture,
+            filename,
+            sha256,
+            size,
+            installed_size,
+            source,
+            depends,
+            pre_depends,
+            provides,
+            essential,
+            priority,
+        ] = stanza.get_each([
+            "Package",
+            "Version",
+            "Architecture",
+            "Filename",
+            "SHA256",
+            "Size",
+            "Installed-Size",
+            "Source",
+            "Depends",
+            "Pre-Depends",
+            "Provides",
+            "Essential",
+            "Priority",
+        ]);
+        let name = name?.into_owned();
+        let version = version?.into_owned();
+        let architecture = architecture?.into_owned();
         // The digest becomes a cache filename and the fetch verifier's expected
         // value, and the pool path becomes a fetch URL and (for a `file://`
         // mirror) a local path. Neither is trusted until the archive signature
@@ -207,11 +237,11 @@ impl Package {
         // index is parsed, rather than at each use site: a stanza whose digest
         // is not 64 lowercase hex characters or whose pool path could traverse
         // out of a mirror root is malformed and dropped.
-        let filename = stanza.get("Filename")?.to_string();
+        let filename = filename?.into_owned();
         if !is_safe_pool_path(&filename) {
             return None;
         }
-        let sha256 = stanza.get("SHA256")?.to_string();
+        let sha256 = sha256?.into_owned();
         if !Algorithm::Sha256.is_hex(&sha256) {
             return None;
         }
@@ -219,19 +249,13 @@ impl Package {
         // leaves the download bounded by the fetcher's own ceiling rather than
         // being dropped: the digest is what decides whether the bytes are the
         // package, and a missing bound is a weaker fetch, not a wrong one.
-        let size = stanza
-            .get("Size")
-            .and_then(|value| value.parse::<u64>().ok());
+        let size = size.and_then(|value| value.parse::<u64>().ok());
         // Read before the literal below moves `name`, which the source name is
         // compared against. Neither field is required: a stanza missing or
         // malforming one is reported as carrying no value rather than dropped,
         // since nothing the bootstrap does depends on either.
-        let installed_size = stanza
-            .get("Installed-Size")
-            .and_then(|value| value.parse::<u64>().ok());
-        let source = stanza
-            .get("Source")
-            .and_then(|value| source_name(value, &name));
+        let installed_size = installed_size.and_then(|value| value.parse::<u64>().ok());
+        let source = source.and_then(|value| source_name(&value, &name));
         Some(Package {
             name,
             version,
@@ -239,22 +263,14 @@ impl Package {
             filename,
             size,
             sha256,
-            depends: stanza
-                .get("Depends")
+            depends: depends.as_deref().map(parse_relations).unwrap_or_default(),
+            pre_depends: pre_depends
+                .as_deref()
                 .map(parse_relations)
                 .unwrap_or_default(),
-            pre_depends: stanza
-                .get("Pre-Depends")
-                .map(parse_relations)
-                .unwrap_or_default(),
-            provides: stanza
-                .get("Provides")
-                .map(parse_provides)
-                .unwrap_or_default(),
-            essential: stanza
-                .get("Essential")
-                .is_some_and(|value| value.eq_ignore_ascii_case("yes")),
-            priority: stanza.get("Priority").map(str::to_string),
+            provides: provides.as_deref().map(parse_provides).unwrap_or_default(),
+            essential: essential.is_some_and(|value| value.eq_ignore_ascii_case("yes")),
+            priority: priority.map(Cow::into_owned),
             installed_size,
             source,
             // Set by the caller as the stanza is folded into an index; the
@@ -765,8 +781,7 @@ pub fn build_depend_names(control: &str, architecture: &str) -> Vec<String> {
         .filter(|line| !line.starts_with('#'))
         .flat_map(|line| [line, "\n"])
         .collect();
-    let stanzas = document::parse(&uncommented);
-    let Some(source) = stanzas.first() else {
+    let Some(source) = document::parse(&uncommented).next() else {
         return Vec::new();
     };
     let mut names = Vec::new();
@@ -1025,19 +1040,22 @@ Multi-Line:
 Package: two
 Version: 1.0
 ";
-        let stanzas = document::parse(text);
+        let stanzas: Vec<_> = document::parse(text).collect();
         assert_eq!(stanzas.len(), 2);
-        assert_eq!(stanzas[0].get("package"), Some("one"));
-        assert_eq!(stanzas[0].get("multi-line"), Some("\nline one\nline two"));
-        assert_eq!(stanzas[1].get("Version"), Some("1.0"));
+        assert_eq!(stanzas[0].get("package").as_deref(), Some("one"));
+        assert_eq!(
+            stanzas[0].get("multi-line").as_deref(),
+            Some("\nline one\nline two")
+        );
+        assert_eq!(stanzas[1].get("Version").as_deref(), Some("1.0"));
 
         // A whitespace-only line separates too, as it does for every other
         // deb822 reader; taken as a continuation it would fold the second
         // stanza into the first.
         let padded = "Package: one\n \nPackage: two\n";
-        let stanzas = document::parse(padded);
+        let stanzas: Vec<_> = document::parse(padded).collect();
         assert_eq!(stanzas.len(), 2);
-        assert_eq!(stanzas[1].get("Package"), Some("two"));
+        assert_eq!(stanzas[1].get("Package").as_deref(), Some("two"));
     }
 
     #[test]

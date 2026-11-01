@@ -3,7 +3,10 @@
 
 mod common;
 
+use std::time::Duration;
+
 use ferroday_cage::{Cage, ConfigError, Error, Limit, Resource};
+use rustix::process::Pid;
 
 #[test]
 fn the_command_is_pid_2_under_the_library_init() {
@@ -127,6 +130,84 @@ fn sigpipe_is_reset_to_the_default_disposition() {
         .run()
         .expect("the sandbox launches");
     assert!(status.success(), "expected SIGPIPE at SIG_DFL inside");
+}
+
+#[test]
+fn the_command_starts_with_no_signal_blocked_or_ignored() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Every process of a launch is forked with every signal blocked, and the
+    // launch stage keeps most of them blocked for as long as it lives and
+    // ignores them while it supervises. None of that may reach the command: an inherited block or an inherited ignore both survive
+    // `execve`. The command is the reader itself, so no shell's own signal
+    // handling is in the picture.
+    for pid_namespace in [true, false] {
+        let output = Cage::builder()
+            .rootfs(rootfs)
+            .pid_namespace(pid_namespace)
+            .command("/bin/busybox")
+            .args(["grep", "-E", "^Sig(Blk|Ign):", "/proc/self/status"])
+            .build()
+            .expect("a valid sandbox configuration")
+            .output()
+            .expect("the sandbox launches");
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            text, "SigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\n",
+            "pid_namespace = {pid_namespace}",
+        );
+    }
+}
+
+#[test]
+fn the_launch_stage_outside_the_sandbox_outlives_the_signals_sent_to_its_group() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Without a PID namespace the launch stage supervises the command from
+    // outside, as an ordinary member of the caller's process group, where a
+    // terminal's interrupt and a shell's `kill %1` reach it alike. Had one of
+    // them ended it, the outcome would be lost and a command in a session of
+    // its own would run on unsupervised. Sent straight to the launch stage,
+    // each must leave the outcome to be collected, as each would leave the
+    // init of a PID namespace.
+    let mut running = Cage::builder()
+        .rootfs(rootfs)
+        .pid_namespace(false)
+        .command("/bin/sh")
+        .args(["-c", "sleep 1; exit 7"])
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn()
+        .expect("the sandbox launches");
+    let launch_stage = parent_of(running.pid());
+    for signal in common::GROUP_SIGNALS {
+        rustix::process::kill_process(launch_stage, signal)
+            .expect("the launch stage is alive to be signalled");
+    }
+    match running.wait_timeout(Duration::from_secs(30)) {
+        Ok(Some(status)) => assert_eq!(status.code(), Some(7)),
+        other => {
+            let _ = running.kill();
+            panic!("the outcome was not collected: {other:?}");
+        }
+    }
+}
+
+/// The parent of the host process `pid`, read from its procfs status.
+fn parent_of(pid: u32) -> Pid {
+    let status =
+        std::fs::read_to_string(format!("/proc/{pid}/status")).expect("the process is alive");
+    let parent = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .expect("a status names its parent")
+        .trim()
+        .parse()
+        .expect("a parent is a number");
+    Pid::from_raw(parent).expect("a living process has a parent")
 }
 
 #[test]

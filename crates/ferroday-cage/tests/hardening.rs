@@ -11,8 +11,8 @@ mod common;
 use std::path::Path;
 
 use ferroday_cage::{
-    Cage, Capability, ConfigError, Error, FsAccess, LandlockScope, NetAccess, Network,
-    SeccompPolicy, SeccompRules,
+    Cage, Capability, ConfigError, Error, FsAccess, LandlockScope, NetAccess, Network, Restriction,
+    SeccompAction, SeccompPolicy, SeccompRules,
 };
 
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
@@ -564,6 +564,54 @@ fn curated_seccomp_denies_creating_a_namespace() {
             && filtered.to_lowercase().contains("not permitted"),
         "the curated profile must deny both namespaces with EPERM: {filtered:?}"
     );
+}
+
+#[test]
+fn an_errno_no_failed_syscall_reports_is_refused_at_build() {
+    // A build alone, so this needs neither the fixture nor seccomp in the
+    // kernel. Zero would hand `getpid` a pid of 0 and tell a `clone3` caller it
+    // is the child; past 4095 the C library reads the answer as a value.
+    let policies = |errno: u16| {
+        [
+            SeccompRules::denying([]).errno_for(libc::SYS_getpid, errno),
+            SeccompRules::denying([libc::SYS_getpid]).listed_action(SeccompAction::Errno(errno)),
+            SeccompRules::allowing([libc::SYS_exit_group])
+                .default_action(SeccompAction::Errno(errno)),
+        ]
+    };
+    let builds = |rules: SeccompRules| {
+        let sandbox = Cage::builder()
+            .rootfs(common::scratch_dir("errno-range"))
+            .command("/bin/sh")
+            .seccomp(SeccompPolicy::Rules(rules.clone()))
+            .build()
+            .map(drop);
+        let restriction = Restriction::builder()
+            .command("/bin/true")
+            .seccomp(SeccompPolicy::Rules(rules))
+            .build()
+            .map(drop);
+        [sandbox, restriction]
+    };
+    for errno in [0, 4096, u16::MAX] {
+        for rules in policies(errno) {
+            for built in builds(rules) {
+                match built {
+                    Err(Error::Config(ConfigError::SeccompInvalid { reason, .. })) => {
+                        assert!(reason.contains(&format!("errno {errno},")), "{reason}");
+                    }
+                    other => panic!("errno {errno} is refused: {other:?}"),
+                }
+            }
+        }
+    }
+    for errno in [1, 4095] {
+        for rules in policies(errno) {
+            for built in builds(rules) {
+                built.unwrap_or_else(|err| panic!("errno {errno} builds: {err}"));
+            }
+        }
+    }
 }
 
 #[test]

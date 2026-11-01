@@ -168,6 +168,14 @@ impl Atom {
         &self.name
     }
 
+    /// The atom as it was written, which is also what it is displayed as.
+    ///
+    /// Two atoms written alike are the same atom, so this is what a resolver
+    /// keys anything it works out once per atom by.
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
     /// How strongly the atom refuses the package, or `None` where it requires
     /// it instead.
     pub(super) fn blocker(&self) -> Option<Blocker> {
@@ -637,6 +645,16 @@ pub(super) enum Dependency {
     /// group inside this one is an alternative of its own, and an any-of group
     /// inside that is refused; see [`parse_any_of`].
     AnyOf(Vec<Vec<Atom>>),
+}
+
+impl Dependency {
+    /// How many atoms it names, across every alternative of a group.
+    pub(super) fn atoms(&self) -> usize {
+        match self {
+            Dependency::One(_) => 1,
+            Dependency::AnyOf(alternatives) => alternatives.iter().map(Vec::len).sum(),
+        }
+    }
 }
 
 /// How deeply one group may nest inside others in a dependency class.

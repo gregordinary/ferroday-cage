@@ -52,69 +52,201 @@
 //! added to a stanza belongs *after* every field the format's first readers
 //! knew, since that is where an older reader puts back what it carried.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Write as _;
 
-/// One stanza as read: its fields in file order.
+/// The stanzas of a document, in order, each read only as it is reached.
+///
+/// Nothing is read ahead and nothing is copied out of the document, so reading
+/// every stanza of a large one holds one stanza at a time, and costs only what
+/// its reader keeps of each.
+pub(crate) fn parse(text: &str) -> Stanzas<'_> {
+    Stanzas { rest: text }
+}
+
+/// The stanzas a document holds, as [`parse`] yields them.
+pub(crate) struct Stanzas<'a> {
+    /// What is left of the document.
+    rest: &'a str,
+}
+
+impl<'a> Iterator for Stanzas<'a> {
+    type Item = Stanza<'a>;
+
+    fn next(&mut self) -> Option<Stanza<'a>> {
+        loop {
+            // A blank line ends a stanza. Whitespace-only counts as blank: deb822
+            // readers treat it so, and a continuation line is one that starts
+            // with a space *and* carries content.
+            while let Some((line, after)) = split_line(self.rest)
+                && line.trim().is_empty()
+            {
+                self.rest = after;
+            }
+            if self.rest.is_empty() {
+                return None;
+            }
+            let start = self.rest;
+            while let Some((line, after)) = split_line(self.rest)
+                && !line.trim().is_empty()
+            {
+                self.rest = after;
+            }
+            let stanza = Stanza {
+                text: &start[..start.len() - self.rest.len()],
+            };
+            // A run of lines holding no field is no stanza: there is nothing in
+            // it a reader could ask for.
+            if stanza.spelled().next().is_some() {
+                return Some(stanza);
+            }
+        }
+    }
+}
+
+/// One stanza as read: the lines it spans, borrowed from the document.
+///
+/// A field is found by walking those lines when it is asked for, so holding a
+/// stanza costs nothing beyond the document however its fields are laid out:
+/// a stanza of a million one-character fields is the same two words as one of
+/// a dozen.
 ///
 /// Field names are matched case-insensitively. A folded value keeps its
 /// continuation lines joined with newlines, so a multi-line field such as a
 /// Debian `Release` file's `SHA256` list is read line by line by the caller.
-pub(crate) struct Stanza {
-    fields: Vec<(String, String)>,
+#[derive(Clone, Copy)]
+pub(crate) struct Stanza<'a> {
+    /// The stanza's lines, each with its line ending.
+    text: &'a str,
 }
 
-impl Stanza {
+impl<'a> Stanza<'a> {
     /// The value of `key`, matched case-insensitively, or `None`.
-    pub(crate) fn get(&self, key: &str) -> Option<&str> {
-        self.fields
-            .iter()
+    ///
+    /// Where the stanza names a field twice, the first answers. The value
+    /// borrows the document, and is copied only where it is folded, which
+    /// joining its lines requires.
+    pub(crate) fn get(&self, key: &str) -> Option<Cow<'a, str>> {
+        self.spelled()
             .find(|(name, _)| name.eq_ignore_ascii_case(key))
-            .map(|(_, value)| value.as_str())
+            .map(|(_, value)| value.unfolded())
+    }
+
+    /// The values of `keys`, each as [`get`](Self::get) answers it, from one
+    /// walk of the stanza.
+    ///
+    /// For a reader taking several fields from every stanza of a large
+    /// document, where asking for each in turn would walk the stanza once per
+    /// field. The Debian and Gentoo index readers are those, so a build with
+    /// neither layer has no caller.
+    #[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
+    pub(crate) fn get_each<const N: usize>(&self, keys: [&str; N]) -> [Option<Cow<'a, str>>; N] {
+        let mut found: [Option<Spelling<'a>>; N] = [None; N];
+        let mut missing = N;
+        for (name, value) in self.spelled() {
+            if missing == 0 {
+                break;
+            }
+            if let Some(at) = keys.iter().position(|key| name.eq_ignore_ascii_case(key))
+                && found[at].is_none()
+            {
+                found[at] = Some(value);
+                missing -= 1;
+            }
+        }
+        found.map(|value| value.map(Spelling::unfolded))
     }
 
     /// Every field, in the order the stanza wrote them.
     ///
     /// For a reader that has to account for fields it does not itself
     /// understand, rather than only look up the ones it does.
-    pub(crate) fn fields(&self) -> &[(String, String)] {
-        &self.fields
+    pub(crate) fn fields(&self) -> impl Iterator<Item = (&'a str, Cow<'a, str>)> + use<'a> {
+        self.spelled().map(|(name, value)| (name, value.unfolded()))
+    }
+
+    /// Every field, each value as the stanza spells it.
+    fn spelled(&self) -> Spelled<'a> {
+        Spelled { rest: self.text }
     }
 }
 
-/// Splits a document into its stanzas.
-pub(crate) fn parse(text: &str) -> Vec<Stanza> {
-    let mut stanzas = Vec::new();
-    let mut fields: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        // A blank line ends a stanza. Whitespace-only counts as blank: deb822
-        // readers treat it so, and a continuation line is one that starts with
-        // a space *and* carries content.
-        if line.trim().is_empty() {
-            if !fields.is_empty() {
-                stanzas.push(Stanza {
-                    fields: std::mem::take(&mut fields),
-                });
+/// The fields of a stanza in order, each value as the stanza spells it, so a
+/// field passed over on the way to another is never unfolded.
+///
+/// A line that starts with a space or a tab continues the field above it. A
+/// line that is neither that nor a field is passed over, and leaves the field
+/// above it the continuation lines that follow. A continuation line with no
+/// field above it continues nothing.
+struct Spelled<'a> {
+    /// The stanza's lines not yet read.
+    rest: &'a str,
+}
+
+impl<'a> Iterator for Spelled<'a> {
+    type Item = (&'a str, Spelling<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (name, first) = loop {
+            let (line, after) = split_line(self.rest)?;
+            self.rest = after;
+            if line.starts_with([' ', '\t']) {
+                continue;
             }
-            continue;
+            if let Some((name, value)) = line.split_once(':') {
+                break (name.trim(), value.trim());
+            }
+        };
+        let below = self.rest;
+        while let Some((line, after)) = split_line(self.rest)
+            && (line.starts_with([' ', '\t']) || !line.contains(':'))
+        {
+            self.rest = after;
         }
-        if line.starts_with([' ', '\t']) {
-            // A continuation of the current field. The single leading space is
-            // removed; the newline is kept so multi-line lists split.
-            if let Some((_, value)) = fields.last_mut() {
+        let below = &below[..below.len() - self.rest.len()];
+        Some((name, Spelling { first, below }))
+    }
+}
+
+/// A field's value as the stanza spells it.
+#[derive(Clone, Copy)]
+struct Spelling<'a> {
+    /// The value on the field's own line, trimmed.
+    first: &'a str,
+    /// The lines between the field and the next, which hold its continuation
+    /// lines among any that are not fields at all.
+    below: &'a str,
+}
+
+impl<'a> Spelling<'a> {
+    /// The value with its continuation lines joined on, each with the single
+    /// leading space removed and the newline kept, so a multi-line list splits.
+    fn unfolded(self) -> Cow<'a, str> {
+        let mut joined: Option<String> = None;
+        let mut rest = self.below;
+        while let Some((line, after)) = split_line(rest) {
+            rest = after;
+            if line.starts_with([' ', '\t']) {
+                let value = joined.get_or_insert_with(|| self.first.to_string());
                 value.push('\n');
                 value.push_str(line.strip_prefix(' ').unwrap_or(line));
             }
-            continue;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            fields.push((name.trim().to_string(), value.trim().to_string()));
-        }
+        joined.map_or(Cow::Borrowed(self.first), Cow::Owned)
     }
-    if !fields.is_empty() {
-        stanzas.push(Stanza { fields });
+}
+
+/// Splits the first line off `text` as [`str::lines`] yields it, without its
+/// line ending, and returns it with what follows; `None` where nothing is left.
+fn split_line(text: &str) -> Option<(&str, &str)> {
+    if text.is_empty() {
+        return None;
     }
-    stanzas
+    Some(match text.split_once('\n') {
+        Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), rest),
+        None => (text, ""),
+    })
 }
 
 /// The fields of one stanza that the reading version did not recognize, in the
@@ -128,16 +260,15 @@ pub(crate) type Carried = Vec<(String, String)>;
 /// Matched case-insensitively, as every other lookup in this format is, so a
 /// document spelling `sha256` does not have that field both read as known and
 /// carried as unknown — which would write it out twice.
-pub(crate) fn carried(stanza: &Stanza, known: &[&str]) -> Carried {
+pub(crate) fn carried(stanza: &Stanza<'_>, known: &[&str]) -> Carried {
     stanza
         .fields()
-        .iter()
         .filter(|(name, _)| {
             !known
                 .iter()
                 .any(|candidate| candidate.eq_ignore_ascii_case(name))
         })
-        .cloned()
+        .map(|(name, value)| (name.to_string(), value.into_owned()))
         .collect()
 }
 
@@ -155,11 +286,11 @@ pub(crate) fn carried(stanza: &Stanza, known: &[&str]) -> Carried {
 /// states no `Format`, or where the format is not `format`. Each layer wraps it
 /// in its own document failure, as [`required`]'s.
 pub(crate) fn header<'a>(
-    stanzas: &'a [Stanza],
+    mut stanzas: Stanzas<'a>,
     format: &str,
-) -> Result<(&'a Stanza, &'a [Stanza]), String> {
-    let (header, rest) = stanzas
-        .split_first()
+) -> Result<(Stanza<'a>, Stanzas<'a>), String> {
+    let header = stanzas
+        .next()
         .ok_or_else(|| "the document holds no stanzas".to_string())?;
     let found = header
         .get("Format")
@@ -169,7 +300,7 @@ pub(crate) fn header<'a>(
             "the document is in format {found:?}, and this library reads {format:?}",
         ));
     }
-    Ok((header, rest))
+    Ok((header, stanzas))
 }
 
 /// Reads a required field, naming where it was missing from.
@@ -433,12 +564,12 @@ mod tests {
     #[test]
     fn a_header_is_the_first_stanza_and_names_the_format_read() {
         let stanzas = parse("Format: plan 1\nSuite: x\n\nPackage: a\n\nPackage: b\n");
-        let (first, rest) = header(&stanzas, "plan 1").expect("the header reads");
-        assert_eq!(first.get("Suite"), Some("x"));
-        assert_eq!(rest.len(), 2);
+        let (first, rest) = header(stanzas, "plan 1").expect("the header reads");
+        assert_eq!(first.get("Suite").as_deref(), Some("x"));
+        assert_eq!(rest.count(), 2);
 
         let refusal = |text: &str| {
-            header(&parse(text), "plan 1")
+            header(parse(text), "plan 1")
                 .map(|_| ())
                 .expect_err("the document is refused")
         };
@@ -449,6 +580,60 @@ mod tests {
         // the comparison is not loosened by case or by a suffix.
         assert!(refusal("Format: PLAN 1\n").contains("format"));
         assert!(refusal("Format: plan 10\n").contains("format"));
+    }
+
+    #[test]
+    fn a_stanza_is_read_where_it_lies_and_copies_only_a_folded_value() {
+        // Reading holds nothing per field: a stanza is where it lies in the
+        // document, however many fields it has.
+        assert_eq!(size_of::<Stanza<'_>>(), size_of::<&str>());
+
+        let text = "\
+Package: one
+Depends: a,
+ b,
+\tc
+Description: short
+ first line
+not a field
+ second line
+Package: shadowed
+
+ \t
+no field here
+
+  stray continuation
+Package: two\r
+Version: 1.0\r
+";
+        let stanzas: Vec<Stanza<'_>> = parse(text).collect();
+        // The blank and whitespace-only lines end a stanza, and a run of lines
+        // holding no field is no stanza at all.
+        assert_eq!(stanzas.len(), 2);
+        let one = stanzas[0];
+        // A value on one line borrows the document.
+        assert!(matches!(one.get("package"), Some(Cow::Borrowed("one"))));
+        // A folded value joins its continuation lines, each with one leading
+        // space removed, and only it is copied to do so.
+        assert!(matches!(one.get("Depends"), Some(Cow::Owned(_))));
+        assert_eq!(one.get("Depends").as_deref(), Some("a,\nb,\n\tc"));
+        // A line that is not a field leaves the field above it its
+        // continuation lines.
+        assert_eq!(
+            one.get("Description").as_deref(),
+            Some("short\nfirst line\nsecond line"),
+        );
+        assert_eq!(one.get("Version"), None);
+        // The fields in order, a name given twice included.
+        let names: Vec<&str> = one.fields().map(|(name, _)| name).collect();
+        assert_eq!(names, ["Package", "Depends", "Description", "Package"]);
+
+        // A continuation with no field above it continues nothing, and a line
+        // ending CR LF reads as one ending LF.
+        let two = stanzas[1];
+        assert_eq!(two.fields().count(), 2);
+        assert_eq!(two.get("Package").as_deref(), Some("two"));
+        assert_eq!(two.get("version").as_deref(), Some("1.0"));
     }
 
     #[test]

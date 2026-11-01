@@ -168,10 +168,7 @@ impl Signals {
     fn install_with(
         open: impl FnOnce(&SigSet) -> Result<OwnedFd, Errno>,
     ) -> Result<Signals, RelayError> {
-        let mut blocked = SigSet::empty();
-        for signal in RELAYED {
-            blocked.insert(signal);
-        }
+        let blocked = SigSet::of(&RELAYED);
         // SAFETY: `blocked` is a live local of exactly the type the call takes.
         // Blocking the relayed set interferes with nothing in the process: the
         // standard library installs handlers only for SIGPIPE and the

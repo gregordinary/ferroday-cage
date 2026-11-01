@@ -4630,9 +4630,7 @@ mod tests {
         append_component(&mut merged, "Package: a\nVersion: 1\n");
         append_component(&mut merged, "Package: b\nVersion: 2\n");
         assert_eq!(merged, "Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n");
-        let stanzas = crate::provision::document::parse(&merged);
-        let names: Vec<_> = stanzas
-            .iter()
+        let names: Vec<_> = crate::provision::document::parse(&merged)
             .filter_map(|stanza| stanza.get("Package"))
             .collect();
         assert_eq!(names, ["a", "b"], "a component's stanza was absorbed");

@@ -72,6 +72,13 @@ before it downloads anything. The example checks on every run all the same,
 since a root that already exists is reused without a bootstrap, and its command
 needs the handler just as much.
 
+The preflight also reads the host-wide switch, `/proc/sys/fs/binfmt_misc/status`,
+and refuses a host where it reads `disabled`. A container that has not mounted
+`binfmt_misc` still runs foreign binaries through the host's registrations,
+which the kernel holds rather than the mount. There the preflight cannot see a
+registration, so it lets the bootstrap proceed, and a missing handler fails the
+first foreign binary with `ENOEXEC`.
+
 `Interpreter` also carries [`resolved`], the interpreter path canonicalized. The
 two are separate facts worth recording separately: the registration usually
 names a wrapper that is a symlink to the real binary, and repointing that

@@ -707,6 +707,12 @@ pub enum SeccompAction {
     /// Allow the syscall.
     Allow,
     /// Fail the syscall with this error number, without running it.
+    ///
+    /// The number is one through 4095, the range the C library reads a failed
+    /// syscall's result as. Zero would report a success the syscall never
+    /// performed, and a larger number would read as the value it returned, so
+    /// the build refuses either with
+    /// [`ConfigError::SeccompInvalid`](crate::ConfigError::SeccompInvalid).
     Errno(u16),
     /// Log the syscall (audit), then allow it.
     Log,
@@ -748,6 +754,38 @@ const ENOSYS: u16 = 38;
 /// The largest errno a syscall can fail with. The C library reads a raw result
 /// in `-4095..=-1` as a failure with that errno, and any other as a value.
 const MAX_ERRNO: u16 = 4095;
+
+/// Whether a filter answering a syscall with `errno` makes it fail: one through
+/// [`MAX_ERRNO`].
+///
+/// Zero answers a call with a success it never performed, so `getpid` reports
+/// pid 0 and a `clone3` caller takes itself for the new child process. A larger
+/// number reads as the value the syscall returned. [`SeccompRules::errno`]
+/// reads a spelling through this, and the build holds every errno a policy
+/// answers with to it.
+fn is_failure_errno(errno: u16) -> bool {
+    (1..=MAX_ERRNO).contains(&errno)
+}
+
+/// Refuses an errno a policy answers with that no failed syscall reports; see
+/// [`is_failure_errno`]. `answering` is the clause naming what answers with it,
+/// a syscall or one of a rule set's two actions, up to the errno itself.
+fn check_errno(answering: &str, errno: u16) -> Result<(), ConfigError> {
+    if is_failure_errno(errno) {
+        return Ok(());
+    }
+    let read_as = if errno == 0 {
+        "a success the syscall never performed"
+    } else {
+        "the value the syscall returned"
+    };
+    Err(ConfigError::SeccompInvalid {
+        reason: format!(
+            "{answering} errno {errno}, which the C library reads as {read_as}; a filter \
+             answers with an errno from 1 through {MAX_ERRNO}"
+        ),
+    })
+}
 
 /// The errno a name such as `ENOSYS` spells, in any letter case, or `None` for
 /// a name no errno has.
@@ -1015,8 +1053,9 @@ impl SyscallRule {
 /// the first syscall the filter governs). A denylist names the syscalls to
 /// refuse and allows the rest.
 ///
-/// Syscalls are named by their kernel number for the host architecture; the
-/// `syscalls` crate or `libc` provides them.
+/// Syscalls are named by their kernel number for the host architecture: `libc`
+/// provides them as constants, and [`syscall`](Self::syscall) reads one from
+/// its name.
 ///
 /// A listed syscall may carry [argument conditions](SeccompArg) through
 /// [`rule`](Self::rule), so the listed action applies only to invocations
@@ -1118,9 +1157,35 @@ impl SeccompRules {
     /// conditions: one of the two would silently lose, so the build refuses
     /// the policy with
     /// [`ConfigError::SeccompInvalid`](crate::ConfigError::SeccompInvalid).
+    /// The build refuses an `errno` outside one through 4095 the same way, for
+    /// the reason [`SeccompAction::Errno`] gives; [`errno`](Self::errno) reads
+    /// a name or a number into that range.
     pub fn errno_for(mut self, syscall: i64, errno: u16) -> SeccompRules {
         self.errnos.insert(syscall, errno);
         self
+    }
+
+    /// The syscall number `name` spells on the host architecture, as
+    /// [`denying`](Self::denying), [`allowing`](Self::allowing),
+    /// [`rule`](Self::rule) and [`errno_for`](Self::errno_for) take it, or
+    /// `None` where the host has no syscall of that name.
+    ///
+    /// The name is the kernel's, spelled exactly, and resolves through the
+    /// table a profile's syscall names resolve through. A syscall another
+    /// architecture has and this one lacks, such as `open` on aarch64, has no
+    /// number here.
+    ///
+    /// ```
+    /// use ferroday_cage::SeccompRules;
+    ///
+    /// assert_eq!(SeccompRules::syscall("clone3"), Some(libc::SYS_clone3));
+    /// assert_eq!(SeccompRules::syscall("CLONE3"), None);
+    /// assert_eq!(SeccompRules::syscall("nosuchcall"), None);
+    /// ```
+    pub fn syscall(name: &str) -> Option<i64> {
+        name.parse::<syscalls::Sysno>()
+            .ok()
+            .map(|sysno| i64::from(sysno.id()))
     }
 
     /// The errno `spelling` names, as [`errno_for`](Self::errno_for) takes it,
@@ -1144,7 +1209,7 @@ impl SeccompRules {
     /// ```
     pub fn errno(spelling: &str) -> Option<u16> {
         match spelling.parse::<u16>() {
-            Ok(number) => (1..=MAX_ERRNO).contains(&number).then_some(number),
+            Ok(number) => is_failure_errno(number).then_some(number),
             Err(_) => errno_named(spelling),
         }
     }
@@ -2089,6 +2154,9 @@ fn x32_deny_prologue() -> [SockFilter; 5] {
 /// syscall the listed action governs. The one per-syscall action is the errno
 /// of `errnos`, which seccompiler cannot express and a prologue of its own
 /// carries; a syscall given one may not be listed as well.
+///
+/// Every errno the filter answers with, the two actions' and those of
+/// `errnos`, is held to [`check_errno`] before anything is compiled.
 fn compile_filter(
     default_action: SeccompAction,
     listed_action: SeccompAction,
@@ -2098,6 +2166,17 @@ fn compile_filter(
     let arch = host_target_arch()?;
     for &syscall in rules.iter().map(|rule| &rule.syscall).chain(errnos.keys()) {
         check_syscall_number(syscall)?;
+    }
+    for (answering, action) in [
+        ("the default action answers with", default_action),
+        ("the listed action answers with", listed_action),
+    ] {
+        if let SeccompAction::Errno(errno) = action {
+            check_errno(answering, errno)?;
+        }
+    }
+    for (&syscall, &errno) in errnos {
+        check_errno(&format!("syscall number {syscall} is answered with"), errno)?;
     }
     if let Some(rule) = rules.iter().find(|rule| errnos.contains_key(&rule.syscall)) {
         return Err(ConfigError::SeccompInvalid {
@@ -2798,9 +2877,7 @@ pub(crate) mod serde_request {
 
     /// Resolves one syscall name to its number for the host architecture.
     fn resolve_syscall(name: &str) -> Result<i64, String> {
-        name.parse::<Sysno>()
-            .map(|sysno| i64::from(sysno.id()))
-            .map_err(|_| format!("unknown syscall {name:?}"))
+        SeccompRules::syscall(name).ok_or_else(|| format!("unknown syscall {name:?}"))
     }
 
     /// Resolves an errno name, such as `ENOSYS`, to its number, in any letter
@@ -3934,6 +4011,53 @@ mod tests {
     }
 
     #[test]
+    fn an_errno_no_failed_syscall_reports_is_refused() {
+        // Zero answers a call with a success it never performed: `getpid`
+        // reports pid 0, and a `clone3` caller takes itself for the child.
+        // Past 4095 the C library reads the answer as a returned value.
+        for errno in [0, MAX_ERRNO + 1, u16::MAX] {
+            for (rules, names) in [
+                (
+                    SeccompRules::denying([]).errno_for(libc::SYS_clone3, errno),
+                    format!("syscall number {}", libc::SYS_clone3),
+                ),
+                (
+                    SeccompRules::denying([libc::SYS_acct])
+                        .listed_action(SeccompAction::Errno(errno)),
+                    "the listed action".to_string(),
+                ),
+                (
+                    SeccompRules::allowing([libc::SYS_read])
+                        .default_action(SeccompAction::Errno(errno)),
+                    "the default action".to_string(),
+                ),
+            ] {
+                match compile_seccomp(&SeccompPolicy::Rules(rules)) {
+                    Err(ConfigError::SeccompInvalid { reason }) => {
+                        assert!(reason.contains(&names), "{reason}");
+                        assert!(reason.contains(&format!("errno {errno},")), "{reason}");
+                    }
+                    other => panic!("errno {errno} from {names} is refused: {other:?}"),
+                }
+            }
+        }
+        // The two ends of the range are errnos a syscall fails with.
+        for errno in [1, MAX_ERRNO] {
+            for rules in [
+                SeccompRules::denying([]).errno_for(libc::SYS_clone3, errno),
+                SeccompRules::denying([libc::SYS_acct]).listed_action(SeccompAction::Errno(errno)),
+                SeccompRules::allowing([libc::SYS_read])
+                    .default_action(SeccompAction::Errno(errno)),
+            ] {
+                assert!(
+                    compile_seccomp(&SeccompPolicy::Rules(rules)).is_ok(),
+                    "{errno}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_curated_denylist_reaches_the_newer_mount_and_pidfd_calls() {
         use syscalls::Sysno;
         let list = curated_denylist();
@@ -3999,8 +4123,12 @@ errno = { clone3 = "enosys" }
 
     #[test]
     fn an_unknown_errno_or_scope_is_refused() {
+        // A profile names an errno and does not number one, so no table can
+        // spell zero or a number past the range a failed syscall reports.
         for profile in [
             "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening.seccomp]\nerrno = { clone3 = \"ENOPE\" }\n",
+            "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening.seccomp]\nerrno = { clone3 = \"0\" }\n",
+            "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening.seccomp]\nerrno = { getpid = \"4096\" }\n",
             "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening]\nlandlock-scope = [\"signals\"]\n",
         ] {
             assert!(toml::from_str::<CageBuilder>(profile).is_err(), "{profile}");

@@ -490,6 +490,46 @@ fn the_handle_kills_a_running_command() {
 }
 
 #[test]
+fn the_restrictions_supervisor_outlives_the_signals_sent_to_its_group() {
+    if !common::seccomp() {
+        return;
+    }
+    // A restriction's command is supervised from outside by the launch stage,
+    // an ordinary member of the caller's process group, where a terminal's
+    // interrupt and a shell's `kill %1` reach it alike. None of them may end
+    // it: the outcome would be lost, and a command in a session of its own
+    // would run on unsupervised.
+    let mut running = Restriction::builder()
+        .command("/bin/sh")
+        .args(["-c", "sleep 1; exit 7"])
+        .seccomp(SeccompPolicy::Curated)
+        .stdin(Stdio::Null)
+        .build()
+        .expect("a valid restriction configuration")
+        .spawn()
+        .expect("the restriction launches");
+    let status = std::fs::read_to_string(format!("/proc/{}/status", running.pid()))
+        .expect("the command is alive");
+    let launch_stage = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|parent| parent.trim().parse().ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("the command has a parent");
+    for signal in common::GROUP_SIGNALS {
+        rustix::process::kill_process(launch_stage, signal)
+            .expect("the launch stage is alive to be signalled");
+    }
+    match running.wait_timeout(Duration::from_secs(30)) {
+        Ok(Some(status)) => assert_eq!(status.code(), Some(7)),
+        other => {
+            let _ = running.kill();
+            panic!("the outcome was not collected: {other:?}");
+        }
+    }
+}
+
+#[test]
 fn landlock_grants_a_single_file_and_a_device_node() {
     if !common::landlock() {
         return;

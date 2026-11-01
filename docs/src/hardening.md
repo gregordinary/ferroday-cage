@@ -174,7 +174,8 @@ available through [`SeccompPolicy`]:
   allow-list names the syscalls the command may make and denies the rest, so it
   must include every syscall the command needs. A deny-list names the syscalls
   to refuse and allows the rest. Syscalls are named by their kernel number for
-  the host architecture.
+  the host architecture, which [`SeccompRules::syscall`] reads from a name such
+  as `clone3`.
 - `Program` — a pre-compiled BPF program ([`SockFilter`] instructions),
   installed verbatim, for a policy produced by an external compiler.
 
@@ -259,7 +260,10 @@ let status = Cage::builder()
 ```
 
 A syscall answered this way cannot also be listed, since one of the two answers
-would never apply. The build refuses that policy.
+would never apply. The build refuses that policy. It also refuses an errno
+outside 1 through 4095, whether given here or as a `SeccompAction::Errno`. Zero
+reports a success the syscall never performed, and the C library reads a larger
+number as the value the syscall returned.
 
 The filter binds the command and its descendants. Seccomp filtering is available
 on the `x86_64`, `aarch64`, and `riscv64` architectures; a policy on any other
@@ -504,6 +508,7 @@ with no sandbox around it.
 [`SeccompPolicy`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.SeccompPolicy.html
 [`SeccompRules`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html
 [`SeccompRules::rule`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.rule
+[`SeccompRules::syscall`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.syscall
 [`SeccompArg`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompArg.html
 [`SockFilter`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SockFilter.html
 [`drop_all_capabilities`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.drop_all_capabilities

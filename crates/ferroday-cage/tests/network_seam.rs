@@ -8,7 +8,7 @@ use common::{Collect, process_exists, sleeper, wait_gone};
 
 use std::time::Duration;
 
-use ferroday_cage::{Cage, Network};
+use ferroday_cage::{Cage, Error, Network, SetupStep};
 
 /// The network namespace a process is in, as the `net:[...]` symlink target
 /// under `/proc/<pid>/ns/net`.
@@ -145,4 +145,39 @@ fn abandoning_a_pending_launch_tears_the_sandbox_down() {
         wait_gone(pid, Duration::from_secs(5)),
         "the abandoned sandbox outlived its pending handle",
     );
+}
+
+#[test]
+fn a_setup_step_that_fails_before_the_gate_fails_the_pending_launch() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // With a PID namespace the init sets the sandbox up after it is published,
+    // so a pending launch is handed out only once the command reports itself
+    // at the gate. A working directory the root lacks fails the setup there,
+    // and the process `netns_pid` would have named is gone; the launch reports
+    // the step rather than a handle naming a process that has exited.
+    for pid_namespace in [true, false] {
+        let result = Cage::builder()
+            .rootfs(rootfs)
+            .pid_namespace(pid_namespace)
+            .current_dir("/no/such/directory")
+            .command("/bin/true")
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn_pending();
+        match result {
+            Err(Error::Setup {
+                step: SetupStep::ChdirWorkdir,
+                ..
+            }) => {}
+            Err(other) => panic!("pid_namespace = {pid_namespace}: {other:?}"),
+            Ok(pending) => panic!(
+                "pid_namespace = {pid_namespace}: a pending launch over a failed setup, naming \
+                 {} (alive: {})",
+                pending.netns_pid(),
+                process_exists(pending.netns_pid()),
+            ),
+        }
+    }
 }

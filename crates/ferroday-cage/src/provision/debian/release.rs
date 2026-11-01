@@ -8,6 +8,7 @@
 //! every fetch below the release is checked against a digest that chains back to
 //! the signature.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::provision::digest::Algorithm;
@@ -79,7 +80,6 @@ impl Release {
     /// `Release`).
     pub(crate) fn parse(body: &str) -> Result<Release, Refusal> {
         let stanza = document::parse(body)
-            .into_iter()
             .next()
             .ok_or_else(|| "the release file is empty".to_string())?;
 
@@ -126,9 +126,9 @@ impl Release {
             hashes,
             acquire_by_hash: marked("Acquire-By-Hash"),
             priority,
-            architectures: split_ws(stanza.get("Architectures")),
-            components: split_ws(stanza.get("Components")),
-            valid_until: stanza.get("Valid-Until").map(str::to_string),
+            architectures: split_ws(stanza.get("Architectures").as_deref()),
+            components: split_ws(stanza.get("Components").as_deref()),
+            valid_until: stanza.get("Valid-Until").map(Cow::into_owned),
             date: stanza.get("Date").map(|value| value.trim().to_string()),
             suite: stanza.get("Suite").map(|value| value.trim().to_string()),
             codename: stanza.get("Codename").map(|value| value.trim().to_string()),

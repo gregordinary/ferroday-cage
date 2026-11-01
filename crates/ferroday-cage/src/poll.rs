@@ -1,9 +1,10 @@
 //! The `poll` discipline: how a loop states its timeout, and how it stops
 //! watching a channel it is finished with.
 //!
-//! Both answers are subtle enough to be worth stating once. The supervisor
-//! loop, the network stack's pump, and the terminal relay each block in `poll`
-//! with a deadline and each retire channels as they close.
+//! Both answers are subtle enough to be worth stating once. The running
+//! handle's pump, the supervisor loop, the network stack's pump, and the
+//! terminal relay each block in `poll` with a deadline and each retire channels
+//! as they close.
 //!
 //! # A retired channel leaves the polled slice
 //!
@@ -17,10 +18,11 @@
 //! unless that descriptor can never hang up, which is a property of its kind
 //! rather than of who holds it. A pidfd is the trap here: the loop holds it
 //! for its whole life and it stays valid, yet it reports `POLLHUP` once its
-//! process has been reaped. So no slot holds a placeholder. The supervisor
-//! loop gathers its live channels to the front of a fixed array and polls only
-//! those. The terminal relay's one retiring channel, the caller's input, is
-//! last, so it shortens the slice.
+//! process has been reaped. So no slot holds a placeholder. The running
+//! handle's pump gathers its live channels to the front of a fixed array and
+//! polls only those. The supervisor loop has one retiring channel, the control
+//! socket, and the terminal relay one, the caller's input; each sits at one end
+//! of its array, so retiring it shortens the slice.
 
 use std::time::Duration;
 

@@ -12,6 +12,7 @@
 //! numbering is independent, so neither can be read as the other and neither
 //! moves when the other does.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::AlpineError;
@@ -446,14 +447,14 @@ impl Plan {
     /// fetched and cached under, the identity is what the package is bound by,
     /// and the architecture is recorded in the root's installed database.
     pub fn parse_document(text: &str) -> Result<Plan, AlpineError> {
-        let stanzas = document::parse(text);
-        let (header, rest) = document::header(&stanzas, FORMAT).map_err(plan_document)?;
+        let (header, rest) =
+            document::header(document::parse(text), FORMAT).map_err(plan_document)?;
         let mut plan = Plan {
             release: required(header.get("Release"), "Release", "the header")?,
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             packages: Vec::new(),
             indexes: Vec::new(),
-            carried: document::carried(header, HEADER_FIELDS),
+            carried: document::carried(&header, HEADER_FIELDS),
         };
 
         for stanza in rest {
@@ -487,8 +488,8 @@ impl Plan {
                         "Installed-Size",
                         &at_package,
                     )?,
-                    origin: stanza.get("Origin").map(str::to_string),
-                    carried: document::carried(stanza, PACKAGE_FIELDS),
+                    origin: stanza.get("Origin").map(Cow::into_owned),
+                    carried: document::carried(&stanza, PACKAGE_FIELDS),
                 };
                 // The document is the only thing behind a plan read this way, so
                 // the shape an index would have guaranteed is checked here.
@@ -520,11 +521,11 @@ impl Plan {
             plan.indexes.push(ResolvedIndex {
                 mirror: required(stanza.get("Mirror"), "Mirror", &at_index)?,
                 release: required(stanza.get("Release"), "Release", &at_index)?,
-                component: stanza.get("Component").map(str::to_string),
+                component: stanza.get("Component").map(Cow::into_owned),
                 sha256: required(stanza.get("SHA256"), "SHA256", &at_index)?,
                 signed_by: required(stanza.get("Signed-By"), "Signed-By", &at_index)?,
-                description: stanza.get("Description").map(str::to_string),
-                carried: document::carried(stanza, INDEX_FIELDS),
+                description: stanza.get("Description").map(Cow::into_owned),
+                carried: document::carried(&stanza, INDEX_FIELDS),
             });
         }
         Ok(plan)
@@ -591,19 +592,19 @@ fn render(stanza: &Draft, out: &mut String) -> Result<(), AlpineError> {
 }
 
 /// Reads a required field, reporting a refusal the same way.
-fn required(value: Option<&str>, field: &str, at: &str) -> Result<String, AlpineError> {
-    document::required(value, field, at).map_err(plan_document)
+fn required(value: Option<Cow<'_, str>>, field: &str, at: &str) -> Result<String, AlpineError> {
+    document::required(value.as_deref(), field, at).map_err(plan_document)
 }
 
 /// Reads an optional numeric field, reporting a refusal the same way.
 ///
 /// The rule is [`document::number`]'s.
 fn number<T: std::str::FromStr + std::fmt::Display>(
-    value: Option<&str>,
+    value: Option<Cow<'_, str>>,
     field: &str,
     at: &str,
 ) -> Result<Option<T>, AlpineError> {
-    document::number(value, field, at).map_err(plan_document)
+    document::number(value.as_deref(), field, at).map_err(plan_document)
 }
 
 /// Builds the document error.
