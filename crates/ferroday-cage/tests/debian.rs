@@ -1152,6 +1152,50 @@ fn hermetic_a_pipe_at_the_index_a_publish_merges_into_fails_it_promptly() {
 }
 
 #[test]
+fn hermetic_a_pipe_or_link_offered_as_a_deb_is_refused_without_being_read() {
+    // A pipeline publishes what its build sandbox left in a directory the
+    // sandbox could write. A named pipe there called `x.deb` would hold the
+    // publish forever on its open, and a link called `x.deb` would have the
+    // host read a file the sandbox chose and copy it into the pool. Each is
+    // refused, promptly, naming the path, and the pool gains nothing.
+    let dir = common::scratch_dir("debian-pool-planted-input");
+    let pool = dir.join("pool");
+    trixie_pool(&pool).publish::<&Path>([]).unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let pipe = out.join("pipe.deb");
+    make_fifo(&pipe);
+    let outside = dir.join("outside.deb");
+    std::fs::write(
+        &outside,
+        deb_with_control(
+            "Package: planted\nVersion: 1.0\nArchitecture: amd64\nDescription: chosen\n",
+            &Tar::new().dir("./usr", 0o755).finish(),
+        ),
+    )
+    .unwrap();
+    let link = out.join("link.deb");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    for planted in [pipe, link] {
+        match publish_within_deadline(&pool, vec![planted.clone()]) {
+            Err(ferroday_cage::provision::debian::DebianError::Io { path, .. }) => {
+                assert_eq!(path, planted, "the failure names the path offered");
+            }
+            other => panic!(
+                "{} is refused as a host failure: {other:?}",
+                planted.display()
+            ),
+        }
+    }
+    assert!(
+        !pool.join("pool/main/p").exists(),
+        "nothing the link named was copied into the pool",
+    );
+}
+
+#[test]
 fn hermetic_a_link_at_another_components_index_is_not_named() {
     // Each publish rescans the suite and names every index it holds, so the
     // scan reads indexes this publish did not write. A link at one of them is
@@ -2414,6 +2458,13 @@ fn layered_build_under_a_range_map_disposes_of_a_subordinate_owned_upper() {
         provision::ensure(&base, &mut debian).expect("the range-mapped base bootstrap runs");
     }
 
+    // The caller's overlay writes beneath `/var/mail`, which the base holds at
+    // `root:mail` with the set-group-ID bit, so the upper has to carry that
+    // directory up to hold the file.
+    let overlay = scratch.join("overlay");
+    std::fs::create_dir_all(overlay.join("var/mail")).unwrap();
+    std::fs::write(overlay.join("var/mail/note"), b"from the overlay\n").unwrap();
+
     let upper = scratch.join("upper");
     let layer = {
         let mut progress = |event: DebianEvent<'_>| {
@@ -2426,6 +2477,7 @@ fn layered_build_under_a_range_map_disposes_of_a_subordinate_owned_upper() {
             .identity_map(ferroday_cage::IdentityMap::Subordinate)
             .base_layer(&base)
             .include(["hello"])
+            .pre_configure_overlay(&overlay)
             .cache_dir(common::download_cache("debian"))
             .build()
             .expect("the builder validates");
@@ -2454,6 +2506,32 @@ fn layered_build_under_a_range_map_disposes_of_a_subordinate_owned_upper() {
     assert!(
         status.success(),
         "hello runs in the range-mapped build root"
+    );
+
+    // The directory the overlay was carried beneath keeps the owner, group and
+    // mode the base holds it at, in the merged view, as the overlay's own
+    // copy-up would have kept them.
+    assert!(
+        upper.join("var/mail/note").is_file(),
+        "carried into the upper"
+    );
+    let mail = |cage: ferroday_cage::CageBuilder| {
+        let output = cage
+            .identity_map(ferroday_cage::IdentityMap::Subordinate)
+            .command("/usr/bin/stat")
+            .args(["-c", "%U:%G %a", "/var/mail"])
+            .build()
+            .expect("the cage builds")
+            .output()
+            .expect("stat runs");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let held = mail(ferroday_cage::Cage::builder().rootfs(&base));
+    assert_eq!(held, "root:mail 2775\n", "the base's own /var/mail");
+    assert_eq!(
+        mail(ferroday_cage::Cage::builder().overlay_rootfs(&base, layer.path())),
+        held,
+        "the merged view's /var/mail is the base's",
     );
 
     // Disposal escalates through the map: the subordinate-owned upper and the

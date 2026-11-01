@@ -9,7 +9,7 @@
 //!
 //! `apk` interleaves: it unpacks one package, runs its scripts, and moves on.
 //! This layer unpacks the whole closure and then runs every script, which is the
-//! Debian layer's shape and the one this phase is proving generalizes.
+//! Debian layer's shape as well.
 //!
 //! The order the scripts run in is what makes the two equivalent. It is a
 //! dependency order, not the closure's name order, because Alpine's base
@@ -36,16 +36,40 @@
 //! situation for the same reason. Alpine's own scripts tolerate it — every one
 //! in the base closure ends `exit 0` — so nothing is stubbed out on their
 //! behalf. A range identity map makes the same call succeed.
+//!
+//! # The owner a package states
+//!
+//! The extraction lays every entry down as the calling user, whom the root's
+//! identity map presents as root. An entry a package states another owner for —
+//! `dbus-daemon-launch-helper`, `root:messagebus` and setuid — is given that
+//! owner here, between the package's `.pre-install` and its `.post-install`,
+//! which is where `apk` gives it: as it lays the entry down, after the
+//! pre-install has created the accounts the owner is named by. The owner is
+//! named the way `apk` names it, by the name the archive records, looked up in
+//! the root's own `/etc/passwd` and `/etc/group`, with the archive's id where
+//! the root has no such account. A child entered into the root's map applies
+//! it, since nothing outside the map can, and the installed database records
+//! the ids it applied.
+//!
+//! Under the single-identity map no id but root exists, so no entry is given
+//! another owner, and the database records the root that every entry is.
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
+
+use rustix::fs::Stat;
 
 use super::installed::{DB_DIR, Database, EXEC_DIR};
 use super::repository::Repository;
 use super::{AlpineError, AlpineEvent, AlpineObserver};
 use crate::provision::Stream;
 use crate::provision::accounts;
+use crate::provision::copyin::{self, Owed, Owner};
+use crate::provision::identity::Ownership;
 use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
 use crate::{IdMapper, IdentityMap, Observer, Stdio};
@@ -79,6 +103,16 @@ const SCRIPT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// then share.
 const MACHINE_ID: &str = "etc/machine-id";
 
+/// The most directories one run of a trigger is handed.
+///
+/// A trigger's matches are its arguments, one per directory, so a run past
+/// this would near the kernel's ceiling on a command's arguments and fail to
+/// launch rather than run. A trigger in a real root matches a handful of
+/// directories: Alpine's patterns name a directory, or one directory's
+/// immediate subdirectories. The refusal names the package, where a failed
+/// launch would name nothing useful.
+const MAX_TRIGGER_MATCHES: usize = 16 * 1024;
+
 /// The state a finished root hands back to `apk`, beside its database.
 ///
 /// One value because a layered build supplies a different one of each: its
@@ -98,6 +132,10 @@ pub(super) struct State<'a> {
     /// A tree already holding keys that this one shadows rather than replaces,
     /// which is a layered build's base. `None` for a full bootstrap.
     pub(super) beneath: Option<&'a Rooted>,
+    /// The identity map the tree is owned through, which a directory a write
+    /// carries up from [`beneath`](Self::beneath) is given the base's
+    /// ownership through.
+    pub(super) ownership: &'a Ownership,
 }
 
 /// Where an install script runs: the tree, how a cage is rooted on it, the map
@@ -127,7 +165,9 @@ pub(super) struct Site<'a> {
 /// and writes the state the finished root hands back to `apk`.
 ///
 /// `order` is the dependency order the closure was laid down in, and the one the
-/// scripts run in. `carried` is the trigger subjects of packages a layered
+/// scripts run in. Between a package's pre-install and its post-install, the
+/// entries it states another owner for are [given](reown_declared) that owner,
+/// and `database` records it. `carried` is the trigger subjects of packages a layered
 /// build's base already holds, empty for a full bootstrap; they fire for the
 /// directories this wave created exactly as the closure's own do, because a
 /// trigger belongs to the installed root rather than to the transaction that ran
@@ -139,9 +179,9 @@ pub(super) struct Site<'a> {
 /// build does both in the upper.
 pub(super) fn configure(
     site: Site<'_>,
-    database: &Database,
-    order: &[ScriptSubject],
-    carried: &[ScriptSubject],
+    database: &mut Database,
+    order: &[ScriptSubject<'_>],
+    carried: &[ScriptSubject<'_>],
     state: &State<'_>,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
@@ -155,28 +195,16 @@ pub(super) fn configure(
         None => None,
     };
 
+    let mut owned = false;
     for subject in order {
-        for kind in [ScriptKind::PreInstall, ScriptKind::PostInstall] {
-            let Some(body) = subject.script(kind) else {
-                continue;
-            };
-            if observer.cancelled() {
-                return Err(AlpineError::Cancelled);
-            }
-            observer.progress(AlpineEvent::Script {
-                package: &subject.name,
-                script: kind.name(),
-            });
-            run(
-                site,
-                &tree,
-                subject,
-                kind,
-                body,
-                std::slice::from_ref(&subject.version),
-                observer,
-            )?;
-        }
+        run_script(site, &tree, subject, ScriptKind::PreInstall, observer)?;
+        owned |= reown_declared(site, &tree, state, database, &subject.declared)?;
+        run_script(site, &tree, subject, ScriptKind::PostInstall, observer)?;
+    }
+    // Written before any script ran, so the scripts read the database of the
+    // root they run in, and again here once it records owners other than root.
+    if owned {
+        write_installed(&tree, database)?;
     }
 
     fire_triggers(site, &tree, database, order, carried, observer)?;
@@ -185,6 +213,95 @@ pub(super) fn configure(
         (Some(epoch), Some(found)) => date_accounts(&tree, &found, epoch),
         _ => Ok(()),
     }
+}
+
+/// Runs `subject`'s script of `kind`, where the package carries one, after
+/// asking the observer whether to stop.
+fn run_script(
+    site: Site<'_>,
+    tree: &Rooted,
+    subject: &ScriptSubject<'_>,
+    kind: ScriptKind,
+    observer: &mut dyn AlpineObserver,
+) -> Result<(), AlpineError> {
+    let Some(body) = subject.script(kind) else {
+        return Ok(());
+    };
+    if observer.cancelled() {
+        return Err(AlpineError::Cancelled);
+    }
+    observer.progress(AlpineEvent::Script {
+        package: &subject.name,
+        script: kind.name(),
+    });
+    run(
+        site,
+        tree,
+        subject,
+        kind,
+        body,
+        &[subject.version.as_str()],
+        observer,
+    )
+}
+
+/// Gives each entry in `declared` the owner its package states, and records the
+/// ids in `database`, reporting whether any entry was given one.
+///
+/// The names are looked up in the root's accounts as they stand now, which is
+/// after the package's pre-install, as `apk` looks them up. A layered build's
+/// base is `state`'s `beneath`, whose accounts the root sees where its upper
+/// holds none. An owner that resolves to root is the one the entry already
+/// has. So is every owner under the single-identity map, which can represent no
+/// other, and nothing is given there.
+///
+/// An entry is given its owner only while its name still holds what the
+/// package laid down, which is checked here and again by the child that
+/// applies it ([`copyin::reown`]). A caller's pre-configure overlay or an
+/// earlier script may have replaced it, and the replacement is not the entry
+/// the owner was stated for.
+fn reown_declared(
+    site: Site<'_>,
+    tree: &Rooted,
+    state: &State<'_>,
+    database: &mut Database,
+    declared: &[Declared],
+) -> Result<bool, AlpineError> {
+    if declared.is_empty() || matches!(site.identity_map, IdentityMap::Single) {
+        return Ok(false);
+    }
+    let [passwd, group] = accounts::ACCOUNTS;
+    let users = accounts::ids(tree, state.beneath, passwd).map_err(accounts_failure)?;
+    let groups = accounts::ids(tree, state.beneath, group).map_err(accounts_failure)?;
+    let mut owed = Vec::new();
+    for entry in declared {
+        let uid = users.get(&entry.uname).copied().unwrap_or(entry.uid);
+        let gid = groups.get(&entry.gname).copied().unwrap_or(entry.gid);
+        if (uid, gid) == (0, 0) {
+            continue;
+        }
+        let relative = Path::new(OsStr::from_bytes(&entry.path));
+        let held = tree
+            .stat(relative)
+            .map_err(AlpineError::at("inspecting an entry", tree.path(relative)))?;
+        if !held.is_some_and(|stat| entry.is(&stat)) {
+            continue;
+        }
+        database
+            .record(entry.record)
+            .own(&entry.path, entry.directory, uid, gid);
+        owed.push(Owed {
+            path: entry.path.clone(),
+            owner: Owner::Tree { uid, gid },
+            dev: entry.dev,
+            ino: entry.ino,
+        });
+    }
+    if owed.is_empty() {
+        return Ok(false);
+    }
+    copyin::reown(site.staging, &owed, state.ownership).map_err(AlpineError::Ownership)?;
+    Ok(true)
 }
 
 /// Removes what the scripts leave that belongs to their run rather than to the
@@ -255,20 +372,31 @@ fn accounts_failure(failure: accounts::Failure) -> AlpineError {
 /// A layered build's `carried` subjects are the base's own trigger-watching
 /// packages, and they run first: they were installed first, and a base's trigger
 /// is the one that knows what to do about the directory it watches.
+///
+/// The directories are spelled as a trigger receives them once, here, rather
+/// than once per pattern that is matched against them. A base's patterns come
+/// from a file its own scripts could have rewritten, and what holds the work to
+/// the size of the install is that every subject is matched against this one
+/// list.
 fn fire_triggers(
     site: Site<'_>,
     tree: &Rooted,
     database: &Database,
-    order: &[ScriptSubject],
-    carried: &[ScriptSubject],
+    order: &[ScriptSubject<'_>],
+    carried: &[ScriptSubject<'_>],
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
-    let directories = database.directories();
+    let mut directories: Vec<String> = database
+        .directories()
+        .into_iter()
+        .map(|directory| format!("/{}", String::from_utf8_lossy(&directory)))
+        .collect();
+    directories.sort_unstable();
     for subject in carried.iter().chain(order) {
         let Some(body) = subject.script(ScriptKind::Trigger) else {
             continue;
         };
-        let matched = subject.triggered_by(&directories);
+        let matched = subject.triggered_by(&directories)?;
         if matched.is_empty() {
             continue;
         }
@@ -300,10 +428,10 @@ fn fire_triggers(
 fn run(
     site: Site<'_>,
     tree: &Rooted,
-    subject: &ScriptSubject,
+    subject: &ScriptSubject<'_>,
     kind: ScriptKind,
     body: &[u8],
-    args: &[String],
+    args: &[&str],
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
     // The name apk gives it, so a script that inspects `$0` sees what it would
@@ -328,9 +456,9 @@ fn run(
 fn launch(
     site: Site<'_>,
     script: &str,
-    subject: &ScriptSubject,
+    subject: &ScriptSubject<'_>,
     kind: ScriptKind,
-    args: &[String],
+    args: &[&str],
     observer: &mut dyn AlpineObserver,
 ) -> Result<(), AlpineError> {
     let Site {
@@ -414,13 +542,22 @@ pub(super) fn register(
 fn open_tree(staging: &Path, state: &State<'_>) -> Result<Rooted, AlpineError> {
     Rooted::open(staging)
         .and_then(|tree| tree.over(state.beneath))
+        .map(|tree| tree.owned_through(state.ownership.clone()))
         .map_err(AlpineError::at("opening the tree", staging))
+}
+
+/// Writes the installed database alone, for a run that has recorded owners in
+/// it since [`write_state`] wrote it whole.
+fn write_installed(tree: &Rooted, database: &Database) -> Result<(), AlpineError> {
+    let path = format!("{DB_DIR}/installed");
+    tree.write(&path, &database.installed())
+        .map_err(AlpineError::at("writing the database", tree.path(&path)))
 }
 
 /// Writes the database and the `/etc/apk` state.
 fn write_state(tree: &Rooted, database: &Database, state: &State<'_>) -> Result<(), AlpineError> {
+    write_installed(tree, database)?;
     for (name, contents) in [
-        ("installed", database.installed()),
         ("triggers", database.triggers()),
         (
             "scripts.tar",
@@ -501,50 +638,111 @@ fn write_keys(tree: &Rooted, state: &State<'_>) -> Result<(), AlpineError> {
 /// A package's scripts, and what a run of one needs to know about it.
 ///
 /// Assembled during the extraction so the configure wave holds no package
-/// container: everything below is a few kilobytes of shell per package.
-pub(super) struct ScriptSubject {
+/// container: everything below is a few kilobytes of shell per package. A
+/// layered build's base contributes subjects too, which borrow their script and
+/// their patterns from the base's own files rather than holding a copy each.
+pub(super) struct ScriptSubject<'a> {
     /// The package name, which names the script file and reaches its scripts.
     pub(super) name: String,
     /// The version, which names the script file and is a script's one argument.
     pub(super) version: String,
     /// The scripts the package carried.
-    pub(super) scripts: Vec<(ScriptKind, Vec<u8>)>,
+    pub(super) scripts: Vec<(ScriptKind, Cow<'a, [u8]>)>,
     /// The path patterns whose contents changing runs the trigger.
-    pub(super) triggers: Vec<String>,
+    pub(super) triggers: Vec<Cow<'a, str>>,
+    /// The entries the package laid down that state an owner other than root,
+    /// which are given it after the package's pre-install. Empty for a base's
+    /// package, whose entries are the base's.
+    pub(super) declared: Vec<Declared>,
 }
 
-impl ScriptSubject {
+/// An entry a package laid down that states an owner other than root, as the
+/// package's archive states it.
+///
+/// See the [module documentation](self) for how the owner is resolved and
+/// where it is applied.
+#[derive(Debug, Clone)]
+pub(super) struct Declared {
+    /// The installed record of the package that laid it down.
+    pub(super) record: usize,
+    /// Its path, as the package spells it.
+    pub(super) path: Vec<u8>,
+    /// Whether it is a directory, which the database records apart from files.
+    pub(super) directory: bool,
+    /// The owning user's name, as the archive records it.
+    pub(super) uname: Vec<u8>,
+    /// The owning group's name.
+    pub(super) gname: Vec<u8>,
+    /// The owning user's id, which stands where the root has no account named
+    /// [`uname`](Self::uname).
+    pub(super) uid: u32,
+    /// The owning group's id, which stands where the root has no group named
+    /// [`gname`](Self::gname).
+    pub(super) gid: u32,
+    /// The device the entry was laid down on.
+    pub(super) dev: u64,
+    /// Its inode number then, which with [`dev`](Self::dev) tells it apart
+    /// from anything that has taken its name since.
+    pub(super) ino: u64,
+}
+
+impl Declared {
+    /// Whether `stat` is the entry this was laid down as.
+    pub(super) fn is(&self, stat: &Stat) -> bool {
+        stat.st_dev == self.dev && stat.st_ino == self.ino
+    }
+}
+
+impl ScriptSubject<'_> {
     /// The body of `kind`, where the package carries one.
     fn script(&self, kind: ScriptKind) -> Option<&[u8]> {
         self.scripts
             .iter()
             .find(|(carried, _)| *carried == kind)
-            .map(|(_, body)| body.as_slice())
+            .map(|(_, body)| body.as_ref())
     }
 
-    /// The directories this package's triggers match, in path order.
+    /// The `directories` this package's triggers match, each once and in the
+    /// order given, which [`fire_triggers`] makes path order.
     ///
     /// A pattern must be absolute — `apk` skips one that is not — and a leading
     /// `+` marks it as firing only for a directory that changed, which for a
-    /// root being created is every directory it holds.
-    fn triggered_by(&self, directories: &HashSet<Vec<u8>>) -> Vec<String> {
-        let mut matched: Vec<String> = Vec::new();
-        for pattern in &self.triggers {
-            let pattern = pattern.strip_prefix('+').unwrap_or(pattern);
-            if !pattern.starts_with('/') {
-                continue;
-            }
-            let pattern = Glob::parse(pattern.as_bytes());
-            for directory in directories {
-                let rooted = format!("/{}", String::from_utf8_lossy(directory));
-                if pattern.matches(rooted.as_bytes()) {
-                    matched.push(rooted);
-                }
-            }
+    /// root being created is every directory it holds. A directory is taken at
+    /// the first pattern it matches, as `apk` takes it, so the result is never
+    /// longer than the list it is drawn from however many patterns there are.
+    ///
+    /// # Errors
+    ///
+    /// [`AlpineError::Config`] when more than [`MAX_TRIGGER_MATCHES`]
+    /// directories match, which is more than one run of the trigger is handed.
+    fn triggered_by<'d>(&self, directories: &'d [String]) -> Result<Vec<&'d str>, AlpineError> {
+        let patterns: Vec<Glob<'_>> = self
+            .triggers
+            .iter()
+            .map(|pattern| pattern.strip_prefix('+').unwrap_or(pattern))
+            .filter(|pattern| pattern.starts_with('/'))
+            .map(|pattern| Glob::parse(pattern.as_bytes()))
+            .collect();
+        let matched: Vec<&str> = directories
+            .iter()
+            .filter(|directory| {
+                patterns
+                    .iter()
+                    .any(|pattern| pattern.matches(directory.as_bytes()))
+            })
+            .map(String::as_str)
+            .collect();
+        if matched.len() > MAX_TRIGGER_MATCHES {
+            return Err(AlpineError::Config {
+                reason: format!(
+                    "the {} trigger matches {} directories, and a trigger runs with at most \
+                     {MAX_TRIGGER_MATCHES} of them as its arguments",
+                    self.name,
+                    matched.len(),
+                ),
+            });
         }
-        matched.sort_unstable();
-        matched.dedup();
-        matched
+        Ok(matched)
     }
 }
 
@@ -725,8 +923,9 @@ impl<'a> Set<'a> {
 /// A dependency order over the closure: a package appears after everything it
 /// needs.
 ///
-/// The graph is the packages' own `depends`, resolved within the closure through
-/// the names each package provides as well as its own. It has cycles — Alpine
+/// The graph is the packages' own `depends`, and the names an `install_if`
+/// package's condition names, resolved within the closure through the names
+/// each package provides as well as its own. It has cycles — Alpine
 /// publishes mutually dependent packages — so this is a depth-first post-order
 /// that steps over a package it is already visiting rather than a sort that
 /// insists on a total order.
@@ -847,6 +1046,7 @@ mod tests {
             version: "1.0-r0".to_string(),
             scripts: Vec::new(),
             triggers: Vec::new(),
+            declared: Vec::new(),
         };
         let mut observer = |_event: AlpineEvent<'_>| {};
         let err = launch(
@@ -921,25 +1121,73 @@ mod tests {
         assert!(Glob::parse(&pattern).matches(&path));
     }
 
-    #[test]
-    fn a_trigger_matches_the_directories_the_install_created() {
-        let subject = ScriptSubject {
+    /// A subject watching `patterns`, with no scripts.
+    fn watching<'a>(patterns: &[&'a str]) -> ScriptSubject<'a> {
+        ScriptSubject {
             name: "busybox".to_string(),
             version: "1.37.0-r30".to_string(),
             scripts: Vec::new(),
-            triggers: ["/bin", "/usr/bin", "/lib/modules/*", "relative/path"]
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
-        };
-        let directories: HashSet<Vec<u8>> = ["bin", "usr/bin", "usr/lib", "lib/modules/6.12.0"]
-            .iter()
-            .map(|path| path.as_bytes().to_vec())
-            .collect();
+            triggers: patterns.iter().copied().map(Cow::Borrowed).collect(),
+            declared: Vec::new(),
+        }
+    }
+
+    /// Root-relative directories as `fire_triggers` hands them over: rooted,
+    /// and in path order.
+    fn rooted(directories: &[&str]) -> Vec<String> {
+        let mut rooted: Vec<String> = directories.iter().map(|path| format!("/{path}")).collect();
+        rooted.sort_unstable();
+        rooted
+    }
+
+    #[test]
+    fn a_trigger_matches_the_directories_the_install_created() {
+        let subject = watching(&["/bin", "/usr/bin", "/lib/modules/*", "relative/path"]);
+        let directories = rooted(&["bin", "usr/bin", "usr/lib", "lib/modules/6.12.0"]);
         assert_eq!(
-            subject.triggered_by(&directories),
+            subject.triggered_by(&directories).expect("a handful match"),
             ["/bin", "/lib/modules/6.12.0", "/usr/bin"],
             "in path order, and a relative pattern matches nothing",
+        );
+    }
+
+    #[test]
+    fn a_directory_is_handed_to_a_trigger_once_however_many_patterns_match_it() {
+        // apk takes a directory at the first pattern that matches it. Matching
+        // every pattern instead makes the list a product of the two, and a
+        // base's patterns are a file its own scripts could have rewritten.
+        let mut patterns = vec!["/*"; 10_000];
+        patterns.extend(["/usr/*", "+/usr/bin"]);
+        let subject = watching(&patterns);
+        let directories = rooted(&["bin", "usr", "usr/bin", "etc"]);
+        assert_eq!(
+            subject.triggered_by(&directories).expect("four match"),
+            ["/bin", "/etc", "/usr", "/usr/bin"],
+        );
+    }
+
+    #[test]
+    fn a_trigger_matching_more_directories_than_it_is_handed_is_refused() {
+        // Every match is an argument to the script, so past the ceiling the
+        // refusal names the package rather than a launch failing to say why.
+        let subject = watching(&["/many/*"]);
+        let names: Vec<String> = (0..=MAX_TRIGGER_MATCHES)
+            .map(|at| format!("many/{at}"))
+            .collect();
+        let directories = rooted(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let Err(err) = subject.triggered_by(&directories) else {
+            panic!("one directory past the ceiling");
+        };
+        assert!(
+            matches!(&err, AlpineError::Config { reason } if reason.contains("busybox")),
+            "{err}",
+        );
+        assert_eq!(
+            subject
+                .triggered_by(&directories[1..])
+                .expect("the ceiling itself is handed over")
+                .len(),
+            MAX_TRIGGER_MATCHES,
         );
     }
 
@@ -1034,6 +1282,200 @@ mod tests {
         let scratch = Scratch::for_test("alpine-bootstrap", tag);
         let tree = Rooted::open(&scratch).expect("the scratch tree opens");
         (scratch, tree)
+    }
+
+    /// One entry of `tree` stated owned by `uname`:`gname`, or by `uid`:`gid`
+    /// where the root has no such names, as it is on disk now.
+    fn stated(
+        tree: &Rooted,
+        path: &str,
+        (uname, gname): (&str, &str),
+        uid: u32,
+        gid: u32,
+    ) -> Declared {
+        let stat = tree
+            .stat(path)
+            .expect("the entry stats")
+            .expect("the entry is there");
+        Declared {
+            record: 0,
+            path: path.as_bytes().to_vec(),
+            directory: false,
+            uname: uname.as_bytes().to_vec(),
+            gname: gname.as_bytes().to_vec(),
+            uid,
+            gid,
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        }
+    }
+
+    /// A database of one package holding each of `files` as root, at `mode`.
+    fn holding(files: &[(&str, u32)]) -> Database {
+        let info = super::super::pkginfo::PkgInfo::parse(
+            "the package",
+            b"pkgname = dbus-daemon-launch-helper\npkgver = 1-r0\narch = x86_64\nsize = 1\n",
+        )
+        .expect("the member parses");
+        let mut record = super::super::installed::Record::open(
+            &info,
+            "x86_64",
+            1024,
+            "Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            format!("X1{}", "0".repeat(40)),
+        );
+        for (path, mode) in files {
+            record.file(path.as_bytes(), 0, 0, *mode, None);
+        }
+        let mut database = Database::default();
+        database.add(record);
+        database
+    }
+
+    /// A full bootstrap's state, owned through `ownership`, which is the part
+    /// of it an owner is given through.
+    fn owned_through(ownership: &Ownership) -> State<'_> {
+        State {
+            world: &[],
+            architecture: "x86_64",
+            sources: &[],
+            repositories: &[],
+            beneath: None,
+            ownership,
+        }
+    }
+
+    #[test]
+    fn under_the_single_identity_map_no_owner_is_given() {
+        // Root is the only id the map holds, so every entry is the root it was
+        // laid down as, and the database says so.
+        let (staging, tree) = rooted_tree("owners-single");
+        tree.write_mode("usr/libexec/helper", b"#!/bin/sh\n", 0o4750)
+            .unwrap();
+        tree.write("etc/group", b"messagebus:x:101:\n").unwrap();
+        let declared = [stated(
+            &tree,
+            "usr/libexec/helper",
+            ("root", "messagebus"),
+            0,
+            0,
+        )];
+        let mut database = holding(&[("usr/libexec/helper", 0o4750)]);
+        let site = Site {
+            staging: &staging,
+            rooting: Rooting::over(None),
+            identity_map: &IdentityMap::Single,
+            id_mapper: None,
+            source_date_epoch: None,
+        };
+        let ownership = Ownership::default();
+        assert!(
+            !reown_declared(
+                site,
+                &tree,
+                &owned_through(&ownership),
+                &mut database,
+                &declared
+            )
+            .expect("nothing to give")
+        );
+        let installed = String::from_utf8(database.installed()).expect("the database is text");
+        assert!(installed.contains("R:helper\na:0:0:4750\n"), "{installed}");
+    }
+
+    #[cfg(feature = "subid")]
+    #[test]
+    fn an_entry_is_given_the_owner_its_package_names_in_the_roots_accounts() {
+        // `dbus-daemon-launch-helper` as Alpine ships it: `root:messagebus` and
+        // setuid, with 0 as the archive's gid, so only the name says which
+        // group. The name is looked up in the root, an unknown name falls back
+        // to the archive's id, and a replaced entry is left as it is.
+        if !ferroday_cage_testkit::require::userns() || !ferroday_cage_testkit::require::range_map()
+        {
+            return;
+        }
+        let (staging, tree) = rooted_tree("owners-subordinate");
+        tree.write(
+            "etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\nmessagebus:x:100:101::/:/sbin/nologin\n",
+        )
+        .unwrap();
+        tree.write("etc/group", b"root:x:0:\nmessagebus:x:101:\n")
+            .unwrap();
+        tree.write_mode("usr/libexec/helper", b"#!/bin/sh\n", 0o4750)
+            .unwrap();
+        tree.write("usr/libexec/numeric", b"").unwrap();
+        tree.write("usr/libexec/replaced", b"laid down").unwrap();
+        let declared = [
+            stated(&tree, "usr/libexec/helper", ("root", "messagebus"), 0, 0),
+            stated(
+                &tree,
+                "usr/libexec/numeric",
+                ("no-such-user", "no-such-group"),
+                7,
+                8,
+            ),
+            stated(
+                &tree,
+                "usr/libexec/replaced",
+                ("messagebus", "messagebus"),
+                0,
+                0,
+            ),
+        ];
+        // The last is replaced since, as a caller's overlay replaces a file.
+        tree.rename("usr/libexec/replaced", "usr/libexec/kept")
+            .unwrap();
+        tree.write("usr/libexec/replaced", b"a replacement")
+            .unwrap();
+
+        let mut database = holding(&[
+            ("usr/libexec/helper", 0o4750),
+            ("usr/libexec/numeric", 0o644),
+            ("usr/libexec/replaced", 0o644),
+        ]);
+        let site = Site {
+            staging: &staging,
+            rooting: Rooting::over(None),
+            identity_map: &IdentityMap::Subordinate,
+            id_mapper: None,
+            source_date_epoch: None,
+        };
+        let ownership = Ownership::new(&IdentityMap::Subordinate, None);
+        assert!(
+            reown_declared(
+                site,
+                &tree,
+                &owned_through(&ownership),
+                &mut database,
+                &declared
+            )
+            .expect("owners given")
+        );
+
+        let installed = String::from_utf8(database.installed()).expect("the database is text");
+        for line in ["R:helper\na:0:101:4750\n", "R:numeric\na:7:8:644\n"] {
+            assert!(installed.contains(line), "{line:?} in {installed}");
+        }
+        assert!(
+            installed.ends_with("R:replaced\n\n"),
+            "the replaced entry keeps root: {installed}",
+        );
+
+        // Read back through the map, which is what the root means by the
+        // ownership on disk.
+        let mut archive = Vec::new();
+        crate::provision::export_tar(&*staging, &mut archive, IdentityMap::Subordinate)
+            .expect("the tree exports");
+        let mut reader = crate::provision::tar::TarReader::new(&archive[..]);
+        let mut owners = HashMap::new();
+        while let Some(entry) = reader.next_entry().expect("the archive reads") {
+            owners.insert(entry.path.clone(), (entry.uid, entry.gid, entry.mode));
+        }
+        let owner = |path: &str| owners.get(path.as_bytes()).copied();
+        assert_eq!(owner("./usr/libexec/helper"), Some((0, 101, 0o4750)));
+        assert_eq!(owner("./usr/libexec/numeric"), Some((7, 8, 0o644)));
+        assert_eq!(owner("./usr/libexec/replaced"), Some((0, 0, 0o644)));
     }
 
     /// The accounts `found` in a shadow file, as `accounts::account_dates`

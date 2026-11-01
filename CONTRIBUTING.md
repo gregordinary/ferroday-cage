@@ -408,8 +408,10 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Resolve a path the kernel keeps inside a tree, retrying a raced walk | `mechanism::resolve::openat2` |
 | Open a directory inside a tree being provisioned | `provision::containment::open_dir`, or `containment::open_dir_path` after a fork |
 | Create the missing directories of a chain inside a tree | `provision::containment::create_dirs` |
+| Replace whatever holds a name in a tree with a new entry, an empty directory included | `provision::containment::replacing`, over `containment::remove_at` |
 | Write into an overlay upper where the mounted overlay would place it | `provision::containment::copy_up`, which the extractor and `Rooted::over` take over a base |
 | Is this entry an overlay whiteout, or this directory opaque? | `provision::containment::is_whiteout`, `containment::is_opaque` |
+| Is this extended attribute the host's rather than the tree's? | `provision::containment::host_assigned_xattr` |
 | Open the regular file a walk just inspected, refusing whatever took its name | `provision::containment::open_typed_file` |
 | Open a named pipe just created, to set its metadata through a descriptor | `provision::containment::open_created_fifo` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
@@ -418,6 +420,8 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Remove or empty a file in such a tree only where what holds the name is approved | `Rooted::remove_if`, `Rooted::truncate_if`, judged by `Rooted::is_file_with_content` or `Rooted::is_whiteout` |
 | Rewrite a file in place, keeping the owner and mode a script gave it | `Rooted::overwrite` |
 | Lay a host tree into a root | `provision::CopyIn`, or `extract::overlay_tree` between configure waves |
+| Give entries a tree already holds the owner only its identity map can express | `provision::copyin::reown`, an `Owed` per entry, `Owner::Host` or `Owner::Tree` |
+| Which identity map, and which delegate, is a tree owned through? | `provision::identity::Ownership` |
 | Stage a layer into an overlay upper, removing the upper on failure only where this call created it | `provision::layer::Staging` |
 | Remove a tree a sandbox wrote, however deep | `provision::remove_tree`, which `provision::Remove` reaches from outside the crate, over the walk in `mechanism::delete_tree` |
 | Take a lock file | `provision::lock_exclusive` |
@@ -434,6 +438,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What does a finished root not keep of the bootstrap that built it? | `provision::debian::bootstrap::clear_run_state`, `alpine::bootstrap::clear_run_state` |
 | Does a dpkg `Status` field mean the package is present and configured? | `provision::debian::bootstrap::is_configured` |
 | Read or rewrite the days a bootstrap's account tools recorded in `/etc/shadow` | `provision::accounts` |
+| Which id does a root's `/etc/passwd` or `/etc/group` give a name? | `provision::accounts::ids` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag`, `atom::use_flag` |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
@@ -456,7 +461,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Decode a URL's percent escapes | `provision::fetch::percent_decode` |
 | Where does a run keep its downloads, and is that directory its own? | `provision::cache::PackageCache`, and `PackageCache::is_derived` for whether a directory a caller named is the run's own |
 | Download into a package cache, checked before it is published there | `provision::cache::download`, or `cache::prefetch` for a batch |
-| Create a package cache, or open what it holds at a name | `provision::cache::create`, `cache::open_entry` |
+| Create a package cache, or open the regular file at a path in a directory others write, a cache entry or a build's output | `provision::cache::create`, `cache::open_entry` |
 | What time is it, as a Unix timestamp? | `provision::now_epoch` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |

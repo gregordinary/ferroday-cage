@@ -20,7 +20,7 @@
 //! Alpine publishes `.SIGN.RSA.`, which is SHA-1. The format defines
 //! `.SIGN.RSA256.` and `.SIGN.RSA512.` for stronger digests, and this reader
 //! refuses both by name; see [`Algorithm`] for why. So an index is bound to its
-//! signing key by RSA-4096 over SHA-1, and a package is bound to that index by
+//! signing key by RSA over SHA-1, and a package is bound to that index by
 //! SHA-1 again, through the `C:` field. Only the last link — a package's control
 //! segment to its file tree, through `.PKGINFO`'s `datahash` — is SHA-256.
 //!
@@ -41,13 +41,13 @@
 //! whoever served the file may replace it freely and nothing downstream would
 //! differ.
 //!
-//! This is `apk`'s rule rather than a relaxation of it, and it was measured: a
-//! root trusting only postmarketOS's index key installs postmarketOS packages,
-//! which are signed by per-builder keys published as a trust anchor nowhere,
-//! while the same package offered to `apk add` as a bare file — where no index
-//! vouches for it and its own signature is all there is — is refused as
-//! `UNTRUSTED signature`. This layer installs from an index or from a plan and
-//! never from a bare file, so the first rule is the one that applies to it.
+//! This is `apk`'s rule rather than a relaxation of it. A root trusting only
+//! postmarketOS's index key installs postmarketOS packages, which are signed by
+//! per-builder keys published as a trust anchor nowhere, while the same package
+//! offered to `apk add` as a bare file — where no index vouches for it and its
+//! own signature is all there is — is refused as `UNTRUSTED signature`. This
+//! layer installs from an index or from a plan and never from a bare file, so
+//! the first rule is the one that applies to it.
 //!
 //! See [`Anchor`](super::apk::Anchor), which is where a caller states which of
 //! the two it holds a container to.
@@ -349,11 +349,18 @@ impl Signatures {
     /// Verifies `payload` against `keys`, answering with the signature that did.
     ///
     /// The members are tried in order and the first that both names a held key
-    /// and verifies is the answer, which is `apk`'s own rule. A member naming a
-    /// key the repository does not trust is passed over rather than refused —
-    /// that is the whole of what makes a rotation-era container readable — so a
-    /// segment nothing verifies is reported against the last member that got as
-    /// far as being checked, and against the whole segment where none did.
+    /// and verifies is the answer. A member naming a key the repository does not
+    /// trust is passed over rather than refused — that is the whole of what
+    /// makes a rotation-era container readable — so a segment nothing verifies
+    /// is reported against the last member that got as far as being checked,
+    /// and against the whole segment where none did.
+    ///
+    /// `apk` passes over an untrusted member too, and stops at the first
+    /// member whose key it holds: that one signature is verified, and its
+    /// failure is final. This goes on to a later held key's member instead,
+    /// which accepts a segment `apk` would refuse only where a trusted key's
+    /// signature over exactly these bytes is present. It is more lenient than
+    /// `apk` and no weaker.
     ///
     /// # Errors
     ///

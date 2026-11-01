@@ -12,6 +12,8 @@
 //! numbering is independent, so neither can be read as the other and neither
 //! moves when the other does.
 
+use std::collections::HashMap;
+
 use super::AlpineError;
 use super::index::{NOARCH, Record};
 use super::version;
@@ -320,7 +322,8 @@ impl PlannedPackage {
     pub(super) fn foreign_to(&self, architecture: &str) -> Option<String> {
         (self.architecture != architecture && self.architecture != NOARCH).then(|| {
             format!(
-                "the plan states {} for architecture {:?}, in a plan for {architecture}, and a                  package is the plan's architecture or {NOARCH}",
+                "the plan states {} for architecture {:?}, in a plan for {architecture}, and a \
+                 package is the plan's architecture or {NOARCH}",
                 self.name, self.architecture,
             )
         })
@@ -525,6 +528,23 @@ impl Plan {
             });
         }
         Ok(plan)
+    }
+
+    /// The first package this plan names twice, as its two entries, or `None`
+    /// where every name appears once.
+    ///
+    /// A root holds one package of a name, and everything that reads a plan
+    /// keys it by name: a pin holds each name to one version, and an install
+    /// writes one installed record and one set of scripts per name. So two
+    /// entries for one name are a plan with no single reading, whether or not
+    /// they agree. A plan this library resolved cannot contain one; a
+    /// hand-written document or an edited `Plan` can.
+    pub(super) fn named_twice(&self) -> Option<(&PlannedPackage, &PlannedPackage)> {
+        let mut seen: HashMap<&str, &PlannedPackage> = HashMap::with_capacity(self.packages.len());
+        self.packages.iter().find_map(|package| {
+            seen.insert(&package.name, package)
+                .map(|first| (first, package))
+        })
     }
 
     /// Builds a plan from a resolved package set, projecting each record onto
@@ -985,6 +1005,13 @@ Origin: postmarketos-base
                 Err(AlpineError::PlanDocument { reason }) => {
                     assert!(reason.contains("busybox"), "{architecture:?}: {reason}");
                     assert!(reason.contains("noarch"), "{architecture:?}: {reason}");
+                    // One sentence, spaced as one: a refusal is read by a
+                    // person, and the line it is split over in the source is
+                    // not part of it.
+                    assert!(
+                        reason.contains(", and a package is the plan's architecture"),
+                        "{architecture:?}: {reason}",
+                    );
                 }
                 other => {
                     panic!("expected an architecture refusal for {architecture:?}, got {other:?}")

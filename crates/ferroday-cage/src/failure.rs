@@ -326,6 +326,11 @@ mod tests {
                     Box::new(AlpineError::Fetch(fetch())) as Box<dyn StdError>,
                     Box::new(AlpineError::Launch(Error::Spawn { source: os_error() })),
                     Box::new(AlpineError::io("reading", "/srv/staging", os_error())),
+                    Box::new(AlpineError::unreadable(
+                        "http://mirror.invalid/x",
+                        "its signature segment is unreadable",
+                        os_error(),
+                    )),
                 ]);
             }
             #[cfg(feature = "gentoo")]

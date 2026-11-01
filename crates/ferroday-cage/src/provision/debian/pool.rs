@@ -79,6 +79,7 @@ use flate2::write::GzEncoder;
 use super::check_coordinate;
 use super::{DebianError, MAX_UNSIZED_INDEX, arch, deb, release, version};
 use crate::ErrorChain;
+use crate::provision::cache;
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::document;
@@ -360,6 +361,15 @@ impl Pool {
     /// digest check. In a build pipeline that means two components produced the
     /// same package version.
     ///
+    /// Each path in `debs` is opened as a file in a tree that is not fully
+    /// trusted, because that is where a pipeline takes them from: the output
+    /// directory its build sandbox wrote. A symbolic link at the path is
+    /// refused rather than followed, so a sandbox cannot have the pool copy a
+    /// host file it chose. Anything else that is not a regular file is refused
+    /// without being opened, so a named pipe cannot hold the publish waiting
+    /// for a writer. The directories above each path are the caller's, and
+    /// resolve as any path a caller names does.
+    ///
     /// A publish discards any signature the pool carries — an `InRelease` or a
     /// `Release.gpg` a caller wrote over an earlier release — since a signature
     /// describes the `Release` it was made over and this call replaces it. A
@@ -412,7 +422,9 @@ impl Pool {
     /// `Size`, or `SHA256`, which the pool supplies from the file it published
     /// and a package may not claim for itself; and one that was rewritten into a
     /// different package while it was being published. Returns
-    /// [`DebianError::Io`] for a failure writing, locking, or scanning the pool.
+    /// [`DebianError::Io`] for a path that cannot be opened, one holding
+    /// anything but a regular file included, and for a failure writing,
+    /// locking, or scanning the pool.
     pub fn publish<P: AsRef<Path>>(
         &self,
         debs: impl IntoIterator<Item = P>,
@@ -889,8 +901,10 @@ fn index_deb(
         reason,
     };
 
-    let mut source =
-        File::open(deb_path).map_err(DebianError::at("opening a .deb to publish", deb_path))?;
+    // Opened as a cache entry is: a pipeline's `.deb`s sit in a directory a
+    // build sandbox wrote, whose names the host must not follow or wait on.
+    let mut source = cache::open_entry(deb_path)
+        .map_err(DebianError::at("opening a .deb to publish", deb_path))?;
 
     // Where the .deb belongs in the pool is what its own control stanza says it
     // is, so the location is settled before anything is written.

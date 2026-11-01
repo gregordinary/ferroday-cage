@@ -9,9 +9,8 @@
 //!
 //! A name may be answered by more than one package: a real package answers its
 //! own name at its own version, and every package whose `p:` field names it
-//! answers it at the version that entry states. The ranking between them was
-//! measured against `apk.static` 3.0.7 rather than read off a wiki, and it is
-//! not the obvious one:
+//! answers it at the version that entry states. The ranking between them is
+//! the one `apk.static` 3.0.7 applies, and it is not the obvious one:
 //!
 //! 1. **The version offered**, highest first — and the version *offered*, not
 //!    the offering package's own. A package providing `thing=9.0` beats the real
@@ -788,7 +787,7 @@ mod tests {
 
     #[test]
     fn the_version_offered_outranks_the_package_that_offers_it() {
-        // Measured against apk.static: a package providing `thing=9.0` beats the
+        // As apk.static ranks them: a package providing `thing=9.0` beats the
         // real `thing` at 1.0, and the real one wins when it is the higher. The
         // ranking is on the version offered for the name, not on the offering
         // package's own version -- both providers here are at 1.0-r0.
@@ -810,7 +809,7 @@ mod tests {
     #[test]
     fn the_provider_priority_breaks_a_tie_in_the_offered_version() {
         // And only a tie: a k: of 90 does not lift a provider over one offering
-        // a higher version, which is the order apk.static was measured to apply.
+        // a higher version, which is the order apk.static applies.
         let tie = merged(&[
             ("app", "1.0-r0", "D:thing"),
             ("thing", "1.0-r0", ""),
@@ -977,11 +976,10 @@ mod tests {
 
     #[test]
     fn a_priority_that_is_not_above_zero_is_no_preference_at_all() {
-        // Established by driving `apk.static` 3.0.7 against a purpose-built
-        // repository rather than read out of its sources: a provider stating
-        // `k:0`, `k:-1` or `k:abc` leaves apk refusing to choose against one
-        // stating no `k:` at all, exactly as two unranked providers do, while
-        // `k:1` wins outright. Telling `k:0` apart from an absent `k:` would
+        // `apk.static` 3.0.7 reads it this way: a provider stating `k:0`,
+        // `k:-1` or `k:abc` leaves it refusing to choose against one stating
+        // no `k:` at all, exactly as two unranked providers do, while `k:1`
+        // wins outright. Telling `k:0` apart from an absent `k:` would
         // make a zero-priority provider silently auto-selectable here and not
         // under apk.
         for stated in ["k:0", "k:-1", "k:abc", "k:"] {

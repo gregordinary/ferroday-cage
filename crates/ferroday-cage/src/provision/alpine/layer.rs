@@ -22,9 +22,12 @@
 //! the archive spells a soname — and a base treated as satisfying a name at any
 //! version would produce an increment that does not close.
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::apk::Member;
 use super::bootstrap::{ARCH, REPOSITORIES, ScriptKind, ScriptSubject, WORLD};
 use super::index::Record;
 use super::installed::{Carried, DB_DIR, Existing};
@@ -68,6 +71,16 @@ const MAX_DATABASE: u64 = 256 * 1024 * 1024;
 /// one-line-per-entry files under `/etc/apk`, each a few hundred bytes in a
 /// real root.
 const MAX_STATE: u64 = 16 * 1024 * 1024;
+
+/// The most paths a base's triggers file may watch, a path one package watches
+/// twice counted once.
+///
+/// Alpine's own minirootfs watches six, all of them busybox's, and a root
+/// watches a few per package that has a trigger at all. The file is one a
+/// base's own scripts could have rewritten, and every path it watches is
+/// matched against every directory an increment creates, so this is what holds
+/// that work to the size of the increment rather than to the size of the file.
+const MAX_TRIGGER_PATTERNS: usize = 4096;
 
 /// What a base layer already carries.
 ///
@@ -199,6 +212,34 @@ impl Base {
         &self.path
     }
 
+    /// The base's archived trigger scripts, read out of its script archive once
+    /// for [`trigger_subjects`](Self::trigger_subjects) to borrow from.
+    ///
+    /// Empty where the base's triggers file watches nothing, so the archive of a
+    /// base no trigger reads is carried forward without being decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpineError::Config`] when the archive is not a readable tar.
+    pub(super) fn trigger_scripts(&self) -> Result<Vec<Member>, AlpineError> {
+        // A base that carries neither `scripts.tar` nor `scripts.tar.gz` reads
+        // as no bytes at all, which is not the same as an archive holding no
+        // members: no stream arrived to be one. A trigger whose script such a
+        // base has nowhere to keep is refused by `trigger_subjects`, by the name
+        // that is missing, rather than here as an unreadable archive.
+        if self.scripts.is_empty() || self.triggers.trim_ascii().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut archived = apk::read_members(&self.scripts).map_err(|err| {
+            self.refusal(format!(
+                "its archived scripts are not a readable tar: {}",
+                ErrorChain::new(&err),
+            ))
+        })?;
+        archived.retain(|member| trigger_identity(&member.name).is_some());
+        Ok(archived)
+    }
+
     /// The base's own packages as trigger subjects, so a directory the increment
     /// creates fires the base's trigger for it.
     ///
@@ -209,88 +250,148 @@ impl Base {
     /// that watch a path are returned; the caller matches the patterns against
     /// the directories the increment created and runs what matched.
     ///
+    /// `archived` is what [`trigger_scripts`](Self::trigger_scripts) read, and
+    /// each subject borrows its script from there and its patterns from the
+    /// base's triggers file.
+    ///
+    /// # One subject per package
+    ///
+    /// The triggers file is one the base's own scripts could have rewritten, so
+    /// it is read the way `apk` reads it rather than trusted to be the file
+    /// `apk` writes. `apk` keys it by control identity, and a second line for
+    /// one package adds to the paths that package watches. So one package is one
+    /// subject however many lines name it, and a path it watches twice is
+    /// watched once. Every lookup is by identity in a table built once, and the
+    /// paths watched across the whole file are held to [`MAX_TRIGGER_PATTERNS`].
+    ///
     /// # Errors
     ///
     /// Returns [`AlpineError::Config`] when the base's database contradicts
     /// itself — a `triggers` line naming a package the database does not record,
-    /// or a package whose archived trigger script is absent. Either would mean
-    /// silently not running a trigger `apk` would have run, which is worse than
-    /// refusing a base that is not whole.
-    pub(super) fn trigger_subjects(&self) -> Result<Vec<ScriptSubject>, AlpineError> {
-        let refuse = |reason: String| AlpineError::Config {
-            reason: format!("the base layer at {}: {reason}", self.path.display()),
-        };
-        let watched = String::from_utf8(self.triggers.clone())
-            .map_err(|_| refuse("its triggers file is not UTF-8".to_string()))?;
+    /// or a package whose archived trigger script is absent — or when its
+    /// triggers file watches more than [`MAX_TRIGGER_PATTERNS`] paths. The first
+    /// two would mean silently not running a trigger `apk` would have run,
+    /// which is worse than refusing a base that is not whole.
+    pub(super) fn trigger_subjects<'a>(
+        &'a self,
+        archived: &'a [Member],
+    ) -> Result<Vec<ScriptSubject<'a>>, AlpineError> {
+        let watched = std::str::from_utf8(&self.triggers)
+            .map_err(|_| self.refusal("its triggers file is not UTF-8".to_string()))?;
         if watched.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        // A base that carries neither `scripts.tar` nor `scripts.tar.gz` reads
-        // as no bytes at all, which is not the same as an archive holding no
-        // members: no stream arrived to be one. A trigger whose script such a
-        // base has nowhere to keep is refused below, by the name that is
-        // missing, rather than here as an unreadable archive.
-        let archived = if self.scripts.is_empty() {
-            Vec::new()
-        } else {
-            apk::members(&self.path.display().to_string(), &self.scripts)?
-        };
-        let mut subjects = Vec::new();
+        // A record can be named by more than one line, and a hostile database
+        // can carry one identity twice. A line belongs to the first record that
+        // carries its identity, so the table keeps the first.
+        let mut records: HashMap<&str, &Record> = HashMap::new();
+        for record in self.records() {
+            records.entry(&record.control_identity).or_insert(record);
+        }
+        // What each package watches, in the order its identity first appears,
+        // and every path once.
+        let mut watching: Vec<(&Record, Vec<&str>)> = Vec::new();
+        let mut slot: HashMap<&str, usize> = HashMap::new();
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
         for line in watched.lines().filter(|line| !line.trim().is_empty()) {
             // A line is the package's control identity, then the paths it
             // watches: the same identity its record opens with, which is how
             // `apk` finds the record the line belongs to.
             let (identity, patterns) = line.split_once(' ').unwrap_or((line, ""));
-            let record = self
-                .records()
-                .find(|record| record.control_identity == identity)
-                .ok_or_else(|| {
-                    refuse(format!(
-                        "its triggers file names {identity}, which no record in its database \
-                         carries",
-                    ))
-                })?;
+            let Some(&record) = records.get(identity) else {
+                return Err(self.refusal(format!(
+                    "its triggers file names {identity}, which no record in its database carries",
+                )));
+            };
+            let at = *slot.entry(identity).or_insert_with(|| {
+                watching.push((record, Vec::new()));
+                watching.len() - 1
+            });
+            for pattern in patterns.split_ascii_whitespace() {
+                if !seen.insert((identity, pattern)) {
+                    continue;
+                }
+                if seen.len() > MAX_TRIGGER_PATTERNS {
+                    return Err(self.refusal(format!(
+                        "its triggers file watches more than {MAX_TRIGGER_PATTERNS} paths, which \
+                         is past what this layer matches an increment against",
+                    )));
+                }
+                watching[at].1.push(pattern);
+            }
+        }
 
-            let script = archived
-                .iter()
-                .find(|member| is_trigger_of(&member.name, record))
+        // Each archived trigger script by the identity its name files it under,
+        // so a package's script is found without a walk of the archive.
+        let mut scripts: HashMap<String, Vec<(&str, &Member)>> = HashMap::new();
+        for member in archived {
+            if let Some((filed_under, identity)) = trigger_identity(&member.name) {
+                scripts
+                    .entry(identity)
+                    .or_default()
+                    .push((filed_under, member));
+            }
+        }
+
+        let mut subjects = Vec::with_capacity(watching.len());
+        // A package whose lines name no path watches nothing, and `apk` lists it
+        // among no trigger's subjects; nor does this.
+        for (record, patterns) in watching
+            .into_iter()
+            .filter(|(_, patterns)| !patterns.is_empty())
+        {
+            let filed_under = format!("{}-{}", record.name, record.version);
+            let script = scripts
+                .get(&record.control_identity)
+                .and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .find(|(filed, _)| *filed == filed_under)
+                        .map(|(_, member)| *member)
+                })
                 .ok_or_else(|| {
-                    refuse(format!(
-                        "{} watches {patterns} and its archived trigger script is not in \
+                    self.refusal(format!(
+                        "{} watches {} and its archived trigger script is not in \
                          {DB_DIR}/{SCRIPTS}",
                         record.name,
+                        patterns.join(" "),
                     ))
                 })?;
-
             subjects.push(ScriptSubject {
                 name: record.name.clone(),
                 version: record.version.clone(),
-                scripts: vec![(ScriptKind::Trigger, script.data.clone())],
-                triggers: patterns
-                    .split_ascii_whitespace()
-                    .map(str::to_string)
-                    .collect(),
+                scripts: vec![(ScriptKind::Trigger, Cow::Borrowed(script.data.as_slice()))],
+                triggers: patterns.into_iter().map(Cow::Borrowed).collect(),
+                declared: Vec::new(),
             });
         }
         Ok(subjects)
     }
+
+    /// A refusal of this base as a base, naming where it sits.
+    fn refusal(&self, reason: String) -> AlpineError {
+        AlpineError::Config {
+            reason: format!("the base layer at {}: {reason}", self.path.display()),
+        }
+    }
 }
 
-/// Whether `member` is the name `apk` archives `record`'s trigger script under.
+/// The `<package>-<version>` an archived trigger script is filed under, and the
+/// control identity it is filed by, or `None` for a member that is not a
+/// trigger script.
 ///
-/// That name is `<package>-<version>.<identity>.trigger`, the identity being
-/// the record's control identity spelled `X1` and hexadecimal, where the record
-/// states it `Q1` and base64. The whole name is matched, the identity as the
-/// one the record carries, so a package whose name and version merely begin
-/// another's, as `a` at `1` begins `a-1.5`, is never handed that package's
-/// script.
-fn is_trigger_of(member: &str, record: &Record) -> bool {
-    member
-        .strip_prefix(&format!("{}-{}.", record.name, record.version))
-        .and_then(|rest| rest.strip_suffix(&format!(".{}", ScriptKind::Trigger.name())))
-        .and_then(super::sign::identity_of_hex)
-        .is_some_and(|identity| identity == record.control_identity)
+/// `apk` archives a trigger script as `<package>-<version>.<identity>.trigger`,
+/// the identity being the record's control identity spelled `X1` and
+/// hexadecimal, where the record states it `Q1` and base64; this answers the
+/// identity in the record's spelling. The identity holds no `.`, so the last
+/// one before it is where the name and version end. Matched on the whole name,
+/// so a package whose name and version merely begin another's, as `a` at `1`
+/// begins `a-1.5`, is never handed that package's script.
+fn trigger_identity(member: &str) -> Option<(&str, String)> {
+    let stem = member.strip_suffix(&format!(".{}", ScriptKind::Trigger.name()))?;
+    let (filed_under, identity) = stem.rsplit_once('.')?;
+    Some((filed_under, super::sign::identity_of_hex(identity)?))
 }
 
 /// Reads a base's archived scripts, under either name `apk` maintains, as one
@@ -409,6 +510,34 @@ mod tests {
         Base::read(dir, "x86_64").unwrap_or_else(|err| panic!("the base reads: {err}"))
     }
 
+    /// One base package's trigger, owned: what the borrowed subject says.
+    #[derive(Debug)]
+    struct Watcher {
+        name: String,
+        version: String,
+        triggers: Vec<String>,
+        scripts: Vec<(ScriptKind, Vec<u8>)>,
+    }
+
+    /// The base's trigger subjects, read as `install` reads them.
+    fn watchers(base: &Base) -> Result<Vec<Watcher>, AlpineError> {
+        let scripts = base.trigger_scripts()?;
+        let subjects = base.trigger_subjects(&scripts)?;
+        Ok(subjects
+            .into_iter()
+            .map(|subject| Watcher {
+                name: subject.name,
+                version: subject.version,
+                triggers: subject.triggers.iter().map(ToString::to_string).collect(),
+                scripts: subject
+                    .scripts
+                    .iter()
+                    .map(|(kind, body)| (*kind, body.to_vec()))
+                    .collect(),
+            })
+            .collect())
+    }
+
     /// The two records `apk` itself wrote, which is what a real base's database
     /// looks like.
     fn minirootfs() -> &'static [u8] {
@@ -516,7 +645,7 @@ mod tests {
             ],
         );
         let base = base_of(&dir);
-        let Some(err) = base.trigger_subjects().err() else {
+        let Some(err) = watchers(&base).err() else {
             panic!("no record carries that identity");
         };
         assert!(
@@ -589,9 +718,8 @@ mod tests {
             ],
         );
         let base = base_of(&dir);
-        let subjects = base
-            .trigger_subjects()
-            .unwrap_or_else(|err| panic!("the base's triggers read: {err}"));
+        let subjects =
+            watchers(&base).unwrap_or_else(|err| panic!("the base's triggers read: {err}"));
         let [subject] = &subjects[..] else {
             panic!("one line, one subject: {}", subjects.len());
         };
@@ -618,7 +746,7 @@ mod tests {
                 (&format!("{DB_DIR}/{SCRIPTS}"), &[0u8; 1024]),
             ],
         );
-        let Some(err) = base_of(&missing).trigger_subjects().err() else {
+        let Some(err) = watchers(&base_of(&missing)).err() else {
             panic!("the archive holds no trigger script");
         };
         assert!(
@@ -655,9 +783,8 @@ mod tests {
             ],
         );
         let base = base_of(&dir);
-        let subjects = base
-            .trigger_subjects()
-            .unwrap_or_else(|err| panic!("the compressed archive reads: {err}"));
+        let subjects =
+            watchers(&base).unwrap_or_else(|err| panic!("the compressed archive reads: {err}"));
         assert_eq!(
             subjects.first().map(|subject| &subject.scripts[..]),
             Some(&[(ScriptKind::Trigger, body.to_vec())][..]),
@@ -666,6 +793,114 @@ mod tests {
         // And what is carried forward is the plain archive, so the increment's
         // own members are appended to it rather than to a compressed stream.
         assert_eq!(base.carried().scripts, first_record_archive(body));
+    }
+
+    #[test]
+    fn a_base_whose_script_archive_is_not_a_tar_is_refused_as_a_base() {
+        // The archive is one of the base's files, not an apk container, so the
+        // refusal is the base's: it names the base and says which file.
+        let (identity, _, _) = first_record();
+        let dir = root(
+            "unreadable-scripts",
+            &[
+                (&format!("{DB_DIR}/{INSTALLED}"), minirootfs()),
+                (
+                    &format!("{DB_DIR}/{TRIGGERS}"),
+                    format!("{identity} /bin\n").as_bytes(),
+                ),
+                (&format!("{DB_DIR}/{SCRIPTS}"), &[b'x'; 1024]),
+            ],
+        );
+        let Some(err) = watchers(&base_of(&dir)).err() else {
+            panic!("the archive is not a tar");
+        };
+        assert!(
+            matches!(&err, AlpineError::Config { reason }
+                if reason.contains("base layer") && reason.contains("archived scripts")),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn a_triggers_file_of_many_lines_for_one_package_is_one_subject() {
+        // The file is one the base's own scripts could have rewritten. apk keys
+        // it by identity, a second line adding to the first, so however many
+        // lines name one package it is one trigger, watching each path once,
+        // and its script is the archive's rather than a copy per line.
+        let (identity, name, _) = first_record();
+        let body = vec![b'#'; 64 * 1024];
+        let archive = first_record_archive(&body);
+        let mut watched = String::new();
+        for _ in 0..50_000 {
+            watched.push_str(&format!("{identity} /bin\n"));
+        }
+        watched.push_str(&format!("{identity} /usr/bin /bin\n"));
+        let dir = root(
+            "many-lines",
+            &[
+                (&format!("{DB_DIR}/{INSTALLED}"), minirootfs()),
+                (&format!("{DB_DIR}/{TRIGGERS}"), watched.as_bytes()),
+                (&format!("{DB_DIR}/{SCRIPTS}"), &archive),
+            ],
+        );
+        let base = base_of(&dir);
+        let scripts = base.trigger_scripts().expect("the archive reads");
+        let subjects = base
+            .trigger_subjects(&scripts)
+            .unwrap_or_else(|err| panic!("the base's triggers read: {err}"));
+        let [subject] = &subjects[..] else {
+            panic!("one package, one subject: {}", subjects.len());
+        };
+        assert_eq!(subject.name, name);
+        assert_eq!(subject.triggers, ["/bin", "/usr/bin"]);
+        let [(ScriptKind::Trigger, Cow::Borrowed(script))] = &subject.scripts[..] else {
+            panic!("the script is borrowed from the archive read");
+        };
+        assert_eq!(*script, &body[..]);
+    }
+
+    #[test]
+    fn a_triggers_file_watching_past_the_ceiling_is_refused() {
+        // A flood of one path is one path, and is read.
+        let (identity, _, _) = first_record();
+        let archive = first_record_archive(b"#!/bin/sh\n");
+        let base_watching = |tag: &str, watched: &str| {
+            root(
+                tag,
+                &[
+                    (&format!("{DB_DIR}/{INSTALLED}"), minirootfs()),
+                    (&format!("{DB_DIR}/{TRIGGERS}"), watched.as_bytes()),
+                    (&format!("{DB_DIR}/{SCRIPTS}"), &archive),
+                ],
+            )
+        };
+        let flood = format!("{identity}{}\n", " /*".repeat(500_000));
+        let subjects = watchers(&base_of(&base_watching("pattern-flood", &flood)))
+            .unwrap_or_else(|err| panic!("one path, however often: {err}"));
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].triggers, ["/*"]);
+
+        // Distinct paths past the ceiling are refused before anything is
+        // matched against them, and the ceiling itself is read.
+        let paths =
+            |count: usize| -> String { (0..count).map(|at| format!(" /watched/{at}")).collect() };
+        let at_ceiling = format!("{identity}{}\n", paths(MAX_TRIGGER_PATTERNS));
+        let subjects = watchers(&base_of(&base_watching("at-ceiling", &at_ceiling)))
+            .unwrap_or_else(|err| panic!("the ceiling is admitted: {err}"));
+        assert_eq!(subjects[0].triggers.len(), MAX_TRIGGER_PATTERNS);
+
+        // Spread over lines, as over one.
+        let past: String = (0..=MAX_TRIGGER_PATTERNS)
+            .map(|at| format!("{identity} /watched/{at}\n"))
+            .collect();
+        let Some(err) = watchers(&base_of(&base_watching("past-ceiling", &past))).err() else {
+            panic!("the file watches past the ceiling");
+        };
+        assert!(
+            matches!(&err, AlpineError::Config { reason }
+                if reason.contains(&MAX_TRIGGER_PATTERNS.to_string())),
+            "{err}",
+        );
     }
 
     #[test]
@@ -697,7 +932,7 @@ mod tests {
 
         // The other package's script alone is not `a`'s.
         let dir = base_with("whole-name-other", &[(&other, b"other\n")]);
-        let Some(err) = base_of(&dir).trigger_subjects().err() else {
+        let Some(err) = watchers(&base_of(&dir)).err() else {
             panic!("a-1.5's script was handed to a");
         };
         assert!(
@@ -707,8 +942,7 @@ mod tests {
 
         // With both archived, the other's first, `a` gets its own.
         let dir = base_with("whole-name-both", &[(&other, b"other\n"), (&own, b"own\n")]);
-        let subjects = base_of(&dir)
-            .trigger_subjects()
+        let subjects = watchers(&base_of(&dir))
             .unwrap_or_else(|err| panic!("the base's triggers read: {err}"));
         assert_eq!(
             subjects.first().map(|subject| &subject.scripts[..]),
@@ -727,7 +961,7 @@ mod tests {
         );
         let base = base_of(&dir);
         assert!(
-            base.trigger_subjects()
+            watchers(&base)
                 .unwrap_or_else(|err| panic!("nothing to read: {err}"))
                 .is_empty(),
         );

@@ -195,6 +195,151 @@ fn a_bootstrap_keeps_no_machine_id_and_dbus_generates_one() {
     assert_eq!(id.trim_end().len(), 32, "{id}");
 }
 
+/// A package's entry is given the owner the package names, as `apk` gives it.
+///
+/// `dbus-daemon-launch-helper` is setuid and owned by the `messagebus` group,
+/// which `dbus`'s pre-install creates. Its archive records the group by name,
+/// with 0 as the id, so only the root's own `/etc/group` says which id it is.
+/// Owned by root, as a bootstrap that gave it no owner left it, the bus cannot
+/// run it. `dbus` brings it in through its `install_if`, which is also what
+/// installs it after `dbus` and so after the group exists.
+#[cfg(feature = "subid")]
+#[test]
+fn a_package_entry_is_given_the_owner_its_package_names() {
+    use ferroday_cage::IdentityMap;
+
+    if !network_enabled() || !common::require::range_map() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        // The scripts run inside a cage, which needs user namespaces.
+        return;
+    };
+    let scratch = common::ranged_scratch("alpine-owner");
+    let rootfs = scratch.join("rootfs");
+    let mut alpine = Alpine::builder(RELEASE)
+        .include(["alpine-base", "dbus", "dbus-daemon-launch-helper"])
+        .identity_map(IdentityMap::Subordinate)
+        .cache_dir(common::download_cache("alpine"))
+        .build()
+        .expect("the builder validates");
+    provision::ensure(&rootfs, &mut alpine).expect("the bootstrap runs");
+
+    let group = std::fs::read_to_string(rootfs.join("etc/group")).expect("the file is there");
+    let messagebus: u32 = group
+        .lines()
+        .find_map(|line| line.strip_prefix("messagebus:x:"))
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|gid| gid.parse().ok())
+        .unwrap_or_else(|| panic!("dbus's pre-install created the group: {group}"));
+    assert_ne!(messagebus, 0);
+
+    // The root, seen from inside the map it was built under, holds the owner.
+    let seen = ferroday_cage::Cage::builder()
+        .rootfs(&rootfs)
+        .identity_map(IdentityMap::Subordinate)
+        .command("/bin/busybox")
+        .args([
+            "stat",
+            "-c",
+            "%u %g %a",
+            "/usr/libexec/dbus-daemon-launch-helper",
+        ])
+        .build()
+        .expect("the cage builds")
+        .output()
+        .expect("busybox runs in the finished rootfs");
+    assert!(seen.status.success(), "{seen:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&seen.stdout).trim(),
+        format!("0 {messagebus} 4750"),
+        "root:messagebus and setuid, as the package names it",
+    );
+
+    // And the database records the ids it was given.
+    let installed = std::fs::read_to_string(rootfs.join("lib/apk/db/installed"))
+        .expect("the database is written");
+    let line = format!("R:dbus-daemon-launch-helper\na:0:{messagebus}:4750\n");
+    assert!(installed.contains(&line), "{line:?} in the database");
+
+    // Which `apk` reads back, and audits against the tree.
+    let status = ferroday_cage::Cage::builder()
+        .rootfs(&rootfs)
+        .identity_map(IdentityMap::Subordinate)
+        .command("/sbin/apk")
+        .args(["audit", "--system", "--quiet"])
+        .build()
+        .expect("the cage builds")
+        .run()
+        .expect("apk audit runs in the finished rootfs");
+    assert!(
+        status.success(),
+        "every file the database records is the file on disk"
+    );
+}
+
+/// The same owner given in a layered build, where the entry lands in an overlay
+/// upper and the account the owner names is created there too.
+#[cfg(feature = "subid")]
+#[test]
+fn an_increment_entry_is_given_the_owner_its_package_names() {
+    use ferroday_cage::IdentityMap;
+
+    if !network_enabled() || !common::require::range_map() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        // The scripts run inside a cage, which needs user namespaces.
+        return;
+    };
+    let scratch = common::ranged_scratch("alpine-layer-owner");
+    if !common::require::overlay(&scratch) {
+        return;
+    }
+    let base = scratch.join("base");
+    let mut alpine = Alpine::builder(RELEASE)
+        .include(["alpine-base"])
+        .identity_map(IdentityMap::Subordinate)
+        .cache_dir(common::download_cache("alpine"))
+        .build()
+        .expect("the builder validates");
+    provision::ensure(&base, &mut alpine).expect("the base bootstrap runs");
+
+    let upper = scratch.join("upper");
+    let layer = Alpine::builder(RELEASE)
+        .base_layer(&base)
+        .include(["dbus", "dbus-daemon-launch-helper"])
+        .identity_map(IdentityMap::Subordinate)
+        .cache_dir(common::download_cache("alpine"))
+        .build()
+        .expect("the builder validates")
+        .stage_layer(&upper)
+        .expect("the increment stages");
+
+    let seen = ferroday_cage::Cage::builder()
+        .overlay_rootfs(&base, layer.path())
+        .identity_map(IdentityMap::Subordinate)
+        .command("/bin/busybox")
+        .args([
+            "sh",
+            "-c",
+            "stat -c '%u %g %a' /usr/libexec/dbus-daemon-launch-helper && \
+             grep '^messagebus:' /etc/group | cut -d: -f3",
+        ])
+        .build()
+        .expect("the cage builds")
+        .output()
+        .expect("busybox runs in the merged root");
+    assert!(seen.status.success(), "{seen:?}");
+    let stdout = String::from_utf8_lossy(&seen.stdout);
+    let mut lines = stdout.lines();
+    let (Some(owner), Some(messagebus)) = (lines.next(), lines.next()) else {
+        panic!("the helper and the group are both there: {stdout}");
+    };
+    assert_eq!(owner, format!("0 {messagebus} 4750"));
+    drop(layer);
+}
+
 /// A bootstrap given an epoch dates the accounts its scripts create by it.
 ///
 /// busybox's `adduser` writes the day it ran into `/etc/shadow`, and into the

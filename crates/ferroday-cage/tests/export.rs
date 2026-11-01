@@ -1278,9 +1278,9 @@ fn a_copy_the_child_refuses_reports_the_childs_own_step() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("a-file"), b"a file\n").unwrap();
     // The destination holds a directory with something in it where the source
-    // holds a file. A copy replaces a file, a link or a pipe at a file's name,
-    // never a directory, so the child's unlink answers EISDIR and it exits at
-    // once.
+    // holds a file. A copy replaces a file, a link, a pipe or an empty
+    // directory at a file's name, never a directory with contents, so the
+    // child's removal answers ENOTEMPTY and it exits at once.
     std::fs::create_dir_all(rootfs.join("a-file/occupied")).unwrap();
     // Sorted after the refused entry and larger than a pipe's 64 KiB buffer, so
     // the walk is still writing long after the child is gone and the parent
@@ -1298,7 +1298,7 @@ fn a_copy_the_child_refuses_reports_the_childs_own_step() {
             assert_eq!(path, rootfs);
             assert_eq!(
                 cause.raw_os_error(),
-                Some(rustix::io::Errno::ISDIR.raw_os_error()),
+                Some(rustix::io::Errno::NOTEMPTY.raw_os_error()),
                 "the child's errno is carried through: {cause}"
             );
         }
@@ -1372,6 +1372,63 @@ fn a_copy_keeps_the_directories_the_root_already_has() {
             "{path}'s modification time was rewritten"
         );
     }
+    let _ = provision::remove(&dir);
+}
+
+/// An entry that is not a directory replaces an empty directory at its name, as
+/// it does in an extraction and in a provisioner's overlay, and a directory with
+/// something in it fails the copy rather than being emptied to make room.
+#[test]
+fn a_copy_replaces_an_empty_directory_and_refuses_a_full_one() {
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("copyin-replace-dir");
+    let rootfs = dir.join("rootfs");
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("file"), b"a file\n").unwrap();
+    std::os::unix::fs::symlink("file", source.join("link")).unwrap();
+    std::fs::write(source.join("first"), b"two names\n").unwrap();
+    std::fs::hard_link(source.join("first"), source.join("second")).unwrap();
+    assert!(make_fifo(&source.join("pipe")), "the source pipe is made");
+    for name in ["file", "link", "first", "second", "pipe"] {
+        std::fs::create_dir_all(rootfs.join(name)).unwrap();
+    }
+
+    provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy replaces each empty directory");
+    assert_eq!(std::fs::read(rootfs.join("file")).unwrap(), b"a file\n");
+    assert_eq!(
+        std::fs::read_link(rootfs.join("link")).unwrap(),
+        Path::new("file")
+    );
+    assert_eq!(
+        std::fs::read(rootfs.join("second")).unwrap(),
+        b"two names\n"
+    );
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_fifo(
+            &std::fs::symlink_metadata(rootfs.join("pipe"))
+                .unwrap()
+                .file_type()
+        ),
+        "the pipe replaced the directory",
+    );
+
+    let full = dir.join("full");
+    std::fs::create_dir_all(full.join("file")).unwrap();
+    std::fs::write(full.join("file/kept"), b"kept\n").unwrap();
+    let err = provision::CopyIn::new(&source, &full)
+        .run()
+        .expect_err("a directory with something in it is not replaced");
+    assert!(
+        matches!(err, provision::ProvisionError::Io { .. }),
+        "{}",
+        ferroday_cage::ErrorChain::new(&err)
+    );
+    assert_eq!(std::fs::read(full.join("file/kept")).unwrap(), b"kept\n");
     let _ = provision::remove(&dir);
 }
 

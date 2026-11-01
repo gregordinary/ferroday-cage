@@ -70,6 +70,7 @@ use super::coordinate::{self, Nesting};
 use super::digest::{self, Algorithm};
 use super::document::Carried;
 use super::extract::{Extraction, Placement};
+use super::identity::Ownership;
 use super::layer::Staging;
 use super::rooted::Rooted;
 use super::{
@@ -763,7 +764,8 @@ impl Debian {
         // for the root to differ.
         if wanted.is_empty() {
             if let Some(source) = config.overlay {
-                super::extract::overlay_tree(upper, source, Some(&base))
+                let ownership = Ownership::new(config.identity_map, config.id_mapper);
+                super::extract::overlay_tree(upper, source, Some((&base, &ownership)))
                     .map_err(|err| wrap(DebianError::Overlay(err)))?;
             }
             return Ok(staging.finish());
@@ -779,7 +781,7 @@ impl Debian {
         let installing = private.as_ref().unwrap_or(&archives).path();
         let statoverride = extract_packages(
             upper,
-            Some(&base),
+            Some((&base, Ownership::new(config.identity_map, config.id_mapper))),
             config.architecture,
             &installables,
             installing,
@@ -2618,10 +2620,12 @@ fn stage_extract(
 /// ([`Extraction::over`]), so a package shipping a legacy top-level path lands
 /// in `usr` exactly where the base's merged-usr links send it, and no farm is
 /// laid into the upper. A farm there would shadow whatever the base holds at
-/// those names, a base that keeps `/bin` a directory included.
+/// those names, a base that keeps `/bin` a directory included. The base comes
+/// with the identity map the upper is owned through, which a directory the
+/// extraction carries up from it is given the base's ownership through.
 fn extract_packages(
     staging: &Path,
-    over: Option<&Path>,
+    over: Option<(&Path, Ownership)>,
     architecture: &str,
     installables: &[Installable],
     archives_host: &Path,
@@ -2630,6 +2634,7 @@ fn extract_packages(
     if over.is_none() {
         create_merged_usr(staging, architecture)?;
     }
+    let (over, ownership) = over.unzip();
 
     // Every `.deb` ships a `./` entry, so the tree being assembled would
     // otherwise take the mode and modification time of whichever package
@@ -2638,7 +2643,8 @@ fn extract_packages(
     // independent of both the package set and the caller's umask.
     let mut extraction = Extraction::new(staging)?
         .root_mode(ROOTFS_ROOT_MODE)
-        .over(over)?;
+        .over(over)?
+        .owned_through(ownership.unwrap_or_default());
     let mut statoverride = StatOverride::default();
     // A statoverride record is one newline-terminated line; a path component
     // carrying an embedded newline would split into a second, forged record
@@ -4739,7 +4745,7 @@ mod tests {
         std::fs::create_dir_all(&upper).expect("the upper is creatable");
         extract_packages(
             &upper,
-            Some(&merged),
+            Some((&merged, Ownership::default())),
             "amd64",
             &install,
             &archives,
@@ -4763,7 +4769,7 @@ mod tests {
         std::fs::create_dir_all(&upper).expect("the upper is creatable");
         extract_packages(
             &upper,
-            Some(&split),
+            Some((&split, Ownership::default())),
             "amd64",
             &install,
             &archives,

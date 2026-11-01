@@ -493,11 +493,13 @@ pub enum ProvisionError {
     EntryUnsupported {
         /// The entry's path as recorded in the archive.
         path: PathBuf,
-        /// The entry's tar typeflag byte.
+        /// The entry's tar typeflag byte. A sparse member is `S` in every GNU
+        /// format, including the pax ones whose header records a regular file.
         kind: u8,
     },
-    /// The file is neither a recognized compression format nor a tar
-    /// archive.
+    /// The file is not a tar archive, either as it stands or decompressed from
+    /// a recognized compression format: it holds fewer bytes than one header,
+    /// or its first block is no tar header.
     #[non_exhaustive]
     FormatUnrecognized {
         /// The file as it was given.
@@ -685,7 +687,8 @@ impl fmt::Display for ProvisionError {
             ),
             ProvisionError::FormatUnrecognized { path } => write!(
                 f,
-                "{} is neither a recognized compression format nor a tar archive",
+                "{} is not a tar archive, either as it stands or in a recognized compression \
+                 format",
                 path.display(),
             ),
             ProvisionError::Cancelled => f.write_str("provisioning was cancelled"),

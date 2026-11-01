@@ -68,6 +68,8 @@ use rustix::io::Errno;
 use crate::path::{self, LeadingSlash};
 
 use super::containment;
+use super::copyin::{Owed, reown};
+use super::identity::Ownership;
 
 /// The mode an intermediate directory is left at.
 ///
@@ -91,7 +93,13 @@ pub(crate) struct Rooted {
     /// never written. See [`over`](Self::over).
     #[cfg(feature = "tarball")]
     lower: Option<OwnedFd>,
-    /// The tree's host path, for error reporting only.
+    /// The identity map the tree is owned through, which a directory carried
+    /// up from the base is given its ownership through. See
+    /// [`owned_through`](Self::owned_through).
+    ownership: Ownership,
+    /// The tree's host path, for error reporting, and for the child that
+    /// re-owns a carried directory, which opens the tree afresh by it. Nothing
+    /// in this process resolves through it.
     root: PathBuf,
 }
 
@@ -107,6 +115,7 @@ impl Rooted {
             fd,
             #[cfg(feature = "tarball")]
             lower: None,
+            ownership: Ownership::default(),
             root: root.to_path_buf(),
         })
     }
@@ -120,7 +129,11 @@ impl Rooted {
     /// with the upper made to hold what the view holds along them
     /// ([`containment::copy_up`]). `lib/apk/db/installed`, over a base whose
     /// `lib` is `usr/lib`, then lands in the upper's `usr/lib` beside a copy
-    /// of the link. A directory carried up from the base keeps the base's mode.
+    /// of the link. A directory carried up from the base keeps what an
+    /// extraction's carry keeps: the base's extended attributes, its mode, and
+    /// its owner and group. The ownership is given from inside the map
+    /// [`owned_through`](Self::owned_through) names, once the write that carried
+    /// the directory has landed beneath it.
     ///
     /// Only creation consults the base. Every read, and every write to a path
     /// whose parents are already there, is the upper's own, as it always was.
@@ -130,6 +143,18 @@ impl Rooted {
             self.lower = Some(rustix::io::fcntl_dupfd_cloexec(&lower.fd, 0)?);
         }
         Ok(self)
+    }
+
+    /// Names the identity map the tree is owned through, which a directory a
+    /// write carries up from the base is given its ownership through.
+    ///
+    /// Unset, the single-identity map, which is what a layer that runs nothing
+    /// in a sandbox writes under. Only a tree [`over`](Self::over) a base
+    /// carries anything up, so it is only there that this matters.
+    #[cfg(any(feature = "debian", feature = "alpine"))]
+    pub(crate) fn owned_through(mut self, ownership: Ownership) -> Rooted {
+        self.ownership = ownership;
+        self
     }
 
     /// The host path `relative` names, for an error message. Nothing resolves
@@ -183,8 +208,9 @@ impl Rooted {
     /// a symbolic link a package shipped in place of one of them names a
     /// directory of the tree rather than of the host.
     pub(crate) fn create_dir_all(&self, relative: impl AsRef<Path>) -> io::Result<()> {
-        self.create_dirs(&components(relative.as_ref())?)?;
-        Ok(())
+        let mut owed = Vec::new();
+        self.create_dirs(&components(relative.as_ref())?, &mut owed)?;
+        self.settle(&owed)
     }
 
     /// Reads the file at `relative`, refusing one that holds more than `limit`
@@ -253,11 +279,12 @@ impl Rooted {
     ///
     /// Only a regular file is opened. Anything else is refused without being
     /// opened at all, a named pipe included; see
-    /// [`open_regular`](Self::open_regular).
+    /// [`regular_stat`](Self::regular_stat).
     pub(crate) fn reader(&self, relative: impl AsRef<Path>) -> io::Result<File> {
         let relative = relative.as_ref();
         let (parent, leaf) = self.parent_of(relative, Parents::Require)?;
-        self.open_regular(&parent, &leaf, relative, OFlags::RDONLY)
+        let typed = self.regular_stat(&parent, &leaf, relative)?;
+        self.open_regular(&parent, &leaf, relative, &typed, OFlags::RDONLY)
     }
 
     /// Replaces the contents of the regular file at `relative` in place.
@@ -272,7 +299,8 @@ impl Rooted {
     pub(crate) fn overwrite(&self, relative: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
         let relative = relative.as_ref();
         let (parent, leaf) = self.parent_of(relative, Parents::Require)?;
-        let mut file = self.open_in_place(&parent, &leaf, relative)?;
+        let typed = self.regular_stat(&parent, &leaf, relative)?;
+        let mut file = self.open_in_place(&parent, &leaf, relative, &typed)?;
         file.set_len(0)?;
         file.write_all(contents)
     }
@@ -290,6 +318,10 @@ impl Rooted {
     /// In place, as [`overwrite`](Self::overwrite) rewrites: the inode, owner,
     /// group, and mode stay the ones a script gave the file. An absent leaf,
     /// or an absent parent, is already done.
+    ///
+    /// What is emptied is the file the predicate approved. The open is held to
+    /// that `stat`, so a file renamed onto the name after the look, regular or
+    /// not, fails the call rather than being emptied unseen.
     pub(crate) fn truncate_if(
         &self,
         relative: impl AsRef<Path>,
@@ -301,73 +333,60 @@ impl Rooted {
             Err(Errno::NOENT | Errno::NOTDIR) => return Ok(()),
             Err(errno) => return Err(errno.into()),
         };
-        match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        let approved = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat)
                 if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-                    && accept(&stat) => {}
+                    && accept(&stat) =>
+            {
+                stat
+            }
             Ok(_) | Err(Errno::NOENT | Errno::NOTDIR) => return Ok(()),
             Err(errno) => return Err(errno.into()),
-        }
-        self.open_in_place(&parent, &leaf, relative)?.set_len(0)
+        };
+        self.open_in_place(&parent, &leaf, relative, &approved)?
+            .set_len(0)
     }
 
-    /// Opens the regular file `leaf` of `parent` for rewriting in place.
+    /// Opens the regular file `leaf` of `parent`, which `typed` describes, for
+    /// rewriting in place.
     ///
     /// A file whose mode denies its owner writing is still the owner's to
     /// rewrite, since the owner may change its mode: `systemd` writes the
     /// machine id `0444`. Such a file is held open for reading, given its
     /// owner's write bit through that descriptor for as long as the open for
     /// writing takes, and given its own mode back before anything is written,
-    /// since a descriptor keeps the access it was opened with. The two opens
-    /// must reach one file, or nothing is written: the name is not trusted to
-    /// hold still between them.
-    fn open_in_place(&self, parent: &OwnedFd, leaf: &CString, relative: &Path) -> io::Result<File> {
-        match self.open_regular(parent, leaf, relative, OFlags::WRONLY) {
-            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
-            opened => return opened,
-        }
-        let held = self.open_regular(parent, leaf, relative, OFlags::RDONLY)?;
-        let before = rustix::fs::fstat(&held)?;
-        let mode = Mode::from_raw_mode(before.st_mode & 0o7777);
-        rustix::fs::fchmod(&held, mode | Mode::WUSR)?;
-        let opened = self.open_regular(parent, leaf, relative, OFlags::WRONLY);
-        rustix::fs::fchmod(&held, mode)?;
-        let file = opened?;
-        let after = rustix::fs::fstat(&file)?;
-        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{} was replaced while it was being opened",
-                    self.path(relative).display(),
-                ),
-            ));
-        }
-        Ok(file)
-    }
-
-    /// Opens the regular file `leaf` of `parent` for `access`, refusing
-    /// anything else without opening it.
-    ///
-    /// What holds the name is looked at first, without following it, so
-    /// nothing but a regular file is ever opened: a named pipe, which an
-    /// ordinary open would wait on until something opened its other end, and
-    /// a device node, whose open can act on the device, are refused before
-    /// either happens. An overlay whiteout is a file that is gone, and reads as
-    /// absent. `relative` names the file in a refusal.
-    ///
-    /// The open itself is [`containment::open_typed_file`]'s: `O_NONBLOCK` and
-    /// `O_NOCTTY` all the same, and refusing a name that no longer holds the
-    /// file looked at, since the name can be replaced between the look and the
-    /// open. A regular file ignores `O_NONBLOCK`, and the flag is cleared before
-    /// the descriptor is handed back all the same.
-    fn open_regular(
+    /// since a descriptor keeps the access it was opened with. Every open is
+    /// held to `typed`, so all of them reach the file the caller looked at, or
+    /// nothing is written: the name is not trusted to hold still between them.
+    fn open_in_place(
         &self,
         parent: &OwnedFd,
         leaf: &CString,
         relative: &Path,
-        access: OFlags,
+        typed: &Stat,
     ) -> io::Result<File> {
+        match self.open_regular(parent, leaf, relative, typed, OFlags::WRONLY) {
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
+            opened => return opened,
+        }
+        let held = self.open_regular(parent, leaf, relative, typed, OFlags::RDONLY)?;
+        let mode = Mode::from_raw_mode(rustix::fs::fstat(&held)?.st_mode & 0o7777);
+        rustix::fs::fchmod(&held, mode | Mode::WUSR)?;
+        let opened = self.open_regular(parent, leaf, relative, typed, OFlags::WRONLY);
+        rustix::fs::fchmod(&held, mode)?;
+        opened
+    }
+
+    /// What holds `leaf` of `parent`, without following it, where it is a
+    /// regular file, refusing anything else without opening it.
+    ///
+    /// Looking first is what keeps anything but a regular file from ever being
+    /// opened: a named pipe, which an ordinary open would wait on until
+    /// something opened its other end, and a device node, whose open can act on
+    /// the device, are refused before either happens. An overlay whiteout is a
+    /// file that is gone, and reads as absent. `relative` names the file in a
+    /// refusal.
+    fn regular_stat(&self, parent: &OwnedFd, leaf: &CString, relative: &Path) -> io::Result<Stat> {
         let stat = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)?;
         if containment::is_whiteout(&stat) {
             return Err(Errno::NOENT.into());
@@ -378,8 +397,29 @@ impl Rooted {
                 format!("{} is not a regular file", self.path(relative).display()),
             ));
         }
+        Ok(stat)
+    }
+
+    /// Opens the regular file `leaf` of `parent` that `typed` describes, for
+    /// `access`.
+    ///
+    /// `typed` is the [`regular_stat`](Self::regular_stat) the caller took, or
+    /// the one it approved. The open itself is
+    /// [`containment::open_typed_file`]'s: `O_NONBLOCK` and `O_NOCTTY` all the
+    /// same, and refusing a name that no longer holds that file, since the name
+    /// can be replaced between the look and the open. A regular file ignores
+    /// `O_NONBLOCK`, and the flag is cleared before the descriptor is handed
+    /// back all the same.
+    fn open_regular(
+        &self,
+        parent: &OwnedFd,
+        leaf: &CString,
+        relative: &Path,
+        typed: &Stat,
+        access: OFlags,
+    ) -> io::Result<File> {
         let fd =
-            containment::open_typed_file(parent.as_fd(), leaf, &stat, access).map_err(|errno| {
+            containment::open_typed_file(parent.as_fd(), leaf, typed, access).map_err(|errno| {
                 match errno {
                     Errno::STALE => io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -580,10 +620,11 @@ impl Rooted {
     /// Renames `from` to `to` within the tree, replacing whatever occupies the
     /// destination. Both paths resolve against the tree's root.
     pub(crate) fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+        let mut owed = Vec::new();
         let (from_parent, from_leaf) = self.parent_of(from.as_ref(), Parents::Require)?;
-        let (to_parent, to_leaf) = self.parent_of(to.as_ref(), Parents::Create)?;
+        let (to_parent, to_leaf) = self.parent_of(to.as_ref(), Parents::Create(&mut owed))?;
         rustix::fs::renameat(&from_parent, &from_leaf, &to_parent, &to_leaf)?;
-        Ok(())
+        self.settle(&owed)
     }
 
     /// Creates a symbolic link at `relative` holding `target` verbatim,
@@ -593,11 +634,12 @@ impl Rooted {
     /// whatever later follows the link, inside the tree.
     pub(crate) fn symlink(&self, target: &str, relative: impl AsRef<Path>) -> io::Result<()> {
         let target = CString::new(target).map_err(|_| Errno::INVAL)?;
-        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Create)?;
+        let mut owed = Vec::new();
+        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Create(&mut owed))?;
         containment::replacing(&parent, &leaf, || {
             rustix::fs::symlinkat(&target, &parent, &leaf)
         })?;
-        Ok(())
+        self.settle(&owed)
     }
 
     /// Creates the file at `relative` holding `contents`, at `mode`.
@@ -608,7 +650,8 @@ impl Rooted {
     /// its own leaves. The mode is applied through the descriptor, so it lands
     /// on the file this created and on nothing else.
     fn create(&self, relative: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
-        let (parent, leaf) = self.parent_of(relative, Parents::Create)?;
+        let mut owed = Vec::new();
+        let (parent, leaf) = self.parent_of(relative, Parents::Create(&mut owed))?;
         let fd = containment::replacing(&parent, &leaf, || {
             rustix::fs::openat(
                 &parent,
@@ -620,18 +663,32 @@ impl Rooted {
         let mut file = File::from(fd);
         file.write_all(contents)?;
         rustix::fs::fchmod(&file, Mode::from_raw_mode(mode))?;
-        Ok(())
+        self.settle(&owed)
+    }
+
+    /// Gives each directory a write carried up from the base the ownership the
+    /// base holds it at, through the map the tree is owned through.
+    ///
+    /// Called once the write has landed, as an extraction gives it once every
+    /// entry has: a directory given to another id could refuse the calling user
+    /// the write beneath it.
+    fn settle(&self, owed: &[Owed]) -> io::Result<()> {
+        reown(&self.root, owed, &self.ownership).map_err(io::Error::other)
     }
 
     /// Opens the parent directory of `relative` and returns it with the leaf
     /// name, creating the missing links of the chain where asked to.
-    fn parent_of(&self, relative: &Path, parents: Parents) -> Result<(OwnedFd, CString), Errno> {
+    fn parent_of(
+        &self,
+        relative: &Path,
+        parents: Parents<'_>,
+    ) -> Result<(OwnedFd, CString), Errno> {
         let components = components(relative)?;
         let (leaf, parent) = components.split_last().expect("validated non-empty");
         let leaf = CString::new(*leaf).map_err(|_| Errno::INVAL)?;
         let parent = match parents {
             Parents::Require => self.open_dir(parent)?,
-            Parents::Create => self.create_dirs(parent)?,
+            Parents::Create(owed) => self.create_dirs(parent, owed)?,
         };
         Ok((parent, leaf))
     }
@@ -670,9 +727,24 @@ impl Rooted {
     ///
     /// [`containment::create_dirs`] is the walk, preceded over a base by
     /// [`containment::copy_up`]; what is here is the mode this side leaves a
-    /// directory at, applied through the descriptor of the one just made.
-    fn create_dirs(&self, components: &[&[u8]]) -> Result<OwnedFd, Errno> {
+    /// directory at, applied through the descriptor of the one just made. The
+    /// ownership a directory carried up from the base is owed is added to
+    /// `owed`, for the caller to [`settle`](Self::settle) once its write is in.
+    #[cfg_attr(
+        not(feature = "tarball"),
+        expect(
+            unused_variables,
+            clippy::ptr_arg,
+            reason = "only a walk over a base carries a directory up, and only a build with a \
+                      provisioner walks over one"
+        )
+    )]
+    fn create_dirs(&self, components: &[&[u8]], owed: &mut Vec<Owed>) -> Result<OwnedFd, Errno> {
         let mut made = |made: containment::Made<'_>| {
+            #[cfg(feature = "tarball")]
+            if let Some(record) = containment::owed(&made)? {
+                owed.push(record);
+            }
             let mode = made.copied.map_or(DIR_MODE, |below| below.st_mode & 0o7777);
             rustix::fs::fchmod(made.dir, Mode::from_raw_mode(mode))
         };
@@ -696,10 +768,10 @@ impl Rooted {
 }
 
 /// Whether a missing parent directory is created or is a failure.
-#[derive(Clone, Copy)]
-enum Parents {
-    /// Create the missing links of the chain.
-    Create,
+enum Parents<'o> {
+    /// Create the missing links of the chain, adding to the list the ownership
+    /// each directory carried up from a base is owed.
+    Create(&'o mut Vec<Owed>),
     /// Fail with the kernel's own `ENOENT`.
     Require,
 }
@@ -1152,6 +1224,30 @@ mod tests {
         // An absent file, or an absent parent, is already done.
         tree.truncate_if("etc/absent", |_| true).unwrap();
         tree.truncate_if("absent/file", |_| true).unwrap();
+    }
+
+    #[test]
+    fn a_truncation_empties_the_file_it_approved_or_nothing() {
+        // The predicate approves one file, and a regular file renamed onto the
+        // name before the open is not that file. It is left as it is and the
+        // call says the name changed, rather than emptying what nobody looked
+        // at. The rename runs inside the predicate, which is exactly the
+        // window between the look and the open.
+        let (scratch, tree) = tree("truncate-raced");
+        let root = scratch.join("tree");
+        tree.write("etc/machine-id", b"approved\n").unwrap();
+        tree.write("etc/other", b"unseen\n").unwrap();
+        let err = tree
+            .truncate_if("etc/machine-id", |_| {
+                std::fs::rename(root.join("etc/other"), root.join("etc/machine-id")).unwrap();
+                true
+            })
+            .expect_err("the name no longer holds the approved file");
+        assert!(err.to_string().contains("was replaced"), "{err}");
+        assert_eq!(
+            std::fs::read(root.join("etc/machine-id")).unwrap(),
+            b"unseen\n",
+        );
     }
 
     #[test]

@@ -31,9 +31,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::containment;
 use super::identity::compose_child_map;
 use super::tar::{
-    BLOCK, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad, ustar_block,
+    BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
+    ustar_block,
 };
 use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
@@ -78,6 +80,13 @@ use crate::{IdMapper, IdentityMap};
 /// [`ProvisionError::SourceChanged`], naming the file: the archive would
 /// otherwise carry it cut or zero-padded. A name that stops holding the file
 /// the walk inspected, before the walk opens it, fails the export too.
+///
+/// A file is archived at its length, a sparse file's holes as the zeros they
+/// read as, and the export holds the archive to no ceiling. A tree untrusted
+/// code wrote can hold a file that cost it nothing to make long: `truncate -s
+/// 16T` writes no data. An export of such a tree bounds its sink, which
+/// [`write_to`](Self::write_to) takes as any `Write`: one that refuses past a
+/// ceiling fails the export there.
 ///
 /// [`write_to_path`](Self::write_to_path) names a file, which the archive is
 /// staged beside and renamed over, so the destination appears complete or not
@@ -865,8 +874,8 @@ impl<'f, W: Write> TarWriter<'f, W> {
     }
 
     /// Writes an entry's header(s): a pax extended header when the ustar fields
-    /// cannot hold the path, link target, size, or any extended attribute, then
-    /// the ustar header itself.
+    /// cannot hold the path, link target, size, modification time, owner,
+    /// group, or any extended attribute, then the ustar header itself.
     fn write_entry(
         &mut self,
         path: &[u8],
@@ -899,6 +908,15 @@ impl<'f, W: Write> TarWriter<'f, W> {
             // clamp it silently or abort the whole export on one exotic stamp.
             pax.extend_from_slice(&pax_record(b"mtime", mtime.to_string().as_bytes()));
         }
+        // An id past the octal field's seven digits: a range map whose extents
+        // reach that far, or an explicit `Ranges` one. Recorded exactly, as GNU
+        // tar records it and as this crate's reader reads it back.
+        if meta.uid > MAX_USTAR_ID {
+            pax.extend_from_slice(&pax_record(b"uid", meta.uid.to_string().as_bytes()));
+        }
+        if meta.gid > MAX_USTAR_ID {
+            pax.extend_from_slice(&pax_record(b"gid", meta.gid.to_string().as_bytes()));
+        }
         for (name, value) in xattrs {
             let mut key = Vec::with_capacity(b"SCHILY.xattr.".len() + name.len());
             key.extend_from_slice(b"SCHILY.xattr.");
@@ -913,7 +931,9 @@ impl<'f, W: Write> TarWriter<'f, W> {
         }
 
         // The ustar header. When a pax record overrides a field, the ustar
-        // field holds a truncated form the reader ignores.
+        // field holds a truncated form the reader ignores. An id is clamped
+        // rather than zeroed, so a reader that ignores pax records takes the
+        // entry for an unprivileged owner's rather than for root's.
         let (name_field, prefix_field) =
             split.unwrap_or((&path[..path.len().min(MAX_USTAR_NAME)], &[][..]));
         let ustar_size = if size_fits { size } else { 0 };
@@ -922,8 +942,8 @@ impl<'f, W: Write> TarWriter<'f, W> {
             name_field,
             prefix_field,
             meta.mode,
-            meta.uid,
-            meta.gid,
+            meta.uid.min(MAX_USTAR_ID),
+            meta.gid.min(MAX_USTAR_ID),
             ustar_size,
             mtime,
             typeflag,
@@ -1095,7 +1115,7 @@ fn read_bytes_u16(reader: &mut impl Read) -> io::Result<Vec<u8>> {
 /// the source filesystem lists attributes in.
 ///
 /// An attribute the host assigns rather than the tree carries is read off the
-/// stream and dropped; see [`host_assigned`].
+/// stream and dropped; see [`containment::host_assigned_xattr`].
 fn read_xattrs(reader: &mut impl Read) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let count = read_u16(reader)? as usize;
     let mut xattrs = Vec::with_capacity(count);
@@ -1104,37 +1124,12 @@ fn read_xattrs(reader: &mut impl Read) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let value_len = read_u32(reader)? as usize;
         let mut value = vec![0u8; value_len];
         reader.read_exact(&mut value)?;
-        if !host_assigned(&name) {
+        if !containment::host_assigned_xattr(&name) {
             xattrs.push((name, value));
         }
     }
     xattrs.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(xattrs)
-}
-
-/// Whether an extended attribute is one the host holding the tree assigns,
-/// rather than one the tree carries.
-///
-/// A security module labels the files it sees: SELinux as `security.selinux`,
-/// Smack as `security.SMACK64` and its relatives, AppArmor as
-/// `security.apparmor`. The integrity subsystem records a measurement or a
-/// signature as `security.ima` and `security.evm`. Overlayfs keeps its own
-/// bookkeeping on an upper's files as `user.overlay.*` and `trusted.overlay.*`.
-/// None of it is the tree's. It describes the host the tree sat on and that
-/// host's policy, it differs between two hosts holding the same tree, and an
-/// image carrying it would bring the build host's labels to wherever it is
-/// deployed, which applies its own. The archive leaves it out, which is what
-/// keeps one tree's archive the same from any host.
-///
-/// An unprivileged sandbox cannot set any of these on a file, so a tree it
-/// built never carries one of its own.
-fn host_assigned(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"security.selinux" | b"security.apparmor" | b"security.ima" | b"security.evm"
-    ) || name.starts_with(b"security.SMACK64")
-        || name.starts_with(b"user.overlay.")
-        || name.starts_with(b"trusted.overlay.")
 }
 
 /// Reads a directory or file metadata frame (the tag already consumed).
@@ -1251,6 +1246,36 @@ mod tests {
         assert_eq!(file.mode, 0o640);
         assert_eq!(file.size, 5);
         assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn an_id_past_the_octal_field_survives_through_a_pax_record() {
+        // A range map's extents can reach past the seven octal digits a ustar
+        // header has for an id. Such an id is carried in a pax record, and the
+        // header's own field holds a placeholder that is not root's.
+        let large = MAX_USTAR_ID + 1;
+        let mut buf = Vec::new();
+        {
+            let mut tar = TarWriter::new(&mut buf, None, None);
+            let mut f = meta("f", 0o644, large, u32::MAX);
+            f.nlink = 1;
+            tar.file(&f, &mut &b""[..]).unwrap();
+            let mut g = meta("g", 0o644, MAX_USTAR_ID, 7);
+            g.nlink = 1;
+            tar.file(&g, &mut &b""[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let mut reader = TarReader::new(&buf[..]);
+        let file = reader.next_entry().unwrap().unwrap();
+        assert_eq!((file.uid, file.gid), (large, u32::MAX));
+        let within = reader.next_entry().unwrap().unwrap();
+        assert_eq!((within.uid, within.gid), (MAX_USTAR_ID, 7));
+        assert!(reader.next_entry().unwrap().is_none());
+
+        // The header block of the first entry, after its pax header and data,
+        // holds the clamped placeholder.
+        let header = &buf[2 * BLOCK as usize..3 * BLOCK as usize];
+        assert_eq!(&header[108..116], b"7777777\0", "the clamped uid field");
     }
 
     #[test]

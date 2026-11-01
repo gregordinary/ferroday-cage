@@ -617,6 +617,23 @@ fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
     empty_target.symlink("link", "");
     let err = provision_err("malformed-empty-symlink", &empty_target.finish());
     assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+
+    // A hard link naming no entry, and a symbolic link whose target no
+    // filesystem can store, are malformed in the same way: neither names
+    // anything outside the root.
+    let mut empty_hardlink = archive();
+    empty_hardlink.hardlink("link", "");
+    let err = provision_err("malformed-empty-hardlink", &empty_hardlink.finish());
+    assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+
+    let record = ferroday_cage_testkit::tar::pax_record("linkpath", "a\0b");
+    let mut nul_target = archive();
+    nul_target
+        .header(b"pax-header", b'x', 0o644, record.len() as u64, 0, b"")
+        .body(record.as_bytes())
+        .symlink("link", "placeholder");
+    let err = provision_err("malformed-nul-symlink", &nul_target.finish());
+    assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
 }
 
 #[test]
@@ -673,6 +690,38 @@ fn an_empty_stream_is_unrecognized_rather_than_published_as_an_empty_rootfs() {
 }
 
 #[test]
+fn a_corrupt_first_header_is_reported_as_what_is_wrong_with_it() {
+    use std::io::Write;
+
+    // A first block carrying the ustar magic with a checksum that does not
+    // match is a damaged tar archive, and the reason says so: calling it some
+    // other format would send whoever reads the error looking for the wrong
+    // problem.
+    let mut tar = archive();
+    tar.file("f", 0o644, b"x");
+    let mut bytes = tar.finish();
+    bytes[0] = b'g';
+    let err = provision_err("extract-corrupt-first-header", &bytes);
+    assert!(
+        matches!(err, ProvisionError::Archive { offset: 0, .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("checksum"), "{err}");
+
+    // A recognized compression whose payload is too short to be a tar archive
+    // is not one, and the report does not claim the compression went
+    // unrecognized.
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(b"a short text, not an archive").unwrap();
+    let err = provision_err("extract-short-gzip-payload", &gz.finish().unwrap());
+    assert!(
+        matches!(err, ProvisionError::FormatUnrecognized { .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("not a tar archive"), "{err}");
+}
+
+#[test]
 fn a_terminated_empty_archive_publishes_an_empty_rootfs() {
     // The counterpart the rejection above must not take with it: two zero
     // blocks are what `tar cf empty.tar --files-from /dev/null` writes, and an
@@ -700,6 +749,92 @@ fn sparse_entries_are_unsupported() {
         matches!(err, ProvisionError::EntryUnsupported { kind: b'S', .. }),
         "{err}"
     );
+}
+
+#[test]
+fn pax_sparse_members_are_unsupported_in_every_format() {
+    // GNU tar's pax sparse formats write a regular file's `0` typeflag and say
+    // the member is sparse only in `GNU.sparse.*` records. Taken at its word,
+    // 0.0 extracts the packed data as the whole file, and 0.1 and 1.0 extract a
+    // `GNUSparseFile.<pid>/` directory holding the map and the packed data,
+    // with the real path missing. Each record set below is the one GNU tar 1.35
+    // writes for a 10 MiB file holding 4 KiB of data, in that format.
+    let packed = [b'd'; 4096];
+    let mut map_then_data = b"1\n4997120\n4096\n".to_vec();
+    map_then_data.resize(512, 0);
+    map_then_data.extend_from_slice(&packed);
+    // One format: its records, the name its member is stored under, and the
+    // member's data.
+    struct Format<'a> {
+        name: &'a str,
+        records: &'a [(&'a str, &'a str)],
+        stored_name: &'a [u8],
+        data: &'a [u8],
+    }
+    let formats = [
+        Format {
+            name: "0.0",
+            records: &[
+                ("GNU.sparse.size", "10485760"),
+                ("GNU.sparse.numblocks", "1"),
+                ("GNU.sparse.offset", "4997120"),
+                ("GNU.sparse.numbytes", "4096"),
+            ],
+            stored_name: b"holes",
+            data: &packed,
+        },
+        Format {
+            name: "0.1",
+            records: &[
+                ("GNU.sparse.size", "10485760"),
+                ("GNU.sparse.numblocks", "1"),
+                ("GNU.sparse.name", "holes"),
+                ("GNU.sparse.map", "4997120,4096"),
+            ],
+            stored_name: b"./GNUSparseFile.4242/holes",
+            data: &packed,
+        },
+        Format {
+            name: "1.0",
+            records: &[
+                ("GNU.sparse.major", "1"),
+                ("GNU.sparse.minor", "0"),
+                ("GNU.sparse.name", "holes"),
+                ("GNU.sparse.realsize", "10485760"),
+            ],
+            stored_name: b"./GNUSparseFile.4242/holes",
+            data: &map_then_data,
+        },
+    ];
+    for Format {
+        name: format,
+        records,
+        stored_name,
+        data,
+    } in formats
+    {
+        let records: String = records
+            .iter()
+            .map(|(key, value)| ferroday_cage_testkit::tar::pax_record(key, value))
+            .collect();
+        let mut tar = archive();
+        tar.header(
+            b"./PaxHeaders/holes",
+            b'x',
+            0o644,
+            records.len() as u64,
+            0,
+            b"",
+        )
+        .body(records.as_bytes())
+        .header(stored_name, b'0', 0o644, data.len() as u64, MTIME, b"")
+        .body(data);
+        let err = provision_err(&format!("extract-pax-sparse-{format}"), &tar.finish());
+        assert!(
+            matches!(err, ProvisionError::EntryUnsupported { kind: b'S', .. }),
+            "format {format}: {err}"
+        );
+    }
 }
 
 #[test]

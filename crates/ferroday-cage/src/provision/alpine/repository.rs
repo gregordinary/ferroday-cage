@@ -50,7 +50,8 @@ pub struct Repository {
     pub(super) release: String,
     /// The components to read, empty for a repository that publishes none.
     pub(super) components: Vec<String>,
-    /// The keys this repository's indexes and packages are verified against.
+    /// The keys this repository's indexes are verified against. A package is
+    /// bound to the index that named it rather than verified on its own.
     pub(super) keys: KeySet,
 }
 
@@ -251,7 +252,11 @@ impl RepositoryBuilder {
         self
     }
 
-    /// Verifies this repository's indexes and packages against `keys`.
+    /// Verifies this repository's indexes against `keys`.
+    ///
+    /// A package is bound to the verified index that named it, by the control
+    /// identity the index records for it, so a package's own signature is read
+    /// and not verified.
     ///
     /// An additional repository must declare its keys: unlike the primary, it
     /// has no default, since its signing key is its own.

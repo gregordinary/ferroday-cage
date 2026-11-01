@@ -107,8 +107,8 @@ pub(crate) use child::CONTROL_TERMINATE;
 #[cfg(feature = "netstack")]
 pub(crate) use child::sweep_fds_keeping;
 pub(crate) use copyin::{
-    COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_SYMLINK, CopyFailure,
-    start_copy_in,
+    COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_OWN, COPY_SYMLINK,
+    CopyFailure, start_copy_in,
 };
 #[cfg(feature = "tarball")]
 pub(crate) use export::{

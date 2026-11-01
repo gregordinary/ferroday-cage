@@ -18,6 +18,8 @@ pub struct Tar {
     data: Vec<u8>,
     v7: bool,
     mtime: u64,
+    /// The `uname` and `gname` every header states, where a fixture set them.
+    names: Option<(String, String)>,
 }
 
 impl Tar {
@@ -38,6 +40,17 @@ impl Tar {
     /// take a time of their own.
     pub fn stamped(mut self, mtime: u64) -> Tar {
         self.mtime = mtime;
+        self
+    }
+
+    /// The same stream naming `uname` and `gname` as the owner in every
+    /// header appended after this, the ids staying whatever each entry states.
+    ///
+    /// A ustar header carries an owner by name as well as by id, and a reader
+    /// that resolves names, as `apk` does, takes the name first. Without this a
+    /// header names no one, as a v7 header cannot.
+    pub fn owner_names(&mut self, uname: &str, gname: &str) -> &mut Tar {
+        self.names = Some((uname.to_string(), gname.to_string()));
         self
     }
 
@@ -223,6 +236,14 @@ impl Tar {
         if !self.v7 {
             block[257..263].copy_from_slice(b"ustar\0");
             block[263..265].copy_from_slice(b"00");
+            if let Some((uname, gname)) = &self.names {
+                assert!(
+                    uname.len() < 32 && gname.len() < 32,
+                    "a fixture owner name fits its field",
+                );
+                block[265..265 + uname.len()].copy_from_slice(uname.as_bytes());
+                block[297..297 + gname.len()].copy_from_slice(gname.as_bytes());
+            }
         }
         // The checksum is computed with its own field read as spaces, which is
         // the format's own rule.

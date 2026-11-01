@@ -1,15 +1,16 @@
 //! The identity map a provisioning child works inside.
 //!
-//! Three operations fork a child into a user namespace to touch a tree at the
-//! ownership that tree intends: the export, the copy in, and the map-assisted
-//! removal. Each has to answer the same question before the fork — who
-//! establishes the map, and over what extents — and the answer is policy
-//! rather than mechanism: the single-identity map is written by the child
-//! itself under the kernel's one-id exception, and any range map is applied
-//! from outside by a delegate, which is the caller's when one was supplied and
-//! the bundled chain's otherwise.
+//! Four operations fork a child into a user namespace to touch a tree at the
+//! ownership that tree intends: the export, the copy in, the map-assisted
+//! removal, and a layered build giving the directories it carried up from its
+//! base the base's owners. Each has to answer the same question before the
+//! fork — who establishes the map, and over what extents — and the answer is
+//! policy rather than mechanism: the single-identity map is written by the
+//! child itself under the kernel's one-id exception, and any range map is
+//! applied from outside by a delegate, which is the caller's when one was
+//! supplied and the bundled chain's otherwise.
 //!
-//! The answer is composed here so the three agree on it. What differs between
+//! The answer is composed here so the four agree on it. What differs between
 //! them is only the error each reports, so the failure leaves as the reason
 //! text and each caller wraps it in its own variant.
 
@@ -20,6 +21,44 @@ use crate::error::ConfigError;
 use crate::failure::ErrorChain;
 use crate::idmap::{IdMapper, ResolvedMap};
 use crate::mechanism::ChildMap;
+
+/// The identity map a tree is owned through, and the delegate that establishes
+/// it where the caller supplied one: what a step needs to re-enter that map.
+///
+/// The pair every builder that writes ownership takes, held by the internal
+/// steps that do the same for it. The default is the single-identity map, as
+/// it is for each of those builders: a tree built with every default was built
+/// under it.
+#[derive(Clone, Default)]
+pub(crate) struct Ownership {
+    /// The map.
+    map: IdentityMap,
+    /// The caller's delegate for a range map, where one was supplied.
+    mapper: Option<Arc<dyn IdMapper>>,
+}
+
+impl Ownership {
+    /// The ownership of a tree built under `map`, through `mapper` where the
+    /// caller supplied one.
+    #[cfg_attr(
+        not(any(feature = "debian", feature = "alpine")),
+        allow(
+            dead_code,
+            reason = "only the Debian and Alpine layers build an upper under a range map"
+        )
+    )]
+    pub(crate) fn new(map: &IdentityMap, mapper: Option<&Arc<dyn IdMapper>>) -> Ownership {
+        Ownership {
+            map: map.clone(),
+            mapper: mapper.cloned(),
+        }
+    }
+
+    /// The child's map for this ownership; see [`compose_child_map`].
+    pub(super) fn child_map(&self) -> Result<ChildMapSource, String> {
+        compose_child_map(&self.map, self.mapper.as_ref())
+    }
+}
 
 /// A resolved range-map delegate: the mapper that applies the map, and the
 /// extents it resolved.

@@ -374,10 +374,17 @@ fn pool_repository(config: &Config) -> Result<Repository, String> {
 }
 
 /// Collects the `.deb` and `.ddeb` files a build left in `out_dir`.
+///
+/// The build sandbox could write anything there, so only regular files are
+/// taken. An entry's type is read without following it: a symbolic link named
+/// `x.deb` would point the publish at a host file the build chose, and a named
+/// pipe would hold it waiting. [`Pool::publish`] refuses both itself, so a name
+/// the build planted is left out here rather than failing the publish.
 fn collect_debs(out_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut debs: Vec<PathBuf> = std::fs::read_dir(out_dir)
         .map_err(|error| format!("cannot read the build output: {}", ErrorChain::new(&error)))?
         .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
         .filter(|path| {
             let ext = path.extension().and_then(OsStr::to_str);

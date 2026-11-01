@@ -375,6 +375,13 @@ being written out of order. A file that grows or shrinks while it is read
 fails the export with `ProvisionError::SourceChanged`, naming the file, rather
 than archiving it cut or padded.
 
+A file is archived at its length, and a sparse file's holes as the zeros they
+read as. A file can cost the command that wrote it nothing: `truncate -s 16T`
+writes no data and takes no space, yet its member holds sixteen tebibytes. The
+export sets no ceiling of its own, as extraction sets no quota. Where untrusted
+code wrote the tree, bound the sink. `write_to` takes any `Write`, and one that
+refuses past a ceiling fails the export at that point.
+
 As with removal, a tree built under a `CageBuilder::id_mapper` delegate is
 exported through `Export::id_mapper`. That re-enters the map using the same
 delegate rather than the bundled chain.
@@ -500,8 +507,9 @@ The destination must already exist, and entries are added to it. A directory the
 tree already carries is kept as it stands: the copy does not set its owner,
 mode, or modification time. A source staged under a restrictive umask
 therefore leaves the tree's `/etc` as it was. Anything else at a directory's
-name is replaced, and a file, symlink, or named pipe replaces whatever is at
-its own.
+name is replaced. A file, symlink, or named pipe replaces whatever is at its
+own, an empty directory included. A directory with something in it fails the
+copy.
 
 A symbolic link that resolves inside the tree to a directory counts as a
 directory. A copy into a merged-usr tree therefore lands through
@@ -634,9 +642,9 @@ filesystem:
   absolute `var/run -> /run` both lead inside the destination. An entry whose
   own path is absolute or climbs with `..` fails with
   `ProvisionError::EntryUnsafe` before anything is written. That error
-  means an escape attempt and nothing else. An entry refused for another
-  reason is a `ProvisionError::EntryRefused`: a path component that is not a
-  directory, or a symbolic link with no target.
+  means an escape attempt and nothing else. Any other refusal is a
+  `ProvisionError::EntryRefused`, such as a path through a file or a link
+  whose target is empty or holds a NUL.
 - **Ownership maps to the calling user.** Every extracted entry belongs to the
   calling user, whom the sandbox's identity map presents as root, so
   extracted files appear root-owned inside the sandbox. Ownership recorded
@@ -648,8 +656,10 @@ filesystem:
   privilege, and the sandbox assembles its own minimal `/dev` at launch.
   FIFOs are extracted. Extended attributes are not applied.
 - A later entry for the same path replaces the earlier one, matching tar's
-  behavior. Sparse and multi-volume members are not supported and fail
-  with a typed error.
+  behavior. Sparse members fail with `ProvisionError::EntryUnsupported`,
+  whichever GNU format wrote them. That is the old `S` type, and the pax
+  formats 0.0, 0.1 and 1.0, whose headers claim a regular file. Multi-volume
+  members fail the same way.
 
 Extraction imposes no size or entry-count quota. Where the archive comes from an
 untrusted source, bound disk usage externally.

@@ -154,7 +154,12 @@ impl<R: Read> Segments<R> {
 /// returns the same buffer it has already filled.
 ///
 /// [`BufRead::consume`] returns no error, so a sink failure is stashed and the
-/// caller reads it back from `failed` when the decode has finished.
+/// caller reads it back from `failed` when the decode has finished. The decode
+/// does not run on to the member's end meanwhile: the next
+/// [`fill_buf`](BufRead::fill_buf) fails, so a sink that refuses bytes stops the
+/// read as soon as it refuses them. That is what makes a ceiling on the
+/// compressed side bound the read rather than only report it afterwards, and a
+/// deflate stream can be made arbitrarily long while decoding to nothing.
 struct Tee<'a, R> {
     inner: R,
     sink: &'a mut dyn Write,
@@ -183,6 +188,11 @@ impl<R: BufRead> Read for Tee<'_, R> {
 
 impl<R: BufRead> BufRead for Tee<'_, R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.failed.is_some() {
+            // The failure itself stays stashed for the caller, which reports it
+            // ahead of whatever the decoder makes of this one.
+            return Err(io::Error::other("the segment's raw bytes were refused"));
+        }
         self.inner.fill_buf()
     }
 
@@ -271,11 +281,10 @@ impl Metadata {
 /// segment, and which of the two anchors below applies depends on what sits
 /// above the container rather than on what the container looks like.
 ///
-/// The distinction is `apk`'s own, established by driving it rather than by
-/// reading about it: a root trusting only postmarketOS's index key installs
-/// postmarketOS packages, whose per-builder signing keys that root has never
-/// seen, while the same package handed to `apk add` as a bare file is refused as
-/// `UNTRUSTED signature`.
+/// The distinction is `apk`'s own. A root trusting only postmarketOS's index key
+/// installs postmarketOS packages, whose per-builder signing keys that root has
+/// never seen, while the same package handed to `apk add` as a bare file is
+/// refused as `UNTRUSTED signature`.
 pub(super) enum Anchor<'a> {
     /// The container's own signature, verified against this key set.
     ///
@@ -328,7 +337,7 @@ pub(super) fn read_metadata<R: Read>(
 ) -> Result<Metadata, AlpineError> {
     let unreadable = |what: &'static str| {
         move |err: io::Error| {
-            AlpineError::container(subject, format!("its {what} segment is unreadable: {err}"))
+            AlpineError::unreadable(subject, format!("its {what} segment is unreadable"), err)
         }
     };
 
@@ -519,12 +528,9 @@ pub(super) fn read_package<R: Read>(
     // down is the only one that decodes it, so verifying before extracting
     // costs a second read of the file rather than a second decompression of it.
     let mut digest = digest::DigestWriter::new(Algorithm::Sha256, io::sink());
-    let length = segments.drain(&mut digest).map_err(|err| {
-        AlpineError::container(subject, format!("its data segment is unreadable: {err}"))
-    })?;
-    let (actual, _) = digest.finish().map_err(|err| {
-        AlpineError::container(subject, format!("its data segment is unreadable: {err}"))
-    })?;
+    let unreadable = |err| AlpineError::unreadable(subject, "its data segment is unreadable", err);
+    let length = segments.drain(&mut digest).map_err(unreadable)?;
+    let (actual, _) = digest.finish().map_err(unreadable)?;
     if length == 0 {
         return Err(AlpineError::container(
             subject,
@@ -562,22 +568,29 @@ pub(super) fn data_reader<R: Read>(inner: R) -> GzDecoder<BufReader<R>> {
 
 /// Reads every member of a decompressed metadata segment into memory.
 ///
-/// `subject` names what is being read, for the error. The caller has already
-/// bounded the segment's decompressed size, and the members of a segment sum to
-/// it, so no member can hold more than the segment does. That is the ceiling
-/// each is read under: a header announcing more is refused before it is read.
+/// `subject` names the container being read, for the error, which reports the
+/// segment as part of that container. [`read_members`] is the same read for a
+/// tar that is not part of one.
 pub(super) fn members(subject: &str, segment: &[u8]) -> Result<Vec<Member>, AlpineError> {
-    let mut reader = TarReader::new(segment);
-    let mut members = Vec::new();
-    let malformed = |err: ProvisionError| {
+    read_members(segment).map_err(|err| {
         AlpineError::container(
             subject,
             format!("a segment is not a readable tar: {}", ErrorChain::new(&err)),
         )
-    };
-    while let Some(entry) = reader.next_entry().map_err(malformed)? {
+    })
+}
+
+/// Reads every member of a tar held in memory.
+///
+/// The caller has already bounded the tar's size, and its members sum to it,
+/// so no member can hold more than the whole does. That is the ceiling each is
+/// read under: a header announcing more is refused before it is read.
+pub(super) fn read_members(tar: &[u8]) -> Result<Vec<Member>, ProvisionError> {
+    let mut reader = TarReader::new(tar);
+    let mut members = Vec::new();
+    while let Some(entry) = reader.next_entry()? {
         let name = String::from_utf8_lossy(&entry.path).into_owned();
-        let data = reader.read_entry(segment.len() as u64).map_err(malformed)?;
+        let data = reader.read_entry(tar.len() as u64)?;
         members.push(Member { name, data });
     }
     Ok(members)
@@ -685,6 +698,51 @@ mod tests {
             // listed, since that is what a plan records as its trust anchor.
             assert_eq!(metadata.signed_by, fixtures::ALPINE_KEY_NAME, "{order}");
         }
+    }
+
+    #[test]
+    fn a_held_keys_signature_that_fails_is_passed_over_for_one_that_verifies() {
+        // Where this reader is deliberately more lenient than apk, which
+        // verifies only the first member naming a key it holds: a later
+        // member that verifies is still accepted, and it is still a trusted
+        // key's signature over exactly the segment that follows.
+        let base = extents(fixtures::ALPINE_BASE);
+        let (name, bytes) = published_signature(fixtures::ALPINE_BASE);
+        let mut damaged = bytes.clone();
+        damaged[0] ^= 0xff;
+        let container = [
+            &segment(&[(name.as_str(), &damaged[..]), (name.as_str(), &bytes[..])])[..],
+            &base[1][..],
+            &base[2][..],
+        ]
+        .concat();
+        let metadata = read_metadata(
+            "rotated",
+            &mut Segments::new(&container[..]),
+            Anchor::Signature(&alpine_keys()),
+            16 * 1024 * 1024,
+        )
+        .unwrap_or_else(|err| panic!("the second member verifies: {err}"));
+        assert_eq!(metadata.signed_by, fixtures::ALPINE_KEY_NAME);
+
+        // The damaged member alone verifies nothing.
+        let container = [
+            &segment(&[(name.as_str(), &damaged[..])])[..],
+            &base[1][..],
+            &base[2][..],
+        ]
+        .concat();
+        let err = read_metadata(
+            "damaged",
+            &mut Segments::new(&container[..]),
+            Anchor::Signature(&alpine_keys()),
+            16 * 1024 * 1024,
+        )
+        .expect_err("the only member does not verify");
+        assert!(
+            matches!(&err, AlpineError::Signature { reason, .. } if reason.contains("does not verify")),
+            "{err}",
+        );
     }
 
     #[test]
@@ -950,8 +1008,7 @@ mod tests {
 
     #[test]
     fn an_alpine_package_is_signed_by_the_key_that_signs_its_index() {
-        // Which is why holding a package to its own signature went unnoticed
-        // until postmarketOS, where the two keys differ. Nothing installs a
+        // postmarketOS is where the two keys differ. Nothing installs a
         // package this way — `read_package` takes no keys at all — but the
         // signature is real and the fact is worth pinning.
         for (name, bytes) in [
@@ -981,7 +1038,7 @@ mod tests {
 
     #[test]
     fn the_verified_payload_is_the_compressed_control_segment() {
-        // The finding the whole reader is shaped by: the signature covers the
+        // What the whole reader is shaped by: the signature covers the
         // raw compressed bytes of the segment after it, not the file and not
         // any decompressed form. The published fixture verifying at all is what
         // proves it, since a payload chosen any other way fails.
@@ -1091,6 +1148,83 @@ mod tests {
                 "cut at {cut}: {err}",
             );
         }
+
+        // A read that failed is the cause rather than part of the reason, so
+        // the decoder's own account of the truncation is reached through the
+        // chain and stated once.
+        let err = read_metadata(
+            "truncated",
+            &mut Segments::new(&fixtures::ALPINE_BASE[..8]),
+            Anchor::Signature(&alpine_keys()),
+            16 * 1024 * 1024,
+        )
+        .expect_err("a gzip header cut short is not readable");
+        let source = std::error::Error::source(&err)
+            .unwrap_or_else(|| panic!("the failed read is the cause: {err}"))
+            .to_string();
+        assert!(!err.to_string().contains(&source), "{err} / {source}");
+    }
+
+    /// A gzip member that decodes to nothing however long it is: `stored`
+    /// empty stored blocks, five bytes each, then a final one.
+    fn empty_member(stored: usize) -> Vec<u8> {
+        let mut member = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+        for _ in 0..stored {
+            member.extend_from_slice(&[0, 0, 0, 0xff, 0xff]);
+        }
+        member.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+        // The CRC-32 and the length of the empty output.
+        member.extend_from_slice(&[0; 8]);
+        member
+    }
+
+    #[test]
+    fn a_compressed_side_past_its_ceiling_stops_the_read() {
+        // A deflate stream can run on for as long as its producer likes while
+        // decoding to nothing, so nothing on the decompressed side ever bounds
+        // it. The compressed side's ceiling has to stop the read when it is
+        // crossed, rather than report the crossing once the member has been
+        // read to its end.
+        struct Counting<'a> {
+            inner: &'a [u8],
+            read: &'a std::cell::Cell<usize>,
+        }
+        impl Read for Counting<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let read = self.inner.read(buf)?;
+                self.read.set(self.read.get() + read);
+                Ok(read)
+            }
+        }
+
+        let member = empty_member(1 << 20);
+        let mut plain = Vec::new();
+        assert_eq!(
+            Segments::new(&member[..])
+                .read_segment(&mut plain, &mut io::sink())
+                .expect("the member is well formed"),
+            Some(member.len() as u64),
+        );
+        assert!(plain.is_empty(), "and it decodes to nothing");
+
+        let read = std::cell::Cell::new(0);
+        let ceiling = 64 * 1024;
+        let err = Segments::new(Counting {
+            inner: &member,
+            read: &read,
+        })
+        .read_segment(
+            &mut io::sink(),
+            &mut LimitedWriter::new(io::sink(), ceiling),
+        )
+        .expect_err("the compressed side is past its ceiling");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            read.get() < 2 * ceiling as usize,
+            "read {} of {} bytes past a ceiling of {ceiling}",
+            read.get(),
+            member.len(),
+        );
     }
 
     #[test]
@@ -1125,7 +1259,7 @@ mod tests {
 
     #[test]
     fn a_package_signed_by_a_key_no_anchor_holds_still_reads() {
-        // The finding postmarketOS produced, as bytes it published. This package
+        // A postmarketOS package, as the archive publishes it. This package
         // is signed by `pmos@local-6a50011b`, which no key set could hold: its
         // repository publishes `build.postmarketos.org` as the trust anchor and
         // signs the index with it, while each package carries whichever builder

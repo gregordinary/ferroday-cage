@@ -49,23 +49,30 @@
 //! - [`COPY_LINK`]: a second or later name for a file already created. Its own
 //!   name and the first name's path, relative to the destination root, follow.
 //!   Metadata is the inode's and is already applied, so none is sent.
+//! - [`COPY_OWN`]: an entry the root already holds, to be given an owner and a
+//!   group. Its path from the destination root, the two ids, and the device and
+//!   inode it must still be follow. Nothing is created. A provisioner that laid
+//!   entries down as the calling user names here the owners only the map can
+//!   give them: a layered build, the base's owner for each directory it carried
+//!   up into the upper; the Alpine layer, the owner each package states.
 //! - [`COPY_END`]: the tree is finished.
 //!
-//! [`COPY_LINK`] is the one frame that carries a path rather than a single
-//! component, because a hard link's two names may sit in different directories
-//! and only the parent's walk knows where the first one was. Containment there
+//! [`COPY_LINK`] and [`COPY_OWN`] are the frames that carry a path rather than
+//! a single component. A hard link's two names may sit in different
+//! directories and only the parent's walk knows where the first one was, and
+//! an entry to own is named by where it sits in the root. Containment there
 //! rests on two things:
 //!
-//! 1. The anchor's directory is resolved from the destination root with
+//! 1. The path's directory part is resolved from the destination root with
 //!    `RESOLVE_IN_ROOT`, so whatever its components are — a merged-usr alias
 //!    the walk adopted, an absolute link, something a concurrent writer put
 //!    there — the resolution cannot leave the root.
-//! 2. The link is made without `AT_SYMLINK_FOLLOW`, so the *final* component is
-//!    never traversed.
+//! 2. The final component is never traversed: a link is made without
+//!    `AT_SYMLINK_FOLLOW`, and an entry to own is opened with `O_NOFOLLOW`.
 //!
-//! The child also refuses an absolute anchor and any component that is empty,
-//! `.`, or `..`. None of those is anything the walk records, so a frame naming
-//! one is a stream the child does not understand.
+//! The child also refuses an absolute path and any component that is empty,
+//! `.`, or `..`. None of those is anything the parent records, so a frame
+//! naming one is a stream the child does not understand.
 //!
 //! A directory the root already has is resolved the same way when it is a
 //! symbolic link: an alias such as `bin -> usr/bin` is followed from the root
@@ -111,6 +118,10 @@ pub(crate) const COPY_FIFO: u8 = 6;
 /// Frame tag: another name for a file already created, followed by the first
 /// name's path relative to the destination root.
 pub(crate) const COPY_LINK: u8 = 7;
+/// Frame tag: an entry the root already holds, followed by its path relative to
+/// the destination root, the uid and gid to give it, and the device and inode
+/// it must still be. See [`own_at`].
+pub(crate) const COPY_OWN: u8 = 8;
 
 wire_enum! {
     /// What the copy child was doing when a syscall failed.
@@ -159,6 +170,9 @@ wire_enum! {
         TooDeep = 14 => "descending into the source tree",
         /// A frame named something that is not a single path component.
         BadName = 15 => "reading an entry's name",
+        /// An entry the root already holds could not be reached to be given
+        /// its owner.
+        Own = 21 => "opening an entry the root already holds, to give it its owner",
     }
 }
 
@@ -510,19 +524,17 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 read_full(stream, &mut size)?;
                 let size = u64::from_le_bytes(size);
                 let name = name.component()?;
-                // O_EXCL after an unlink, rather than O_TRUNC: an existing
-                // entry may be a symlink, and truncating through one would
-                // write outside the tree.
-                match fs::unlinkat(&current, name, AtFlags::empty()) {
-                    Ok(()) | Err(Errno::NOENT) => {}
-                    Err(errno) => return Err((CopyStep::Create, errno)),
-                }
-                let file = fs::openat(
-                    &current,
-                    name,
-                    OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                    Mode::from_bits_truncate(0o600),
-                )
+                // O_EXCL, replacing what holds the name, rather than O_TRUNC:
+                // an existing entry may be a symlink, and truncating through
+                // one would write outside the tree.
+                let file = containment::replacing(&current, name, || {
+                    fs::openat(
+                        &current,
+                        name,
+                        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                        Mode::from_bits_truncate(0o600),
+                    )
+                })
                 .map_err(|errno| (CopyStep::Create, errno))?;
                 copy_data(stream, file.as_fd(), size)?;
                 apply_meta(file.as_fd(), &meta)?;
@@ -534,11 +546,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 let mut terminated = [0u8; LINK_BUF + 1];
                 let target = cstr_in(&mut terminated, &raw[..len])?;
                 let name = name.component()?;
-                match fs::unlinkat(&current, name, AtFlags::empty()) {
-                    Ok(()) | Err(Errno::NOENT) => {}
-                    Err(errno) => return Err((CopyStep::Symlink, errno)),
-                }
-                fs::symlinkat(target, &current, name)
+                containment::replacing(&current, name, || fs::symlinkat(target, &current, name))
                     .map_err(|errno| (CopyStep::Symlink, errno))?;
                 // A symlink carries ownership and a modification time but no
                 // mode: the kernel fixes a symlink's mode at 0777 and ignores an
@@ -558,20 +566,18 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
             COPY_FIFO => {
                 let (name, meta) = read_named(stream)?;
                 let name = name.component()?;
-                match fs::unlinkat(&current, name, AtFlags::empty()) {
-                    Ok(()) | Err(Errno::NOENT) => {}
-                    Err(errno) => return Err((CopyStep::Fifo, errno)),
-                }
                 // Created 0600 and widened below, for the reason a directory
                 // is: the copy owns the window between creation and the final
                 // mode, and a permissive one should not exist inside it.
-                fs::mknodat(
-                    &current,
-                    name,
-                    rustix::fs::FileType::Fifo,
-                    Mode::from_bits_truncate(0o600),
-                    0,
-                )
+                containment::replacing(&current, name, || {
+                    fs::mknodat(
+                        &current,
+                        name,
+                        rustix::fs::FileType::Fifo,
+                        Mode::from_bits_truncate(0o600),
+                        0,
+                    )
+                })
                 .map_err(|errno| (CopyStep::Fifo, errno))?;
                 // Applied through a descriptor, as every other entry's is, so
                 // a source-chosen mode lands on this pipe and on nothing a
@@ -587,15 +593,26 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 raw[len] = 0;
                 contained_path(&raw[..=len])?;
                 let name = name.component()?;
-                match fs::unlinkat(&current, name, AtFlags::empty()) {
-                    Ok(()) | Err(Errno::NOENT) => {}
-                    Err(errno) => return Err((CopyStep::Link, errno)),
-                }
                 // The link shares the anchor's inode, so it carries the
                 // ownership, mode, and modification time already applied to
                 // it — there is nothing further to set, which is the whole
                 // point of recording it as a link.
                 link_to_anchor(&anchor_root, &mut raw[..=len], &current, name)?;
+            }
+            COPY_OWN => {
+                let mut raw = [0u8; LINK_BUF + 1];
+                let len = read_bytes_u16(stream, &mut raw[..LINK_BUF])?.len();
+                raw[len] = 0;
+                contained_path(&raw[..=len])?;
+                let mut fields = [0u8; 24];
+                read_full(stream, &mut fields)?;
+                let owner = OwnFrame {
+                    uid: u32::from_le_bytes(fields[0..4].try_into().expect("slice length is 4")),
+                    gid: u32::from_le_bytes(fields[4..8].try_into().expect("slice length is 4")),
+                    dev: u64::from_le_bytes(fields[8..16].try_into().expect("slice length is 8")),
+                    ino: u64::from_le_bytes(fields[16..24].try_into().expect("slice length is 8")),
+                };
+                own_at(&anchor_root, &mut raw[..=len], &owner)?;
             }
             _ => return Err((CopyStep::ReadFrame, Errno::INVAL)),
         }
@@ -689,38 +706,133 @@ fn enter_dir(
 }
 
 /// Links `name` under `current` onto the file at `anchor`, a path from the
-/// destination root that [`contained_path`] has already admitted.
+/// destination root that [`contained_path`] has already admitted, replacing
+/// what holds `name` as every other entry the copy lays in does.
 ///
 /// `anchor` is the path followed by its terminator. The directory part is
 /// resolved from the root with `RESOLVE_IN_ROOT`, so no component of it — an
 /// alias [`enter_dir`] adopted included — can take the resolution out of the
 /// root. The final component is linked without `AT_SYMLINK_FOLLOW`, so it is
 /// never traversed. The separator before it is overwritten with a terminator
-/// to split the two in place.
+/// to split the two in place, once, before any link is tried.
 fn link_to_anchor(
     root: &OwnedFd,
     anchor: &mut [u8],
     current: &OwnedFd,
     name: &CStr,
 ) -> Result<(), (CopyStep, Errno)> {
-    let link = |dir: BorrowedFd<'_>, leaf: &CStr| {
+    let (dir, leaf) = parent_in_root(root, anchor, CopyStep::Link)?;
+    let dir = dir.as_ref().map_or(root.as_fd(), AsFd::as_fd);
+    containment::replacing(current, name, || {
         fs::linkat(dir, leaf, current, name, AtFlags::empty())
-            .map_err(|errno| (CopyStep::Link, errno))
-    };
+    })
+    .map_err(|errno| (CopyStep::Link, errno))
+}
+
+/// Splits `path`, a path from the destination root that [`contained_path`] has
+/// already admitted followed by its terminator, into the directory holding its
+/// final component and that component.
+///
+/// The directory is resolved from the root with `RESOLVE_IN_ROOT`, so no
+/// component of it — an alias [`enter_dir`] adopted included — can take the
+/// resolution out of the root. `None` is the root itself, for a path of one
+/// component. The final component is only named, for an `*at` call that does
+/// not follow it. The separator before it is overwritten with a terminator to
+/// split the two in place, once, before anything acts on either. `step` is what
+/// a failed resolution reports.
+fn parent_in_root<'p>(
+    root: &OwnedFd,
+    path: &'p mut [u8],
+    step: CopyStep,
+) -> Result<(Option<OwnedFd>, &'p CStr), (CopyStep, Errno)> {
     let malformed = |_| (CopyStep::BadName, Errno::INVAL);
-    let Some(split) = anchor.iter().rposition(|byte| *byte == b'/') else {
-        return link(
-            root.as_fd(),
-            CStr::from_bytes_with_nul(anchor).map_err(malformed)?,
-        );
+    let Some(split) = path.iter().rposition(|byte| *byte == b'/') else {
+        return Ok((None, CStr::from_bytes_with_nul(path).map_err(malformed)?));
     };
-    anchor[split] = 0;
-    let (dir, leaf) = anchor.split_at(split + 1);
+    path[split] = 0;
+    let (dir, leaf) = path.split_at(split + 1);
     let dir = CStr::from_bytes_with_nul(dir).map_err(malformed)?;
     let leaf = CStr::from_bytes_with_nul(leaf).map_err(malformed)?;
     let dir = containment::open_dir_path(root.as_fd(), dir, OFlags::PATH, ResolveFlags::IN_ROOT)
-        .map_err(|errno| (CopyStep::Link, errno))?;
-    link(dir.as_fd(), leaf)
+        .map_err(|errno| (step, errno))?;
+    Ok((Some(dir), leaf))
+}
+
+/// What a [`COPY_OWN`] frame states: the owner to give an entry, and the entry
+/// it must still be.
+struct OwnFrame {
+    uid: u32,
+    gid: u32,
+    /// The device the entry was on when the parent recorded it.
+    dev: u64,
+    /// Its inode number then.
+    ino: u64,
+}
+
+/// Gives the entry at `path` — a path from the destination root, as
+/// [`parent_in_root`] takes one — the owner `owner` names, where it is still
+/// the entry `owner` identifies.
+///
+/// The parent records an entry's device and inode when it lays the entry down
+/// or carries it up from a base, and names it here later, after other writers
+/// have had the tree: the rest of an extraction, a caller's files laid over
+/// it, a script. A name that holds anything else by then, or nothing, is left
+/// as it is. The entry the owner was stated for is gone, and giving its owner
+/// to whatever took the name would re-own an unrelated entry.
+///
+/// The final component is never followed. A symbolic link is given its owner
+/// as the link it is, through a descriptor of the link. Anything else is opened
+/// without following and without waiting — a named pipe opens as readily as a
+/// file — and given its owner through that descriptor. Its mode is then put
+/// back as it was. A `chown` clears a file's setuid and setgid bits, and a
+/// setuid or setgid helper is the commonest file an owner is stated for. The
+/// kernel keeps a directory's set-group-ID bit, but a filesystem that cleared
+/// it would change what new entries beneath the directory inherit.
+fn own_at(root: &OwnedFd, path: &mut [u8], owner: &OwnFrame) -> Result<(), (CopyStep, Errno)> {
+    let (dir, leaf) = parent_in_root(root, path, CopyStep::Own)?;
+    let dir = dir.as_ref().map_or(root.as_fd(), AsFd::as_fd);
+    let uid = Some(rustix::fs::Uid::from_raw(owner.uid));
+    let gid = Some(rustix::fs::Gid::from_raw(owner.gid));
+    let opened = fs::openat(
+        dir,
+        leaf,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    );
+    match opened {
+        Ok(entry) => {
+            let stat = fs::fstat(&entry).map_err(|errno| (CopyStep::Own, errno))?;
+            if !is_entry(&stat, owner) {
+                return Ok(());
+            }
+            fs::fchown(&entry, uid, gid).map_err(|errno| (CopyStep::Chown, errno))?;
+            fs::fchmod(&entry, Mode::from_bits_truncate(stat.st_mode & 0o7777))
+                .map_err(|errno| (CopyStep::Metadata, errno))
+        }
+        // What `O_NOFOLLOW` answers for a symbolic link.
+        Err(Errno::LOOP) => {
+            let link = fs::openat(
+                dir,
+                leaf,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|errno| (CopyStep::Own, errno))?;
+            let stat = fs::fstat(&link).map_err(|errno| (CopyStep::Own, errno))?;
+            if !is_entry(&stat, owner) {
+                return Ok(());
+            }
+            fs::chownat(&link, c"", uid, gid, AtFlags::EMPTY_PATH)
+                .map_err(|errno| (CopyStep::Chown, errno))
+        }
+        Err(Errno::NOENT | Errno::NOTDIR) => Ok(()),
+        Err(errno) => Err((CopyStep::Own, errno)),
+    }
+}
+
+/// Whether `stat` is the entry `owner` was recorded for.
+fn is_entry(stat: &fs::Stat, owner: &OwnFrame) -> bool {
+    stat.st_dev == owner.dev && stat.st_ino == owner.ino
 }
 
 /// The path from the destination root to the directory the walk holds open,
@@ -1146,6 +1258,145 @@ mod tests {
         frame.extend_from_slice(&(anchor.len() as u16).to_le_bytes());
         frame.extend_from_slice(anchor);
         frame
+    }
+
+    /// A [`COPY_OWN`] frame naming `path`, to be given `uid` and `gid` where
+    /// it is still the entry `path_on_disk` is now.
+    fn own_frame(path: &[u8], uid: u32, gid: u32, path_on_disk: &std::path::Path) -> Vec<u8> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path_on_disk).expect("the entry exists");
+        own_frame_at(path, uid, gid, meta.dev(), meta.ino())
+    }
+
+    /// A [`COPY_OWN`] frame naming `path` as the entry `dev` and `ino` name.
+    fn own_frame_at(path: &[u8], uid: u32, gid: u32, dev: u64, ino: u64) -> Vec<u8> {
+        let mut frame = vec![COPY_OWN];
+        frame.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        frame.extend_from_slice(path);
+        frame.extend_from_slice(&uid.to_le_bytes());
+        frame.extend_from_slice(&gid.to_le_bytes());
+        frame.extend_from_slice(&dev.to_le_bytes());
+        frame.extend_from_slice(&ino.to_le_bytes());
+        frame
+    }
+
+    /// The caller's own ids, which an unprivileged process may give a file it
+    /// owns, where root is one it may not.
+    fn own_ids() -> (u32, u32) {
+        (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        )
+    }
+
+    #[test]
+    fn an_owned_entry_keeps_its_setuid_bit() {
+        // A `chown` clears the setuid and setgid bits of a file, and a helper
+        // that is given an owner is the entry that most needs them. Giving a
+        // file to its own owner clears them for an unprivileged caller all the
+        // same, which is what makes this observable without privilege.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("copyin-own-setuid");
+        std::fs::create_dir_all(dir.join("usr/libexec")).unwrap();
+        let helper = dir.join("usr/libexec/helper");
+        std::fs::write(&helper, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o4750)).unwrap();
+        let (uid, gid) = own_ids();
+
+        let mut frames = own_frame(b"usr/libexec/helper", uid, gid, &helper);
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+        assert_eq!(mode_and_mtime(&helper).0, 0o4750);
+    }
+
+    #[test]
+    fn an_entry_whose_name_holds_something_else_is_left_alone() {
+        // Root is an owner an unprivileged caller cannot give, so an attempt
+        // fails, and an entry left alone is one with no attempt made.
+        if rustix::process::getuid().is_root() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "the test needs a caller other than root, to whom a chown to root is refused",
+            );
+            return;
+        }
+        let dir = Scratch::new("copyin-own-replaced");
+        std::fs::write(dir.join("file"), b"laid down\n").unwrap();
+        let frame = own_frame(b"file", 0, 0, &dir.join("file"));
+
+        // Replaced since: another inode at the name. The original is kept
+        // elsewhere, so its inode number is not the one the replacement takes.
+        std::fs::rename(dir.join("file"), dir.join("kept")).unwrap();
+        std::fs::write(dir.join("file"), b"a replacement\n").unwrap();
+        let mut frames = frame.clone();
+        frames.extend(own_frame_at(b"gone", 0, 0, 1, 1));
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+
+        // The entry itself is acted on, which is the refusal.
+        let mut frames = own_frame(b"file", 0, 0, &dir.join("file"));
+        frames.push(COPY_END);
+        assert_eq!(
+            consume_frames_in(dir.path(), &frames),
+            Err((CopyStep::Chown, Errno::PERM)),
+        );
+    }
+
+    #[test]
+    fn an_owned_symbolic_link_is_owned_as_itself() {
+        // The link is never followed: a frame naming the link acts on the
+        // link, and an outside target is neither opened nor changed.
+        if rustix::process::getuid().is_root() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "the test needs a caller other than root, to whom a chown to root is refused",
+            );
+            return;
+        }
+        let dir = Scratch::new("copyin-own-link");
+        let outside = Scratch::new("copyin-own-link-outside");
+        let target = outside.join("target");
+        std::fs::write(&target, b"outside\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("link")).unwrap();
+
+        let mut frames = own_frame(b"link", 0, 0, &dir.join("link"));
+        frames.push(COPY_END);
+        assert_eq!(
+            consume_frames_in(dir.path(), &frames),
+            Err((CopyStep::Chown, Errno::PERM)),
+            "the link itself is what the owner is given to",
+        );
+
+        // Named by the target's identity, the link is not the entry, and the
+        // target is not reached through it.
+        let mut frames = own_frame(b"link", 0, 0, &target);
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+    }
+
+    #[test]
+    fn an_entry_to_own_is_named_inside_the_root() {
+        // The directory part resolves in the root, an absolute link included,
+        // and a path that climbs out is a frame the child does not understand.
+        let dir = Scratch::new("copyin-own-in-root");
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::create_dir_all(dir.join("var")).unwrap();
+        std::os::unix::fs::symlink("/run", dir.join("var/run")).unwrap();
+        std::fs::write(dir.join("run/socketdir"), b"").unwrap();
+        let (uid, gid) = own_ids();
+
+        let mut frames = own_frame(b"var/run/socketdir", uid, gid, &dir.join("run/socketdir"));
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+
+        for path in [&b"../escape"[..], b"/etc/passwd", b"a//b", b"a/./b"] {
+            let mut frames = own_frame_at(path, uid, gid, 0, 0);
+            frames.push(COPY_END);
+            assert_eq!(
+                consume_frames_in(dir.path(), &frames),
+                Err((CopyStep::BadName, Errno::INVAL)),
+                "{}",
+                String::from_utf8_lossy(path),
+            );
+        }
     }
 
     /// The permission bits and modification time of `path`, without following

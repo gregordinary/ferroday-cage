@@ -36,6 +36,7 @@ use super::{DebianError, DebianEvent, DebianObserver};
 use crate::provision::Stream;
 use crate::provision::accounts;
 use crate::provision::document;
+use crate::provision::identity::Ownership;
 use crate::provision::layer::Rooting;
 use crate::provision::rooted::Rooted;
 use crate::{IdMapper, IdentityMap, Observer, Stdio};
@@ -495,12 +496,15 @@ pub(crate) fn configure_delta(
         statoverride,
         identity_map,
         source_date_epoch,
+        id_mapper,
         // Read by the dpkg waves this hands the gathered value down to.
         archives_host: _,
-        id_mapper: _,
         env: _,
     } = wave;
     let single = matches!(identity_map, IdentityMap::Single);
+    // What a directory the host side carries up from the base is re-owned
+    // through: the map the waves run under.
+    let ownership = Ownership::new(identity_map, id_mapper);
 
     // The increment's own tree, which every host-side step below is anchored
     // to, over the base so a directory a step creates never hides a link the
@@ -508,7 +512,8 @@ pub(crate) fn configure_delta(
     let base = open_tree(lower)?;
     let tree = open_tree(upper)?
         .over(Some(&base))
-        .map_err(DebianError::at("opening the tree", upper))?;
+        .map_err(DebianError::at("opening the tree", upper))?
+        .owned_through(ownership.clone());
     // The accounts' dates before any script runs, the base's where the upper
     // holds no file of its own yet.
     let found = found_dates(source_date_epoch, &tree, Some(&base))?;
@@ -546,7 +551,7 @@ pub(crate) fn configure_delta(
     // just-unpacked files — a shipped conffile among them — and before configure
     // so the maintainer scripts read the injected values.
     if let Some(source) = overlay_source {
-        super::super::extract::overlay_tree(upper, source, Some(lower))
+        super::super::extract::overlay_tree(upper, source, Some((lower, &ownership)))
             .map_err(DebianError::Overlay)?;
     }
 

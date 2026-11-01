@@ -110,6 +110,10 @@ resolves to the *later* repository, which is what makes an additional repository
 an overlay: a package it republishes at the version the primary already offers is
 the one that wins.
 
+A repository here carries no tag, so apk's `name@tag` pinning has no equivalent.
+`include` and `exclude` refuse a name carrying one at `build`, rather than
+resolving it as a package nothing offers.
+
 ### Two layouts, one type
 
 Alpine publishes `<release>/<component>/<architecture>`; postmarketOS publishes
@@ -401,8 +405,9 @@ caller's own supplied through `fetcher`.
 The chain has three links, and it is worth stating plainly because two of them
 rest on SHA-1:
 
-1. The index is signed with RSA-4096 over **SHA-1** (`.SIGN.RSA.`), verified
-   against the repository's key set.
+1. The index is signed with RSA over **SHA-1** (`.SIGN.RSA.`), verified
+   against the repository's key set. Alpine's current keys are 4096-bit. The
+   older keys it still ships are 2048-bit, mips64's only key among them.
 2. The index's `C:` field identifies each package's control segment by **SHA-1**
    of its compressed bytes.
 3. `.PKGINFO`'s `datahash` binds the file tree to that control segment by
@@ -504,23 +509,51 @@ identified by digests the index states, and indexes are re-fetched.
 
 ## Ownership
 
-The [identity map](identity-maps.md) decides the ownership the finished rootfs
-carries, and Alpine asks less of it than Debian does.
+The [identity map](identity-maps.md) decides the ownership the finished root
+filesystem carries, and the right map follows from what the root is for.
 
 The default single-identity map maps the calling user to root and nothing else,
-and the archive is content with that: every file of every package in an
-`alpine-base` closure is owned by root, so extraction needs none of the ownership
-emulation the Debian bootstrap installs stubs for. The one place it shows is that
-`alpine-baselayout`'s install script gives `/etc/shadow` to the `shadow` group,
-which the single map cannot represent. That call fails, harmlessly and exactly as
-it fails under `apk` in the same situation — Alpine's scripts tolerate it — and
-the resulting root is a working userland with that one group ownership flattened.
+so every entry of the finished root is owned by root. The installed database
+records root for each one, so it describes the tree. Most of Alpine is
+root-owned throughout, and every entry of an `alpine-base` closure is. Two
+things are flattened. `alpine-baselayout`'s install script gives `/etc/shadow`
+to the `shadow` group, which fails here exactly as it fails under `apk` in the
+same situation. Alpine's scripts tolerate it.
 
-A rootfs that is itself the product wants real ownership, and `identity_map`
-selects it. Under `IdentityMap::Subordinate` the system ids genuinely exist and
-that `chown` succeeds. A site-specific delegate establishes the map where one is
-supplied through `id_mapper`, as [Identity maps](identity-maps.md) describes for
-a sandbox.
+The other is a package's own entries that name another owner. The commonest are
+service helpers such as `dbus-daemon-launch-helper`, which is `root:messagebus`
+and setuid. Under this map it lands as `root:root`, so the bus cannot run it.
+That is right for a build or run environment consumed back inside
+single-identity sandboxes, which cannot observe the difference.
+
+A root that is itself the product wants real ownership, and `identity_map`
+selects it. Under `IdentityMap::Subordinate` the system ids genuinely exist, and
+the scripts' `chown` calls succeed. Each entry a package names another owner for
+is given that owner as `apk` gives it, between the package's `.pre-install` and
+`.post-install`:
+
+- **By name first.** The archive records an owner's user and group names
+  beside their ids. Each name is looked up in the root's own `/etc/passwd` and
+  `/etc/group`, as the package's `.pre-install` left them.
+- **By id otherwise.** A name the root has no account for falls back to the id
+  the archive records.
+- **Only the entry the package laid down.** An entry a pre-configure overlay or
+  an earlier script has replaced keeps the owner the replacement has.
+
+The extraction runs as the calling user, so a child entered into the root's map
+gives each entry its owner, and puts back the setuid and setgid bits the change
+of owner clears. The installed database records the ids given. An id the map
+does not hold fails the bootstrap with `AlpineError::Ownership`, rather than
+leaving the entry owned by root.
+
+An extract-only root runs no `.pre-install`, so there are no accounts to name an
+owner by. Its entries are owned by root under either map.
+
+A site-specific delegate establishes the map where one is supplied through
+`id_mapper`, as [Identity maps](identity-maps.md) describes for a sandbox.
+Because the ownership is real, it reaches the host, and
+[`provision::remove`](provisioning.md#removing-a-rootfs) deletes such a tree
+through the map.
 
 ## Extract-only and foreign architectures
 

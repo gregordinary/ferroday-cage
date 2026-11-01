@@ -53,10 +53,13 @@ enum Source {
 /// A stream that ends before its first header block holds no archive, and is
 /// refused with [`ProvisionError::FormatUnrecognized`]: an empty file, a
 /// truncated download, and a compression stream whose decoded payload is empty
-/// all arrive that way, and taking one as a complete archive of nothing would
-/// publish an empty tree that every later run then trusted. A *missing final
-/// terminator* is tolerated, as GNU tar tolerates it, but only once at least
-/// one entry has been read.
+/// or shorter than a header all arrive that way, and taking one as a complete
+/// archive of nothing would publish an empty tree that every later run then
+/// trusted. So is a stream whose first block is no tar header at all. A first
+/// header that is a corrupt one, its magic present and its checksum wrong, is
+/// [`ProvisionError::Archive`] instead, naming what is wrong with it. A
+/// *missing final terminator* is tolerated, as GNU tar tolerates it, but only
+/// once at least one entry has been read.
 ///
 /// A compressed stream is read to its end, past the archive's end-of-archive
 /// marker, so the integrity check each format carries is compared for every
@@ -104,7 +107,8 @@ enum Source {
 ///   applied.
 /// - A later entry for the same path replaces the earlier one, as with
 ///   tar itself. Sparse and multi-volume members are unsupported and fail
-///   with [`ProvisionError::EntryUnsupported`].
+///   with [`ProvisionError::EntryUnsupported`]. That includes a sparse member
+///   in any of GNU's pax formats, whose header claims a regular file.
 ///
 /// Extraction imposes no size or entry-count quota, so a caller extracting
 /// untrusted archives should bound disk usage externally. Decoder memory is
@@ -267,9 +271,10 @@ impl Provisioner for Tarball {
             // in as a path or a stream is one nothing else vouches for, so that
             // check is read too.
             Ok(()) => archive.finish(MAX_TRAILING_BYTES),
-            // A stream whose very first block is not a tar header is not
-            // a tar archive at all.
-            Err(ProvisionError::Archive { .. }) if archive.rejected_at_start() => {
+            // A stream too short to hold a header, or whose first block is
+            // none, is not a tar archive at all. Every other failure, the
+            // first header's included, keeps the reason it was refused for.
+            Err(ProvisionError::Archive { .. }) if archive.not_a_tar() => {
                 Err(ProvisionError::FormatUnrecognized { path: subject })
             }
             Err(err) => Err(err),

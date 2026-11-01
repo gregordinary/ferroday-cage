@@ -19,7 +19,7 @@
 //! letters are ignored and unknown syntax is refused.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::AlpineError;
@@ -247,8 +247,8 @@ pub(super) fn is_package_name(name: &str) -> bool {
 /// was malformed before anything was fetched.
 ///
 /// The whole index is refused rather than the record dropped, which is stricter
-/// than `apk`: measured against `apk.static`, a record whose `C:` will not
-/// decode is silently skipped and the rest of the index used. A mirror that
+/// than `apk`: `apk.static` silently skips a record whose `C:` will not decode
+/// and uses the rest of the index. A mirror that
 /// serves a malformed record has served something this reader cannot account
 /// for, and a root assembled from the remainder would be missing whatever that
 /// record named, without saying so.
@@ -286,22 +286,31 @@ pub(super) fn parse(subject: &str, text: &str, from: usize) -> Result<Vec<Record
 /// this same grammar: an installed record opens with exactly the fields an index
 /// record carries, but a database is not an index, and a refusal that called it
 /// one would name the wrong thing.
+///
+/// A letter repeated within one record is refused through a set of the letters
+/// that record has carried. Unknown letters are admitted, and a letter is any
+/// character, so one record can carry as many letters as it has lines. A base
+/// layer's `installed` header reaches here from a tree its own scripts wrote,
+/// and a walk of the record's fields for every line would make such a header
+/// cost the square of its length.
 pub(super) fn parse_records(text: &str, from: usize) -> Result<Vec<Record>, String> {
     let mut records = Vec::new();
     let mut fields: Vec<(char, &str)> = Vec::new();
+    let mut letters: HashSet<char> = HashSet::new();
     for (number, line) in text.lines().enumerate() {
         if line.is_empty() {
             if let Some(record) = record(&fields, number, from)? {
                 records.push(record);
             }
             fields.clear();
+            letters.clear();
             continue;
         }
         let mut characters = line.chars();
         let (Some(key), Some(':')) = (characters.next(), characters.next()) else {
             return Err(format!("line {} is not a field: {line:?}", number + 1));
         };
-        if fields.iter().any(|(seen, _)| *seen == key) {
+        if !letters.insert(key) {
             return Err(format!(
                 "the record ending at line {} carries {key}: twice",
                 number + 1
@@ -378,12 +387,11 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
         provides: list(value('p'), Provided::parse).map_err(malformed)?,
         install_if: list(value('i'), Dependency::parse).map_err(malformed)?,
         // A `k:` that is not a number greater than zero is no priority, which is
-        // measurably `apk`'s own reading rather than a lenient one: driving
-        // `apk.static` 3.0.7 over a purpose-built repository, a `k:0`, a `k:-1`
-        // and a `k:abc` provider each left it refusing to choose against a
-        // provider stating no `k:` at all, while a `k:1` provider won. It keeps
-        // the record either way, so refusing one here would refuse an index apk
-        // itself reads.
+        // `apk`'s own reading rather than a lenient one: `apk.static` 3.0.7
+        // refuses to choose between a provider stating `k:0`, `k:-1` or
+        // `k:abc` and one stating no `k:` at all, and picks a `k:1` provider
+        // over it. It keeps the record either way, so refusing one here would
+        // refuse an index apk itself reads.
         provider_priority: value('k')
             .and_then(|value| value.parse().ok())
             .filter(|priority| *priority > 0),
@@ -783,6 +791,37 @@ mod tests {
         // one a reader takes is exactly the ambiguity to refuse.
         let text = format!("{}P:b\n", record("a", "1.0-r0", "x86_64", ""));
         let err = parse("the index", &text, 0).expect_err("the record names itself twice");
+        assert!(matches!(err, AlpineError::Index { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_record_of_many_distinct_letters_is_read_in_one_pass() {
+        // Unknown letters are admitted, and any character is a letter, so
+        // nothing bounds how many one record carries but its length. A base's
+        // database is a tree its own scripts wrote. The letters are told apart
+        // through a set, so this reads in a pass over the record rather than in
+        // one per line, and the record still reads as the one package it names.
+        let mut text = record("a", "1.0-r0", "x86_64", "");
+        let letters: Vec<char> = (0x4e00..0x4e00 + 0x3_0000)
+            .filter_map(char::from_u32)
+            .take(150_000)
+            .collect();
+        assert_eq!(letters.len(), 150_000);
+        for letter in &letters {
+            text.push_str(&format!("{letter}:x\n"));
+        }
+        let records = parsed(&text);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "a");
+
+        // And the set is the record's own: the next record may carry the same
+        // letters again.
+        let twice = format!("{text}\n{text}");
+        assert_eq!(parsed(&twice).len(), 2);
+        // While a letter repeated within one record is still refused, at the
+        // end of the run of letters as at its start.
+        let repeated = format!("{text}{}:y\n", letters[letters.len() - 1]);
+        let err = parse("the index", &repeated, 0).expect_err("the last letter appears twice");
         assert!(matches!(err, AlpineError::Index { .. }), "{err}");
     }
 

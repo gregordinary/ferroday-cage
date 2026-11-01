@@ -809,8 +809,8 @@ mod tests {
 
     #[test]
     fn the_operator_is_a_set_of_orderings_rather_than_a_spelling() {
-        // Every row was measured against apk.static 3.0.7 with a dependency on
-        // a package published at 2.5-r0.
+        // Every row is apk.static 3.0.7's answer for a dependency on a package
+        // published at 2.5-r0.
         for (text, accepted) in [
             ("lib=2.5-r0", true),
             ("lib=2.0", false),
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn a_fuzzy_constraint_accepts_a_version_that_begins_with_it() {
-        // Each row measured against apk.static. The rule is a prefix over the
+        // Each row is apk.static's answer. The rule is a prefix over the
         // token stream, so it accepts versions on both sides of its own: `~1.0`
         // takes `1.0_rc1`, which is *below* 1.0.
         for (text, candidate, accepted) in [

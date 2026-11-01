@@ -27,9 +27,11 @@
 //! A layered build extracts into an overlay upper over a base it never
 //! writes, and [`Extraction::over`] names that base: every entry is then
 //! placed as it would be in the mounted overlay, so a directory of the
-//! increment's never hides a link of the base's. [`overlay_tree`] takes the
-//! base the same way.
+//! increment's never hides a link of the base's, and a directory of the base's
+//! it writes beneath keeps the ownership and attributes the base gives it.
+//! [`overlay_tree`] takes the base the same way.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(any(feature = "debian", feature = "alpine"))]
@@ -48,6 +50,8 @@ use crate::path::{self, LeadingSlash, Refused};
 
 use super::ProvisionError;
 use super::containment::{self, Made, Reached};
+use super::copyin::{Owed, reown};
+use super::identity::Ownership;
 use super::tar::{Entry, TarReader};
 
 /// How every path an extraction writes through is resolved: inside the root,
@@ -112,6 +116,10 @@ struct Tree<'a> {
     root: BorrowedFd<'a>,
     /// The base, read and never written. See [`Extraction::over`].
     lower: Option<BorrowedFd<'a>>,
+    /// The ownership the directories carried up from the base are owed, which
+    /// the calling user cannot give them, recorded for the walk's caller to give
+    /// through the map once its writes are done.
+    owed: &'a RefCell<Vec<Owed>>,
 }
 
 /// An extraction into one root directory, across one or more archives.
@@ -143,6 +151,12 @@ pub(crate) struct Extraction {
     /// The directory inside the archive that stands for the extraction root,
     /// where the archive wraps its tree in one.
     under: Option<Vec<u8>>,
+    /// The ownership the directories carried up from the base are owed, given
+    /// by [`finalize`](Self::finalize).
+    owed: RefCell<Vec<Owed>>,
+    /// The identity map the root is owned through, which that ownership is
+    /// given through. See [`owned_through`](Self::owned_through).
+    ownership: Ownership,
 }
 
 impl Extraction {
@@ -155,6 +169,8 @@ impl Extraction {
             root_meta: None,
             root_mode_fixed: false,
             under: None,
+            owed: RefCell::new(Vec::new()),
+            ownership: Ownership::default(),
         })
     }
 
@@ -179,9 +195,18 @@ impl Extraction {
     /// resolves it, and a later entry supersedes what holds its name. The base
     /// is never written, so a directory of its own is
     /// one an entry that is not a directory cannot supersede, and such an entry
-    /// is refused. A directory the base holds and the archive only implies
-    /// keeps the base's mode and modification time, as the overlay's own copy
-    /// carries them up.
+    /// is refused.
+    ///
+    /// A directory the base holds and the archive only implies keeps what the
+    /// overlay's own copy-up keeps: the base's extended attributes, POSIX access
+    /// control lists among them, its mode and modification time, and its owner
+    /// and group. The calling user cannot give a directory another id's
+    /// ownership, so [`finalize`](Self::finalize) gives it from inside the map
+    /// [`owned_through`](Self::owned_through) names. Under the single-identity
+    /// map an id other than the caller's cannot be represented at all, and a
+    /// directory the base holds at one is carried owned by root of the map. A
+    /// directory the caller cannot list, one another id owns and only that id
+    /// may read, carries no extended attributes up, since none can be read.
     ///
     /// What the per-entry hook sees is unchanged: the entry's path as the
     /// archive spells it, which is the path a package database records —
@@ -193,6 +218,18 @@ impl Extraction {
             self.lower_fd = Some(open_root(lower)?);
         }
         Ok(self)
+    }
+
+    /// Names the identity map the root is owned through, which the ownership a
+    /// directory carried up from the base is owed is given through.
+    ///
+    /// Unset, the single-identity map, which is what a layer that runs nothing
+    /// in a sandbox writes under. Only an extraction [`over`](Self::over) a base
+    /// carries anything up, so it is only there that this matters.
+    #[cfg(any(feature = "debian", feature = "alpine"))]
+    pub(crate) fn owned_through(mut self, ownership: Ownership) -> Extraction {
+        self.ownership = ownership;
+        self
     }
 
     /// Fixes the extraction root's own mode, in place of taking it from a `./`
@@ -254,13 +291,15 @@ impl Extraction {
         let tree = Tree {
             root: self.root_fd.as_fd(),
             lower: self.lower_fd.as_ref().map(AsFd::as_fd),
+            owed: &self.owed,
         };
         while let Some(mut entry) = archive.next_entry()? {
             match entry.typeflag {
                 // Unextractable without privilege; the sandbox provides its
                 // own /dev. GNU volume labels are archive metadata.
                 b'3' | b'4' | b'V' => continue,
-                // Sparse and multi-volume members are not supported.
+                // Sparse and multi-volume members are not supported. The reader
+                // reports a sparse member as `S` whichever GNU format wrote it.
                 b'S' | b'M' => {
                     return Err(ProvisionError::EntryUnsupported {
                         path: bytes_to_path(&entry.path),
@@ -344,14 +383,21 @@ impl Extraction {
 
     /// Applies the deferred directory metadata and consumes the extraction.
     ///
-    /// `root` names the extraction root for error reporting only.
+    /// Last of all, a directory carried up from the base is given the owner and
+    /// group the base holds it at, from a child re-entered into the map the root
+    /// is owned through ([`reown`]). That waits for every entry, as a mode does:
+    /// a directory given to another id could refuse the calling user the
+    /// entries still to be written beneath it.
+    ///
+    /// `root` names the extraction root in an error, and is where that child
+    /// opens it.
     pub(crate) fn finalize(self, root: &Path) -> Result<(), ProvisionError> {
         apply_dir_meta(self.root_fd.as_fd(), self.dir_meta)?;
         if let Some(meta) = self.root_meta {
             apply_meta_fd(self.root_fd.as_fd(), &meta)
                 .map_err(|errno| ProvisionError::io("finalizing", root, errno.into()))?;
         }
-        Ok(())
+        reown(root, &self.owed.into_inner(), &self.ownership)
     }
 }
 
@@ -463,7 +509,7 @@ fn open_parent(
     let mut lower = None;
     if let Some(base) = tree.lower {
         let walked = containment::copy_up(tree.root, base, parent, CONTAINMENT, &mut |made| {
-            place_made(made, dir_meta.as_deref_mut())
+            place_made(made, dir_meta.as_deref_mut(), tree.owed)
         });
         match walked {
             Ok(Reached::Directory(found)) => lower = found,
@@ -472,7 +518,7 @@ fn open_parent(
         }
     }
     let dir = containment::create_dirs(tree.root, parent, CONTAINMENT, &mut |made| {
-        place_made(made, dir_meta.as_deref_mut())
+        place_made(made, dir_meta.as_deref_mut(), tree.owed)
     })
     .map_err(|errno| parent_error(errno, entry_path))?;
     Ok(Parent { dir, lower })
@@ -486,11 +532,17 @@ fn open_parent(
 /// layered extraction's base keeps the base's mode and modification time,
 /// which is what the merged view showed before the root held it; only the
 /// deferred pass restores the time, since a directory's time moves as its
-/// contents are written.
+/// contents are written. The base's owner and group, where they are not the
+/// ones the carry gave it, are recorded in `owed` for the caller to give once
+/// its writes are done.
 fn place_made(
     made: Made<'_>,
     dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
+    owed: &RefCell<Vec<Owed>>,
 ) -> Result<(), Errno> {
+    if let Some(record) = containment::owed(&made)? {
+        owed.borrow_mut().push(record);
+    }
     let meta = match made.copied {
         Some(stat) => DirMeta {
             mode: stat.st_mode & 0o7777,
@@ -555,7 +607,7 @@ fn prepare_dir(
         return Ok(());
     };
     match containment::copy_up(tree.root, base, components, CONTAINMENT, &mut |made| {
-        place_made(made, dir_meta.as_deref_mut())
+        place_made(made, dir_meta.as_deref_mut(), tree.owed)
     }) {
         Ok(_) | Err(Errno::NOTDIR) => Ok(()),
         Err(errno) => Err(parent_error(errno, entry_path)),
@@ -828,8 +880,10 @@ fn extract_symlink(
     if entry.link_target.is_empty() {
         return Err(entry_refused(&entry.path, "the symlink target is empty"));
     }
+    // A link's target is stored and never resolved here, so a NUL in it is a
+    // malformed entry rather than a reach for anything outside the root.
     let target = CString::new(entry.link_target.clone())
-        .map_err(|_| entry_unsafe(&entry.path, "the symlink target contains a NUL byte"))?;
+        .map_err(|_| entry_refused(&entry.path, "the symlink target contains a NUL byte"))?;
     let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
@@ -872,7 +926,7 @@ fn extract_hardlink(
     // the noun names which of its two paths was rejected.
     let target_components = validate_path(&entry.link_target, &entry.path, "hardlink target")?;
     if target_components.is_empty() {
-        return Err(entry_unsafe(&entry.path, "the hardlink target is empty"));
+        return Err(entry_refused(&entry.path, "the hardlink target is empty"));
     }
     let target_parent = open_dir_at(tree.root, &target_components[..target_components.len() - 1])
         .map_err(|errno| resolve_error(errno, &entry.path))?;
@@ -1124,10 +1178,12 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// it, an absolute one included: an overlay's `var/run/` lands in `run/` where
 /// the root links `var/run` to `/run`, and the link stays a link.
 ///
-/// `over` is the base `root` is an overlay upper over, in a layered build, and
-/// is consulted as [`Extraction::over`] consults it: an overlay directory where
-/// the base links to a directory merges through the link rather than hiding
-/// it.
+/// `over` is the base `root` is an overlay upper over, in a layered build, with
+/// the identity map `root` is owned through. The base is consulted as
+/// [`Extraction::over`] consults it: an overlay directory where the base links
+/// to a directory merges through the link rather than hiding it. A directory
+/// the walk carries up from the base keeps what an extraction's keeps, the
+/// ownership given through that map once the walk is done.
 ///
 /// This backs the Debian and Alpine provisioners' pre-configure overlay, which
 /// lays a caller's configuration into the root after the packages are unpacked
@@ -1144,9 +1200,10 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 ///
 /// Where they differ, the job differs. This runs in the provisioner's own
 /// process between two dpkg or apk waves, writing as the calling user, whom the
-/// bootstrap's identity map already presents as root, so it needs no child
-/// re-entered into the map. It can lay into an upper over a base, which a
-/// `CopyIn` never writes into. It stamps what it writes with the time of
+/// bootstrap's identity map already presents as root, so what it lays in needs
+/// no child re-entered into the map. It can lay into an upper over a base, which
+/// a `CopyIn` never writes into, and only a directory it carries up from that
+/// base is re-owned through the map. It stamps what it writes with the time of
 /// writing, as the rest of a bootstrap does; an export's `clamp_mtime` is what
 /// makes the root reproducible, where a `CopyIn` carries the source's times
 /// because it mirrors an export. And it lays only what configuration for the
@@ -1156,15 +1213,21 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 pub(crate) fn overlay_tree(
     root: &Path,
     source: &Path,
-    over: Option<&Path>,
+    over: Option<(&Path, &Ownership)>,
 ) -> Result<(), ProvisionError> {
     let root_fd = open_root(root)?;
-    let lower_fd = over.map(open_root).transpose()?;
+    let lower_fd = over.map(|(lower, _)| open_root(lower)).transpose()?;
+    let owed = RefCell::new(Vec::new());
     let tree = Tree {
         root: root_fd.as_fd(),
         lower: lower_fd.as_ref().map(AsFd::as_fd),
+        owed: &owed,
     };
-    overlay_dir(tree, source)
+    overlay_dir(tree, source)?;
+    match over {
+        Some((_, ownership)) => reown(root, &owed.into_inner(), ownership),
+        None => Ok(()),
+    }
 }
 
 /// One item of the overlay walk's stack.
@@ -1353,7 +1416,7 @@ fn overlay_symlink(
     let target = fs::read_link(source_path)
         .map_err(|err| ProvisionError::io("reading the overlay symlink", source_path, err))?;
     let target = CString::new(target.as_os_str().as_bytes())
-        .map_err(|_| entry_unsafe(&path, "the symlink target contains a NUL byte"))?;
+        .map_err(|_| entry_refused(&path, "the symlink target contains a NUL byte"))?;
     let parent = open_parent(tree, components, &path, None)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &path)?;
@@ -1435,9 +1498,11 @@ mod tests {
             .iter()
             .map(|name| name.to_vec())
             .collect();
+        let owed = std::cell::RefCell::new(Vec::new());
         let tree = Tree {
             root: fd.as_fd(),
             lower: None,
+            owed: &owed,
         };
         open_parent(tree, &components, b"usr/lib/file", None)
             .expect("the implied parents are created");
@@ -2071,6 +2136,241 @@ mod layered_tests {
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
             "the base's own\nlibrary\ndmsetup\n",
+        );
+    }
+
+    /// A POSIX access control list granting the named user `named` and the
+    /// directory's own owner, group, and others, in the kernel's extended
+    /// attribute encoding: a version, then each entry's tag, permissions, and
+    /// id, sorted by tag.
+    fn acl(named: u32) -> Vec<u8> {
+        const UNDEFINED: u32 = u32::MAX;
+        let mut encoded = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 7u16, UNDEFINED),
+            (0x02, 5, named),
+            (0x04, 5, UNDEFINED),
+            (0x10, 7, UNDEFINED),
+            (0x20, 5, UNDEFINED),
+        ] {
+            encoded.extend_from_slice(&tag.to_le_bytes());
+            encoded.extend_from_slice(&perm.to_le_bytes());
+            encoded.extend_from_slice(&id.to_le_bytes());
+        }
+        encoded
+    }
+
+    /// The value of the attribute `name` on `path`, `None` where it carries
+    /// none.
+    fn xattr(path: &Path, name: &str) -> Option<Vec<u8>> {
+        let mut value = vec![0u8; 4096];
+        match rustix::fs::lgetxattr(path, name, &mut value[..]) {
+            Ok(read) => {
+                value.truncate(read);
+                Some(value)
+            }
+            Err(rustix::io::Errno::NODATA) => None,
+            Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
+        }
+    }
+
+    #[test]
+    fn a_carried_directory_keeps_the_bases_extended_attributes() {
+        // The overlay's own copy-up keeps a directory's attributes, its access
+        // control lists among them, and an increment written beneath a base
+        // directory must leave the merged view showing what the overlay would.
+        // What the host assigns rather than the tree carries stays behind.
+        let scratch = Scratch::for_test("extract-layered", "xattrs");
+        if !holds_user_xattrs(&scratch) {
+            return;
+        }
+        let base = scratch.join("base");
+        let mail = base.join("var/mail");
+        fs::create_dir_all(&mail).unwrap();
+        // A directory beneath a default list, created before the default was
+        // set, so it carries none of its own.
+        fs::create_dir_all(base.join("var/log/journal")).unwrap();
+        let set = |path: &Path, name: &str, value: &[u8]| {
+            rustix::fs::lsetxattr(path, name, value, rustix::fs::XattrFlags::empty())
+        };
+        if set(&mail, "system.posix_acl_access", &acl(4242)).is_err() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "this filesystem holds no POSIX access control lists",
+            );
+            return;
+        }
+        set(&mail, "system.posix_acl_default", &acl(4243)).unwrap();
+        set(&mail, "user.mime_type", b"text/plain").unwrap();
+        set(&mail, "user.overlay.redirect", b"elsewhere").unwrap();
+        set(
+            &base.join("var/log"),
+            "system.posix_acl_default",
+            &acl(4244),
+        )
+        .unwrap();
+
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+        let mut tar = Tar::new();
+        tar.file("var/mail/note", 0o644, b"a note\n").file(
+            "var/log/journal/entry",
+            0o644,
+            b"an entry\n",
+        );
+        extract_over(&upper, &base, &tar.finish()).expect("the increment extracts");
+
+        let carried = upper.join("var/mail");
+        for name in [
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+            "user.mime_type",
+        ] {
+            assert_eq!(
+                xattr(&carried, name),
+                xattr(&mail, name),
+                "{name} is carried up as the base holds it",
+            );
+        }
+        assert_eq!(
+            xattr(&carried, "user.overlay.redirect"),
+            None,
+            "the overlay's own bookkeeping stays with the base",
+        );
+        // The upper's `var/log` holds the base's default, so a directory made
+        // beneath it inherits one. The base's own `journal` carries none, and
+        // neither does its copy.
+        let journal = upper.join("var/log/journal");
+        assert_eq!(
+            xattr(&upper.join("var/log"), "system.posix_acl_default"),
+            Some(acl(4244))
+        );
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            assert_eq!(xattr(&journal, name), None, "{name} was not the base's");
+        }
+    }
+
+    /// The proof that matters for ownership: a base whose directory a range map
+    /// chowned to a group of its own, an increment extracted beneath it, and the
+    /// merged view a build sandbox is rooted on.
+    #[cfg(all(feature = "subid", any(feature = "debian", feature = "alpine")))]
+    #[test]
+    fn a_carried_directory_keeps_the_bases_owner_and_group_under_a_range_map() {
+        use super::overlay_tree;
+        use crate::IdentityMap;
+        use crate::provision::identity::Ownership;
+        use crate::provision::rooted::Rooted;
+
+        let Some(fixture) = ferroday_cage_testkit::fixture::fixture_rootfs(|tarball, root| {
+            crate::provision::ensure(root, &mut crate::provision::Tarball::new(tarball))
+        }) else {
+            return;
+        };
+        if !ferroday_cage_testkit::require::range_map() {
+            return;
+        }
+        let scratch = Scratch::for_test("extract-layered", "owner");
+        if !ferroday_cage_testkit::require::overlay(&scratch) {
+            return;
+        }
+        let base = scratch.join("base");
+        let copied = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(fixture)
+            .arg(&base)
+            .status()
+            .expect("cp runs");
+        assert!(copied.success());
+        fs::create_dir_all(base.join("var/mail")).unwrap();
+        // `root:mail 2775`, as Debian ships `/var/mail`. Only the map can name
+        // the group, and only root of it can keep the set-group-ID bit on it.
+        let chowned = crate::Cage::builder()
+            .rootfs(fixture)
+            .bind(&base, "/work")
+            .command("/bin/sh")
+            .args([
+                "-c",
+                "chown 0:8 /work/var/mail && chmod 2775 /work/var/mail",
+            ])
+            .identity_map(IdentityMap::Subordinate)
+            .build()
+            .expect("the sandbox configuration is valid")
+            .run()
+            .expect("the sandbox runs");
+        assert!(chowned.success(), "the base's directory is chowned");
+        let held = fs::metadata(base.join("var/mail")).unwrap();
+        assert_ne!(
+            held.gid(),
+            rustix::process::getegid().as_raw(),
+            "the base holds the directory at a group the caller is not",
+        );
+        let ownership = Ownership::new(&IdentityMap::Subordinate, None);
+        let owner_of = |path: &Path| {
+            let meta = fs::metadata(path).unwrap();
+            (meta.uid(), meta.gid(), meta.mode() & 0o7777)
+        };
+        let expected = (held.uid(), held.gid(), 0o2775);
+
+        // Each way the host side carries a directory up: an extraction, a
+        // contained write, and a caller's overlay laid into the upper.
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+        let mut tar = Tar::new();
+        tar.file("var/mail/note", 0o644, b"a note\n");
+        let mut extraction = Extraction::new(&upper)
+            .unwrap()
+            .over(Some(&base))
+            .unwrap()
+            .owned_through(ownership.clone());
+        extraction
+            .extract(&mut TarReader::new(&tar.finish()[..]), &mut |_, _| {
+                Ok(Placement::Write)
+            })
+            .unwrap();
+        extraction
+            .finalize(&upper)
+            .expect("the extraction finishes");
+        assert_eq!(owner_of(&upper.join("var/mail")), expected, "extracted");
+
+        let written = scratch.join("written");
+        fs::create_dir(&written).unwrap();
+        let below = Rooted::open(&base).unwrap();
+        Rooted::open(&written)
+            .unwrap()
+            .over(Some(&below))
+            .unwrap()
+            .owned_through(ownership.clone())
+            .write("var/mail/note", b"a note\n")
+            .expect("the write lands");
+        assert_eq!(owner_of(&written.join("var/mail")), expected, "written");
+
+        let laid = scratch.join("laid");
+        fs::create_dir(&laid).unwrap();
+        let source = scratch.join("source");
+        fs::create_dir_all(source.join("var/mail")).unwrap();
+        fs::write(source.join("var/mail/note"), b"a note\n").unwrap();
+        overlay_tree(&laid, &source, Some((&base, &ownership))).expect("the overlay lays in");
+        assert_eq!(owner_of(&laid.join("var/mail")), expected, "laid in");
+
+        // The merged view, as the kernel shows it to a sandbox rooted on it.
+        let output = crate::Cage::builder()
+            .overlay_rootfs(&base, &upper)
+            .command("/bin/sh")
+            .args(["-c", "stat -c '%u:%g %a' /var/mail"])
+            .identity_map(IdentityMap::Subordinate)
+            .build()
+            .expect("the sandbox configuration is valid")
+            .output()
+            .expect("the sandbox runs");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "0:8 2775\n");
+
+        // The single-identity map has no group but the caller's, so there the
+        // directory is carried at the caller's own.
+        let single = scratch.join("single");
+        fs::create_dir(&single).unwrap();
+        extract_over(&single, &base, &tar.finish()).expect("the increment extracts");
+        assert_eq!(
+            fs::metadata(single.join("var/mail")).unwrap().gid(),
+            rustix::process::getegid().as_raw(),
         );
     }
 }

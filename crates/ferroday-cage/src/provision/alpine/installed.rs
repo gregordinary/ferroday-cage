@@ -24,10 +24,9 @@
 //! every architecture says `noarch` while the index — and so the record `apk`
 //! writes — says the repository's.
 //!
-//! The result was checked rather than reasoned about: for the 27 packages of
-//! `alpine-base`, this writer reproduces the 33 KB `installed` that `apk.static`
-//! writes byte for byte, with one deliberate difference recorded in
-//! [`Record::header`].
+//! For the 27 packages of `alpine-base`, this writer reproduces the 33 KB
+//! `installed` that `apk.static` writes byte for byte, with one deliberate
+//! difference recorded in [`Record::header`].
 //!
 //! # The file lines
 //!
@@ -54,10 +53,18 @@ use super::sign;
 use crate::provision::tar;
 
 /// The uid, gid and mode a directory has when its record states none.
-const DEFAULT_DIR_ACL: (u32, u32, u32) = (0, 0, 0o755);
+const DEFAULT_DIR_ACL: Acl = Acl {
+    uid: 0,
+    gid: 0,
+    mode: 0o755,
+};
 
 /// The uid, gid and mode a file has when its record states none.
-const DEFAULT_FILE_ACL: (u32, u32, u32) = (0, 0, 0o644);
+const DEFAULT_FILE_ACL: Acl = Acl {
+    uid: 0,
+    gid: 0,
+    mode: 0o644,
+};
 
 /// Where the database lives inside the root.
 pub(super) const DB_DIR: &str = "lib/apk/db";
@@ -109,26 +116,41 @@ pub(super) struct Record {
 /// describes a directory twice states one ACL for it rather than two.
 struct DirectoryLines {
     path: Vec<u8>,
-    acl: Option<Vec<u8>>,
+    /// The ownership and mode the directory's own entry stated, or `None` for
+    /// a directory only its contents named.
+    acl: Option<Acl>,
     files: Vec<FileLines>,
 }
 
-/// One file of a record: the name it is recorded under, and the lines that
-/// describe it.
+/// One file of a record: the name it is recorded under, and what describes it.
 ///
-/// The name is held apart from the lines, rather than the whole directory being
-/// one appended buffer, because a file line can be taken away again. A package
-/// that takes a path over from an earlier one leaves that earlier record still
-/// claiming it otherwise, and the finished root would list one path under two
-/// packages with two `Z:` digests — of which at most one can match what is on
-/// disk. It is also what makes one package shipping a path twice record it once,
-/// which is the entry the extraction leaves behind.
+/// Held as fields rather than as rendered lines, because two things change after
+/// the file is laid down. A file can be taken away again: a package that takes a
+/// path over from an earlier one leaves that earlier record still claiming it
+/// otherwise, and the finished root would list one path under two packages with
+/// two `Z:` digests — of which at most one can match what is on disk. And its
+/// owner is recorded once the package's pre-install has created the accounts the
+/// owner is named by. Keeping the name apart is also what makes one package
+/// shipping a path twice record it once, which is the entry the extraction
+/// leaves behind.
 struct FileLines {
     /// The entry name, within its directory, which is what a later claim finds
     /// it by.
     name: Vec<u8>,
-    /// The `R:` line and the `a:` and `Z:` lines that follow it.
-    lines: Vec<u8>,
+    /// Its ownership and mode, which the `a:` line states where they are not
+    /// the default.
+    acl: Acl,
+    /// The SHA-1 the package's archive states for it, which the `Z:` line
+    /// carries.
+    digest: Option<[u8; 20]>,
+}
+
+/// An entry's owner and mode, as the database records them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Acl {
+    uid: u32,
+    gid: u32,
+    mode: u32,
 }
 
 impl Record {
@@ -255,8 +277,7 @@ impl Record {
     /// description standing, which is the extraction's own rule and so
     /// describes the directory that survived.
     pub(super) fn directory(&mut self, path: &[u8], uid: u32, gid: u32, mode: u32) {
-        let acl = acl_line(b'M', uid, gid, mode, DEFAULT_DIR_ACL);
-        self.directory_at(path).acl = acl;
+        self.directory_at(path).acl = Some(Acl { uid, gid, mode });
     }
 
     /// Records a file, symbolic link or hard link the package ships, at the
@@ -279,26 +300,46 @@ impl Record {
         digest: Option<[u8; 20]>,
     ) {
         let (directory, name) = split_leaf(path);
-        let mut lines = Vec::new();
-        lines.extend_from_slice(b"R:");
-        lines.extend_from_slice(name);
-        lines.push(b'\n');
-        if let Some(acl) = acl_line(b'a', uid, gid, mode, DEFAULT_FILE_ACL) {
-            lines.extend_from_slice(&acl);
-        }
-        if let Some(digest) = digest {
-            lines.extend_from_slice(b"Z:");
-            lines.extend_from_slice(sign::identity(&digest).as_bytes());
-            lines.push(b'\n');
-        }
-
+        let acl = Acl { uid, gid, mode };
         let files = &mut self.directory_at(directory).files;
         match files.iter_mut().find(|file| file.name == name) {
-            Some(file) => file.lines = lines,
+            Some(file) => {
+                file.acl = acl;
+                file.digest = digest;
+            }
             None => files.push(FileLines {
                 name: name.to_vec(),
-                lines,
+                acl,
+                digest,
             }),
+        }
+    }
+
+    /// Records `uid` and `gid` as the owner of the entry at `path`, a directory
+    /// or a file this record already holds, keeping its mode.
+    ///
+    /// What a bootstrap records once the entry has been given its owner, which
+    /// happens after the package's pre-install rather than as the entry is laid
+    /// down. An entry the record no longer holds, because a later package took
+    /// it, is not this record's to describe, and nothing changes.
+    pub(super) fn own(&mut self, path: &[u8], directory: bool, uid: u32, gid: u32) {
+        let acl = if directory {
+            self.at
+                .get(path)
+                .and_then(|at| self.directories[*at].acl.as_mut())
+        } else {
+            let (parent, name) = split_leaf(path);
+            self.at.get(parent).and_then(|at| {
+                self.directories[*at]
+                    .files
+                    .iter_mut()
+                    .find(|file| file.name == name)
+                    .map(|file| &mut file.acl)
+            })
+        };
+        if let Some(acl) = acl {
+            acl.uid = uid;
+            acl.gid = gid;
         }
     }
 
@@ -322,11 +363,24 @@ impl Record {
             out.extend_from_slice(b"F:");
             out.extend_from_slice(&directory.path);
             out.push(b'\n');
-            if let Some(acl) = &directory.acl {
-                out.extend_from_slice(acl);
+            if let Some(acl) = directory
+                .acl
+                .and_then(|acl| acl_line(b'M', acl, DEFAULT_DIR_ACL))
+            {
+                out.extend_from_slice(&acl);
             }
             for file in &directory.files {
-                out.extend_from_slice(&file.lines);
+                out.extend_from_slice(b"R:");
+                out.extend_from_slice(&file.name);
+                out.push(b'\n');
+                if let Some(acl) = acl_line(b'a', file.acl, DEFAULT_FILE_ACL) {
+                    out.extend_from_slice(&acl);
+                }
+                if let Some(digest) = file.digest {
+                    out.extend_from_slice(b"Z:");
+                    out.extend_from_slice(sign::identity(&digest).as_bytes());
+                    out.push(b'\n');
+                }
             }
         }
         out
@@ -353,10 +407,11 @@ fn split_leaf(path: &[u8]) -> (&[u8], &[u8]) {
 /// The omission is not a space saving: `apk` writes the line only for a
 /// difference, and a record that stated every default would be a record `apk`
 /// did not write, which is the thing this writer is measured against.
-fn acl_line(field: u8, uid: u32, gid: u32, mode: u32, default: (u32, u32, u32)) -> Option<Vec<u8>> {
-    if (uid, gid, mode) == default {
+fn acl_line(field: u8, acl: Acl, default: Acl) -> Option<Vec<u8>> {
+    if acl == default {
         return None;
     }
+    let Acl { uid, gid, mode } = acl;
     Some(format!("{}:{uid}:{gid}:{mode:o}\n", field as char).into_bytes())
 }
 
@@ -509,19 +564,21 @@ impl Database {
     /// Whether the package numbered `at` may lay `path` down, and records it as
     /// the owner where it may.
     ///
-    /// This is `apk`'s own rule with the cases a bootstrap cannot reach removed
-    /// — nothing is being upgraded and nothing is being removed, so what is
-    /// left is what the two packages' `replaces` say about each other:
+    /// This is `apk`'s own rule, checked in `apk`'s order, with the cases a
+    /// bootstrap cannot reach removed: nothing is being upgraded, so no two
+    /// records share a name, and nothing is being removed. What is left is
+    /// where the two packages came from and what their `replaces` say about
+    /// each other:
     ///
+    /// - they were built from one source package: the later takes the file,
+    ///   whatever either one's `replaces` says, since one build shipping a path
+    ///   twice is its own business;
     /// - the earlier package names the later one *more strongly* than the later
     ///   names it back — including where the later names it not at all: the
     ///   earlier keeps the file;
     /// - otherwise, the later package names the earlier one: it takes the file.
     ///   Equal priorities fall here, so two packages that name each other at the
     ///   same strength are settled by install order, as `apk` settles them;
-    /// - neither names the other but they were built from one source package:
-    ///   the later takes it, since one build shipping a path twice is its own
-    ///   business;
     /// - otherwise the two disagree, and that is [`Claim::Contested`].
     ///
     /// `apk` warns about that last case, skips the file, and marks the package
@@ -547,15 +604,18 @@ impl Database {
         }
 
         let (earlier, later) = (&self.records[owner], &self.records[at]);
-        let earlier_claims = replaces(earlier, later).then_some(earlier.replaces_priority);
-        let later_claims = replaces(later, earlier).then_some(later.replaces_priority);
-        let claim = match (earlier_claims, later_claims) {
-            (Some(earlier_priority), later) if Some(earlier_priority) > later => Claim::Kept,
-            (_, Some(_)) => Claim::Replaces,
-            _ if earlier.origin.is_some() && earlier.origin == later.origin => Claim::Replaces,
-            _ => Claim::Contested {
-                owner: earlier.name.clone(),
-            },
+        let claim = if earlier.origin.is_some() && earlier.origin == later.origin {
+            Claim::Replaces
+        } else {
+            let earlier_claims = replaces(earlier, later).then_some(earlier.replaces_priority);
+            let later_claims = replaces(later, earlier).then_some(later.replaces_priority);
+            match (earlier_claims, later_claims) {
+                (Some(earlier_priority), later) if Some(earlier_priority) > later => Claim::Kept,
+                (_, Some(_)) => Claim::Replaces,
+                _ => Claim::Contested {
+                    owner: earlier.name.clone(),
+                },
+            }
         };
         if claim == Claim::Replaces {
             self.owner.insert(path.to_vec(), at);
@@ -887,6 +947,35 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_recorded_after_the_entry_is_laid_down_is_the_one_written() {
+        // An entry is recorded as root when it is laid down, and given its
+        // package's owner once the accounts it names exist; the record states
+        // the owner it was given, mode and digest kept.
+        let info = info("dbus-daemon-launch-helper", "1-r0", "");
+        let mut record = record(&info);
+        record.directory(b"usr/libexec", 0, 0, 0o755);
+        record.file(b"usr/libexec/helper", 0, 0, 0o4750, Some([0xab; 20]));
+        record.directory(b"var/lib/dbus", 0, 0, 0o750);
+        record.own(b"usr/libexec/helper", false, 0, 101);
+        record.own(b"var/lib/dbus", true, 100, 101);
+        // An entry the record does not hold is not this record's to describe.
+        record.own(b"usr/libexec/other", false, 7, 7);
+        record.own(b"usr/share", true, 7, 7);
+        let rendered = String::from_utf8(record.render()).expect("the record is text");
+        let (_, files) = rendered
+            .split_once("F:usr/libexec\n")
+            .expect("the directory is there");
+        assert_eq!(
+            files,
+            "R:helper\n\
+             a:0:101:4750\n\
+             Z:Q1q6urq6urq6urq6urq6urq6urq6s=\n\
+             F:var/lib/dbus\n\
+             M:100:101:750\n",
+        );
+    }
+
+    #[test]
     fn a_directory_named_by_its_contents_first_still_carries_its_own_mode() {
         // An archive may list a file before the directory holding it. The
         // directory has to be opened by the file, or the record would name a
@@ -1099,6 +1188,24 @@ mod tests {
         assert_eq!(
             contest("origin = shared\n", "origin = shared\n"),
             Claim::Replaces,
+        );
+        // The source is asked first, as apk asks it: the later package takes
+        // the file even where the earlier names it more strongly, which would
+        // otherwise keep the file with the earlier.
+        assert_eq!(
+            contest(
+                "origin = shared\nreplaces = second\nreplaces_priority = 1000\n",
+                "origin = shared\n",
+            ),
+            Claim::Replaces,
+        );
+        // And without a shared source the same `replaces` keeps it.
+        assert_eq!(
+            contest(
+                "origin = one\nreplaces = second\nreplaces_priority = 1000\n",
+                "origin = other\n",
+            ),
+            Claim::Kept,
         );
     }
 

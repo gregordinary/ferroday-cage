@@ -18,9 +18,11 @@
 //! `C:` field is a SHA-1 over the package's control segment as it lies in the
 //! file, and `.PKGINFO`'s `datahash` is a SHA-256 over the data segment as it
 //! lies in the file. So the chain from a signing key to a file on disk runs
-//! RSA-4096 over SHA-1, then SHA-1 again, then SHA-256 — and the layer verifies
+//! RSA over SHA-1, then SHA-1 again, then SHA-256 — and the layer verifies
 //! exactly that, because the published format offers nothing stronger and
-//! verifying less than `apk` does would be worse rather than safer.
+//! verifying less than `apk` does would be worse rather than safer. Alpine's
+//! current signing keys are 4096-bit; the older ones it still ships, mips64's
+//! only key among them, are 2048-bit.
 //!
 //! # Example
 //!
@@ -50,10 +52,13 @@ mod resolve;
 mod sign;
 mod version;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Seek as _};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -67,6 +72,7 @@ use super::cache;
 use super::coordinate::{self, Nesting};
 use super::digest::Algorithm;
 use super::extract::{Extraction, Placement};
+use super::identity::Ownership;
 // `super::layer` is the shared one; this module has a `layer` of its own, which
 // reads a provisioned base rather than describing how a cage is rooted on it.
 use super::layer::{Rooting, Staging};
@@ -79,7 +85,7 @@ use super::{
 };
 use crate::failure::path_io_error;
 use crate::{ErrorChain, IdMapper, IdentityMap};
-use bootstrap::ScriptSubject;
+use bootstrap::{Declared, ScriptSubject};
 use index::{Index, Record};
 use installed::{Carried, Claim, Database};
 use pin::Pins;
@@ -690,6 +696,10 @@ impl AlpineBuilder {
     /// repository offers; holding one to a version is what [`pin`](Self::pin)
     /// is for, and reading `busybox>=1.37` as a package name would otherwise
     /// fail as a package nothing offers.
+    ///
+    /// So is a name carrying an apk repository tag, such as `busybox@edge`. A
+    /// [`Repository`] carries no tag, and every name resolves against every
+    /// configured repository.
     pub fn include<I, S>(mut self, packages: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -777,9 +787,10 @@ impl AlpineBuilder {
     /// are not what the repository in that slot publishes; and one stating a
     /// package no index for its architecture could publish: by a name or a
     /// version outside the format, with a malformed control identity, or for
-    /// an architecture other than the plan's or `noarch`. It also
-    /// refuses the combinations that would silently drop half of what was asked
-    /// for — [`include`](Self::include), [`exclude`](Self::exclude) and
+    /// an architecture other than the plan's or `noarch`; and one naming a
+    /// package twice, which a root cannot hold. It also refuses the
+    /// combinations that would silently drop half of what was asked for —
+    /// [`include`](Self::include), [`exclude`](Self::exclude) and
     /// [`pin`](Self::pin) all describe a resolution, and a plan is one already.
     pub fn plan(mut self, plan: Plan) -> Self {
         self.plan = Some(plan);
@@ -791,7 +802,10 @@ impl AlpineBuilder {
     /// No script runs and no trigger fires, so the tree is what the packages
     /// ship and nothing a script would have derived from it: no `busybox` applet
     /// links, no accounts a `.pre-install` would have added. Because nothing
-    /// executes, this serves an architecture the host cannot run.
+    /// executes, this serves an architecture the host cannot run. With no
+    /// accounts to name them by, the entries a package states another owner for
+    /// stay root's, as under the single-identity map; see
+    /// [`identity_map`](Self::identity_map).
     ///
     /// # This still registers what it installed
     ///
@@ -806,17 +820,33 @@ impl AlpineBuilder {
         self
     }
 
-    /// Runs the install scripts under `map` rather than under the default
-    /// single-identity map.
+    /// Builds the root under `map` rather than under the default
+    /// single-identity map: the install scripts run under it, and the entries
+    /// a package states another owner for are given that owner through it.
     ///
-    /// Alpine's packages are entirely root-owned — every entry of every package
-    /// in the `alpine-base` closure is uid 0, gid 0 — so unlike a Debian
-    /// bootstrap the extraction itself needs nothing from a wider map. What a
-    /// wider map buys is the scripts: `alpine-baselayout`'s `.post-install`
-    /// assigns `/etc/shadow` to the `shadow` group, which the single-identity
-    /// map cannot represent. That call fails under `apk` in the same situation,
-    /// and Alpine's scripts tolerate it, so the default is a working bootstrap
-    /// with the group ownership flattened to root.
+    /// Under the single-identity map only root exists, so every entry of the
+    /// finished root is owned by root, and the installed database records
+    /// that. Most of Alpine is root-owned throughout — every entry of every
+    /// package in the `alpine-base` closure is — so for most roots that is no
+    /// change at all. What it flattens is two things. `alpine-baselayout`'s
+    /// `.post-install` assigns `/etc/shadow` to the `shadow` group, which fails
+    /// there as it fails under `apk` in the same situation, and Alpine's scripts
+    /// tolerate it. And a package's own non-root entries, such as
+    /// `dbus-daemon-launch-helper`, which is `root:messagebus` and setuid, land
+    /// as root.
+    ///
+    /// Under a range map such as [`IdentityMap::Subordinate`] the system ids
+    /// exist. The scripts' calls succeed, and each entry a package states
+    /// another owner for is given it as `apk` gives it: by the names its
+    /// archive records, looked up in the root's own `/etc/passwd` and
+    /// `/etc/group` once the package's `.pre-install` has created the accounts,
+    /// and by the archive's ids where the root has no such names. The installed
+    /// database records the ids given. An id the map does not hold fails the
+    /// bootstrap with [`AlpineError::Ownership`] rather than flattening the
+    /// entry.
+    ///
+    /// [`extract_only`](Self::extract_only) runs no `.pre-install`, so it gives
+    /// no owner under either map.
     pub fn identity_map(mut self, map: IdentityMap) -> Self {
         self.identity_map = map;
         self
@@ -850,9 +880,10 @@ impl AlpineBuilder {
     /// to it, and never removes an entry it did not just write.
     ///
     /// An entry is used only when it reads back as the package the plan names —
-    /// its signature verifies, its control identity matches, and its file tree
-    /// digests to what its own metadata says — so a truncated or substituted
-    /// entry is downloaded again rather than trusted.
+    /// its control identity matches, and its file tree digests to what its own
+    /// metadata says — so a truncated or substituted entry is downloaded again
+    /// rather than trusted. Its own signature is read and not verified, as for a
+    /// fresh download: the control identity already fixes the bytes it covers.
     pub fn cache_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cache_dir = Some(dir.as_ref().to_path_buf());
         self
@@ -1005,6 +1036,17 @@ impl AlpineBuilder {
         let components = self.components.unwrap_or_else(|| vec!["main".to_string()]);
 
         for name in self.includes.iter().chain(&self.excludes) {
+            // Before the version operators, so `foo@edge>=1` is reported for
+            // the tag, which is the part with no remedy here.
+            if name.contains('@') {
+                return Err(AlpineError::Config {
+                    reason: format!(
+                        "{name:?} names a repository tag, and the repositories configured here \
+                         carry none; a name resolves against every configured repository, the \
+                         highest version winning",
+                    ),
+                });
+            }
             if name.contains(['<', '>', '=', '~']) {
                 return Err(AlpineError::Config {
                     reason: format!(
@@ -1222,6 +1264,15 @@ fn validate_plan(
             return contradiction(reason);
         }
     }
+    // Installed twice, a package would be recorded twice and its scripts run
+    // twice, into a root that can only hold it once.
+    if let Some((first, again)) = plan.named_twice() {
+        return contradiction(format!(
+            "the plan names the package {} twice, at {} and at {}, and a root holds one package \
+             of each name",
+            again.name, first.version, again.version,
+        ));
+    }
     Ok(())
 }
 
@@ -1306,7 +1357,7 @@ fn parse_index(
     // curiosity.
     if !segments
         .at_end()
-        .map_err(|err| AlpineError::container(url, format!("its end is unreadable: {err}")))?
+        .map_err(|err| AlpineError::unreadable(url, "its end is unreadable", err))?
     {
         return Err(AlpineError::container(
             url,
@@ -1733,12 +1784,16 @@ fn install(
         })
         .transpose()
         .map_err(wrap)?;
+    // What a directory the host side carries up from the base is re-owned
+    // through: the map the install scripts run under.
+    let ownership = Ownership::new(&alpine.identity_map, alpine.id_mapper.as_ref());
     let state = bootstrap::State {
         world: &world,
         architecture: &alpine.architecture,
         sources: &sources,
         repositories: &alpine.repositories,
         beneath: beneath.as_ref(),
+        ownership: &ownership,
     };
 
     if let Some(base) = base {
@@ -1787,9 +1842,9 @@ fn install(
 
     let order = install_order(&acquired);
     let carried = base.map(layer::Base::carried).unwrap_or_default();
-    let (database, subjects) = lay_down(
+    let (mut database, subjects) = lay_down(
         into,
-        base.map(layer::Base::path),
+        base.map(|base| (base.path(), ownership.clone())),
         carried,
         &mut acquired,
         &order,
@@ -1799,7 +1854,7 @@ fn install(
     // After every package's files are down, so this overwrites what they
     // shipped, and before any script runs, so a script reads what was injected.
     if let Some(overlay) = &alpine.overlay {
-        super::extract::overlay_tree(into, overlay, base.map(layer::Base::path))?;
+        super::extract::overlay_tree(into, overlay, base.map(|base| (base.path(), &ownership)))?;
     }
 
     if alpine.extract_only {
@@ -1809,9 +1864,14 @@ fn install(
     }
     // A base's own trigger-watching packages fire for the directories this
     // install created, which is what `apk` does: a trigger belongs to the root
-    // rather than to the transaction.
+    // rather than to the transaction. Their scripts are read out of the base's
+    // archive once, and each subject borrows its own.
+    let archived = match base {
+        Some(base) => base.trigger_scripts().map_err(wrap)?,
+        None => Vec::new(),
+    };
     let watching = match base {
-        Some(base) => base.trigger_subjects().map_err(wrap)?,
+        Some(base) => base.trigger_subjects(&archived).map_err(wrap)?,
         None => Vec::new(),
     };
     bootstrap::configure(
@@ -1822,7 +1882,7 @@ fn install(
             id_mapper: alpine.id_mapper.as_ref(),
             source_date_epoch: alpine.source_date_epoch,
         },
-        &database,
+        &mut database,
         &subjects,
         &watching,
         &state,
@@ -2106,7 +2166,14 @@ fn read_acquired(
 }
 
 /// The order the closure is laid down and configured in: a package after
-/// everything it needs.
+/// everything it needs, and a package its `install_if` brought in after the
+/// packages that condition names.
+///
+/// The second is `apk`'s order too: it adds an `install_if` package to a
+/// transaction only once everything the condition names is in it. It matters
+/// where the package's entries are owned by an account the other's
+/// pre-install creates. `dbus-daemon-launch-helper` needs nothing of `dbus`,
+/// and is owned by the `messagebus` group `dbus`'s pre-install adds.
 fn install_order(acquired: &[Acquired]) -> Vec<usize> {
     let mut provides: HashMap<String, Vec<usize>> = HashMap::new();
     for (at, held) in acquired.iter().enumerate() {
@@ -2126,10 +2193,10 @@ fn install_order(acquired: &[Acquired]) -> Vec<usize> {
     let depends: Vec<Vec<String>> = acquired
         .iter()
         .map(|held| {
-            held.package
-                .info
-                .depends
+            let info = &held.package.info;
+            info.depends
                 .iter()
+                .chain(&info.install_if)
                 // A `!` entry states what must *not* be installed. The
                 // resolution already settled that; an install order has no edge
                 // to draw from it.
@@ -2151,21 +2218,36 @@ fn install_order(acquired: &[Acquired]) -> Vec<usize> {
 ///
 /// `over` is the base a layered build's staging tree is an overlay upper over,
 /// which the extraction places every entry through ([`Extraction::over`]), so a
-/// link the base holds is never hidden by a directory of the increment's. The
-/// database records each path as the package spells it, as `apk` does.
+/// link the base holds is never hidden by a directory of the increment's. It
+/// comes with the identity map the staging tree is owned through, which a
+/// directory carried up from the base is given the base's ownership through.
+/// The database records each path as the package spells it, as `apk` does.
+///
+/// Every entry is laid down as the calling user, whom the root's identity map
+/// presents as root, and the database records root as each one's owner. An
+/// entry whose package states another owner is returned among its subject's
+/// [`declared`](ScriptSubject::declared), with the device and inode it was laid
+/// down as, for the configure wave to give it that owner once the package's
+/// pre-install has run.
 fn lay_down(
     staging: &Path,
-    over: Option<&Path>,
+    over: Option<(&Path, Ownership)>,
     carried: Carried,
     acquired: &mut [Acquired],
     order: &[usize],
     observer: &mut dyn AlpineObserver,
-) -> Result<(Database, Vec<ScriptSubject>), ProvisionError> {
+) -> Result<(Database, Vec<ScriptSubject<'static>>), ProvisionError> {
+    let (over, ownership) = over.unzip();
     let mut extraction = Extraction::new(staging)?
         .root_mode(ROOTFS_ROOT_MODE)
-        .over(over)?;
+        .over(over)?
+        .owned_through(ownership.unwrap_or_default());
     let mut database = Database::carrying(carried);
     let mut subjects = Vec::with_capacity(order.len());
+    // The entries that state an owner other than root, by path: the last entry
+    // written at a path is the one on disk, so it is the one whose owner holds,
+    // and an entry stating root clears an earlier one's.
+    let mut stated: HashMap<Vec<u8>, Declared> = HashMap::new();
 
     for at in order {
         let held = &mut acquired[*at];
@@ -2200,7 +2282,15 @@ fn lay_down(
 
         let mut collision = None;
         extraction.extract(&mut archive, &mut |entry, components| {
-            record_entry(&mut database, at, entry, components, &mut collision)
+            let placement = record_entry(&mut database, at, entry, components, &mut collision)?;
+            if placement == Placement::Write {
+                let path = components.join(&b'/');
+                match stated_owner(at, entry, &path) {
+                    Some(declared) => stated.insert(path, declared),
+                    None => stated.remove(&path),
+                };
+            }
+            Ok(placement)
         })?;
         if let Some(collision) = collision {
             return Err(wrap(collision));
@@ -2209,13 +2299,71 @@ fn lay_down(
         subjects.push(ScriptSubject {
             name: held.package.info.name.clone(),
             version: held.package.info.version.clone(),
-            scripts: held.package.scripts.clone(),
-            triggers: held.package.info.triggers.clone(),
+            scripts: held
+                .package
+                .scripts
+                .iter()
+                .map(|(kind, body)| (*kind, Cow::Owned(body.clone())))
+                .collect(),
+            triggers: held
+                .package
+                .info
+                .triggers
+                .iter()
+                .cloned()
+                .map(Cow::Owned)
+                .collect(),
+            declared: Vec::new(),
         });
     }
 
     extraction.finalize(staging)?;
+
+    // Each entry's device and inode as it was laid down, read through the same
+    // in-root resolution the extraction placed it by. They are what the
+    // configure wave tells the entry apart from a replacement by.
+    let tree = Rooted::open(staging).map_err(|err| ProvisionError::io("opening", staging, err))?;
+    let mut stated: Vec<Declared> = stated.into_values().collect();
+    stated.sort_by(|a, b| a.path.cmp(&b.path));
+    for mut declared in stated {
+        let relative = Path::new(OsStr::from_bytes(&declared.path));
+        let Some(stat) = tree
+            .stat(relative)
+            .map_err(|err| ProvisionError::io("inspecting", tree.path(relative), err))?
+        else {
+            continue;
+        };
+        declared.dev = stat.st_dev;
+        declared.ino = stat.st_ino;
+        // A subject was pushed for every record added, in the same pass, so a
+        // record's number is its subject's place.
+        subjects[declared.record].declared.push(declared);
+    }
     Ok((database, subjects))
+}
+
+/// The owner `entry` states, where it is anyone but root, as a [`Declared`]
+/// for the record numbered `at`, its device and inode still to be read.
+///
+/// An owner is root where its name is `root` or absent and its id is 0, which
+/// is how nearly every entry of every package is owned. The name `root` is not
+/// looked up: a root whose `/etc/passwd` gave it another id would be no root.
+fn stated_owner(at: usize, entry: &crate::provision::tar::Entry, path: &[u8]) -> Option<Declared> {
+    let root = |name: &[u8], id: u32| (name.is_empty() || name == b"root") && id == 0;
+    if root(&entry.uname, entry.uid) && root(&entry.gname, entry.gid) {
+        return None;
+    }
+    Some(Declared {
+        record: at,
+        path: path.to_vec(),
+        directory: entry.typeflag == b'5',
+        uname: entry.uname.clone(),
+        gname: entry.gname.clone(),
+        uid: entry.uid,
+        gid: entry.gid,
+        dev: 0,
+        ino: 0,
+    })
 }
 
 /// Records one archive entry against the package laying it down, and decides
@@ -2240,12 +2388,14 @@ fn record_entry(
     collision: &mut Option<AlpineError>,
 ) -> Result<Placement, ProvisionError> {
     let path = components.join(&b'/');
+    // Root, which is what the extraction leaves every entry owned by. An entry
+    // whose package states another owner is given it, and the record told so,
+    // in the configure wave.
+    let (uid, gid) = (0, 0);
     if entry.typeflag == b'5' {
         // Directories are shared by construction — every package ships the ones
         // it writes into — so they are recorded rather than contested.
-        database
-            .record(at)
-            .directory(&path, entry.uid, entry.gid, entry.mode);
+        database.record(at).directory(&path, uid, gid, entry.mode);
         return Ok(Placement::Write);
     }
 
@@ -2264,7 +2414,7 @@ fn record_entry(
 
     database
         .record(at)
-        .file(&path, entry.uid, entry.gid, entry.mode, entry.checksum_sha1);
+        .file(&path, uid, gid, entry.mode, entry.checksum_sha1);
     Ok(Placement::Write)
 }
 
@@ -2330,6 +2480,10 @@ pub enum AlpineError {
         subject: String,
         /// What was wrong with it.
         reason: String,
+        /// The read that failed, where the container could not be read rather
+        /// than read as something this reader refuses: a gzip stream that does
+        /// not decode, a segment past its ceiling, or the file itself.
+        source: Option<io::Error>,
     },
     /// A signature was not accepted: it did not verify against the key set, or
     /// the signature member was refused on its own terms.
@@ -2415,6 +2569,11 @@ pub enum AlpineError {
     },
     /// A cage could not be built or run.
     Launch(crate::Error),
+    /// An entry could not be given the owner its package states.
+    ///
+    /// Carries what the child entered into the root's identity map reported,
+    /// such as an id the map has no room for.
+    Ownership(ProvisionError),
     /// The bootstrap's observer asked it to stop.
     ///
     /// Surfaces to a caller as [`super::ProvisionError::Cancelled`].
@@ -2439,6 +2598,24 @@ impl AlpineError {
         AlpineError::Container {
             subject: subject.into(),
             reason: reason.into(),
+            source: None,
+        }
+    }
+
+    /// A container that could not be read, naming what was being read, the
+    /// part of it the read was in, and the read's own failure.
+    ///
+    /// The failure is the cause rather than part of the reason, so a rendered
+    /// chain states it once.
+    pub(crate) fn unreadable(
+        subject: impl Into<String>,
+        reason: impl Into<String>,
+        source: io::Error,
+    ) -> AlpineError {
+        AlpineError::Container {
+            subject: subject.into(),
+            reason: reason.into(),
+            source: Some(source),
         }
     }
 
@@ -2490,7 +2667,9 @@ impl fmt::Display for AlpineError {
             AlpineError::Config { reason } => {
                 write!(f, "the Alpine bootstrap is misconfigured: {reason}")
             }
-            AlpineError::Container { subject, reason } => {
+            AlpineError::Container {
+                subject, reason, ..
+            } => {
                 write!(f, "the apk container {subject} is unusable: {reason}")
             }
             AlpineError::Signature { subject, reason } => {
@@ -2539,6 +2718,9 @@ impl fmt::Display for AlpineError {
                 status,
             } => write!(f, "the {package} {script} script {status}"),
             AlpineError::Launch(_) => f.write_str("an install script could not launch"),
+            AlpineError::Ownership(_) => {
+                f.write_str("an entry could not be given the owner its package states")
+            }
             AlpineError::Cancelled => f.write_str("the bootstrap was cancelled"),
             AlpineError::Fetch(_) => f.write_str("the Alpine bootstrap could not fetch a resource"),
             AlpineError::Io { op, path, .. } => write!(
@@ -2555,7 +2737,12 @@ impl std::error::Error for AlpineError {
         match self {
             AlpineError::Fetch(err) => Some(err),
             AlpineError::Launch(err) => Some(err),
+            AlpineError::Ownership(err) => Some(err),
             AlpineError::Io { source, .. } => Some(source),
+            AlpineError::Container {
+                source: Some(source),
+                ..
+            } => Some(source),
             _ => None,
         }
     }
@@ -3425,6 +3612,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_requested_name_carrying_a_repository_tag_is_refused_where_it_is_named() {
+        // apk's world spells a tagged repository `name@tag`. No repository here
+        // carries a tag, so the name would otherwise reach the resolution and
+        // fail late as a package nothing offers.
+        for (include, exclude) in [
+            (&["busybox@edge"][..], &[][..]),
+            (&["busybox@edge>=1.37"][..], &[][..]),
+            (&["busybox"][..], &["musl@testing"][..]),
+        ] {
+            let err = Alpine::builder("v3.23")
+                .architecture("x86_64")
+                .include(include.iter().copied())
+                .exclude(exclude.iter().copied())
+                .build()
+                .expect_err("a tag names no configured repository");
+            assert!(
+                matches!(&err, AlpineError::Config { reason } if reason.contains("repository tag")),
+                "{include:?} {exclude:?}: {err}",
+            );
+        }
+    }
+
     /// A plan entry for a committed package, read out of the package itself.
     ///
     /// The identity is recomputed rather than written down so the plan is one
@@ -3518,6 +3728,177 @@ mod tests {
         assert_eq!(
             carried,
             ["pre-install", "post-install", "pre-upgrade", "post-upgrade"],
+        );
+    }
+
+    /// An apk container of a package stating `pkginfo`, whose file tree is
+    /// `tree`: a signature segment no anchor holds, the control segment, and
+    /// the data segment the control segment's `datahash` binds.
+    fn container_of(pkginfo: &str, tree: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let gzip = |tar: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(tar).expect("the segment compresses");
+            encoder.finish().expect("the segment closes")
+        };
+        let data = gzip(tree);
+        let pkginfo = format!(
+            "{pkginfo}datahash = {}\n",
+            crate::provision::digest::Algorithm::Sha256.hex_of(&data),
+        );
+        let control = gzip(
+            &ferroday_cage_testkit::tar::Tar::new()
+                .file(".PKGINFO", 0o644, pkginfo.as_bytes())
+                .finish(),
+        );
+        let signature = gzip(
+            &ferroday_cage_testkit::tar::Tar::new()
+                .file(".SIGN.RSA.nobody.rsa.pub", 0o644, &[0; 512])
+                .finish(),
+        );
+        [signature, control, data].concat()
+    }
+
+    /// `container`, acquired through the cache entry `cache` holds for it.
+    fn acquired_from(cache: &Path, container: &[u8]) -> Acquired {
+        let planned = planned_from(container, "x86_64");
+        let path = cache.join(planned.file_name());
+        std::fs::write(&path, container).expect("the package is writable");
+        read_acquired(
+            File::open(&path).expect("the package opens"),
+            &path,
+            &planned,
+            "x86_64",
+        )
+        .expect("the package answers the plan entry")
+    }
+
+    #[test]
+    fn a_package_its_install_if_brought_in_is_installed_after_the_condition() {
+        // apk adds an `install_if` package to a transaction only once what the
+        // condition names is in it. The launch helper needs nothing of `dbus`,
+        // and its group is the one `dbus`'s pre-install creates, so ordered by
+        // its dependencies alone it would be given its owner before the group
+        // exists.
+        let scratch = Scratch::new("alpine-install-if-order");
+        let empty = ferroday_cage_testkit::tar::Tar::new().finish();
+        let acquired = [
+            acquired_from(
+                &scratch,
+                &container_of(
+                    "pkgname = dbus-daemon-launch-helper\npkgver = 1-r0\narch = x86_64\n\
+                     size = 1\ninstall_if = dbus=1-r0\n",
+                    &empty,
+                ),
+            ),
+            acquired_from(
+                &scratch,
+                &container_of(
+                    "pkgname = dbus\npkgver = 1-r0\narch = x86_64\nsize = 1\n",
+                    &empty,
+                ),
+            ),
+        ];
+        let names: Vec<&str> = install_order(&acquired)
+            .into_iter()
+            .map(|at| acquired[at].package.info.name.as_str())
+            .collect();
+        assert_eq!(names, ["dbus", "dbus-daemon-launch-helper"]);
+    }
+
+    #[test]
+    fn an_entry_stating_another_owner_is_laid_down_as_root_and_declared() {
+        // `dbus-daemon-launch-helper` as Alpine ships it: the archive's gid is
+        // 0, and only its group name says `messagebus`. The extraction lays it
+        // down as the calling user, the database records the root that is, and
+        // the entry is handed on, as it lies on disk, for the configure wave to
+        // give the owner the name resolves to.
+        let scratch = Scratch::new("alpine-declared");
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(&cache).expect("the cache is creatable");
+        let staging = scratch.join("root");
+        std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
+
+        let mut tree = ferroday_cage_testkit::tar::Tar::new();
+        tree.dir("usr", 0o755).dir("usr/libexec", 0o755);
+        tree.file("usr/libexec/plain", 0o755, b"#!/bin/sh\n");
+        tree.owner_names("root", "messagebus");
+        tree.file("usr/libexec/helper", 0o4750, b"#!/bin/sh\n");
+        tree.owner_names("messagebus", "messagebus");
+        tree.dir_owned("var", 0o755, 0, 0);
+        tree.owner_names("root", "root");
+        tree.dir_owned("var/numeric", 0o750, 100, 101);
+        let container = container_of(
+            "pkgname = dbus-daemon-launch-helper\npkgver = 1.16.2-r1\narch = x86_64\n\
+             size = 1\norigin = dbus\n",
+            &tree.finish(),
+        );
+        let planned = planned_from(&container, "x86_64");
+        let path = cache.join(planned.file_name());
+        std::fs::write(&path, &container).expect("the package is writable");
+        let mut acquired = vec![
+            read_acquired(
+                File::open(&path).expect("the package opens"),
+                &path,
+                &planned,
+                "x86_64",
+            )
+            .expect("the package answers the plan entry"),
+        ];
+        let (database, subjects) = lay_down(
+            &staging,
+            None,
+            Carried::default(),
+            &mut acquired,
+            &[0],
+            &mut Silent,
+        )
+        .expect("the package lays down");
+
+        let installed = String::from_utf8(database.installed()).expect("the database is text");
+        assert!(installed.contains("R:helper\na:0:0:4750\n"), "{installed}");
+        assert!(
+            installed.contains("F:var/numeric\nM:0:0:750\n"),
+            "{installed}"
+        );
+
+        let [subject] = &subjects[..] else {
+            panic!("one package, one subject");
+        };
+        // Each as `path user:group uid:gid`, and a directory marked by its
+        // trailing slash.
+        let declared: Vec<String> = subject
+            .declared
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}{} {}:{} {}:{}",
+                    String::from_utf8_lossy(&entry.path),
+                    if entry.directory { "/" } else { "" },
+                    String::from_utf8_lossy(&entry.uname),
+                    String::from_utf8_lossy(&entry.gname),
+                    entry.uid,
+                    entry.gid,
+                )
+            })
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                "usr/libexec/helper root:messagebus 0:0",
+                "var/ messagebus:messagebus 0:0",
+                "var/numeric/ root:root 100:101",
+            ],
+            "in path order, and none for an entry root owns",
+        );
+        let helper = &subject.declared[0];
+        let on_disk = std::fs::symlink_metadata(staging.join("usr/libexec/helper"))
+            .expect("the helper is laid down");
+        assert!(
+            std::os::unix::fs::MetadataExt::ino(&on_disk) == helper.ino
+                && std::os::unix::fs::MetadataExt::dev(&on_disk) == helper.dev,
+            "the entry is named as it lies on disk",
         );
     }
 
@@ -4642,14 +5023,35 @@ mod tests {
 
     #[test]
     fn a_plan_resolved_for_another_architecture_is_refused_at_build() {
-        // The failure this replaces: `build()` succeeded, the first package
-        // downloaded, and the run failed with a per-package "states
-        // architecture" error rather than an upfront configuration refusal.
+        // Refused where the configuration is frozen, rather than after the
+        // first package has downloaded, as a per-package "states architecture"
+        // error the run would otherwise end in.
         let mut plan = resolved_plan();
         plan.architecture = "aarch64".to_string();
         let reason = refuses_plan(plan, |builder| builder);
         assert!(reason.contains("aarch64"), "{reason}");
         assert!(reason.contains("x86_64"), "{reason}");
+    }
+
+    #[test]
+    fn a_plan_naming_one_package_twice_is_refused_at_build() {
+        // A root holds one package of a name. Installed, the second entry would
+        // write a second installed record, archive its scripts twice and run
+        // them twice; the refusal is the one a pin naming a package twice gets.
+        let mut plan = resolved_plan();
+        let mut again = plan.packages[0].clone();
+        again.version = "0.1-r0".to_string();
+        plan.packages.push(again);
+        let reason = refuses_plan(plan.clone(), |builder| builder);
+        assert!(reason.contains("twice"), "{reason}");
+        assert!(reason.contains(&plan.packages[0].name), "{reason}");
+
+        // Identical entries are no less a duplicate.
+        let mut plan = resolved_plan();
+        let first = plan.packages[0].clone();
+        plan.packages.push(first);
+        let reason = refuses_plan(plan, |builder| builder);
+        assert!(reason.contains("twice"), "{reason}");
     }
 
     #[test]

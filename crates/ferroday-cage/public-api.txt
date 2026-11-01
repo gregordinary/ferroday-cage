@@ -112,6 +112,7 @@ pub ferroday_cage::provision::alpine::AlpineError::Collision::path: alloc::strin
 pub ferroday_cage::provision::alpine::AlpineError::Config::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Container
 pub ferroday_cage::provision::alpine::AlpineError::Container::reason: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Container::source: core::option::Option<core::io::error::Error>
 pub ferroday_cage::provision::alpine::AlpineError::Container::subject: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Digest
 pub ferroday_cage::provision::alpine::AlpineError::Digest::actual: alloc::string::String
@@ -126,6 +127,7 @@ pub ferroday_cage::provision::alpine::AlpineError::Io::op: &'static str
 pub ferroday_cage::provision::alpine::AlpineError::Io::path: std::path::PathBuf
 pub ferroday_cage::provision::alpine::AlpineError::Io::source: core::io::error::Error
 pub ferroday_cage::provision::alpine::AlpineError::Launch(ferroday_cage::Error)
+pub ferroday_cage::provision::alpine::AlpineError::Ownership(ferroday_cage::provision::ProvisionError)
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Pin
 pub ferroday_cage::provision::alpine::AlpineError::Pin::unheld: alloc::vec::Vec<ferroday_cage::provision::alpine::UnheldPin>
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::PlanDocument

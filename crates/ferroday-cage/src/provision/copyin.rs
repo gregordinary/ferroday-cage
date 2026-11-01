@@ -11,6 +11,11 @@
 //! the same table, and the same reason, as the export's. And the skip report
 //! names every entry the copy could not create, so a rootfs that ends up
 //! missing something says so.
+//!
+//! The same child also gives an owner to entries a tree already holds, for a
+//! provisioner that laid them down as the calling user: [`reown`], which a
+//! layered build gives the directories it carried up from its base, and the
+//! Alpine layer the entries a package states another owner for.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
@@ -24,7 +29,7 @@ use std::sync::Arc;
 use rustix::fs::{self, AtFlags, OFlags};
 
 use super::containment;
-use super::identity::compose_child_map;
+use super::identity::{Ownership, compose_child_map};
 use super::{Delegate, ProvisionError};
 use crate::IdentityMap;
 use crate::failure::ErrorChain;
@@ -32,8 +37,8 @@ use crate::idmap::{IdMapper, IdRange};
 use crate::mechanism::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
 use crate::mechanism::frame;
 use crate::mechanism::{
-    COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_SYMLINK, ChildMap,
-    CopyFailure, start_copy_in,
+    COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_OWN, COPY_SYMLINK,
+    ChildMap, CopyFailure, start_copy_in,
 };
 use crate::path;
 
@@ -75,7 +80,9 @@ everything it can create — a named pipe included — and names the rest.
 /// link that resolves inside the rootfs to a directory, such as merged-usr's
 /// `bin -> usr/bin`: the copy lands through it, resolving it from the rootfs's
 /// root as the sandbox would. Anything else at a directory's name is replaced,
-/// and a file, symlink, or named pipe replaces whatever is at its own.
+/// and a file, symlink, or named pipe replaces whatever is at its own, an empty
+/// directory included. A directory with something in it is not replaced, and
+/// fails the copy.
 ///
 /// Directories, regular files, symbolic links, and named pipes are copied.
 /// Several names for one file are copied as hard links, so a tree keeps the
@@ -319,6 +326,169 @@ fn copy_in_inner(
     };
     child.finish().map_err(|err| failure(err, rootfs))?;
     Ok(report)
+}
+
+/// An entry a tree already holds, and the owner it is owed: what [`reown`]
+/// gives it.
+///
+/// A provisioner lays a tree down as the calling user, who can create an entry
+/// owned by nobody else, so an owner only the tree's identity map can express is
+/// recorded here and given afterwards. Two steps owe one. A layered build
+/// carries a base's directory up into its upper, where the base holds it at the
+/// owner its packages and scripts gave it, as the overlay's own copy-up would
+/// have kept. And the Alpine layer gives an entry a package states another
+/// owner for that owner, once the package's pre-install has created it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Owed {
+    /// Where the entry is, slash-joined from the tree's root, which the in-map
+    /// child resolves as the root does, following every link but the last.
+    pub(crate) path: Vec<u8>,
+    /// The owner and group it is owed.
+    pub(crate) owner: Owner,
+    /// The device the entry was on when it was recorded.
+    pub(crate) dev: u64,
+    /// Its inode number then. With [`dev`](Self::dev), what tells the entry
+    /// apart from anything that has taken its name since, which [`reown`]
+    /// leaves alone.
+    pub(crate) ino: u64,
+}
+
+/// The ids an [`Owed`] entry is owed, and the side of the tree's identity map
+/// they are stated on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Owner {
+    /// As the host stores them, which is how a carried directory's base holds
+    /// it. Read back through the map to the ids they mean inside the tree, as a
+    /// copy reads a source tree's (see [`Translation`]). An id the map has no
+    /// inside id for cannot be set from inside it either, so the entry keeps
+    /// the owner it has: under the single-identity map, that is every id but
+    /// the caller's own.
+    #[cfg_attr(
+        not(feature = "tarball"),
+        allow(
+            dead_code,
+            reason = "only a layered build carries a base's directory up, and only a build with \
+                      a provisioner makes one"
+        )
+    )]
+    Host {
+        /// The owner.
+        uid: u32,
+        /// The group.
+        gid: u32,
+    },
+    /// As the tree means them, which is how a package names its owner through
+    /// the root's own accounts. An id the map does not hold is refused, naming
+    /// the entry, since nothing else could give the entry the owner it states.
+    #[cfg_attr(
+        not(feature = "alpine"),
+        allow(
+            dead_code,
+            reason = "only the Alpine layer names an owner through the root's own accounts"
+        )
+    )]
+    Tree {
+        /// The owner.
+        uid: u32,
+        /// The group.
+        gid: u32,
+    },
+}
+
+/// Gives each entry `owed` names inside the tree at `root` the owner recorded
+/// for it, from a child re-entered into the map the tree is owned through.
+///
+/// The counterpart of a copy for a tree laid down already: nothing is created,
+/// and an entry is given the ids its owner names as the tree means them, which
+/// a process outside the map cannot do for the reason a copy cannot create such
+/// an entry. The child resolves each path from the root, changes nothing but
+/// the entry's owner and group, and leaves alone a name that no longer holds
+/// the entry recorded; see the copy-in child's `COPY_OWN` frame. Nothing is
+/// forked when nothing is left to give.
+///
+/// # Errors
+///
+/// [`ProvisionError::CopyUnprivileged`] where the map cannot be established,
+/// [`ProvisionError::EntryRefused`] for a path longer than a frame carries, and
+/// [`ProvisionError::Io`] for a failure of the child, naming `root`. A
+/// [`Owner::Tree`] id the map does not hold is an
+/// [`EntryRefused`](ProvisionError::EntryRefused) naming the entry.
+pub(crate) fn reown(
+    root: &Path,
+    owed: &[Owed],
+    ownership: &Ownership,
+) -> Result<(), ProvisionError> {
+    if owed.is_empty() {
+        return Ok(());
+    }
+    let map_source = ownership
+        .child_map()
+        .map_err(|reason| ProvisionError::CopyUnprivileged {
+            path: root.to_path_buf(),
+            reason,
+        })?;
+    let child_map = map_source.child_map();
+    let translation = Translation::of(&child_map);
+
+    let mut frames = Vec::new();
+    for record in owed {
+        let path = root.join(OsStr::from_bytes(&record.path));
+        let (uid, gid) = match record.owner {
+            Owner::Host { uid, gid } => {
+                let (Some(uid), Some(gid)) = (translation.maps_uid(uid), translation.maps_gid(gid))
+                else {
+                    continue;
+                };
+                (uid, gid)
+            }
+            Owner::Tree { uid, gid } => {
+                if !translation.holds_uid(uid) || !translation.holds_gid(gid) {
+                    return Err(ProvisionError::EntryRefused {
+                        path,
+                        reason: format!(
+                            "its owner {uid}:{gid} is an id the identity map does not hold"
+                        ),
+                    });
+                }
+                (uid, gid)
+            }
+        };
+        // The child resolves the path into a fixed buffer, as it does a hard
+        // link's anchor.
+        if record.path.len() > LINK_BUF {
+            return Err(ProvisionError::EntryRefused {
+                path,
+                reason: "the path of an entry to own is longer than a frame can carry".to_string(),
+            });
+        }
+        frames.push(COPY_OWN);
+        frames.extend_from_slice(&(record.path.len() as u16).to_le_bytes());
+        frames.extend_from_slice(&record.path);
+        frames.extend_from_slice(&uid.to_le_bytes());
+        frames.extend_from_slice(&gid.to_le_bytes());
+        frames.extend_from_slice(&record.dev.to_le_bytes());
+        frames.extend_from_slice(&record.ino.to_le_bytes());
+    }
+    if frames.is_empty() {
+        return Ok(());
+    }
+    frames.push(COPY_END);
+
+    let root_c = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
+        ProvisionError::io(
+            "re-owning in",
+            root,
+            io::Error::from(io::ErrorKind::InvalidInput),
+        )
+    })?;
+    let child = start_copy_in(&root_c, child_map).map_err(|err| failure(err, root))?;
+    if let Err(err) = put(child.stream(), &frames, root) {
+        return Err(match child.abandon() {
+            Some(reported) => failure(reported, root),
+            None => err,
+        });
+    }
+    child.finish().map_err(|err| failure(err, root))
 }
 
 /// Turns a child-side failure into the caller's error.
@@ -652,6 +822,46 @@ impl Translation {
     fn gid(&self, host: u32, path: &Path) -> Result<u32, ProvisionError> {
         inside(&self.gid, host, "gid", path)
     }
+
+    /// The inside uid a host uid stands for, where the map has one.
+    fn maps_uid(&self, host: u32) -> Option<u32> {
+        located(&self.uid, host).and_then(|mapped| u32::try_from(mapped).ok())
+    }
+
+    /// The inside gid a host gid stands for, where the map has one.
+    fn maps_gid(&self, host: u32) -> Option<u32> {
+        located(&self.gid, host).and_then(|mapped| u32::try_from(mapped).ok())
+    }
+
+    /// Whether the map holds the inside uid `inside`.
+    fn holds_uid(&self, inside: u32) -> bool {
+        holds(&self.uid, inside)
+    }
+
+    /// Whether the map holds the inside gid `inside`.
+    fn holds_gid(&self, inside: u32) -> bool {
+        holds(&self.gid, inside)
+    }
+}
+
+/// The inside id the extent covering `host` maps it to, widened so it cannot
+/// wrap; `None` where no extent covers it.
+fn located(extents: &[IdRange], host: u32) -> Option<u64> {
+    extents.iter().find_map(|extent| {
+        let outside = u64::from(extent.outside);
+        let end = outside + u64::from(extent.count);
+        (u64::from(host) >= outside && u64::from(host) < end)
+            .then(|| u64::from(extent.inside) + (u64::from(host) - outside))
+    })
+}
+
+/// Whether an extent maps the inside id `inside` to a host id, so that a
+/// `chown` to it from inside the map can succeed.
+fn holds(extents: &[IdRange], inside: u32) -> bool {
+    extents.iter().any(|extent| {
+        let start = u64::from(extent.inside);
+        (start..start + u64::from(extent.count)).contains(&u64::from(inside))
+    })
 }
 
 /// Finds the inside id `host` falls to, refusing one no extent covers.
@@ -671,24 +881,19 @@ fn inside(extents: &[IdRange], host: u32, which: &str, path: &Path) -> Result<u3
             reason,
         })
     };
-    for extent in extents {
-        let outside = u64::from(extent.outside);
-        let end = outside + u64::from(extent.count);
-        if u64::from(host) >= outside && u64::from(host) < end {
-            let mapped = u64::from(extent.inside) + (u64::from(host) - outside);
-            return match u32::try_from(mapped) {
-                Ok(inside) => Ok(inside),
-                Err(_) => refuse(format!(
-                    "the source entry's {which} {host} maps to {mapped}, which is past the \
-                     largest id the kernel names",
-                )),
-            };
-        }
+    match located(extents, host) {
+        Some(mapped) => match u32::try_from(mapped) {
+            Ok(inside) => Ok(inside),
+            Err(_) => refuse(format!(
+                "the source entry's {which} {host} maps to {mapped}, which is past the largest \
+                 id the kernel names",
+            )),
+        },
+        None => refuse(format!(
+            "the source entry's {which} {host} is outside the identity map, so the rootfs \
+             has no id for it",
+        )),
     }
-    refuse(format!(
-        "the source entry's {which} {host} is outside the identity map, so the rootfs \
-         has no id for it",
-    ))
 }
 
 /// Opens the source tree's root as the directory the walk reads from.
@@ -1048,6 +1253,36 @@ mod tests {
         match stream_at(&path, 4) {
             Err(ProvisionError::SourceChanged { recorded, .. }) => assert_eq!(recorded, 4),
             other => panic!("expected a source-changed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_owner_the_map_cannot_express_is_passed_over_or_refused_by_where_it_came_from() {
+        // Under the single-identity map only root exists. A base's host id the
+        // map has no inside id for leaves the entry as its carry left it, which
+        // is that map's documented limit; an id a package states for the tree
+        // is refused, naming the entry, since nothing else could give it. Both
+        // are settled before anything is forked.
+        let root = Scratch::new("copyin-reown-unheld");
+        let owed = |owner| Owed {
+            path: b"usr/libexec/helper".to_vec(),
+            owner,
+            dev: 0,
+            ino: 0,
+        };
+        let host = owed(Owner::Host {
+            uid: u32::MAX - 1,
+            gid: u32::MAX - 1,
+        });
+        assert!(reown(&root, &[host], &Ownership::default()).is_ok());
+
+        let tree = owed(Owner::Tree { uid: 0, gid: 101 });
+        match reown(&root, &[tree], &Ownership::default()) {
+            Err(ProvisionError::EntryRefused { path, reason }) => {
+                assert_eq!(path, root.join("usr/libexec/helper"));
+                assert!(reason.contains("0:101"), "{reason}");
+            }
+            other => panic!("expected the entry refused, got {other:?}"),
         }
     }
 

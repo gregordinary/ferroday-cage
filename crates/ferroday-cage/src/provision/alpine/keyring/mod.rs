@@ -123,7 +123,10 @@ const POSTMARKETOS: Bundled = Bundled {
     pem: include_str!("build.postmarketos.org.rsa.pub"),
 };
 
-/// The signing keys a repository's index and packages are verified against.
+/// The signing keys a repository's indexes are verified against.
+///
+/// A package is not verified against the set: it is bound to the verified index
+/// that named it, through the control identity the index records.
 ///
 /// Obtained from the bundle with [`alpine`](Self::alpine) or
 /// [`postmarketos`](Self::postmarketos), or assembled from a caller's own keys
@@ -246,15 +249,14 @@ impl KeySet {
     ///
     /// # Errors
     ///
-    /// Returns [`AlpineError::Signature`] for a key that is not a PEM
-    /// `SubjectPublicKeyInfo` holding an RSA public key.
+    /// Returns [`AlpineError::Config`] for a key that is not a PEM
+    /// `SubjectPublicKeyInfo` holding an RSA public key: a key set is the
+    /// configuration a repository is verified under, and no signature has been
+    /// read yet.
     pub fn insert(&mut self, name: impl Into<String>, pem: &str) -> Result<(), AlpineError> {
         let name = name.into();
-        let key = RsaPublicKey::from_public_key_pem(pem).map_err(|err| {
-            AlpineError::signature(
-                name.clone(),
-                format!("{name} is not a usable RSA public key: {err}"),
-            )
+        let key = RsaPublicKey::from_public_key_pem(pem).map_err(|err| AlpineError::Config {
+            reason: format!("the key {name} is not a usable RSA public key: {err}"),
         })?;
         self.keys.insert(
             name,
@@ -332,7 +334,7 @@ mod tests {
 
     #[test]
     fn the_architecture_partitions_are_all_but_disjoint() {
-        // The finding this bundle is shaped by. Only the two oldest keys serve
+        // The partition this bundle mirrors. Only the two oldest keys serve
         // more than one architecture, so an x86_64 signature does not verify on
         // an aarch64 root.
         let x86_64 = KeySet::alpine("x86_64").expect("x86_64 is in the bundle");
@@ -388,7 +390,12 @@ mod tests {
         let err = set
             .insert("mine.rsa.pub", "-----BEGIN PUBLIC KEY-----\nnope\n")
             .expect_err("the key does not parse");
-        assert!(matches!(err, AlpineError::Signature { .. }), "{err}");
+        // A key is configuration, and the refusal names it once.
+        assert!(
+            matches!(&err, AlpineError::Config { reason }
+                if reason.matches("mine.rsa.pub").count() == 1),
+            "{err}",
+        );
         assert!(set.is_empty(), "a refused key is not held");
     }
 

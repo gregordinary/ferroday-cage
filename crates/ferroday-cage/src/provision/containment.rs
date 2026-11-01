@@ -30,11 +30,13 @@
 //!
 //! [`replacing`] is here for the same reason [`open_dir`] is. Both halves of
 //! provisioning create entries in a tree that may already hold something at the
-//! name, and both answer it the same way: unlink whatever is there and create
-//! again. What differs between them is only what a failure is called — the
-//! extractor reports a `ProvisionError` naming the archive entry, the host-side
-//! steps an errno the operation's own error carries — so the errno-level
-//! algorithm is stated once and each caller says what its failures are.
+//! name, and so does the copy-in child laying a host tree into a root. All of
+//! them answer it the same way: remove whatever is there, an empty directory
+//! included, and create again. What differs between them is only what a failure
+//! is called — the extractor reports a `ProvisionError` naming the archive
+//! entry, the host-side steps an errno the operation's own error carries, the
+//! child a step and an errno — so the errno-level algorithm is stated once and
+//! each caller says what its failures are.
 //!
 //! # Opening what a walk found or made
 //!
@@ -56,6 +58,12 @@
 //! it walks the chain through the merged view and makes the upper hold what
 //! that view holds along it, so the kernel's own resolution in the upper then
 //! goes where it would go in the mounted overlay.
+//!
+//! A directory it carries up keeps what the overlay's own copy-up keeps: the
+//! extended attributes, which the walk gives it, and the mode, time, owner and
+//! group, which the caller states. Ownership is the one part the calling user
+//! cannot give, so the caller hands what is [`owed`] to the copy-in child,
+//! which sets it from inside the tree's identity map.
 
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -162,8 +170,11 @@ pub(super) struct Made<'a> {
     /// put at the name since.
     pub(super) dir: BorrowedFd<'a>,
     /// The lower layer's directory this one stands in for, where [`copy_up`]
-    /// made it to carry one up. Its mode and modification time are the ones the
-    /// merged view showed before the upper held anything there.
+    /// made it to carry one up. Its mode, modification time, owner, and group
+    /// are the ones the merged view showed before the upper held anything
+    /// there. The walk has already given the new directory the lower one's
+    /// extended attributes; the rest are the caller's to state, the ownership
+    /// through [`owed`].
     pub(super) copied: Option<&'a Stat>,
 }
 
@@ -297,7 +308,39 @@ pub(super) fn is_opaque(dir: BorrowedFd<'_>) -> Result<bool, Errno> {
 }
 
 #[cfg(feature = "tarball")]
-pub(super) use layered::{Reached, copy_up, mark_opaque, modified};
+pub(super) use layered::{Reached, copy_up, mark_opaque, modified, owed};
+
+/// Whether an extended attribute is one the host holding a tree assigns, rather
+/// than one the tree carries.
+///
+/// A security module labels the files it sees: SELinux as `security.selinux`,
+/// Smack as `security.SMACK64` and its relatives, AppArmor as
+/// `security.apparmor`. The integrity subsystem records a measurement or a
+/// signature as `security.ima` and `security.evm`. Overlayfs keeps its own
+/// bookkeeping on an upper's files as `user.overlay.*` and `trusted.overlay.*`.
+/// None of it is the tree's. It describes the host the tree sat on and that
+/// host's policy, and it differs between two hosts holding the same tree.
+///
+/// The one answer to the question. An export leaves these out of the archive,
+/// so one tree's archive is the same from any host, and a layered build's
+/// carry leaves them off the upper's copy of a base directory, as the overlay's
+/// own copy-up does.
+///
+/// Most of these an unprivileged sandbox cannot set at all. A `user.overlay.`
+/// one is the exception: on a root filesystem that is a plain directory, a
+/// sandbox owns the files it writes and can set it. It is left out all the
+/// same, since an overlay mounted with `userxattr`, as every one this library
+/// mounts is, reads that namespace as its own bookkeeping. A carried
+/// `user.overlay.opaque` would hide a lower layer's directory there.
+#[cfg(feature = "tarball")]
+pub(super) fn host_assigned_xattr(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"security.selinux" | b"security.apparmor" | b"security.ima" | b"security.evm"
+    ) || name.starts_with(b"security.SMACK64")
+        || name.starts_with(b"user.overlay.")
+        || name.starts_with(b"trusted.overlay.")
+}
 
 /// The walk through an overlay's merged view, which only a layered build makes,
 /// and so only a build with a provisioner in it: the increment's extraction and
@@ -308,10 +351,24 @@ mod layered {
     use std::ffi::{CStr, CString};
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-    use rustix::fs::{AtFlags, FileType, OFlags, ResolveFlags, Stat, Timespec, Timestamps};
+    use rustix::fs::{
+        AtFlags, FileType, OFlags, ResolveFlags, Stat, Timespec, Timestamps, XattrFlags,
+    };
     use rustix::io::Errno;
 
-    use super::{Made, OPAQUE, is_opaque, is_whiteout, make_dir, open_child_dir, open_dir};
+    use super::{
+        Made, OPAQUE, host_assigned_xattr, is_opaque, is_whiteout, make_dir, open_child_dir,
+        open_dir,
+    };
+    use crate::provision::copyin::{Owed, Owner};
+
+    /// The extended attributes that hold a POSIX access control list: one for
+    /// the directory itself, and the default its new entries inherit.
+    const ACLS: [&CStr; 2] = [c"system.posix_acl_access", c"system.posix_acl_default"];
+
+    /// How many times a listing or a value is read again after it grew between
+    /// asking its size and reading it.
+    const XATTR_ATTEMPTS: u32 = 3;
 
     /// How many symbolic links one [`copy_up`] walk follows before it leaves the
     /// rest to the kernel, which refuses the loop itself. The kernel's own bound,
@@ -355,13 +412,14 @@ mod layered {
     ///
     /// The walk goes through the merged view one name at a time: an entry the
     /// upper holds is the one the overlay shows, and where it holds none, the
-    /// lower's is. A directory only the lower holds is created in the upper and
-    /// handed to `made` with the lower's own [`Stat`], so the caller can give it
-    /// the mode and time the merged view showed. A symbolic link only the lower
-    /// holds is copied into the upper verbatim, with the lower's modification
-    /// time, and followed; a link the upper holds is followed as it stands.
-    /// Following one splices its target into the rest of the walk, as path
-    /// resolution does.
+    /// lower's is. A directory only the lower holds is created in the upper,
+    /// given the lower one's extended attributes ([`carry_xattrs`]), and handed
+    /// to `made` with the lower's own [`Stat`], so the caller can give it the
+    /// mode, time, and ownership the merged view showed. A symbolic link only
+    /// the lower holds is copied into the upper verbatim, with the lower's
+    /// modification time, and followed; a link the upper holds is followed as
+    /// it stands. Following one splices its target into the rest of the walk,
+    /// as path resolution does.
     ///
     /// After the walk the upper resolves the chain, by itself, to where the merged
     /// view does, so the caller's own kernel-contained resolution and
@@ -572,6 +630,7 @@ mod layered {
             .expect("a directory is carried up only from a lower the overlay shows");
         let lower = lower_dir(below.as_fd(), leaf)?;
         let dir = make_dir(top.upper.as_fd(), leaf)?;
+        carry_xattrs(below.as_fd(), leaf, dir.as_fd())?;
         let path = level_path(stack, &name);
         made(Made {
             path: &path,
@@ -583,6 +642,141 @@ mod layered {
             upper: dir,
             lower,
         })
+    }
+
+    /// Gives the upper's new directory `upper` the extended attributes of the
+    /// lower's directory `leaf` of `below`, as the overlay's own copy-up gives
+    /// the copy it makes.
+    ///
+    /// Every attribute the tree carries is copied, POSIX access control lists
+    /// and `user.` attributes among them. What the host assigns rather than the
+    /// tree carries is not ([`host_assigned_xattr`]): the overlay's own
+    /// bookkeeping would mean something else in the upper, and a security
+    /// module labels the new directory as it creates it. A `trusted.` attribute
+    /// is never listed for an unprivileged caller, and the overlay a sandbox
+    /// mounts cannot read one either.
+    ///
+    /// An access control list the new directory inherited from a default on its
+    /// parent, where the lower's directory carries none, is removed: the copy
+    /// holds what the lower's directory holds and nothing more. A failure to set
+    /// a `user.` attribute the upper's filesystem does not support is passed
+    /// over, as the overlay passes it over; one to set an access control list is
+    /// the caller's to report, since the copy would grant other access than the
+    /// base does.
+    ///
+    /// A lower directory the caller cannot open for reading cannot be asked for
+    /// its attributes at all, unprivileged, and its copy carries none. The walk
+    /// through such a directory needs only search permission, so it can carry
+    /// one up: a directory another id owns and only that id may list.
+    fn carry_xattrs(
+        below: BorrowedFd<'_>,
+        leaf: &CStr,
+        upper: BorrowedFd<'_>,
+    ) -> Result<(), Errno> {
+        let lower = match open_child_dir(below, leaf, OFlags::RDONLY) {
+            Ok(lower) => lower,
+            Err(Errno::ACCESS) => return Ok(()),
+            Err(errno) => return Err(errno),
+        };
+        let listing = read_sized(
+            || rustix::fs::flistxattr_query(&lower),
+            |buffer| rustix::fs::flistxattr(&lower, buffer),
+        )?;
+        let mut carried = [false; ACLS.len()];
+        for name in listing.split(|byte| *byte == 0) {
+            if name.is_empty() || host_assigned_xattr(name) {
+                continue;
+            }
+            let Ok(name) = CString::new(name) else {
+                continue;
+            };
+            let value = match read_sized(
+                || rustix::fs::fgetxattr_query(&lower, &name),
+                |buffer| rustix::fs::fgetxattr(&lower, &name, buffer),
+            ) {
+                Ok(value) => value,
+                // Removed since the listing: there is nothing to carry.
+                Err(Errno::NODATA) => continue,
+                Err(errno) => return Err(errno),
+            };
+            let acl = ACLS.iter().position(|acl| *acl == name.as_c_str());
+            match rustix::fs::fsetxattr(upper, &name, &value, XattrFlags::empty()) {
+                Ok(()) => {}
+                Err(Errno::NOTSUP) if acl.is_none() => continue,
+                Err(errno) => return Err(errno),
+            }
+            if let Some(at) = acl {
+                carried[at] = true;
+            }
+        }
+        for (acl, carried) in ACLS.iter().zip(carried) {
+            if carried {
+                continue;
+            }
+            match rustix::fs::fremovexattr(upper, *acl) {
+                Ok(()) | Err(Errno::NODATA | Errno::NOTSUP) => {}
+                Err(errno) => return Err(errno),
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a listing or a value whose length `query` answers, through `read`,
+    /// which fills the buffer it is given and answers the length it filled.
+    ///
+    /// The length can change between the asking and the reading, which the
+    /// read answers with `ERANGE`; it is asked again a few times before that is
+    /// reported. A filesystem without extended attributes has none to read.
+    fn read_sized(
+        mut query: impl FnMut() -> Result<usize, Errno>,
+        mut read: impl FnMut(&mut [u8]) -> Result<usize, Errno>,
+    ) -> Result<Vec<u8>, Errno> {
+        for _ in 0..XATTR_ATTEMPTS {
+            let size = match query() {
+                Ok(size) => size,
+                Err(Errno::NOTSUP) => return Ok(Vec::new()),
+                Err(errno) => return Err(errno),
+            };
+            let mut buffer = vec![0u8; size];
+            match read(&mut buffer) {
+                Ok(read) => {
+                    buffer.truncate(read);
+                    return Ok(buffer);
+                }
+                Err(Errno::RANGE) => continue,
+                Err(errno) => return Err(errno),
+            }
+        }
+        Err(Errno::RANGE)
+    }
+
+    /// The ownership the directory a carry made is owed, where the lower's
+    /// directory it stands in for is held at an owner or a group the new one
+    /// was not given.
+    ///
+    /// The carry is the calling user's, so the new directory belongs to the
+    /// caller's own ids, or to its parent's group where the parent is
+    /// set-group-ID. A lower directory at the same two ids is owed nothing, and
+    /// that is every directory of a base built under the single-identity map.
+    /// The record names the new directory by its device and inode too, so the
+    /// owner reaches it and nothing that takes its name before it is given.
+    pub(in crate::provision) fn owed(made: &Made<'_>) -> Result<Option<Owed>, Errno> {
+        let Some(lower) = made.copied else {
+            return Ok(None);
+        };
+        let upper = rustix::fs::fstat(made.dir)?;
+        if (upper.st_uid, upper.st_gid) == (lower.st_uid, lower.st_gid) {
+            return Ok(None);
+        }
+        Ok(Some(Owed {
+            path: made.path.to_vec(),
+            owner: Owner::Host {
+                uid: lower.st_uid,
+                gid: lower.st_gid,
+            },
+            dev: upper.st_dev,
+            ino: upper.st_ino,
+        }))
     }
 
     /// Copies the lower's symbolic link at `leaf` into the upper, and returns its
@@ -706,15 +900,19 @@ pub(crate) fn open_created_fifo(dir: BorrowedFd<'_>, name: &CStr) -> Result<Owne
 /// and the create act on the same entry the kernel already resolved — nothing
 /// here re-walks a path, and the containment that got the caller its descriptor
 /// is what keeps this inside the tree.
-pub(super) fn replacing<T>(
-    parent: &OwnedFd,
-    leaf: &CString,
+///
+/// It allocates nothing, so the copy-in child replaces what holds a name after
+/// the fork as the extractor and the host-side steps do in process. A `create`
+/// that allocates nothing keeps it that way.
+pub(crate) fn replacing<T>(
+    parent: impl AsFd,
+    leaf: &CStr,
     mut create: impl FnMut() -> Result<T, Errno>,
 ) -> Result<T, Errno> {
     for _ in 0..REPLACE_ATTEMPTS {
         match create() {
             Ok(value) => return Ok(value),
-            Err(Errno::EXIST) => remove_at(parent, leaf)?,
+            Err(Errno::EXIST) => remove_at(parent.as_fd(), leaf)?,
             Err(errno) => return Err(errno),
         }
     }
@@ -724,10 +922,11 @@ pub(super) fn replacing<T>(
 /// Removes the entry at `leaf` in `parent`, whichever kind it is.
 ///
 /// An empty directory is removed; a non-empty one keeps the `ENOTEMPTY` the
-/// kernel gave, which is what both callers want to report — a tar entry does not
-/// supersede a directory that still holds entries, and neither does a host-side
-/// write.
-pub(super) fn remove_at(parent: &OwnedFd, leaf: &CString) -> Result<(), Errno> {
+/// kernel gave, which is what every caller wants to report — a tar entry does
+/// not supersede a directory that still holds entries, and neither does a
+/// host-side write or an entry a copy lays in.
+pub(crate) fn remove_at(parent: impl AsFd, leaf: &CStr) -> Result<(), Errno> {
+    let parent = parent.as_fd();
     match rustix::fs::unlinkat(parent, leaf, AtFlags::empty()) {
         Ok(()) => Ok(()),
         Err(Errno::ISDIR) => rustix::fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR),

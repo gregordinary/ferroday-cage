@@ -167,6 +167,12 @@ consumer upgrading can skip it.
   pattern's and the path's lengths. A pattern of many `*`s, from a package's
   signed metadata or a layered base's `triggers` file, could hold the bootstrap
   for minutes per directory.
+- A layered Alpine build reads its base's trigger state in time and memory in
+  proportion to the base. One package is one trigger however many lines name it,
+  and a base watching more than 4096 paths is refused. A base whose scripts had
+  rewritten `lib/apk/db/triggers` and `scripts.tar` could exhaust the host's
+  memory or CPU in the next `stage_layer`. A trigger matching more than 16,384
+  directories is refused, naming the package.
 - A package or tarball downloaded into a cache is checked before it is renamed
   into place, in every layer, so another run sharing the cache never reads
   unverified bytes there. The Alpine and Gentoo layers published a complete body
@@ -207,6 +213,14 @@ consumer upgrading can skip it.
   refused at `build`. It is written verbatim into the finished root's
   `sources.list`, where a space split the line and a newline added a source of
   its own.
+- Publishing into a `debian::Pool` follows no symbolic link and waits on no
+  named pipe. `Pool::publish` opens each `.deb` it is given only where its path
+  holds a regular file, and refuses anything else as `DebianError::Io` naming
+  the path. A build pipeline publishes from a directory its build sandbox wrote.
+  A planted `x.deb` link there made the host copy a file of the sandbox's
+  choosing into the pool, and a planted pipe hung the publish. Inside the pool,
+  a link or a pipe where a package or an index copy belongs is replaced, and one
+  where the index being merged into belongs fails the publish.
 - Laying a tree down sets no mode by name. A chmod by name follows a symbolic
   link at the entry, so a process racing the tree between an entry's creation
   and its mode could have the mode applied to a file of its choosing.
@@ -330,6 +344,8 @@ consumer upgrading can skip it.
 - The Debian provisioner recognizes `loong64`: a `loongarch64` host maps to it,
   a foreign bootstrap's preflight looks for the `qemu-loongarch64` handler, and
   the root gets the `/lib64` link the architecture's loader lives under.
+- `AlpineError::Ownership`, which fails an Alpine bootstrap whose entry could
+  not be given the owner its package states.
 - A Gentoo provision keeps the stage3's signed digest document beside the
   tarball in `cache_dir`. A resolution reads that copy before asking the
   archive, and verifies it at every use. A pinned build id then provisions from
@@ -450,6 +466,10 @@ consumer upgrading can skip it.
   the OS error two or three times. A consumer that prints an error with `{}` now
   prints its outermost layer alone, and renders the chain to keep the cause:
   through `ErrorChain`, or its own error-reporting crate.
+- **Breaking.** `alpine::KeySet::insert` reports a key that is not a usable RSA
+  public key as `AlpineError::Config`, naming the key once, rather than as
+  `AlpineError::Signature`. `AlpineError::Container` gains `source`, the failed
+  read where a container could not be read, which its reason no longer repeats.
 - **Breaking.** `DebianBuilder::fetcher`, `AlpineBuilder::fetcher` and
   `GentooBuilder::fetcher` take the transport by value, as `impl Fetch +
   'static`, rather than as a `Box<dyn Fetch>`: pass the transport itself, or a
@@ -549,6 +569,9 @@ consumer upgrading can skip it.
 - An Alpine install script runs with exactly the environment `apk` gives one:
   `PATH`, `APK_SCRIPT` and `APK_PACKAGE`, plus `SOURCE_DATE_EPOCH` where one is
   set. It also received `HOME=/root`.
+- An Alpine `include` or `exclude` naming a repository tag, such as
+  `busybox@edge`, is refused at `build`. Repository tags are not supported, and
+  such a name failed the resolution as a package nothing offers.
 - A Debian bootstrap and a layered build replace `start-stop-daemon` with a
   stand-in that starts nothing while packages configure, as debootstrap does,
   and restore it afterwards. A maintainer script that starts its daemon
@@ -729,6 +752,12 @@ consumer upgrading can skip it.
   entry that is not a directory is refused over a directory the base holds, and
   one beneath a base directory the calling user cannot search fails naming the
   entry.
+- A base directory a layered build writes beneath arrives in the upper with the
+  base's owner, group and extended attributes, as the overlay's own copy-up
+  carries it. Its POSIX access control lists are among them. It arrived owned by
+  the calling user, with no attributes. Under the single-identity map an owner
+  other than the caller's cannot be represented, and the directory arrives owned
+  by root.
 - A layered build's `stage_layer`, in all three layers, removes the overlay
   upper on failure only where the call created it. An upper that already
   existed is the caller's and stays, holding whatever the failed call wrote into
@@ -739,13 +768,15 @@ consumer upgrading can skip it.
   file of is read from both layers, the changed file from the upper and the rest
   from the base. It was read from the upper alone and refused for carrying no
   `SLOT`.
-- `CopyIn` lays a source's `bin/`, `sbin/`, `lib/` and `lib64/` into a merged-usr
-  root through the root's aliases, resolving each from the root as the sandbox
-  would, and leaves the owner, mode, and modification time of a directory the
-  root already has as they are. It failed on every merged-usr root, and a source
-  staged under umask 077 left the root's `/etc` at `0700`. A file or dangling
-  link at a directory's name is replaced, as `overlay_tree` and the extractor
-  replace it.
+- `CopyIn` lays a source's `bin/`, `sbin/`, `lib/` and `lib64/` into a
+  merged-usr root through the root's aliases, resolving each from the root as
+  the sandbox would, and leaves the owner, mode, and modification time of a
+  directory the root already has as they are. It failed on every merged-usr
+  root, and a source staged under umask 077 left the root's `/etc` at `0700`. A
+  file or dangling link at a directory's name is replaced, as `overlay_tree` and
+  the extractor replace it. So is an empty directory at the name of a file, a
+  link, or a named pipe, while a directory holding anything still fails the
+  copy.
 - `CopyIn` follows a symbolic link at the source path itself, as it does at any
   other component of the caller's path. The pre-check followed it and the walk
   then refused it.
@@ -761,6 +792,10 @@ consumer upgrading can skip it.
   minutes. A tree whose open directories together hold more entries than that
   memory, several hundred thousand, fails the export rather than being written
   out of order.
+- `Export` writes an owner or group id larger than 2097151 in a pax record, as
+  GNU tar does, rather than failing the export. The header's own field holds
+  2097151, so a reader that ignores pax records does not take the entry for
+  root's.
 - Two threads exporting to the same path with `Export::write_to_path` each
   publish a complete archive. They shared a staging file name, so one could
   publish the other's archive while it was still being written.
@@ -780,10 +815,6 @@ consumer upgrading can skip it.
 - The Debian package pool's publish lock is close-on-exec, so a process spawned
   during a publish no longer keeps the pool locked after the publish returns.
   The export's internal duplicate of its frame stream is close-on-exec as well.
-- Publishing into a `debian::Pool` no longer follows a symbolic link or waits on
-  a named pipe at a name the pool already holds. A link or a pipe where a
-  package or an index copy belongs is replaced, and one where the index being
-  merged into belongs fails the publish.
 - A provisioner's host-side read of a file inside a tree no longer waits on a
   named pipe left at that path, or holds a file a script made arbitrarily large.
   Nothing but a regular file is opened, and each read refuses a file past a
@@ -823,9 +854,28 @@ consumer upgrading can skip it.
   `noarch`, or a control identity that is not a `Q1` digest, is refused when the
   document is read and at `build`. The architecture was written verbatim into
   the root's installed database.
+- An Alpine plan naming one package twice is refused at `build`, as a pin naming
+  one twice already was. Installing it wrote two installed records for the
+  package and ran its scripts twice.
+- An Alpine root built under a range identity map gives each entry the owner its
+  package states, as apk does. The archive's user and group names are looked up
+  in the root's own `/etc/passwd` and `/etc/group` after the package's
+  pre-install, with the archive's ids where the root has no such account. The
+  installed database records the ids given. `dbus-daemon-launch-helper`, which
+  is setuid and `root:messagebus`, arrived owned by root, so the bus could not
+  run it. Under the single-identity map, and in an extract-only root, every
+  entry is owned by root, and the database now records that rather than the
+  archive's ids.
+- An Alpine package an `install_if` brings in is installed after the packages
+  its condition names, as apk orders it.
+- Where two Alpine packages built from one source package ship the same path,
+  the one installed later takes it, whatever their `replaces` fields say, as apk
+  decides it. A `replaces` priority on the earlier one kept the file.
 - A layered Alpine build finds a base package's archived trigger script by its
   whole name. A package whose name and version began another's, such as `a` at
   `1` and `a-1.5`, could be handed the other's script.
+- An Alpine container segment past its compressed-size ceiling stops the read
+  once the ceiling is crossed, rather than once the gzip member ends.
 - Gentoo atoms follow portage and the package manager specification. A
   `=cat/pkg-1.2*` atom matches only at a version-part boundary, so
   `=dev-lang/python-3.1*` no longer admits 3.12. A package name may not contain
@@ -869,6 +919,20 @@ consumer upgrading can skip it.
   compared, and a zstd frame's content checksum is compared as each frame ends.
   A damaged final block was extracted as though it were sound. More than a
   mebibyte after the marker is refused.
+- A tar member in one of GNU's pax sparse formats, 0.0, 0.1 or 1.0, is refused
+  with `ProvisionError::EntryUnsupported`, as an old-format sparse member
+  already was. Such a member's header claims a regular file, and it was
+  extracted as its packed data, or as a `GNUSparseFile.*` directory with the
+  real path missing.
+- A tar archive is refused as malformed where a pax header or a GNU long name is
+  followed by the end-of-archive marker, with no entry for it to describe. One
+  ending without the marker already was.
+- A malformed archive is reported for what is wrong with it. A corrupt first
+  header, or a first entry the reader refuses, is `ProvisionError::Archive` with
+  the reason, rather than `FormatUnrecognized`, whose message no longer says the
+  compression went unrecognized. An empty hardlink target, or a NUL byte in a
+  symbolic link's target, is `EntryRefused` rather than `EntryUnsafe`, which
+  asserts an escape attempt.
 - The bundled HTTP client reads a response's framing to its grammar: a
   `Content-Length` or chunk size with a sign is refused, `Transfer-Encoding` is
   read as a list in which only one `chunked` is accepted, and a folded header
@@ -930,12 +994,21 @@ consumer upgrading can skip it.
   both bootstraps ask. `containment::open_typed_file` opens a file a walk just
   inspected for `Rooted`, the export child and `CopyIn`, and `open_created_fifo`
   opens a named pipe just created for the extractor and the copy-in child.
+  `containment::replacing` replaces whatever holds a name for the copy-in child
+  as well, and `containment::host_assigned_xattr` is the one list of the
+  attributes the export and a layered carry leave out.
+- The copy-in child's `COPY_OWN` frame gives an entry the tree already holds its
+  owner from inside the identity map, provided the name still holds the entry
+  recorded. `provision::copyin::reown` sends it, through the
+  `provision::identity::Ownership` a tree is written under, for a layered
+  build's carried directories and an Alpine package's declared owners alike.
 - `provision::layer::Staging` takes a build layer's upper for the `stage_layer`
   of all three layers, and removes it on failure only where it created it.
 - `provision::cache` holds the package cache: `PackageCache`, the one way a
   cache directory is created, the one way an entry is opened, and the one
   staged, verified download path, mirror walk and batch alike, for all three
-  layers. `provision::Staged` is the one staging file, which every download,
+  layers. `Pool::publish` opens its `.deb` inputs through `cache::open_entry`
+  too. `provision::Staged` is the one staging file, which every download,
   `write_atomically`, the Debian pool, and `Export::write_to_path` write
   through.
 - `provision::lock_exclusive` takes every lock file, and `provision::remove_tree`
@@ -951,7 +1024,8 @@ consumer upgrading can skip it.
 - `provision::document::header` and `document::number` read every plan
   document's header and number fields, in all three layers.
 - `provision::accounts` is the shadow-file mechanism the Debian and Alpine
-  bootstraps share, and `binfmt::preflight` the one refusal of a foreign
+  bootstraps share, and `accounts::ids` reads the id a root's `/etc/passwd` or
+  `/etc/group` gives a name. `binfmt::preflight` is the one refusal of a foreign
   bootstrap. `provision::fetch::percent_decode`, moved out of the Debian index
   reader, decodes a URL's escapes for that reader and the bundled fetcher alike.
 - `provision::debian::bootstrap::is_configured` is the one reading of a dpkg

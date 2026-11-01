@@ -632,6 +632,10 @@ impl Walker<'_> {
     /// archive of the file: it reports the change for an entry it keeps, as a
     /// copy into a rootfs does. One byte read past the declared size is how a
     /// grown file is noticed; nothing of it is sent.
+    ///
+    /// A sparse file's holes read as zeros and are streamed as data. Nothing
+    /// here bounds a file's length, so the bound on an archive is its sink's,
+    /// as the `Export` documentation says.
     fn stream_data(&self, fd: BorrowedFd<'_>, size: u64) -> Result<(), (ExportStep, Errno)> {
         let stream = self.stream;
         let mut buf = [0u8; DATA_BUF];

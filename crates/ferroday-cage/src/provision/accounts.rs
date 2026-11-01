@@ -1,5 +1,6 @@
 //! The day each account's password last changed, as a bootstrap's install
-//! scripts record it in `/etc/shadow` and the host side reads and dates it.
+//! scripts record it in `/etc/shadow` and the host side reads and dates it, and
+//! the id each account and group is given in `/etc/passwd` and `/etc/group`.
 //!
 //! `shadow(5)` counts that day from 1970, and the tools that create accounts
 //! write it from the clock, or from `SOURCE_DATE_EPOCH` where they read one. A
@@ -24,7 +25,12 @@ pub(super) const SHADOW: [&str; 2] = ["etc/shadow", "etc/shadow-"];
 /// The seconds in the unit `/etc/shadow` counts in, a day.
 pub(super) const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
-/// The most of a [`SHADOW`] file a host-side step reads.
+/// The file a root names its users in, and the one it names its groups in.
+#[cfg(feature = "alpine")]
+pub(super) const ACCOUNTS: [&str; 2] = ["etc/passwd", "etc/group"];
+
+/// The most of an accounts file a host-side step reads: a [`SHADOW`] file, or
+/// one of [`ACCOUNTS`].
 ///
 /// An account is one line of about a hundred bytes, so this is past a hundred
 /// thousand of them. A script can make the file any length it likes without
@@ -110,6 +116,47 @@ pub(super) fn account_dates(tree: &Rooted, beneath: Option<&Rooted>) -> Result<D
             Some((name.to_vec(), fields.next()?.to_vec()))
         })
         .collect())
+}
+
+/// The id each name in the accounts file at `path` is given, as the root sees
+/// the file: the tree's, or where the tree holds none, the one beneath it in a
+/// layered build. `path` is one of [`ACCOUNTS`], both of which keep the id in a
+/// line's third field.
+///
+/// The first line naming an account is the one that counts, as `getpwnam(3)`
+/// and `getgrnam(3)` read the files, and a line whose third field is not a
+/// number names no id. No file is no accounts, and neither is a whiteout, which
+/// removes the base's file from the merged root.
+#[cfg(feature = "alpine")]
+pub(super) fn ids(
+    tree: &Rooted,
+    beneath: Option<&Rooted>,
+    path: &str,
+) -> Result<HashMap<Vec<u8>, u32>, Failure> {
+    let held = match (Accounts::read(tree, path)?, beneath) {
+        (Accounts::Absent, Some(beneath)) => Accounts::read(beneath, path)?,
+        (held, _) => held,
+    };
+    let Accounts::Held(contents) = held else {
+        return Ok(HashMap::new());
+    };
+    let mut ids = HashMap::new();
+    for line in contents.split(|&byte| byte == b'\n') {
+        let mut fields = line.split(|&byte| byte == b':');
+        let (Some(name), Some(_password), Some(id)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(id) = std::str::from_utf8(id)
+            .ok()
+            .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        ids.entry(name.to_vec()).or_insert(id);
+    }
+    Ok(ids)
 }
 
 /// The last-change field `/etc/shadow` records for a change at `epoch`: the
@@ -309,6 +356,34 @@ mod tests {
         // An upper that holds none after the run is left to the base.
         redate(&upper, &before, b"19675", any_written).expect("nothing to date");
         assert!(!upper.exists("etc/shadow").unwrap());
+    }
+
+    #[cfg(feature = "alpine")]
+    #[test]
+    fn a_name_is_given_the_id_its_first_line_states() {
+        // As getpwnam reads the file: the first line naming an account counts,
+        // and a line whose third field is no number names no id.
+        let (_dir, tree) = rooted_tree("ids");
+        let [passwd, group] = ACCOUNTS;
+        tree.write(
+            passwd,
+            b"root:x:0:0:root:/root:/bin/sh\nmessagebus:x:100:101::/:/sbin/nologin\n\
+              messagebus:x:7:7::/:/bin/sh\nbroken:x:+5:0::/:\nempty:x::0::/:\nshort:x\n",
+        )
+        .unwrap();
+        let users = ids(&tree, None, passwd).expect("the file reads");
+        let id = |name: &str| users.get(name.as_bytes()).copied();
+        assert_eq!(id("root"), Some(0));
+        assert_eq!(id("messagebus"), Some(100));
+        assert_eq!((id("broken"), id("empty"), id("short")), (None, None, None));
+
+        // No file is no names, and a layered build reads its base's where the
+        // upper holds none.
+        assert!(ids(&tree, None, group).expect("no file").is_empty());
+        let (_upper_dir, upper) = rooted_tree("ids-upper");
+        tree.write(group, b"messagebus:x:101:\n").unwrap();
+        let groups = ids(&upper, Some(&tree), group).expect("the base's file reads");
+        assert_eq!(groups.get(&b"messagebus"[..]), Some(&101));
     }
 
     /// Records an overlay whiteout at `relative` in `tree`, as an overlay

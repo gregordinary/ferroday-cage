@@ -109,6 +109,16 @@ impl<'a> Rooting<'a> {
 /// increment and leaving the base pristine; the base is a separate directory
 /// the handle never touches.
 ///
+/// The increment's files are written into the upper on the host, as the calling
+/// user, where the mounted overlay would place them. A directory of the base's
+/// that one lands beneath is carried into the upper first, keeping what the
+/// overlay's own copy-up keeps: the base's extended attributes, POSIX access
+/// control lists among them, its mode and modification time, and its owner and
+/// group. The ownership is given from inside the identity map the increment is
+/// staged under. Under the single-identity map, a base directory held at an id
+/// other than the caller's is carried owned by root, since that map has no other
+/// id. A base directory the calling user cannot list carries no attributes up.
+///
 /// Keep the handle alive for as long as the build root is in use, and drop it to
 /// dispose of the increment. The removal is best-effort at drop time — a drop
 /// cannot report an error — so a caller that must observe a disposal failure
