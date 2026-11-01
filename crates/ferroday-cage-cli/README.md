@@ -103,9 +103,10 @@ fcage --profile ./build.toml -- /usr/bin/make
 ```
 
 `--restricted-profile` is the path for a profile from a source you do not control. It
-refuses the keys that would let one bind an arbitrary host path or reach the host network.
-Flags given alongside a profile override it, and each default-on toggle has a counterpart
-in both directions.
+refuses the keys that map host resources in or share a host namespace. Those are binds,
+raw mounts, host networking, the host PID namespace, and an overlay root. Flags given
+alongside a profile override it, and each default-on toggle has a counterpart in both
+directions.
 
 ## Exit codes
 
@@ -117,7 +118,7 @@ in both directions.
 | 125 | the sandbox could not be built or launched, a standard stream was refused, or a relayed stream could not be read or delivered |
 | 126 | the command exists but could not be executed |
 | 127 | the command does not exist |
-| 141 | an export or a listing found its reader gone |
+| 141 | a reader of `fcage`'s own output or diagnostics went away before `fcage` was done |
 | 2 | usage error |
 
 ## Requirements

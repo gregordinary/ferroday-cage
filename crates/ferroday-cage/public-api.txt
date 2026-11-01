@@ -2749,6 +2749,7 @@ impl ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::allowing<I: core::iter::traits::collect::IntoIterator<Item = i64>>(I) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::default_action(self, ferroday_cage::SeccompAction) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::denying<I: core::iter::traits::collect::IntoIterator<Item = i64>>(I) -> ferroday_cage::SeccompRules
+pub fn ferroday_cage::SeccompRules::errno(&str) -> core::option::Option<u16>
 pub fn ferroday_cage::SeccompRules::errno_for(self, i64, u16) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::listed_action(self, ferroday_cage::SeccompAction) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::rule<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::SeccompArg>>(self, i64, I) -> ferroday_cage::SeccompRules

@@ -52,20 +52,20 @@ fn a_retired_standard_input_does_not_spin() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut child = Command::new(FCAGE)
-        .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal"])
-        .args(["--", "/bin/sleep", "3"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("fcage starts");
+    let mut child = common::spawn_grouped(
+        Command::new(FCAGE)
+            .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal"])
+            .args(["--", "/bin/sleep", "3"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
     // Closing the write end hangs the pipe up, which is the trigger.
     drop(child.stdin.take());
 
     std::thread::sleep(Duration::from_millis(1500));
     let ticks = common::cpu_ticks(child.id()).expect("the relay is still running");
-    let status = child.wait().expect("the relay exits");
+    let status = common::finish_bounded(child, PATIENCE).status;
 
     // The kernel counts in 10ms ticks on every configuration this runs on, so
     // an idle 1.5 seconds is a handful of them and a spinning one is ~150.
@@ -113,15 +113,16 @@ fn an_expired_timeout_exits_124() {
         return;
     };
     let started = Instant::now();
-    let output = Command::new(FCAGE)
-        .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal"])
-        .args(["--timeout", "1", "--kill-after", "1"])
-        .args(["--", "/bin/sleep", "60"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("fcage runs");
+    let output = common::run_bounded(
+        Command::new(FCAGE)
+            .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal"])
+            .args(["--timeout", "1", "--kill-after", "1"])
+            .args(["--", "/bin/sleep", "60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
     assert_eq!(output.status.code(), Some(124), "{}", output.status);
     assert!(
         started.elapsed() < Duration::from_secs(20),
@@ -143,21 +144,22 @@ fn an_expired_timeout_exits_124_against_a_command_that_never_stops_printing() {
         return;
     };
     let started = Instant::now();
-    let output = Command::new(FCAGE)
-        .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal"])
-        .args(["--timeout", "2", "--kill-after", "1"])
-        // Three writers, so the relay is refilled while it drains.
-        .args([
-            "--",
-            "/bin/sh",
-            "-c",
-            "yes flooding & yes flooding & yes flooding",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("fcage runs");
+    let output = common::run_bounded(
+        Command::new(FCAGE)
+            .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal"])
+            .args(["--timeout", "2", "--kill-after", "1"])
+            // Three writers, so the relay is refilled while it drains.
+            .args([
+                "--",
+                "/bin/sh",
+                "-c",
+                "yes flooding & yes flooding & yes flooding",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
     assert_eq!(output.status.code(), Some(124), "{}", output.status);
     assert!(
         started.elapsed() < Duration::from_secs(20),
@@ -337,53 +339,7 @@ fn a_stop_restores_the_terminal_and_a_continue_re_enters_raw_mode() {
     pty::assert_restored(&cooked, &session.settings());
 }
 
-/// A caller started with its standard input closed relays the session's output
-/// and ends on the command's own terms.
-///
-/// `fcage --terminal ... 0<&-` is the shape: descriptor 0 names no open file
-/// description at all, so `poll` answers `POLLNVAL` and a read answers `EBADF`.
-/// Both take the retiring path end-of-input takes -- there is nothing to relay
-/// and never will be -- and the caller-bound direction carries on alone. A loop
-/// that treated `POLLNVAL` as nothing to act on would spin on a slot that is
-/// ready forever.
-#[test]
-fn a_caller_with_no_standard_input_at_all_still_relays() {
-    let Some(rootfs) = common::fixture_rootfs() else {
-        return;
-    };
-    // `sh -c` with the descriptor closed by the shell, since `Command` has no
-    // way to spawn a child with a descriptor absent rather than redirected.
-    let script = format!(
-        "exec {} --rootfs {} --terminal -- /bin/sh -c 'echo marker-from-inside; exit 3' 0<&-",
-        shell_quote(FCAGE),
-        shell_quote(rootfs.to_str().expect("a UTF-8 rootfs path")),
-    );
-    let started = Instant::now();
-    let output = Command::new("/bin/sh")
-        .args(["-c", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("fcage starts");
-    let seen = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        seen.contains("marker-from-inside"),
-        "{seen}{}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert_eq!(output.status.code(), Some(3), "{output:?}");
-    // A spin would still have produced the right answer; that it produced one
-    // promptly is what says the closed slot was retired rather than polled.
-    assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
-}
-
 // -- Helpers ------------------------------------------------------------------
-
-/// Quotes `text` for a single-quoted shell word.
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
 
 /// Runs `fcage --terminal` over a pipe carrying `input`, and collects the
 /// result. The pipe is closed after the write, which retires the relay's
@@ -393,14 +349,14 @@ fn shell_quote(text: &str) -> String {
 /// than hanging the run: libtest has no per-test deadline of its own, and a
 /// relay that never finishes is exactly the failure these tests exist to catch.
 fn run_with_input(rootfs: &Path, command: &[&str], input: &str) -> std::process::Output {
-    let mut child = Command::new(FCAGE)
-        .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal", "--"])
-        .args(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("fcage starts");
+    let mut child = common::spawn_grouped(
+        Command::new(FCAGE)
+            .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal", "--"])
+            .args(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     {
         let mut stdin = child.stdin.take().expect("the pipe is there");
         stdin.write_all(input.as_bytes()).expect("the write lands");

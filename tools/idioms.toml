@@ -19,13 +19,15 @@ name = "a deadline from a duration"
 # side of the `+` by the names the workspace gives the two: a clock reading
 # (`Instant::now()`, or a local `now` or `since`), or a duration (a `Duration`
 # constructor, or a named deadline, timeout, interval or backoff constant).
-pattern = '(?:Instant::now\(\)|\bnow|\bsince) \+ |\+ (?:Duration::|[A-Z][A-Z0-9_]*(?:DEADLINE|TIMEOUT|INTERVAL|BACKOFF)\b)'
+# `+=` is matched as well as `+`: a deadline moved on by a duration is the same
+# addition.
+pattern = '(?:Instant::now\(\)|\bnow|\bsince) \+=? |\+=? (?:Duration::|[A-Z][A-Z0-9_]*(?:DEADLINE|TIMEOUT|INTERVAL|BACKOFF)\b)'
 answer = """\
 `Instant::now().checked_add(d)`, and a duration the clock cannot express is no \
 deadline at all. The addition panics on overflow, and every timeout this \
 workspace takes is a caller's number: `Running::wait_timeout`, `--timeout`, \
 and `HttpFetch::request_timeout` all read an inexpressible one as a wait \
-without a bound, and two of the three learned it the hard way."""
+without a bound rather than a panic."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/netstack/tcp.rs"
@@ -82,13 +84,17 @@ why = "The answer."
 
 [[idiom]]
 name = "splitting a path on its separators"
-pattern = "split\\(\\|by?t?e?\\| \\*by?t?e? == b'/'\\)"
+# Every spelling of a split at a `/`: a byte slice's closure, whatever it names
+# its byte, and a string's `split`, `rsplit`, `splitn` and `split_once`. A
+# regular expression cannot tell a path from any other value written with a
+# `/`, so a CIDR or a Gentoo `category/name` is a site too, recorded as what it
+# is.
+pattern = '''\b(?:r?split|split_terminator|split_inclusive|r?splitn|r?split_once)\((?:\w+, )?(?:'/'|"/"|\|&?\w+\| \*?\w+ == b?'/')\)'''
 answer = """\
 `path::tree_components` for a path that names something inside a tree, and \
 `path::is_ordinary_component` for what it leaves behind. Both refuse `..`, a \
 NUL, and the shapes that are not a name; a hand-rolled split decides those \
-again, and the two reviews found four splits that had decided them \
-differently."""
+again, and two splits that decide them differently admit different paths."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/path.rs"
@@ -121,15 +127,118 @@ filesystem one: it is checked before and after percent-decoding, and against \
 rules a filesystem path has no use for."""
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/provision/debian/resolve.rs"
+count = 1
+why = """\
+Not a path: an install list entry written `name/release`, apt's spelling for a \
+package from a named release. A Debian package name holds no `/`, so the first \
+one ends the name and what follows is the release."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/src/provision/extract.rs"
 count = 1
 why = """\
 Not a caller's path at all: it undoes the extractor's own join of components \
 it had already validated, to key the deferred directory metadata."""
 
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/alpine/bootstrap.rs"
+count = 1
+why = """\
+A trigger's glob compared with a directory one component at a time, as \
+`fnmatch(3)` with `FNM_PATHNAME` compares them for `apk`. Every component takes \
+part in the comparison, and a shape `tree_components` would refuse is simply \
+one the glob does not match."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/coordinate.rs"
+count = 1
+why = """\
+The answer to a different question: `coordinate::check`, what a release, a \
+component or an architecture may contain. A coordinate becomes segments of a \
+mirror URL rather than a path in a tree, and the check refuses an empty, `.` or \
+`..` segment as a URL path's rules require."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/http.rs"
+count = 1
+why = """\
+A `file://` URL's path, percent-decoded one component at a time, as an HTTP \
+server decodes a request line. A component that decoding changed is then held \
+to `path::is_ordinary_component`, so the rule is shared."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/debian/mod.rs"
+count = 1
+why = """\
+The file name of a `.deb` path the bootstrap composed itself, from the \
+archive directory it creates and a package's digest."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/mod.rs"
+count = 1
+why = """\
+The file name at the end of an archive-relative path, which a signed pointer \
+document named and `coordinate::check` has already held to the URL path rules."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/pointer.rs"
+count = 1
+why = """\
+A pointer document's entry, `build-id/file`, split after `coordinate::check` \
+has accepted it as two segments of a mirror URL."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/installed.rs"
+count = 2
+why = """\
+One undoes the layer's own join of `DB_DIR`, a category and an entry name, to \
+open each prefix beneath the overlay upper through `containment::open_dir`. The \
+other is not a path: `slot_of` takes the slot out of a `slot/subslot` value."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/atom.rs"
+count = 3
+why = """\
+Not paths: a package's `category/name`, and a slot's `slot/subslot` in a \
+candidate and in a slot dependency, each in the package manager \
+specification's own grammar."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/gpkg.rs"
+count = 1
+why = "Not a path: a planned package's `category/name`."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/vdb.rs"
+count = 1
+why = "Not a path: a planned package's `category/name`, rejoined as its entry directory."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/gentoo/version.rs"
+count = 1
+why = "Not a path: a `category/name-version` value's category."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/netstack/mod.rs"
+count = 1
+why = "Not a path: a profile's network in `address/length` form."
+
+[[idiom.site]]
+path = "crates/ferroday-cage-cli/src/main.rs"
+count = 2
+why = "Not paths: `--netstack-cidr` and `--netstack-cidr6`, each an `address/length`."
+
+[[idiom.site]]
+path = "crates/ferroday-cage/examples/fetch-sandbox.rs"
+count = 1
+why = "Not a path: the example's `--cidr`, an `address/length`."
+
 [[idiom]]
 name = "scanning for a NUL"
-pattern = '\.contains\(&0\)'
+# A byte slice's `contains`, and a string's `contains` or `find`, each in the
+# spellings a NUL takes.
+pattern = '''\b(?:contains|find)\((?:&0(?:u8)?|&b'\\0'|'\\0'|"\\0")\)'''
 answer = """\
 `path::tree_components` and `path::is_ordinary_component`, which refuse one \
 before anything is resolved. A path carrying a NUL is not a path that was \
@@ -147,6 +256,23 @@ count = 1
 why = """\
 Writing arbitrary bytes into a stack buffer as a `CStr`, post-fork: the refusal \
 is about what a `CStr` can hold rather than about what a path may name."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/debian/version.rs"
+count = 1
+why = """\
+Not a refusal: a version is compared as `dpkg` reads it, which stops at a NUL. \
+The function's own documentation says why that is a different question from \
+the one `path::is_ordinary_component` answers."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/examples/orchestrator.rs"
+count = 1
+why = """\
+Part of the example's own answer to what one path component may contain, for \
+a group name it turns into a profile's file name. `path::is_ordinary_component` \
+is the library's own and not public, and an example is a consumer of the public \
+API and nothing more."""
 
 [[idiom]]
 name = "a serde key spelled by hand"
@@ -174,8 +300,7 @@ Neither site, which is why this entry exists. The library composes no \
 different crates with no way to share one. What the record buys is that a \
 change to either arrives as a diff naming the other: the rule they must agree \
 on is glibc's, where the keyword and its value are separated by whitespace and \
-a line running them together is ignored, and a review found them already \
-disagreeing about exactly that."""
+a line running them together is ignored."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage-cli/src/main.rs"
@@ -192,9 +317,9 @@ name = "a mirror-relative URL built by hand"
 pattern = "trim_end_matches\\('/'\\)"
 answer = """\
 `provision::mirror_url`. A configured mirror may or may not end in a slash and \
-a composed suffix may or may not begin with one, so the join owns both; eight \
-sites decided it separately before, and a doubled or missing separator \
-addresses no archive."""
+a composed suffix may or may not begin with one, so the join owns both. A \
+doubled or missing separator addresses no archive, and a join decided at each \
+site is a separator decided at each site."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/fetch.rs"
@@ -215,10 +340,10 @@ name = "a hand-rolled mirror walk"
 pattern = 'let mut (?:last_missing|unserved) = None;'
 answer = """\
 `provision::walk_mirrors`, with the layer's error answering \
-`provision::Failover`. Eight copies of the same nine lines existed across the \
-three userlands, and the round-3 review found a bug in exactly one of them -- \
-the oversized-body case advancing or stopping depending on the transfer \
-encoding. A single walk is a single place to get that right."""
+`provision::Failover`. Which failure moves on to the next mirror and which ends \
+the walk has cases a copy gets subtly wrong, such as an oversized body, which \
+ends the walk whatever transfer encoding carried it. A single walk is a single \
+place to get that right."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/fetch.rs"
@@ -231,9 +356,8 @@ pattern = '\.create_new\(true\)'
 answer = """\
 `provision::Staged`, which creates the staging file exclusively under a name \
 unique to the call, removes it on any failure, and publishes it by a rename. \
-Six downloads, a pool, an export, and two copies each staged and cleaned up \
-for themselves, and only one of the downloads checked what it published \
-before the rename."""
+A staging file made by hand has each of those to get right again, along with \
+checking what it holds before the rename publishes it."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/mod.rs"
@@ -288,10 +412,8 @@ pattern = 'io::write\([^\n]*\) \{\n\s+Ok\(0\)'
 answer = """\
 `mechanism::frame::write_full`, which loops over short writes, retries `EINTR`, \
 and reports a zero-byte write on a descriptor that is neither full nor closed \
-as the anomaly it is. The vocabulary table listed `mechanism::frame` as the \
-framed protocol between a helper child and its caller, which did not advertise \
-that its byte-level readers and writers are reusable on their own -- and a \
-review found the relay had written a second one."""
+as the anomaly it is. Its byte-level readers and writers serve any descriptor, \
+not only the framed protocol between a helper child and its caller."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/mechanism/frame.rs"

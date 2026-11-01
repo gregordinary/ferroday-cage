@@ -369,6 +369,43 @@ fn a_directory_is_refused_on_any_standard_stream() {
 }
 
 #[test]
+fn a_refused_stream_ends_the_run_before_its_root_is_provisioned() {
+    // The streams are judged before a provisioner runs, so a stream fcage will
+    // not hand over is reported at once rather than after a bootstrap, and the
+    // root that launch could not have used is not built at all.
+    let dir = common::scratch_dir("fcage-stream-before-provision");
+    let tarball = dir.join("root.tar");
+    std::fs::write(
+        &tarball,
+        common::Tar::new()
+            .dir("etc", 0o755)
+            .file("etc/hostname", 0o644, b"root\n")
+            .finish(),
+    )
+    .expect("the tarball is written");
+    let rootfs = dir.join("root");
+    let mut command = Command::new(FCAGE);
+    command
+        .args(["--rootfs", rootfs.to_str().expect("a UTF-8 scratch path")])
+        .args([
+            "--provision-tar",
+            tarball.to_str().expect("a UTF-8 scratch path"),
+        ])
+        .args(["--", "/bin/true"])
+        .stdin(File::open(&dir).expect("the directory opens"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_bounded(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(125), "{stderr}");
+    assert!(stderr.contains("standard input is a directory"), "{stderr}");
+    assert!(
+        !rootfs.exists(),
+        "the root was provisioned for a refused launch"
+    );
+}
+
+#[test]
 fn a_process_that_outlives_the_command_does_not_hold_the_run_open() {
     // A restriction has no PID namespace, so a background process the command
     // started survives it and keeps the relay's pipe open. The run still ends

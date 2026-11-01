@@ -231,10 +231,10 @@ consumer upgrading can skip it.
   `ConfigError::LandlockScopeUnenforceable` on a kernel below Landlock ABI 6.
   Profile key `landlock-scope`; `fcage`: `--landlock-scope LIST`.
 - `SeccompRules::errno_for`, which answers one syscall with an errno of its own
-  ahead of the policy's actions. Answering `clone3` with `ENOSYS` lets a policy
-  that conditions `clone`'s flags keep threads working, since the C library then
-  falls back to `clone`. Profile: an `errno` table in `[hardening.seccomp]`;
-  `fcage`: `--seccomp-errno SYSCALL=ERRNO`.
+  ahead of the policy's actions. Profile: an `errno` table in
+  `[hardening.seccomp]`; `fcage`: `--seccomp-errno SYSCALL=ERRNO`, which joins
+  the seccomp policy the other flags or a profile set, and is refused beside the
+  curated one.
 - `CageBuilder::mount` and `CageBuilder::mounts`, which add a `Mount` of either
   kind to the one mount sequence, so a sequence read back through `get_mounts`
   carries over to another builder whole.
@@ -507,6 +507,18 @@ consumer upgrading can skip it.
 - **Breaking.** `RangeMapBlocker::HelperCannotMapRoot` is removed, and
   `host::range_map_blocker` no longer reports a `newuidmap` whose file
   capabilities lack `CAP_SETFCAP`. Match on the remaining variants.
+- **Breaking.** `fcage --no-base-env` no longer passes the host's `TERM`, so the
+  command gets only the variables the run names. Pass it with `--setenv` where
+  the command needs it.
+- **Breaking.** `fcage` refuses, as a usage error, a plan beside a flag that
+  shapes a resolution. That is `--debian-plan` beside `--debian-include`,
+  `--debian-exclude`, `--debian-base-priority` or `--debian-pin`,
+  `--alpine-plan` beside `--alpine-include`, `--alpine-exclude` or
+  `--alpine-pin`, and `--gentoo-plan` beside `--gentoo-install` or
+  `--gentoo-prefer-use`. A Gentoo plan overrode the two in silence, and the
+  rest failed at `build`, exiting 125.
+- `fcage` refuses an `https://` mirror on every mirror flag, as a usage error,
+  since it fetches over `http://` and `file://` only.
 - An Alpine or Gentoo fetch failure names the bootstrap it stopped, as a Debian
   one does: `the Alpine bootstrap could not fetch a resource`, with the fetch's
   own error beneath it. A Gentoo host failure reads `a Gentoo bootstrap step
@@ -680,13 +692,32 @@ consumer upgrading can skip it.
   `169.254.169.253`, was counted as reachable and bound into a sandbox that
   could not reach it. A host directory bound over `/etc` replaces the composed
   bind, as it replaces the library's own.
+- `fcage` no longer panics, exiting 101, when the reader of its standard output
+  or standard error goes away. Output that is the run's purpose, `--help`,
+  `--version` and the Gentoo listings, exits 141, as a writer to a closed pipe
+  does. A warning before a launch, or a provisioning run's progress, stops the
+  work at its next clean point and exits 141, so a bootstrap piped into `head`
+  stops. A diagnostic of a failure keeps the failure's exit code. A `--terminal`
+  session whose output reader goes away exits 141 rather than 125.
+- `fcage` checks a launch's profile, network-stack configuration and standard
+  streams before it provisions the root. A mistake in any of them was reported
+  only after a bootstrap, and a refused run now provisions nothing.
 - `fcage --export-rootfs` and `--export-to` refuse a value spelled as another
   flag, as every other flag does. `--export-to --clamp-mtime=0` wrote an archive
   named `--clamp-mtime=0`, without the clamp, and exited 0.
+- A provision-and-exit `fcage` run no longer refuses a flag's value that looks
+  like a flag, such as `--rootfs --mydir`, as a launch flag.
+- `fcage --remove-rootfs` and `--remove-overlay-upper` refuse, as usage errors,
+  an empty destination, which removed nothing and exited 0, and a path with no
+  final component such as `.`. `--gentoo-installed` refuses an empty root, which
+  it read as a root with nothing installed.
 - `fcage` no longer suggests a joined `--flag=VALUE` form for `--bind`,
   `--ro-bind`, or `--setenv`, which take two values and have none.
 - `fcage --timeout` and `--kill-after` refuse a number of seconds too small to
   be a nanosecond, which rounded to no time at all.
+- `fcage --help` states what `--restrict` requires, that `--restricted-profile`
+  refuses an overlay root, and that `--path-lookup` relaxes the absolute-command
+  rule. Its synopsis lists the Gentoo listing modes.
 - A layered build no longer hides the links its base holds to directories. A
   package shipping `lib64/` or `sbin/` over a merged-usr base, as the Gentoo
   binhost's lvm2 does over a stage3, made real directories in the upper that hid
@@ -939,7 +970,9 @@ consumer upgrading can skip it.
   `roster_enum!`, and the `roster` module is unconditional.
 - `poll::slot` is gone. A `poll` loop leaves a finished channel out of the
   polled slice, as the `poll` module states.
-- `fcage` and the examples state their exit codes once each.
+- `fcage` and the examples state their exit codes once each. `fcage`'s
+  `output` module makes every write of its own and decides what a reader gone
+  means for it.
 - The `orchestrator`, `gentoo-binhost` and `fetch-sandbox` examples set
   `test = true`, so `cargo test` runs the tests that hold their documented
   invocations to the build.
@@ -954,23 +987,31 @@ consumer upgrading can skip it.
   carries one `digest` and the MD5 hasher is driven through the same `Digest`
   trait as the SHA-2 ones.
 - `tools/rust_source.py` is the one reading of a source file the census tools
-  take: every comment and every test-only item removed. `tools/check-seam.py`
-  expands grouped imports and resolves `super::` paths, and finds 40 reaches
-  past the provisioning seam, twelve of them internal. `tools/check-parity.py`
-  finds every builder in the API snapshot rather than a list of them, which
-  brings it to 23. `tools/check-keyrings.py` reports a keyring Debian adds.
-  `tests/stability.rs` fails on a public enum or struct variant without
-  `#[non_exhaustive]`, and on a forwarding implementation of `Fetch` or
-  `IdMapper` that leaves out one of the trait's methods.
+  take: every comment and every test-only item removed. It finds an item's end
+  by matching delimiters, and reads a `cfg` predicate rather than matching its
+  spelling. `tools/check-seam.py` expands grouped imports and resolves `super::`
+  paths, and finds 40 reaches past the provisioning seam, twelve of them
+  internal. `tools/check-parity.py` finds every builder in the API snapshot
+  rather than a list of them, which brings it to 23. It holds a launch builder's
+  setting to a flag a launch takes. `tools/check-keyrings.py` reports a keyring
+  Debian adds. `docs/check-links.py` builds a heading's anchor as mdBook does,
+  and checks it against a build's own. `tests/stability.rs` fails on a public
+  enum or struct variant without `#[non_exhaustive]`, and on a forwarding
+  implementation of `Fetch` or `IdMapper` that leaves out one of the trait's
+  methods.
 - Every test skip goes through the testkit's `require` module, which honors its
   `REQUIRE` variable at every site, and `FERRODAY_CAGE_REQUIRE_LANDLOCK_NET` is
   folded into `FERRODAY_CAGE_REQUIRE_LANDLOCK`. The testkit holds one copy of
   each fixture and harness, the tar writer, the pseudoterminal and the process
-  helpers among them, and enables none of the library's features.
+  helpers among them, and enables none of the library's features. Its bounded
+  process runner starts a child in a process group of its own through
+  `spawn_grouped`, and ends the whole group past the deadline.
 - CI pins every action by commit and every installed tool by version, checks
   mdBook's download against its digest, and builds the semver baseline from the
   last release tag with its own lockfile. It sets
-  `FERRODAY_CAGE_REQUIRE_OVERLAY` and `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE`.
+  `FERRODAY_CAGE_REQUIRE_OVERLAY` and `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE`,
+  installs the pinned toolchain with `rustup toolchain install`, and checks out
+  without persisting credentials.
 - The profile-format pin covers every key the format can carry, a pin of the
   resolved provenance record's serialized keys covers every key the record can
   carry, and `NetStackBuilder`'s keys have a pin of their own.

@@ -418,9 +418,11 @@ it:
   either way.
 - Hardening flags compose with a profile's `[hardening]` table. `--landlock-ro`,
   `--landlock-rw`, `--landlock-bind`, and `--landlock-connect` add grants to it.
-  `--landlock-scope`, the seccomp flags, `--drop-caps`, and `--keep-caps` replace
-  its scopes, seccomp policy, or capability posture. The seccomp flags mirror the
-  profile's seccomp table, so a rule reads the same on a flag as in the table.
+  `--landlock-scope`, `--drop-caps`, `--keep-caps`, and the seccomp flags that set
+  a posture replace its scopes, capability posture, or seccomp policy.
+  `--seccomp-errno` joins the policy that stands instead, the flags' or else the
+  profile's. The seccomp flags mirror the profile's seccomp table, so a rule reads
+  the same on a flag as in the table.
   `--seccomp-allow` and `--seccomp-deny` take comma-separated syscall names.
   `--seccomp-allow-rule` and `--seccomp-deny-rule` take a syscall name with
   `arg`/`len`/`op`/`value`/`mask` conditions, and `--seccomp-errno` takes

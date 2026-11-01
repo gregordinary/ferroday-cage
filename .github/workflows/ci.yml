@@ -24,11 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after the checkout talks to the remote, so the token is not
+          # left in the working copy's git configuration for a later step.
+          persist-credentials: false
       - name: Install Rust (pinned)
         # rust-toolchain.toml pins the toolchain and its components, so fmt,
         # clippy, and the build all run under the same rustfmt everywhere.
-        # This provisions that toolchain; every cargo call below selects it.
-        run: rustup show
+        # This provisions that toolchain, the active one with no toolchain
+        # named; every cargo call below selects it.
+        run: rustup toolchain install
       - name: Cache the dependency build
         # Keyed on the lockfile and the job, so a job reuses only its own
         # feature selection's artifacts and a dependency change invalidates
@@ -130,8 +135,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust (pinned)
-        run: rustup show
+        run: rustup toolchain install
       - name: Cache the dependency build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install cargo-hack
@@ -210,9 +217,11 @@ jobs:
       RUSTDOC_JSON_NIGHTLY: nightly-2026-07-09
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust (pinned, plus the pinned nightly for rustdoc JSON)
         run: |
-          rustup show
+          rustup toolchain install
           rustup toolchain install "$RUSTDOC_JSON_NIGHTLY" --profile minimal
       - name: Cache the dependency build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -242,12 +251,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # The baseline is the newest release tag, so this job needs the
           # history and its tags rather than the single commit a checkout
           # fetches by default.
           fetch-depth: 0
       - name: Install Rust (pinned)
-        run: rustup show
+        run: rustup toolchain install
       - name: Cache the dependency build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install cargo-semver-checks
@@ -305,6 +315,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Check dependency licenses and advisories
         # deny.toml pins the permitted license set, the RUSTSEC advisory
         # policy, and the registries a dependency may come from; this fails the
@@ -319,6 +331,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust (MSRV)
         # An independent floor guard: the `+1.91` override wins over the pinned
         # toolchain, which sits ahead of the floor, so this checks the version
@@ -341,8 +355,10 @@ jobs:
       MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust (pinned)
-        run: rustup show
+        run: rustup toolchain install
       # No dependency cache in this job. What it builds is what `pages`
       # publishes, and a restored cache is compiled code the build would run:
       # the job pays for its own dependency build rather than trust one.
@@ -370,8 +386,10 @@ jobs:
         # URLs, so to mdBook they are external and a renamed method leaves a
         # dangling link nothing notices. This resolves each one against the
         # rustdoc output, and each cross-chapter link (heading anchors
-        # included) against docs/src.
-        run: python3 docs/check-links.py
+        # included) against docs/src. The anchors it computes are compared with
+        # the ones the build above rendered, so its reading of mdBook's slug
+        # cannot drift from mdBook's own.
+        run: python3 docs/check-links.py --book docs/book
       - name: Package the guide
         # Uploaded on every run, so a pull request proves the artifact builds;
         # only the deploy job below publishes it, and only from main.

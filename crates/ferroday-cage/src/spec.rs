@@ -3072,6 +3072,11 @@ impl CageBuilder {
     }
 
     /// The seccomp policy applied to the command, or `None` for no filter.
+    ///
+    /// What a caller reads to extend a policy a profile set rather than replace
+    /// it: [`SeccompRules`](crate::SeccompRules) is a value, so the rules come
+    /// back out, take another entry, and go back in through
+    /// [`seccomp`](Self::seccomp).
     pub fn get_seccomp(&self) -> Option<&crate::hardening::SeccompPolicy> {
         self.hardening.seccomp()
     }

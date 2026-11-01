@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Compare each vendored keyring against what its distribution ships
         # Fails loudly and gates nothing: no release and no merge waits on it,
         # and what it produces is a maintainer noticing that an anchor has

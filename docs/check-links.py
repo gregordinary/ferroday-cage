@@ -14,19 +14,24 @@ external URLs and mdBook skips them, but the file they name is right here, and a
 rename would otherwise leave the guide pointing at nothing with nothing
 noticing.
 
+A heading's anchor is computed here the way mdBook computes it. Given a build
+of the guide with `--book`, each chapter's computed anchors are also compared
+with the ids that build rendered, so a heading read differently from mdBook
+fails the check rather than passing a link the published guide breaks.
+
 Usage:
 
     cargo doc --workspace --all-features --no-deps
-    python3 docs/check-links.py
+    python3 docs/check-links.py [--book docs/book]
 
 Exits non-zero, listing every bad link, when any link cannot be resolved.
 """
 
 from __future__ import annotations
 
+import html
 import re
 import sys
-import unicodedata
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -48,6 +53,13 @@ REFERENCE = re.compile(r"^\[[^\]]+\]:\s*(\S+)", re.MULTILINE)
 FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
 
 
+# A code span in a heading: mdBook keeps its text and drops the backticks.
+CODE_SPAN = re.compile(r"(`+)(.+?)\1")
+
+# A run of underscores, which may delimit emphasis.
+UNDERSCORES = re.compile(r"_+")
+
+
 def anchors_of_markdown(text: str) -> set[str]:
     """The heading anchors mdBook generates for a chapter."""
     anchors: set[str] = set()
@@ -57,13 +69,79 @@ def anchors_of_markdown(text: str) -> set[str]:
         heading = line.lstrip("#").strip()
         if not heading:
             continue
-        # mdBook's slug: lowercase, strip anything that is not alphanumeric,
-        # a space, a hyphen, or an underscore, then hyphenate spaces.
-        slug = unicodedata.normalize("NFKD", heading).lower()
-        slug = re.sub(r"[^\w\s-]", "", slug, flags=re.UNICODE)
-        slug = re.sub(r"[\s_]+", "-", slug.strip())
-        anchors.add(slug)
+        slug = slug_of(rendered(heading))
+        # A repeated heading takes the first free numbered suffix, as mdBook
+        # numbers it.
+        anchor, repeat = slug, 0
+        while anchor in anchors:
+            repeat += 1
+            anchor = f"{slug}-{repeat}"
+        anchors.add(anchor)
     return anchors
+
+
+def rendered(heading: str) -> str:
+    """The text of a heading as mdBook renders it: a code span's contents as
+    written, and the rest without the underscores that delimit emphasis.
+
+    An asterisk delimits emphasis too, and needs no rule of its own: the slug
+    drops it like any other punctuation.
+    """
+    parts = []
+    at = 0
+    for span in CODE_SPAN.finditer(heading):
+        parts.append(without_emphasis(heading[at : span.start()]))
+        parts.append(span.group(2))
+        at = span.end()
+    parts.append(without_emphasis(heading[at:]))
+    return "".join(parts)
+
+
+def without_emphasis(text: str) -> str:
+    """`text` without the underscore runs that pair up as emphasis.
+
+    A run can open emphasis where it starts a word and close it where it ends
+    one; an underscore inside a word, as in `snake_case`, does neither. Each
+    closer pairs with the nearest open run before it, and a run left unpaired is
+    the literal underscore it looks like, as in `foo_`.
+    """
+    def word(at: int) -> bool:
+        return 0 <= at < len(text) and text[at].isalnum()
+
+    def blank(at: int) -> bool:
+        return not 0 <= at < len(text) or text[at].isspace()
+
+    paired: list[tuple[int, int]] = []
+    open_runs: list[tuple[int, int]] = []
+    for run in UNDERSCORES.finditer(text):
+        start, end = run.span()
+        closes = not blank(start - 1) and not word(end)
+        opens = not blank(end) and not word(start - 1)
+        if closes and open_runs:
+            paired.extend([open_runs.pop(), (start, end)])
+        elif opens:
+            open_runs.append((start, end))
+    kept = list(text)
+    for start, end in paired:
+        kept[start:end] = [""] * (end - start)
+    return "".join(kept)
+
+
+def slug_of(heading: str) -> str:
+    """mdBook's anchor for a heading's rendered text.
+
+    Character by character: a letter, a digit, `_` and `-` stay, lowercased;
+    each whitespace character becomes a `-`, so a run of them is a run of
+    hyphens; everything else is dropped. "Read & write" is therefore
+    `read--write`, and "a `non_exhaustive` type" keeps its underscore.
+    """
+    out = []
+    for char in heading:
+        if char.isalnum() or char in "_-":
+            out.append(char.lower())
+        elif char.isspace():
+            out.append("-")
+    return "".join(out)
 
 
 def check_rustdoc_link(url: str) -> str | None:
@@ -118,6 +196,25 @@ def check_chapter_link(source: Path, url: str) -> str | None:
     return None
 
 
+def check_rendered_anchors(chapter: Path, book: Path) -> str | None:
+    """Compare a chapter's computed anchors with those a build rendered; None if
+    they agree."""
+    page = book / f"{chapter.stem}.html"
+    if not page.is_file():
+        return f"the build at {book} has no page {page.name}"
+    rendered_ids = {
+        html.unescape(found)
+        for found in re.findall(r'<h[1-6] id="([^"]+)"', page.read_text(encoding="utf-8"))
+    }
+    computed = anchors_of_markdown(chapter.read_text(encoding="utf-8"))
+    if computed == rendered_ids:
+        return None
+    return (
+        f"anchors computed here and not rendered: {sorted(computed - rendered_ids)}; "
+        f"rendered and not computed: {sorted(rendered_ids - computed)}"
+    )
+
+
 def links_in(text: str) -> list[str]:
     stripped = FENCE.sub("", text)
     return [
@@ -127,6 +224,13 @@ def links_in(text: str) -> list[str]:
 
 
 def main() -> int:
+    arguments = sys.argv[1:]
+    book = None
+    if arguments[:1] == ["--book"] and len(arguments) == 2:
+        book = Path(arguments[1])
+    elif arguments:
+        print("usage: python3 docs/check-links.py [--book DIR]", file=sys.stderr)
+        return 2
     if not RUSTDOC.is_dir():
         print(
             "docs/check-links.py: no rustdoc output at target/doc; run\n"
@@ -139,6 +243,10 @@ def main() -> int:
     failures: list[str] = []
     checked = 0
     for chapter in sorted(SRC.glob("*.md")):
+        if book is not None and chapter.name != "SUMMARY.md":
+            problem = check_rendered_anchors(chapter, book)
+            if problem:
+                failures.append(f"{chapter.relative_to(REPO)}: heading anchors\n    {problem}")
         text = chapter.read_text(encoding="utf-8")
         for url in links_in(text):
             if url.startswith(DOCS_RS):

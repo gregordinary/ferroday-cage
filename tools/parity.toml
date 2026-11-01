@@ -25,6 +25,11 @@
 # constructor, a terminal such as `build`, an accessor, and a trait impl have
 # other shapes and are not recorded. Every public type with a setting is a
 # builder, and the checker fails on one this file does not name.
+#
+# A builder's flags are ones a launch takes, unless the builder names the mode
+# it belongs to with `mode`, a `Mode` variant of the CLI's flag table. Such a
+# builder's flags are its mode's own or a launch's, since a mode's parser takes
+# a few launch flags, such as `--identity-map`, as well as its own.
 
 # The launch builder. This is the surface the documentation's parity claim is
 # about, and every setting on it is spelled here.
@@ -42,8 +47,8 @@ flags = ["--overlay-lower", "--overlay-upper", "--overlay-work"]
 
 [[builder.setting]]
 name = "overlay_rootfs"
-flags = ["--rootfs", "--overlay-upper", "--overlay-work"]
-why = "The shorthand for an overlay over one lower directory, which the trio spells by naming --rootfs as that directory."
+flags = ["--overlay-lower", "--overlay-upper"]
+why = "The shorthand for an overlay over one lower directory, which --overlay-lower given once spells beside --overlay-upper."
 
 [[builder.setting]]
 name = "bind"
@@ -578,6 +583,7 @@ why = "As the Debian builder's."
 [[builder]]
 name = "Remove"
 path = "ferroday_cage::provision::Remove"
+mode = "Remove"
 
 [[builder.setting]]
 name = "identity_map"
@@ -595,6 +601,7 @@ flags = ["--keep-lock"]
 [[builder]]
 name = "Export"
 path = "ferroday_cage::provision::Export"
+mode = "Export"
 
 [[builder.setting]]
 name = "identity_map"

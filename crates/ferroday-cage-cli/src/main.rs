@@ -41,6 +41,7 @@
 //! publishes the enumerations they print. `tools/parity.toml` records the whole
 //! comparison, setting by setting, and a check holds it to the code.
 
+mod output;
 mod streams;
 mod terminal;
 
@@ -51,9 +52,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ferroday_cage::provision::Provisioned;
 use ferroday_cage::provision::alpine::KeySet as AlpineKeySet;
 use ferroday_cage::provision::debian::{Priority, Repository};
+use ferroday_cage::provision::{ProvisionError, ProvisionEvent, Provisioned, Provisioner};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ErrorChain, ExitStatus, FsAccess, IdRange,
@@ -82,7 +83,7 @@ const FAILED: u8 = 125;
 /// Reports a failure of `fcage`'s own on standard error, and returns
 /// [`FAILED`].
 fn fail(diagnostic: impl Into<Diagnostic>) -> ExitCode {
-    eprintln!("fcage: {}", diagnostic.into().0);
+    output::report(format_args!("fcage: {}", diagnostic.into().0));
     ExitCode::from(FAILED)
 }
 
@@ -134,15 +135,6 @@ diagnostic_from_errors!(
     RelayError,
     streams::StartError,
 );
-
-/// The exit code of a writer whose reader went away: what a process `SIGPIPE`
-/// killed exits with, which is what a shell expects of a pipeline's early end.
-///
-/// Rust ignores `SIGPIPE`, so the write fails with `EPIPE` instead of the
-/// process dying of the signal, and the code is reported for it.
-fn broken_pipe() -> u8 {
-    ExitStatus::signaled(rustix::process::Signal::PIPE.as_raw()).shell_code()
-}
 
 /// What follows a flag's name on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,19 +243,17 @@ enum Take {
     Two(fn(&mut Options, &'static str, OsString, OsString) -> Result<(), String>),
     /// A flag a launch refuses, because it belongs to another mode. The arity
     /// is still recorded: the pre-scan walks past such a flag's value like any
-    /// other's, and reading its value as the command is how a mode used to be
-    /// chosen by accident.
+    /// other's, since reading that value as the command would end the scan
+    /// before a mode flag after it.
     Refused(Arity),
 }
 
 /// One flag `fcage` accepts, wherever it accepts it.
 ///
 /// This is the parser's vocabulary, the help's contents, and the suggester's
-/// candidate list, declared once. Each of those used to be derived from one of
-/// the others by scraping text -- the help read out of a 371-line string
-/// constant, and the parser's vocabulary read out of this file's own source --
-/// which meant a pattern that stopped matching produced an empty list and an
-/// empty list passed.
+/// candidate list, declared once. None of the three is derived from another by
+/// reading text, where a pattern that stopped matching would produce an empty
+/// list that every check over it passes.
 #[derive(Clone, Copy)]
 struct Flag {
     /// The name, with its leading dashes.
@@ -399,7 +389,7 @@ const FLAGS: &[Flag] = &[
         placeholder: "URL",
         help: &["Archive mirror (default: http://deb.debian.org/debian)"],
         take: Take::One(|options, flag, value| {
-            options.debian_mirror = Some(into_string(flag, value)?);
+            options.debian_mirror = Some(fetchable_mirror(flag, into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -447,8 +437,10 @@ const FLAGS: &[Flag] = &[
         help: &[
             "Install exactly the packages FILE names, resolving",
             "nothing. FILE is a plan document a previous resolution",
-            "wrote; it supersedes --debian-include and",
-            "--debian-exclude",
+            "wrote. The flags that shape a resolution",
+            "(--debian-include, --debian-exclude,",
+            "--debian-base-priority, --debian-pin) cannot be given",
+            "with it",
         ],
         take: Take::One(|options, _flag, value| {
             options.debian_plan = Some(PathBuf::from(value));
@@ -518,7 +510,7 @@ const FLAGS: &[Flag] = &[
         take: Take::One(|options, flag, value| {
             options
                 .debian_mirror_fallback
-                .push(into_string(flag, value)?);
+                .push(fetchable_mirror(flag, into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -543,8 +535,9 @@ const FLAGS: &[Flag] = &[
         section: Section::Provisioning,
         help: &[
             "Accept the archive without verifying its signature.",
-            "Every mirror must then be file:// or https://, the",
-            "transports that authenticate what they serve",
+            "Every mirror must then be file://: an unsigned archive",
+            "is taken only over a transport that authenticates what",
+            "it serves, and fcage fetches nothing over https://",
         ],
         take: Take::Bare(|options| {
             options.debian_trust_unsigned = true;
@@ -666,7 +659,7 @@ const FLAGS: &[Flag] = &[
             "http://dl-cdn.alpinelinux.org/alpine)",
         ],
         take: Take::One(|options, flag, value| {
-            options.alpine_mirror = Some(into_string(flag, value)?);
+            options.alpine_mirror = Some(fetchable_mirror(flag, into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -718,8 +711,9 @@ const FLAGS: &[Flag] = &[
         help: &[
             "Install exactly the packages FILE names, resolving",
             "nothing. FILE is a plan document a previous resolution",
-            "wrote; it supersedes --alpine-include and",
-            "--alpine-exclude",
+            "wrote. The flags that shape a resolution",
+            "(--alpine-include, --alpine-exclude, --alpine-pin)",
+            "cannot be given with it",
         ],
         take: Take::One(|options, _flag, value| {
             options.alpine_plan = Some(PathBuf::from(value));
@@ -794,7 +788,7 @@ const FLAGS: &[Flag] = &[
         take: Take::One(|options, flag, value| {
             options
                 .alpine_mirror_fallback
-                .push(into_string(flag, value)?);
+                .push(fetchable_mirror(flag, into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -979,10 +973,12 @@ const FLAGS: &[Flag] = &[
         placeholder: "FILE",
         help: &[
             "Install the packages FILE names, resolving nothing.",
-            "FILE is a plan document a previous run wrote; it",
-            "supersedes --gentoo-install and --gentoo-prefer-use. A",
-            "package the root has at the planned version is skipped,",
-            "and one whose slot the root already holds is refused",
+            "FILE is a plan document a previous run wrote. The",
+            "flags that shape a resolution (--gentoo-install,",
+            "--gentoo-prefer-use) cannot be given with it. A",
+            "package the root has at the planned version is",
+            "skipped, and one whose slot the root already holds",
+            "is refused",
         ],
         take: Take::One(|options, _flag, value| {
             options.gentoo_plan = Some(PathBuf::from(value));
@@ -996,7 +992,7 @@ const FLAGS: &[Flag] = &[
         placeholder: "URL",
         help: &["Archive mirror (default:", "http://distfiles.gentoo.org)"],
         take: Take::One(|options, flag, value| {
-            options.gentoo_mirror = Some(into_string(flag, value)?);
+            options.gentoo_mirror = Some(fetchable_mirror(flag, into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -1013,7 +1009,7 @@ const FLAGS: &[Flag] = &[
         take: Take::One(|options, flag, value| {
             options
                 .gentoo_mirror_fallback
-                .push(into_string(flag, value)?);
+                .push(fetchable_mirror(flag, into_string(flag, value)?)?);
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -1230,9 +1226,10 @@ const FLAGS: &[Flag] = &[
             "Load a TOML profile from an untrusted source: like",
             "--profile, but the operations that map host resources",
             "into the sandbox or share a host namespace (binds, raw",
-            "mounts, host networking, the host PID namespace) are",
-            "refused. The rootfs it names still grants access to that",
-            "host subtree, so pass a rootfs you control",
+            "mounts, host networking, the host PID namespace, an",
+            "overlay root) are refused. The rootfs it names still",
+            "grants access to that host subtree, so pass a rootfs",
+            "you control",
         ],
         take: Take::One(|options, _flag, value| {
             let path = PathBuf::from(value);
@@ -1475,11 +1472,12 @@ const FLAGS: &[Flag] = &[
             "Give the sandbox a pseudoterminal of its own and relay",
             "this terminal to it: interactive programs work, and the",
             "sandbox reaches nothing of the terminal fcage was",
-            "started from. TERM passes through as ever, so set it",
-            "with --setenv TERM to override. From a script, where",
-            "fcage's own input is not a terminal, this degrades to a",
-            "plain byte relay around a sandbox that still has a real",
-            "terminal of its own, at 80x24",
+            "started from. TERM passes through as ever unless",
+            "--no-base-env is given, and --setenv TERM overrides it.",
+            "From a script, where fcage's own input is not a",
+            "terminal, this degrades to a plain byte relay around a",
+            "sandbox that still has a real terminal of its own, at",
+            "80x24",
         ],
         take: Take::Bare(|options| {
             options.terminal = true;
@@ -1715,11 +1713,13 @@ const FLAGS: &[Flag] = &[
             "Confine the command with Landlock and seccomp only:",
             "no namespaces, no root filesystem swap, and paths are",
             "host paths. The fallback for hosts without",
-            "unprivileged user namespaces; requires at least one",
-            "--landlock-* or --seccomp flag, and accepts only",
-            "those plus --setenv, --no-base-env, --chdir,",
-            "--stdin, --terminal, --timeout, --kill-after,",
-            "--rlimit, and --stop-with-caller",
+            "unprivileged user namespaces; requires a Landlock",
+            "grant (--landlock-ro, --landlock-rw, --landlock-bind,",
+            "--landlock-connect) or a seccomp flag, and accepts",
+            "only those, --landlock-scope, --setenv,",
+            "--no-base-env, --chdir, --stdin, --terminal,",
+            "--timeout, --kill-after, --rlimit, and",
+            "--stop-with-caller, with their counterparts",
         ],
         take: Take::Bare(|options| {
             options.restrict = true;
@@ -1897,9 +1897,11 @@ const FLAGS: &[Flag] = &[
         placeholder: "SYSCALL=ERRNO",
         help: &[
             "Answer every call of SYSCALL with ERRNO, by name or",
-            "number, ahead of the other seccomp flags (repeatable;",
-            "e.g. clone3=ENOSYS, which the C library answers by",
-            "falling back to clone)",
+            "number (1 to 4095), ahead of every other seccomp rule.",
+            "Joins the policy the other seccomp flags or a profile",
+            "set rather than replacing it (repeatable; e.g.",
+            "clone3=ENOSYS, which the C library answers by falling",
+            "back to clone)",
         ],
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
@@ -2005,8 +2007,9 @@ const FLAGS: &[Flag] = &[
         long: "--no-base-env",
         section: Section::Off,
         help: &[
-            "Give the command exactly the --setenv variables, with",
-            "no PATH or HOME supplied underneath them",
+            "Give the command only the variables --setenv and a",
+            "profile name, with no PATH, HOME, or host TERM",
+            "supplied underneath them",
         ],
         take: Take::Bare(|options| {
             options.base_env = Some(false);
@@ -2121,6 +2124,10 @@ Usage: fcage [--rootfs DIR | --overlay-lower DIR | --profile FILE | --restricted
        fcage --remove-rootfs DIR [--identity-map M] [--keep-lock]
        fcage --remove-overlay-upper DIR [--identity-map M]
        fcage --export-rootfs DIR [--export-to FILE] [--identity-map M] [--clamp-mtime EPOCH]
+       fcage --gentoo-variants ARCH [--gentoo-mirror URL] [--gentoo-mirror-fallback URL] [--gentoo-max-pointer-age DAYS]
+       fcage --gentoo-packages ARCH --gentoo-binhost SUBARCH [--gentoo-mirror URL] [--gentoo-mirror-fallback URL]
+       fcage --gentoo-installed ROOT
+       fcage --gentoo-keyring-horizon
 ";
 
 /// What `--help` prints below them.
@@ -2135,19 +2142,23 @@ Each toggle has a counterpart to override a profile in the other direction:
 --managed-mounts, --base-env, --stop-with-caller, and --no-path-lookup.
 A profile's [hardening] table composes with the hardening flags:
 --landlock-ro, --landlock-rw, --landlock-bind, and --landlock-connect add
-grants to it, while --landlock-scope, the seccomp flags, --drop-caps, and
---keep-caps replace its scopes, seccomp policy, or capability posture. The
-seccomp flags are mutually constrained: --seccomp curated stands alone, and
-an allow side (--seccomp-allow, --seccomp-allow-rule) cannot be mixed with a
-deny side (--seccomp-deny, --seccomp-deny-rule). --seccomp-errno joins either
-side, or alone denies only what it names.
+grants to it, while --landlock-scope, --drop-caps, --keep-caps, and the
+seccomp flags that set a posture replace its scopes, capability posture, or
+seccomp policy. Those seccomp flags are mutually constrained: --seccomp
+curated stands alone, and an allow side (--seccomp-allow,
+--seccomp-allow-rule) cannot be mixed with a deny side (--seccomp-deny,
+--seccomp-deny-rule). --seccomp-errno joins whichever policy stands, the
+flags' or else the profile's, and with neither denies only what it names; a
+curated posture takes none.
 
 The command path is interpreted inside the sandbox (with --restrict, on the
-host) and must be absolute; a command given on the command line replaces one
-named by the profile. The command runs with inherited standard streams and a
-clean environment: PATH and HOME, the host TERM when set, profile variables,
-and the --setenv values. With --restrict the base is PATH alone, there being
-no sandbox root for HOME to name. --no-base-env drops the base either way.
+host) and must be absolute, unless --path-lookup resolves a name with no
+slash against the sandbox's PATH; a command given on the command line
+replaces one named by the profile. The command runs with inherited standard
+streams and a clean environment: PATH and HOME, the host TERM when set,
+profile variables, and the --setenv values. With --restrict the base is PATH
+alone, there being no sandbox root for HOME to name. --no-base-env drops the
+base, and the host TERM with it, either way.
 
 A standard stream that is a regular file or a block device is not handed
 to the command. It gets a pipe instead, and fcage copies between the pipe
@@ -2164,8 +2175,8 @@ when it is terminated by a signal, or 124 when --timeout expires. fcage
 itself exits 125 when the sandbox cannot be built or launched, when a
 standard stream is refused, or when a relayed stream could not be read or
 delivered; 126 when the command exists but cannot be executed; 127 when
-the command does not exist; 141 when an export or a listing finds its
-reader gone; and 2 on usage errors.
+the command does not exist; 141 when a reader of fcage's own output or
+diagnostics goes away before fcage is done; and 2 on usage errors.
 ";
 
 /// A parsed command line.
@@ -2326,6 +2337,9 @@ struct Options {
     seccomp_deny: Vec<i64>,
     seccomp_allow_rules: Vec<(i64, Vec<SeccompArg>)>,
     seccomp_deny_rules: Vec<(i64, Vec<SeccompArg>)>,
+    /// The `--seccomp-errno` answers, kept apart from [`seccomp`](Self::seccomp)
+    /// until the launch: they join whichever policy stands, and with a profile
+    /// that is not known until the profile is loaded.
     seccomp_errno: Vec<(i64, u16)>,
     caps: Option<CapsChoice>,
     restrict: bool,
@@ -2416,19 +2430,19 @@ fn unrecognized_option(arg: &OsStr) -> String {
     let name = flag_name(&given);
     // A flag of another mode is not a misspelling. Suggesting it would offer
     // the spelling just refused; naming the mode that accepts it will not.
-    if let Some(owner) = export_only_owner(name) {
+    if let Some(owner) = owning_mode_flag(name) {
         return format!(
             "unrecognized option {given}\n{name} is an option of {owner}, which is a mode of \
              its own.",
         );
     }
-    // The candidates are the table itself. They used to be scraped out of the
-    // rendered help, which is now rendered from the table -- so the roster and
-    // the vocabulary are one list rather than two that have to agree.
+    // The candidates are the table itself, which the help is rendered from, so
+    // the roster and the vocabulary are one list rather than two that have to
+    // agree.
     let candidates: Vec<&str> = FLAGS
         .iter()
         .map(|flag| flag.long)
-        .filter(|flag| export_only_owner(flag).is_none())
+        .filter(|flag| owning_mode_flag(flag).is_none())
         .collect();
     match nearest_flag(name, &candidates) {
         Some(flag) => format!("unrecognized option {given}\nTry 'fcage {flag}'."),
@@ -2447,12 +2461,12 @@ fn flag_name(arg: &str) -> &str {
 ///
 /// A flag of another mode is not a misspelling, so the suggester never offers
 /// one; naming the flag that selects the owning mode is the useful answer.
-fn export_only_owner(flag: &str) -> Option<&'static str> {
+fn owning_mode_flag(flag: &str) -> Option<&'static str> {
     let entry = FLAGS.iter().find(|entry| entry.long == flag)?;
     // A flag that *selects* its mode is not an option of another mode: it is
     // the mode, and typing it is how a caller asks for one. Only a flag that
-    // belongs to a mode without selecting it -- `--export-to` -- is the case
-    // this answers.
+    // belongs to a mode without selecting it -- `--export-to`, `--keep-lock`
+    // -- is the case this answers.
     if entry.mode == Mode::Launch || entry.selects {
         return None;
     }
@@ -2678,20 +2692,19 @@ fn apply_flag(
 fn main() -> ExitCode {
     match parse(std::env::args_os().skip(1)) {
         Ok(Invocation::Help) => {
-            print!("{}", usage());
-            ExitCode::SUCCESS
+            output::print_stdout("the help", |out| out.write_all(usage().as_bytes()))
         }
-        Ok(Invocation::Version) => {
-            // Both numbers, because they move independently: `fcage 0.4.1` was
-            // correct across library 0.4.2 and 0.4.3, and the library is where
-            // a containment defect would be.
-            println!(
+        Ok(Invocation::Version) => output::print_stdout("the version", |out| {
+            // Both numbers, because they move independently: one `fcage`
+            // release can be built against several library releases, and the
+            // library is where a containment defect would be.
+            writeln!(
+                out,
                 "fcage {} (ferroday-cage {})",
                 env!("CARGO_PKG_VERSION"),
                 ferroday_cage::VERSION,
-            );
-            ExitCode::SUCCESS
-        }
+            )
+        }),
         Ok(Invocation::Run(options)) => run(*options),
         Ok(Invocation::Remove { dest, map, removal }) => remove_tree(&dest, map, removal),
         Ok(Invocation::GentooVariants {
@@ -2724,11 +2737,7 @@ fn main() -> ExitCode {
             map,
             clamp_mtime,
         }) => export_rootfs(&source, dest.as_deref(), map, clamp_mtime),
-        Err(message) => {
-            eprintln!("fcage: {message}");
-            eprintln!("Try 'fcage --help' for usage.");
-            ExitCode::from(USAGE)
-        }
+        Err(message) => usage_error(format_args!("{message}")),
     }
 }
 
@@ -2750,10 +2759,11 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         Some(Mode::Export) => return parse_export(args),
         _ => {}
     }
-    // Kept for the no-effect check at the end, which asks what was written
-    // rather than what it parsed to.
-    let raw = args.clone();
     let mut args = args.into_iter();
+    // The flags the loop below applied, in order, for the no-effect check at
+    // the end. A value is the flag's, whatever it looks like, so only what the
+    // loop took as a flag is a flag here.
+    let mut applied: Vec<&'static str> = Vec::new();
 
     let mut options = Options {
         profile: None,
@@ -2876,6 +2886,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             // exactly one value, so this is `Some` for those and nothing else.
             let joined = flag_value(&arg, format!("{}=", flag.long).as_bytes());
             apply_flag(flag, &mut options, joined, &mut args)?;
+            applied.push(flag.long);
             continue;
         }
         if arg.as_bytes().starts_with(b"-") && arg != "-" {
@@ -2897,10 +2908,13 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         std::mem::take(&mut options.seccomp_allow_rules),
         std::mem::take(&mut options.seccomp_deny_rules),
     )?;
-    options.seccomp = answer_seccomp_errnos(
-        options.seccomp.take(),
-        std::mem::take(&mut options.seccomp_errno),
-    )?;
+    // The curated posture is a whole policy and takes no errno. A profile's own
+    // posture is checked when the profile is loaded; this one is the command
+    // line's, so it is the usage error it looks like now.
+    if matches!(options.seccomp, Some(SeccompPolicy::Curated)) && !options.seccomp_errno.is_empty()
+    {
+        return Err("--seccomp curated cannot be combined with --seccomp-errno".to_string());
+    }
 
     // --kill-after is the grace period before the SIGKILL that follows a
     // --timeout; without a timeout it has nothing to hang on and would be
@@ -2985,9 +2999,12 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         if options.landlock.is_empty()
             && options.landlock_net.is_empty()
             && options.seccomp.is_none()
+            && options.seccomp_errno.is_empty()
         {
             return Err(
-                "--restrict requires at least one grant: a --landlock-* rule or a --seccomp filter"
+                "--restrict requires at least one grant: a --landlock-ro, --landlock-rw, \
+                 --landlock-bind or --landlock-connect rule, or a seccomp filter; \
+                 --landlock-scope alone leaves the filesystem and the network open"
                     .to_string(),
             );
         }
@@ -3055,6 +3072,41 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     if options.provision_gentoo.is_none() && has_gentoo_modifiers(&options) {
         return Err("the --gentoo-* options require --provision-gentoo".to_string());
     }
+    // A plan is a resolution that already happened, so a flag that shapes a
+    // resolution has nothing to shape beside one. The Debian and Alpine layers
+    // refuse such a pair when they are built, and the Gentoo layer lets the
+    // plan win. Refused here, each is the usage error it is, and none of them
+    // is dropped in silence.
+    plan_alone(
+        "--debian-plan",
+        options.debian_plan.is_some(),
+        &[
+            (!options.debian_include.is_empty(), "--debian-include"),
+            (!options.debian_exclude.is_empty(), "--debian-exclude"),
+            (
+                options.debian_base_priority.is_some(),
+                "--debian-base-priority",
+            ),
+            (options.debian_pin.is_some(), "--debian-pin"),
+        ],
+    )?;
+    plan_alone(
+        "--alpine-plan",
+        options.alpine_plan.is_some(),
+        &[
+            (!options.alpine_include.is_empty(), "--alpine-include"),
+            (!options.alpine_exclude.is_empty(), "--alpine-exclude"),
+            (options.alpine_pin.is_some(), "--alpine-pin"),
+        ],
+    )?;
+    plan_alone(
+        "--gentoo-plan",
+        options.gentoo_plan.is_some(),
+        &[
+            (!options.gentoo_install.is_empty(), "--gentoo-install"),
+            (!options.gentoo_prefer_use.is_empty(), "--gentoo-prefer-use"),
+        ],
+    )?;
     // A variant is what a bootstrap installs, and the archive publishes dozens
     // per architecture with no default among them. Refusing here rather than
     // letting the library refuse after two fetches is what makes the message
@@ -3084,7 +3136,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     // the way the command line said.
     if options.command_line.is_empty()
         && options.profile.is_none()
-        && let Some(flag) = first_launch_flag(&raw)
+        && let Some(flag) = applied.into_iter().find(|flag| !provisions(flag))
     {
         return Err(format!(
             "{flag} configures a launch, and a provisioning run without a command does not \
@@ -3094,25 +3146,22 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     Ok(Invocation::Run(Box::new(options)))
 }
 
-/// The first argument of a provision-and-exit invocation that configures the
-/// launch rather than the provisioning, if any.
-///
-/// A provision-and-exit run names no command, so nothing in the vector is a
-/// positional and every `--` argument is one of fcage's own. The provisioning
-/// vocabulary is short enough to name; everything else shapes a sandbox that is
-/// never built.
-///
-/// The bare `--` separator is not a flag and is skipped: it introduces a command
-/// line rather than configuring one, and a run that ends on it — `--rootfs /r
-/// --provision-debian trixie --` — names no launch setting at all. Reading it as
-/// a flag would refuse such a run for something it did not do.
-fn first_launch_flag(args: &[OsString]) -> Option<String> {
-    args.iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .find(|arg| arg != "--" && arg.starts_with("--") && !provisions(flag_name(arg)))
+/// Refuses `plan`, where it was given, beside any flag in `shaping` that was
+/// given too: each shapes a resolution, which a plan replaces.
+fn plan_alone(plan: &str, given: bool, shaping: &[(bool, &str)]) -> Result<(), String> {
+    match shaping.iter().find(|(set, _)| given && *set) {
+        Some((_, flag)) => Err(format!(
+            "{plan} installs what a resolution already chose, so {flag}, which shapes a \
+             resolution, has nothing to shape; give one of the two"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Whether `flag` configures the provisioning rather than the launch.
+///
+/// The provisioning vocabulary is short enough to name; everything else shapes a
+/// sandbox, which a provision-and-exit run never builds.
 fn provisions(flag: &str) -> bool {
     matches!(
         flag,
@@ -3224,7 +3273,7 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
             {
                 return Err(format!("{named} and {flag} are alternatives"));
             }
-            target = Some((flag, removal, PathBuf::from(dest)));
+            target = Some((flag, removal, removal_target(flag, dest)?));
         } else if arg == "--identity-map" {
             map = parse_identity_map(
                 "--identity-map",
@@ -3269,6 +3318,40 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
     Ok(Invocation::Remove { dest, map, removal })
 }
 
+/// The tree a mode flag names, refusing an empty value.
+///
+/// An empty value is almost always a variable that was never set, as in
+/// `--remove-rootfs "$ROOT"`, and the library reads it as a path that is not
+/// there. A removal would then succeed having removed nothing, and a listing
+/// would answer that nothing is installed, neither of which is about the tree
+/// the caller meant.
+fn tree_value(flag: &str, value: OsString) -> Result<PathBuf, String> {
+    if value.is_empty() {
+        return Err(format!(
+            "{flag} requires a directory, and was given an empty value, which is what an \
+             unset variable expands to"
+        ));
+    }
+    Ok(PathBuf::from(value))
+}
+
+/// The tree a removal flag names, refusing a value that names none.
+///
+/// Beyond [`tree_value`]'s refusal, a path with no final component, such as
+/// `.`, `..` or `/`, names no tree of its own to remove from its parent, and no
+/// lock file beside one.
+fn removal_target(flag: &str, value: OsString) -> Result<PathBuf, String> {
+    let dest = tree_value(flag, value)?;
+    if dest.file_name().is_none() {
+        return Err(format!(
+            "{flag}: {} names no directory of its own; name the tree itself, as in \
+             /srv/roots/trixie",
+            dest.display(),
+        ));
+    }
+    Ok(dest)
+}
+
 /// Parses a `--gentoo-variants` command line, excluding the program name.
 ///
 /// A listing reads the signed enumeration and prints it, so it takes the
@@ -3296,13 +3379,17 @@ fn parse_gentoo_variants(args: Vec<OsString>) -> Result<Invocation, String> {
         } else if let Some(value) = flag_value(&arg, b"--gentoo-variants=") {
             architecture = Some(into_string("--gentoo-variants", value)?);
         } else if arg == "--gentoo-mirror" {
-            mirror = Some(string_value("--gentoo-mirror", &mut args)?);
+            let url = string_value("--gentoo-mirror", &mut args)?;
+            mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror=") {
-            mirror = Some(into_string("--gentoo-mirror", value)?);
+            let url = into_string("--gentoo-mirror", value)?;
+            mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
         } else if arg == "--gentoo-mirror-fallback" {
-            fallbacks.push(string_value("--gentoo-mirror-fallback", &mut args)?);
+            let url = string_value("--gentoo-mirror-fallback", &mut args)?;
+            fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror-fallback=") {
-            fallbacks.push(into_string("--gentoo-mirror-fallback", value)?);
+            let url = into_string("--gentoo-mirror-fallback", value)?;
+            fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
         } else if arg == "--gentoo-max-pointer-age" {
             max_pointer_age = Some(parse_pointer_age(&string_value(
                 "--gentoo-max-pointer-age",
@@ -3385,13 +3472,17 @@ fn parse_gentoo_packages(args: Vec<OsString>) -> Result<Invocation, String> {
         } else if let Some(value) = flag_value(&arg, b"--gentoo-binhost=") {
             binhost = Some(into_string("--gentoo-binhost", value)?);
         } else if arg == "--gentoo-mirror" {
-            mirror = Some(string_value("--gentoo-mirror", &mut args)?);
+            let url = string_value("--gentoo-mirror", &mut args)?;
+            mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror=") {
-            mirror = Some(into_string("--gentoo-mirror", value)?);
+            let url = into_string("--gentoo-mirror", value)?;
+            mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
         } else if arg == "--gentoo-mirror-fallback" {
-            fallbacks.push(string_value("--gentoo-mirror-fallback", &mut args)?);
+            let url = string_value("--gentoo-mirror-fallback", &mut args)?;
+            fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror-fallback=") {
-            fallbacks.push(into_string("--gentoo-mirror-fallback", value)?);
+            let url = into_string("--gentoo-mirror-fallback", value)?;
+            fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
         } else {
             return Err(mode_conflict(
                 &arg,
@@ -3428,14 +3519,12 @@ fn parse_gentoo_installed(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--gentoo-installed" {
-            root = Some(PathBuf::from(value_for(
+            root = Some(tree_value(
                 "--gentoo-installed",
-                "a value",
-                Arity::One,
-                &mut args,
-            )?));
+                value_for("--gentoo-installed", "a value", Arity::One, &mut args)?,
+            )?);
         } else if let Some(value) = flag_value(&arg, b"--gentoo-installed=") {
-            root = Some(PathBuf::from(value));
+            root = Some(tree_value("--gentoo-installed", value)?);
         } else {
             return Err(mode_conflict(
                 &arg,
@@ -3938,13 +4027,15 @@ impl MirrorSpec {
                  primary mirror, and the rest are mirror-fallback="
             ));
         }
-        self.primary = Some(url.to_string());
+        self.primary = Some(fetchable_mirror(flag, url.to_string())?);
         Ok(())
     }
 
     /// Records a `mirror-fallback=` field.
-    fn fallback(&mut self, url: &str) {
-        self.fallbacks.push(url.to_string());
+    fn fallback(&mut self, flag: &str, url: &str) -> Result<(), String> {
+        self.fallbacks
+            .push(fetchable_mirror(flag, url.to_string())?);
+        Ok(())
     }
 
     /// The primary and its backstops, refusing a spec that names only backstops.
@@ -3957,6 +4048,28 @@ impl MirrorSpec {
         }
         Ok((self.primary, self.fallbacks))
     }
+}
+
+/// A mirror URL `fcage` can fetch from, refusing an `https://` one.
+///
+/// The library's own client speaks plain HTTP and reads `file://`, and an
+/// `https://` mirror needs a fetcher that a program supplies as code, which a
+/// command line cannot carry. Refused here, the mistake is a usage error naming
+/// the flag, rather than a failure partway through a run that names a library
+/// setting `fcage` has no flag for. Plain HTTP costs a signed archive nothing:
+/// the signature authenticates whatever the transport delivers.
+fn fetchable_mirror(flag: &str, url: String) -> Result<String, String> {
+    if url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
+        return Err(format!(
+            "{flag}: {url:?} is an https:// mirror, which fcage cannot fetch from; name the \
+             archive over http://, which its signature authenticates, or a local copy over \
+             file://"
+        ));
+    }
+    Ok(url)
 }
 
 /// Parses a `--debian-repository` specification:
@@ -3974,7 +4087,7 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
         match key {
             "suite" => suite = Some(value.to_string()),
             "mirror" => mirrors.primary("--debian-repository", value)?,
-            "mirror-fallback" => mirrors.fallback(value),
+            "mirror-fallback" => mirrors.fallback("--debian-repository", value)?,
             "components" => extend_comma(&mut components, value),
             "keyring" => keyring = Some(PathBuf::from(value)),
             "name" => name = Some(value.to_string()),
@@ -4151,7 +4264,7 @@ fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
         match key {
             "release" => release = Some(value.to_string()),
             "mirror" => mirrors.primary("--alpine-repository", value)?,
-            "mirror-fallback" => mirrors.fallback(value),
+            "mirror-fallback" => mirrors.fallback("--alpine-repository", value)?,
             "components" => extend_comma(&mut components, value),
             "keys" => keys = Some(parse_alpine_keys("--alpine-repository", value)?),
             other => {
@@ -4182,15 +4295,14 @@ fn parse_alpine_repository(spec: &str) -> Result<AlpineRepositorySpec, String> {
 /// needed one.
 ///
 /// A free function rather than a closure inside the main parser, because the
-/// sub-parsers are functions of their own and a closure there is out of scope:
-/// three flags spelled this message by hand before it moved here.
+/// mode parsers are functions of their own and need the same message.
 ///
 /// A value that names another flag is refused rather than consumed. `fcage
 /// --remove-rootfs --identity-map=subordinate` would otherwise take the map's
 /// spelling as the tree to delete, and report success having removed a path of
 /// that name in the working directory instead. Every flag taking a separated
-/// value has that shape, which is why the refusal is here and not at the one it
-/// was found on.
+/// value has that shape, which is why the refusal is here rather than at any
+/// one flag.
 ///
 /// Only a name [`FLAGS`] holds is refused, so a value that merely begins with a
 /// dash is still the caller's: `--gentoo-prefer-use -systemd` states a
@@ -4468,24 +4580,38 @@ fn assemble_seccomp(
     Ok(Some(SeccompPolicy::Rules(policy)))
 }
 
-/// Answers each syscall in `errnos` with its errno, on the policy the other
-/// seccomp flags assembled.
+/// The seccomp policy a launch sets, or `None` to leave the one it has.
 ///
-/// An errno joins an allow side or a deny side alike, and with neither it
-/// makes a deny side of its own, refusing only what it names. The curated
-/// posture is a whole policy and takes none.
-fn answer_seccomp_errnos(
-    policy: Option<SeccompPolicy>,
+/// `flags` is the policy the allow, deny and curated flags assembled, which
+/// replaces a profile's as every flag given beside a profile overrides it.
+/// `errnos` joins whichever policy then stands: the flags', or else the
+/// profile's, `beneath`. An errno beside a profile's allow-list therefore
+/// answers its syscall without discarding the list. With neither policy, the
+/// errnos make a deny side of their own, refusing only what they name. The
+/// curated posture is a whole policy and takes none, and a policy that is not
+/// a rule set cannot be extended by one.
+fn compose_seccomp(
+    flags: Option<SeccompPolicy>,
     errnos: Vec<(i64, u16)>,
+    beneath: Option<&SeccompPolicy>,
 ) -> Result<Option<SeccompPolicy>, String> {
     if errnos.is_empty() {
-        return Ok(policy);
+        return Ok(flags);
     }
-    let rules = match policy {
-        None => SeccompRules::denying([]),
-        Some(SeccompPolicy::Rules(rules)) => rules,
-        Some(_) => {
+    let rules = match (flags, beneath) {
+        (Some(SeccompPolicy::Rules(rules)), _) => rules,
+        (None, Some(SeccompPolicy::Rules(rules))) => rules.clone(),
+        (None, None) => SeccompRules::denying([]),
+        (Some(_), _) => {
             return Err("--seccomp curated cannot be combined with --seccomp-errno".to_string());
+        }
+        (None, Some(_)) => {
+            return Err(
+                "--seccomp-errno cannot be added to the profile's seccomp policy, which is the \
+                 curated posture rather than a set of rules; add the errno to a rule set, or \
+                 replace the profile's policy with --seccomp-allow or --seccomp-deny"
+                    .to_string(),
+            );
         }
     };
     let rules = errnos.into_iter().fold(rules, |rules, (syscall, errno)| {
@@ -4497,27 +4623,22 @@ fn answer_seccomp_errnos(
 /// Parses one `--seccomp-errno` value, `SYSCALL=ERRNO`, into the syscall's
 /// number and the errno's.
 ///
-/// The errno is a name such as `ENOSYS`, in any letter case, or a number. A
-/// name resolves through the `syscalls` crate's errno table, the one a
-/// profile's `errno` table resolves through, as [`resolve_syscall_name`] does
-/// for the syscall.
+/// The errno is read by [`SeccompRules::errno`]: a name such as `ENOSYS`, in
+/// any letter case, through the table a profile's `errno` entries resolve
+/// through, or a number a failed syscall can report. Zero is refused, since the
+/// command would read it as a success the syscall never performed.
 fn parse_seccomp_errno(flag: &str, value: &str) -> Result<(i64, u16), String> {
     let (name, errno) = value
         .split_once('=')
         .ok_or_else(|| format!("{flag} expects SYSCALL=ERRNO, not {value:?}"))?;
     let syscall = resolve_syscall_name(flag, name.trim())?;
     let errno = errno.trim();
-    let number = match errno.parse::<u16>() {
-        Ok(number) => Some(number),
-        Err(_) => {
-            let wanted = errno.to_ascii_uppercase();
-            (1..4096)
-                .map(syscalls::Errno::new)
-                .find(|candidate| candidate.name() == Some(wanted.as_str()))
-                .and_then(|found| u16::try_from(found.into_raw()).ok())
-        }
-    };
-    let number = number.ok_or_else(|| format!("{flag}: unknown errno {errno:?}"))?;
+    let number = SeccompRules::errno(errno).ok_or_else(|| {
+        format!(
+            "{flag}: {errno:?} is not an errno a syscall can fail with; name one, such as \
+             ENOSYS, or give its number, from 1 to 4095"
+        )
+    })?;
     Ok((syscall, number))
 }
 
@@ -4601,9 +4722,10 @@ struct ProfileMeta {
 /// sandbox.
 ///
 /// A default is not a setting, though, so it is applied only where nothing else
-/// answers. Seeding the option with it instead made every run state the tie, and
-/// a profile's `stop-with-caller = false` was overridden by a value its author
-/// never wrote — leaving a documented profile key unreachable through `fcage`.
+/// answers. Seeding the option with it would make every run state the tie, and
+/// a profile's `stop-with-caller = false` would be overridden by a value its
+/// author never wrote, leaving a documented profile key unreachable through
+/// `fcage`.
 fn stop_with_caller_default(flag: Option<bool>, profile_states_it: bool) -> Option<bool> {
     flag.or((!profile_states_it).then_some(true))
 }
@@ -4611,7 +4733,7 @@ fn stop_with_caller_default(flag: Option<bool>, profile_states_it: bool) -> Opti
 /// A `toml` error rendered as the body of one `fcage:` diagnostic.
 ///
 /// The crate's `Display` ends with a newline of its own, and every diagnostic
-/// here goes out through `eprintln!`, so formatting one verbatim leaves a blank
+/// here goes out as a line of its own, so formatting one verbatim leaves a blank
 /// line behind the message. Only trailing whitespace is dropped: a parse
 /// diagnostic keeps its span, its caret, and the line breaks between them, and
 /// a single-line refusal -- an `unknown field`, or one of the restricted
@@ -4742,8 +4864,12 @@ fn export_rootfs(
     use std::io::IsTerminal as _;
 
     if dest.is_none() && std::io::stdout().is_terminal() {
-        eprintln!("fcage: refusing to write an archive to the terminal");
-        eprintln!("Try '--export-to FILE', or pipe the output into a compressor.");
+        output::report(format_args!(
+            "fcage: refusing to write an archive to the terminal"
+        ));
+        output::report(format_args!(
+            "Try '--export-to FILE', or pipe the output into a compressor."
+        ));
         return ExitCode::from(USAGE);
     }
 
@@ -4797,254 +4923,252 @@ fn export_rootfs(
         // — is not a failure of the export. The conventional ending is a quiet
         // one, so it is reported as the signal a writer to a closed pipe would
         // ordinarily die of rather than as noise on stderr.
-        Err(ferroday_cage::provision::ProvisionError::Io { source, .. })
+        Err(ProvisionError::Io { source, .. })
             if dest.is_none() && source.kind() == std::io::ErrorKind::BrokenPipe =>
         {
-            ExitCode::from(broken_pipe())
+            ExitCode::from(output::broken_pipe())
         }
         Err(error) => fail(error),
     }
 }
 
-/// Builds and runs the sandbox, mapping the outcome onto the exit status.
+/// Provisions the root filesystem where the run asks for one, then builds and
+/// runs the sandbox, mapping the outcome onto the exit status.
+///
+/// Everything a launch can be refused for without its root filesystem is
+/// settled before a provisioner runs: the provisioner's own configuration, the
+/// profile, the network stack's configuration, and the standard streams. A
+/// mistake in any of them is then reported at once rather than after a
+/// bootstrap that took minutes, and a refused run provisions nothing.
 fn run(options: Options) -> ExitCode {
     if options.restrict {
         return run_restricted(options);
     }
-    // What provisioning did, where an invocation asked for any. `Existing` says
-    // the destination was already a directory and the provisioner never ran,
-    // which is the reuse the flag is meant to allow and also what an empty
-    // directory the user just made looks like.
-    let mut provisioned = None;
-    if let Some(tarball) = &options.provision_tar {
-        // The parser guarantees a rootfs accompanies --provision-tar. An
-        // already-provisioned rootfs is reused as it stands.
-        let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-        let mut provisioner = ferroday_cage::provision::Tarball::new(tarball);
-        match ferroday_cage::provision::ensure(rootfs, &mut provisioner) {
-            Ok(outcome) => provisioned = Some(outcome),
-            Err(error) => return fail(error),
-        }
-    }
-    if let Some(suite) = &options.provision_debian {
-        let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-        match provision_debian(suite, &options, rootfs) {
-            Ok(outcome) => provisioned = Some(outcome),
-            Err(code) => return code,
-        }
-    }
-    if let Some(release) = &options.provision_alpine {
-        let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-        match provision_alpine(release, &options, rootfs) {
-            Ok(outcome) => provisioned = Some(outcome),
-            Err(code) => return code,
-        }
-    }
-
-    if let Some(architecture) = &options.provision_gentoo {
-        let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-        match provision_gentoo(architecture, &options, rootfs) {
-            Ok(outcome) => provisioned = Some(outcome),
-            Err(code) => return code,
-        }
-    }
+    let mut provisioner = match provisioner(&options) {
+        Ok(provisioner) => provisioner,
+        Err(code) => return code,
+    };
+    let rootfs = options.rootfs.clone();
 
     // A provisioning run with no command and no profile provisions and exits.
     if options.command_line.is_empty() && options.profile.is_none() {
-        // The one place reuse is worth saying out loud. Everywhere else the
-        // flag is a standing instruction and silence is the point -- it can sit
-        // in an invocation forever and cost nothing once the tree is there. But
-        // a run whose whole purpose was to provision, and which provisioned
-        // nothing, exits 0 having done nothing at all, and an empty directory
-        // the caller just created is indistinguishable from a finished rootfs.
-        if provisioned == Some(Provisioned::Existing) {
-            let rootfs = options.rootfs.as_deref().expect("checked at parse time");
-            eprintln!(
-                "fcage: {} already exists, so nothing was provisioned; \
-                 remove it first to provision again",
-                rootfs.display(),
-            );
-        }
-        return ExitCode::SUCCESS;
+        let rootfs = rootfs.as_deref().expect("checked at parse time");
+        let provisioner = provisioner.as_deref_mut().expect("checked at parse time");
+        return match provision(rootfs, provisioner) {
+            // The one place reuse is worth saying out loud. Everywhere else the
+            // flag is a standing instruction and silence is the point -- it can
+            // sit in an invocation forever and cost nothing once the tree is
+            // there. But a run whose whole purpose was to provision, and which
+            // provisioned nothing, exits 0 having done nothing at all, and an
+            // empty directory the caller just created is indistinguishable from
+            // a finished rootfs.
+            Ok(Provisioned::Existing) => {
+                output::report(format_args!(
+                    "fcage: {} already exists, so nothing was provisioned; remove it first to \
+                     provision again",
+                    rootfs.display(),
+                ));
+                ExitCode::SUCCESS
+            }
+            Ok(_) => ExitCode::SUCCESS,
+            Err(code) => code,
+        };
     }
 
-    // Assembled here for two reasons: `options` is consumed field by field as
-    // the builder is composed below, and a configuration the stack refuses is
-    // better reported before a sandbox has been built for it.
-    let stack = if options.netstack {
-        match netstack_from(&options) {
-            Ok(stack) => Some(stack),
-            Err(error) => return fail(error),
-        }
-    } else {
-        None
+    let launch = match Launch::prepare(options) {
+        Ok(launch) => launch,
+        Err(code) => return code,
     };
+    if let Some(provisioner) = provisioner.as_deref_mut() {
+        let rootfs = rootfs.as_deref().expect("checked at parse time");
+        if let Err(code) = provision(rootfs, provisioner) {
+            return code;
+        }
+    }
+    launch.run()
+}
 
-    let mut profile_sets_term = false;
-    let mut profile_network_host = false;
-    let mut profile_sets_stop_with_caller = false;
-    let mut builder = match &options.profile {
-        Some(path) => match load_profile(
-            path,
-            !options.command_line.is_empty(),
-            options.profile_restricted,
-        ) {
-            Ok((builder, meta)) => {
+/// A sandbox launch composed and checked, waiting only for its root
+/// filesystem.
+struct Launch {
+    builder: CageBuilder,
+    /// The native network stack, for a `--netstack` run.
+    stack: Option<NetStack>,
+    /// The standard streams the launch hands over, judged, or `None` where a
+    /// pseudoterminal of the sandbox's own replaces all three.
+    streams: Option<streams::Judged>,
+    terminal: bool,
+    timeout: Option<Duration>,
+    kill_after: Duration,
+    publications: Vec<(SocketAddr, u16)>,
+}
+
+impl Launch {
+    /// Composes the launch `options` describe, and refuses whatever the launch
+    /// would refuse that does not need the root filesystem to exist.
+    ///
+    /// The builder only records settings, so composing it before the root is
+    /// provisioned changes nothing it does. What is checked here is what would
+    /// otherwise surface after a bootstrap: the stack's configuration, the
+    /// profile, the profile against the flags, and the standard streams.
+    fn prepare(options: Options) -> Result<Launch, ExitCode> {
+        let stack = if options.netstack {
+            Some(netstack_from(&options).map_err(fail)?)
+        } else {
+            None
+        };
+
+        let mut profile_sets_term = false;
+        let mut profile_network_host = false;
+        let mut profile_sets_stop_with_caller = false;
+        let mut builder = match &options.profile {
+            Some(path) => {
+                let (builder, meta) = load_profile(
+                    path,
+                    !options.command_line.is_empty(),
+                    options.profile_restricted,
+                )
+                .map_err(fail)?;
                 profile_sets_term = meta.sets_term;
                 profile_network_host = meta.network_host;
                 profile_sets_stop_with_caller = meta.sets_stop_with_caller;
                 builder
             }
-            Err(message) => return fail(message),
-        },
-        None => Cage::builder(),
-    };
+            None => Cage::builder(),
+        };
 
-    // The parse-time guard rejects --netstack with --share-net, but a profile
-    // can request host networking without any CLI network flag, leaving that
-    // check blind. Reconcile against the loaded profile: attaching a stack to a
-    // host-network sandbox cannot work, and the usage error belongs here.
-    if options.netstack && options.network.is_none() && profile_network_host {
-        eprintln!("fcage: --netstack cannot be used with a profile that sets network = \"host\"");
-        eprintln!("Try 'fcage --help' for usage.");
-        return ExitCode::from(USAGE);
-    }
-
-    if let Some(rootfs) = options.rootfs {
-        builder = builder.rootfs(rootfs);
-    }
-    // An overlay root, when the run named one. Parse-time validation has
-    // already established that a lower and an upper are both present and that
-    // no --rootfs competes with them.
-    if !options.overlay_lowers.is_empty() {
-        let mut overlay = Overlay::new();
-        for lower in options.overlay_lowers {
-            overlay = overlay.lower(lower);
+        // The parse-time guard rejects --netstack with --share-net, but a
+        // profile can request host networking without any CLI network flag,
+        // leaving that check blind. Reconcile against the loaded profile:
+        // attaching a stack to a host-network sandbox cannot work, and the
+        // usage error belongs here.
+        if options.netstack && options.network.is_none() && profile_network_host {
+            return Err(usage_error(format_args!(
+                "--netstack cannot be used with a profile that sets network = \"host\""
+            )));
         }
-        if let Some(upper) = options.overlay_upper {
-            overlay = overlay.upper(upper);
+
+        // The seccomp flags against the profile's own policy, which is known
+        // only now. A conflict between the two is the usage error it is.
+        let seccomp = compose_seccomp(
+            options.seccomp,
+            options.seccomp_errno,
+            builder.get_seccomp(),
+        )
+        .map_err(|message| usage_error(format_args!("{message}")))?;
+
+        if let Some(rootfs) = options.rootfs {
+            builder = builder.rootfs(rootfs);
         }
-        if let Some(work) = options.overlay_work {
-            overlay = overlay.work(work);
+        // An overlay root, when the run named one. Parse-time validation has
+        // already established that a lower and an upper are both present and
+        // that no --rootfs competes with them.
+        if !options.overlay_lowers.is_empty() {
+            let mut overlay = Overlay::new();
+            for lower in options.overlay_lowers {
+                overlay = overlay.lower(lower);
+            }
+            if let Some(upper) = options.overlay_upper {
+                overlay = overlay.upper(upper);
+            }
+            if let Some(work) = options.overlay_work {
+                overlay = overlay.work(work);
+            }
+            builder = builder.overlay(overlay);
         }
-        builder = builder.overlay(overlay);
-    }
-    let mut command_line = options.command_line.into_iter();
-    if let Some(command) = command_line.next() {
-        builder = builder.command(PathBuf::from(command)).args(command_line);
-    }
-    // The host TERM passes through so interactive commands work at a prompt,
-    // but only as a fallback: a profile or --setenv TERM overrides it. Since
-    // `envs` appends (last-wins), adding the host TERM unconditionally would
-    // override the profile, so it is added only when neither the profile nor
-    // --setenv sets TERM.
-    let mut env = options.setenv;
-    let setenv_sets_term = env.iter().any(|(key, _)| key.to_str() == Some("TERM"));
-    if !profile_sets_term
-        && !setenv_sets_term
-        && let Some(term) = std::env::var_os("TERM")
-    {
-        env.push((OsString::from("TERM"), term));
-    }
-    builder = builder.envs(env);
-    // One sequence, so a `--raw-mount` written between two `--bind` flags is
-    // applied between them.
-    builder = builder.mounts(options.mounts);
-    for (resource, soft, hard) in options.rlimits {
-        builder = builder.rlimit(resource, soft, hard);
-    }
-    if let Some(map) = options.identity_map {
-        builder = builder.identity_map(map);
-    }
-    if let Some(identity) = options.run_as {
-        builder = builder.run_as(identity);
-    }
-    if let Some(enabled) = options.path_lookup {
-        builder = builder.path_lookup(enabled);
-    }
-    if let Some(hostname) = options.hostname {
-        builder = builder.hostname(hostname);
-    }
-    if let Some(chdir) = options.chdir {
-        builder = builder.current_dir(chdir);
-    }
-    if let Some(stdin) = options.stdin {
-        builder = builder.stdin(stdin);
-    }
-    if let Some(network) = options.network {
-        builder = builder.network(network);
-    }
-    if let Some(isolate) = options.pid_namespace {
-        builder = builder.pid_namespace(isolate);
-    }
-    if let Some(mount) = options.mount_proc {
-        builder = builder.mount_proc(mount);
-    }
-    if let Some(mount) = options.mount_dev {
-        builder = builder.mount_dev(mount);
-    }
-    if let Some(mount) = options.mount_tmp {
-        builder = builder.mount_tmp(mount);
-    }
-    if let Some(bind) = options.resolv_conf {
-        builder = builder.resolv_conf(bind);
-    }
-    if let Some(managed) = options.managed_mounts {
-        builder = builder.managed_mounts(managed);
-    }
-    if let Some(base) = options.base_env {
-        builder = builder.base_env(base);
-    }
-    if let Some(tie) =
-        stop_with_caller_default(options.stop_with_caller, profile_sets_stop_with_caller)
-    {
-        builder = builder.stop_with_caller(tie);
-    }
-    for (path, writable) in options.landlock {
-        builder = builder.landlock_fs(landlock_access(writable), path);
-    }
-    for (port, access) in options.landlock_net {
-        builder = builder.landlock_net(access, port);
-    }
-    if let Some(scopes) = options.landlock_scope {
-        builder = builder.landlock_scope(scopes);
-    }
-    if let Some(policy) = options.seccomp {
-        builder = builder.seccomp(policy);
-    }
-    match options.caps {
-        Some(CapsChoice::DropAll) => builder = builder.drop_all_capabilities(),
-        Some(CapsChoice::Keep(caps)) => builder = builder.keep_capabilities(caps),
-        None => {}
-    }
+        let mut command_line = options.command_line.into_iter();
+        if let Some(command) = command_line.next() {
+            builder = builder.command(PathBuf::from(command)).args(command_line);
+        }
+        if let Some(base) = options.base_env {
+            builder = builder.base_env(base);
+        }
+        // Since `envs` appends (last-wins), adding the host TERM
+        // unconditionally would override the profile's, so it is added only
+        // when neither the profile nor --setenv sets TERM.
+        let mut env = options.setenv;
+        let setenv_sets_term = env.iter().any(|(key, _)| key.to_str() == Some("TERM"));
+        if let Some(term) = passed_term(
+            builder.get_base_env(),
+            profile_sets_term || setenv_sets_term,
+            std::env::var_os("TERM"),
+        ) {
+            env.push((OsString::from("TERM"), term));
+        }
+        builder = builder.envs(env);
+        // One sequence, so a `--raw-mount` written between two `--bind` flags
+        // is applied between them.
+        builder = builder.mounts(options.mounts);
+        for (resource, soft, hard) in options.rlimits {
+            builder = builder.rlimit(resource, soft, hard);
+        }
+        if let Some(map) = options.identity_map {
+            builder = builder.identity_map(map);
+        }
+        if let Some(identity) = options.run_as {
+            builder = builder.run_as(identity);
+        }
+        if let Some(enabled) = options.path_lookup {
+            builder = builder.path_lookup(enabled);
+        }
+        if let Some(hostname) = options.hostname {
+            builder = builder.hostname(hostname);
+        }
+        if let Some(chdir) = options.chdir {
+            builder = builder.current_dir(chdir);
+        }
+        if let Some(stdin) = options.stdin {
+            builder = builder.stdin(stdin);
+        }
+        if let Some(network) = options.network {
+            builder = builder.network(network);
+        }
+        if let Some(isolate) = options.pid_namespace {
+            builder = builder.pid_namespace(isolate);
+        }
+        if let Some(mount) = options.mount_proc {
+            builder = builder.mount_proc(mount);
+        }
+        if let Some(mount) = options.mount_dev {
+            builder = builder.mount_dev(mount);
+        }
+        if let Some(mount) = options.mount_tmp {
+            builder = builder.mount_tmp(mount);
+        }
+        if let Some(bind) = options.resolv_conf {
+            builder = builder.resolv_conf(bind);
+        }
+        if let Some(managed) = options.managed_mounts {
+            builder = builder.managed_mounts(managed);
+        }
+        if let Some(tie) =
+            stop_with_caller_default(options.stop_with_caller, profile_sets_stop_with_caller)
+        {
+            builder = builder.stop_with_caller(tie);
+        }
+        for (path, writable) in options.landlock {
+            builder = builder.landlock_fs(landlock_access(writable), path);
+        }
+        for (port, access) in options.landlock_net {
+            builder = builder.landlock_net(access, port);
+        }
+        if let Some(scopes) = options.landlock_scope {
+            builder = builder.landlock_scope(scopes);
+        }
+        if let Some(policy) = seccomp {
+            builder = builder.seccomp(policy);
+        }
+        match options.caps {
+            Some(CapsChoice::DropAll) => builder = builder.drop_all_capabilities(),
+            Some(CapsChoice::Keep(caps)) => builder = builder.keep_capabilities(caps),
+            None => {}
+        }
 
-    if options.terminal && !options.netstack {
-        return run_on_a_terminal(builder, options.timeout, options.kill_after);
-    }
-
-    // Every launch below hands the sandbox `fcage`'s own standard streams,
-    // unless a terminal replaces all three, so each is judged and any that is a
-    // file is relayed rather than handed over.
-    let streams = StreamSettings {
-        get: [
-            CageBuilder::get_stdin,
-            CageBuilder::get_stdout,
-            CageBuilder::get_stderr,
-        ],
-        set: [CageBuilder::stdin, CageBuilder::stdout, CageBuilder::stderr],
-    };
-    let (mut builder, relay) = match relay_streams(builder, &streams, options.terminal) {
-        Ok(relayed) => relayed,
-        Err(code) => return code,
-    };
-
-    if options.netstack {
         // The native stack composes the sandbox's DNS from the host's own,
         // where the stack forwards to one of its nameservers, unless the run
-        // opts out. --no-managed-mounts opts out
-        // as surely as --no-resolv-conf does: its promise is that the sandbox
-        // carries exactly the binds the command line names, and this would be
-        // one it does not.
+        // opts out. --no-managed-mounts opts out as surely as --no-resolv-conf
+        // does: its promise is that the sandbox carries exactly the binds the
+        // command line names, and this would be one it does not.
         //
         // The builder is asked rather than the flags, so that a profile
         // setting either toggle governs this composition exactly as the
@@ -5054,26 +5178,89 @@ fn run(options: Options) -> ExitCode {
         // mount of theirs at `/etc/resolv.conf`, or a host tree of theirs over
         // `/etc`, which this composition yields to exactly as the library's own
         // bind for a host-network sandbox does.
-        let stack = stack.expect("assembled above for exactly this branch");
-        if builder.get_resolv_conf() {
-            builder = compose_netstack_resolv_conf(builder, &stack);
+        if let Some(stack) = &stack
+            && builder.get_resolv_conf()
+        {
+            builder = compose_netstack_resolv_conf(builder, stack)
+                .map_err(|output::ReaderGone| ExitCode::from(output::broken_pipe()))?;
         }
-        return run_with_netstack(
+
+        // Every launch hands the sandbox `fcage`'s own standard streams, unless
+        // a terminal replaces all three, so each is judged now and any that is a
+        // file is relayed once the launch starts. A terminal without the
+        // network stack is driven by the library's terminal launch, which
+        // takes no stream of `fcage`'s at all.
+        let streams = if options.terminal && stack.is_none() {
+            None
+        } else {
+            Some(judge_streams(&builder, &CAGE_STREAMS, options.terminal)?)
+        };
+
+        Ok(Launch {
             builder,
             stack,
-            &options.netstack_publish,
-            options.terminal,
-            options.timeout,
-            options.kill_after,
-            relay,
-        );
+            streams,
+            terminal: options.terminal,
+            timeout: options.timeout,
+            kill_after: options.kill_after,
+            publications: options.netstack_publish,
+        })
     }
 
-    let outcome = builder
-        .build()
-        .and_then(|cage| cage.spawn())
-        .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
-    finish(relay, outcome.map_err(Failure::from))
+    /// Starts the launch's stream relays, builds the sandbox, and runs it.
+    fn run(self) -> ExitCode {
+        let Launch {
+            builder,
+            stack,
+            streams,
+            terminal,
+            timeout,
+            kill_after,
+            publications,
+        } = self;
+        let Some(judged) = streams else {
+            return run_on_a_terminal(builder, timeout, kill_after);
+        };
+        let (builder, relay) = match route_streams(builder, judged, &CAGE_STREAMS) {
+            Ok(routed) => routed,
+            Err(code) => return code,
+        };
+        if let Some(stack) = stack {
+            return run_with_netstack(
+                builder,
+                stack,
+                &publications,
+                terminal,
+                timeout,
+                kill_after,
+                relay,
+            );
+        }
+        let outcome = builder
+            .build()
+            .and_then(|cage| cage.spawn())
+            .and_then(|running| wait_with_deadline(running, timeout, kill_after));
+        finish(relay, outcome.map_err(Failure::from))
+    }
+}
+
+/// The host's `TERM`, where a launch passes it to the command.
+///
+/// It passes through so an interactive command works at a prompt, as a
+/// fallback beneath the base environment: `named` says a profile or `--setenv`
+/// gives TERM a value of its own, which wins. A run without the base
+/// environment asked for exactly the variables it names, so it gets none, and
+/// a run meant to be hermetic does not vary with the caller's terminal.
+fn passed_term(base_env: bool, named: bool, host: Option<OsString>) -> Option<OsString> {
+    host.filter(|_| base_env && !named)
+}
+
+/// Reports a usage error found once a launch's inputs are read, such as a
+/// profile that contradicts a flag, and returns [`USAGE`].
+fn usage_error(message: std::fmt::Arguments<'_>) -> ExitCode {
+    output::report(format_args!("fcage: {message}"));
+    output::report(format_args!("Try 'fcage --help' for usage."));
+    ExitCode::from(USAGE)
 }
 
 /// A launch builder's three standard-stream settings, in stream order: the
@@ -5088,27 +5275,61 @@ struct StreamSettings<B> {
     set: [fn(B, Stdio) -> B; 3],
 }
 
-/// Judges `fcage`'s standard streams for a launch, and routes each one that is
-/// a file through a relay.
+/// [`CageBuilder`]'s three standard-stream settings.
+const CAGE_STREAMS: StreamSettings<CageBuilder> = StreamSettings {
+    get: [
+        CageBuilder::get_stdin,
+        CageBuilder::get_stdout,
+        CageBuilder::get_stderr,
+    ],
+    set: [CageBuilder::stdin, CageBuilder::stdout, CageBuilder::stderr],
+};
+
+/// [`RestrictionBuilder`]'s three standard-stream settings.
+const RESTRICTION_STREAMS: StreamSettings<RestrictionBuilder> = StreamSettings {
+    get: [
+        RestrictionBuilder::get_stdin,
+        RestrictionBuilder::get_stdout,
+        RestrictionBuilder::get_stderr,
+    ],
+    set: [
+        RestrictionBuilder::stdin,
+        RestrictionBuilder::stdout,
+        RestrictionBuilder::stderr,
+    ],
+};
+
+/// Judges `fcage`'s standard streams for a launch, starting nothing.
 ///
 /// A stream the builder leaves inherited is handed over as `fcage` holds it,
 /// unless `terminal` says a pseudoterminal replaces all three. The builder is
 /// asked rather than the flags, so a profile's stream settings count exactly as
-/// `--stdin` does. A refused stream, or a relay that cannot start, is reported
-/// here and ends the run with [`FAILED`] before anything is launched.
-fn relay_streams<B>(
-    builder: B,
+/// `--stdin` does. A refused stream is reported here and ends the run with
+/// [`FAILED`] before anything is provisioned or launched.
+fn judge_streams<B>(
+    builder: &B,
     streams: &StreamSettings<B>,
     terminal: bool,
-) -> Result<(B, streams::StreamRelay), ExitCode> {
+) -> Result<streams::Judged, ExitCode> {
     let inherited = if terminal {
         [false; 3]
     } else {
         streams
             .get
-            .map(|get| matches!(get(&builder), Stdio::Inherit))
+            .map(|get| matches!(get(builder), Stdio::Inherit))
     };
-    let mut relay = streams::StreamRelay::start(inherited).map_err(fail)?;
+    streams::Judged::streams(inherited).map_err(fail)
+}
+
+/// Starts the relays a judgement calls for, and routes each relayed stream of
+/// `builder` through its relay. A relay that cannot start is reported here and
+/// ends the run with [`FAILED`] before anything is launched.
+fn route_streams<B>(
+    builder: B,
+    judged: streams::Judged,
+    streams: &StreamSettings<B>,
+) -> Result<(B, streams::StreamRelay), ExitCode> {
+    let mut relay = judged.start().map_err(fail)?;
     let mut builder = builder;
     for (replacement, set) in relay.take_replacements().into_iter().zip(streams.set) {
         if let Some(stdio) = replacement {
@@ -5121,7 +5342,7 @@ fn relay_streams<B>(
 /// Settles a run that relayed its streams: the relays first, then the outcome.
 fn finish(relay: streams::StreamRelay, outcome: Result<Option<ExitStatus>, Failure>) -> ExitCode {
     let delivered = settle(relay);
-    report(outcome, delivered)
+    settled_code(outcome, delivered)
 }
 
 /// Stops the stream relays, and reports each one that failed. Returns whether
@@ -5135,17 +5356,17 @@ fn finish(relay: streams::StreamRelay, outcome: Result<Option<ExitStatus>, Failu
 fn settle(relay: streams::StreamRelay) -> bool {
     let failures = relay.finish();
     for (streams, error) in &failures {
-        eprintln!(
+        output::report(format_args!(
             "fcage: relaying the command's {streams}: {}",
             ErrorChain::new(error)
-        );
+        ));
     }
     failures.is_empty()
 }
 
 /// Maps a settled run onto the process exit status: the outcome's own, or
 /// [`FAILED`] where a relay failed, whatever the command's status was.
-fn report(outcome: Result<Option<ExitStatus>, Failure>, delivered: bool) -> ExitCode {
+fn settled_code(outcome: Result<Option<ExitStatus>, Failure>, delivered: bool) -> ExitCode {
     let code = conclude(outcome);
     if delivered {
         code
@@ -5266,10 +5487,21 @@ fn run_with_netstack(
     };
     // A publication that left the port to the kernel is useless until the
     // caller knows which one it got. Said before the command is released, and
-    // before a terminal session takes the caller's terminal into raw mode.
+    // before a terminal session takes the caller's terminal into raw mode. A
+    // reader that has gone is told nothing, so the command is not released:
+    // dropping the pending launch tears the sandbox down, and the stack stops
+    // with it.
     for ((requested, guest_port), bound) in publications.iter().zip(handle.published()) {
-        if requested.port() == 0 {
-            eprintln!("fcage: publishing the sandbox's port {guest_port} on {bound}");
+        if requested.port() == 0
+            && output::say(format_args!(
+                "fcage: publishing the sandbox's port {guest_port} on {bound}"
+            ))
+            .is_err()
+        {
+            drop(pending);
+            // A stack that does not stop cleanly has nowhere left to say so.
+            let _ = handle.stop();
+            return finish(relay, Err(Failure::ReaderGone));
         }
     }
     let running = match pending.proceed() {
@@ -5293,12 +5525,12 @@ fn run_with_netstack(
     // output, and after the terminal relay has restored the caller's terminal,
     // so it is not stair-stepped.
     if let Err(error) = stopped {
-        eprintln!(
+        output::report(format_args!(
             "fcage: the network stack did not stop cleanly: {}",
             ErrorChain::new(&error)
-        );
+        ));
     }
-    report(outcome, delivered)
+    settled_code(outcome, delivered)
 }
 
 /// Composes the sandbox's `resolv.conf` for a native-stack run: binds the
@@ -5320,31 +5552,37 @@ fn run_with_netstack(
 /// may name a routable resolver and resolve perfectly well. The warning
 /// therefore reports what was not composed; it does not predict that the
 /// sandbox has no DNS, which is not this function's to know.
-fn compose_netstack_resolv_conf(builder: CageBuilder, stack: &NetStack) -> CageBuilder {
+///
+/// The warning is written before the launch, so a reader of it that has gone
+/// stops the launch: [`output::ReaderGone`].
+fn compose_netstack_resolv_conf(
+    builder: CageBuilder,
+    stack: &NetStack,
+) -> Result<CageBuilder, output::ReaderGone> {
     let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
         // No host resolv.conf to compose from; leave the sandbox's as-is.
-        return builder;
+        return Ok(builder);
     };
     if names_a_forwarded_nameserver(&contents, stack) {
-        return builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf");
+        return Ok(builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf"));
     }
     // The remedies are named as flags rather than as goals. This is the default
     // configuration on every systemd-resolved host, so it is the warning most
     // users of --netstack ever see, and "point it at a routable nameserver" is
     // not something anyone can type.
-    eprintln!(
+    output::say(format_args!(
         "fcage: the host's nameservers are all ones the network stack refuses, such as a \
          loopback or link-local address, so no resolv.conf was composed; the sandbox \
          resolves through whatever its rootfs ships"
-    );
-    eprintln!(
+    ))?;
+    output::say(format_args!(
         "Try '--ro-bind FILE /etc/resolv.conf' with a file naming a routable nameserver, \
          which is taken in place of this composition; or '--netstack-host-loopback' with \
          the gateway address, which reaches a host resolver only when that resolver \
          listens on 127.0.0.1, not systemd-resolved's 127.0.0.53 stub; or \
          '--no-resolv-conf' to leave the rootfs's own and silence this."
-    );
-    builder
+    ))?;
+    Ok(builder)
 }
 
 /// The port a `resolv.conf` nameserver is queried on: `resolv.conf` names no
@@ -5379,21 +5617,26 @@ fn run_restricted(options: Options) -> ExitCode {
     if let Err(code) = withhold_from_restricted_command() {
         return code;
     }
+    // The seccomp flags have no profile beneath them here, and the curated
+    // posture beside an errno was refused when the command line was parsed.
+    let seccomp = match compose_seccomp(options.seccomp, options.seccomp_errno, None) {
+        Ok(seccomp) => seccomp,
+        Err(message) => return usage_error(format_args!("{message}")),
+    };
     let mut builder = Restriction::builder();
     let mut command_line = options.command_line.into_iter();
     if let Some(command) = command_line.next() {
         builder = builder.command(PathBuf::from(command)).args(command_line);
     }
-    // The host TERM passes through so interactive commands work at a
-    // prompt; it is set first, so a --setenv TERM overrides it.
-    let mut env = options.setenv;
-    if let Some(term) = std::env::var_os("TERM") {
-        env.insert(0, (OsString::from("TERM"), term));
-    }
-    builder = builder.envs(env);
     if let Some(base) = options.base_env {
         builder = builder.base_env(base);
     }
+    // Set first, so a --setenv TERM overrides it.
+    let mut env = options.setenv;
+    if let Some(term) = passed_term(builder.get_base_env(), false, std::env::var_os("TERM")) {
+        env.insert(0, (OsString::from("TERM"), term));
+    }
+    builder = builder.envs(env);
     if let Some(chdir) = options.chdir {
         builder = builder.current_dir(chdir);
     }
@@ -5415,7 +5658,7 @@ fn run_restricted(options: Options) -> ExitCode {
     if let Some(scopes) = options.landlock_scope {
         builder = builder.landlock_scope(scopes);
     }
-    if let Some(policy) = options.seccomp {
+    if let Some(policy) = seccomp {
         builder = builder.seccomp(policy);
     }
 
@@ -5442,19 +5685,9 @@ fn run_restricted(options: Options) -> ExitCode {
 
     // As for a sandbox: each stream is judged, and one that is a file is relayed
     // rather than handed over.
-    let streams = StreamSettings {
-        get: [
-            RestrictionBuilder::get_stdin,
-            RestrictionBuilder::get_stdout,
-            RestrictionBuilder::get_stderr,
-        ],
-        set: [
-            RestrictionBuilder::stdin,
-            RestrictionBuilder::stdout,
-            RestrictionBuilder::stderr,
-        ],
-    };
-    let (builder, relay) = match relay_streams(builder, &streams, false) {
+    let relayed = judge_streams(&builder, &RESTRICTION_STREAMS, false)
+        .and_then(|judged| route_streams(builder, judged, &RESTRICTION_STREAMS));
+    let (builder, relay) = match relayed {
         Ok(relayed) => relayed,
         Err(code) => return code,
     };
@@ -5491,7 +5724,8 @@ fn withhold_from_restricted_command() -> Result<(), ExitCode> {
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).map_err(
         |errno| {
             fail(format_args!(
-                "cannot withhold fcage's descriptors from a restricted command: {errno}"
+                "cannot withhold fcage's descriptors from a restricted command: {}",
+                ErrorChain::new(&std::io::Error::from(errno)),
             ))
         },
     )
@@ -5538,6 +5772,9 @@ enum Failure {
     /// A part of `fcage`'s own failed, such as the network stack or the
     /// terminal relay's plumbing, which exits [`FAILED`].
     Fcage(Diagnostic),
+    /// A reader of `fcage`'s own output went away before the run was done,
+    /// which ends it as a writer to a closed pipe ends.
+    ReaderGone,
 }
 
 impl From<Error> for Failure {
@@ -5550,9 +5787,16 @@ impl From<RelayError> for Failure {
     /// The sandbox failing under the terminal relay is the library's failure,
     /// so a launch that fails the same way with and without a terminal exits
     /// the same way. The relay's own plumbing failing is `fcage`'s.
+    ///
+    /// A relay whose write to the caller found no reader left has lost its
+    /// reader, which ends the run as any write of `fcage`'s to a closed pipe
+    /// does.
     fn from(error: RelayError) -> Failure {
         match error {
             RelayError::Cage(error) => Failure::Cage(error),
+            RelayError::Io { source, .. } if source.kind() == std::io::ErrorKind::BrokenPipe => {
+                Failure::ReaderGone
+            }
             other => Failure::Fcage(other.into()),
         }
     }
@@ -5563,10 +5807,11 @@ impl Failure {
     fn report(self) -> ExitCode {
         match self {
             Failure::Cage(error) => {
-                eprintln!("fcage: {}", ErrorChain::new(&error));
+                output::report(format_args!("fcage: {}", ErrorChain::new(&error)));
                 ExitCode::from(error.shell_code())
             }
             Failure::Fcage(diagnostic) => fail(diagnostic),
+            Failure::ReaderGone => ExitCode::from(output::broken_pipe()),
         }
     }
 }
@@ -5610,14 +5855,242 @@ fn plan_from<P, E: std::error::Error + 'static>(
     })
 }
 
-/// Bootstraps a Debian rootfs from the archive, printing progress to stderr.
+/// The provisioner a `--provision-*` flag configures, built, or `None` for a
+/// run that provisions nothing.
 ///
-/// Returns `Err` with the process exit code on failure.
-fn provision_debian(
+/// Built before anything else a run does. A configuration the layer refuses, a
+/// plan or pin document that does not read, and a key set this machine cannot
+/// supply are each reported before a launch is composed, and before a
+/// bootstrap spends minutes on a root that would then go unused.
+fn provisioner(options: &Options) -> Result<Option<Box<dyn Provisioner>>, ExitCode> {
+    if let Some(tarball) = &options.provision_tar {
+        return Ok(Some(Box::new(ferroday_cage::provision::Tarball::new(
+            tarball,
+        ))));
+    }
+    if let Some(suite) = &options.provision_debian {
+        return Ok(Some(Box::new(debian_provisioner(suite, options)?)));
+    }
+    if let Some(release) = &options.provision_alpine {
+        return Ok(Some(Box::new(alpine_provisioner(release, options)?)));
+    }
+    if let Some(architecture) = &options.provision_gentoo {
+        return Ok(Some(Box::new(gentoo_provisioner(architecture, options)?)));
+    }
+    Ok(None)
+}
+
+/// Publishes a root filesystem at `rootfs` through `provisioner`, reporting its
+/// progress on standard error.
+///
+/// An existing directory is reused as it stands. A reader of the progress that
+/// goes away stops the run at the provisioner's next clean point, which leaves
+/// no destination behind, and the run exits 141. So does a run that finished
+/// before it reached such a point, since the reader left before the run did.
+fn provision(rootfs: &Path, provisioner: &mut dyn Provisioner) -> Result<Provisioned, ExitCode> {
+    let mut progress = Progress::new(std::io::stderr());
+    let published = ferroday_cage::provision::Provision::new(rootfs)
+        .observe(&mut progress)
+        .run(provisioner);
+    match published {
+        Ok(_) | Err(ProvisionError::Cancelled) if progress.gone => {
+            Err(ExitCode::from(output::broken_pipe()))
+        }
+        Ok(provisioned) => Ok(provisioned),
+        Err(error) => Err(fail(error)),
+    }
+}
+
+/// What a provisioning run reports as it goes: each userland's progress, and
+/// the output of the commands its bootstrap runs in a cage. Also whether the
+/// run should stop, which it should once nothing reads what it reports.
+///
+/// Generic over where the report goes so that a test can hand it a pipe whose
+/// reader has gone; a run hands it standard error.
+struct Progress<W> {
+    out: W,
+    /// Whether a write found the reader gone. Nothing more is written once it
+    /// has, and the run is asked to stop.
+    gone: bool,
+}
+
+impl<W: std::io::Write> Progress<W> {
+    fn new(out: W) -> Progress<W> {
+        Progress { out, gone: false }
+    }
+
+    /// Writes one line of progress.
+    fn line(&mut self, line: std::fmt::Arguments<'_>) -> Result<(), output::ReaderGone> {
+        output::say_to(&mut self.out, line)
+    }
+
+    /// Reports a Debian bootstrap's step.
+    fn debian(
+        &mut self,
+        event: &ferroday_cage::provision::debian::DebianEvent<'_>,
+    ) -> Result<(), output::ReaderGone> {
+        use ferroday_cage::provision::debian::DebianEvent;
+        match event {
+            DebianEvent::Fetching { url, .. } => self.line(format_args!("fcage: fetching {url}")),
+            DebianEvent::Resolving => self.line(format_args!("fcage: resolving the package set")),
+            DebianEvent::Unsatisfiable {
+                requirement,
+                required_by,
+                reason,
+                ..
+            } => self.line(format_args!(
+                "fcage: {required_by} requires {requirement}, and {reason}"
+            )),
+            DebianEvent::Downloading {
+                package,
+                index,
+                total,
+                ..
+            } => self.line(format_args!(
+                "fcage: downloading {package} ({index}/{total})"
+            )),
+            DebianEvent::Extracting { package, .. } => {
+                self.line(format_args!("fcage: extracting {package}"))
+            }
+            // dpkg's own output passes straight through.
+            DebianEvent::CommandOutput { bytes, .. } => output::pass_to(&mut self.out, bytes),
+            _ => Ok(()),
+        }
+    }
+
+    /// Reports an Alpine bootstrap's step, in the same shape as a Debian one's,
+    /// which is the point of
+    /// [`AlpineEvent`](ferroday_cage::provision::alpine::AlpineEvent) carrying
+    /// the same progress.
+    fn alpine(
+        &mut self,
+        event: &ferroday_cage::provision::alpine::AlpineEvent<'_>,
+    ) -> Result<(), output::ReaderGone> {
+        use ferroday_cage::provision::alpine::AlpineEvent;
+        match event {
+            AlpineEvent::Fetching { url, .. } => self.line(format_args!("fcage: fetching {url}")),
+            AlpineEvent::Resolving => self.line(format_args!("fcage: resolving the package set")),
+            AlpineEvent::Downloading {
+                package,
+                index,
+                total,
+                ..
+            } => self.line(format_args!(
+                "fcage: downloading {package} ({index}/{total})"
+            )),
+            AlpineEvent::Extracting { package, .. } => {
+                self.line(format_args!("fcage: extracting {package}"))
+            }
+            AlpineEvent::Script {
+                package, script, ..
+            } => self.line(format_args!("fcage: {package}: {script}")),
+            // An install script's own output passes straight through.
+            AlpineEvent::CommandOutput { bytes, .. } => output::pass_to(&mut self.out, bytes),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<W: std::io::Write> Progress<W> {
+    /// Reports a Gentoo bootstrap's step, as the other layers do.
+    fn gentoo(
+        &mut self,
+        event: &ferroday_cage::provision::gentoo::GentooEvent<'_>,
+    ) -> Result<(), output::ReaderGone> {
+        use ferroday_cage::provision::gentoo::GentooEvent;
+        match event {
+            GentooEvent::Fetching { url, .. } => self.line(format_args!("fcage: fetching {url}")),
+            GentooEvent::Resolved { stage3, .. } => self.line(format_args!(
+                "fcage: resolved {} to build {} ({} bytes), vouched for by {}",
+                stage3.variant(),
+                stage3.build_id(),
+                stage3.size(),
+                stage3.certificate(),
+            )),
+            GentooEvent::Verifying { path, .. } => {
+                self.line(format_args!("fcage: verifying {}", path.display()))
+            }
+            GentooEvent::Extracting { path, .. } => {
+                self.line(format_args!("fcage: extracting {}", path.display()))
+            }
+            GentooEvent::Index {
+                builds,
+                skipped,
+                generated,
+                ..
+            } => self.line(format_args!(
+                "fcage: the binhost index names {builds} builds{}{}",
+                match skipped {
+                    0 => String::new(),
+                    skipped => format!(", {skipped} of which this layer cannot act on"),
+                },
+                generated.map_or_else(String::new, |at| format!(", generated at {at}")),
+            )),
+            GentooEvent::Planned {
+                packages, bytes, ..
+            } => self.line(format_args!(
+                "fcage: installing {packages} packages ({bytes} bytes)"
+            )),
+            GentooEvent::Merging {
+                package, version, ..
+            } => self.line(format_args!("fcage: merging {package}-{version}")),
+            GentooEvent::DependencyCycle { packages, .. } => self.line(format_args!(
+                "fcage: a runtime dependency cycle among {} was broken to order the merge",
+                packages.join(", "),
+            )),
+            // Reported before the run fails, so a caller fixing an install list
+            // sees every atom the binhost cannot answer rather than the first.
+            GentooEvent::Unsatisfiable {
+                atom,
+                wanted_by,
+                reason,
+                ..
+            } => self.line(format_args!(
+                "fcage: {wanted_by} requires {atom}, and no build {reason}"
+            )),
+            GentooEvent::Conflict {
+                atom,
+                stated_by,
+                blocks,
+                installed,
+                ..
+            } => self.line(format_args!(
+                "fcage: {stated_by} blocks {blocks} with {atom}, which {}",
+                if *installed {
+                    "the root already has"
+                } else {
+                    "this same resolution would install"
+                },
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<W: std::io::Write> ferroday_cage::provision::ProvisionObserver for Progress<W> {
+    fn progress(&mut self, event: ProvisionEvent<'_>) {
+        if self.gone {
+            return;
+        }
+        let written = match event {
+            ProvisionEvent::Debian(event) => self.debian(event),
+            ProvisionEvent::Alpine(event) => self.alpine(event),
+            ProvisionEvent::Gentoo(event) => self.gentoo(event),
+            _ => Ok(()),
+        };
+        self.gone = written.is_err();
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.gone
+    }
+}
+
+/// The Debian bootstrap the `--debian-*` flags configure, built.
+fn debian_provisioner(
     suite: &str,
     options: &Options,
-    rootfs: &Path,
-) -> Result<Provisioned, ExitCode> {
+) -> Result<ferroday_cage::provision::debian::Debian, ExitCode> {
     use ferroday_cage::provision::debian::{Debian, Plan};
 
     let mut builder = Debian::builder(suite).extract_only(options.debian_extract_only);
@@ -5673,58 +6146,25 @@ fn provision_debian(
         builder = builder.repository(repository.clone());
     }
 
-    let mut debian = builder.build().map_err(fail)?;
-    let mut progress = print_debian_event;
-    ferroday_cage::provision::ensure(rootfs, &mut debian.observe(&mut progress)).map_err(fail)
+    builder.build().map_err(fail)
 }
 
-/// Prints a Debian bootstrap progress event to stderr.
-fn print_debian_event(event: ferroday_cage::provision::debian::DebianEvent<'_>) {
-    use ferroday_cage::provision::debian::DebianEvent;
-    use std::io::Write;
-    match event {
-        DebianEvent::Fetching { url, .. } => eprintln!("fcage: fetching {url}"),
-        DebianEvent::Resolving => eprintln!("fcage: resolving the package set"),
-        DebianEvent::Unsatisfiable {
-            requirement,
-            required_by,
-            reason,
-            ..
-        } => eprintln!("fcage: {required_by} requires {requirement}, and {reason}"),
-        DebianEvent::Downloading {
-            package,
-            index,
-            total,
-            ..
-        } => eprintln!("fcage: downloading {package} ({index}/{total})"),
-        DebianEvent::Extracting { package, .. } => eprintln!("fcage: extracting {package}"),
-        // dpkg's own output flows straight to stderr.
-        DebianEvent::CommandOutput { bytes, .. } => {
-            let _ = std::io::stderr().write_all(bytes);
-        }
-        _ => {}
-    }
-}
-
-/// Bootstraps an Alpine rootfs from the archive, printing progress to stderr.
+/// The Alpine bootstrap the `--alpine-*` flags configure, built.
 ///
-/// Mirrors [`provision_debian`] flag for flag where the two layers agree. Where
-/// they do not, the difference is the archive's: apk publishes no priority band,
-/// so there is no base-set floor and the install set is exactly what
-/// `--alpine-include` names closed over its dependencies; and it has no unsigned
-/// mode and no freshness window, so there is nothing for a `--debian-*`
-/// counterpart of `trust-unsigned` or `allow-stale-release` to relax.
-fn provision_alpine(
+/// Mirrors [`debian_provisioner`] flag for flag where the two layers agree.
+/// Where they do not, the difference is the archive's: apk publishes no
+/// priority band, so there is no base-set floor and the install set is exactly
+/// what `--alpine-include` names closed over its dependencies; and it has no
+/// unsigned mode and no freshness window, so there is nothing for a
+/// `--debian-*` counterpart of `trust-unsigned` or `allow-stale-release` to
+/// relax.
+fn alpine_provisioner(
     release: &str,
     options: &Options,
-    rootfs: &Path,
-) -> Result<Provisioned, ExitCode> {
+) -> Result<ferroday_cage::provision::alpine::Alpine, ExitCode> {
     use ferroday_cage::provision::alpine::{Alpine, Plan, Repository};
 
-    let usage = |message: String| {
-        eprintln!("fcage: {message}");
-        ExitCode::from(USAGE)
-    };
+    let usage = |message: String| usage_error(format_args!("{message}"));
     // The architecture the key sets are chosen by: the one named, or the host's,
     // which is what the builder would default to.
     let architecture = options
@@ -5796,25 +6236,20 @@ fn provision_alpine(
             })?);
     }
 
-    let mut alpine = builder.build().map_err(fail)?;
-    let mut progress = print_alpine_event;
-    ferroday_cage::provision::ensure(rootfs, &mut alpine.observe(&mut progress)).map_err(fail)
+    builder.build().map_err(fail)
 }
 
-/// Bootstraps a Gentoo rootfs from a signed stage3, printing progress to
-/// stderr.
+/// The Gentoo bootstrap the `--gentoo-*` flags configure, built.
 ///
 /// A run is two waves where the other two layers have one of a different shape:
 /// the stage3 is extracted, and then the binary packages `--gentoo-install`
 /// names are resolved against the root that produced and merged into it. A
-/// command line that names no package does exactly the first, which is what a
-/// stage3 bootstrap has always been.
-fn provision_gentoo(
+/// command line that names no package does exactly the first: a stage3
+/// bootstrap and nothing more.
+fn gentoo_provisioner(
     architecture: &str,
     options: &Options,
-    rootfs: &Path,
-) -> Result<Provisioned, ExitCode> {
-    use ferroday_cage::provision::ProvisionEvent;
+) -> Result<ferroday_cage::provision::gentoo::Gentoo, ExitCode> {
     use ferroday_cage::provision::gentoo::{Gentoo, Plan};
 
     let mut builder = Gentoo::builder(architecture);
@@ -5849,88 +6284,12 @@ fn provision_gentoo(
         builder = builder.max_pointer_age(age.map(days));
     }
 
-    let mut gentoo = builder.build().map_err(fail)?;
-    let mut progress = |event: ProvisionEvent<'_>| {
-        if let ProvisionEvent::Gentoo(event) = event {
-            print_gentoo_event(event);
-        }
-    };
-    ferroday_cage::provision::Provision::new(rootfs)
-        .observe(&mut progress)
-        .run(&mut gentoo)
-        .map_err(fail)
+    builder.build().map_err(fail)
 }
 
 /// A count of days as a duration.
 fn days(count: u64) -> std::time::Duration {
     std::time::Duration::from_secs(count.saturating_mul(24 * 60 * 60))
-}
-
-/// Prints one Gentoo provisioning step to stderr, as the other layers do.
-fn print_gentoo_event(event: &ferroday_cage::provision::gentoo::GentooEvent<'_>) {
-    use ferroday_cage::provision::gentoo::GentooEvent;
-    match event {
-        GentooEvent::Fetching { url, .. } => eprintln!("fcage: fetching {url}"),
-        GentooEvent::Resolved { stage3, .. } => eprintln!(
-            "fcage: resolved {} to build {} ({} bytes), vouched for by {}",
-            stage3.variant(),
-            stage3.build_id(),
-            stage3.size(),
-            stage3.certificate(),
-        ),
-        GentooEvent::Verifying { path, .. } => {
-            eprintln!("fcage: verifying {}", path.display());
-        }
-        GentooEvent::Extracting { path, .. } => {
-            eprintln!("fcage: extracting {}", path.display());
-        }
-        GentooEvent::Index {
-            builds,
-            skipped,
-            generated,
-            ..
-        } => eprintln!(
-            "fcage: the binhost index names {builds} builds{}{}",
-            match skipped {
-                0 => String::new(),
-                skipped => format!(", {skipped} of which this layer cannot act on"),
-            },
-            generated.map_or_else(String::new, |at| format!(", generated at {at}")),
-        ),
-        GentooEvent::Planned {
-            packages, bytes, ..
-        } => eprintln!("fcage: installing {packages} packages ({bytes} bytes)"),
-        GentooEvent::Merging {
-            package, version, ..
-        } => eprintln!("fcage: merging {package}-{version}"),
-        GentooEvent::DependencyCycle { packages, .. } => eprintln!(
-            "fcage: a runtime dependency cycle among {} was broken to order the merge",
-            packages.join(", "),
-        ),
-        // Reported before the run fails, so a caller fixing an install list
-        // sees every atom the binhost cannot answer rather than the first.
-        GentooEvent::Unsatisfiable {
-            atom,
-            wanted_by,
-            reason,
-            ..
-        } => eprintln!("fcage: {wanted_by} requires {atom}, and no build {reason}"),
-        GentooEvent::Conflict {
-            atom,
-            stated_by,
-            blocks,
-            installed,
-            ..
-        } => eprintln!(
-            "fcage: {stated_by} blocks {blocks} with {atom}, which {}",
-            if *installed {
-                "the root already has"
-            } else {
-                "this same resolution would install"
-            },
-        ),
-        _ => {}
-    }
 }
 
 /// Prints the stage3 variants an architecture publishes, from the signed
@@ -5967,7 +6326,7 @@ fn gentoo_variants(
     // The build id belongs beside the variant rather than in a heading: a
     // sub-architecture is built on its own cadence, so one document routinely
     // points different variants at different builds.
-    print_listing("the variant listing", |out| {
+    output::print_stdout("the variant listing", |out| {
         for variant in variants.names() {
             let build = variants.build_id(variant).unwrap_or("");
             let size = variants.size(variant).unwrap_or(0);
@@ -5975,46 +6334,6 @@ fn gentoo_variants(
         }
         Ok(())
     })
-}
-
-/// Writes a listing to standard output, reporting a reader that stopped early as
-/// the quiet ending it is.
-///
-/// A listing is a stream a reader is expected to walk away from —
-/// `fcage --gentoo-packages amd64 | head` is the everyday case — and `println!`
-/// answers that by panicking: Rust ignores `SIGPIPE`, so the write returns
-/// `EPIPE` rather than the process dying of the signal, and the macro has
-/// nowhere to report an error to. The command then exits 101 with a panic
-/// message on stderr where a shell expected 141 and silence.
-///
-/// [`export_rootfs`] answers the same question in its own terms, because its
-/// write goes through the library and fails as a `ProvisionError` naming what it
-/// was doing — a diagnostic this could only report as a bare `io::Error`.
-fn print_listing(
-    subject: &str,
-    records: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
-) -> ExitCode {
-    use std::io::Write as _;
-    // Buffered, so a listing of thousands of lines is a handful of writes: the
-    // records below are small and there is no reader waiting on each one.
-    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    let written = records(&mut out).and_then(|()| out.flush());
-    ExitCode::from(listing_status(subject, written))
-}
-
-/// What a listing exits with, given how its writes ended.
-///
-/// Separate from [`print_listing`] because that one owns the process's own
-/// standard output, and what is worth pinning is the reading of the outcome.
-fn listing_status(subject: &str, written: std::io::Result<()>) -> u8 {
-    match written {
-        Ok(()) => 0,
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => broken_pipe(),
-        Err(error) => {
-            eprintln!("fcage: cannot write {subject}: {}", ErrorChain::new(&error));
-            FAILED
-        }
-    }
 }
 
 /// Prints what the binhost publishes: every package name and its versions.
@@ -6050,7 +6369,7 @@ fn gentoo_packages(
     // One line per package, its versions after it: a name is what a caller
     // writes in an atom, and the versions are what tells them whether the one
     // they meant is on offer.
-    print_listing("the package listing", |out| {
+    output::print_stdout("the package listing", |out| {
         for name in catalogue.names() {
             let versions: Vec<&str> = catalogue.versions(name).collect();
             writeln!(out, "{name}\t{}", versions.join(" "))?;
@@ -6073,14 +6392,18 @@ fn gentoo_installed(root: &Path) -> ExitCode {
         Ok(installed) => installed,
         Err(error) => return fail(error),
     };
-    if installed.is_empty() {
-        eprintln!(
+    // Said before the listing, so a reader that has gone stops it there.
+    if installed.is_empty()
+        && output::say(format_args!(
             "fcage: no packages are installed at {}: its package database is empty or \
              absent, and an absent one is what a root that is not a Gentoo root looks like",
             root.display(),
-        );
+        ))
+        .is_err()
+    {
+        return ExitCode::from(output::broken_pipe());
     }
-    print_listing("the installed listing", |out| {
+    output::print_stdout("the installed listing", |out| {
         for package in installed.packages() {
             writeln!(
                 out,
@@ -6107,7 +6430,7 @@ fn gentoo_keyring_horizon() -> ExitCode {
         Err(error) => return fail(error),
     };
     let horizon = gentoo.keyring_horizon();
-    print_listing("the keyring horizon", |out| {
+    output::print_stdout("the keyring horizon", |out| {
         for held in &horizon {
             writeln!(
                 out,
@@ -6150,36 +6473,6 @@ fn gentoo_keyring_horizon() -> ExitCode {
             },
         )
     })
-}
-
-/// Prints an Alpine bootstrap progress event to stderr.
-///
-/// The same shape as [`print_debian_event`], which is the point of
-/// [`AlpineEvent`](ferroday_cage::provision::alpine::AlpineEvent) carrying the
-/// same progress: a consumer reports one layer by changing the type it matches
-/// on.
-fn print_alpine_event(event: ferroday_cage::provision::alpine::AlpineEvent<'_>) {
-    use ferroday_cage::provision::alpine::AlpineEvent;
-    use std::io::Write;
-    match event {
-        AlpineEvent::Fetching { url, .. } => eprintln!("fcage: fetching {url}"),
-        AlpineEvent::Resolving => eprintln!("fcage: resolving the package set"),
-        AlpineEvent::Downloading {
-            package,
-            index,
-            total,
-            ..
-        } => eprintln!("fcage: downloading {package} ({index}/{total})"),
-        AlpineEvent::Extracting { package, .. } => eprintln!("fcage: extracting {package}"),
-        AlpineEvent::Script {
-            package, script, ..
-        } => eprintln!("fcage: {package}: {script}"),
-        // An install script's own output flows straight to stderr.
-        AlpineEvent::CommandOutput { bytes, .. } => {
-            let _ = std::io::stderr().write_all(bytes);
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]
@@ -6354,27 +6647,43 @@ mod tests {
     }
 
     #[test]
-    fn the_export_only_roster_holds_only_export_options() {
+    fn every_option_of_a_mode_is_refused_by_a_launch_and_taken_by_its_mode() {
         // The roster is the table's `mode`, so this is what keeps that honest:
-        // every flag it calls an export's must be one a launch refuses and an
-        // export accepts, or the suggester attributes a flag to the wrong mode.
-        let export_only: Vec<&str> = FLAGS
+        // every flag it files under a mode must be one a launch refuses and
+        // that mode accepts, or the suggester attributes a flag to the wrong
+        // mode.
+        let options: Vec<&Flag> = FLAGS
             .iter()
-            .filter(|flag| flag.mode == Mode::Export && !flag.selects)
-            .map(|flag| flag.long)
+            .filter(|flag| {
+                !matches!(flag.mode, Mode::Launch | Mode::Help | Mode::Version) && !flag.selects
+            })
             .collect();
-        assert!(!export_only.is_empty(), "the roster is not empty");
-        for flag in export_only {
-            let launch = parse_error(&["--rootfs", "/srv/alpine", flag, "/bin/sh"]);
+        assert!(!options.is_empty(), "the roster is not empty");
+        for flag in options {
+            let long = flag.long;
+            let owner = owning_mode_flag(long).expect("a mode's option names its mode");
+            assert_eq!(
+                FLAGS
+                    .iter()
+                    .find(|entry| entry.long == owner)
+                    .map(|entry| entry.mode),
+                Some(flag.mode),
+                "{long} is attributed to {owner}, which selects another mode",
+            );
+            let launch = parse_error(&["--rootfs", "/srv/alpine", long, "/bin/sh"]);
             assert!(
                 launch.contains("unrecognized option"),
-                "a launch accepts {flag}, which the roster calls an export's: {launch:?}",
+                "a launch accepts {long}, which the roster calls {owner}'s: {launch:?}",
             );
-            let export = parse_args(&["--export-rootfs", "/roots/a", flag, "1700000000"]);
+            let mut args = vec![owner, "/roots/a", long];
+            if flag.arity() != Arity::Bare {
+                args.push("1700000000");
+            }
+            let taken = parse_args(&args);
             assert!(
-                export.is_ok(),
-                "an export refuses {flag}, which the roster calls its own: {:?}",
-                export.err(),
+                taken.is_ok(),
+                "{owner} refuses {long}, which the roster calls its own: {:?}",
+                taken.err(),
             );
         }
     }
@@ -6421,6 +6730,15 @@ mod tests {
             ])
             .is_ok()
         );
+        // A value is the flag's, whatever it looks like: a directory named
+        // `--mydir` is a rootfs, not a launch flag nobody gave.
+        let Invocation::Run(options) =
+            parse_args(&["--rootfs", "--mydir", "--provision-tar", "t.tar"])
+                .expect("a value spelled like an option is still a value")
+        else {
+            panic!("the invocation is a provisioning run");
+        };
+        assert_eq!(options.rootfs.as_deref(), Some(Path::new("--mydir")));
         // A trailing separator with nothing after it names no launch setting:
         // it introduces a command line rather than configuring one, and the run
         // it ends is the provisioning run it was already.
@@ -6478,47 +6796,79 @@ mod tests {
     #[test]
     fn every_userland_takes_a_plan_document_the_same_way() {
         // A plan replaces a resolution and a pin constrains one, and both are
-        // documents a previous resolution wrote. Gentoo has taken a plan since
-        // it gained one; Debian and Alpine take both, so a reproducible install
-        // is expressible at a prompt for each of the three formats and not only
-        // from a program.
-        let options = run_options(&[
-            "--rootfs",
-            "/roots/trixie",
-            "--provision-debian",
-            "trixie",
-            "--debian-plan",
-            "/plans/trixie.plan",
-            "--debian-pin",
-            "/plans/trixie.pin",
-        ]);
-        assert_eq!(
-            options.debian_plan.as_deref(),
-            Some(Path::new("/plans/trixie.plan"))
-        );
-        assert_eq!(
-            options.debian_pin.as_deref(),
-            Some(Path::new("/plans/trixie.pin"))
-        );
+        // documents a previous resolution wrote. Gentoo takes a plan; Debian
+        // and Alpine take both, so a reproducible install is expressible at a
+        // prompt for each of the three formats and not only from a program.
+        for (userland, release) in [("debian", "trixie"), ("alpine", "v3.23")] {
+            for document in ["plan", "pin"] {
+                let flag = format!("--{userland}-{document}");
+                let path = format!("/plans/{userland}.{document}");
+                let options = run_options(&[
+                    "--rootfs",
+                    "/roots/r",
+                    &format!("--provision-{userland}"),
+                    release,
+                    &flag,
+                    &path,
+                ]);
+                let parsed = match (userland, document) {
+                    ("debian", "plan") => options.debian_plan,
+                    ("debian", _) => options.debian_pin,
+                    (_, "plan") => options.alpine_plan,
+                    _ => options.alpine_pin,
+                };
+                assert_eq!(parsed.as_deref(), Some(Path::new(&path)), "{flag}");
+            }
+        }
 
-        let options = run_options(&[
-            "--rootfs",
-            "/roots/alpine",
-            "--provision-alpine",
-            "v3.23",
-            "--alpine-plan",
-            "/plans/alpine.plan",
-            "--alpine-pin",
-            "/plans/alpine.pin",
-        ]);
-        assert_eq!(
-            options.alpine_plan.as_deref(),
-            Some(Path::new("/plans/alpine.plan"))
-        );
-        assert_eq!(
-            options.alpine_pin.as_deref(),
-            Some(Path::new("/plans/alpine.pin"))
-        );
+        // A plan is a resolution that already happened, so every flag that
+        // shapes one is refused beside it, in each format alike, rather than
+        // dropped or left to fail once the provisioner is built.
+        for (provision, release, plan, shaping) in [
+            (
+                "--provision-debian",
+                "trixie",
+                "--debian-plan",
+                &[
+                    ["--debian-include", "curl"],
+                    ["--debian-exclude", "curl"],
+                    ["--debian-base-priority", "important"],
+                    ["--debian-pin", "/plans/p"],
+                ][..],
+            ),
+            (
+                "--provision-alpine",
+                "v3.23",
+                "--alpine-plan",
+                &[
+                    ["--alpine-include", "curl"],
+                    ["--alpine-exclude", "curl"],
+                    ["--alpine-pin", "/plans/p"],
+                ],
+            ),
+            (
+                "--provision-gentoo",
+                "amd64",
+                "--gentoo-plan",
+                &[
+                    ["--gentoo-install", "dev-vcs/git"],
+                    ["--gentoo-prefer-use", "keyring"],
+                ],
+            ),
+        ] {
+            for [flag, value] in shaping {
+                let mut args = vec!["--rootfs", "/roots/r", provision, release];
+                if provision == "--provision-gentoo" {
+                    args.extend(["--gentoo-variant", "amd64-openrc"]);
+                }
+                args.extend([plan, "/plans/plan", flag, value]);
+                let error = parse_error(&args);
+                assert!(
+                    error.contains(plan) && error.contains(flag),
+                    "{plan} beside {flag}: {error}",
+                );
+            }
+        }
 
         // And each belongs to its own provisioner, as the rest of its family
         // does.
@@ -6665,8 +7015,6 @@ mod tests {
             "--gentoo-prefer-use",
             "-X gtk",
             "--gentoo-prefer-use=keyring",
-            "--gentoo-plan",
-            "/plans/binhost.plan",
         ]);
         assert_eq!(options.gentoo_binhost.as_deref(), Some("x86-64"));
         assert_eq!(
@@ -6674,6 +7022,18 @@ mod tests {
             ["dev-vcs/git[keyring]", "app-editors/vim"],
         );
         assert_eq!(options.gentoo_prefer_use, ["-X", "gtk", "keyring"]);
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/gentoo",
+            "--provision-gentoo",
+            "amd64",
+            "--gentoo-variant",
+            "amd64-openrc",
+            "--gentoo-binhost",
+            "x86-64",
+            "--gentoo-plan",
+            "/plans/binhost.plan",
+        ]);
         assert_eq!(
             options.gentoo_plan.as_deref(),
             Some(Path::new("/plans/binhost.plan")),
@@ -7004,20 +7364,47 @@ mod tests {
     #[test]
     fn a_listing_whose_reader_stops_early_ends_quietly() {
         // Rust ignores SIGPIPE, so a write to a closed pipe returns EPIPE
-        // rather than killing the process -- and `println!` panicked on it,
-        // ending a listing at exit 101 with a panic message where a shell
-        // expected 141 and silence. `fcage --gentoo-packages amd64 | head` is
-        // the everyday case.
+        // rather than killing the process, and `println!` panics on it: exit
+        // 101 and a panic message where a shell expects 141 and silence.
+        // `fcage --gentoo-packages amd64 | head` is the everyday case.
         assert_eq!(
-            listing_status("a listing", Err(std::io::ErrorKind::BrokenPipe.into())),
+            output::stdout_status("a listing", Err(std::io::ErrorKind::BrokenPipe.into())),
             141,
         );
         // Any other write failure is a real one and says so.
         assert_eq!(
-            listing_status("a listing", Err(std::io::ErrorKind::StorageFull.into())),
+            output::stdout_status("a listing", Err(std::io::ErrorKind::StorageFull.into())),
             125,
         );
-        assert_eq!(listing_status("a listing", Ok(())), 0);
+        assert_eq!(output::stdout_status("a listing", Ok(())), 0);
+    }
+
+    #[test]
+    fn a_provisioning_run_whose_progress_reader_has_gone_stops() {
+        use ferroday_cage::provision::ProvisionObserver as _;
+        use ferroday_cage::provision::debian::DebianEvent;
+
+        // The reader goes first, so the first line of progress finds the pipe
+        // closed, as a `2>&1 | head` does once `head` has its lines.
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        drop(reader);
+        let mut progress = Progress::new(writer);
+        assert!(!progress.cancelled(), "nothing has been written yet");
+        progress.progress(ProvisionEvent::Debian(&DebianEvent::Resolving));
+        assert!(
+            progress.cancelled(),
+            "a run whose progress nobody reads goes on to the end",
+        );
+
+        // A reader still there sees the progress, and the run goes on.
+        let (mut reader, writer) = std::io::pipe().expect("a pipe");
+        let mut progress = Progress::new(writer);
+        progress.progress(ProvisionEvent::Debian(&DebianEvent::Resolving));
+        assert!(!progress.cancelled());
+        drop(progress);
+        let mut seen = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut seen).expect("the line arrives");
+        assert_eq!(seen, "fcage: resolving the package set\n");
     }
 
     #[test]
@@ -7090,7 +7477,7 @@ mod tests {
             "--rootfs",
             "/r",
             "--alpine-repository",
-            "release=v3.23 mirror=https://dl-cdn.alpinelinux.org/alpine keys=",
+            "release=v3.23 mirror=http://dl-cdn.alpinelinux.org/alpine keys=",
             "/bin/true",
         ]);
         assert!(error.contains("names no key set"), "{error}");
@@ -7111,9 +7498,9 @@ mod tests {
 
     #[test]
     fn every_flag_the_parser_accepts_is_in_the_help() {
-        // The parser's vocabulary and the help's contents are one list, so
-        // most of what this used to check is now unwritable. What is left is
-        // the flags the help documents in prose rather than as an entry: the
+        // The parser's vocabulary and the help's contents are one list, so an
+        // entry cannot be missing from either. What is left to check is the
+        // flags the help documents in prose rather than as an entry: the
         // counterpart toggles, each named in the closing paragraphs. A flag
         // filed there and then forgotten in the prose is documented nowhere,
         // and the suggester could never offer it.
@@ -7520,6 +7907,169 @@ mod tests {
         // The map parser rejects the flag as a spelling before it can be
         // mistaken for the destination.
         assert!(parse_args(&["--identity-map", "--remove-rootfs"]).is_err());
+    }
+
+    #[test]
+    fn a_launch_is_checked_before_its_root_is_provisioned() {
+        // A typo in a profile, or a stack configuration the stack refuses, is
+        // reported before a provisioner spends minutes on a root the launch
+        // then cannot use, and the root is not provisioned at all.
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-checked-first");
+        let tarball = dir.join("root.tar");
+        std::fs::write(
+            &tarball,
+            ferroday_cage_testkit::tar::Tar::new()
+                .dir("etc", 0o755)
+                .file("etc/hostname", 0o644, b"root\n")
+                .finish(),
+        )
+        .expect("the tarball is written");
+        let profile = dir.join("typo.toml");
+        std::fs::write(&profile, "rootfs = \"/tmp\"\nnot-a-key = 1\n")
+            .expect("the profile is written");
+        let path = |path: &Path| path.to_str().expect("a UTF-8 scratch path").to_string();
+        for (case, extra) in [
+            ("profile", vec!["--profile".to_string(), path(&profile)]),
+            (
+                "stack",
+                vec![
+                    "--netstack".to_string(),
+                    "--netstack-no-ipv4".to_string(),
+                    "--netstack-no-ipv6".to_string(),
+                ],
+            ),
+        ] {
+            let rootfs = dir.join(case);
+            let mut args = vec![
+                "--rootfs".to_string(),
+                path(&rootfs),
+                "--provision-tar".to_string(),
+                path(&tarball),
+            ];
+            args.extend(extra);
+            args.push("/bin/true".to_string());
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert_eq!(run(*run_options(&args)), ExitCode::from(FAILED), "{case}");
+            assert!(
+                !rootfs.exists(),
+                "{case}: the root was provisioned for a launch that was refused",
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_term_passes_only_beneath_the_base_environment() {
+        let term = || Some(OsString::from("xterm-256color"));
+        assert_eq!(passed_term(true, false, term()), term());
+        // A profile's or --setenv's own TERM wins.
+        assert_eq!(passed_term(true, true, term()), None);
+        // --no-base-env asks for exactly the variables the run names, so a
+        // hermetic run does not vary with the caller's terminal.
+        assert_eq!(passed_term(false, false, term()), None);
+        assert_eq!(passed_term(true, false, None), None);
+    }
+
+    #[test]
+    fn an_https_mirror_is_refused_where_it_is_written() {
+        // The library's own client cannot fetch one, and its refusal names a
+        // setting fcage has no flag for, so the mistake is caught as written.
+        let https = "https://deb.debian.org/debian";
+        let launch = |args: &[&str]| {
+            let mut all = vec!["--rootfs", "/roots/r"];
+            all.extend_from_slice(args);
+            parse_error(&all)
+        };
+        for error in [
+            launch(&["--provision-debian", "trixie", "--debian-mirror", https]),
+            launch(&[
+                "--provision-debian",
+                "trixie",
+                "--debian-mirror-fallback",
+                https,
+            ]),
+            launch(&[
+                "--provision-debian",
+                "trixie",
+                "--debian-repository",
+                &format!("suite=trixie mirror={https}"),
+            ]),
+            launch(&[
+                "--provision-debian",
+                "trixie",
+                "--debian-repository",
+                &format!("suite=trixie mirror=http://a mirror-fallback={https}"),
+            ]),
+            launch(&["--provision-alpine", "v3.23", "--alpine-mirror", https]),
+            launch(&[
+                "--provision-alpine",
+                "v3.23",
+                "--alpine-mirror-fallback",
+                https,
+            ]),
+            launch(&[
+                "--provision-alpine",
+                "v3.23",
+                "--alpine-repository",
+                &format!("release=v3.23 mirror={https} keys=alpine"),
+            ]),
+            launch(&[
+                "--provision-gentoo",
+                "amd64",
+                "--gentoo-variant",
+                "amd64-openrc",
+                "--gentoo-mirror",
+                "HTTPS://distfiles.gentoo.org",
+            ]),
+            parse_error(&["--gentoo-variants", "amd64", "--gentoo-mirror", https]),
+            parse_error(&[
+                "--gentoo-packages",
+                "amd64",
+                "--gentoo-mirror-fallback",
+                https,
+            ]),
+        ] {
+            assert!(error.contains("https:// mirror"), "{error}");
+        }
+        // Plain HTTP and a local copy are what fcage fetches.
+        assert!(
+            parse_args(&[
+                "--rootfs",
+                "/roots/r",
+                "--provision-debian",
+                "trixie",
+                "--debian-mirror",
+                "http://deb.debian.org/debian",
+                "--debian-mirror-fallback",
+                "file:///srv/mirror/debian",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_removal_names_a_tree_of_its_own() {
+        // An empty value is an unset variable, and the library reads it as a
+        // path that is not there: the removal would succeed, removing nothing.
+        for args in [
+            &["--remove-rootfs="][..],
+            &["--remove-rootfs", ""],
+            &["--remove-overlay-upper="],
+            &["--remove-overlay-upper", ""],
+        ] {
+            let error = parse_error(args);
+            assert!(error.contains("empty value"), "{args:?}: {error}");
+        }
+        // A path with no final component names no tree beside its parent.
+        for dest in [".", "..", "/", "a/..", "./"] {
+            let error = parse_error(&["--remove-rootfs", dest]);
+            assert!(error.contains("no directory of its own"), "{dest}: {error}");
+        }
+        // A trailing `/.` still names the directory before it.
+        assert!(parse_args(&["--remove-rootfs", "roots/a/."]).is_ok());
+        // A listing of what a root has installed reads the empty value the same
+        // way, and would answer that nothing is.
+        let error = parse_error(&["--gentoo-installed="]);
+        assert!(error.contains("empty value"), "{error}");
     }
 
     /// The export an argument list parses to, panicking if it is anything else.
@@ -8102,26 +8652,29 @@ mod tests {
                 "{bad}"
             );
         }
+        // Only an errno a failed syscall can report. Zero answers a call with a
+        // success it never performed, so `getpid=0` reports pid 0 and
+        // `clone3=0` tells the parent it is the child; past 4095 the C library
+        // reads the result as a value rather than a failure.
+        for out_of_range in ["clone3=0", "getpid=4096", "getpid=65535", "getpid=-1"] {
+            let error =
+                parse_seccomp_errno("--seccomp-errno", out_of_range).expect_err(out_of_range);
+            assert!(error.contains("1 to 4095"), "{out_of_range}: {error}");
+        }
+        assert_eq!(
+            parse_seccomp_errno("--seccomp-errno", "getpid=4095"),
+            Ok((sysno("getpid"), 4095)),
+        );
 
-        // Alone, an errno makes a deny side of its own; beside a side, it joins
-        // it; beside the curated posture, it is refused.
+        // An errno alone is a restriction's whole grant, so it is accepted.
         let alone = run_options(&[
             "--restrict",
             "--seccomp-errno",
             "clone3=ENOSYS",
             "/bin/true",
         ]);
-        assert!(matches!(alone.seccomp, Some(SeccompPolicy::Rules(_))));
-        let joined = run_options(&[
-            "--rootfs",
-            "/srv/rootfs",
-            "--seccomp-allow",
-            "read",
-            "--seccomp-errno",
-            "clone3=ENOSYS",
-            "/bin/true",
-        ]);
-        assert!(matches!(joined.seccomp, Some(SeccompPolicy::Rules(_))));
+        assert_eq!(alone.seccomp_errno, [(sysno("clone3"), 38)]);
+        // Beside the curated posture it is refused, as soon as both are read.
         assert!(
             parse_error(&[
                 "--restrict",
@@ -8132,6 +8685,94 @@ mod tests {
                 "/bin/true"
             ])
             .contains("--seccomp-errno")
+        );
+    }
+
+    /// The rules a composed policy holds, rendered for comparison.
+    fn rules_of(policy: Option<SeccompPolicy>) -> String {
+        match policy {
+            Some(SeccompPolicy::Rules(rules)) => format!("{rules:?}"),
+            Some(_) => panic!("the policy is not a rule set"),
+            None => panic!("no policy was composed"),
+        }
+    }
+
+    #[test]
+    fn a_seccomp_errno_joins_whichever_policy_stands() {
+        let errno = || vec![(sysno("clone3"), 38)];
+        let allow = || SeccompRules::allowing([sysno("read")]);
+        let deny = || SeccompRules::denying([sysno("ptrace")]);
+
+        // With no other policy, the errnos make a deny side of their own.
+        assert_eq!(
+            rules_of(compose_seccomp(None, errno(), None).unwrap()),
+            format!(
+                "{:?}",
+                SeccompRules::denying([]).errno_for(sysno("clone3"), 38)
+            ),
+        );
+        // Beside the flags' own side, they join it.
+        assert_eq!(
+            rules_of(compose_seccomp(Some(SeccompPolicy::Rules(allow())), errno(), None).unwrap()),
+            format!("{:?}", allow().errno_for(sysno("clone3"), 38)),
+        );
+        // Beside a profile's allow-list, and no allow or deny flag, they join
+        // the profile's list rather than replacing it with a deny side that
+        // refuses only what they name. The list is the confinement.
+        let profile = SeccompPolicy::Rules(allow());
+        assert_eq!(
+            rules_of(compose_seccomp(None, errno(), Some(&profile)).unwrap()),
+            format!("{:?}", allow().errno_for(sysno("clone3"), 38)),
+        );
+        // A side the flags assemble replaces the profile's, as any flag beside
+        // a profile overrides it, and the errnos join that side.
+        assert_eq!(
+            rules_of(
+                compose_seccomp(Some(SeccompPolicy::Rules(deny())), errno(), Some(&profile))
+                    .unwrap()
+            ),
+            format!("{:?}", deny().errno_for(sysno("clone3"), 38)),
+        );
+        // A profile's curated posture takes no errno.
+        assert!(
+            compose_seccomp(None, errno(), Some(&SeccompPolicy::Curated))
+                .unwrap_err()
+                .contains("profile's seccomp policy")
+        );
+        // Without errnos, the flags' policy stands as it is, and with no flag
+        // at all the profile's is left in place.
+        assert!(
+            compose_seccomp(None, Vec::new(), Some(&profile))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_launch_beside_a_profile_keeps_its_seccomp_list_under_an_errno() {
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-profile-seccomp");
+        let profile = dir.join("strict.toml");
+        std::fs::write(
+            &profile,
+            "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\n\n\
+             [hardening.seccomp]\nallow = [\"read\", \"write\", \"execve\"]\n",
+        )
+        .expect("the profile is written");
+        let options = run_options(&[
+            "--profile",
+            profile.to_str().expect("a UTF-8 scratch path"),
+            "--seccomp-errno",
+            "clone3=ENOSYS",
+        ]);
+        let launch = Launch::prepare(*options).unwrap_or_else(|_| panic!("the launch composes"));
+        let joined = launch.builder.get_seccomp().cloned();
+        assert_eq!(
+            rules_of(joined),
+            format!(
+                "{:?}",
+                SeccompRules::allowing([sysno("read"), sysno("write"), sysno("execve")])
+                    .errno_for(sysno("clone3"), 38)
+            ),
         );
     }
 
@@ -8462,9 +9103,22 @@ mod tests {
             .err()
             .expect("a restriction with no grant is rejected");
         assert!(err.contains("at least one grant"), "{err}");
-        // A single grant satisfies it.
+        // A scope is not a grant: it enrolls no path and no port, so the
+        // filesystem and the network stay open, and the help says so.
+        let err = parse_run(&["--restrict", "--landlock-scope", "signal", "/bin/true"])
+            .err()
+            .expect("a restriction with only a scope is rejected");
+        assert!(err.contains("--landlock-scope alone"), "{err}");
+        let help = usage();
+        assert!(
+            help.contains("--restrict") && help.contains("requires a Landlock"),
+            "the help names what a restriction requires",
+        );
+        // A single grant satisfies it, and so does an errno answer alone.
         parse_run(&["--restrict", "--landlock-ro", "/lib", "/bin/true"])
             .expect("a Landlock grant is enough");
+        parse_run(&["--restrict", "--seccomp-errno", "ptrace=EPERM", "/bin/true"])
+            .expect("a seccomp errno is enough");
     }
 
     #[test]

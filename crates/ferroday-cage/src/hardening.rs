@@ -745,6 +745,24 @@ const EPERM: u16 = 1;
 /// absence: the x32 guard, and `clone3` in the curated policy.
 const ENOSYS: u16 = 38;
 
+/// The largest errno a syscall can fail with. The C library reads a raw result
+/// in `-4095..=-1` as a failure with that errno, and any other as a value.
+const MAX_ERRNO: u16 = 4095;
+
+/// The errno a name such as `ENOSYS` spells, in any letter case, or `None` for
+/// a name no errno has.
+///
+/// Through the `syscalls` crate's errno table, the source the syscall names
+/// come from. Its numbers are the generic ones every architecture with seccomp
+/// support here shares.
+fn errno_named(name: &str) -> Option<u16> {
+    let wanted = name.to_ascii_uppercase();
+    (1..=i32::from(MAX_ERRNO))
+        .map(syscalls::Errno::new)
+        .find(|errno| errno.name() == Some(wanted.as_str()))
+        .and_then(|errno| u16::try_from(errno.into_raw()).ok())
+}
+
 /// `BPF_MAXINSNS`, the kernel's ceiling on a classic BPF filter's length. A
 /// compiled seccomp program is checked against it at build time so an
 /// over-long program is rejected rather than silently truncated when its
@@ -1103,6 +1121,32 @@ impl SeccompRules {
     pub fn errno_for(mut self, syscall: i64, errno: u16) -> SeccompRules {
         self.errnos.insert(syscall, errno);
         self
+    }
+
+    /// The errno `spelling` names, as [`errno_for`](Self::errno_for) takes it,
+    /// or `None` where it names none a syscall can fail with.
+    ///
+    /// A name such as `ENOSYS` resolves in any letter case, through the table
+    /// a profile's `errno` entries resolve through. A number is taken as it
+    /// stands when it is one through 4095, the errnos the C library reads a
+    /// failed syscall's result as. Zero is refused, since a filter answering
+    /// with it reports a success the syscall never performed, and so is
+    /// anything larger, which the caller would read as a returned value.
+    ///
+    /// ```
+    /// use ferroday_cage::SeccompRules;
+    ///
+    /// assert_eq!(SeccompRules::errno("ENOSYS"), Some(libc::ENOSYS as u16));
+    /// assert_eq!(SeccompRules::errno("enosys"), Some(libc::ENOSYS as u16));
+    /// assert_eq!(SeccompRules::errno("38"), Some(38));
+    /// assert_eq!(SeccompRules::errno("0"), None);
+    /// assert_eq!(SeccompRules::errno("4096"), None);
+    /// ```
+    pub fn errno(spelling: &str) -> Option<u16> {
+        match spelling.parse::<u16>() {
+            Ok(number) => (1..=MAX_ERRNO).contains(&number).then_some(number),
+            Err(_) => errno_named(spelling),
+        }
     }
 
     /// Sets the action for unlisted syscalls (the default is `Allow` for a
@@ -2760,18 +2804,9 @@ pub(crate) mod serde_request {
     }
 
     /// Resolves an errno name, such as `ENOSYS`, to its number, in any letter
-    /// case.
-    ///
-    /// Through the `syscalls` crate's errno table, the source the syscall names
-    /// come from. Its numbers are the generic ones every architecture with
-    /// seccomp support here shares.
+    /// case. A profile names an errno and does not number one.
     fn resolve_errno(name: &str) -> Result<u16, String> {
-        let wanted = name.to_ascii_uppercase();
-        (1..4096)
-            .map(syscalls::Errno::new)
-            .find(|errno| errno.name() == Some(wanted.as_str()))
-            .and_then(|errno| u16::try_from(errno.into_raw()).ok())
-            .ok_or_else(|| format!("unknown errno {name:?}"))
+        super::errno_named(name).ok_or_else(|| format!("unknown errno {name:?}"))
     }
 
     /// Names one errno, for serialization.

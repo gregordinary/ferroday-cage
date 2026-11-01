@@ -59,13 +59,20 @@ body:
     attributes:
       label: Host probes
       description: >
-        The library's own report on what the host allows. Paste whichever
-        apply; several failures are host configuration rather than defects, and
-        these say so immediately.
+        What the host allows. Several failures are host configuration rather
+        than defects, and these say so immediately. From the library, paste
+        whichever of its probes apply. From `fcage`, whose error already names
+        a facility the host denies, paste the shell commands' output instead.
       value: |
+        Library:
         host::userns_blocker():
         host::range_map_blocker():
         host::overlay_blocker(<the upper's directory>):
+
+        fcage, from a shell:
+        sysctl kernel.unprivileged_userns_clone user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns
+        grep "^$(id -un):" /etc/subuid /etc/subgid
+        ls -l "$(command -v newuidmap)" "$(command -v newgidmap)"
       render: text
   - type: checkboxes
     id: identity

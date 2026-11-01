@@ -20,6 +20,11 @@ shapes and are not settings. A setting taken by reference (`&mut self`
 returning `&mut Self`) would slip past that reading, so one fails the check
 outright: the crate's builders take themselves by value.
 
+A flag is checked for the invocation it belongs to as well as for existing.
+The flag table records each flag's mode, and a flag a launch refuses -- a
+removal's, an export's, `--help` -- cannot be what reaches a launch builder's
+setting. A builder of another mode names that mode in the record.
+
 It is not a demand that everything have a flag. Some settings genuinely cannot,
 for one of three reasons: the setting takes executable behavior an argument
 cannot carry, it is spelled somewhere other than a flag, or it belongs to a
@@ -141,12 +146,32 @@ def by_reference() -> list[str]:
     ]
 
 
-def flags() -> set[str]:
-    """Every long flag the CLI's own table declares."""
-    return set(re.findall(r'long: "(--[a-z0-9-]+)"', CLI.read_text(encoding="utf-8")))
+def flags() -> dict[str, str]:
+    """Every long flag the CLI's own table declares, with the invocation that
+    takes it: `Launch` for one a launch applies, and otherwise its mode.
+
+    An entry states its `mode` and its `take` only where they differ from the
+    table's defaults, which are a launch and a refusal: a launch takes a flag
+    only when its entry gives it a `take` other than `Refused`.
+    """
+    source = CLI.read_text(encoding="utf-8")
+    table = re.search(r"^const FLAGS: &\[Flag\] = &\[\n(.*?)^\];", source, re.MULTILINE | re.DOTALL)
+    if not table:
+        raise SystemExit(f"{CLI}: no FLAGS table")
+    found = {}
+    for entry in re.split(r"^    Flag \{\n", table.group(1), flags=re.MULTILINE)[1:]:
+        long = re.search(r'^        long: "(--[a-z0-9-]+)"', entry, re.MULTILINE)
+        mode = re.search(r"^        mode: Mode::(\w+)", entry, re.MULTILINE)
+        take = re.search(r"^        take: Take::(\w+)", entry, re.MULTILINE)
+        if not long:
+            raise SystemExit(f"{CLI}: a FLAGS entry names no flag")
+        mode = mode.group(1) if mode else "Launch"
+        refused = take is None or take.group(1) == "Refused"
+        found[long.group(1)] = "Refused" if mode == "Launch" and refused else mode
+    return found
 
 
-def check(builder: dict, present: list[str], offered: set[str]) -> list[str]:
+def check(builder: dict, present: list[str], offered: dict[str, str]) -> list[str]:
     """How the record for one builder differs from the two surfaces."""
     recorded = {setting["name"]: setting for setting in builder.get("setting", [])}
     problems = []
@@ -174,6 +199,11 @@ def check(builder: dict, present: list[str], offered: set[str]) -> list[str]:
         for flag in named:
             if flag not in offered:
                 problems.append(f"    missing     {name}: the CLI has no {flag}")
+            elif offered[flag] not in ("Launch", builder.get("mode", "Launch")):
+                problems.append(
+                    f"    elsewhere   {name}: {flag} is not taken by "
+                    f"{'a launch' if 'mode' not in builder else 'a launch or ' + builder['mode']}"
+                )
     return problems
 
 

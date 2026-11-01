@@ -10,10 +10,11 @@
 //! helper.
 #![allow(unused_imports, dead_code)]
 
-pub use ferroday_cage_testkit::process::{cpu_ticks, finish_bounded, run_bounded};
+pub use ferroday_cage_testkit::process::{cpu_ticks, finish_bounded, run_bounded, spawn_grouped};
 pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;
 pub use ferroday_cage_testkit::scratch::scratch_dir;
+pub use ferroday_cage_testkit::tar::Tar;
 
 /// The pinned Alpine minirootfs, provisioned through the library's own tarball
 /// provisioner, or `None` when the sandbox tests should skip.

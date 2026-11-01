@@ -492,6 +492,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
 | Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |
+| Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, `say`, `report` |
 | Make a scratch tree for a test that leaves nothing to accumulate | `scratch::Scratch`, removed when it drops, or from a test suite `common::scratch_dir`, emptied when the next run reuses it, and `common::ranged_scratch` for a tree of subordinate-owned entries |
 | What happens when a run's timeout runs out? | `relay::Escalation` |
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |
@@ -499,7 +500,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
 | Skip a test the host cannot run, or fail it where a `REQUIRE` variable says it must run | `ferroday_cage_testkit::require` |
 | Play the user at a pseudoterminal in a test | `ferroday_cage_testkit::pty` |
-| Run a host process in a test, failing the test past a deadline | `ferroday_cage_testkit::process::run_bounded`, `finish_bounded` |
+| Run a host process in a test, failing the test past a deadline | `ferroday_cage_testkit::process::run_bounded`, or `spawn_grouped` then `finish_bounded` |
 | How much processor time has a process or a thread used? | `ferroday_cage_testkit::process::cpu_ticks`, `thread_ticks` |
 
 Two guards hold the table to the code, and each covers what the other cannot:

@@ -200,22 +200,29 @@ pub struct StreamRelay {
     stop: Option<OwnedFd>,
 }
 
-impl StreamRelay {
-    /// Starts a relay for each of `fcage`'s own standard streams that is a file
-    /// and that the launch would inherit.
+/// `fcage`'s own standard streams as a launch would hand them over, judged and
+/// not yet relayed.
+///
+/// Judging reads each stream's kind and starts nothing, so a launch judges its
+/// streams before it does anything slow, such as provisioning its root, and a
+/// stream it refuses ends the run before that work rather than after it. The
+/// relays start from the judgement once the launch is ready to use them.
+pub struct Judged {
+    /// How each stream is handled, or `None` for one the launch does not
+    /// inherit: standard input, output, and error, in that order.
+    judged: [Option<Handling>; 3],
+}
+
+impl Judged {
+    /// Judges each of `fcage`'s own standard streams that the launch would
+    /// inherit.
     ///
     /// `inherited` says, for standard input, output, and error in that order,
-    /// whether the launch leaves the stream as it inherited it. Every such
-    /// stream is judged before anything starts, so a refusal leaves no thread
-    /// running and no input read.
-    pub fn start(inherited: [bool; 3]) -> Result<StreamRelay, StartError> {
-        let own = [
-            rustix::stdio::stdin(),
-            rustix::stdio::stdout(),
-            rustix::stdio::stderr(),
-        ];
+    /// whether the launch leaves the stream as it inherited it. A stream of a
+    /// kind `fcage` neither hands over nor relays is refused here.
+    pub fn streams(inherited: [bool; 3]) -> Result<Judged, StartError> {
         let mut judged: [Option<Handling>; 3] = [None, None, None];
-        for (index, stream) in own.iter().enumerate() {
+        for (index, stream) in own_streams().iter().enumerate() {
             if !inherited[index] {
                 continue;
             }
@@ -229,7 +236,16 @@ impl StreamRelay {
                 kind => judged[index] = Some(kind),
             }
         }
+        Ok(Judged { judged })
+    }
 
+    /// Starts a relay for each judged stream that is a file.
+    ///
+    /// Every stream was judged before anything starts, so a refusal leaves no
+    /// thread running and no input read.
+    pub fn start(self) -> Result<StreamRelay, StartError> {
+        let Judged { judged } = self;
+        let own = own_streams();
         let mut relay = StreamRelay {
             replacements: [None, None, None],
             input: None,
@@ -277,7 +293,18 @@ impl StreamRelay {
         }
         Ok(relay)
     }
+}
 
+/// `fcage`'s own standard input, output, and error, in that order.
+fn own_streams() -> [BorrowedFd<'static>; 3] {
+    [
+        rustix::stdio::stdin(),
+        rustix::stdio::stdout(),
+        rustix::stdio::stderr(),
+    ]
+}
+
+impl StreamRelay {
     /// Starts an output relay copying a pipe onto `destination`, and returns
     /// the pipe's write end for the command.
     fn pump(

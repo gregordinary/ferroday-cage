@@ -15,7 +15,9 @@
 //! helper.
 #![allow(unused_imports, dead_code)]
 
-pub use ferroday_cage_testkit::process::{finish_bounded, process_exists, run_bounded, wait_gone};
+pub use ferroday_cage_testkit::process::{
+    finish_bounded, process_exists, run_bounded, spawn_grouped, wait_gone,
+};
 pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;
 pub use ferroday_cage_testkit::sandbox::{Collect, sleeper};
