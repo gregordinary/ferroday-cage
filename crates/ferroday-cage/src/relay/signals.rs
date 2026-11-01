@@ -81,10 +81,16 @@ const SFD_NONBLOCK: usize = OFlags::NONBLOCK.bits() as usize;
 /// Call it **on the main thread, before building the sandbox and before
 /// creating any thread**: a thread inherits the creating thread's mask, so
 /// blocking first is what keeps a process-directed `SIGINT` from being delivered
-/// to some other thread and killing the process behind the relay's back. The
-/// library starts exactly one thread of its own — the native network stack's
-/// pump, with the `netstack` feature — so a program composing a relay with a
-/// stack installs this before it attaches one.
+/// to some other thread and killing the process behind the relay's back.
+///
+/// The library starts threads in two places, and both inherit the mask of the
+/// thread that calls into it. `NetStack::attach`, with the `netstack` feature,
+/// starts the native network stack's pump, which runs for as long as the stack
+/// is attached; a program composing a relay with a stack installs this before
+/// it attaches one. `HttpFetch::fetch_all`, which a provisioner's downloads
+/// reach, runs a batch on scoped workers and joins every one before it returns.
+/// Those cannot outlive the call, so the order matters for them only where a
+/// provisioner runs while a session is being relayed.
 ///
 /// The blocked set stays blocked for the process's life. That is deliberate: a
 /// relay that restored the mask on the way out would leave a window in which the

@@ -81,17 +81,28 @@ orchestrator's, so it composes into scripts like any other launcher.
 ## A group profile
 
 A group profile is a sandbox specification — the format [Profiles](profiles.md)
-documents in full. The sample `offline` group denies the network outright and
-starts in a tmpfs working directory:
+documents in full. The sample `offline` group denies the network outright,
+starts in a tmpfs working directory, and looks a bare command name up on the
+sandbox's `PATH`:
 
 ```toml
 network = "none"
 hostname = "offline"
 workdir = "/tmp"
+path-lookup = true
 
 [env]
 LANG = "C.UTF-8"
 ```
+
+Every sample group sets `path-lookup`, which is what lets a prompt name `cargo`
+rather than its path. A group without it takes an absolute command path, as any
+builder does by default.
+
+The sample groups apply no [hardening](hardening.md), so none of them is a
+boundary against hostile code. A group meant for untrusted code adds a
+`[hardening]` table, and the orchestrator then needs the `hardening` feature
+beside `serde`.
 
 Grouping by posture rather than by application is what lets a handful of
 profiles serve a whole workflow: an `offline` group for hermetic work, a

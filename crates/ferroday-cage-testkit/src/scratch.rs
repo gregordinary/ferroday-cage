@@ -42,8 +42,13 @@ pub fn download_cache(suite: &str) -> PathBuf {
     cache
 }
 
-/// Creates an empty scratch directory for one test, under `target` so
-/// `cargo clean` clears it. Any previous run's directory is removed first.
+/// Creates an empty scratch directory for one test, in the fixture cache
+/// [`cache_dir`] names, and returns its path.
+///
+/// No guard removes it: the tree outlives the test, and the next call with the
+/// same `name` removes it before creating it again. One fixed name per test is
+/// what keeps that from accumulating. The cache sits under `target`, so
+/// `cargo clean` clears it, unless `FERRODAY_CAGE_FIXTURE_DIR` moves it.
 pub fn scratch_dir(name: &str) -> PathBuf {
     let dir = cache_dir().join(format!("scratch-{name}"));
     if dir.exists() {

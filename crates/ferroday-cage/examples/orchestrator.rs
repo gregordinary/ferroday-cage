@@ -11,6 +11,10 @@
 //! orchestrator run net-dev -- curl https://example.com
 //! ```
 //!
+//! A bare command name such as `cargo` is found on the sandbox's `PATH`
+//! because each sample group sets `path-lookup = true`. A group without it
+//! takes an absolute command path, as the library does by default.
+//!
 //! It exists to exercise the library's `serde` feature and its
 //! profile-plus-overrides composition path from the vantage of a real
 //! consumer. Because a profile *is* a [`CageBuilder`], composition is nothing
@@ -85,8 +89,10 @@ Overrides (run), composed onto the group profile:
   -V, --version         Print the version
 
 A command given after the group replaces the group's default command as a
-unit; a group without a default command requires one. The command path is
-interpreted inside the sandbox and must be absolute. The command's exit code
+unit; a group without a default command requires one. The command is
+interpreted inside the sandbox. It must be an absolute path, unless the group
+sets path-lookup = true, which finds a bare name on the sandbox's PATH; the
+sample groups all set it. The command's exit code
 is the orchestrator's exit code, or 128 plus the signal number when it is
 terminated by a signal; 125 announces a sandbox that could not be built or
 launched, 126 a command that cannot be executed, 127 a command that does not
@@ -340,13 +346,28 @@ fn run_group(
     };
 
     // A profile is a CageBuilder, so it deserializes straight into one.
-    let mut builder = match load_group(&path) {
+    let builder = match load_group(&path) {
         Ok(builder) => builder,
         Err(message) => {
             return failure("orchestrator", &message);
         }
     };
 
+    match compose(builder, overrides, command_line).build() {
+        Ok(cage) => launch(cage),
+        Err(error) => {
+            report_build_error(group, &error);
+            ExitCode::from(error.shell_code())
+        }
+    }
+}
+
+/// Layers the invocation's overrides and command onto a group profile.
+fn compose(
+    mut builder: CageBuilder,
+    overrides: Overrides,
+    command_line: Vec<OsString>,
+) -> CageBuilder {
     // Scalar overrides replace the profile's value.
     if let Some(rootfs) = overrides.rootfs {
         builder = builder.rootfs(rootfs);
@@ -376,14 +397,7 @@ fn run_group(
     if let Some(chdir) = overrides.chdir {
         builder = builder.current_dir(chdir);
     }
-
-    match builder.build() {
-        Ok(cage) => launch(cage),
-        Err(error) => {
-            report_build_error(group, &error);
-            ExitCode::from(error.shell_code())
-        }
-    }
+    builder
 }
 
 /// Resolves a group name to its profile path, rejecting names that are not a
@@ -436,5 +450,78 @@ fn report_build_error(group: &str, error: &Error) {
             "orchestrator: group '{group}' sets no rootfs; add one to the profile or pass --rootfs DIR"
         ),
         other => eprintln!("orchestrator: {}", ErrorChain::new(other)),
+    }
+}
+
+/// The sample groups, held to the invocations this file and the guide show.
+///
+/// A launch needs a root filesystem the reader supplies, so these go as far as
+/// the build, which is where a profile's configuration is refused.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sample group profiles beside this file.
+    const PROFILES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/orchestrator-profiles"
+    );
+
+    /// Parses `line`, a `run` invocation, against the sample groups, and builds
+    /// its sandbox over a root filesystem that exists.
+    fn build(line: &[&str]) -> Result<Cage, Error> {
+        let args = ["--profiles", PROFILES]
+            .iter()
+            .chain(line)
+            .map(OsString::from);
+        let Ok(Invocation::Run {
+            profiles,
+            group,
+            mut overrides,
+            command_line,
+        }) = parse(args)
+        else {
+            panic!("{line:?} is a run invocation");
+        };
+        let dir = profile_dir(profiles).expect("--profiles names the directory");
+        let path = group_profile_path(&dir, &group).expect("a sample group's name");
+        let builder = load_group(&path).unwrap_or_else(|message| panic!("{message}"));
+        overrides.rootfs = Some(std::env::temp_dir());
+        compose(builder, overrides, command_line).build()
+    }
+
+    #[test]
+    fn the_documented_invocations_build() {
+        for line in [
+            &["run", "offline", "--", "cargo", "test"][..],
+            &["run", "offline", "--", "cargo", "build"],
+            &["run", "net-dev", "--", "curl", "https://example.com"],
+            &[
+                "run",
+                "offline",
+                "--rootfs",
+                "/srv/rootfs/alpine",
+                "--",
+                "/bin/echo",
+                "hello",
+            ],
+        ] {
+            if let Err(error) = build(line) {
+                panic!("{line:?}: {}", ErrorChain::new(&error));
+            }
+        }
+    }
+
+    #[test]
+    fn every_sample_group_loads() {
+        let mut groups = 0;
+        for entry in std::fs::read_dir(PROFILES).expect("the sample groups are readable") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension() == Some(OsStr::new("toml")) {
+                load_group(&path).unwrap_or_else(|message| panic!("{message}"));
+                groups += 1;
+            }
+        }
+        assert_eq!(groups, 3, "the guide names three sample groups");
     }
 }

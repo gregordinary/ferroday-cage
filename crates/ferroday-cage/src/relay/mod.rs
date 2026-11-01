@@ -65,12 +65,12 @@
 //!   call [`Pty::resize`], which is how a full-screen program inside learns to
 //!   redraw.
 //! - **`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`** — forward: terminate the
-//!   sandbox and keep relaying. The sandbox's exit closes the replicas, which
-//!   ends the relaying, and restoration happens on the normal path. A second
-//!   such signal escalates to a kill. These arrive only from *outside*: in raw
-//!   mode a typed `^C` is a byte the relay forwards, which the sandbox's own
-//!   line discipline turns into the sandbox's own `SIGINT`, delivered to the
-//!   sandbox's own foreground process group. Forwarding the four from outside
+//!   sandbox and keep relaying. The command's exit ends the relaying, and
+//!   restoration happens on the normal path. A second such signal escalates
+//!   to a kill. These arrive only from *outside*: in raw mode a typed `^C` is
+//!   a byte the relay forwards, which the sandbox's own line discipline turns
+//!   into the sandbox's own `SIGINT`, delivered to the sandbox's own
+//!   foreground process group. Forwarding the four from outside
 //!   is what keeps the caller's shell managing the relaying process as one job
 //!   and that process passing the management on.
 //! - **`SIGTSTP`** — restore the terminal, then stop with a self-directed
@@ -90,6 +90,15 @@
 //! restores the caller's terminal and waits for the command's exit with the
 //! same deadline and the same signals in force: a timeout still escalates, and
 //! a `SIGINT` or `SIGTERM` from outside still reaches the command.
+//!
+//! The converse holds too: the command's exit ends the session while its
+//! terminal is still open. Without a PID namespace a descendant that outlives
+//! the command can hold a replica for as long as it runs, and a kill reaches
+//! only the command. So the loop watches for the command's exit beside the
+//! terminal. Once the command has exited, the relay delivers what the terminal
+//! holds at that moment, which includes everything the command wrote, and
+//! stops. A deadline or an interrupt therefore ends the session however long a
+//! descendant keeps the terminal.
 //!
 //! # Raw mode belongs to the foreground
 //!
@@ -167,6 +176,20 @@ pub use signals::Signals;
 /// The relay's read buffer, per direction and per wake.
 const RELAY_BUF: usize = 8192;
 
+/// The most the relay reads from the sandbox's terminal once the command has
+/// exited.
+///
+/// Everything the command wrote is queued between the terminal's two ends by
+/// then, and Linux bounds that queue at about twenty kilobytes. A
+/// pseudoterminal's flip buffers stop taking writes at 8 KiB, which the last
+/// write may overshoot by a buffer of its own, and the line discipline holds
+/// 4 KiB more. A writer that finds the queue full blocks rather than queueing
+/// further. So the first twenty kilobytes read after the exit hold all of the
+/// command's output, and this bound is several times that. What it stops is a
+/// descendant that outlives the command and writes without pause, which would
+/// otherwise keep the drain going for as long as it runs.
+const DRAIN_LIMIT: usize = 64 * 1024;
+
 /// Which channel a poll slot watches.
 ///
 /// The caller's input is last because it is the one channel that retires: a
@@ -177,11 +200,13 @@ const RELAY_BUF: usize = 8192;
 /// on every pass and the loop never blocks again. The [`poll`] module states
 /// the rule, and how a loop whose retiring channels are not last keeps it.
 ///
-/// The other two indices stay stable across the change, and an unpolled slot's
-/// `revents` stays as `PollFd::new` left it: empty.
+/// The other indices stay stable across the change, and an unpolled slot's
+/// `revents` stays as `PollFd::new` left it: empty. The command's exit does not
+/// retire while the loop runs, because its readiness is what ends the loop.
 const PRIMARY: usize = 0;
 const SIGNALS: usize = 1;
-const INPUT: usize = 2;
+const EXIT: usize = 2;
+const INPUT: usize = 3;
 
 /// A byte loop between the caller's terminal and the sandbox's.
 ///
@@ -273,10 +298,14 @@ impl<'fd> Relay<'fd> {
     /// afterwards — [`Escalation::outcome`]'s convention.
     ///
     /// The session runs in two phases. The first relays both directions until
-    /// end-of-file on the primary, which means only that no replica is open
-    /// any more. A command that closed its standard streams is still running,
-    /// so the second phase waits for its exit, and the deadline and the relayed
-    /// signals bind it there exactly as they bind the first.
+    /// end-of-file on the primary or the command's exit, whichever comes
+    /// first. End-of-file means only that no replica is open any more. A
+    /// command that closed its standard streams is still running, so the
+    /// second phase waits for its exit, and the deadline and the relayed
+    /// signals bind it there exactly as they bind the first. The command's
+    /// exit ends the relaying even while a descendant that outlived it holds
+    /// the terminal open: what the terminal holds at that moment is delivered,
+    /// and nothing after it. The module documentation states the rule.
     ///
     /// The order on the way in is everything fallible first, then raw mode
     /// immediately before the loop, so every failure before that point leaves
@@ -366,7 +395,7 @@ impl<'fd> Relay<'fd> {
     }
 
     /// The first phase: relays both directions until end-of-file on the
-    /// primary.
+    /// primary or the command's exit.
     fn pump(
         &self,
         running: &mut Running<'_>,
@@ -382,6 +411,12 @@ impl<'fd> Relay<'fd> {
         let mut buf = [0u8; RELAY_BUF];
 
         loop {
+            // The status pipe is gone once the outcome has been read, which a
+            // caller that waited before relaying may have done already: the
+            // command has exited either way.
+            let Some(exit) = running.status_pipe() else {
+                return self.drain(pty, &mut buf);
+            };
             // The caller's input is watched only while there is room to put what
             // it produces: with a full pending buffer, reading more would grow
             // it without bound.
@@ -393,6 +428,7 @@ impl<'fd> Relay<'fd> {
             let mut slots = [
                 PollFd::new(pty, primary_events),
                 PollFd::new(&signal_fd, PollFlags::IN),
+                PollFd::from_borrowed_fd(exit, PollFlags::IN),
                 PollFd::new(&self.input, PollFlags::IN),
             ];
             // The retired input slot leaves the polled slice rather than being
@@ -410,6 +446,9 @@ impl<'fd> Relay<'fd> {
                 Err(Errno::INTR) => continue,
                 Err(errno) => return Err(RelayError::at("waiting on the session")(errno)),
             }
+            // Read out before anything else, which also ends the slots' borrow
+            // of the status pipe before `running` is signalled.
+            let ready: [PollFlags; 4] = std::array::from_fn(|index| slots[index].revents());
 
             // Asked on every wakeup, not only on the one `poll` timed out on.
             // Once the deadline is behind the loop the poll timeout is zero, so
@@ -418,13 +457,10 @@ impl<'fd> Relay<'fd> {
             // as long as it kept winning that race. Consulting the clock instead
             // makes the expiry a consequence of the clock.
             if escalation.passed() {
-                // Escalate, and keep relaying: the sandbox's exit closes the
-                // replicas, end-of-file ends the loop, and the wait that
-                // follows collects the exit.
+                // Escalate, and keep relaying: the command's exit ends the
+                // loop, and the wait that follows collects it.
                 escalation.expire(running)?;
             }
-
-            let ready: [PollFlags; 3] = std::array::from_fn(|index| slots[index].revents());
 
             if ready[SIGNALS].intersects(PollFlags::IN) {
                 self.handle_signals(running, signals, Some(pty), guard, interrupted)?;
@@ -486,7 +522,45 @@ impl<'fd> Relay<'fd> {
                     }
                 }
             }
+
+            // The command has exited. Whatever still holds the terminal open
+            // outlived it, and the session is over: what the terminal holds
+            // now is delivered, and nothing after it. Answered after this
+            // pass's own reads, which the drain then continues.
+            if !ready[EXIT].is_empty() {
+                return self.drain(pty, &mut buf);
+            }
         }
+    }
+
+    /// Delivers what the sandbox's terminal holds once the command has exited,
+    /// and no more.
+    ///
+    /// Ends when the primary has nothing ready, when no replica is open, or at
+    /// [`DRAIN_LIMIT`], whichever comes first. A read that finds nothing ready
+    /// waits for the kernel to finish moving what the replica side already
+    /// wrote, so "nothing ready" includes the command's last write. The limit
+    /// is what keeps a descendant that writes without pause from holding the
+    /// session open.
+    fn drain(&self, pty: &Pty, buf: &mut [u8]) -> Result<(), RelayError> {
+        let mut drained = 0;
+        while drained < DRAIN_LIMIT {
+            let room = buf.len().min(DRAIN_LIMIT - drained);
+            match rustix::io::read(pty, &mut buf[..room]) {
+                // End-of-file and hangup end it as they end the loop, and the
+                // primary is non-blocking, so an empty one answers `EAGAIN`.
+                Ok(0) | Err(Errno::AGAIN | Errno::IO) => return Ok(()),
+                Ok(read) => {
+                    write_all(self.output, &buf[..read])?;
+                    drained += read;
+                }
+                Err(Errno::INTR) => {}
+                Err(errno) => {
+                    return Err(RelayError::at("reading the sandbox's terminal")(errno));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drains the signal descriptor and acts on everything it carried.

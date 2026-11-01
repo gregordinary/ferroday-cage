@@ -11,7 +11,8 @@ mod common;
 use std::path::Path;
 
 use ferroday_cage::{
-    Cage, Capability, FsAccess, LandlockScope, NetAccess, SeccompPolicy, SeccompRules,
+    Cage, Capability, ConfigError, Error, FsAccess, LandlockScope, NetAccess, Network,
+    SeccompPolicy, SeccompRules,
 };
 
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
@@ -238,6 +239,96 @@ fn the_signal_scope_confines_a_sandbox_sharing_the_host_pid_space() {
 }
 
 #[test]
+fn a_scope_no_namespace_bounds_builds_only_where_the_kernel_enforces_it() {
+    // A build alone, so this needs neither the fixture nor user namespaces. On a
+    // kernel with scopes both sandboxes build; on one without, the scope that
+    // is the only bound on its reach refuses the build rather than vanish.
+    let abi = ferroday_cage::host::landlock_abi();
+    let enforced = abi.is_some_and(|abi| abi >= 6);
+    let base = || {
+        Cage::builder()
+            .rootfs(common::scratch_dir("unbounded-scope"))
+            .command("/bin/sh")
+    };
+    for (builder, expected) in [
+        (
+            base()
+                .pid_namespace(false)
+                .landlock_scope([LandlockScope::Signal]),
+            "signal",
+        ),
+        (
+            base()
+                .network(Network::Host)
+                .resolv_conf(false)
+                .landlock_scope([LandlockScope::AbstractUnixSocket]),
+            "abstract-unix-socket",
+        ),
+    ] {
+        match builder.build() {
+            Ok(_) => assert!(enforced, "{expected} built at Landlock ABI {abi:?}"),
+            Err(Error::Config(ConfigError::LandlockScopeUnenforceable {
+                scope,
+                abi: reported,
+                ..
+            })) => {
+                assert!(!enforced, "{expected} was refused at Landlock ABI {abi:?}");
+                assert_eq!((scope, reported), (expected, abi));
+            }
+            Err(other) => panic!("{expected}: {other}"),
+        }
+    }
+    // Behind the namespaces a default sandbox has, the same scopes are
+    // additive, and build on any kernel.
+    base()
+        .landlock_scope(LandlockScope::ALL.iter().copied())
+        .build()
+        .expect("a scope a namespace also bounds is not refused");
+}
+
+#[test]
+fn a_landlock_grant_through_a_link_fails_rather_than_follow_it() {
+    let Some(rootfs) = common::scratch_rootfs("landlock-through-a-link") else {
+        return;
+    };
+    if !common::landlock() {
+        return;
+    }
+    // Links a root could ship or an earlier run could plant, both pointing at
+    // the whole sandbox: one at the end of a grant's path, one on the way to
+    // it. Followed, either grant would cover every path in the sandbox, and
+    // the command would read /etc/passwd. Neither is followed, so the launch
+    // fails and names the grant.
+    std::os::unix::fs::symlink("/", rootfs.join("etc/everything")).unwrap();
+    std::os::unix::fs::symlink("/", rootfs.join("srv/app")).unwrap();
+    for grant in ["/etc/everything", "/srv/app/etc"] {
+        let error = Cage::builder()
+            .rootfs(&rootfs)
+            .command("/bin/busybox")
+            .args(["cat", "/etc/passwd"])
+            .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/bin")
+            .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/lib")
+            .landlock_fs(FsAccess::READ, grant)
+            .build()
+            .expect("a valid sandbox configuration")
+            .run()
+            .expect_err("a grant through a link fails the launch");
+        match error {
+            Error::Setup {
+                step: ferroday_cage::SetupStep::LandlockAddRule,
+                detail,
+                source,
+                ..
+            } => {
+                assert_eq!(detail.as_deref(), Some(format!("r on {grant}").as_str()));
+                assert_eq!(source.raw_os_error(), Some(libc::ELOOP), "{source}");
+            }
+            other => panic!("{grant}: expected a Landlock rule failure, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn landlock_request_without_the_lsm_is_a_setup_error() {
     let Some(rootfs) = rootfs() else { return };
     // Only meaningful where Landlock is absent: a requested restriction that
@@ -428,6 +519,50 @@ fn curated_seccomp_denies_a_listed_syscall() {
             && !filtered.contains("rc=0")
             && (denied.contains("permission denied") || denied.contains("not permitted")),
         "the curated profile must deny the mount syscall with EPERM: {filtered:?}"
+    );
+}
+
+#[test]
+fn curated_seccomp_denies_creating_a_namespace() {
+    let Some(rootfs) = rootfs() else {
+        return;
+    };
+    if !common::seccomp() {
+        return;
+    }
+    // The command is root in its own user namespace, so a new user namespace
+    // and a new network namespace are both its to create unfiltered. Running
+    // the script both ways isolates the filter from any other cause. Every
+    // command the shell runs is a process it started, so the filtered run
+    // reaching its last line is the evidence that processes still start.
+    let script = "unshare -U true 2>&1; echo user=$?; unshare -n true 2>&1; echo net=$?";
+    let run = |curated: bool| -> String {
+        let mut builder = Cage::builder()
+            .rootfs(rootfs)
+            .command("/bin/busybox")
+            .args(["sh", "-c", script]);
+        if curated {
+            builder = builder.seccomp(SeccompPolicy::Curated);
+        }
+        let output = builder
+            .build()
+            .expect("a valid sandbox configuration")
+            .output()
+            .expect("the sandbox launches");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let unfiltered = run(false);
+    assert!(
+        unfiltered.contains("user=0") && unfiltered.contains("net=0"),
+        "both namespaces should be created without the filter: {unfiltered:?}"
+    );
+    let filtered = run(true);
+    assert!(
+        filtered.contains("user=1")
+            && filtered.contains("net=1")
+            && filtered.to_lowercase().contains("not permitted"),
+        "the curated profile must deny both namespaces with EPERM: {filtered:?}"
     );
 }
 

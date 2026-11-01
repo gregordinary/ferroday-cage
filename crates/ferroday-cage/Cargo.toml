@@ -98,15 +98,17 @@ debian = ["tarball", "dep:irongall", "dep:sha2"]
 # tarball extractor for the packages' data segments.
 alpine = ["tarball", "dep:rsa", "dep:sha1", "dep:sha2"]
 # The Gentoo userland provisioner: bootstrap a rootfs from a signed stage3
-# tarball. It selects the same dependencies the Debian layer does, which is what
-# it costs to add: OpenPGP for the signed pointer and digest documents, and the
-# SHA-512 those record. Builds on the tarball extractor for the stage3 itself.
+# tarball, and install binary packages into it. It selects the Debian layer's
+# dependencies (OpenPGP for the signed pointer and digest documents, and the
+# SHA-512 those record) and the MD5 portage's package database records. Builds
+# on the tarball extractor for the stage3 itself.
 gentoo = ["tarball", "dep:irongall", "dep:sha2", "dep:md-5"]
 # The hardening layer: opt-in Landlock filesystem rules, seccomp syscall
 # filters, and capability drops applied to the sandboxed command.
 hardening = ["dep:seccompiler"]
 # The native userspace network stack: outbound TCP and UDP connectivity for
-# the isolated network namespace, with no external helper binary.
+# the isolated network namespace, and inbound TCP through published ports,
+# with no external helper binary.
 netstack = ["dep:smoltcp"]
 # The subordinate-id delegate: establish uid/gid range maps through the
 # shadow suite's setuid `newuidmap`/`newgidmap` helpers. The one feature
@@ -217,10 +219,13 @@ required-features = ["tarball"]
 
 # A worked consumer: a profile-driven, group-based sandbox orchestrator. It
 # loads profiles through the `serde` feature, so it builds only when that
-# feature is enabled.
+# feature is enabled. `test` runs its tests under a plain `cargo test`, which
+# otherwise builds an example without running them: they hold the sample
+# profiles beside it to the invocations its documentation shows.
 [[example]]
 name = "orchestrator"
 required-features = ["serde"]
+test = true
 
 # A worked consumer: an ebuild development sandbox that provisions a Gentoo
 # stage3 and builds packages in it under a subordinate uid/gid range map, so
@@ -235,10 +240,12 @@ required-features = ["gentoo", "subid"]
 # A worked consumer: a Gentoo binary-package sandbox that provisions a stage3
 # and installs prebuilt packages into it from the archive's binhost, then runs a
 # command against the result. It provisions through the Gentoo provisioner, so
-# it builds only when the `gentoo` feature is enabled.
+# it builds only when the `gentoo` feature is enabled. Its tests hold the
+# command lines it documents to the sandbox it builds, and `test` runs them.
 [[example]]
 name = "gentoo-binhost"
 required-features = ["gentoo"]
+test = true
 
 # A worked consumer: a Debian source-package build sandbox that bootstraps a
 # suite with build tooling and builds a .deb from source. It provisions the
@@ -275,10 +282,12 @@ required-features = ["debian"]
 # A worked consumer: a fetch sandbox that provisions an Alpine root and runs
 # wget through the native network stack. It provisions through the tarball
 # provisioner and attaches the stack, so it builds only when both the
-# `netstack` and `tarball` features are enabled.
+# `netstack` and `tarball` features are enabled. `test` runs its argument
+# parsing tests.
 [[example]]
 name = "fetch-sandbox"
 required-features = ["netstack", "tarball"]
+test = true
 
 # A worked consumer: a C build sandbox that provisions an Alpine root with the
 # toolchain and links a source tree statically against musl, reporting whether

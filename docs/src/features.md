@@ -26,15 +26,16 @@ cargo add ferroday-cage --features serde,tarball,hardening
 | [`alpine`](alpine.md) | The Alpine provisioner: resolve and install a package set from an apk repository, with signature verification. Serves postmarketOS's repositories too. Implies `tarball` | `rsa`, `sha1`, `sha2`, and `tarball`'s |
 | [`gentoo`](gentoo.md) | The Gentoo provisioner: resolve a stage3 variant to the build the archive currently publishes and extract it, then install prebuilt packages into it from the archive's binary-package host, all verified against a vendored keyring. Implies `tarball` | `irongall`, `sha2`, `md-5`, and `tarball`'s |
 | [`hardening`](hardening.md) | Landlock filesystem and network rules, seccomp syscall filters, capability drops, and the [restriction fallback](restriction-fallback.md) for hosts without user namespaces | `seccompiler` |
-| [`netstack`](userspace-networking.md) | A native userspace TCP/IP stack giving the isolated network outbound IPv4 and IPv6, terminated in-process | `smoltcp` |
+| [`netstack`](userspace-networking.md) | A native userspace TCP/IP stack giving the isolated network IPv4 and IPv6, outbound and through published ports, terminated in-process | `smoltcp` |
 | [`subid`](identity-maps.md) | The subordinate-id delegate: uid/gid range maps established through the shadow suite's `newuidmap`/`newgidmap` | nothing (see below) |
 
 Every dependency above is pure Rust, with any C backend it offers left off, so
-no combination needs a C compiler. Three link the `libc` crate's bindings to the
-C library the target already has. They are `seccompiler` under `hardening`, and
-the random number crates the signature checks of `debian`, `alpine`, and
-`gentoo` draw on. All three run in the calling process, and none is reached from
-the sandbox stages after the fork.
+no combination needs a C compiler. Two reach the `libc` crate's bindings to the
+C library the target already has. `seccompiler`, under `hardening`, does on
+every target. `cpufeatures` does on aarch64, where it asks the C library which
+processor extensions the hashes can use. The SHA-1 and SHA-2 crates bring it
+under `tarball` and every userland. Both run in the calling process, and neither
+is reached from the sandbox stages after the fork.
 
 `subid` is the one feature that changes that property in a different way: it
 adds no dependency, but it is the only feature under which the library executes
@@ -52,9 +53,11 @@ featureless build and is tried first regardless.
 - **Loading sandbox configuration from files.** `serde`.
 - **Producing the root filesystem too.** `tarball` for an archive, `debian` for
   a bootstrapped Debian userland, `alpine` for an Alpine or postmarketOS one,
-  `gentoo` for one bootstrapped from a signed stage3. An `alpine`-only build is
-  the lightest of the three userlands: it needs no OpenPGP implementation, which
-  `debian` and `gentoo` each pull in.
+  `gentoo` for one bootstrapped from a signed stage3. `debian` and `gentoo` add
+  little to what `tarball` compiles: `irongall`, which has no dependencies of
+  its own, and for `gentoo` `md-5`. `alpine` is the heaviest of the three.
+  `rsa` brings a bignum implementation, and `rsa` and `sha1` an older
+  generation of the hash traits beside the one `tarball` uses.
 - **Giving the sandbox network access.** `netstack` for the bundled stack.
   Without it, the [seam](userspace-networking.md) an external stack attaches to
   is still there — it is part of the featureless build.

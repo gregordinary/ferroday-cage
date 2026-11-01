@@ -86,12 +86,20 @@ impl Requirement {
     /// When the variable is set.
     #[track_caller]
     pub fn skip(self, reason: impl Display) {
+        self.insist(&reason);
+        eprintln!("skipping: {reason}");
+    }
+
+    /// Fails the test when the variable demands that it run, and otherwise
+    /// does nothing: the half of [`skip`](Self::skip) that a facility shares
+    /// when another facility's skip is the one reported.
+    #[track_caller]
+    fn insist(self, reason: impl Display) {
         assert!(
             !self.demanded(),
             "{reason}, and {} says this test must run",
             self.variable
         );
-        eprintln!("skipping: {reason}");
     }
 
     /// Whether a test needing this facility runs: `available`, or else the skip
@@ -200,12 +208,23 @@ pub fn landlock_net(abi: Option<i32>) -> bool {
 
 /// Whether the kernel's Landlock ABI has scopes (ABI 6), given what
 /// `host::landlock_abi` reported.
+///
+/// A kernel with no Landlock at all is missing Landlock before it is missing
+/// scopes, so its skip is [`landlock`]'s, which [`LANDLOCK`] turns into a
+/// failure as it does for every Landlock test. [`LANDLOCK_SCOPE`] still demands
+/// the test there too, since scopes are among what that kernel lacks.
 #[track_caller]
 pub fn landlock_scope(abi: Option<i32>) -> bool {
-    LANDLOCK_SCOPE.holds(
-        abi.is_some_and(|abi| abi >= 6),
-        format!("Landlock ABI {abi:?} predates scopes (needs 6)"),
-    )
+    match abi {
+        None => {
+            LANDLOCK_SCOPE.insist("the kernel offers no Landlock support");
+            landlock(abi)
+        }
+        Some(abi) => LANDLOCK_SCOPE.holds(
+            abi >= 6,
+            format!("Landlock ABI {abi} predates scopes (needs 6)"),
+        ),
+    }
 }
 
 /// Whether the kernel offers seccomp filtering, given what

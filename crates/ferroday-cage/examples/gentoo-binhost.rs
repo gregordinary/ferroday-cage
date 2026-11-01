@@ -63,6 +63,8 @@
 //! whether it was created or reused; an already-provisioned root is reused as
 //! it stands. With `--plan` it resolves against `--rootfs` and prints the plan
 //! document, fetching the index but downloading no package and merging nothing.
+//! A trailing command that is a bare name, such as `git`, is looked up on the
+//! sandbox's `PATH`, as a shell would.
 //!
 //! # Resolve now, replay later
 //!
@@ -95,13 +97,13 @@
 //! --help               Print this help and exit
 //! ```
 
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent, Plan};
 use ferroday_cage::provision::{Provision, ProvisionEvent};
-use ferroday_cage::{Cage, Error, ErrorChain};
+use ferroday_cage::{Cage, CageBuilder, Error, ErrorChain};
 
 mod common;
 use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
@@ -297,19 +299,28 @@ fn run(options: Options) -> Result<ExitCode, String> {
     let Some((program, arguments)) = options.command.split_first() else {
         return Ok(ExitCode::SUCCESS);
     };
-    // Nothing beyond the cage's own namespaces and private root: what runs here
-    // is whatever the caller asked for against a root they just provisioned,
-    // and the boundary it needs is the one the cage already draws.
-    let status = Cage::builder()
-        .rootfs(&options.rootfs)
-        .command(program)
-        .args(arguments)
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("HOME", "/root")
+    let status = sandbox(&options.rootfs, program, arguments)
         .build()
         .and_then(|cage| cage.run())
         .map_err(|error: Error| ErrorChain::new(&error).to_string())?;
     Ok(ExitCode::from(status.shell_code()))
+}
+
+/// The sandbox a trailing command runs in, over the root just provisioned.
+///
+/// Nothing beyond the cage's own namespaces and private root: what runs here
+/// is whatever the caller asked for against a root they just provisioned, and
+/// the boundary it needs is the one the cage already draws. A bare command
+/// name is looked up on the `PATH` set here, so `-- git --version` works as it
+/// does at a shell prompt.
+fn sandbox(rootfs: &Path, program: &OsStr, arguments: &[OsString]) -> CageBuilder {
+    Cage::builder()
+        .rootfs(rootfs)
+        .command(program)
+        .args(arguments)
+        .path_lookup(true)
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("HOME", "/root")
 }
 
 /// Prints what a provisioning run is doing, one line per step.
@@ -360,6 +371,9 @@ Usage:
   {PROGRAM} [OPTIONS] --rootfs DIR
   {PROGRAM} [OPTIONS] --rootfs DIR -- COMMAND [ARGS...]
 
+COMMAND runs in the provisioned root. A bare name is looked up on the
+sandbox's PATH.
+
 Options:
   --rootfs DIR         Where the root filesystem lives (required)
   --arch ARCH          Architecture to provision (default: {DEFAULT_ARCH})
@@ -379,4 +393,54 @@ Options:
                        the binhost carries what it names
   --help               Print this help and exit",
     );
+}
+
+/// The command lines this file documents, held to what they claim as far as
+/// the build: provisioning reaches a live archive, which a test does not.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parses a documented command line and builds the sandbox its trailing
+    /// command runs in, over a root filesystem that exists.
+    fn build(line: &[&str]) -> Result<Cage, Error> {
+        let options = parse(line.iter().map(OsString::from))
+            .expect("a documented command line parses")
+            .expect("not a help request");
+        let (program, arguments) = options
+            .command
+            .split_first()
+            .expect("the documented line carries a command");
+        sandbox(&std::env::temp_dir(), program, arguments).build()
+    }
+
+    #[test]
+    fn the_documented_commands_build() {
+        for line in [
+            &[
+                "--rootfs",
+                "./gentoo",
+                "--cache",
+                "./gentoo-cache",
+                "--install",
+                "dev-vcs/git",
+                "--",
+                "git",
+                "--version",
+            ][..],
+            &[
+                "--rootfs",
+                "./elsewhere",
+                "--plan-file",
+                "binhost.plan",
+                "--",
+                "git",
+                "--version",
+            ],
+        ] {
+            if let Err(error) = build(line) {
+                panic!("{line:?}: {}", ErrorChain::new(&error));
+            }
+        }
+    }
 }

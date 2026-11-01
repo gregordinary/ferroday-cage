@@ -307,12 +307,38 @@ pub(crate) fn net_access_for_abi(abi: i32) -> u64 {
 /// Both scopes arrive together in ABI 6 (Linux 6.12). Below it the kernel
 /// defines no scope, and a ruleset carrying one is refused outright, so the
 /// command stage drops them there: the same best-effort downgrade
-/// [`fs_access_for_abi`] performs for a filesystem right.
+/// [`fs_access_for_abi`] performs for a filesystem right. A scope that is the
+/// only bound on its reach never gets that far, since
+/// [`ensure_scopes_enforceable`] refuses it at build.
 pub(crate) fn scope_for_abi(abi: i32) -> u64 {
     if abi >= 6 {
         scope::ABSTRACT_UNIX_SOCKET | scope::SIGNAL
     } else {
         0
+    }
+}
+
+/// Refuses the first scope in `scoped` that a kernel at `abi` cannot enforce,
+/// where `abi` is `None` when the kernel offers no Landlock LSM at all.
+///
+/// For the scopes nothing but Landlock bounds: [`LandlockScope::Signal`]
+/// without a PID namespace, [`LandlockScope::AbstractUnixSocket`] without a
+/// network namespace of the sandbox's own, and every scope a restriction names.
+/// Dropping one of those would leave the reach it names wide open, so the
+/// build fails with [`ConfigError::LandlockScopeUnenforceable`] instead. The
+/// callers pick which scopes they pass; a scope a namespace also bounds, or a
+/// restriction's default, is masked by [`scope_for_abi`] rather than refused.
+pub(crate) fn ensure_scopes_enforceable(scoped: u64, abi: Option<i32>) -> Result<(), ConfigError> {
+    let enforced = abi.map_or(0, scope_for_abi);
+    match LandlockScope::ALL
+        .iter()
+        .find(|scope| scoped & !enforced & scope.to_landlock() != 0)
+    {
+        Some(scope) => Err(ConfigError::LandlockScopeUnenforceable {
+            scope: scope.as_str(),
+            abi,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -340,7 +366,7 @@ pub(crate) fn fs_grant_masked_away(fs_handled: u64, abi: i32) -> bool {
 ///
 /// Callers that treat a masked-away grant as a build error rather than run
 /// unconfined: `HardeningPlan::ensure_landlock_enforceable` (the restriction
-/// fallback) and `HardeningPlan::ensure_host_net_enforceable` (a host-network
+/// fallback) and `HardeningPlan::ensure_sandbox_enforceable` (a host-network
 /// cage, whose only network boundary is Landlock).
 pub(crate) fn net_grant_masked_away(net_handled: u64, abi: i32) -> bool {
     net_handled != 0 && net_handled & net_access_for_abi(abi) == 0
@@ -547,8 +573,9 @@ roster_enum! {
     /// A scope is not a grant. It names an interaction with processes outside
     /// the domain and denies it, while the same interaction between the
     /// command and the processes it starts stays open. A scope needs Landlock
-    /// ABI 6 (Linux 6.12); on an older kernel that offers Landlock it narrows
-    /// away best-effort, as an unsupported filesystem right does.
+    /// ABI 6 (Linux 6.12). On an older kernel it narrows away best-effort where
+    /// a namespace also bounds its reach, and is refused at build where nothing
+    /// else does; [`CageBuilder::landlock_scope`] says which is which.
     ///
     /// Each scope has a canonical kebab-case name (`abstract-unix-socket`),
     /// printed by [`Display`](std::fmt::Display) and parsed by
@@ -710,6 +737,13 @@ impl SeccompAction {
 
 /// `EPERM`, the error a denied syscall reports by default.
 const EPERM: u16 = 1;
+
+/// `ENOSYS`, the error a kernel answers a syscall it does not implement with.
+///
+/// The generic number, which every architecture with seccomp support here
+/// shares. A filter answers with it where the caller should read a refusal as
+/// absence: the x32 guard, and `clone3` in the curated policy.
+const ENOSYS: u16 = 38;
 
 /// `BPF_MAXINSNS`, the kernel's ceiling on a classic BPF filter's length. A
 /// compiled seccomp program is checked against it at build time so an
@@ -1104,10 +1138,17 @@ pub enum SeccompPolicy {
     /// allowing the rest. A convenience posture, not a boundary claim; its
     /// exact roster is documented and grows only additively.
     ///
-    /// Two entries are conditioned on an argument rather than naming a whole
-    /// syscall: `ioctl` is denied for the `TIOCSTI` and `TIOCLINUX` requests,
+    /// Some entries are conditioned on an argument rather than naming a whole
+    /// syscall. `ioctl` is denied for the `TIOCSTI` and `TIOCLINUX` requests,
     /// which write to a terminal's input queue, and allowed for everything
-    /// else.
+    /// else. `unshare` and `clone` are denied whenever their flags create a
+    /// namespace, and allowed otherwise, so processes and threads start as
+    /// usual. `clone3` takes its flags in memory a filter cannot read, so it
+    /// is answered `ENOSYS`, and the C library falls back to `clone`.
+    ///
+    /// Denying namespace creation means a command that builds a sandbox of
+    /// its own, such as a browser or a container runtime, does not run under
+    /// this policy as it does elsewhere.
     Curated,
     /// A caller-authored allow- or denylist.
     Rules(SeccompRules),
@@ -1283,6 +1324,62 @@ fn curated_ioctl_rules() -> Vec<SyscallRule> {
             conditions: vec![SeccompArg::eq_dword(1, request)],
         })
         .collect()
+}
+
+/// The curated denylist's namespace entries: `clone` and `unshare` whenever
+/// their flags create a namespace of any kind.
+///
+/// `setns` is denied outright, and these close the other way in. A command
+/// that creates a user namespace holds every capability inside it, and with a
+/// network namespace beside it reaches netfilter and the rest of the network
+/// configuration a capability gates. Denied by flag rather than by syscall,
+/// because `clone` is how every process and thread starts.
+///
+/// One rule per flag, since a masked comparison tests its mask's bits against
+/// a single value, and "any of these bits" is the union of the one-bit tests.
+/// The comparison is on the low 32 bits: every flag here sits in them, and
+/// `clone` reads no more of its flags than that. `CLONE_NEWTIME` is
+/// `unshare`'s alone, because in `clone`'s flags its bit falls in the low
+/// byte, which carries the exit signal.
+///
+/// `clone3` takes its flags in a structure a filter cannot read, which is why
+/// [`curated_errnos`] answers it `ENOSYS`: the C library then falls back to
+/// `clone`, where these rules see the flags.
+fn curated_namespace_rules() -> Vec<SyscallRule> {
+    use rustix::thread::UnshareFlags;
+    use syscalls::Sysno;
+
+    let created = UnshareFlags::NEWNS
+        | UnshareFlags::NEWCGROUP
+        | UnshareFlags::NEWUTS
+        | UnshareFlags::NEWIPC
+        | UnshareFlags::NEWUSER
+        | UnshareFlags::NEWPID
+        | UnshareFlags::NEWNET;
+    let each_flag = |syscall: Sysno, flags: UnshareFlags| {
+        flags.iter().map(move |flag| SyscallRule {
+            syscall: syscall.id() as i64,
+            conditions: vec![SeccompArg::masked_eq_dword(
+                0,
+                u64::from(flag.bits()),
+                u64::from(flag.bits()),
+            )],
+        })
+    };
+    each_flag(Sysno::clone, created)
+        .chain(each_flag(Sysno::unshare, created | UnshareFlags::NEWTIME))
+        .collect()
+}
+
+/// The syscalls the curated policy answers with an errno of their own: `clone3`
+/// with `ENOSYS`, which the C library reads as a kernel without it.
+///
+/// Denied with the policy's `EPERM`, `clone3` would fail every thread glibc
+/// 2.34 and later starts. Allowed, it would create the namespaces
+/// [`curated_namespace_rules`] refuse through `clone`, since its flags are out
+/// of the filter's sight.
+fn curated_errnos() -> BTreeMap<i64, u16> {
+    BTreeMap::from([(syscalls::Sysno::clone3.id() as i64, ENOSYS)])
 }
 
 roster_enum! {
@@ -1540,6 +1637,42 @@ impl Request {
         self.capabilities = CapabilityPosture::Reduce(caps.into_iter().collect());
     }
 
+    /// The Landlock filesystem grants, in the order they were added.
+    pub(crate) fn fs_grants(&self) -> impl Iterator<Item = (FsAccess, &Path)> {
+        self.landlock
+            .iter()
+            .map(|grant| (grant.access, grant.path.as_path()))
+    }
+
+    /// The Landlock network grants, in the order they were added.
+    pub(crate) fn net_grants(&self) -> impl Iterator<Item = (NetAccess, u16)> {
+        self.landlock_net
+            .iter()
+            .map(|grant| (grant.access, grant.port))
+    }
+
+    /// The Landlock scopes requested, in [`LandlockScope::ALL`]'s order.
+    pub(crate) fn scopes(&self) -> impl Iterator<Item = LandlockScope> {
+        LandlockScope::ALL
+            .iter()
+            .copied()
+            .filter(|scope| self.scope & scope.to_landlock() != 0)
+    }
+
+    /// The seccomp policy, when one is set.
+    pub(crate) fn seccomp(&self) -> Option<&SeccompPolicy> {
+        self.seccomp.as_ref()
+    }
+
+    /// The capabilities kept: `None` leaves the capability sets untouched, and
+    /// an empty list drops every capability.
+    pub(crate) fn kept_capabilities(&self) -> Option<&[Capability]> {
+        match &self.capabilities {
+            CapabilityPosture::Keep => None,
+            CapabilityPosture::Reduce(caps) => Some(caps),
+        }
+    }
+
     /// Lowers the request into the frozen plan, compiling the seccomp policy
     /// and validating the Landlock grant paths. Called from the builders'
     /// `build`, where allocation and failure are free.
@@ -1622,6 +1755,9 @@ impl Request {
             },
             landlock_scoped: self.scope,
             landlock_labels,
+            // A sandbox's grants refuse a link on their way, and the
+            // restriction's build, whose paths are the host's, lets them follow.
+            grants_follow_links: false,
             seccomp,
             keep_caps,
             // Whether the identity switch needs securebits is decided by
@@ -1655,12 +1791,13 @@ fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigErro
                 .into_iter()
                 .map(SyscallRule::unconditional)
                 .chain(curated_ioctl_rules())
+                .chain(curated_namespace_rules())
                 .collect();
             compile_filter(
                 SeccompAction::Allow,
                 SeccompAction::Errno(EPERM),
                 &rules,
-                &BTreeMap::new(),
+                &curated_errnos(),
             )?
         }
         SeccompPolicy::Rules(rules) => compile_filter(
@@ -1835,9 +1972,9 @@ fn errno_prologue(arch: u32, errnos: &BTreeMap<i64, u16>) -> Vec<SockFilter> {
     program
 }
 
-/// A five-instruction classic-BPF prologue applying `deny` to every syscall
-/// carrying `__X32_SYSCALL_BIT`, for prepending to a denylist compiled for
-/// x86_64.
+/// A five-instruction classic-BPF prologue answering every syscall carrying
+/// `__X32_SYSCALL_BIT` with `ENOSYS`, for prepending to a denylist compiled
+/// for x86_64.
 ///
 /// A denylist gates on AUDIT_ARCH_X86_64 and then matches raw syscall numbers.
 /// The x32 ABI shares that arch but sets `__X32_SYSCALL_BIT` on every number,
@@ -1852,10 +1989,17 @@ fn errno_prologue(arch: u32, errnos: &BTreeMap<i64, u16>) -> Vec<SockFilter> {
 ///   [1] if A != AUDIT_ARCH_X86_64: jump past the guard
 ///   [2] A = seccomp_data.nr
 ///   [3] if A & __X32_SYSCALL_BIT == 0: jump past the guard
-///   [4] return `deny`
+///   [4] return ERRNO(ENOSYS)
 /// ```
-fn x32_deny_prologue(deny: SeccompAction) -> [SockFilter; 5] {
-    let ret = ret_value(deny);
+///
+/// The answer is fixed rather than taken from the policy. A denylist's listed
+/// action may itself let a syscall run (`Log` does), and the errnos a policy
+/// gives single syscalls are keyed by their 64-bit numbers, so neither
+/// describes the x32 range. `ENOSYS` is what a kernel built without x32
+/// answers for the same numbers, so a program that probes for x32 reads it
+/// as absent, and nothing is let through whatever the policy says.
+fn x32_deny_prologue() -> [SockFilter; 5] {
+    let ret = ret_value(SeccompAction::Errno(ENOSYS));
     [
         SockFilter {
             code: bpf::LD_W_ABS,
@@ -1999,7 +2143,7 @@ fn compile_filter(
     // ahead of seccompiler's program, which reloads the arch word itself.
     let needs_x32_guard =
         matches!(arch, seccompiler::TargetArch::x86_64) && default_action.is_permissive();
-    let guard = needs_x32_guard.then(|| x32_deny_prologue(listed_action));
+    let guard = needs_x32_guard.then(x32_deny_prologue);
     let answers = (!errnos.is_empty()).then(|| errno_prologue(audit_arch(arch), errnos));
     let program: Vec<SockFilter> = guard
         .into_iter()
@@ -2356,20 +2500,16 @@ pub(crate) mod serde_request {
         /// Raises the in-memory request into its profile form, rejecting the
         /// parts a profile cannot represent.
         fn from_request(request: &Request) -> Result<HardeningProfile, String> {
-            let (drop_caps, keep_caps) = match &request.capabilities {
-                CapabilityPosture::Keep => (false, None),
-                CapabilityPosture::Reduce(caps) if caps.is_empty() => (true, None),
-                CapabilityPosture::Reduce(caps) => (
+            let (drop_caps, keep_caps) = match request.kept_capabilities() {
+                None => (false, None),
+                Some([]) => (true, None),
+                Some(caps) => (
                     false,
                     Some(caps.iter().map(|cap| cap.to_string()).collect()),
                 ),
             };
 
-            let landlock_scope = LandlockScope::ALL
-                .iter()
-                .filter(|scope| request.scope & scope.to_landlock() != 0)
-                .map(|scope| scope.to_string())
-                .collect();
+            let landlock_scope = request.scopes().map(|scope| scope.to_string()).collect();
 
             let seccomp = request
                 .seccomp
@@ -2655,6 +2795,69 @@ pub(crate) mod serde_request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `seccomp_data` a filter is run over: the syscall number, the audit
+    /// architecture, and the six arguments.
+    struct Call {
+        arch: u32,
+        nr: u32,
+        args: [u64; 6],
+    }
+
+    impl Call {
+        /// A call of `syscall` on the host's architecture, with `args` and then
+        /// zeroes.
+        fn host(syscall: i64, args: &[u64]) -> Call {
+            let mut all = [0; 6];
+            all[..args.len()].copy_from_slice(args);
+            Call {
+                arch: audit_arch(host_target_arch().unwrap()),
+                nr: u32::try_from(syscall).unwrap(),
+                args: all,
+            }
+        }
+    }
+
+    /// Runs a classic BPF filter over `call` as the kernel does, returning the
+    /// `SECCOMP_RET_*` value it answers.
+    ///
+    /// Only the instructions this crate's fragments and seccompiler's backend
+    /// emit are interpreted. Any other fails the test, so a program that
+    /// starts using one is not misread.
+    fn run_filter(program: &[SockFilter], call: &Call) -> u32 {
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&call.nr.to_ne_bytes());
+        data[4..8].copy_from_slice(&call.arch.to_ne_bytes());
+        for (index, arg) in call.args.iter().enumerate() {
+            let at = 16 + 8 * index;
+            data[at..at + 8].copy_from_slice(&arg.to_ne_bytes());
+        }
+        let mut accumulator = 0u32;
+        let mut next = 0usize;
+        loop {
+            let insn = program[next];
+            next += 1;
+            let k = insn.k;
+            let branch = |taken: bool| usize::from(if taken { insn.jt } else { insn.jf });
+            match insn.code {
+                bpf::LD_W_ABS => {
+                    let at = k as usize;
+                    accumulator = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+                }
+                // BPF_ALU | BPF_AND | BPF_K
+                0x54 => accumulator &= k,
+                bpf::JMP_JA => next += k as usize,
+                bpf::JMP_JEQ_K => next += branch(accumulator == k),
+                // BPF_JMP | BPF_JGT | BPF_K
+                0x25 => next += branch(accumulator > k),
+                // BPF_JMP | BPF_JGE | BPF_K
+                0x35 => next += branch(accumulator >= k),
+                bpf::JMP_JSET_K => next += branch(accumulator & k != 0),
+                bpf::RET_K => return k,
+                code => panic!("instruction {code:#06x} at {} is not interpreted", next - 1),
+            }
+        }
+    }
 
     #[test]
     fn fs_access_composes_and_contains() {
@@ -2959,7 +3162,7 @@ mod tests {
         // A denylist (permissive default) is bypassable through the x32 ABI, so
         // the compiled program must begin with the guard denying that range.
         let program = compile_seccomp(&SeccompPolicy::Curated).unwrap();
-        let guard = x32_deny_prologue(SeccompAction::Errno(EPERM));
+        let guard = x32_deny_prologue();
         assert!(program.len() > guard.len());
         assert_eq!(&program[..guard.len()], &guard[..]);
     }
@@ -2973,7 +3176,7 @@ mod tests {
         // Both false branches must land on instruction 5, the first of
         // seccompiler's own program: from [1] that is 1 + 1 + jf(3) = 5, and
         // from [3] it is 3 + 1 + jf(1) = 5.
-        let guard = x32_deny_prologue(SeccompAction::Errno(EPERM));
+        let guard = x32_deny_prologue();
         assert_eq!(
             guard,
             [
@@ -3005,20 +3208,113 @@ mod tests {
                     jf: 1,
                     k: 0x4000_0000,
                 },
-                // [4] return EPERM
+                // [4] return ENOSYS
                 SockFilter {
                     code: 0x06,
                     jt: 0,
                     jf: 0,
-                    k: 0x0005_0000 | u32::from(EPERM),
+                    k: 0x0005_0000 | 38,
                 },
             ],
         );
+    }
 
-        // The returned action is the caller's, not a constant.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_x32_guard_denies_whatever_the_policy_lets_run() {
+        // A listed action that lets the call run, and an errno the policy gives
+        // one syscall by its 64-bit number. Neither describes an x32 call, and
+        // the guard answers every one of them ENOSYS all the same.
+        let rules = SeccompRules::denying([libc::SYS_ptrace])
+            .listed_action(SeccompAction::Log)
+            .errno_for(libc::SYS_keyctl, EPERM);
+        let program = compile_seccomp(&SeccompPolicy::Rules(rules)).unwrap();
+        let enosys = ret_value(SeccompAction::Errno(ENOSYS));
+        for syscall in [libc::SYS_keyctl, libc::SYS_ptrace, libc::SYS_getpid] {
+            let x32 = Call::host(syscall | i64::from(X32_SYSCALL_BIT), &[]);
+            assert_eq!(run_filter(&program, &x32), enosys, "x32 syscall {syscall}");
+        }
+        // The 64-bit calls keep the answers the policy gives them.
+        for (syscall, action) in [
+            (libc::SYS_keyctl, SeccompAction::Errno(EPERM)),
+            (libc::SYS_ptrace, SeccompAction::Log),
+            (libc::SYS_getpid, SeccompAction::Allow),
+        ] {
+            let call = Call::host(syscall, &[]);
+            assert_eq!(run_filter(&program, &call), ret_value(action), "{syscall}");
+        }
+    }
+
+    #[test]
+    fn enosys_is_the_kernels() {
+        assert_eq!(i32::from(ENOSYS), libc::ENOSYS);
+        assert_eq!(i32::from(EPERM), libc::EPERM);
+    }
+
+    #[test]
+    fn the_curated_policy_denies_creating_a_namespace() {
+        let program = compile_seccomp(&SeccompPolicy::Curated).unwrap();
+        let eperm = ret_value(SeccompAction::Errno(EPERM));
+        let allow = ret_value(SeccompAction::Allow);
+        let sigchld = libc::SIGCHLD as u64;
+        let new = [
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWCGROUP,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWNET,
+        ]
+        .map(|flag| flag as u64);
+
+        // Every namespace flag, alone or beside others, refuses the call.
+        for flag in new {
+            for flags in [flag, flag | sigchld, flag | libc::CLONE_NEWUSER as u64] {
+                let clone = Call::host(libc::SYS_clone, &[flags]);
+                assert_eq!(run_filter(&program, &clone), eperm, "clone {flags:#x}");
+                let unshare = Call::host(libc::SYS_unshare, &[flags]);
+                assert_eq!(run_filter(&program, &unshare), eperm, "unshare {flags:#x}");
+            }
+        }
+        let new_time = Call::host(libc::SYS_unshare, &[libc::CLONE_NEWTIME as u64]);
+        assert_eq!(run_filter(&program, &new_time), eperm);
+        // Bits above the low 32 hide nothing: `clone` never reads them, and
+        // `unshare` refuses them itself.
+        let high = Call::host(libc::SYS_unshare, &[1 << 32 | libc::CLONE_NEWUSER as u64]);
+        assert_eq!(run_filter(&program, &high), eperm);
+
+        // A process or a thread starts as usual. glibc's thread flags, its
+        // fork's, and a vfork-style spawn are all flags without a namespace.
+        let thread = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM
+            | libc::CLONE_SETTLS
+            | libc::CLONE_PARENT_SETTID
+            | libc::CLONE_CHILD_CLEARTID) as u64;
+        let fork = (libc::CLONE_CHILD_SETTID | libc::CLONE_CHILD_CLEARTID) as u64 | sigchld;
+        let spawn = (libc::CLONE_VM | libc::CLONE_VFORK) as u64 | sigchld;
+        for flags in [thread, fork, spawn] {
+            let clone = Call::host(libc::SYS_clone, &[flags]);
+            assert_eq!(run_filter(&program, &clone), allow, "clone {flags:#x}");
+        }
+        // Unsharing what is not a namespace stays allowed. The exit signal's
+        // byte is `clone`'s, so a signal number sharing `CLONE_NEWTIME`'s bit
+        // is not mistaken for it.
+        let files = Call::host(libc::SYS_unshare, &[libc::CLONE_FILES as u64]);
+        assert_eq!(run_filter(&program, &files), allow);
+        let signal = Call::host(libc::SYS_clone, &[libc::CLONE_NEWTIME as u64 | sigchld]);
+        assert_eq!(run_filter(&program, &signal), allow);
+
+        // `clone3` is answered ENOSYS, whatever it was asked, so the C library
+        // falls back to `clone`.
+        let clone3 = Call::host(libc::SYS_clone3, &[0, 88]);
         assert_eq!(
-            x32_deny_prologue(SeccompAction::KillProcess)[4].k,
-            0x8000_0000,
+            run_filter(&program, &clone3),
+            ret_value(SeccompAction::Errno(ENOSYS))
         );
     }
 
@@ -3318,6 +3614,130 @@ mod tests {
             LandlockScope::bits_of(LandlockScope::ALL.iter().copied()),
         );
         assert_eq!(scope_for_abi(9), scope_for_abi(6));
+    }
+
+    /// Whether `result` refuses `scope` on a kernel that reported `abi`.
+    fn refuses_scope(result: Result<(), ConfigError>, scope: &str, abi: Option<i32>) -> bool {
+        matches!(
+            result,
+            Err(ConfigError::LandlockScopeUnenforceable { scope: refused, abi: reported })
+                if refused == scope && reported == abi
+        )
+    }
+
+    #[test]
+    fn a_scope_is_refused_where_the_kernel_cannot_enforce_it() {
+        let both = scope::SIGNAL | scope::ABSTRACT_UNIX_SOCKET;
+        for abi in [Some(6), Some(9)] {
+            assert!(ensure_scopes_enforceable(both, abi).is_ok());
+        }
+        // Below ABI 6, and with no Landlock at all, every scope is refused,
+        // naming the first of them.
+        for abi in [None, Some(1), Some(5)] {
+            assert!(refuses_scope(
+                ensure_scopes_enforceable(scope::SIGNAL, abi),
+                "signal",
+                abi,
+            ));
+            assert!(refuses_scope(
+                ensure_scopes_enforceable(scope::ABSTRACT_UNIX_SOCKET, abi),
+                "abstract-unix-socket",
+                abi,
+            ));
+            assert!(ensure_scopes_enforceable(both, abi).is_err());
+            // No scope asked for, nothing to refuse.
+            assert!(ensure_scopes_enforceable(0, abi).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_sandbox_refuses_the_signal_scope_only_without_a_pid_namespace() {
+        let mut request = Request::default();
+        request.set_scope([LandlockScope::Signal]);
+        let plan = request.lower().unwrap();
+        let unasked = || -> Option<i32> { panic!("the ABI was probed with nothing to check") };
+
+        // Behind a PID namespace the scope is additive, so nothing is checked
+        // and the ABI is never probed. Host networking does not change that.
+        assert!(
+            plan.ensure_sandbox_enforceable(false, false, unasked)
+                .is_ok()
+        );
+        assert!(
+            plan.ensure_sandbox_enforceable(true, false, unasked)
+                .is_ok()
+        );
+        // Without one it is the only bound on signalling the host's processes.
+        for abi in [None, Some(5)] {
+            assert!(refuses_scope(
+                plan.ensure_sandbox_enforceable(false, true, || abi),
+                "signal",
+                abi,
+            ));
+        }
+        assert!(
+            plan.ensure_sandbox_enforceable(false, true, || Some(6))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_host_network_sandbox_refuses_what_it_cannot_enforce_on_the_host_network() {
+        let unasked = || -> Option<i32> { panic!("the ABI was probed with nothing to check") };
+
+        let mut scoped = Request::default();
+        scoped.set_scope([LandlockScope::AbstractUnixSocket]);
+        let scoped = scoped.lower().unwrap();
+        // In a network namespace of its own, and without a PID namespace, the
+        // socket scope is additive.
+        assert!(
+            scoped
+                .ensure_sandbox_enforceable(false, true, unasked)
+                .is_ok()
+        );
+        for abi in [None, Some(5)] {
+            assert!(refuses_scope(
+                scoped.ensure_sandbox_enforceable(true, false, || abi),
+                "abstract-unix-socket",
+                abi,
+            ));
+        }
+        assert!(
+            scoped
+                .ensure_sandbox_enforceable(true, false, || Some(6))
+                .is_ok()
+        );
+
+        // A network grant needs only ABI 4, so at ABI 5 the grant passes and
+        // the scope beside it is what is refused.
+        let mut granted = Request::default();
+        granted.grant_net(NetAccess::CONNECT, 443);
+        let mut both = granted.clone();
+        let granted = granted.lower().unwrap();
+        assert!(
+            granted
+                .ensure_sandbox_enforceable(false, true, unasked)
+                .is_ok()
+        );
+        for abi in [None, Some(3)] {
+            assert!(matches!(
+                granted.ensure_sandbox_enforceable(true, false, || abi),
+                Err(ConfigError::HostNetworkLandlockUnenforceable { abi: reported })
+                    if reported == abi
+            ));
+        }
+        assert!(
+            granted
+                .ensure_sandbox_enforceable(true, false, || Some(4))
+                .is_ok()
+        );
+        both.set_scope([LandlockScope::AbstractUnixSocket]);
+        let both = both.lower().unwrap();
+        assert!(refuses_scope(
+            both.ensure_sandbox_enforceable(true, false, || Some(5)),
+            "abstract-unix-socket",
+            Some(5),
+        ));
     }
 
     #[test]

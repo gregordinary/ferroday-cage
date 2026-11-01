@@ -90,6 +90,9 @@ struct Session {
     after: Termios,
     /// Everything the user's end read.
     seen: String,
+    /// How long the session ran: from just before its escalation was built to
+    /// the relay's return. Neither the session lock nor the launch is in it.
+    ran: Duration,
 }
 
 impl Session {
@@ -148,7 +151,9 @@ fn relayed(
     }
     // Built here rather than by the caller: an `Escalation`'s deadline runs
     // from where it was built, and building one before the launch would spend
-    // the timeout on starting the sandbox.
+    // the timeout on starting the sandbox. The session's own clock starts with
+    // it, so what a test asserts about a bound is measured from the bound.
+    let started = Instant::now();
     if let Some((timeout, kill_after)) = bound {
         relay = relay.escalation(Escalation::new(Some(timeout), kill_after));
     }
@@ -173,9 +178,10 @@ fn relayed(
             });
             let outcome = relay.run(&mut running, &pty, &signals);
             done.store(true, Ordering::Release);
-            outcome
+            (outcome, started.elapsed())
         })
     };
+    let (outcome, ran) = outcome;
 
     let after =
         termios::tcgetattr(&caller.primary).expect("the caller terminal reports its settings");
@@ -184,6 +190,7 @@ fn relayed(
         before,
         after,
         seen: caller.seen,
+        ran,
     }
 }
 
@@ -868,6 +875,197 @@ fn a_deadline_stops_a_restricted_command_that_closed_its_terminal() {
     session.assert_restored();
 }
 
+// -- A terminal that outlives its command -------------------------------------
+
+/// A descendant that keeps the session's terminal open after the command exits.
+///
+/// It ignores `SIGHUP`, inherited from the script that starts it, so the hangup
+/// the command's exit sends the session's foreground process group does not end
+/// it. Without a PID namespace nothing else does. It writes to the terminal
+/// every second, and gives up after twenty, or at the first write that fails
+/// because the terminal was hung up. A relay that waited for it therefore shows
+/// as a session that lasted twenty seconds, not as a suite that never ends.
+const DESCENDANT_HOLDING_THE_TERMINAL: &str =
+    "(i=0; while [ $i -lt 20 ]; do sleep 1; echo tick || exit; i=$((i+1)); done) &";
+
+/// How long a session that a descendant outlives may run before the test calls
+/// it waiting for the descendant: well short of the descendant's twenty
+/// seconds, and generous for a loaded host.
+const WELL_BEFORE_THE_DESCENDANT: Duration = Duration::from_secs(12);
+
+/// A command that leaves [`DESCENDANT_HOLDING_THE_TERMINAL`] behind and then
+/// ignores the termination request, so only the kill ends it. The ignored
+/// disposition survives the `exec`.
+fn leaves_a_descendant_and_ignores_the_request() -> String {
+    format!("trap '' HUP TERM; {DESCENDANT_HOLDING_THE_TERMINAL} echo ready; exec sleep 60")
+}
+
+/// A sandbox without a PID namespace, where a descendant can outlive the
+/// command, running `/bin/sh -c script` against the fixture rootfs.
+fn shell_without_a_pid_namespace(rootfs: &std::path::Path, script: &str) -> Cage {
+    Cage::builder()
+        .rootfs(rootfs)
+        .pid_namespace(false)
+        .command("/bin/sh")
+        .args(["-c", script])
+        .build()
+        .expect("a valid sandbox configuration")
+}
+
+/// Waits for the command to announce itself and for the descendant's first
+/// write, so a descendant that failed to start fails the test rather than
+/// passing it.
+fn expect_the_descendant(caller: &mut Caller) {
+    caller.expect("ready");
+    caller.expect("tick");
+}
+
+/// Asserts that a session bounded at two seconds plus one of grace ended at
+/// the kill: no sooner, since only the kill ends the command, and not when
+/// the descendant holding its terminal gave up.
+fn assert_ended_at_the_kill(session: &Session) {
+    assert!(
+        matches!(session.outcome, Ok(None)),
+        "the deadline passed, so no status is reported: {:?}",
+        session.outcome,
+    );
+    assert!(
+        session.ran >= Duration::from_secs(3),
+        "the session ended before the kill: {:?}",
+        session.ran,
+    );
+    assert!(
+        session.ran < WELL_BEFORE_THE_DESCENDANT,
+        "the session waited for the descendant holding its terminal: {:?}",
+        session.ran,
+    );
+    session.assert_restored();
+}
+
+/// The command's exit ends the session while a descendant still holds its
+/// terminal: the deadline's kill is the end of it, not the descendant's exit.
+#[test]
+fn a_deadline_ends_a_session_whose_terminal_a_descendant_holds() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let cage =
+        shell_without_a_pid_namespace(rootfs, &leaves_a_descendant_and_ignores_the_request());
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        Some((Duration::from_secs(2), Duration::from_secs(1))),
+        |terminal| cage.spawn_terminal(terminal),
+        expect_the_descendant,
+    );
+    assert_ended_at_the_kill(&session);
+}
+
+/// An interrupt from outside ends such a session as promptly: the command
+/// acts on the request, and its exit ends the relaying.
+#[test]
+fn an_interrupt_ends_a_session_whose_terminal_a_descendant_holds() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let cage = shell_without_a_pid_namespace(
+        rootfs,
+        &format!("trap '' HUP; {DESCENDANT_HOLDING_THE_TERMINAL} echo ready; exec sleep 60"),
+    );
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        None,
+        |terminal| cage.spawn_terminal(terminal),
+        |caller| {
+            expect_the_descendant(caller);
+            caller.signal(Signal::TERM);
+        },
+    );
+
+    assert_eq!(
+        session.status().signal(),
+        Some(Signal::TERM.as_raw()),
+        "the command was ended by the forwarded request: {:?}",
+        session.outcome,
+    );
+    assert!(
+        session.ran < WELL_BEFORE_THE_DESCENDANT,
+        "the session waited for the descendant holding its terminal: {:?}",
+        session.ran,
+    );
+    session.assert_restored();
+}
+
+/// What the command wrote before it exited reaches the caller in full, although
+/// its exit ends the relaying while the terminal is still open.
+///
+/// The exit has to arrive while the session's terminal still holds more than
+/// the relay reads at once. So the user stops reading for a second while the
+/// command writes a burst and exits. That fills the caller's terminal, stalls
+/// the relay in its write, and leaves the burst's tail queued behind it. Only
+/// the drain that follows the exit delivers that tail.
+#[test]
+fn a_session_ended_by_the_commands_exit_delivers_everything_it_wrote() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // About forty kilobytes: past what the caller's terminal, the relay's
+    // buffer, and most of the session's terminal hold between them.
+    const LINES: usize = 3600;
+    let cage = shell_without_a_pid_namespace(
+        rootfs,
+        &format!(
+            "trap '' HUP; {DESCENDANT_HOLDING_THE_TERMINAL} echo ready; read go; \
+             i=0; while [ $i -lt {LINES} ]; do echo line-$i; i=$((i+1)); done; echo last-line"
+        ),
+    );
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        None,
+        |terminal| cage.spawn_terminal(terminal),
+        |caller| {
+            expect_the_descendant(caller);
+            caller.send("go\n");
+            std::thread::sleep(Duration::from_secs(1));
+        },
+    );
+
+    assert!(session.status().success(), "{}", session.seen);
+    for at in 0..LINES {
+        assert!(
+            session.seen.contains(&format!("line-{at}\r\n")),
+            "line {at} of the command's output never arrived",
+        );
+    }
+    assert!(session.seen.contains("last-line"), "{}", session.seen);
+    assert!(
+        session.ran < WELL_BEFORE_THE_DESCENDANT,
+        "the session waited for the descendant holding its terminal: {:?}",
+        session.ran,
+    );
+    session.assert_restored();
+}
+
+/// The restriction fallback has no PID namespace at all, so the deadline's
+/// kill reaches only its command, and the session still ends there.
+#[cfg(feature = "hardening")]
+#[test]
+fn a_deadline_ends_a_restricted_session_whose_terminal_a_descendant_holds() {
+    let Some(restriction) = restricted_shell(&leaves_a_descendant_and_ignores_the_request()) else {
+        return;
+    };
+    let session = relayed(
+        Wiring::Terminal { raw: true },
+        (24, 80),
+        Some((Duration::from_secs(2), Duration::from_secs(1))),
+        |terminal| restriction.spawn_terminal(terminal),
+        expect_the_descendant,
+    );
+    assert_ended_at_the_kill(&session);
+}
+
 /// A restriction running `/bin/sh -c script` from the host's system trees, or
 /// `None`, with the skip reported, where the kernel offers no Landlock.
 ///
@@ -881,10 +1079,13 @@ fn restricted_shell(script: &str) -> Option<ferroday_cage::Restriction> {
         return None;
     }
     // The command runs from the system trees, so they are what it is granted;
-    // the pseudoterminal arrives as descriptors and needs no path at all.
+    // the pseudoterminal arrives as descriptors and needs no path at all. A
+    // shell without job control opens `/dev/null` as a background job's input,
+    // so a script that starts one needs that too.
     let mut builder = ferroday_cage::Restriction::builder()
         .command("/bin/sh")
-        .args(["-c", script]);
+        .args(["-c", script])
+        .landlock_fs(ferroday_cage::FsAccess::READ, "/dev/null");
     for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
         if std::path::Path::new(tree).exists() {
             builder = builder.landlock_fs(
@@ -1082,13 +1283,15 @@ fn helper_relay_started_in_the_background() {
 
 // -- Restoration outside a session --------------------------------------------
 
-/// `restore_terminal` reaches the first raw session's terminal and nothing else,
-/// so a terminal no relay has touched is left exactly as it is.
+/// `restore_terminal` reaches the terminal of the raw session in force and
+/// nothing else, so a terminal no relay has touched is left exactly as it is.
 ///
-/// Order-independent by construction: whatever earlier test may already have
-/// recorded a raw session, this terminal is not it.
+/// Taken under the session lock, since the session in force is whichever
+/// relay holds one: a call made beside another test's session would restore
+/// that session's terminal under it.
 #[test]
 fn restoring_leaves_a_terminal_no_session_touched_alone() {
+    let _serial = serially();
     let (primary, _replica) = pty::pair(24, 80);
     let before = termios::tcgetattr(&primary).expect("the settings are readable");
     restore_terminal();

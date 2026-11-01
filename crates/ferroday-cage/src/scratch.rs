@@ -6,8 +6,10 @@
 //! an ad-hoc directory that only clears itself on the *next* run accumulates
 //! one tree per run forever, which a long-lived machine notices.
 //!
-//! Integration tests use `tests/common::scratch_dir`, which places its trees
-//! under `target` for the same reason.
+//! Integration tests take theirs from the testkit's `scratch_dir` instead: one
+//! fixed name per test in the fixture cache, under `target` unless
+//! `FERRODAY_CAGE_FIXTURE_DIR` moves it, emptied when the next run reuses it.
+//! A fixed name is what keeps a tree that outlives its test from accumulating.
 
 use std::path::{Path, PathBuf};
 
@@ -46,10 +48,9 @@ impl Scratch {
 
     /// Creates an empty scratch directory for `subject`'s test named `tag`.
     ///
-    /// Every test module used to wrap [`new`](Self::new) in a local `tempdir`
-    /// that prefixed the tag with the module's own name — six functions of one
-    /// name and six meanings. This is that, once: the prefix is an argument, so
-    /// a reader of a call site sees which tree it makes.
+    /// [`new`](Self::new) with the tag prefixed by the subject. The prefix is
+    /// an argument rather than each test module's own wrapper, so a reader of a
+    /// call site sees which tree it makes.
     pub(crate) fn for_test(subject: &str, tag: &str) -> Scratch {
         Scratch::new(&format!("{subject}-{tag}"))
     }

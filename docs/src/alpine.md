@@ -414,8 +414,9 @@ less than `apk` does would be worse rather than safer, so the layer verifies
 exactly this and offers no knob: a knob would be a choice between verifying and
 not verifying. Forging a package against this chain requires a chosen-prefix
 SHA-1 collision whose second preimage is a well-formed gzip of a tar containing a
-`.PKGINFO` — expensive, but no longer theoretical. The question is revisited when
-Alpine publishes apk v3 indexes, which no release does today.
+`.PKGINFO` — expensive, but no longer theoretical. No Alpine release publishes
+its indexes in the apk v3 format, so this is the chain every release installs
+through.
 
 ### What binds a package to what was asked for
 
@@ -458,9 +459,8 @@ selecting from it.
 
 ### A private repository signs its index
 
-There is no equivalent of the Debian layer's `trust_unsigned`, and none is
-planned. apk has no unsigned mode in practice, so admitting one would be this
-layer's invention rather than interoperability with anything.
+There is no equivalent of the Debian layer's `trust_unsigned`. apk has no
+unsigned mode in practice, so the layer offers none either.
 
 The route for a caller with a repository of their own is the one `apk` itself
 takes: sign the index with their own key, as `abuild-sign` does, and pass that key

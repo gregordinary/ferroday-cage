@@ -1,12 +1,12 @@
 //! Tap-device creation and configuration inside the sandbox's network
 //! namespace.
 //!
-//! This module is one of the crate's two homes of `unsafe` (the other is
-//! the launch mechanism). The unsafe surface here is the fork of the helper
-//! process and the interface-ioctl boundary: each ioctl passes a
-//! `#[repr(C)]` view of the kernel's request struct, laid out
-//! field-for-field with a compile-time size assertion, and carries a SAFETY
-//! comment stating the layout it relies on.
+//! This module is one of the crate's three homes of `unsafe`; the others are
+//! the launch mechanism and the terminal relay's signals. The unsafe surface
+//! here is the fork of the helper process and the interface-ioctl boundary:
+//! each ioctl passes a `#[repr(C)]` view of the kernel's request struct, laid
+//! out field-for-field with a compile-time size assertion, and carries a
+//! SAFETY comment stating the layout it relies on.
 //!
 //! The work happens in a forked, short-lived helper process, and the shape
 //! is dictated by a kernel rule: `setns` to a network namespace demands

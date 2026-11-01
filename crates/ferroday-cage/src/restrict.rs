@@ -65,10 +65,12 @@
 //! the first three. Its default [`landlock_scope`](RestrictionBuilder::landlock_scope)
 //! confines signals and abstract-socket connections to the processes the
 //! command started, and the scopes give every restriction a Landlock domain,
-//! grants or none. On an older kernel the scopes are dropped, signals and
-//! abstract sockets stay open, and only a Landlock grant creates a domain; the
-//! curated seccomp denylist still blocks `ptrace` and `process_vm_*`. The
-//! curated denylist also blocks `keyctl`, which is what closes the keyrings.
+//! grants or none. On an older kernel the default scopes are dropped, signals
+//! and abstract sockets stay open, and only a Landlock grant creates a domain;
+//! the curated seccomp denylist still blocks `ptrace` and `process_vm_*`. Scopes
+//! the caller names are refused there instead, since nothing else would bound
+//! those reaches. The curated denylist also blocks `keyctl`, which is what
+//! closes the keyrings.
 //!
 //! A default sandbox closes the first three through its PID and network
 //! namespaces. Its own user namespace gives it user keyrings of its own, so of
@@ -141,7 +143,9 @@ use rustix::thread::UnshareFlags;
 use crate::error::{ConfigError, Error};
 use crate::hardening::{FsAccess, LandlockScope, NetAccess, Request, SeccompPolicy};
 use crate::limits::{Limit, Resource};
-use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, StdioPlan};
+use crate::mechanism::{
+    Confinement, HardeningPlan, IdentityPlan, LaunchPlan, ManagedPlaceholders, StdioPlan,
+};
 use crate::observer::{Collect, Observer, Output};
 use crate::running::Running;
 use crate::spec::{self, Stdio};
@@ -328,6 +332,11 @@ pub struct RestrictionBuilder {
     stop_with_caller: bool,
     rlimits: BTreeMap<Resource, (Limit, Limit)>,
     hardening: Request,
+    /// Whether the caller named the scopes through
+    /// [`landlock_scope`](Self::landlock_scope), rather than leaving the default
+    /// every restriction starts with. A kernel that cannot enforce a named scope
+    /// refuses the build, and drops a default one.
+    scopes_named: bool,
 }
 
 impl Default for RestrictionBuilder {
@@ -351,6 +360,7 @@ impl Default for RestrictionBuilder {
                 hardening.set_scope(LandlockScope::ALL.iter().copied());
                 hardening
             },
+            scopes_named: false,
         }
     }
 }
@@ -446,8 +456,9 @@ impl RestrictionBuilder {
 
     /// Sets the command's working directory, a host path.
     ///
-    /// The path must be absolute and must exist at launch; a missing
-    /// directory is a setup error, not a fallback. The default is `/`.
+    /// The path must be absolute, with no `..` component, and must exist at
+    /// launch; a missing directory is a setup error, not a fallback. The
+    /// default is `/`.
     pub fn current_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.workdir = Some(path.as_ref().to_path_buf());
         self
@@ -508,6 +519,12 @@ impl RestrictionBuilder {
     /// device node as well as a directory; there it allows only the rights that
     /// act on a file, since there are no entries to list, create, or remove.
     ///
+    /// The path is resolved as the host resolves it, through symbolic links, so
+    /// a grant on a merged-`/usr` host's `/lib` covers `/usr/lib`. A grant
+    /// therefore covers whatever a link on its path points at when the command
+    /// starts, including a link an earlier run left in a directory it could
+    /// write.
+    ///
     /// The ruleset is enforced on a kernel that offers Landlock, best-effort
     /// down to the kernel's supported ABI. A filesystem grant keeps its ABI-1
     /// base rights on every Landlock kernel, so it always enforces there; a
@@ -566,17 +583,25 @@ impl RestrictionBuilder {
     /// calling user and reach the session bus and the X server. Both are on by
     /// default; name fewer only for a command that needs that reach.
     ///
-    /// Scopes need Landlock ABI 6 (Linux 6.12). On a kernel without it,
-    /// Landlock LSM or not, the build drops them, which leaves those reaches
-    /// open; [`host::landlock_abi`](crate::host::landlock_abi) reports the
-    /// running ABI. Unlike a grant, a scope alone does not count as
-    /// confinement: a restriction with no grant and no seccomp policy is still
-    /// refused as [`ConfigError::RestrictionEmpty`](crate::ConfigError::RestrictionEmpty).
+    /// Scopes need Landlock ABI 6 (Linux 6.12), and a restriction has no
+    /// namespace behind either reach. A scope named here is therefore refused at
+    /// build on a kernel without it, Landlock LSM or not, as
+    /// [`ConfigError::LandlockScopeUnenforceable`](crate::ConfigError::LandlockScopeUnenforceable).
+    /// The default scopes, left unnamed, are dropped on such a kernel instead,
+    /// which leaves those reaches open so that a seccomp-only restriction still
+    /// runs there. [`host::landlock_abi`](crate::host::landlock_abi) reports the
+    /// running ABI. Naming no scope at all, an empty list, turns them off on
+    /// every kernel.
+    ///
+    /// Unlike a grant, a scope alone does not count as confinement: a
+    /// restriction with no grant and no seccomp policy is still refused as
+    /// [`ConfigError::RestrictionEmpty`](crate::ConfigError::RestrictionEmpty).
     ///
     /// [`LandlockScope::Signal`]: crate::LandlockScope::Signal
     /// [`LandlockScope::AbstractUnixSocket`]: crate::LandlockScope::AbstractUnixSocket
     pub fn landlock_scope<I: IntoIterator<Item = LandlockScope>>(mut self, scopes: I) -> Self {
         self.hardening.set_scope(scopes);
+        self.scopes_named = true;
         self
     }
 
@@ -679,19 +704,15 @@ impl RestrictionBuilder {
             return Err(ConfigError::RestrictionEmpty.into());
         }
         let mut hardening = self.hardening.lower()?;
-        // A restriction is confined only by what this host enforces, so its
-        // Landlock grants must actually apply here. If they all fall outside
-        // the running kernel's Landlock ABI, no ruleset is built and the
-        // command would run unconfined; refuse rather than silently drop the
-        // requested confinement.
-        hardening.ensure_landlock_enforceable()?;
-        // The scopes are best-effort, since every restriction requests them
-        // unasked: a kernel that cannot enforce them drops them here, where a
-        // grant on such a kernel was refused above. Without this, a kernel
-        // with no Landlock LSM would fail a seccomp-only restriction at setup
-        // for want of a ruleset nobody asked for.
-        hardening.landlock_scoped &=
-            crate::hardening::scope_for_abi(crate::mechanism::probe_landlock_abi().unwrap_or(0));
+        settle_landlock(
+            &mut hardening,
+            self.scopes_named,
+            crate::mechanism::probe_landlock_abi(),
+        )?;
+        // The grants are host paths, resolved as the host resolves them: a
+        // merged-`/usr` host's `/lib` is a link, and refusing links would refuse
+        // the very grants that make a host command runnable.
+        hardening.grants_follow_links = true;
         // Always drop to the empty capability set. A restriction runs on the
         // host with no user namespace, so a privileged caller (root, or one
         // holding file capabilities) would otherwise carry its full permitted
@@ -755,6 +776,31 @@ impl RestrictionBuilder {
     }
 }
 
+/// Holds a restriction's Landlock request to what a kernel at `abi` enforces,
+/// where `abi` is `None` when the kernel offers no Landlock LSM.
+///
+/// A restriction is confined only by what the host enforces, so a grant that
+/// falls outside the kernel's ABI, which would leave the command unconfined
+/// for that access kind, is refused rather than dropped. So is a scope the
+/// caller named (`scopes_named`): a restriction has no namespace behind either
+/// reach a scope confines. The default scopes are the exception, since every
+/// restriction requests them unasked. A kernel that cannot enforce them drops
+/// them here, or a kernel with no Landlock LSM would fail a seccomp-only
+/// restriction at setup for want of a ruleset nobody asked for.
+fn settle_landlock(
+    hardening: &mut HardeningPlan,
+    scopes_named: bool,
+    abi: Option<i32>,
+) -> Result<(), ConfigError> {
+    hardening.ensure_landlock_enforceable(abi)?;
+    if scopes_named {
+        crate::hardening::ensure_scopes_enforceable(hardening.landlock_scoped, abi)
+    } else {
+        hardening.landlock_scoped &= abi.map_or(0, crate::hardening::scope_for_abi);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +844,11 @@ mod tests {
             // the whole question here.
             base_env: _,
             stop_with_caller: _,
+            // A restriction's alone. It starts with every scope, which a
+            // sandbox does not, so it tells that default apart from scopes its
+            // caller named: a kernel too old for scopes drops the one and
+            // refuses the other.
+            scopes_named: _,
         } = RestrictionBuilder::default();
     }
 
@@ -962,6 +1013,95 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// Settles `builder`'s Landlock request against a kernel that reported
+    /// `abi`, returning the scopes it kept.
+    fn settle(builder: RestrictionBuilder, abi: Option<i32>) -> Result<u64, ConfigError> {
+        let mut hardening = builder.hardening.lower().expect("a valid request");
+        settle_landlock(&mut hardening, builder.scopes_named, abi)?;
+        Ok(hardening.landlock_scoped)
+    }
+
+    #[test]
+    fn a_kernel_without_scopes_drops_the_default_and_refuses_named_ones() {
+        use crate::hardening::scope;
+        let every = scope::SIGNAL | scope::ABSTRACT_UNIX_SOCKET;
+        for abi in [None, Some(5)] {
+            // The default is every restriction's, asked for or not, so a kernel
+            // that cannot enforce it drops it and the build goes ahead.
+            assert_eq!(settle(restricted_true(), abi).unwrap(), 0);
+            // A scope the caller named is refused, since nothing but Landlock
+            // would bound its reach. The full default, named, is refused too.
+            for (named, name) in [
+                (vec![LandlockScope::Signal], "signal"),
+                (
+                    vec![LandlockScope::AbstractUnixSocket],
+                    "abstract-unix-socket",
+                ),
+                (LandlockScope::ALL.to_vec(), "signal"),
+            ] {
+                match settle(restricted_true().landlock_scope(named), abi) {
+                    Err(ConfigError::LandlockScopeUnenforceable {
+                        scope,
+                        abi: reported,
+                    }) => {
+                        assert_eq!((scope, reported), (name, abi));
+                    }
+                    other => panic!("a named scope at {abi:?} was not refused: {other:?}"),
+                }
+            }
+            // Naming none asks for nothing to refuse.
+            let off = restricted_true().landlock_scope([]);
+            assert_eq!(settle(off, abi).unwrap(), 0);
+        }
+        // A kernel with scopes keeps the default and a named scope alike.
+        assert_eq!(settle(restricted_true(), Some(6)).unwrap(), every);
+        let named = restricted_true().landlock_scope([LandlockScope::Signal]);
+        assert_eq!(settle(named, Some(6)).unwrap(), scope::SIGNAL);
+    }
+
+    #[test]
+    fn a_grant_the_kernel_cannot_enforce_is_refused_whatever_the_scopes() {
+        let granted = || restricted_true().landlock_fs(FsAccess::READ, "/usr");
+        assert!(matches!(
+            settle(granted(), None),
+            Err(ConfigError::RestrictionLandlockUnenforceable { abi: None })
+        ));
+        let net = || restricted_true().landlock_net(NetAccess::CONNECT, 443);
+        assert!(matches!(
+            settle(net(), Some(3)),
+            Err(ConfigError::RestrictionLandlockUnenforceable { abi: Some(3) })
+        ));
+        assert!(settle(net(), Some(4)).is_ok());
+        assert!(settle(granted(), Some(1)).is_ok());
+    }
+
+    #[test]
+    fn a_named_scope_builds_only_where_the_kernel_enforces_it() {
+        let built = restricted_true()
+            .landlock_scope([LandlockScope::Signal])
+            .build();
+        match crate::mechanism::probe_landlock_abi() {
+            Some(abi) if abi >= 6 => {
+                let restriction = built.expect("a kernel with scopes enforces a named one");
+                assert_eq!(
+                    restriction.plan.hardening.landlock_scoped,
+                    crate::hardening::scope::SIGNAL,
+                );
+            }
+            abi => assert!(matches!(
+                built,
+                Err(Error::Config(ConfigError::LandlockScopeUnenforceable { abi: reported, .. }))
+                    if reported == abi
+            )),
+        }
+    }
+
+    #[test]
+    fn a_restriction_lets_its_grants_follow_the_hosts_links() {
+        let restriction = restricted_true().build().unwrap();
+        assert!(restriction.plan.hardening.grants_follow_links);
     }
 
     #[test]

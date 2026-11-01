@@ -108,8 +108,8 @@ pub fn userns_blocker() -> Option<UsernsBlocker> {
 ///
 /// The version rises as the kernel gains filesystem and network access
 /// rights; [`CageBuilder::landlock_fs`] enforces best-effort down to it. A
-/// `None` result means a Landlock request would fail at setup rather than
-/// apply.
+/// `None` result means a Landlock request is refused rather than applied: at
+/// build where Landlock is its only boundary, and at launch otherwise.
 ///
 /// [`CageBuilder::landlock_fs`]: crate::CageBuilder::landlock_fs
 #[cfg(feature = "hardening")]
@@ -575,11 +575,52 @@ pub fn range_map_blocker() -> Option<RangeMapBlocker> {
     }
 }
 
-/// The delegated-tier checks behind [`range_map_blocker`]: the caller's own
-/// `no_new_privs`, helper presence and privilege, the subordinate files, and
-/// the allocation.
+/// The delegated-tier checks behind [`range_map_blocker`]: whatever stops the
+/// helpers themselves, then the allocation.
 #[cfg(feature = "subid")]
 fn delegated_blocker() -> Option<RangeMapBlocker> {
+    if let Some(blocker) = helper_blocker() {
+        return Some(blocker);
+    }
+
+    match crate::idmap::probe_allocation() {
+        None => {}
+        Some((_, crate::idmap::AllocationUnusable::Empty)) => {
+            return Some(RangeMapBlocker::NoSubordinateAllocation);
+        }
+        // The query could not answer, which is a different diagnosis from an
+        // empty allocation and has a different remedy — most often "install
+        // getsubids", on a host whose subordinate ids come from a directory
+        // service rather than from the files. Reporting the empty-allocation
+        // blocker here would advise adding /etc/subuid entries, which on such a
+        // host is wrong twice over: the user may well have an allocation, and
+        // the files are not the authority.
+        Some((kind, unusable)) => {
+            return Some(RangeMapBlocker::SubordinateAllocationUnknown {
+                reason: unusable.to_string(kind),
+            });
+        }
+    }
+
+    None
+}
+
+/// Why the shadow suite's helpers cannot establish a map on this host, or
+/// `None` when nothing known stands in their way.
+///
+/// The conditions are the caller's own `no_new_privs`, a helper absent from
+/// `PATH` or holding no privilege, and a subordinate file the helpers refuse to
+/// open. Each one fails every map the helpers are asked to write, whatever the
+/// request and whatever the allocation.
+///
+/// The one answer to whether the helpers can work here.
+/// [`SubidMapper`](crate::SubidMapper)'s `resolve` asks it before it reports a
+/// map, so a build and a provisioner's preflight refuse a host the launch would
+/// fail on. [`range_map_blocker`] asks it before the allocation, so the probe
+/// and the delegate name the same condition. A helper is judged at the path
+/// [`find_on_path`] resolves, which is the path the delegate executes.
+#[cfg(feature = "subid")]
+pub(crate) fn helper_blocker() -> Option<RangeMapBlocker> {
     use rustix::thread::CapabilitySet;
 
     // First, since it defeats every helper whatever the helper's own state.
@@ -605,25 +646,6 @@ fn delegated_blocker() -> Option<RangeMapBlocker> {
             .unwrap_or(false)
         {
             return Some(RangeMapBlocker::SubordinateFileSymlink { path });
-        }
-    }
-
-    match crate::idmap::probe_allocation() {
-        None => {}
-        Some((_, crate::idmap::AllocationUnusable::Empty)) => {
-            return Some(RangeMapBlocker::NoSubordinateAllocation);
-        }
-        // The query could not answer, which is a different diagnosis from an
-        // empty allocation and has a different remedy — most often "install
-        // getsubids", on a host whose subordinate ids come from a directory
-        // service rather than from the files. Reporting the empty-allocation
-        // blocker here would advise adding /etc/subuid entries, which on such a
-        // host is wrong twice over: the user may well have an allocation, and
-        // the files are not the authority.
-        Some((kind, unusable)) => {
-            return Some(RangeMapBlocker::SubordinateAllocationUnknown {
-                reason: unusable.to_string(kind),
-            });
         }
     }
 

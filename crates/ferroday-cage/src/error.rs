@@ -305,7 +305,8 @@ pub enum ConfigError {
         /// The flags as they were given to the builder.
         flags: u64,
     },
-    /// The working directory path is not absolute.
+    /// The working directory is not a normal absolute path: it is relative, or
+    /// has a component other than a plain name, such as `..`.
     #[non_exhaustive]
     WorkdirNotAbsolute {
         /// The working directory as it was given to the builder.
@@ -419,6 +420,28 @@ pub enum ConfigError {
         /// absent.
         abi: Option<i32>,
     },
+    /// A Landlock scope that is the only bound on its reach cannot be enforced
+    /// on this host.
+    ///
+    /// A sandbox's namespaces bound the reaches the scopes confine: a PID
+    /// namespace hides the host's processes from a signal, and a network
+    /// namespace hides the host's abstract sockets. Where none stands behind a
+    /// requested scope, the scope is the boundary, and the build is refused on
+    /// a kernel that cannot enforce it: one below Landlock ABI 6, or one without
+    /// the LSM. That is `signal` under
+    /// [`pid_namespace(false)`](crate::CageBuilder::pid_namespace),
+    /// `abstract-unix-socket` under [`Network::Host`](crate::Network::Host),
+    /// and any scope a restriction names explicitly. A restriction's default
+    /// scopes are dropped on such a kernel instead.
+    #[non_exhaustive]
+    LandlockScopeUnenforceable {
+        /// The scope, as a profile names it: `signal` or
+        /// `abstract-unix-socket`.
+        scope: &'static str,
+        /// The kernel's supported Landlock ABI, or `None` when the LSM is
+        /// absent.
+        abi: Option<i32>,
+    },
     /// A profile loaded under the restricted policy uses an operation only a
     /// trusted profile may.
     ///
@@ -428,6 +451,18 @@ pub enum ConfigError {
     /// operations that map host resources into the sandbox or share a host
     /// namespace: bind mounts, raw mounts, an overlay root, host networking,
     /// and sharing the host PID namespace.
+    // The paragraph links a feature-gated item, so its doc text is gated on the
+    // feature: present in the canonical all-features build, absent — link and
+    // all — from a build without `serde`, where no profile is loaded at all.
+    #[cfg_attr(
+        feature = "serde",
+        doc = "
+Returned by [`RestrictedProfile::try_from`](crate::RestrictedProfile) on a
+[`CageBuilder`](crate::CageBuilder). Deserializing a `RestrictedProfile`
+directly reports the same refusal through the serde format's own error,
+rendered as text.
+"
+    )]
     #[non_exhaustive]
     ProfileOperationForbidden {
         /// The forbidden operation, as a short phrase.
@@ -474,13 +509,12 @@ pub enum ConfigError {
     /// The fallback is between delegates, never between tiers: a range
     /// request that no delegate can establish is refused rather than
     /// silently downgraded to the single-identity map. The reason carries
-    /// each delegate's refusal, and the host probe's diagnosis when
-    /// [`host::range_map_blocker`](crate::host::range_map_blocker)
-    /// identifies one.
+    /// each delegate's refusal. The subordinate delegate refuses a host its
+    /// helpers cannot work on with the condition
+    /// [`host::range_map_blocker`](crate::host::range_map_blocker) names.
     #[non_exhaustive]
     IdentityMapUnavailable {
-        /// Why each delegate refused, each refusal rendered with its causes,
-        /// and any identified host blocker.
+        /// Why each delegate refused, each refusal rendered with its causes.
         ///
         /// The message includes it only for the bundled chain. A configured
         /// delegate's refusal is the `source`, which a renderer reaches on its
@@ -505,11 +539,13 @@ pub enum ConfigError {
         space: &'static str,
     },
     /// A run-as identity names supplementary groups under the
-    /// single-identity map.
+    /// single-identity map's gid map: the caller's own gid alone.
     ///
-    /// Establishing that map requires denying `setgroups`, so no group list
-    /// can ever be set inside it. Supplementary groups need a range gid
-    /// map.
+    /// The single-identity map has that gid map, and so does a range map whose
+    /// gid list is that one extent. Establishing it without privilege over the
+    /// parent namespace denies `setgroups`, as the kernel and the shadow
+    /// helpers do, so no group list can be set inside it. Supplementary groups
+    /// need a gid map that maps more than the caller's own gid.
     RunAsGroupsWithSingleMap,
     /// The profile mounts no procfs the nested user namespace's identity map
     /// can be established through.
@@ -520,6 +556,12 @@ pub enum ConfigError {
     /// restriction they carry. Establishing that namespace's map reaches for a
     /// procfs by path from inside the sandbox, so a sandbox with no procfs has
     /// no way to establish one.
+    ///
+    /// The map files are written, and named from a procfs's root, so a procfs
+    /// that cannot take the write does not count. That is one that ends up
+    /// read-only, through a read-only bind, `MS_RDONLY` on a raw mount, a later
+    /// read-only remount, or a source mounted read-only. It is also a bind of a
+    /// tree inside a procfs, such as `/proc/sys`, rather than of its root.
     ///
     /// Reachable only from a profile that opts out of the managed mounts with
     /// [`managed_mounts(false)`](crate::CageBuilder::managed_mounts) (or
@@ -728,7 +770,7 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::WorkdirNotAbsolute { path } => write!(
                 f,
-                "the working directory {} is not absolute",
+                "the working directory {} is not a normal absolute path",
                 path.display(),
             ),
             ConfigError::HostnameInvalid { name } => write!(
@@ -791,6 +833,18 @@ impl fmt::Display for ConfigError {
                      to fall back on",
                 ),
             },
+            ConfigError::LandlockScopeUnenforceable { scope, abi } => match abi {
+                Some(abi) => write!(
+                    f,
+                    "the Landlock scope {scope} needs Landlock ABI 6, and the kernel supports ABI \
+                     {abi}; no namespace bounds the reach it confines"
+                ),
+                None => write!(
+                    f,
+                    "the Landlock scope {scope} needs the Landlock LSM, which the kernel does not \
+                     offer; no namespace bounds the reach it confines"
+                ),
+            },
             ConfigError::ProfileOperationForbidden { operation } => write!(
                 f,
                 "this profile uses {operation}, which the restricted policy reserves for a \
@@ -827,8 +881,8 @@ impl fmt::Display for ConfigError {
                 )
             }
             ConfigError::RunAsGroupsWithSingleMap => f.write_str(
-                "run-as supplementary groups require a range gid map; the single-identity \
-                 map denies setgroups",
+                "run-as supplementary groups require a gid map wider than the caller's own gid; \
+                 a gid map of that gid alone, the single-identity map's, denies setgroups",
             ),
             ConfigError::NestedUsernsNeedsProcfs => f.write_str(
                 "the sandbox mounts no procfs the nested user namespace that locks its mount \

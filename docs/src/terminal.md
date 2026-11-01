@@ -82,8 +82,11 @@ the same answer: where the caller owns both ends, the feed and the drain are the
 caller's, and a wait that must be bounded is bounded.
 
 **A caller that sends no input** drains to end-of-file and then waits. That
-cannot deadlock, and it ends when the command does. The example above is the
-whole pattern, and its second line is the part worth understanding.
+cannot deadlock. It ends when the last process holding the terminal closes it,
+which under the default PID namespace is the command's exit. Without one, a
+descendant that outlives the command can hold the terminal open, and the drain
+lasts as long as that descendant does. The example above is the whole pattern,
+and its second line is the part worth understanding.
 
 **An interactive caller** needs both directions at once, and
 [the relay](#the-relay) is the answer: one poll loop that cannot be stalled by
@@ -372,9 +375,15 @@ the environment, so four decisions belong to the program driving the session:
   handle. Blocking the relayed set is process-wide, so it is an explicit call
   rather than something `run` does on the way past — and it must precede every
   thread the run may start, because a thread inherits the mask of the thread
-  that created it. The library starts one thread of its own — the [native
-  network stack](userspace-networking.md)'s pump — so a program composing a
-  relay with a stack installs the signals before it attaches one.
+  that created it.
+
+  The library starts threads in two places. Attaching the [native network
+  stack](userspace-networking.md) starts its pump, which runs for as long as
+  the stack is attached. A program composing a relay with a stack therefore
+  installs the signals before it attaches one. `HttpFetch::fetch_all` runs a
+  provisioner's batch downloads on scoped workers and joins each before it
+  returns. Those matter only to a program that provisions while it relays a
+  session.
 
   Nothing restores the mask, deliberately: a relay that unblocked on the way out
   would leave a window in which the signals it exists to handle were fatal
@@ -405,10 +414,10 @@ the environment, so four decisions belong to the program driving the session:
 
 ### What the loop does
 
-One thread, one poll: the primary, the signal descriptor, and the caller's
-input — in that order, because the input is the one channel that retires and a
-retired channel must leave the polled set rather than be given an empty events
-mask. `poll` reports `POLLHUP`, `POLLERR`, and `POLLNVAL` whatever the requested
+One thread, one poll: the primary, the signal descriptor, the command's exit,
+and the caller's input — in that order, because the input is the one channel
+that retires and a retired channel must leave the polled set rather than be
+given an empty events mask. `poll` reports `POLLHUP`, `POLLERR`, and `POLLNVAL` whatever the requested
 events are, so a muted slot on a hung-up pipe is ready on every pass and the
 loop stops blocking; dropping the slot is what keeps `producer | fcage --terminal
 ...` from burning a core after the producer exits.
@@ -428,6 +437,16 @@ is open, and a command that closed its standard streams is still running. The
 relay restores the caller's terminal and waits for the command's exit. The
 deadline and the relayed signals stay in force, so a timeout still escalates and
 a `SIGTERM` from outside still reaches the command.
+
+The command's exit ends the relaying too, even while its terminal stays open.
+Without a PID namespace, a descendant that outlives the command can hold the
+terminal for as long as it runs, and a kill reaches only the command. Once the
+command has exited, the relay delivers what the terminal holds at that moment
+and stops. That includes everything the command wrote, since Linux queues only
+a few tens of kilobytes between a pseudoterminal's two ends. The drain reads at
+most 64 KiB, so a descendant writing without pause cannot prolong it. A timeout
+or an interrupt therefore ends the session however long a descendant keeps the
+terminal.
 
 Signals are read as data rather than handled: no library code runs in signal
 context, so there are no handlers, no async-signal-safety reasoning, and no
@@ -471,11 +490,35 @@ promise otherwise. Restoration means *termios*. Screen contents — an alternate
 screen left active, a hidden cursor — were written by the sandboxed program
 through the relay verbatim and belong to it, exactly as `ssh` treats them.
 
-`restore_terminal()` reaches the *first* terminal a raw session was entered on,
-which is what a panic hook with no argument can name. Sequential sessions on the
-same terminal restore correctly, and so does every session's own exit, because
-`run` restores from its own guard. A program relaying raw sessions on different
-terminals over its lifetime is the case the hook does not cover.
+`restore_terminal()` reaches the terminal of the raw session in force, with the
+settings that session found there. Sequential sessions are each covered, on one
+terminal or on several. Outside a session it does nothing: the terminal's
+settings are the shell's again, and replaying a finished session's settings
+overwrites whatever the shell has set since. It also does nothing while the
+process is in the background. The job in the foreground holds the terminal
+then, and the session's own guard restores it as the session ends.
+
+### What the sandbox's output reaches
+
+The relay copies the sandbox's output to the caller's terminal byte for byte, so
+its escape sequences act on the caller's terminal emulator. That is how a
+full-screen program draws. It also lets the program set the window title and,
+where the emulator permits it, the clipboard. The same holds for any command
+whose output is the caller's terminal, with or without the relay.
+
+Some sequences are queries: a cursor-position report, a device-attributes
+request, a color query. The emulator answers each by writing the reply into its
+own input, as though it had been typed. While the session is relayed, that input
+is read as the caller's and forwarded to the sandbox, which asked. A reply that
+arrives after the session ends lands at whatever reads the terminal next,
+usually the caller's shell. Restoration discards the input pending at that
+moment, but not a reply still on its way.
+
+A reply carries what the emulator reports about itself, not text the program
+chose. The exception is an emulator configured to report its window title, which
+echoes text the program set. Modern emulators disable that report by default for
+this reason. The relay filters nothing, as `ssh` filters nothing, so a caller
+that runs an untrusted command keeps such reports off.
 
 ### The worked consumer
 

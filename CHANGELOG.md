@@ -32,16 +32,19 @@ consumer upgrading can skip it.
   directory descriptor, inherited or given through `Stdio::from_fd`, let the
   command walk the host's filesystem from it by path, past the sandbox's root.
   The launch refuses one before it creates anything.
-- Every launch, of a sandbox or a restriction, gives the command a fresh session
-  keyring in place of the caller's. A sandboxed command previously inherited the
-  caller's session keyring, so it possessed, and could read through `keyctl`,
-  every key the caller's login session held. It possesses none of them now. Two
-  reaches remain. A key whose permissions grant its owner read stays readable,
-  since the command runs as that owner. A restricted command can also link the
-  calling user's user, user session, and persistent keyrings into its own and
-  read their keys, which a sandbox's own user namespace prevents. The curated
-  seccomp policy, which denies `keyctl`, closes both. Key descriptions stay
-  listed in `/proc/keys`.
+- **Breaking.** Every launch, of a sandbox or a restriction, gives the command a
+  fresh session keyring in place of the caller's. A sandboxed command previously
+  inherited the caller's session keyring, so it possessed, and could read
+  through `keyctl`, every key the caller's login session held. It possesses none
+  of them now, and a command that used one no longer finds it. Each running
+  command's keyring counts against the calling user's kernel key quota, and a
+  launch that finds the quota exhausted fails with `Error::KeyQuotaExhausted`.
+  Two reaches remain. A key whose permissions grant its owner read stays
+  readable, since the command runs as that owner. A restricted command can also
+  link the calling user's user, user session, and persistent keyrings into its
+  own and read their keys, which a sandbox's own user namespace prevents. The
+  curated seccomp policy, which denies `keyctl`, closes both. Key descriptions
+  stay listed in `/proc/keys`.
 - **Breaking.** A restriction confines its command's signals, and its
   connections to abstract sockets, to the processes it started, on a kernel
   with Landlock ABI 6 (Linux 6.12) or later. A restricted command could
@@ -50,17 +53,22 @@ consumer upgrading can skip it.
   restriction also has a Landlock domain, which refuses it ptrace access to
   processes outside it, `/proc/<pid>/environ` among them. A caller whose
   command needs either reach names fewer scopes through
-  `RestrictionBuilder::landlock_scope`, or `fcage --landlock-scope`.
-- `fcage`: a standard stream that is a regular file or a block device is relayed
-  through a pipe rather than handed to the command. A command could previously
-  reopen such a file through `/proc/self/fd` with more access than the stream
-  carried: rewrite a file given as standard input, or read back and truncate a
-  log opened for appending. Input the command does not read is returned to the
-  file, so the next reader starts where the command stopped, and two output
-  streams on one file keep the order the command wrote in. A relayed standard
-  input puts the command in a session of its own, as `--stdin null` does. A
-  stream that is neither a pipe, a socket, a character device, nor a file, such
-  as a directory, is refused. A refused stream, and a relay that cannot read the
+  `RestrictionBuilder::landlock_scope`, or `fcage --landlock-scope`. On an
+  older kernel, or one without Landlock, the default scopes are dropped, and a
+  scope named that way is refused at `build` with
+  `ConfigError::LandlockScopeUnenforceable`. An empty list names none and builds
+  on every kernel.
+- **Breaking.** `fcage`: a standard stream that is a regular file or a block
+  device is relayed through a pipe rather than handed to the command. A command
+  could previously reopen such a file through `/proc/self/fd` with more access
+  than the stream carried: rewrite a file given as standard input, or read back
+  and truncate a log opened for appending. Input the command does not read is
+  returned to the file, so the next reader starts where the command stopped, and
+  two output streams on one file keep the order the command wrote in. A relayed
+  standard input puts the command in a session of its own, as `--stdin null`
+  does, so it has no controlling terminal and `/dev/tty` fails to open. A stream
+  that is neither a pipe, a socket, a character device, nor a file, such as a
+  directory, is refused. A refused stream, and a relay that cannot read the
   input or deliver the output, exit 125. `fcage` is not dumpable during a
   restricted run, so a restricted command cannot reopen the file through
   `fcage`'s own descriptors.
@@ -73,20 +81,42 @@ consumer upgrading can skip it.
   refused at `build` with `ConfigError::SeccompInvalid`. It was truncated, so
   `masked_eq_dword(0, 1 << 32, 0)` masked with zero and matched every call, a
   filter more permissive than the one configured.
-- The curated seccomp policy denies `open_tree_attr`, the mount API's newest
-  call, and `pidfd_getfd`, which copies a descriptor out of another process
-  under the same check `process_vm_readv` makes.
+- **Breaking.** The curated seccomp policy denies creating a namespace. It also
+  denies `open_tree_attr`, the mount API's newest call, and `pidfd_getfd`, which
+  copies a descriptor out of another process under the same check
+  `process_vm_readv` makes. `unshare`, and `clone` whenever its flags create a
+  namespace, fail with `EPERM`. `clone3` is answered `ENOSYS`, from which the C
+  library falls back to `clone`, so processes and threads start as before. A
+  command that builds a sandbox of its own, such as a browser, a container
+  runtime, or `fcage`, needs a policy of its own.
+- On x86_64, the guard a denylist seccomp filter carries against the x32
+  syscall ABI answers every x32 syscall `ENOSYS`. It answered with the policy's
+  listed action, so a listed action that lets a syscall run, such as
+  `SeccompAction::Log`, let every x32 call through, past an errno the policy
+  gave that syscall.
+- **Breaking.** A sandbox's Landlock filesystem grant no longer follows a
+  symbolic link on its path. A grant whose path crosses a link, at any
+  component, fails the launch with `ELOOP` at `SetupStep::LandlockAddRule`,
+  reported against the grant, rather than covering wherever the link points. On
+  a root where `/lib` is a link to `usr/lib`, grant `/usr`. A restriction's
+  grants are host paths and still follow the host's links.
 - The network stack refuses AWS's IPv6 instance-service block, `fd00:ec2::/32`,
   whose metadata service at `fd00:ec2::254` serves the instance role's
   credentials. The IPv4 metadata service was already refused as link-local.
-- irongall verifies OpenPGP signatures in place of `pgp`, and the `ruzstd` floor
-  moves to 0.9.1. rPGP 0.20 parsed nested embedded signatures by unbounded
-  recursion, so a signed document
-  fetched from a mirror (a Debian `InRelease`, a Gentoo pointer, digest document
-  or binary package Manifest) could exhaust the stack and abort the process
-  before any signature was checked. ruzstd 0.9.0 let a crafted zstd block decode
-  past the format's block size, outside the window cap (RUSTSEC-2026-0344),
-  which `Tarball` and the unsigned Gentoo binary-package index reached.
+- The network stack holds an address under NAT64's well-known prefix,
+  `64:ff9b::/96`, to the rules for the IPv4 address it embeds. A guest could
+  reach `169.254.169.254`, the host's loopback, or its own IPv4 subnet through a
+  NAT64 translator on the host. Every other IPv4 destination stays reachable
+  that way.
+- Verifying a signed document no longer recurses without bound. rPGP 0.20, which
+  irongall replaces, parsed nested embedded signatures by unbounded recursion. A
+  signed document fetched from a mirror (a Debian `InRelease`, a Gentoo pointer,
+  digest document or binary package Manifest) could exhaust the stack and abort
+  the process before any signature was checked.
+- The `ruzstd` floor moves to 0.9.1. ruzstd 0.9.0 let a crafted zstd block
+  decode past the format's block size, outside the window cap
+  (RUSTSEC-2026-0344), which `Tarball` and the unsigned Gentoo binary-package
+  index reached.
 - A zstd stream of many frames decodes in time linear in their number. Each
   frame wrapped the stream in one more reader, so a stream of a hundred thousand
   empty skippable frames took seconds to decode, and exhausted the stack in a
@@ -173,8 +203,10 @@ consumer upgrading can skip it.
   `RestrictionBuilder::landlock_scope`, which confine a command's signals or
   abstract-socket connections to the processes of its own Landlock domain. A
   sandbox takes none by default and needs one only where `pid_namespace(false)`
-  or `Network::Host` exposes the host's processes. Profile key
-  `landlock-scope`; `fcage`: `--landlock-scope LIST`.
+  or `Network::Host` exposes the host's processes. A scope nothing else bounds,
+  a sandbox's there or any a restriction names, is refused at `build` with
+  `ConfigError::LandlockScopeUnenforceable` on a kernel below Landlock ABI 6.
+  Profile key `landlock-scope`; `fcage`: `--landlock-scope LIST`.
 - `SeccompRules::errno_for`, which answers one syscall with an errno of its own
   ahead of the policy's actions. Answering `clone3` with `ENOSYS` lets a policy
   that conditions `clone`'s flags keep threads working, since the C library then
@@ -187,11 +219,25 @@ consumer upgrading can skip it.
   `CageBuilder` has for the settings the two share: `get_command`, `get_args`,
   `get_envs`, `get_base_env`, `get_current_dir`, `get_stdin`, `get_stdout`,
   `get_stderr`, `get_stop_with_caller` and `get_rlimits`.
-- `ResolvedInputs::run_as`, the `Identity` the command switches to, and
-  `ResolvedInputs::no_new_privileges`. A record previously read the same for a
-  build run as uid 0 and one run as another id. `Identity::get_uid`, `get_gid`
-  and `get_groups` read the identity it reports, as they read
-  `CageBuilder::get_run_as`.
+- `CageBuilder::get_landlock_fs`, `get_landlock_net`, `get_landlock_scope`,
+  `get_seccomp` and `get_keep_capabilities`, which read a builder's hardening
+  posture as the other getters read its settings. A consumer vetting a profile
+  it did not write can read it whole, and extend its seccomp rules rather than
+  replace them. `get_keep_capabilities` answers for both capability setters:
+  `None` leaves the capabilities alone, and an empty list drops them all.
+- `RestrictedProfile` implements `TryFrom<CageBuilder>`, which holds a builder
+  to the restricted policy and returns `ConfigError::ProfileOperationForbidden`
+  as a value. Deserializing a `RestrictedProfile` reports the same refusal
+  through the serde format's own error.
+- `ResolvedInputs::run_as`, the `Identity` the command switches to,
+  `ResolvedInputs::no_new_privileges`, `ResolvedInputs::pid_namespace`, and
+  `ResolvedInputs::hostname`, the name the command sees, the host's own where
+  none is configured. A hardening posture that requests Landlock records
+  `ResolvedHardening::Applied::landlock_abi`, the kernel's ABI its requests are
+  narrowed to. A record previously read the same for two builds that differed
+  in any of these.
+  `Identity::get_uid`, `get_gid` and `get_groups` read the identity it reports,
+  as they read `CageBuilder::get_run_as`.
 - `ConfigError::OverlayOptionsTooLong`, refusing an overlay whose mount options
   exceed the 4095 bytes `mount(2)` passes on whole. The kernel cut a longer
   string short, and the remainder could mount a different work directory.
@@ -297,6 +343,14 @@ consumer upgrading can skip it.
   `spawn_pending_terminal` waits for the terminal, so a setup failure before it
   exists is reported there rather than from `proceed`. A restriction's terminal
   still comes from the host's `/dev/ptmx`.
+- **Breaking.** A working directory, for a sandbox or a restriction, is held to
+  the rule every configured absolute path is: a `..` component is refused at
+  `build` with `ConfigError::WorkdirNotAbsolute`. Its message now reads "not a
+  normal absolute path".
+- A profile naming `identity-map = "subordinate"` loads in a build without the
+  `subid` feature, and `build` decides. A configured `id_mapper` that reports an
+  allocation establishes it, and without one the build refuses it, naming the
+  feature. It was refused as it loaded, so such a profile could not round-trip.
 - **Breaking.** A Debian bootstrap, and a layered build's increment, keeps no
   record of its run. Once its last configure wave has run it removes
   `/var/log/dpkg.log`, `/var/log/alternatives.log`,
@@ -384,11 +438,7 @@ consumer upgrading can skip it.
   `ResolvedHardening::Applied` gains `landlock_scope`.
 - **Breaking.** `RangeMapBlocker::HelperCannotMapRoot` is removed, and
   `host::range_map_blocker` no longer reports a `newuidmap` whose file
-  capabilities lack `CAP_SETFCAP`. That is how shadow installs the helper, and
-  it writes every map an unprivileged caller can ask for: Linux wants
-  `CAP_SETFCAP` only for a map naming the parent's uid 0, which only a root
-  caller's map does, and a root caller's helper does not take its capabilities
-  from the file. Match on the remaining variants.
+  capabilities lack `CAP_SETFCAP`. Match on the remaining variants.
 - An Alpine or Gentoo fetch failure names the bootstrap it stopped, as a Debian
   one does: `the Alpine bootstrap could not fetch a resource`, with the fetch's
   own error beneath it. A Gentoo host failure reads `a Gentoo bootstrap step
@@ -463,9 +513,22 @@ consumer upgrading can skip it.
   number past 32 bits panicked inside `build`.
 - A range identity map the bundled delegates cannot write is refused at `build`
   rather than failing every launch with `EPERM`. `DirectMapper` refuses a uid map
-  naming outside uid 0 without `CAP_SETFCAP`, and `SubidMapper` refuses any map
-  while the caller runs under `no_new_privs`, which strips the helpers of their
-  privilege.
+  naming outside uid 0 without `CAP_SETFCAP`. `SubidMapper` refuses any map on a
+  host whose shadow helpers cannot establish one: a helper missing from `PATH`
+  or without its setuid bit or file capability, a symbolic-link `/etc/subuid` or
+  `/etc/subgid`, or a caller under `no_new_privs`. The Debian and Alpine
+  provisioners' preflight refuses the same before it downloads anything.
+- A subordinate allocation read from `/etc/subuid` and `/etc/subgid` takes in
+  every entry under the caller's user name or uid, as `newuidmap` honours them.
+  It took only the entries under whichever of the two matched first.
+  `IdentityMap::Subordinate` maps the whole allocation, and an outside id two
+  entries grant is mapped once.
+- A run-as identity under a range map whose gid map is the caller's own gid
+  alone now launches. `newgidmap` denies `setgroups` when it writes such a map,
+  so the launch failed at `SetupStep::SetGroups`. The command keeps the group
+  list it inherited, as under the single-identity map, and a run-as group list
+  under such a map is refused at `build` with
+  `ConfigError::RunAsGroupsWithSingleMap`.
 - An export, a copy in, or a removal given a malformed range identity map, or a
   delegate that resolves one, refuses it by name, as `build` does. It reached
   the kernel and failed with `EINVAL` at the write.
@@ -486,10 +549,18 @@ consumer upgrading can skip it.
 - A restriction's refusal of a bare command name no longer suggests path
   lookup, which a restriction does not offer. `ConfigError::CommandNotAbsolute`
   carries `lookup_offered`, which is `false` for a restriction.
-- A raw remount or propagation change at `/proc` no longer makes `build` refuse
-  the profile with `NestedUsernsNeedsProcfs`, since neither mounts anything over
-  the procfs. A raw move is read as `mount(2)` reads it, and a move naming
-  `proc` serves only where its source is a procfs.
+- `build` judges the procfs a nested user namespace needs as the launch uses it.
+  A raw remount or propagation change at `/proc` no longer makes it refuse the
+  profile with `NestedUsernsNeedsProcfs`, since neither mounts anything over the
+  procfs. A raw move is read as `mount(2)` reads it. A procfs serves only where
+  it is the writable root of one, which the nested identity map is written
+  through. A read-only procfs, or a bind or move of anything else, such as
+  `/proc/sys`, is refused rather than failing at launch.
+- A raw mount whose flags carry the legacy `MS_MGC_VAL` magic number is read as
+  `mount(2)` reads it, with the magic discarded. Its bits overlap `MS_PRIVATE`
+  and `MS_SLAVE`, so `build` took such a mount for a propagation change. A
+  procfs mounted that way failed the procfs requirement, and a mount at
+  `/etc/resolv.conf` did not replace the managed bind.
 - Waiting on a sandbox without a PID namespace no longer spins at full CPU while
   a process the command left behind holds its captured output open. The wait
   watched the exited command's pidfd in place of each finished channel, and a
@@ -500,15 +571,32 @@ consumer upgrading can skip it.
   its standard streams outlived `--timeout` and ignored `SIGINT` and `SIGTERM`
   until it exited on its own. The caller's terminal is restored as soon as the
   relaying ends, before that wait.
+- A terminal session ends when its command does, once what the terminal still
+  held is delivered. Without a PID namespace, and under every restriction, a
+  process the command left behind could hold the terminal open. The session, and
+  `fcage --terminal --timeout`, then ran on past a timeout, a kill, or an
+  interrupt. What such a process writes after the command exits is not relayed.
 - A terminal relay started in the background, `fcage --terminal ... &`, no
   longer puts the shell's terminal into raw mode. Raw mode is entered only while
   the relaying process is in the terminal's foreground process group, at the
   start and on each `SIGCONT`, so `fg` enters it and `bg` does not.
+- `relay::restore_terminal`, and the panic hook `install_panic_restore`
+  installs, restore only a terminal whose raw session is in force, with the
+  settings that session found, and only while the process is in that terminal's
+  foreground. The hook rewrote the first session's terminal, discarding its
+  type-ahead, at any later panic in the process. It now also reaches a session
+  relayed on another terminal.
 - The network stack no longer spins at full CPU when a UDP reply cannot be
   delivered to the guest: a host socket is waited on only while the guest's side
   has room for its reply. TCP and UDP are carried only from the guest's own
   address, and a frame from any other source is dropped, since nothing sent back
   to it can be delivered.
+- The network stack no longer answers IPv6 neighbor solicitations for addresses
+  on the guest's subnet other than the gateway, as it already withheld ARP and
+  ICMP echo for them. A connection to such an address now fails silently, as the
+  guide describes, rather than with a reset. A request behind a hop-by-hop
+  options header is held to the same rule, and TCP and UDP behind one are
+  carried like any other.
 - `NetStackBuilder::build` refuses an interface name holding a vertical tab or
   the byte `0xA0`, which the kernel refuses, rather than failing at `attach` as
   `TapCreate`.
@@ -662,11 +750,14 @@ consumer upgrading can skip it.
   `idmap::single_identity_lines` formats the single-identity map's two lines
   before a fork. A short identity-map write in a sandbox stage reports
   `EMSGSIZE`, as the host side already did.
-- Every range identity map passes through `idmap::resolve_delegate`, which
-  takes the configured delegate, whose refusal is final, or the bundled chain,
-  and validates the request and the delegate's answer: a build, an export, a
-  copy in, a map-assisted removal, and the Debian and Alpine preflights, which
-  ask it through `idmap::establishable`.
+- Every range identity map passes through `idmap::resolve_delegate`, which takes
+  the configured delegate, whose refusal is final, or the bundled chain, and
+  validates the request and the delegate's answer: a build, an export, a copy
+  in, a map-assisted removal, and the Debian and Alpine preflights, which ask it
+  through `idmap::establishable`. `host::helper_blocker` is the one answer to
+  whether the shadow helpers can establish a map, which `SubidMapper::resolve`
+  and `host::range_map_blocker` both ask. `idmap::is_own_gid_alone` is the one
+  reading of a gid map no group list can be set under.
 - `ErrorChain` is the one walk of an error's causes, recorded in the idiom
   census, and every place the library turns one of its own errors into a text
   reason renders it through `ErrorChain`.
@@ -705,6 +796,9 @@ consumer upgrading can skip it.
   and for the host probe, `spec::validate_command` validates the command for both
   builders, and `MountAction::arrival` reads what a mount op brings to rest on
   its target, for the placeholder, procfs and `resolv.conf` checks alike.
+  `mechanism::raw_mount_flags` reads a raw mount's flags as `mount(2)` acts on
+  them, and `spec::covers` answers whether a path lies at or under a mount
+  target the launch froze.
 - The Gentoo layer checks a path component with `path::is_ordinary_component`,
   and splits a name from its version through one `version::version_hyphen` that
   the package-name rule shares.
@@ -713,6 +807,9 @@ consumer upgrading can skip it.
 - `poll::slot` is gone. A `poll` loop leaves a finished channel out of the
   polled slice, as the `poll` module states.
 - `fcage` and the examples state their exit codes once each.
+- The `orchestrator`, `gentoo-binhost` and `fetch-sandbox` examples set
+  `test = true`, so `cargo test` runs the tests that hold their documented
+  invocations to the build.
 - `lzma-rust2` moves to 0.24, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the
   sans-I/O decoder to apply the limit is gone. The cap, and what an archive over

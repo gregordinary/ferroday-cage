@@ -7,32 +7,33 @@
 //! *on behalf of an address it does not own* has to be withheld from it: the
 //! interface accepts any destination (`any_ip`) so that routed traffic reaches
 //! the flows' sockets, and that switch also makes it answer address resolution
-//! and ICMP echo for the whole address space. Those two are the only frames
-//! whose answer is the interface's own, so classifying them is what keeps
-//! `any_ip` a receive rule rather than a claim of ownership. And TCP and UDP
-//! are carried only from the guest's own address, so every segment and
-//! datagram reports its source. The classifier is a pure function over
-//! `smoltcp::wire`, with no state and no side effects; it reports what a frame
-//! is, and [`pump`](super::pump) decides.
+//! and ICMP echo for the whole address space. Address resolution is an ARP
+//! request in IPv4 and a neighbor solicitation in IPv6. Those requests and an
+//! echo request are the only frames whose answer is the interface's own, so
+//! classifying them is what keeps `any_ip` a receive rule rather than a claim
+//! of ownership. And TCP and UDP are carried only from the guest's own
+//! address, so every segment and datagram reports its source. The classifier
+//! is a pure function over `smoltcp::wire`, with no state and no side effects;
+//! it reports what a frame is, and [`pump`](super::pump) decides.
 //!
 //! Only cleanly parsed, unfragmented frames classify. IP fragmentation is
 //! not compiled in, so the interface rejects every fragment before it
 //! reaches a socket; classifying one would create state for a frame that
 //! is about to be discarded, so an IPv4 fragment classifies as
-//! [`Sniff::Other`] here too. IPv6 needs no such rule, since its fragment
-//! header is an extension header and extension headers are not walked: a
-//! connection-opening segment behind one classifies as [`Sniff::Other`],
-//! leaving it to the interface, which answers an unmatched segment with a
-//! reset. A datagram behind an extension header reaches its port's socket
-//! without being classified, which is why the UDP table checks the source again
-//! where it opens a flow. Checksums are not verified here; the interface
-//! remains the arbiter of validity, and a listener created for a segment the
-//! interface then discards is reaped by the establish deadline.
+//! [`Sniff::Other`] here too. IPv6 extension headers are walked exactly as far
+//! as the interface walks them: one hop-by-hop options header directly after
+//! the fixed header, past which the interface processes the packet as it would
+//! without one. Any other extension header, the fragment header among them,
+//! ends the interface's processing with a parameter-problem reply, so nothing
+//! behind one reaches a socket or is answered, and such a packet classifies as
+//! [`Sniff::Other`]. Checksums are not verified here; the interface remains the
+//! arbiter of validity, and a listener created for a segment the interface then
+//! discards is reaped by the establish deadline.
 
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Icmpv4Message, Icmpv4Packet,
-    Icmpv6Message, Icmpv6Packet, IpAddress, IpEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet,
-    TcpPacket, UdpPacket,
+    Icmpv6Message, Icmpv6Packet, IpAddress, IpEndpoint, IpProtocol, Ipv4Packet, Ipv6ExtHeader,
+    Ipv6ExtHeaderRepr, Ipv6Packet, TcpPacket, UdpPacket,
 };
 
 /// What a frame means to the flow engine.
@@ -59,8 +60,9 @@ pub(super) enum Sniff {
         /// The destination the guest addressed.
         dst: IpEndpoint,
     },
-    /// An address-resolution request: an ARP request, whose answer would
-    /// assert that this interface holds `target`.
+    /// An address-resolution request: an ARP request or a neighbor
+    /// solicitation, whose answer would assert that this interface holds
+    /// `target`.
     Resolve {
         /// The address whose hardware address the guest is asking for.
         target: IpAddress,
@@ -104,11 +106,15 @@ pub(super) fn classify(frame: &[u8]) -> Sniff {
             let Ok(packet) = Ipv6Packet::new_checked(ethernet.payload()) else {
                 return Sniff::Other;
             };
+            let Some((protocol, payload)) = past_hop_by_hop(packet.next_header(), packet.payload())
+            else {
+                return Sniff::Other;
+            };
             classify_transport(
-                packet.next_header(),
+                protocol,
                 IpAddress::Ipv6(packet.src_addr()),
                 IpAddress::Ipv6(packet.dst_addr()),
-                packet.payload(),
+                payload,
             )
         }
         EthernetProtocol::Arp => {
@@ -132,6 +138,23 @@ pub(super) fn classify(frame: &[u8]) -> Sniff {
         }
         _ => Sniff::Other,
     }
+}
+
+/// The protocol and payload the interface processes an IPv6 packet as: what
+/// follows a hop-by-hop options header where the packet opens with one, and
+/// the packet's own otherwise.
+///
+/// That header is the one extension header smoltcp walks, and it walks no
+/// further, so this is the view the interface acts on. `None` is a hop-by-hop
+/// header that does not parse, which the interface discards too.
+fn past_hop_by_hop(next_header: IpProtocol, payload: &[u8]) -> Option<(IpProtocol, &[u8])> {
+    if next_header != IpProtocol::HopByHop {
+        return Some((next_header, payload));
+    }
+    let header = Ipv6ExtHeader::new_checked(payload).ok()?;
+    let repr = Ipv6ExtHeaderRepr::parse(&header).ok()?;
+    let rest = payload.get(repr.header_len() + repr.data.len()..)?;
+    Some((repr.next_header, rest))
 }
 
 /// Classifies a transport payload between the given addresses.
@@ -164,17 +187,26 @@ fn classify_transport(
                 dst: IpEndpoint::new(dst, datagram.dst_port()),
             }
         }
-        // An echo request is the one ICMP message the interface answers by
-        // itself. Every other ICMPv6 message is left alone, neighbor discovery
-        // among them: an advertisement is confined to the interface's own
-        // addresses already, and a solicitation the interface ignores is how
-        // the guest learns an address is nobody's.
+        // An echo request is one of the two ICMP messages the interface answers
+        // by itself. The other is a neighbor solicitation, which smoltcp
+        // answers for any target under `any_ip`: its own check compares only
+        // the low sixteen bits of the solicited-node group with an address it
+        // holds, and then asks whether it holds the target, which `any_ip`
+        // answers yes. A solicitation the interface ignores is how the guest
+        // learns an address is nobody's, so it is classified by its target.
+        // Every other ICMPv6 message is left alone: an advertisement or a
+        // router message asserts nothing on the interface's behalf.
         IpProtocol::Icmp => match Icmpv4Packet::new_checked(payload) {
             Ok(message) if message.msg_type() == Icmpv4Message::EchoRequest => Sniff::Echo { dst },
             _ => Sniff::Other,
         },
+        // `new_checked` holds a solicitation to its full fixed length, so the
+        // target is there to read.
         IpProtocol::Icmpv6 => match Icmpv6Packet::new_checked(payload) {
             Ok(message) if message.msg_type() == Icmpv6Message::EchoRequest => Sniff::Echo { dst },
+            Ok(message) if message.msg_type() == Icmpv6Message::NeighborSolicit => Sniff::Resolve {
+                target: IpAddress::Ipv6(message.target_addr()),
+            },
             _ => Sniff::Other,
         },
         _ => Sniff::Other,
@@ -188,8 +220,8 @@ mod tests {
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-        EthernetRepr, IpAddress, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
-        TcpRepr, TcpSeqNumber,
+        EthernetRepr, Icmpv6Repr, IpAddress, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, NdiscRepr,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
     };
 
     use super::*;
@@ -515,17 +547,152 @@ mod tests {
         }
     }
 
-    #[test]
-    fn neighbor_discovery_is_not_an_echo_request() {
-        // Withholding a neighbor solicitation would break the guest's only way
-        // to reach the gateway. It needs no rule of its own: smoltcp answers
-        // one only for an address whose solicited-node group the interface
-        // joined, which `any_ip` does not widen.
-        let solicitation = 135;
-        let frame = icmp_frame(
-            solicitation,
-            IpAddress::Ipv6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 2)),
+    /// The guest's address in the fixtures' IPv6 frames.
+    const GUEST_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x15);
+
+    /// Wraps an ICMPv6 message from the guest to `dst` in an Ethernet frame,
+    /// behind a hop-by-hop options header when `hop_by_hop` is set.
+    fn icmpv6_frame(message: &Icmpv6Repr<'_>, dst: Ipv6Addr, hop_by_hop: bool) -> Vec<u8> {
+        let checksums = ChecksumCapabilities::default();
+        let mut icmp = vec![0u8; message.buffer_len()];
+        message.emit(
+            &GUEST_V6,
+            &dst,
+            &mut Icmpv6Packet::new_unchecked(&mut icmp),
+            &checksums,
         );
+        // Next header ICMPv6, a length of zero (eight bytes in all), and one
+        // PadN option filling the rest.
+        let options: &[u8] = match hop_by_hop {
+            true => &[58, 0, 1, 4, 0, 0, 0, 0],
+            false => &[],
+        };
+        let ip = Ipv6Repr {
+            src_addr: GUEST_V6,
+            dst_addr: dst,
+            next_header: match hop_by_hop {
+                true => IpProtocol::HopByHop,
+                false => IpProtocol::Icmpv6,
+            },
+            payload_len: options.len() + icmp.len(),
+            hop_limit: 255,
+        };
+        let ethernet = EthernetRepr {
+            src_addr: EthernetAddress([0x02, 0, 0, 0, 0, 1]),
+            dst_addr: EthernetAddress([0x33, 0x33, 0xff, 0, 0, 2]),
+            ethertype: EthernetProtocol::Ipv6,
+        };
+        let mut frame = vec![0u8; ethernet.buffer_len() + ip.buffer_len() + ip.payload_len];
+        let mut eth = EthernetFrame::new_unchecked(&mut frame);
+        ethernet.emit(&mut eth);
+        let mut packet = Ipv6Packet::new_unchecked(eth.payload_mut());
+        ip.emit(&mut packet);
+        let payload = packet.payload_mut();
+        payload[..options.len()].copy_from_slice(options);
+        payload[options.len()..].copy_from_slice(&icmp);
+        frame
+    }
+
+    /// A neighbor solicitation for `target`, sent to its solicited-node group.
+    fn solicitation(target: Ipv6Addr) -> (Icmpv6Repr<'static>, Ipv6Addr) {
+        let [.., a, b, c] = target.octets();
+        let group = Ipv6Addr::new(
+            0xff02,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0xff00 | u16::from(a),
+            u16::from_be_bytes([b, c]),
+        );
+        let message = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: target,
+            lladdr: Some(EthernetAddress([0x02, 0, 0, 0, 0, 1]).into()),
+        });
+        (message, group)
+    }
+
+    #[test]
+    fn a_neighbor_solicitation_classifies_by_the_address_it_asks_after() {
+        // The IPv6 counterpart of the ARP request above, and withheld for the
+        // same reason. smoltcp would answer this one under `any_ip`, since its
+        // own check compares only the low sixteen bits of the group, which
+        // `::1:2` shares with a gateway at `::2`.
+        let target = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, 2);
+        let (message, group) = solicitation(target);
+        assert_eq!(
+            classify(&icmpv6_frame(&message, group, false)),
+            Sniff::Resolve {
+                target: IpAddress::Ipv6(target),
+            },
+        );
+    }
+
+    #[test]
+    fn a_hop_by_hop_header_hides_nothing_the_interface_acts_on() {
+        // The interface walks one hop-by-hop options header and then processes
+        // the packet as it would without one, so the classifier reads past it
+        // too. Otherwise the header would carry a request the interface answers
+        // past the rule that withholds it.
+        let target = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, 2);
+        let (message, group) = solicitation(target);
+        assert_eq!(
+            classify(&icmpv6_frame(&message, group, true)),
+            Sniff::Resolve {
+                target: IpAddress::Ipv6(target),
+            },
+        );
+
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let echo = Icmpv6Repr::EchoRequest {
+            ident: 1,
+            seq_no: 1,
+            data: &[],
+        };
+        assert_eq!(
+            classify(&icmpv6_frame(&echo, dst, true)),
+            Sniff::Echo {
+                dst: IpAddress::Ipv6(dst),
+            },
+        );
+    }
+
+    #[test]
+    fn a_hop_by_hop_header_that_does_not_parse_classifies_as_other() {
+        // A length that runs past the packet: the interface discards it too.
+        let target = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let (message, group) = solicitation(target);
+        let mut frame = icmpv6_frame(&message, group, true);
+        let header = EthernetRepr {
+            src_addr: EthernetAddress([0; 6]),
+            dst_addr: EthernetAddress([0; 6]),
+            ethertype: EthernetProtocol::Ipv6,
+        }
+        .buffer_len()
+            + 40;
+        frame[header + 1] = 200;
+        assert_eq!(classify(&frame), Sniff::Other);
+    }
+
+    #[test]
+    fn another_extension_header_ends_classification() {
+        // The interface walks no header but the hop-by-hop one. Anything behind
+        // another is answered with a parameter problem and reaches no socket,
+        // so there is nothing to classify.
+        let target = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, 2);
+        let (message, group) = solicitation(target);
+        let mut frame = icmpv6_frame(&message, group, true);
+        let next_header = EthernetRepr {
+            src_addr: EthernetAddress([0; 6]),
+            dst_addr: EthernetAddress([0; 6]),
+            ethertype: EthernetProtocol::Ipv6,
+        }
+        .buffer_len()
+            + 6;
+        // Destination options in place of hop-by-hop: the same shape, a
+        // different header.
+        frame[next_header] = 60;
         assert_eq!(classify(&frame), Sniff::Other);
     }
 }

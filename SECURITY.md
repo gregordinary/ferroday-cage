@@ -32,9 +32,9 @@ The library's job is to build the boundary it says it builds. In scope:
 
 - **Containment bypass.** Code inside the sandbox reaching a host path, host
   process, or host resource the configuration did not grant.
-- **A restriction that does not restrict.** A configured Landlock grant,
-  seccomp filter, capability drop, or resource limit that is silently not
-  applied, applied more permissively than configured, or escapable.
+- **A restriction that does not restrict.** A configured Landlock grant or
+  scope, seccomp filter, capability drop, or resource limit that is silently
+  not applied, applied more permissively than configured, or escapable.
 - **Identity-map defects.** A sandbox acting as an id outside its configured
   map, or a map established differently from what was requested.
 - **Provisioning containment.** An archive or package that writes outside the

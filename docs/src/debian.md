@@ -197,9 +197,9 @@ A dependency nothing can satisfy fails the resolution. Three cases reach it:
 - A name no configured archive carries.
 - A name carried only at a version the declared constraint rules out.
 - One an exclusion removed that a hard dependency needed.
- Installing anyway would succeed, since dpkg configures with
-`--force-depends`, and leave a root whose packages cannot work. The resolution
-refuses instead.
+
+Installing anyway would succeed, since dpkg configures with `--force-depends`,
+and leave a root whose packages cannot work. The resolution refuses instead.
 
 Every refusal is reported before the run fails, and the failure names all of
 them. A resolution reports each one as a `DebianEvent::Unsatisfiable` carrying

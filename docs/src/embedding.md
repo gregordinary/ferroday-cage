@@ -236,9 +236,9 @@ because that stack is what the root was made of. Recording only the mounts would
 leave two builds — one on a rootfs, one on an overlay over the same base —
 looking identical.
 
-`identity`, `run-as`, `no-new-privileges`, `network`, `rlimits`, and
-`hardening` are the posture the launch puts the command under, and each changes
-what a build produces:
+`identity`, `run-as`, `no-new-privileges`, `network`, `pid-namespace`,
+`hostname`, `rlimits`, and `hardening` are the posture the launch puts the
+command under, and each changes what a build produces:
 
 - **`identity`** — the identity map: which ids exist inside the sandbox. A
   file's recorded ownership follows from it.
@@ -251,6 +251,11 @@ what a build produces:
   hardening control.
 - **`network`** — the namespace the sandbox creates. A stack attached to a
   pending launch is not visible here, being established after the cage is built.
+- **`pid-namespace`** — whether the command runs under the sandbox's own init.
+  Without one it sees the caller's processes, and its descendants can outlive
+  it.
+- **`hostname`** — the name the command sees. Where none is configured it is the
+  host's, read when the record is made, so two hosts write two records.
 - **`rlimits`** — a build that adapts its parallelism to `RLIMIT_NOFILE`, or
   fails a link under `RLIMIT_AS`, produces different output.
 - **`hardening`** — the subtlest, and the one most worth recording: a seccomp
@@ -258,7 +263,8 @@ what a build produces:
   syscall reads the refusal as an absent feature. The Landlock grants are
   recorded in full, by path and by port; the seccomp filter is recorded as its
   instruction count, since the program itself is thousands of instructions and
-  means nothing to a reader.
+  means nothing to a reader. A posture that asks for Landlock also records the
+  kernel's Landlock ABI, which the requested rights are narrowed to at launch.
 
 `hardening` is present whether or not the `hardening` feature is compiled in,
 reporting `unavailable` when it is not. A record that simply left the key out

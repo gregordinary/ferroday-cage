@@ -1,22 +1,19 @@
-//! A harness for a reported transient: a parallel first-touch of an
+//! A harness for a transient overlay fault: a parallel first touch of an
 //! overlay-merged directory answering `ENOENT` for a file that is present.
 //!
-//! # The report
+//! # The fault
 //!
-//! A consumer running `make -j32` on an overlay root has twice seen a compile
-//! fail with `ENOENT` on a header that is provably in the upper layer, and pass
-//! on immediate retry. What makes the report worth an instrument rather than a
-//! shrug is that the transient is established without one: the same stage's
-//! `./configure` had, minutes earlier and in the same layer, successfully
-//! compiled probes that `#include`d both of the headers that later went
-//! missing. The file was momentarily unfindable, not absent.
+//! A heavily parallel build on an overlay root can fail with `ENOENT` on a
+//! header that is in the upper layer, and pass on immediate retry. The file is
+//! momentarily unfindable rather than absent: a serial step in the same layer
+//! read it minutes before. The fault does not reproduce on demand, and its
+//! cause is unconfirmed.
 //!
-//! Their build root is a fresh mount per command — configure, then make, then
-//! install, each in its own cage over the same upper — so the parallel build
-//! starts against a superblock whose dentry cache the serial configure warmed
-//! and which was then destroyed. Their one clean control does its serial
-//! configure and its parallel build inside a *single* mount, and never
-//! first-touches under parallelism.
+//! Its observed shape is narrow. Each failure is an upper-side path in a
+//! directory both layers carry, which overlayfs assembles from both. Each comes
+//! from a parallel build in a fresh mount, one cage per command over a shared
+//! upper, so the build's lookups are the first that superblock sees. A serial
+//! step and a parallel one inside a single mount have not shown it.
 //!
 //! # What this runs
 //!
@@ -29,25 +26,20 @@
 //! 2. releases `--parallel` processes that all look up three probes at once;
 //! 3. tears the mount down.
 //!
-//! The three probes are the shapes the field evidence distinguishes, and
-//! looking for all three in one storm is what tells a reproduction of the
-//! reported fault from a reproduction of something else:
+//! The three probes are the shapes that tell this fault from another:
 //!
 //! - `upper-only`, a file directly in the merged directory;
 //! - `upper-dir/inside`, a file under an upper-only *subdirectory* of it;
 //! - `lower-only`, a file the lower alone carries.
 //!
-//! The report says the first two fail and the third never has, which is a
-//! constraint rather than an absence: lower-only paths are opened orders of
-//! magnitude more often, by the same processes in the same command. A run that
-//! misses all three evenly is reproducing something else and should be read as
-//! such.
+//! The fault misses the first two and never the third, although a build opens
+//! lower-only paths far more often. A run that misses all three evenly is
+//! reproducing something else.
 //!
 //! `--warm` performs one serial lookup of the merged directory in the same
-//! mount before releasing the storm. That is the direct test of the reported
-//! discriminator: if the storm fires without it and never with it, the
-//! consumer's mount-per-command shape is the cause and collapsing two commands
-//! into one cage is the fix.
+//! mount before releasing the storm. That tests the fresh mount as the cause:
+//! a storm that fires without it and never with it means running the commands
+//! in one cage avoids the fault.
 //!
 //! # Usage
 //!
@@ -56,9 +48,9 @@
 //!     [--trials 2000] [--parallel 32] [--warm]
 //! ```
 //!
-//! `--rootfs` is any rootfs carrying a POSIX shell; the crate's own test
-//! fixture will do. Nothing in it is written to: the probes go in layers of the
-//! harness's own, and the rootfs is only ever a lower.
+//! `--rootfs` is any root filesystem carrying a POSIX shell; the crate's own
+//! test fixture will do. Nothing in it is written to: the probes go in layers
+//! of the harness's own, and the root filesystem is only ever a lower.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -69,26 +61,48 @@ use ferroday_cage::{Cage, ErrorChain, IdentityMap, Overlay};
 
 mod common;
 
-use common::{string_value, value_for};
+use common::{failure, string_value, usage_error, value_for};
+
+/// The program name in diagnostics and usage.
+const PROGRAM: &str = "overlay-race";
+
+const USAGE: &str = "\
+Probe for a transient ENOENT on a parallel first touch of an overlay-merged
+directory.
+
+Usage:
+  overlay-race --rootfs DIR [--trials N] [--parallel N] [--warm]
+
+Options:
+  --rootfs DIR       A root filesystem carrying a POSIX shell; only ever a
+                     lower layer, never written to
+  --trials N         Fresh mounts to storm (default 2000)
+  --parallel N       Processes released at once in each storm (default 32)
+  --warm             Look the merged directory up once, serially, before each
+                     storm
+  -h, --help         Print this help
+
+The process exits 0 when every trial ran, whatever it found, 125 when a trial
+could not be run, and 2 on a usage error.
+";
 
 fn main() -> ExitCode {
-    let options = match Options::parse() {
-        Ok(options) => options,
-        Err(reason) => {
-            eprintln!("overlay-race: {reason}");
-            eprintln!("usage: overlay-race --rootfs DIR [--trials N] [--parallel N] [--warm]");
-            return ExitCode::from(2);
+    let options = match Options::parse(std::env::args_os().skip(1)) {
+        Ok(Some(options)) => options,
+        Ok(None) => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
         }
+        Err(reason) => return usage_error(PROGRAM, &reason),
     };
 
     let scratch = std::env::temp_dir().join(format!("overlay-race-{}", std::process::id()));
     let _ = ferroday_cage::provision::remove(&scratch);
     if let Err(err) = lay_out_layers(&scratch) {
-        eprintln!(
-            "overlay-race: preparing the layers: {}",
-            ErrorChain::new(&err)
+        return failure(
+            PROGRAM,
+            &format!("preparing the layers: {}", ErrorChain::new(&err)),
         );
-        return ExitCode::FAILURE;
     }
 
     println!(
@@ -104,9 +118,8 @@ fn main() -> ExitCode {
         match storm(&options, &scratch, trial) {
             Ok(report) => misses.absorb(&report),
             Err(err) => {
-                eprintln!("overlay-race: trial {trial}: {err}");
                 let _ = ferroday_cage::provision::remove(&scratch);
-                return ExitCode::FAILURE;
+                return failure(PROGRAM, &format!("trial {trial}: {err}"));
             }
         }
         trial += 1;
@@ -118,19 +131,18 @@ fn main() -> ExitCode {
     println!("\n{} trials complete: {misses}", options.trials);
     if misses.total() == 0 {
         println!(
-            "nothing fired. That is a result about this host and this shape, not a \
-             refutation of the report."
+            "nothing fired. That is a result about this host and this shape, and does \
+             not rule the fault out."
         );
     } else if misses.lower_only > 0 && misses.upper_only > 0 && misses.upper_dir > 0 {
         println!(
-            "all three shapes missed. The field evidence has never lost a lower-only \
-             path, so this is very likely a different fault -- read it as such before \
-             reading it as the reported one."
+            "all three shapes missed. The fault this probes for never loses a lower-only \
+             path, so this is very likely a different fault."
         );
     } else {
         println!(
             "the upper-side shapes missed and the lower-only one did not, which is the \
-             asymmetry the report describes."
+             fault's own asymmetry."
         );
     }
     let _ = ferroday_cage::provision::remove(&scratch);
@@ -146,14 +158,17 @@ struct Options {
 }
 
 impl Options {
-    fn parse() -> Result<Options, String> {
+    /// Parses the command line, excluding the program name, or `None` where
+    /// `--help` answered it.
+    fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Options>, String> {
         let mut rootfs = None;
         let mut trials = 2000;
         let mut parallel = 32;
         let mut warm = false;
-        let mut args = std::env::args_os().skip(1);
         while let Some(arg) = args.next() {
-            if arg == "--rootfs" {
+            if arg == "-h" || arg == "--help" {
+                return Ok(None);
+            } else if arg == "--rootfs" {
                 rootfs = Some(PathBuf::from(value_for("--rootfs", &mut args)?));
             } else if arg == "--trials" {
                 trials = count("--trials", &mut args)?;
@@ -165,12 +180,12 @@ impl Options {
                 return Err(format!("unrecognized option {}", arg.to_string_lossy()));
             }
         }
-        Ok(Options {
+        Ok(Some(Options {
             rootfs: rootfs.ok_or("--rootfs is required")?,
             trials,
             parallel,
             warm,
-        })
+        }))
     }
 }
 
@@ -214,9 +229,9 @@ impl std::fmt::Display for Misses {
 /// Builds the two layers the probes live in.
 ///
 /// The probe directory exists in the lower *and* the upper, which is the whole
-/// point: overlayfs has to assemble one entry for it from both, and it is that
-/// assembly the report suspects. A directory only one layer carries is copied
-/// straight through and races nothing.
+/// point: overlayfs has to assemble one entry for it from both, and every
+/// observed failure was in such a directory. A directory only one layer
+/// carries is copied straight through and races nothing.
 fn lay_out_layers(scratch: &Path) -> std::io::Result<()> {
     let lower = scratch.join("lower/probe");
     std::fs::create_dir_all(&lower)?;
@@ -288,7 +303,7 @@ fn storm(options: &Options, scratch: &Path, trial: u32) -> Result<Misses, String
 fn script(options: &Options) -> String {
     let warm = if options.warm {
         // One serial lookup of the merged directory, in this mount, before the
-        // storm. The direct test of the reported discriminator.
+        // storm: the direct test of the fresh mount as the cause.
         "ls /probe >/dev/null 2>&1\n"
     } else {
         ""

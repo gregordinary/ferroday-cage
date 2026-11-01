@@ -11,7 +11,8 @@ use crate::status::ExitStatus;
 enum Signalled {
     /// `SIGTERM` to the command, which it may act on or ignore.
     Terminate,
-    /// `SIGKILL` to the supervisor, which nothing inside survives.
+    /// `SIGKILL` to the supervisor: with a PID namespace nothing inside
+    /// survives it, and without one it reaches the command alone.
     Kill,
     /// Nothing: the kill has already been sent.
     Nothing,
@@ -139,9 +140,12 @@ impl Escalation {
     /// Acts on the deadline that has just passed and moves to the next stage.
     ///
     /// The termination request is a `SIGTERM` the command may trap, clean up
-    /// under, or ignore; the kill takes the sandbox's supervisor and, with it,
-    /// everything inside. Called by a waiter whose own deadline passed; on the
-    /// final stage there is nothing left to send and it does nothing.
+    /// under, or ignore. The kill takes the sandbox's supervisor, and with a
+    /// PID namespace everything inside goes with it; without one it reaches
+    /// the command alone, as [`Running::kill`] states. Either way the command
+    /// has exited once the kill lands, which is what a waiter collects. Called
+    /// by a waiter whose own deadline passed; on the final stage there is
+    /// nothing left to send and it does nothing.
     pub fn expire(&mut self, running: &mut Running<'_>) -> Result<(), Error> {
         match self.advance() {
             Signalled::Terminate => running.terminate(),

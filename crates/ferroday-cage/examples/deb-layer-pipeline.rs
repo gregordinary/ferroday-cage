@@ -71,7 +71,7 @@ use ferroday_cage::{Cage, ErrorChain, Network};
 
 mod common;
 
-use common::{flag_value, into_string, string_value, usage_error, value_for};
+use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
 
 /// The suite bootstrapped when `--suite` is not given.
 const DEFAULT_SUITE: &str = "trixie";
@@ -140,8 +140,8 @@ Components:
   -V, --version         Print the version
 
 Each build runs 'dpkg-buildpackage -us -uc -b' over a copy of the component's
-source. The process exits 0 when every component builds, 1 when a build fails,
-and 2 on a usage error.
+source. The process exits 0 when every component builds, 125 when the pipeline
+stops short (the base, a layer, a build, or the pool), and 2 on a usage error.
 ";
 
 /// A parsed command line.
@@ -175,10 +175,7 @@ fn main() -> ExitCode {
         }
         Ok(Invocation::Run(config)) => match run(config) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("deb-layer-pipeline: {message}");
-                ExitCode::FAILURE
-            }
+            Err(message) => failure("deb-layer-pipeline", &message),
         },
         Err(message) => usage_error("deb-layer-pipeline", &message),
     }

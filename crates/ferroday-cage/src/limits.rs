@@ -183,15 +183,22 @@ roster_enum! {
     /// A per-process resource whose limit the launch sets on the command.
     ///
     /// Each variant names the kernel's `RLIMIT_*` resource it sets and the unit
-    /// its values are counted in. Two carry sandbox-specific caveats:
+    /// its values are counted in. Three carry sandbox-specific caveats:
     ///
-    /// - [`Processes`](Self::Processes) is the kernel's `RLIMIT_NPROC`, which
-    ///   counts processes per *real user id* across the whole system, not per
-    ///   namespace or per sandbox. Under the single-identity map the command's
-    ///   real uid outside the sandbox is the calling user's, so the limit counts
-    ///   the caller's other processes too, and the cap is a ceiling on the pair
-    ///   rather than on the sandbox alone. A range identity map gives the sandbox
-    ///   distinct host ids, so the count is the sandbox's own.
+    /// - [`Processes`](Self::Processes) is the kernel's `RLIMIT_NPROC`, a count
+    ///   per user rather than per process, and the kernel version decides what a
+    ///   user is. From Linux 5.14 it counts per user id within each user
+    ///   namespace, charging a namespace's processes to its creator one level
+    ///   up. The command runs in a user namespace of the sandbox's own, so the
+    ///   count is the sandbox's processes, and the caller's processes outside it
+    ///   do not count. From 5.6 to 5.13 it counts per host user id across the
+    ///   whole system, so a command running as the calling user's host id
+    ///   shares the cap with every other process of the caller's. Root of the
+    ///   single-identity map is that id, and so is root of the subordinate map.
+    ///   A non-root [`run_as`](crate::CageBuilder::run_as) identity under a
+    ///   range map is a host id of its own, whose count is the sandbox's.
+    /// - [`PendingSignals`](Self::PendingSignals) is `RLIMIT_SIGPENDING`, which
+    ///   counts queued signals per user in the same way, on the same kernels.
     /// - [`AddressSpace`](Self::AddressSpace) counts mapped address space, not
     ///   resident memory, so a command that maps far more than it touches — many
     ///   runtimes and allocators do — hits it long before its real memory use
@@ -239,11 +246,11 @@ roster_enum! {
         /// `RLIMIT_NOFILE`: one greater than the highest file descriptor the
         /// command may open.
         OpenFiles = rustix::process::Resource::Nofile => "open-files",
-        /// `RLIMIT_SIGPENDING`: signals that may be queued for the command's real
-        /// user id.
+        /// `RLIMIT_SIGPENDING`: signals that may be queued for the command's
+        /// user, counted per user as the caveat above describes.
         PendingSignals = rustix::process::Resource::Sigpending => "pending-signals",
-        /// `RLIMIT_NPROC`: processes and threads for the command's real user id.
-        /// The fork-bomb ceiling; see the caveat above.
+        /// `RLIMIT_NPROC`: processes and threads for the command's user. The
+        /// fork-bomb ceiling; see the caveat above for what it counts.
         Processes = rustix::process::Resource::Nproc => "processes",
         /// `RLIMIT_STACK`: the main thread's stack, in bytes.
         Stack = rustix::process::Resource::Stack => "stack",

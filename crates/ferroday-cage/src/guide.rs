@@ -4,9 +4,8 @@
 //! `rust` blocks is a doctest of this crate: it compiles against the library the
 //! test run built, with the dev-dependencies a doctest already has, and a block
 //! without `no_run` or `ignore` runs as any other doctest does. `mdbook build`
-//! renders the guide and does not compile it, which left every block in it
-//! unverified prose in a repository that gates its public API, its whole feature
-//! powerset, and the guide's own links.
+//! renders the guide and does not compile it, so this module is what holds the
+//! guide's code to the library.
 //!
 //! The module exists only while doctests are being collected, so nothing here
 //! reaches an ordinary build, the rendered API documentation, or the packaged

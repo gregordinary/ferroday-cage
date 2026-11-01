@@ -660,9 +660,9 @@ reach the destination directory, on a filesystem not mounted `nosuid`, can
 therefore run it as the calling user. Extract an untrusted archive into a
 directory only the calling user can reach, or onto a `nosuid` filesystem.
 
-[An ebuild development sandbox](ebuild-sandbox.md) works this into a consumer:
-it provisions a Gentoo stage3 through `Tarball`, then runs a package build in
-the provisioned root.
+[An ebuild development sandbox](ebuild-sandbox.md) works this into a consumer.
+Given a stage3 tarball already on the host, it provisions the root through
+`Tarball`, then runs a package build in it.
 
 ## Keeping a provisioned root pristine
 

@@ -549,18 +549,24 @@ fn the_stack_resolves_only_for_the_gateway() {
     // the flows' sockets. That switch would also have it answer address
     // resolution for the whole of the guest's link, which would make the stack
     // claim to be every address on it — and would leave the guest with a
-    // resolved neighbour for a host that does not exist.
+    // resolved neighbour for a host that does not exist. Both families resolve:
+    // ARP for IPv4, neighbor discovery for IPv6.
     let mut observer = Collect::default();
     let cage = Cage::builder()
         .rootfs(rootfs)
         .command("/bin/sh")
         .args([
             "-c",
-            // The routed address resolves the gateway on its way out; the
-            // on-link one is asked after directly.
+            // The routed addresses resolve the gateway on their way out; the
+            // on-link ones are asked after directly. `fd00::1:2` shares the
+            // gateway's low sixteen bits, which is all smoltcp's own
+            // solicited-node check compares.
             "/usr/bin/nc -w 2 203.0.113.9 80 </dev/null; \
              /usr/bin/nc -w 2 10.0.2.99 80 </dev/null; \
-             cat /proc/net/arp",
+             /usr/bin/nc -w 2 2001:db8::9 80 </dev/null; \
+             /usr/bin/nc -w 2 fd00::1:2 80 </dev/null; \
+             cat /proc/net/arp; \
+             /sbin/ip -6 neigh show",
         ])
         .build()
         .expect("a valid sandbox configuration");
@@ -572,13 +578,13 @@ fn the_stack_resolves_only_for_the_gateway() {
         .expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
     running
-        .wait_timeout(Duration::from_secs(20))
+        .wait_timeout(Duration::from_secs(30))
         .expect("the wait completes")
         .expect("the command exits before the deadline");
     handle.stop().expect("the stack stops cleanly");
 
-    // A completed entry carries flags 0x2; one the guest asked after and never
-    // heard back about stays at 0x0, or is absent entirely.
+    // A completed ARP entry carries flags 0x2; one the guest asked after and
+    // never heard back about stays at 0x0, or is absent entirely.
     let table = String::from_utf8_lossy(&observer.stdout);
     let resolved = |address: &str| {
         table
@@ -592,6 +598,23 @@ fn the_stack_resolves_only_for_the_gateway() {
     );
     assert!(
         !resolved("10.0.2.99"),
+        "nothing holds an on-link address other than the gateway: {table}",
+    );
+
+    // A resolved IPv6 neighbour carries the hardware address it resolved to;
+    // a failed or incomplete one carries none.
+    let resolved_v6 = |address: &str| {
+        table
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some(address))
+            .any(|line| line.split_whitespace().any(|field| field == "lladdr"))
+    };
+    assert!(
+        resolved_v6("fd00::2"),
+        "the gateway is the stack, and answers for itself: {table}",
+    );
+    assert!(
+        !resolved_v6("fd00::1:2"),
         "nothing holds an on-link address other than the gateway: {table}",
     );
 }

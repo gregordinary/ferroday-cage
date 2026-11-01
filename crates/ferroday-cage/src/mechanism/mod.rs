@@ -408,8 +408,9 @@ pub(crate) struct RunAsPlan {
     /// The gid the command runs as.
     pub(crate) gid: rustix::thread::Gid,
     /// The supplementary groups, set verbatim — an empty list clears the
-    /// caller's inherited groups.
-    pub(crate) groups: Vec<rustix::thread::Gid>,
+    /// caller's inherited groups — or `None` where the gid map cannot carry a
+    /// list and the inherited one stands.
+    pub(crate) groups: Option<Vec<rustix::thread::Gid>>,
 }
 
 /// The mount targets a launch has to create as empty files in the root, and the
@@ -607,7 +608,9 @@ const _: () = assert!(size_of::<SockFilter>() == 8);
 
 /// One frozen Landlock grant: an absolute sandbox path and the kernel
 /// `LANDLOCK_ACCESS_FS_*` bitmask allowed beneath it. The command stage masks
-/// the access to the running kernel's ABI and opens the path after the pivot.
+/// the access to the running kernel's ABI and opens the path after the pivot,
+/// through symbolic links only where
+/// [`HardeningPlan::grants_follow_links`] says so.
 #[cfg(feature = "hardening")]
 #[derive(Debug, Clone)]
 pub(crate) struct LandlockRule {
@@ -654,13 +657,23 @@ pub(crate) struct HardeningPlan {
     /// The `LANDLOCK_SCOPE_*` flags the ruleset scopes, masked to the kernel
     /// ABI in the child. Zero when no scope applies. A ruleset is built when it
     /// is non-zero even with no grant at all, since a scope needs a domain to
-    /// confine its reach to.
+    /// confine its reach to. A scope the mask would drop where nothing else
+    /// bounds its reach was refused at build, so the mask only ever narrows a
+    /// scope a namespace stands behind.
     pub(crate) landlock_scoped: u64,
     /// Caller-side labels naming each Landlock rule in a setup error:
     /// [`landlock`](Self::landlock)'s grants first, then
     /// [`landlock_net`](Self::landlock_net)'s, in the order the command stage
     /// adds them. Never touched by the sandbox stages.
     pub(crate) landlock_labels: Vec<String>,
+    /// Whether a filesystem grant's path is resolved through symbolic links.
+    ///
+    /// False for a sandbox, whose root may hold links a package or an earlier
+    /// run planted: a link on the way to a grant's target would carry the grant
+    /// to wherever it points, so a path crossing one fails the rule instead.
+    /// True for a restriction, whose paths are the caller's host paths, where
+    /// a link such as a merged-`/usr` host's `/lib` is how the host is laid out.
+    pub(crate) grants_follow_links: bool,
     /// The compiled seccomp program, installed verbatim when present.
     pub(crate) seccomp: Option<Vec<SockFilter>>,
     /// The capability bits to retain across the drop; `None` leaves the
@@ -689,7 +702,8 @@ impl HardeningPlan {
             && !self.set_securebits
     }
 
-    /// Checks that the plan's Landlock grants can be enforced on this host.
+    /// Checks that the plan's Landlock grants can be enforced on a kernel at
+    /// `abi`, the probed Landlock ABI, or `None` where the LSM is absent.
     ///
     /// For the restriction fallback, whose only filesystem and network boundary
     /// is Landlock: when the plan requests a grant but this host's Landlock ABI
@@ -705,13 +719,15 @@ impl HardeningPlan {
     /// unrestricted. A plan with no Landlock grant passes; a cage does not call
     /// this — for its filesystem grants and for an isolated-network cage the
     /// namespace isolation remains the boundary — but see
-    /// [`ensure_host_net_enforceable`](Self::ensure_host_net_enforceable) for
-    /// the one case a cage must check.
-    pub(crate) fn ensure_landlock_enforceable(&self) -> Result<(), crate::error::ConfigError> {
+    /// [`ensure_sandbox_enforceable`](Self::ensure_sandbox_enforceable) for
+    /// what a cage must check.
+    pub(crate) fn ensure_landlock_enforceable(
+        &self,
+        abi: Option<i32>,
+    ) -> Result<(), crate::error::ConfigError> {
         if self.landlock.is_empty() && self.landlock_net.is_empty() {
             return Ok(());
         }
-        let abi = probe_landlock_abi();
         let unenforceable = match abi {
             None => true,
             Some(abi) => {
@@ -725,33 +741,59 @@ impl HardeningPlan {
         Ok(())
     }
 
-    /// Checks that a host-network cage's Landlock network grant can be enforced.
+    /// Checks that a sandbox's Landlock requests can be enforced wherever no
+    /// namespace of the sandbox stands behind them, asking `landlock_abi` for
+    /// the kernel's Landlock ABI only when there is such a request.
     ///
-    /// Under [`Network::Host`](crate::Network::Host) there is no network
-    /// namespace, so a Landlock network grant is the sandbox's only network
-    /// boundary — exactly the restriction fallback's situation for that one
-    /// access kind. When the grant is masked away (a kernel below Landlock ABI
-    /// 4, or the LSM absent), the command would reach the host network
-    /// unrestricted despite the explicit grant; refuse the build instead.
+    /// `host_network` is a sandbox under [`Network::Host`](crate::Network::Host),
+    /// which has no network namespace, and `host_pids` one without a PID
+    /// namespace. Each leaves Landlock the only boundary on one reach:
     ///
-    /// A cage with no network grant, or one whose network is
-    /// [`Isolated`](crate::Network::Isolated) or [`None`](crate::Network::None),
-    /// does not need this: the network namespace is the boundary there, and a
-    /// masked-away Landlock grant is a best-effort downgrade of additive
-    /// hardening. The caller invokes this only on the host-network path.
-    pub(crate) fn ensure_host_net_enforceable(&self) -> Result<(), crate::error::ConfigError> {
-        if self.landlock_net.is_empty() {
+    /// - Under host networking, a network grant bounds the host network, so a
+    ///   kernel that masks it away (below ABI 4, or without the LSM) is
+    ///   refused with `HostNetworkLandlockUnenforceable`. So is
+    ///   [`LandlockScope::AbstractUnixSocket`](crate::LandlockScope::AbstractUnixSocket),
+    ///   the only bound on the host's abstract sockets.
+    /// - Without a PID namespace,
+    ///   [`LandlockScope::Signal`](crate::LandlockScope::Signal) is the only
+    ///   bound on signalling the host's processes.
+    ///
+    /// A scope refused here is `LandlockScopeUnenforceable`, on a kernel below
+    /// ABI 6 or without the LSM. Anything a namespace also bounds is additive
+    /// hardening, so the command stage narrows it best-effort instead: the
+    /// filesystem grants, behind the swapped root; a network grant or the
+    /// socket scope in a network namespace of the sandbox's own; the signal
+    /// scope in a PID namespace.
+    pub(crate) fn ensure_sandbox_enforceable(
+        &self,
+        host_network: bool,
+        host_pids: bool,
+        landlock_abi: impl FnOnce() -> Option<i32>,
+    ) -> Result<(), crate::error::ConfigError> {
+        use crate::hardening::scope;
+
+        let net_grant = host_network && !self.landlock_net.is_empty();
+        let mut unbounded = 0;
+        if host_network {
+            unbounded |= scope::ABSTRACT_UNIX_SOCKET;
+        }
+        if host_pids {
+            unbounded |= scope::SIGNAL;
+        }
+        let scoped = self.landlock_scoped & unbounded;
+        if !net_grant && scoped == 0 {
             return Ok(());
         }
-        let abi = probe_landlock_abi();
-        let unenforceable = match abi {
-            None => true,
-            Some(abi) => crate::hardening::net_grant_masked_away(self.landlock_net_handled, abi),
-        };
-        if unenforceable {
+
+        let abi = landlock_abi();
+        if net_grant
+            && abi.is_none_or(|abi| {
+                crate::hardening::net_grant_masked_away(self.landlock_net_handled, abi)
+            })
+        {
             return Err(crate::error::ConfigError::HostNetworkLandlockUnenforceable { abi });
         }
-        Ok(())
+        crate::hardening::ensure_scopes_enforceable(scoped, abi)
     }
 }
 
@@ -869,26 +911,48 @@ pub(crate) enum Arrival {
 
 /// `MS_REMOUNT`. rustix keeps the flag to its own remount call, and a raw
 /// mount carries the caller's bits verbatim.
-const MS_REMOUNT: u32 = 0x20;
+pub(crate) const MS_REMOUNT: u32 = 0x20;
 /// `MS_MOVE`, kept to rustix's own move call for the same reason.
 const MS_MOVE: u32 = 0x2000;
+/// `MS_MGC_VAL`, the magic number `mount(2)` once required in the high half of
+/// its flags word.
+const MS_MGC_VAL: u32 = 0xC0ED_0000;
+/// `MS_MGC_MSK`, the half of the flags word the magic number occupies.
+const MS_MGC_MSK: u32 = 0xFFFF_0000;
+
+/// A raw mount's flags as `mount(2)` acts on them: the legacy magic number
+/// discarded where the high half of the word is exactly that number.
+///
+/// The kernel's `path_mount` strips it before it reads a single flag, and the
+/// magic's bits overlap `MS_PRIVATE` and `MS_SLAVE`. Read as given, a raw mount
+/// carrying it looks like a propagation change while the kernel performs a
+/// fresh mount, so every reading of a raw mount's flags goes through this.
+pub(crate) fn raw_mount_flags(flags: MountFlags) -> u32 {
+    let flags = flags.bits();
+    if flags & MS_MGC_MSK == MS_MGC_VAL {
+        flags & !MS_MGC_MSK
+    } else {
+        flags
+    }
+}
 
 impl Arrival {
     /// What a raw mount carrying `flags` brings to rest on its target, or
     /// `None` where it brings none.
     ///
     /// Read the way `mount(2)` reads its flags, in the order the kernel tests
-    /// them. A remount changes a mount already standing and brings none.
-    /// `MS_BIND` binds a tree, whatever else is set. A propagation change
-    /// brings none. `MS_MOVE` moves a mount standing elsewhere onto the target,
-    /// and anything else mounts a fresh filesystem of the type named.
+    /// them, after [`raw_mount_flags`] has discarded the legacy magic. A
+    /// remount changes a mount already standing and brings none. `MS_BIND`
+    /// binds a tree, whatever else is set. A propagation change brings none.
+    /// `MS_MOVE` moves a mount standing elsewhere onto the target, and anything
+    /// else mounts a fresh filesystem of the type named.
     pub(crate) fn of_raw(flags: MountFlags) -> Option<Arrival> {
         let propagation = (MountPropagationFlags::SHARED
             | MountPropagationFlags::PRIVATE
             | MountPropagationFlags::DOWNSTREAM
             | MountPropagationFlags::UNBINDABLE)
             .bits();
-        let flags = flags.bits();
+        let flags = raw_mount_flags(flags);
         if flags & MS_REMOUNT != 0 {
             None
         } else if flags & MountFlags::BIND.bits() != 0 {

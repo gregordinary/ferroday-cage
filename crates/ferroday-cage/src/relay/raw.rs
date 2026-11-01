@@ -4,48 +4,73 @@
 //! `SIGINT`/`SIGTERM`/`SIGQUIT`, and on a stop — a relay that leaves the user's
 //! shell unusable is a worse failure than the one the terminal feature started
 //! from. This module is the whole of that discipline: a guard for the loop's
-//! frame, a process-global save for the panic hook, and one restorer all of them
-//! call.
+//! frame, a process-global record of the raw session in force for the panic
+//! hook, and one restorer all of them call.
 
 use std::cell::{Cell, RefCell};
-use std::os::fd::{BorrowedFd, OwnedFd};
-use std::sync::OnceLock;
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
 use rustix::termios::{self, OptionalActions, Termios};
 
 use super::RelayError;
 
-/// The first raw session's terminal, and its settings before that session.
+/// The raw session in force: its terminal, and the settings it found there.
 struct Saved {
     /// A duplicate of the descriptor raw mode was entered on.
     ///
-    /// Duplicated rather than borrowed because the hook outlives the relay: the
-    /// caller's own descriptor may be closed by the time a panic unwinds, and a
-    /// closed descriptor's number is one the process may have reallocated to a
-    /// file. The duplicate is held for the process's life, so it names the same
-    /// open file description for as long as anything could ask.
+    /// Duplicated rather than borrowed because the hook may run on another
+    /// thread than the relay, at any point in the session: the caller's own
+    /// descriptor is the caller's to close, and a closed descriptor's number is
+    /// one the process may have reallocated to a file. The duplicate names the
+    /// same open file description for as long as the record holds it.
     fd: OwnedFd,
     /// The settings to replay.
     original: Termios,
+    /// The guard that recorded it, so a guard retires its own record and no
+    /// other.
+    session: u64,
 }
 
-/// The first raw session's terminal, saved for [`restore_terminal`].
+/// The raw session in force, for [`restore_terminal`]: `None` whenever no
+/// guard holds a terminal in raw mode.
 ///
-/// A `OnceLock` rather than a mutex: [`restore_terminal`] is called from a panic
-/// hook, where a mutex the panicking thread already held would deadlock or
-/// answer with a poisoned lock. Written once, before the first raw session's
-/// loop begins, and never mutated, so a lock-free read is always correct.
-static SAVED: OnceLock<Saved> = OnceLock::new();
+/// A guard records its session immediately before it puts the terminal into raw
+/// mode, and retires the record as it restores. So the record exists exactly
+/// while raw mode is in force, and the hook restores nothing outside a session.
+///
+/// A mutex, which [`restore_terminal`] only ever tries. The hook runs from
+/// wherever a panic happens, and blocking there could deadlock. The lock is
+/// held for the length of a record's update and no longer, and nothing inside
+/// it can panic.
+static SESSION: Mutex<Option<Saved>> = Mutex::new(None);
+
+/// The identity the next guard takes, which is what [`Saved::session`] holds.
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
 /// Installs the panic hook once per process.
 static PANIC_HOOK: OnceLock<()> = OnceLock::new();
 
-/// Restores the terminal of the first raw session this process entered.
+/// Takes the session record, blocking, for a guard's update.
 ///
-/// Idempotent and lock-free, so every exit path may call it without
-/// coordination, including a panic hook. A no-op before any relay has entered
-/// raw mode, which is what leaves a failure before that point with the caller's
-/// terminal untouched.
+/// A poisoned lock is taken anyway. No update can panic while it holds the
+/// lock, and the record is whole whatever another thread did.
+fn session() -> MutexGuard<'static, Option<Saved>> {
+    SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Restores the terminal of the raw session in force, where this process is in
+/// that terminal's foreground.
+///
+/// Idempotent, and never blocks, so every exit path may call it without
+/// coordination, a panic hook included. It does nothing before a relay has
+/// entered raw mode, which leaves a failure before that point with the caller's
+/// terminal untouched. It does nothing after the session has restored the
+/// terminal either. The settings are then the shell's again, and replaying the
+/// session's would overwrite whatever the shell has set since.
 ///
 /// The flush is deliberate: input pending at restoration is raw bytes typed at a
 /// session that no longer exists, and discarding them beats letting half an
@@ -53,13 +78,21 @@ static PANIC_HOOK: OnceLock<()> = OnceLock::new();
 ///
 /// # What it reaches
 ///
-/// The *first* terminal a raw session was entered on, which is what a hook with
-/// no argument can name. Sequential sessions on the same terminal — the real
-/// case — restore correctly, and so does every session's own exit, because
-/// [`Relay::run`](super::Relay::run) restores the terminal it was given from a
-/// guard in its own frame rather than through this. A process that relays raw
-/// sessions on *different* terminals over its lifetime is the case this does not
-/// cover: a panic during the second session restores the first one's terminal.
+/// The terminal of the session that holds one in raw mode now, with the
+/// settings that session found there. Sequential sessions are each covered, on
+/// one terminal or on several.
+///
+/// Only from the foreground. A process put into the background with a session
+/// in force has had its terminal taken by the job now in the foreground. A
+/// job-control shell reinstates its own settings when it takes the terminal
+/// back, so replaying the session's would overwrite them and discard the
+/// shell's type-ahead. The session's own guard still restores it when the
+/// session ends, a panic unwinding through [`Relay::run`](super::Relay::run)
+/// included, by the rule [`Signals`](super::Signals) describes.
+///
+/// A call that finds the record busy does nothing. A guard holds it only while
+/// it records or retires a session, and that guard is the one about to restore
+/// the terminal or to enter raw mode on it.
 ///
 /// Restoration means *termios*. `SIGKILL` and `SIGSTOP` are uncatchable and out
 /// of scope, with the same honesty a leaked handle gets: the remedy is `stty
@@ -67,9 +100,19 @@ static PANIC_HOOK: OnceLock<()> = OnceLock::new();
 /// screen left active, a hidden cursor — were written by the sandboxed program
 /// through the relay verbatim and belong to it, exactly as `ssh` treats them.
 pub fn restore_terminal() {
-    if let Some(saved) = SAVED.get() {
-        let _ = termios::tcsetattr(&saved.fd, OptionalActions::Flush, &saved.original);
+    let mut record = match SESSION.try_lock() {
+        Ok(record) => record,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    let Some(saved) = record.as_ref() else {
+        return;
+    };
+    if !in_foreground(saved.fd.as_fd()) {
+        return;
     }
+    let _ = termios::tcsetattr(&saved.fd, OptionalActions::Flush, &saved.original);
+    *record = None;
 }
 
 /// Installs a panic hook that calls [`restore_terminal`] before the hook it
@@ -100,8 +143,8 @@ pub fn install_panic_restore() {
 /// does: normal exit, an early return, or a panic unwinding through the relay's
 /// frame.
 ///
-/// Holds the settings it found, so it restores *its own* terminal rather than
-/// the process-global save [`restore_terminal`] replays.
+/// Holds the settings it found, so it restores *its own* terminal. It also
+/// records them for [`restore_terminal`] for as long as raw mode is in force.
 ///
 /// # Only from the foreground
 ///
@@ -123,6 +166,8 @@ pub(super) struct RawMode<'fd> {
     original: RefCell<Option<Termios>>,
     /// Whether this guard's raw settings are in force now.
     raw: Cell<bool>,
+    /// This guard's identity in the process-global record.
+    session: u64,
 }
 
 impl<'fd> RawMode<'fd> {
@@ -144,6 +189,7 @@ impl<'fd> RawMode<'fd> {
             fd,
             original: RefCell::new(None),
             raw: Cell::new(false),
+            session: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
         };
         guard.enter_in_foreground("putting the caller's terminal into raw mode")?;
         Ok(guard)
@@ -186,6 +232,11 @@ impl<'fd> RawMode<'fd> {
 
     /// Puts the terminal into raw mode if this process is in its foreground and
     /// raw mode is not already in force.
+    ///
+    /// The session is recorded for [`restore_terminal`] before the terminal
+    /// changes, so the hook never finds raw mode in force without the settings
+    /// to undo it. Everything that can fail happens before that, so a failure
+    /// here leaves the terminal as it was.
     fn enter_in_foreground(&self, op: &'static str) -> Result<(), RelayError> {
         if self.raw.get() || !in_foreground(self.fd) {
             return Ok(());
@@ -195,43 +246,59 @@ impl<'fd> RawMode<'fd> {
             Some(original) => original,
             None => self.first_entry()?,
         };
-        let mut raw = original;
+        let duplicate = rustix::io::fcntl_dupfd_cloexec(self.fd, 0).map_err(RelayError::at(
+            "duplicating the caller's terminal descriptor",
+        ))?;
+        let mut raw = original.clone();
         raw.make_raw();
-        termios::tcsetattr(self.fd, OptionalActions::Now, &raw).map_err(RelayError::at(op))?;
+        *session() = Some(Saved {
+            fd: duplicate,
+            original,
+            session: self.session,
+        });
+        if let Err(errno) = termios::tcsetattr(self.fd, OptionalActions::Now, &raw) {
+            self.retire();
+            return Err(RelayError::at(op)(errno));
+        }
         self.raw.set(true);
         Ok(())
     }
 
-    /// Reads the settings the first entry finds and records them, for this
-    /// guard and for the panic hook.
+    /// Reads the settings the first entry finds, which every later restore of
+    /// this guard's replays.
     fn first_entry(&self) -> Result<Termios, RelayError> {
         let original = termios::tcgetattr(self.fd)
             .map_err(RelayError::at("reading the caller's terminal settings"))?;
-        // Duplicated before anything is changed, so the process-global save
-        // below cannot fail once the terminal is raw. Wasted where a raw session
-        // has already been recorded, which costs one descriptor for the length
-        // of this call.
-        let duplicate = rustix::io::fcntl_dupfd_cloexec(self.fd, 0).map_err(RelayError::at(
-            "duplicating the caller's terminal descriptor",
-        ))?;
-        // Recorded for the panic hook's reach. The first raw session in the
-        // process wins; a later one is already covered for its own frame by
-        // this guard.
-        let _ = SAVED.set(Saved {
-            fd: duplicate,
-            original: original.clone(),
-        });
         *self.original.borrow_mut() = Some(original.clone());
         Ok(original)
     }
 
     /// Writes the saved settings back, where raw mode is in force.
+    ///
+    /// The session's record is retired first, so a panic hook that runs from
+    /// here on finds nothing to replay.
     fn write_original(&self, when: OptionalActions) {
         if !self.raw.replace(false) {
             return;
         }
+        self.retire();
         if let Some(original) = self.original.borrow().as_ref() {
             let _ = termios::tcsetattr(self.fd, when, original);
+        }
+    }
+
+    /// Removes this guard's session from the process-global record, where it is
+    /// still there.
+    ///
+    /// The panic hook may have taken it already, and only a record of this
+    /// guard's own is removed.
+    fn retire(&self) {
+        let mut record = session();
+        if record
+            .as_ref()
+            .is_some_and(|saved| saved.session == self.session)
+        {
+            *record = None;
         }
     }
 }
@@ -279,8 +346,6 @@ pub(super) fn window_size(fd: BorrowedFd<'_>) -> Option<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsFd as _;
-
     use std::time::Duration;
 
     use rustix::termios::{LocalModes, SpecialCodeIndex};
@@ -298,8 +363,39 @@ mod tests {
         allocate(&Terminal::new().size(24, 80)).expect("a pseudoterminal is allocatable")
     }
 
+    /// One guard at a time across these tests.
+    ///
+    /// The record the panic hook reads is process-global, and the hook restores
+    /// whichever session it holds. A test that calls the hook while another
+    /// test's session is in force would restore that session's terminal under
+    /// it.
+    static GUARDS: Mutex<()> = Mutex::new(());
+
+    /// Takes [`GUARDS`], ignoring a poisoning left by a failed test: the lock
+    /// orders the tests and guards no state of its own.
+    fn serially() -> MutexGuard<'static, ()> {
+        GUARDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The settings `primary`'s terminal carries now.
+    fn settings(primary: &OwnedFd) -> Termios {
+        termios::tcgetattr(primary).expect("the settings are readable")
+    }
+
+    /// Plays the shell between sessions: turns echo off on `primary`'s
+    /// terminal, a setting no session's original carries.
+    fn shell_turns_echo_off(primary: &OwnedFd) {
+        let mut shells = settings(primary);
+        shells.local_modes.remove(LocalModes::ECHO);
+        termios::tcsetattr(primary, OptionalActions::Now, &shells)
+            .expect("the settings are settable");
+    }
+
     #[test]
     fn raw_mode_is_visible_from_the_other_end_and_undone_on_drop() {
+        let _serial = serially();
         let (primary, replica) = pair();
         let before = termios::tcgetattr(&primary).expect("the settings are readable");
         assert!(
@@ -329,6 +425,7 @@ mod tests {
 
     #[test]
     fn a_stop_restores_and_a_continue_re_enters() {
+        let _serial = serially();
         let (primary, replica) = pair();
         let cooked = termios::tcgetattr(&primary).expect("the settings are readable");
 
@@ -355,6 +452,7 @@ mod tests {
 
     #[test]
     fn a_stop_keeps_the_type_ahead_that_an_ending_session_discards() {
+        let _serial = serially();
         // The two restores differ only in what they do with input already in
         // the queue, so the terminal here is one whose baseline is already
         // non-canonical: a read then answers from the queue directly, and the
@@ -409,6 +507,7 @@ mod tests {
 
     #[test]
     fn restoring_replays_the_first_settings_rather_than_the_last() {
+        let _serial = serially();
         // A second guard on an already-raw terminal would save raw as its
         // original if it read the terminal at that moment. The guard the loop
         // holds is entered once per session, so this pins the property the
@@ -429,6 +528,7 @@ mod tests {
 
     #[test]
     fn a_restore_writes_only_where_raw_mode_is_in_force() {
+        let _serial = serially();
         // Once the session has restored the terminal, its settings are the
         // shell's again, and a later restore, the guard's drop among them,
         // must not replay what the session found over what the shell has
@@ -480,6 +580,185 @@ mod tests {
         assert!(
             matches!(refused, Err(RelayError::Io { .. })),
             "a pipe has no termios to save"
+        );
+    }
+
+    #[test]
+    fn the_panic_restore_undoes_the_session_in_force() {
+        let _serial = serially();
+        let (primary, replica) = pair();
+        let cooked = settings(&primary);
+        let raw = RawMode::enter(replica.as_fd()).expect("raw mode is enterable");
+        restore_terminal();
+        assert_eq!(
+            settings(&primary).local_modes,
+            cooked.local_modes,
+            "the hook left the session's terminal raw",
+        );
+        drop(raw);
+    }
+
+    #[test]
+    fn the_panic_restore_leaves_a_terminal_whose_session_has_ended() {
+        // Once the session has restored the terminal, its settings are the
+        // shell's again. A panic later in the process must not replay the
+        // session's over whatever the shell has set since.
+        let _serial = serially();
+        let (primary, replica) = pair();
+        drop(RawMode::enter(replica.as_fd()).expect("raw mode is enterable"));
+        shell_turns_echo_off(&primary);
+        restore_terminal();
+        assert!(
+            !settings(&primary).local_modes.contains(LocalModes::ECHO),
+            "the hook rewrote a terminal no session held",
+        );
+    }
+
+    #[test]
+    fn the_panic_restore_reaches_the_session_in_force_on_another_terminal() {
+        // A program relaying sessions on two terminals in turn: the hook
+        // restores the one in force, with the settings it found, and leaves
+        // the first alone.
+        let _serial = serially();
+        let (first, first_replica) = pair();
+        drop(RawMode::enter(first_replica.as_fd()).expect("raw mode is enterable"));
+        shell_turns_echo_off(&first);
+
+        let (second, second_replica) = pair();
+        let cooked = settings(&second);
+        let raw = RawMode::enter(second_replica.as_fd()).expect("raw mode is enterable");
+        restore_terminal();
+        assert!(
+            !settings(&first).local_modes.contains(LocalModes::ECHO),
+            "the hook rewrote the first session's terminal",
+        );
+        assert_eq!(
+            settings(&second).local_modes,
+            cooked.local_modes,
+            "the hook left the session in force raw",
+        );
+        drop(raw);
+    }
+
+    /// Names the role this test binary plays when it runs itself as the child
+    /// process of [`the_panic_restore_leaves_a_terminal_its_session_lost_to_the_foreground`].
+    const BACKGROUND_HELPER: &str = "FERRODAY_CAGE_TEST_BACKGROUND_RESTORE";
+
+    /// A session moved to the background has lost its terminal to the job in
+    /// the foreground, and the hook leaves that job's settings alone.
+    ///
+    /// Only a process with the terminal as its controlling terminal has a
+    /// foreground to be out of, which this test process cannot become without
+    /// taking every other test with it. So it runs this test binary as a child
+    /// process in a session of its own, on a fresh pseudoterminal, and the
+    /// child plays both the session and the shell; see
+    /// [`helper_restore_in_the_background`].
+    #[test]
+    fn the_panic_restore_leaves_a_terminal_its_session_lost_to_the_foreground() {
+        let (primary, replica) = pair();
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let mut command = std::process::Command::new(exe);
+        command
+            .args([
+                "--exact",
+                "relay::raw::tests::helper_restore_in_the_background",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(BACKGROUND_HELPER, "1");
+        let mut child = ferroday_cage_testkit::pty::spawn_controlled(&mut command, &replica);
+        drop(replica);
+
+        // Drained throughout, so the child's report cannot fill the terminal.
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("the helper can be waited for") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the helper did not finish; it printed:\n{seen}");
+            }
+            ferroday_cage_testkit::pty::drain_until(
+                &primary,
+                std::time::Instant::now() + Duration::from_millis(50),
+                &mut seen,
+            );
+        };
+        while ferroday_cage_testkit::pty::drain_until(
+            &primary,
+            std::time::Instant::now() + Duration::from_millis(100),
+            &mut seen,
+        ) {}
+        assert!(status.success(), "the helper failed; it printed:\n{seen}");
+        assert!(
+            seen.contains("1 passed"),
+            "the helper ran no test; it printed:\n{seen}",
+        );
+    }
+
+    /// Not a test of its own: when [`BACKGROUND_HELPER`] is set, this plays a
+    /// session that the shell moves to the background, and the shell that
+    /// takes the terminal back. Without the variable it does nothing.
+    #[test]
+    fn helper_restore_in_the_background() {
+        use std::os::unix::process::CommandExt as _;
+
+        if std::env::var_os(BACKGROUND_HELPER).is_none() {
+            return;
+        }
+        // Blocked, as a relay blocks it, so a write to the terminal from the
+        // background succeeds rather than stopping this process: the shell
+        // this plays writes from there, and so would the hook.
+        let _signals = crate::relay::Signals::install().expect("the relay's signals install");
+        let terminal = rustix::stdio::stdin();
+        let raw = RawMode::enter(terminal).expect("raw mode is enterable");
+        let original = raw
+            .original
+            .borrow()
+            .clone()
+            .expect("the session entered raw mode in the foreground");
+
+        // The shell takes the foreground and reinstates settings of its own.
+        let mut shell = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a process to hold the foreground starts");
+        let shell_group =
+            rustix::process::Pid::from_raw(i32::try_from(shell.id()).expect("a process id fits"))
+                .expect("a live process id");
+        termios::tcsetpgrp(terminal, shell_group).expect("the foreground moves to the shell");
+        let mut shells = original.clone();
+        shells.local_modes.remove(LocalModes::ECHO);
+        termios::tcsetattr(terminal, OptionalActions::Now, &shells)
+            .expect("the shell's settings are settable");
+
+        restore_terminal();
+        let in_the_background = termios::tcgetattr(terminal).expect("the settings are readable");
+
+        // Back in the foreground, with the session's raw mode still its own.
+        termios::tcsetpgrp(terminal, rustix::process::getpgrp())
+            .expect("the foreground returns to the session");
+        restore_terminal();
+        let in_the_foreground = termios::tcgetattr(terminal).expect("the settings are readable");
+
+        let _ = shell.kill();
+        let _ = shell.wait();
+        drop(raw);
+
+        assert!(
+            !in_the_background.local_modes.contains(LocalModes::ECHO),
+            "the hook rewrote the settings of the job in the foreground",
+        );
+        assert_eq!(
+            in_the_foreground.local_modes, original.local_modes,
+            "the hook did not restore the session's terminal in the foreground",
         );
     }
 }

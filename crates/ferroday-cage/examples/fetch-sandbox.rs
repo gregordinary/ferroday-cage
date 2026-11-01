@@ -12,15 +12,16 @@
 //!     http://example.org
 //! ```
 //!
-//! It is the worked example for the `netstack` feature, exercising every public
-//! item of the network-stack API in the order a consumer uses them:
+//! It is the worked example for the `netstack` feature, taking an outbound
+//! fetch through a stack's whole life in the order a consumer drives it:
 //! [`NetStack::builder`](ferroday_cage::NetStack::builder) to configure the
 //! stack, [`spawn_pending`](ferroday_cage::Cage::spawn_pending) to hold the
 //! command at the gate, [`attach`](ferroday_cage::NetStack::attach) to stand the
 //! network up, [`proceed`](ferroday_cage::Pending::proceed) to release the
 //! command once the network is ready, and
 //! [`stop`](ferroday_cage::NetStackHandle::stop) to tear the stack down after
-//! the command exits.
+//! the command exits. Publishing a port, for a server inside the sandbox, is
+//! the guide's to show: a fetch has nothing listening.
 //!
 //! DNS is the caller's to arrange. The stack refuses loopback and link-local
 //! destinations, so a host running systemd-resolved — whose `127.0.0.53` stub is
@@ -37,6 +38,7 @@
 //! ```
 
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -45,7 +47,7 @@ use ferroday_cage::{Cage, Error, ErrorChain, NetStack, NetStackError};
 
 mod common;
 
-use common::{failure, usage_error, value_for};
+use common::{failure, string_value, usage_error, value_for};
 
 /// The fetch tool, addressed by absolute path: the cage does not resolve the
 /// command against `PATH`.
@@ -165,7 +167,8 @@ fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
     let mut builder = Cage::builder()
         .rootfs(&options.rootfs)
         .command(WGET)
-        .args(["-qO-", &options.url.to_string_lossy()]);
+        .arg("-qO-")
+        .arg(&options.url);
     // Give the sandbox the host's DNS only if the stack forwards to one of its
     // nameservers.
     if host_has_forwarded_nameserver(&stack) {
@@ -233,11 +236,10 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Options>, St
         } else if arg == "--tarball" {
             tarball = Some(PathBuf::from(value_for("--tarball", &mut args)?));
         } else if arg == "--cidr" {
-            let value = value_for("--cidr", &mut args)?;
-            cidr = Some(parse_cidr(&value.to_string_lossy())?);
+            cidr = Some(parse_cidr(&string_value("--cidr", &mut args)?)?);
         } else if arg == "--host-loopback" {
             host_loopback = true;
-        } else if arg.to_string_lossy().starts_with('-') && arg != "-" {
+        } else if arg.as_bytes().starts_with(b"-") && arg != "-" {
             return Err(format!("unrecognized option {}", arg.to_string_lossy()));
         } else if url.is_none() {
             url = Some(arg);
@@ -302,5 +304,24 @@ mod tests {
         assert_eq!(options.rootfs, Path::new("/r"));
         assert!(options.host_loopback);
         assert_eq!(options.url, OsString::from("http://10.0.0.1"));
+    }
+
+    /// A `--cidr` value is text, and one that is not is refused as such,
+    /// naming the option, rather than parsed from a lossy rendering of it.
+    #[test]
+    fn a_cidr_that_is_not_text_is_refused_by_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut line: Vec<OsString> = ["--rootfs", "/r", "--tarball", "a.tar.gz", "--cidr"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        line.push(OsString::from_vec(b"10.0.2.0/\xff".to_vec()));
+        line.push(OsString::from("http://10.0.0.1"));
+        let Err(message) = parse(line.into_iter()) else {
+            panic!("a --cidr that is not UTF-8 is refused");
+        };
+        assert!(message.contains("--cidr value"), "{message}");
+        assert!(message.contains("not valid UTF-8"), "{message}");
     }
 }

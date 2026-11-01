@@ -129,7 +129,8 @@ the `netstack` feature the library brings its own:
 [`NetStack::attach`] creates a tap device inside the sandbox's
 namespace and terminates the guest's TCP and UDP flows in the
 caller's process, forwarding each over an ordinary host socket —
-self-contained, unprivileged outbound connectivity.
+self-contained, unprivileged outbound connectivity, and inbound
+connections to the ports the caller publishes.
 "
 )]
 //!

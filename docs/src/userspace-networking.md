@@ -48,7 +48,8 @@ the tap device in the sandbox's namespace, terminates the guest's TCP and UDP
 flows in an in-process TCP/IP implementation, and forwards each over an
 ordinary host socket. The result is unprivileged outbound IPv4 and IPv6: the
 host sees a normal application making connections, and the sandbox sees a
-gateway to the world.
+gateway to the world. Connections run the other way only through a port the
+caller [publishes](#publishing-a-port).
 
 A stack is built from a [`NetStackBuilder`], attached to a pending launch, and
 stopped once the command has finished:
@@ -177,6 +178,13 @@ re-expressed in the other family. The guest's own subnet is refused too: it is a
 private link between the guest and the stack, and forwarding it would send the
 guest's on-link traffic to the host's view of those addresses, which collides
 with a real LAN wherever the default `10.0.2.0/24` overlaps one.
+
+NAT64's well-known prefix, `64:ff9b::/96`, is how an IPv6-only host reaches IPv4
+destinations, through a translator that connects to the IPv4 address in the last
+32 bits. The guest reaches what the host reaches, so the prefix is carried. The
+embedded address is held to the IPv4 rules, so `64:ff9b::169.254.169.254` is
+refused and `64:ff9b::203.0.113.9` is carried. A network-specific translation
+prefix looks like any other routable address, and the stack treats it as one.
 
 That subnet refusal is the silent one. Those addresses are on-link from the
 guest's point of view, so it resolves a hardware address before it sends a
@@ -361,7 +369,8 @@ with `--share-net` and with `--restrict`.
 ### A worked example
 
 The `fetch-sandbox` example provisions an Alpine root, attaches the stack, and
-fetches a URL, exercising every public item of the API in order:
+fetches a URL. It drives the stack's whole life in order, from the builder to
+`stop`:
 
 ```sh
 cargo run --example fetch-sandbox --features netstack,tarball -- \

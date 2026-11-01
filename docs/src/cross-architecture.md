@@ -67,9 +67,10 @@ match foreign_interpreter("arm64") {
 
 Those are three different problems with three different fixes — install it,
 enable it, re-register it — and a message that collapsed them would send a
-reader to the wrong one. The example checks before it provisions, because the
-provisioner's own preflight runs at the point it first executes a target binary,
-which is after every package has been downloaded and unpacked.
+reader to the wrong one. The provisioner's own preflight tells them apart too,
+before it downloads anything. The example checks on every run all the same,
+since a root that already exists is reused without a bootstrap, and its command
+needs the handler just as much.
 
 `Interpreter` also carries [`resolved`], the interpreter path canonicalized. The
 two are separate facts worth recording separately: the registration usually

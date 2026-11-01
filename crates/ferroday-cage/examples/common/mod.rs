@@ -24,9 +24,9 @@
 //! questions, and that is where the sharing stops. A crate's examples are not
 //! reachable from another crate, so the two could only meet in a crate
 //! published for the purpose — a dependency on every consumer's build for four
-//! functions that parse arguments. The boundary is therefore deliberate rather
-//! than pending: each side owns the wording of its own diagnostics, and neither
-//! is the reference for the other.
+//! functions that parse arguments. The boundary is therefore deliberate: each
+//! side owns the wording of its own diagnostics, and neither is the reference
+//! for the other.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

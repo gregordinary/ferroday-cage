@@ -641,6 +641,61 @@ fn an_explicit_range_request_launches() {
     assert_eq!(extents, 2, "the requested extents are the map: {stdout}");
 }
 
+/// A range map whose gid list is the caller's own gid alone, which
+/// `newgidmap` writes by denying `setgroups`: a non-root run-as identity
+/// launches under it and keeps the group list it inherited, where a call
+/// clearing that list would fail the launch.
+#[cfg(feature = "subid")]
+#[test]
+fn run_as_launches_under_the_callers_own_gid_alone() {
+    let Some(rootfs) = rootfs() else { return };
+    if !common::require::range_map() {
+        return;
+    }
+    let Some((uid_start, uid_count)) = subordinate_allocation("/etc/subuid") else {
+        common::require::SUBID.skip("the subordinate allocation is not stated in the files");
+        return;
+    };
+    let span = 1_000.min(uid_count);
+    if span <= 250 {
+        common::require::SUBID.skip("the subordinate allocation is too small to map id 250");
+        return;
+    }
+    let uid = vec![
+        IdRange {
+            inside: 0,
+            outside: rustix::process::geteuid().as_raw(),
+            count: 1,
+        },
+        IdRange {
+            inside: 1,
+            outside: uid_start,
+            count: span,
+        },
+    ];
+    let gid = vec![IdRange {
+        inside: 0,
+        outside: rustix::process::getegid().as_raw(),
+        count: 1,
+    }];
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "echo \"$(id -u) $(id -g)\""])
+        .identity_map(IdentityMap::ranges(uid, gid))
+        .run_as(Identity::new(250, 0))
+        .build()
+        .expect("the sandbox should build");
+    let output = cage.output().expect("the sandbox should launch");
+    let stdout = stdout_of(&output);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout.trim(), "250 0", "{stdout}");
+}
+
 /// An explicit range request for ids the caller has no claim to is refused at
 /// build time, with the offending extent named.
 #[cfg(feature = "subid")]

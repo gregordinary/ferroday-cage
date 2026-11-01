@@ -130,30 +130,35 @@ populated, for a build with no network at all.
 
 ### Scratch directories
 
-A test that needs a real filesystem tree takes it from a guard that removes the
-tree when it drops. It does not compose a path under the system temporary
-directory by hand. A directory that only clears itself on the *next* run leaves
-one tree per run behind forever, which a long-lived machine notices.
-
-Three shapes cover every test here:
+A test that needs a real filesystem tree does not compose a path under the
+system temporary directory by hand. It takes one from a shape that removes its
+tree when it drops, or reuses one fixed name. Either way a run adds no tree to
+what earlier runs left. Four shapes cover every test:
 
 - **A unit test** inside `crates/ferroday-cage/src` uses
-  `crate::scratch::Scratch`, which dereferences to its `Path`.
-- **An integration test** uses `common::scratch_dir`, which places its trees
-  under `target` so `cargo clean` clears them. A test that fills its tree with
-  subordinate-owned entries uses `common::ranged_scratch` instead, as
-  `tests/export.rs` and the removal test in `tests/identity.rs` do. Such a tree
-  resists removal by the calling user, and `scratch_dir` clears a previous run's
-  tree as that user. So it lives in the system temporary directory, and its
-  guard removes it through `provision::Remove` when it drops.
-- **A network suite's downloads** are not a scratch tree at all: they are kept
+  `crate::scratch::Scratch`. It creates a directory with an unpredictable name
+  in the system temporary directory, dereferences to its `Path`, and removes the
+  tree when it drops.
+- **An integration test** uses `common::scratch_dir(name)`. It returns the path
+  of an empty directory named for the test, in the fixture cache, and holds no
+  guard. The tree outlives the test, and the next run of that test empties it
+  before use.
+- **A tree of subordinate-owned entries** comes from `common::ranged_scratch`
+  instead, as `tests/export.rs` and the removal test in `tests/identity.rs` do.
+  Such a tree resists removal by the calling user, `scratch_dir`'s emptying
+  included. So it lives in the system temporary directory under a name carrying
+  the process id. Its guard removes it through `provision::Remove` under the
+  subordinate map when it drops.
+- **A network suite's downloads** are not a scratch tree at all. They are kept
   on purpose, so that a second run does not fetch half a gigabyte again.
-  `common::download_cache` names one directory per suite, under
-  `FERRODAY_CAGE_FIXTURE_DIR` where it is set and the system temporary directory
-  otherwise. It and `ranged_scratch` are the two places here that deliberately
-  sit outside `target`.
-  A `cargo clean` costing that much to undo is a reason not to run the network
-  suites.
+  `common::download_cache` names one fixed directory per suite. A `cargo clean`
+  costing that much to undo is a reason not to run the network suites.
+
+The fixture cache is `test-fixtures` under `target`, which `cargo clean`
+clears. It holds the root filesystem fixture and every `scratch_dir` tree.
+`FERRODAY_CAGE_FIXTURE_DIR` moves the fixture cache and the download caches
+together. Without it, the download caches sit in the system temporary
+directory. `ranged_scratch` uses the system temporary directory either way.
 
 Both crates' `tests/common/mod.rs` are mostly re-exports of
 `ferroday-cage-testkit`, a workspace member that is never published. It holds
@@ -465,10 +470,15 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Resolve a range identity map into the extents a delegate writes, validated | `idmap::resolve_delegate`, through the configured delegate or the bundled chain |
 | Can a provisioner establish its range map, asked before it downloads anything? | `idmap::establishable` |
+| Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |
+| Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |
 | What does the single-identity map write? | `idmap::single_identity_lines` |
 | Validate the command a sandbox or a restriction executes | `spec::validate_command` |
+| Can this kernel enforce a Landlock request that is a reach's only bound? | `mechanism::HardeningPlan::ensure_sandbox_enforceable` for a sandbox, and `HardeningPlan::ensure_landlock_enforceable` with `hardening::ensure_scopes_enforceable` for a restriction |
 | Compose an overlay's mount options | `mechanism::overlay_options` |
 | What does a mount op bring to rest on its target, if anything? | `mechanism::MountAction::arrival`, or `Arrival::of_raw` for a raw mount's flags |
+| Read a raw mount's flags as `mount(2)` acts on them | `mechanism::raw_mount_flags` |
+| Is this path at or under a mount target the launch froze? | `spec::covers` |
 | Does a launch bind the host's `resolv.conf`, or has a mount of the caller's claimed it? | `CageBuilder::get_resolv_conf` |
 | Does the network stack carry the guest's traffic to this destination? | `NetStack::forwards` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
@@ -478,7 +488,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
 | Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |
-| Make a scratch tree that clears itself | `scratch::Scratch`, or from a test suite `common::scratch_dir`, and `common::ranged_scratch` for a tree of subordinate-owned entries |
+| Make a scratch tree for a test that leaves nothing to accumulate | `scratch::Scratch`, removed when it drops, or from a test suite `common::scratch_dir`, emptied when the next run reuses it, and `common::ranged_scratch` for a tree of subordinate-owned entries |
 | What happens when a run's timeout runs out? | `relay::Escalation` |
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |
 | Parse an argument in an example | `examples/common` |

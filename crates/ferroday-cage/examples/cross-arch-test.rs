@@ -352,11 +352,12 @@ fn run(config: Config) -> ExitCode {
 /// where it cannot run at all.
 ///
 /// The three refusals are three different problems with three different fixes,
-/// so they are told apart rather than collapsed into one message. Checking here
-/// rather than letting the provisioner check keeps a half-hour bootstrap from
-/// running before the failure: the provisioner's own preflight runs at the
-/// point it first executes a target binary, which is after every package has
-/// been downloaded and unpacked.
+/// so they are told apart rather than collapsed into one message. The
+/// provisioner's own preflight refuses the same hosts before it downloads
+/// anything, but only when it bootstraps. This runs on every launch, because a
+/// root that already exists is reused as it stands and its command needs the
+/// handler all the same. It also refuses a host that runs the architecture
+/// natively, where the example would demonstrate nothing.
 fn report_interpreter(architecture: &str) -> Result<(), ExitCode> {
     let Some(interpreter) = foreign_interpreter(architecture) else {
         // Either the host runs this architecture natively, in which case the

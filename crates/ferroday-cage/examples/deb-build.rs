@@ -13,11 +13,12 @@
 //! ```
 //!
 //! It is the Debian counterpart of the ebuild sandbox: where that example
-//! provisions a Gentoo stage3 from a tarball, this one bootstraps a Debian
-//! suite from the archive through the [`Debian`](ferroday_cage::provision::debian::Debian)
-//! provisioner, and where the tarball provisioner extracts silently, this one
-//! wires a [progress](ferroday_cage::provision::debian::Debian::observe)
-//! sink so the heavy bootstrap reports what it is doing.
+//! provisions a Gentoo stage3 through the Gentoo provisioner, this one
+//! bootstraps a Debian suite from the archive through the
+//! [`Debian`](ferroday_cage::provision::debian::Debian) provisioner. Both wire
+//! a progress sink, this one through
+//! [`observe`](ferroday_cage::provision::debian::Debian::observe), so the heavy
+//! bootstrap reports what it is doing.
 //!
 //! # The build environment is baked in
 //!
@@ -31,10 +32,10 @@
 //! into the root, changing them means provisioning a fresh `--rootfs`; an
 //! existing root is reused as it stands.
 //!
-//! Talking to the archive to discover build dependencies, rather than running
-//! `apt-get build-dep` inside the cage, keeps to the provisioner's model: it
-//! speaks to the archive directly and never invokes an external package tool.
-//! It also means the build needs no network and no writable package database.
+//! The provisioner resolves those dependencies itself, speaking to the archive
+//! directly, so the build needs no network and no writable package database.
+//! The root's `sources.list` names binary packages only, which leaves
+//! `apt-get build-dep` nothing to resolve against inside the cage.
 //!
 //! # No hardening, and the identity map
 //!

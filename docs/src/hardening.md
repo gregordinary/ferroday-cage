@@ -54,12 +54,19 @@ single file or device node, such as `/etc/hostname` or `/dev/null`. There it
 allows only the rights that act on a file, since there are no entries to list,
 create, or remove.
 
+A grant's path names its target itself. No component may be a symbolic link,
+the last one included. A link in a root that is not fully trusted can point
+anywhere in the sandbox, and a grant resolved through it would cover wherever it
+points. A grant that crosses a link fails the launch with `ELOOP`, naming the
+grant. On a merged-`/usr` root, where `/lib` is a link to `usr/lib`, grant
+`/usr` instead.
+
 The rules are enforced on any kernel that offers Landlock, best-effort down to
-the kernel's supported ABI: a rule referencing an access right a kernel does not
+the kernel's supported ABI. A rule naming an access right a kernel does not
 define is narrowed to what that kernel enforces, never widened. A kernel with no
-Landlock support at all is a setup error, not a silent success — a requested
-restriction never fails to apply unnoticed. [`host::landlock_abi`] reports the
-running kernel's supported ABI version, or `None` when Landlock is absent.
+Landlock support at all fails the launch with a setup error, rather than run the
+command without its rules. [`host::landlock_abi`] reports the running kernel's
+supported ABI version, or `None` when Landlock is absent.
 
 ## Landlock network rules
 
@@ -135,23 +142,34 @@ abstract socket such a process created. Both reaches stay open between the
 command and the processes it starts. A scope is not a grant, so it enrolls no
 path or port and leaves the filesystem and the network as the grants left them.
 
-Scopes need Landlock ABI 6 (Linux 6.12). On an older kernel that offers Landlock
-they narrow away best-effort, as an unsupported right does. The [restriction
-fallback](restriction-fallback.md), which has neither namespace, applies both
-scopes by default.
+Scopes need Landlock ABI 6 (Linux 6.12). Where a namespace also bounds its
+reach, a scope is additive, and an older kernel that offers Landlock narrows it
+away best-effort. Where nothing else bounds the reach, the scope is the
+boundary. That is `Signal` under [`pid_namespace(false)`], and
+`AbstractUnixSocket` under [`Network::Host`]. There a kernel below ABI 6, or one
+without Landlock, refuses the build with
+[`ConfigError::LandlockScopeUnenforceable`].
+
+The [restriction fallback](restriction-fallback.md), which has neither
+namespace, applies both scopes by default. A kernel that cannot enforce them
+drops the default scopes, and refuses scopes a restriction names itself.
 
 ## Seccomp syscall filters
 
 [`seccomp`] applies a syscall filter to the command. Three policies are
 available through [`SeccompPolicy`]:
 
-- `Curated` — a built-in deny-list of dangerous and rarely-legitimate syscalls
-  (mounting, kernel modules, the keyring, tracing, time-setting, and similar),
-  answering each with `EPERM` and allowing the rest. Two entries name an
-  argument rather than a whole syscall: `ioctl` is denied for the `TIOCSTI` and
-  `TIOCLINUX` requests, which write to a terminal's input queue, and allowed for
-  everything else. A convenience posture, not a boundary claim; its roster grows
-  as new syscalls warrant denial.
+- `Curated` — a built-in deny-list of dangerous and rarely-legitimate syscalls,
+  answering each with `EPERM` and allowing the rest. It covers mounting,
+  creating or entering a namespace, kernel modules, the keyring, tracing,
+  time-setting, and similar. Some entries name an argument rather than a whole
+  syscall. `ioctl` is denied for the `TIOCSTI` and `TIOCLINUX` requests, which
+  write to a terminal's input queue. `clone` and `unshare` are denied when their
+  flags create a namespace, so processes and threads still start. `clone3` is
+  answered `ENOSYS`, for the reason [Argument
+  conditions](#argument-conditions) gives. A command that builds a sandbox of its
+  own, such as a browser, needs a policy of its own. The roster grows as new
+  syscalls warrant denial; it is a convenience posture, not a boundary claim.
 - `Rules` — a caller-authored [`SeccompRules`] allow-list or deny-list. An
   allow-list names the syscalls the command may make and denies the rest, so it
   must include every syscall the command needs. A deny-list names the syscalls
@@ -245,10 +263,17 @@ would never apply. The build refuses that policy.
 
 The filter binds the command and its descendants. Seccomp filtering is available
 on the `x86_64`, `aarch64`, and `riscv64` architectures; a policy on any other
-is a build error. A rootfs run for a foreign architecture through `qemu-user`
-executes host-architecture syscalls, so a native filter does not describe the
-guest's behavior — do not combine the two. [`host::seccomp_available`] reports
-whether the kernel offers seccomp at all.
+is a build error. [`host::seccomp_available`] reports whether the kernel offers
+seccomp at all.
+
+A root filesystem for a foreign architecture, run through `qemu-user`, is
+filtered correctly: the task making each syscall is the emulator, a host binary
+making host syscalls. What differs is the set it makes. An allowlist written
+against a native run can be too narrow for the same workload emulated. The
+curated policy compiles and runs the foreign-architecture example's probe
+unchanged, as [A foreign-architecture test
+run](cross-architecture.md#where-the-architecture-is-decided-and-where-it-is-not)
+describes.
 
 ## Capability drops
 
@@ -359,12 +384,14 @@ name in the first column is what a profile's `[rlimit]` table and the
 
 Two carry kernel semantics worth knowing before relying on them:
 
-- **`Processes`** is `RLIMIT_NPROC`, which the kernel counts per *real user id*
-  across the whole system, not per namespace. Under the default
-  single-identity map the command's real uid outside the sandbox is the calling
-  user's, so the cap is a ceiling on the caller and the sandbox together rather
-  than on the sandbox alone. A [range identity map](identity-maps.md) gives the
-  sandbox distinct host ids, and the count becomes its own.
+- **`Processes`** is `RLIMIT_NPROC`, which from Linux 5.14 the kernel counts per
+  user id within each user namespace. The count is then the sandbox's own
+  processes, and the caller's processes outside it do not count. From 5.6 to
+  5.13 the kernel counts per host user id across the whole system. A command
+  running as the calling user's host id then shares the cap with the caller's
+  other processes. A [range identity map](identity-maps.md) with a non-root
+  run-as identity gives it a host id of its own. `pending-signals` counts queued
+  signals the same way.
 - **`AddressSpace`** counts mapped address space, not resident memory. A
   runtime that maps far more than it touches — many do — hits the limit well
   before its real memory use approaches the value.
@@ -488,5 +515,6 @@ with no sandbox around it.
 [`landlock_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.landlock_scope
 [`LandlockScope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.LandlockScope.html
 [`SeccompRules::errno_for`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.errno_for
+[`ConfigError::LandlockScopeUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
 [`host::landlock_abi`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_abi.html
 [`host::seccomp_available`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.seccomp_available.html

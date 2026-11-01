@@ -140,10 +140,10 @@ leaves the binds hidden beneath the tmpfs.
 `identity-map` and `[run-as]` select the sandbox's [identity
 map](identity-maps.md) and the identity the command runs as; explicit
 ranges are spelled as an `[identity-map.ranges]` table, shown in that
-chapter. A profile requesting `subordinate` on a build without the `subid`
-feature is refused when it loads, exactly as a hardening posture is refused
-by a build that cannot enforce it. The identity-map delegate itself is
-code, not configuration, and has no profile key.
+chapter. Every identity form loads in every build, and `build` refuses one no
+delegate can establish: `subordinate` on a build without the `subid` feature
+needs a configured delegate that reports an allocation. The identity-map
+delegate itself is code, not configuration, and has no profile key.
 
 ## Inspecting a loaded profile
 
@@ -378,12 +378,26 @@ layer is created rather than required to exist: the profile would choose a host
 path for the library to create directories at. A trusted consumer configures one
 with `overlay` after loading.
 
-The policy does not bound the host authority the command wields, which remains
-the calling user's: the rootfs the profile names is presented read-write, so it
-still grants access to that host subtree. A consumer that does not trust the
-profile to choose its own rootfs should override it —
-`into_builder().rootfs(path)` with a directory the consumer controls — after
-loading.
+Deserializing a `RestrictedProfile` reports a refusal through the format's own
+error, as text. A consumer that matches on the refusal deserializes a
+`CageBuilder` and converts it with `RestrictedProfile::try_from` instead. The
+conversion applies the same policy and returns
+`ConfigError::ProfileOperationForbidden`, naming the operation.
+
+The policy bounds what the profile may map in, not the host authority the
+command wields, which remains the calling user's. The rootfs the profile names
+is presented read-write, so it still grants access to that host subtree. A
+consumer that does not trust the profile to choose its own rootfs overrides it
+after loading, with `into_builder().rootfs(path)` naming a directory the
+consumer controls.
+
+A range `identity-map` and a `run-as` identity pass the filter too. The bundled
+delegates hold the outside ids a map names to the caller's own authority: its
+capabilities and its namespace's map, or its subordinate allocation. A custom
+delegate supplied with `id_mapper`, such as a privileged broker, must check them
+itself. Otherwise a profile can map host ids the caller does not hold into the
+sandbox, host root among them. [Identity maps](identity-maps.md#delegates)
+states the delegate's duty.
 
 ## Profiles at the command line
 

@@ -22,19 +22,15 @@
 //! second job: smoltcp's own `any_ip` also makes the interface answer
 //! address resolution and ICMP echo for every address, since the check both
 //! answers run is the same "is this addressed to us" the switch overrides.
-//! So an ARP request or an echo request naming an address the interface does
-//! not hold is dropped before the interface sees it ([`Engine::holds`]), and
-//! two properties follow. An address on the guest's own subnet other than the
-//! gateway is on-link as far as the guest is concerned, so the guest asks for
-//! its hardware address, nothing replies, and no segment for it ever reaches
-//! the stack — which is why that refusal alone is not a reset, see
-//! [`host_target`]. And a successful ping inside the guest means the gateway
-//! answered, rather than the stack answering in the name of whatever was
-//! pinged.
-//!
-//! Neighbor discovery needs no such rule: smoltcp answers a solicitation only
-//! for an address whose solicited-node multicast group the interface has
-//! joined, which `any_ip` does not widen.
+//! So an ARP request, a neighbor solicitation, or an echo request naming an
+//! address the interface does not hold is dropped before the interface sees it
+//! ([`Engine::holds`]), and two properties follow. An address on the guest's
+//! own subnet other than the gateway is on-link as far as the guest is
+//! concerned, so the guest asks for its hardware address, nothing replies, and
+//! no segment for it ever reaches the stack — which is why that refusal alone
+//! is not a reset, see [`host_target`]. And a successful ping inside the guest
+//! means the gateway answered, rather than the stack answering in the name of
+//! whatever was pinged.
 //!
 //! A published port runs the other way. Its host listener sits in the same
 //! poll, and each connection it accepts becomes a flow whose guest-facing
@@ -61,7 +57,7 @@ use super::device::TapDevice;
 use super::sniff::{self, Sniff};
 use super::tcp::{self, TcpFlow};
 use super::udp::UdpTables;
-use super::{GATEWAY_MAC, Listener, Plan, PumpExit};
+use super::{GATEWAY_MAC, Listener, Plan, PlanV4, PumpExit};
 
 /// The most frames ingested from the tap per loop iteration, so servicing
 /// and transmission interleave with heavy receive traffic.
@@ -672,6 +668,8 @@ impl Engine {
 ///   embed an IPv4 one — the mapped `::ffff:a.b.c.d` and the deprecated
 ///   compatible `::a.b.c.d` alike — so an IPv4 refusal cannot be re-expressed in
 ///   the other family.
+/// - An address under NAT64's well-known prefix, `64:ff9b::/96`, whose embedded
+///   IPv4 address the IPv4 rules refuse; see [`nat64_embedded`].
 /// - The guest's own subnet, which is a private link between the guest and this
 ///   stack. Forwarding it would send the guest's on-link traffic to the host's
 ///   view of those addresses instead, colliding with a real LAN wherever the two
@@ -706,18 +704,7 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
                     .admits(dst.port)
                     .then(|| SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, dst.port)));
             }
-            let mask = u32::MAX << (32 - u32::from(v4.prefix_len));
-            let on_link = u32::from(addr) & mask == u32::from(v4.gateway) & mask;
-            if addr.is_unspecified()
-                // 0.0.0.0/8: `is_unspecified` covers only 0.0.0.0 itself, and
-                // the rest of the block is no more routable.
-                || addr.octets()[0] == 0
-                || addr.is_multicast()
-                || addr.is_broadcast()
-                || addr.is_loopback()
-                || addr.is_link_local()
-                || on_link
-            {
+            if refuses_v4(addr, Some(v4)) {
                 return None;
             }
             Some(SocketAddr::from((addr, dst.port)))
@@ -732,6 +719,8 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
             }
             let mask = u128::MAX << (128 - u32::from(v6.prefix_len));
             let on_link = prefix_bits(addr) & mask == prefix_bits(v6.gateway) & mask;
+            let translated_refusal =
+                nat64_embedded(addr).is_some_and(|embedded| refuses_v4(embedded, plan.v4.as_ref()));
             if addr.is_unspecified()
                 || addr.is_multicast()
                 || addr.is_loopback()
@@ -740,6 +729,7 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
                 // compatible. `to_ipv4` accepts either, where `to_ipv4_mapped`
                 // would let `::a.b.c.d` through.
                 || addr.to_ipv4().is_some()
+                || translated_refusal
                 || is_aws_instance_service(addr)
                 || on_link
             {
@@ -747,6 +737,53 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
             }
             Some(SocketAddr::from((addr, dst.port)))
         }
+    }
+}
+
+/// Whether the IPv4 rules refuse `addr`, other than as the gateway: the
+/// special-purpose blocks, and the guest's own subnet where the plan has an
+/// IPv4 side.
+///
+/// The gateway is the caller's to settle first, since a connection to it may
+/// map to host loopback. Reached through NAT64 it is just an address on the
+/// guest's subnet, and refused as one.
+fn refuses_v4(addr: std::net::Ipv4Addr, v4: Option<&PlanV4>) -> bool {
+    let on_link = v4.is_some_and(|v4| {
+        let mask = u32::MAX << (32 - u32::from(v4.prefix_len));
+        u32::from(addr) & mask == u32::from(v4.gateway) & mask
+    });
+    addr.is_unspecified()
+        // 0.0.0.0/8: `is_unspecified` covers only 0.0.0.0 itself, and the rest
+        // of the block is no more routable.
+        || addr.octets()[0] == 0
+        || addr.is_multicast()
+        || addr.is_broadcast()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || on_link
+}
+
+/// The IPv4 address `addr` embeds under NAT64's well-known prefix,
+/// `64:ff9b::/96`, or `None` for an address outside it.
+///
+/// A host on an IPv6-only network reaches IPv4 destinations through a
+/// translator, and the guest reaches what the host reaches, so the prefix as a
+/// whole is carried. The translator connects to the embedded IPv4 address from
+/// its own position, which is the host's where the translator runs on the
+/// host. So an embedded address is held to the IPv4 rules. That keeps an IPv4
+/// refusal from being re-expressed through the translator, as the mapped and
+/// compatible forms would re-express it through the host's own stack.
+///
+/// Only the well-known prefix says so in the address. A network-specific
+/// prefix, the local-use `64:ff9b:1::/48` among them, is indistinguishable
+/// from any other routable address, and a caller on such a network confines
+/// it outside the stack.
+fn nat64_embedded(addr: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    match addr.segments() {
+        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => Some(std::net::Ipv4Addr::from(
+            u32::from(high) << 16 | u32::from(low),
+        )),
+        _ => None,
     }
 }
 
@@ -869,6 +906,58 @@ mod tests {
                 "{dst}",
             );
         }
+    }
+
+    #[test]
+    fn nat64_carries_what_the_ipv4_rules_carry_and_nothing_else() {
+        // A translator connects to the embedded IPv4 address from its own
+        // position, possibly the host's, so that address is held to the IPv4
+        // rules: the metadata service, loopback, and the guest's own IPv4
+        // subnet stay refused when spelled under the well-known prefix.
+        let plan = plan(false);
+        for dst in [
+            v6("64:ff9b::169.254.169.254", 80),
+            v6("64:ff9b::127.0.0.1", 80),
+            v6("64:ff9b::10.0.2.2", 80),
+            v6("64:ff9b::10.0.2.15", 80),
+            v6("64:ff9b::0.1.2.3", 80),
+            v6("64:ff9b::224.0.0.1", 80),
+        ] {
+            assert_eq!(host_target(dst, &plan), None, "{dst}");
+        }
+        // What the IPv4 rules carry, a translator is asked to carry too: an
+        // IPv6-only host reaches the IPv4 world this way.
+        assert_eq!(
+            host_target(v6("64:ff9b::203.0.113.9", 443), &plan),
+            Some("[64:ff9b::cb00:7109]:443".parse().unwrap()),
+        );
+        // Only the well-known /96 embeds an address in its last 32 bits. Its
+        // neighbours, the local-use /48 among them, are ordinary destinations.
+        for dst in [
+            v6("64:ff9b:1::a9fe:a9fe", 80),
+            v6("64:ff9b:0:0:0:1:a9fe:a9fe", 80),
+        ] {
+            assert_eq!(
+                host_target(dst, &plan),
+                Some(SocketAddr::from((IpAddr::from(dst.addr), dst.port))),
+                "{dst}",
+            );
+        }
+        // Without an IPv4 side the guest has no IPv4 subnet to collide with,
+        // and the special-purpose blocks are refused all the same.
+        let v6_only = NetStack::builder()
+            .ipv4(false)
+            .build()
+            .expect("a v6-only configuration is valid")
+            .plan;
+        assert_eq!(
+            host_target(v6("64:ff9b::10.0.2.7", 80), &v6_only),
+            Some("[64:ff9b::a00:207]:80".parse().unwrap()),
+        );
+        assert_eq!(
+            host_target(v6("64:ff9b::169.254.169.254", 80), &v6_only),
+            None
+        );
     }
 
     #[test]
@@ -1016,8 +1105,9 @@ mod tests {
     use rustix::net::{AddressFamily, SocketType};
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
-        EthernetFrame, EthernetProtocol, EthernetRepr, IpProtocol, Ipv4Packet, Ipv4Repr,
-        Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+        EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv6Message, Icmpv6Packet, Icmpv6Repr,
+        IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, NdiscRepr, TcpControl, TcpPacket,
+        TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
     };
     use std::net::{Ipv6Addr as StdIpv6Addr, SocketAddr as StdSocketAddr, TcpListener, UdpSocket};
 
@@ -1119,9 +1209,6 @@ mod tests {
 
     /// A UDP datagram in an IPv6 frame, behind a hop-by-hop options header
     /// when `hop_by_hop` is set.
-    ///
-    /// The classifier does not walk extension headers, so a datagram behind
-    /// one reaches its port's socket without having been classified.
     fn udp_v6(
         src: StdIpv6Addr,
         dst: StdIpv6Addr,
@@ -1300,10 +1387,21 @@ mod tests {
         assert!(engine.consider(Sniff::TcpSegment { src: GUEST.into() }));
     }
 
+    /// Hands `frame` to the engine's interface as ingestion would once
+    /// `consider` let it through, and lets the interface and the flows act on
+    /// it.
+    fn deliver(engine: &mut Engine, frame: &[u8]) {
+        let mut queued = engine.device.take_buffer();
+        queued.extend_from_slice(frame);
+        engine.device.enqueue(queued);
+        engine
+            .iface
+            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.service();
+    }
+
     #[test]
-    fn a_datagram_behind_an_extension_header_from_another_source_opens_no_flow() {
-        // The classifier never sees a datagram behind an extension header, so
-        // the source rule has to hold where the UDP table opens a flow.
+    fn a_datagram_from_another_source_opens_no_flow_whatever_carries_it() {
         let Ok(socket) = UdpSocket::bind((StdIpv6Addr::LOCALHOST, 0)) else {
             ferroday_cage_testkit::require::TUN.skip("the host has no IPv6 loopback");
             return;
@@ -1312,21 +1410,34 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("the timeout is settable");
         let port = socket.local_addr().expect("an address").port();
-        let driven = Driven::start(mapping(port), Vec::new());
+        let (tap, _guest) = tap_pair();
+        let mut engine = engine(tap, mapping(port), Vec::new());
         let guest: StdIpv6Addr = "fd00::15".parse().unwrap();
         let gateway: StdIpv6Addr = "fd00::2".parse().unwrap();
         let stranger: StdIpv6Addr = "2001:db8::99".parse().unwrap();
 
         // The guest's own datagram binds the port's socket and opens a flow.
-        driven.send(&udp_v6(guest, gateway, port, b"from the guest", false));
+        let own = udp_v6(guest, gateway, port, b"from the guest", false);
+        assert!(engine.consider(classify(&own)));
+        deliver(&mut engine, &own);
         let mut buffer = [0u8; 64];
         let (len, _) = socket
             .recv_from(&mut buffer)
             .expect("the guest's datagram arrives");
         assert_eq!(&buffer[..len], b"from the guest");
 
-        // A stranger's, behind a hop-by-hop header, reaches that socket too.
-        driven.send(&udp_v6(stranger, gateway, port, b"from a stranger", true));
+        // A stranger's behind a hop-by-hop header is withheld as one without
+        // it is: the classifier reads past that header as the interface does.
+        let spoofed = udp_v6(stranger, gateway, port, b"from a stranger", true);
+        assert!(
+            !engine.consider(classify(&spoofed)),
+            "a stranger's datagram behind a hop-by-hop header passed",
+        );
+
+        // And one that reaches the interface without being classified, as one
+        // behind a header smoltcp walked and the classifier did not would,
+        // reaches the port's socket and still opens no flow.
+        deliver(&mut engine, &spoofed);
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .expect("the timeout is settable");
@@ -1343,6 +1454,110 @@ mod tests {
                 "{error}",
             ),
         }
+    }
+
+    /// A neighbor solicitation from the guest for `target`, sent to its
+    /// solicited-node group with the hop limit neighbor discovery requires.
+    fn solicit(target: StdIpv6Addr) -> Vec<u8> {
+        let guest: StdIpv6Addr = "fd00::15".parse().unwrap();
+        let [.., a, b, c] = target.octets();
+        let group = StdIpv6Addr::new(
+            0xff02,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0xff00 | u16::from(a),
+            u16::from_be_bytes([b, c]),
+        );
+        let message = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: target,
+            lladdr: Some(EthernetAddress(GUEST_MAC).into()),
+        });
+        let mut icmp = vec![0u8; message.buffer_len()];
+        message.emit(
+            &guest,
+            &group,
+            &mut Icmpv6Packet::new_unchecked(&mut icmp),
+            &ChecksumCapabilities::default(),
+        );
+        let repr = Ipv6Repr {
+            src_addr: guest,
+            dst_addr: group,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: icmp.len(),
+            hop_limit: 255,
+        };
+        let mut packet = vec![0u8; repr.buffer_len() + icmp.len()];
+        let mut ip = Ipv6Packet::new_unchecked(&mut packet);
+        repr.emit(&mut ip);
+        ip.payload_mut().copy_from_slice(&icmp);
+        ethernet(EthernetProtocol::Ipv6, &packet)
+    }
+
+    /// Whether the stack advertises `target` to the guest within `within`.
+    fn advertised(driven: &Driven, target: StdIpv6Addr, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        let mut buffer = [0u8; 2048];
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let mut ready = [PollFd::new(&driven.guest, PollFlags::IN)];
+            match rustix::event::poll(&mut ready, Some(&crate::poll::timeout(left))) {
+                Ok(0) => return false,
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(errno) => panic!("the guest's end cannot be polled: {errno}"),
+            }
+            let len = match rustix::io::read(&driven.guest, &mut buffer) {
+                Ok(len) => len,
+                Err(Errno::AGAIN | Errno::INTR) => continue,
+                Err(errno) => panic!("the guest's end cannot be read: {errno}"),
+            };
+            let Ok(frame) = EthernetFrame::new_checked(&buffer[..len]) else {
+                continue;
+            };
+            let Ok(packet) = Ipv6Packet::new_checked(frame.payload()) else {
+                continue;
+            };
+            if packet.next_header() != IpProtocol::Icmpv6 {
+                continue;
+            }
+            let Ok(message) = Icmpv6Packet::new_checked(packet.payload()) else {
+                continue;
+            };
+            if message.msg_type() == Icmpv6Message::NeighborAdvert
+                && message.target_addr() == target
+            {
+                return true;
+            }
+        }
+    }
+
+    #[test]
+    fn neighbor_discovery_answers_for_the_gateway_alone() {
+        let driven = Driven::start(NetStack::default().plan, Vec::new());
+
+        // An on-link address that shares its low sixteen bits with the
+        // gateway's, which is all smoltcp's own check compares; under `any_ip`
+        // the interface would advertise it.
+        let stranger: StdIpv6Addr = "fd00::1:2".parse().unwrap();
+        driven.send(&solicit(stranger));
+        assert!(
+            !advertised(&driven, stranger, Duration::from_millis(500)),
+            "the stack advertised an on-link address it does not hold",
+        );
+
+        // The gateway is the stack, and answers for itself.
+        let gateway: StdIpv6Addr = "fd00::2".parse().unwrap();
+        driven.send(&solicit(gateway));
+        assert!(
+            advertised(&driven, gateway, Duration::from_secs(2)),
+            "the gateway did not answer for itself",
+        );
     }
 
     #[test]

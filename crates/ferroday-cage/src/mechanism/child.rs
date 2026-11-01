@@ -836,13 +836,15 @@ fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result
 /// The order is forced by the kernel: supplementary groups and the gid
 /// first, while `CAP_SETGID` is effective, and the uid last, because after
 /// it the gid is no longer settable. The groups call sets the run-as
-/// identity's supplementary groups, and happens only under a range map. Under
-/// the single-identity map it is skipped — `setgroups` is denied there, and
-/// the build rejects a run-as identity that names groups — so the command
-/// keeps the process's inherited supplementary group list. That list still
-/// grants nothing the caller has on the host: the namespace's single-entry
-/// gid map presents every other gid as the overflow gid, which is what bounds
-/// group membership under a single map, not a clearing call here.
+/// identity's supplementary groups wherever the build froze a list. It froze
+/// none where the gid map is the caller's own gid alone, the single-identity
+/// map's gid map: the kernel and shadow's `newgidmap` both deny `setgroups`
+/// when they write that map, and the build rejects a run-as identity that
+/// names groups. The command then keeps the process's inherited
+/// supplementary group list. That list grants nothing beyond what the caller
+/// has on the host: the namespace's single-entry gid map presents every other
+/// gid as the overflow gid, which is what bounds group membership there, not a
+/// clearing call here.
 ///
 /// All three calls are the thread-scoped raw syscalls: this process is
 /// single-threaded, so no cross-thread broadcast is needed and none of
@@ -870,9 +872,8 @@ fn switch_identity(context: &Context<'_>) -> Result<(), (SetupStep, Errno)> {
         return Ok(());
     };
     rustix::thread::set_no_new_privs(true).map_err(|errno| (SetupStep::SetNoNewPrivs, errno))?;
-    if context.plan.identity.is_ranged() {
-        rustix::thread::set_thread_groups(&run_as.groups)
-            .map_err(|errno| (SetupStep::SetGroups, errno))?;
+    if let Some(groups) = &run_as.groups {
+        rustix::thread::set_thread_groups(groups).map_err(|errno| (SetupStep::SetGroups, errno))?;
     }
     rustix::thread::set_thread_res_gid(Some(run_as.gid), Some(run_as.gid), Some(run_as.gid))
         .map_err(|errno| (SetupStep::SetGid, errno))?;

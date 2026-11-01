@@ -22,19 +22,17 @@ over a third of the library's public functions, and their shape is driven by
 three external archives' formats rather than by this library's design. That is
 the part of the surface most likely to have to move, tied to the version number
 of the part least likely to: a Debian layer that has to break to follow a change
-in the archive would break the whole library's minor version with it.
+in the archive breaks the whole library's minor version with it.
 
-They stay in the library for now, and the reason is that nothing has needed the
-break. The argument for splitting is real and gets stronger with each release;
-the argument against splitting *today* is that four crates cost four release
-cycles, four sets of feature plumbing, and a set of items that are internal
-today becoming public because a separate crate would need them.
+They are in the library because nothing has needed that break. Four crates
+cost four release cycles and four sets of feature plumbing. A separate crate
+would also need items that are internal now to become public.
 
 Two things would settle it. A userland needing a breaking change the rest of the
 library does not is the direct one. So is a consumer who wants one archive
 format without the others' dependency weight.
 
-What keeps the decision cheap in the meantime is that the layers already sit on
+What keeps the decision cheap is that the layers already sit on
 a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
 tar, compress, extract, digest, document and OpenPGP machinery -- and reach
 around it in thirty-eight places, ten of which are internal. `tools/seam.toml`

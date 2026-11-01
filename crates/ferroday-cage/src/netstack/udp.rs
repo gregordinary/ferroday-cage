@@ -264,9 +264,12 @@ impl UdpTables {
                 let destination = IpEndpoint::new(local, port);
                 let guest = meta.endpoint;
                 // The classifier withholds a datagram from any other source,
-                // but one behind an IPv6 extension header reaches this socket
-                // unclassified. Its replies would have nowhere to go; see
-                // `Plan::is_guest`.
+                // and this states the rule a second time where a flow opens.
+                // The classifier parses a frame on its own, reading past the
+                // extension headers smoltcp walks today and no further, so a
+                // smoltcp that walked further would deliver datagrams here
+                // that it never classified. Its replies would have nowhere to
+                // go; see `Plan::is_guest`.
                 if !plan.is_guest(guest.addr) {
                     continue;
                 }

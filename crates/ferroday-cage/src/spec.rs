@@ -16,9 +16,9 @@ use crate::error::{ConfigError, Error, OverlayLayer};
 use crate::idmap::{self, IdMapper, Identity, IdentityMap};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
-    Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction, MountDir,
-    MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, RlimitPlan, RunAsPlan,
-    StdioPlan,
+    self, Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction,
+    MountDir, MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, RlimitPlan,
+    RunAsPlan, StdioPlan,
 };
 use crate::observer::{Collect, Observer, Output};
 use crate::path;
@@ -83,11 +83,11 @@ const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
 /// above the target is the sandbox's own, and the target is created in it as
 /// it would be in the root.
 ///
-/// A target is read through [`path::absolute_components`], as the launch
-/// freezes it, so `/etc//resolv.conf` and `/etc/./resolv.conf` are the same
-/// target here as they will be at launch. A mount whose target or flags
-/// [`build`](CageBuilder::build) refuses claims nothing, since no sandbox is
-/// built with it.
+/// A target is read through [`path::absolute_components`] and compared as the
+/// launch freezes it, through [`covers`], so `/etc//resolv.conf` and
+/// `/etc/./resolv.conf` are the same target here as they will be at launch. A
+/// mount whose target or flags [`build`](CageBuilder::build) refuses claims
+/// nothing, since no sandbox is built with it.
 fn claims_resolv_conf(mount: &Mount) -> bool {
     let arrival = match mount {
         Mount::Bind(_) => Some(Arrival::Tree),
@@ -95,12 +95,15 @@ fn claims_resolv_conf(mount: &Mount) -> bool {
             .ok()
             .and_then(|flags| Arrival::of_raw(MountFlags::from_bits_retain(flags))),
     };
-    let (Some(arrival), Ok(target)) = (arrival, sandbox_path_components(mount.get_target())) else {
+    let target =
+        sandbox_path_components(mount.get_target()).and_then(|components| rel_cstring(&components));
+    let (Some(arrival), Ok(target)) = (arrival, target) else {
         return false;
     };
-    let resolv_conf = [OsStr::new("etc"), OsStr::new("resolv.conf")];
-    target == resolv_conf || (arrival == Arrival::Tree && resolv_conf.starts_with(&target))
+    target.as_c_str() == RESOLV_CONF_TARGET
+        || (arrival == Arrival::Tree && covers(&target, RESOLV_CONF_TARGET))
 }
+
 /// The mode of a mount point standing in for a world-writable sticky
 /// directory: `/tmp` and `/dev/shm`, which the profile covers with a
 /// `mode=1777` tmpfs.
@@ -126,7 +129,7 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "lowercase")
+    serde(rename_all = "kebab-case")
 )]
 pub enum Network {
     /// A new network namespace whose only interface is loopback, brought up
@@ -1475,9 +1478,9 @@ impl CageBuilder {
 
     /// Sets the command's working directory inside the sandbox.
     ///
-    /// The path must be absolute and must exist inside the sandbox at launch;
-    /// a missing directory is a setup error, not a fallback. The default is
-    /// `/`.
+    /// The path must be absolute, with no `..` component, and must exist
+    /// inside the sandbox at launch; a missing directory is a setup error, not
+    /// a fallback. The default is `/`.
     pub fn current_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.workdir = Some(path.as_ref().to_path_buf());
         self
@@ -1579,7 +1582,9 @@ impl CageBuilder {
     /// [`build`](Self::build) and its [`apply`](IdMapper::apply) runs
     /// during each launch, against the launch stage held at an internal
     /// gate. [`IdentityMap::Single`] needs no delegate and never consults
-    /// one.
+    /// one. The delegate holds the outside ids a map names to the caller's
+    /// own authority, as [`IdMapper`]'s authority section sets out, since a
+    /// profile can name them.
     ///
     /// The delegate is taken by value and kept, as every builder that takes
     /// one keeps it: the [`Cage`] this builds applies it at each launch, long
@@ -1609,15 +1614,16 @@ impl CageBuilder {
     /// The switch sits within the hardening layer, after securebits,
     /// no-new-privileges, and Landlock and before the capability drop and the
     /// seccomp filter, so the command holds the identity from its first
-    /// instruction and its descendants inherit it. Every id must be contained in the
-    /// [`identity_map`](Self::identity_map); supplementary groups
-    /// additionally require a range gid map, because the single-identity
-    /// map denies `setgroups`. Without a keep-capabilities request the
-    /// kernel clears the command's capabilities across the switch, which is
-    /// the boundary a non-root identity exists to draw; a kept capability
-    /// set survives it, and retaining `CAP_SETUID`, `CAP_SETGID`, or
-    /// `CAP_SETPCAP` alongside a non-root identity is rejected at build
-    /// time.
+    /// instruction and its descendants inherit it. Every id must be contained
+    /// in the [`identity_map`](Self::identity_map); supplementary groups
+    /// additionally require a gid map wider than the caller's own gid,
+    /// because a gid map of that gid alone, the single-identity map's, denies
+    /// `setgroups`. The command then keeps the group list it inherited.
+    /// Without a keep-capabilities request the kernel clears the command's
+    /// capabilities across the switch, which is the boundary a non-root
+    /// identity exists to draw; a kept capability set survives it, and
+    /// retaining `CAP_SETUID`, `CAP_SETGID`, or `CAP_SETPCAP` alongside a
+    /// non-root identity is rejected at build time.
     ///
     /// The launch sets no-new-privileges whenever a run-as identity is
     /// configured, in every build of the library and whatever else the sandbox
@@ -1740,8 +1746,8 @@ impl CageBuilder {
     /// A container usually needs a procfs from somewhere: the nested user
     /// namespace the command enters — which is what locks the sandbox's mount
     /// flags — establishes its identity map through one, by path. Setting this
-    /// to `false` therefore obliges the profile to mount a procfs of its own,
-    /// and [`build`](Self::build) refuses one that does not with
+    /// to `false` therefore obliges the profile to mount a writable procfs of
+    /// its own, and [`build`](Self::build) refuses one that does not with
     /// [`ConfigError::NestedUsernsNeedsProcfs`](crate::ConfigError::NestedUsernsNeedsProcfs).
     /// The exception is a range
     /// [`identity_map`](Self::identity_map) with
@@ -2280,14 +2286,18 @@ impl CageBuilder {
             // otherwise have cleared the CAP_SETPCAP it requires.
             hardening.set_securebits = matches!(&self.run_as, Some(identity) if identity.uid != 0)
                 && hardening.keep_caps.is_some();
-            // Under host networking there is no network namespace, so a
-            // Landlock network grant is the sandbox's only network boundary.
-            // Refuse a build whose grant this kernel cannot enforce rather than
-            // reach the host network unrestricted, the same posture the
-            // restriction fallback takes for its Landlock-only confinement.
-            if matches!(self.network, Network::Host) {
-                hardening.ensure_host_net_enforceable()?;
-            }
+            // Where no namespace of the sandbox stands behind a reach (the host
+            // network under host networking, the host's processes without a
+            // PID namespace), a Landlock request is that reach's only boundary.
+            // Refuse a build whose request this kernel cannot enforce rather
+            // than run without it, the posture the restriction fallback takes
+            // for its Landlock-only confinement. The ABI is probed only when
+            // such a request exists.
+            hardening.ensure_sandbox_enforceable(
+                matches!(self.network, Network::Host),
+                !self.pid_namespace,
+                crate::mechanism::probe_landlock_abi,
+            )?;
             hardening
         };
 
@@ -2394,10 +2404,9 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// mount, a raw mount, host networking, an overlay root (`[overlay]`, whose upper
 /// creates host directories at a path the profile picks), and sharing the host
 /// PID namespace (`pid-namespace = false`, which would bind the host's `/proc`
-/// into the sandbox). A profile using any of them is rejected with
-/// [`ConfigError::ProfileOperationForbidden`]. Everything else — the rootfs
-/// (never the host root, which [`CageBuilder::build`] rejects for every
-/// profile), command, arguments, environment, working directory, hostname,
+/// into the sandbox). A profile using any of them is refused. Everything else —
+/// the rootfs (never the host root, which [`CageBuilder::build`] rejects for
+/// every profile), command, arguments, environment, working directory, hostname,
 /// hardening posture, resource limits, the identity map and run-as identity,
 /// and the remaining mount toggles — is accepted, so a restricted profile
 /// still shapes the sandbox.
@@ -2427,6 +2436,30 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// consumer extends with its own trusted calls — including any binds it means
 /// to allow — before [`build`](CageBuilder::build).
 ///
+/// # The refusal as a value
+///
+/// Deserializing a `RestrictedProfile` reports a forbidden operation through
+/// the serde format's own error, as text, since that is the only error a
+/// `Deserialize` can return. A consumer that matches on the refusal
+/// deserializes a [`CageBuilder`] instead and converts it with
+/// [`RestrictedProfile::try_from`], which holds it to the same policy and
+/// returns [`ConfigError::ProfileOperationForbidden`]:
+///
+/// ```
+/// use ferroday_cage::{CageBuilder, ConfigError, RestrictedProfile};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let builder: CageBuilder = toml::from_str("network = \"host\"\n")?;
+/// match RestrictedProfile::try_from(builder) {
+///     Err(ConfigError::ProfileOperationForbidden { operation, .. }) => {
+///         assert_eq!(operation, "host networking");
+///     }
+///     other => panic!("host networking is refused: {other:?}"),
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
 /// [`ConfigError::ProfileOperationForbidden`]: crate::ConfigError::ProfileOperationForbidden
 #[cfg(feature = "serde")]
 #[derive(Debug, Clone)]
@@ -2441,14 +2474,26 @@ impl RestrictedProfile {
     }
 }
 
+/// Holds a builder to the restricted policy, as deserializing a
+/// `RestrictedProfile` does, and returns the refusal as a value.
+#[cfg(feature = "serde")]
+impl TryFrom<CageBuilder> for RestrictedProfile {
+    type Error = ConfigError;
+
+    /// Accepts `builder` under the restricted policy, or refuses it with
+    /// [`ConfigError::ProfileOperationForbidden`] naming the first forbidden
+    /// operation it uses.
+    fn try_from(builder: CageBuilder) -> Result<RestrictedProfile, ConfigError> {
+        builder.check_restricted()?;
+        Ok(RestrictedProfile(builder))
+    }
+}
+
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for RestrictedProfile {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let builder = CageBuilder::deserialize(deserializer)?;
-        builder
-            .check_restricted()
-            .map_err(|err| serde::de::Error::custom(crate::failure::ErrorChain::new(&err)))?;
-        Ok(RestrictedProfile(builder))
+        RestrictedProfile::try_from(CageBuilder::deserialize(deserializer)?)
+            .map_err(|err| serde::de::Error::custom(crate::failure::ErrorChain::new(&err)))
     }
 }
 
@@ -2457,7 +2502,7 @@ impl CageBuilder {
     /// Rejects the profile operations the restricted policy reserves for a
     /// trusted profile: bind mounts, raw mounts, host networking, an overlay
     /// root, and sharing the host PID namespace. Backs [`RestrictedProfile`]'s
-    /// deserialization.
+    /// conversion from a builder, and through it its deserialization.
     fn check_restricted(&self) -> Result<(), ConfigError> {
         // Destructured exhaustively, with no `..`: a new builder field fails to
         // compile here until someone classifies it, so the untrusted-profile
@@ -2564,13 +2609,17 @@ impl CageBuilder {
 /// Validates a run-as identity against the identity plan and freezes it.
 ///
 /// Every id must be contained in the map that will exist at launch, and
-/// supplementary groups require a range gid map: the single-identity map is
-/// established by denying `setgroups`, so no group list can ever be set
-/// inside it.
+/// supplementary groups require a gid map wider than the caller's own gid. The
+/// single-identity map's gid map is that gid alone, and is established by
+/// denying `setgroups`, so no group list can ever be set inside it. A range
+/// map whose gid list is that one extent is held to the same rule, since the
+/// shadow helpers deny `setgroups` when they write it; see
+/// [`idmap::is_own_gid_alone`]. Under either, the plan carries no group list,
+/// and the command keeps the one it inherited.
 fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan, Error> {
     let unmapped =
         |id: u32, space: &'static str| Error::from(ConfigError::RunAsUnmapped { id, space });
-    match plan {
+    let settable = match plan {
         IdentityPlan::Single => {
             if identity.uid != 0 {
                 return Err(unmapped(identity.uid, "uid"));
@@ -2578,9 +2627,7 @@ fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan
             if identity.gid != 0 {
                 return Err(unmapped(identity.gid, "gid"));
             }
-            if !identity.groups.is_empty() {
-                return Err(ConfigError::RunAsGroupsWithSingleMap.into());
-            }
+            false
         }
         IdentityPlan::Ranged { map, .. } => {
             if !idmap::maps_inside_id(map.uid(), identity.uid) {
@@ -2594,7 +2641,11 @@ fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan
                     return Err(unmapped(group, "supplementary group"));
                 }
             }
+            !idmap::is_own_gid_alone(map.gid())
         }
+    };
+    if !settable && !identity.groups.is_empty() {
+        return Err(ConfigError::RunAsGroupsWithSingleMap.into());
     }
     // `from_raw_unchecked` is the safe constructor without the debug assert
     // against the sentinel -1; the kernel rejects unusable ids at the
@@ -2602,11 +2653,13 @@ fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan
     Ok(RunAsPlan {
         uid: rustix::thread::Uid::from_raw_unchecked(identity.uid),
         gid: rustix::thread::Gid::from_raw_unchecked(identity.gid),
-        groups: identity
-            .groups
-            .iter()
-            .map(|&group| rustix::thread::Gid::from_raw_unchecked(group))
-            .collect(),
+        groups: settable.then(|| {
+            identity
+                .groups
+                .iter()
+                .map(|&group| rustix::thread::Gid::from_raw_unchecked(group))
+                .collect()
+        }),
     })
 }
 
@@ -2703,7 +2756,8 @@ fn build_nested_plan(
 /// of. Where a profile mounts more than one, the last still visible is taken —
 /// any of them would serve. An op that brings no mount to rest, such as a
 /// remount or a propagation change, hides nothing; see
-/// [`MountAction::arrival`].
+/// [`MountAction::arrival`]. A remount can still make a procfs unusable, by
+/// leaving it read-only, and one that does drops it as a cover would.
 fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
     // Walked backwards, because what is wanted is the *last* one still visible:
     // a candidate qualifies when nothing after it comes to rest on top of it.
@@ -2714,15 +2768,39 @@ fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
         let Some(target) = procfs_op_target(op, needs_fresh) else {
             continue;
         };
-        let covered = ops[at + 1..]
+        let later = &ops[at + 1..];
+        let covered = later
             .iter()
             .filter_map(|later| later.action.arrival())
             .any(|(over, _)| covers(over, target));
-        if !covered {
+        if !covered && !remounted_read_only(later, target) {
             return Some(target);
         }
     }
     None
+}
+
+/// Whether the last remount among `later` that acts on the mount at `target`
+/// leaves it read-only.
+///
+/// A remount acts on the mount standing at exactly its target, and sets the
+/// read-only flag to what it names, so the last one decides. A remount at
+/// another path leaves this mount as it was.
+fn remounted_read_only(later: &[MountOp], target: &CStr) -> bool {
+    later
+        .iter()
+        .rev()
+        .find_map(|op| match &op.action {
+            MountAction::Raw {
+                target: at, flags, ..
+            } if at.as_c_str() == target => {
+                let flags = mechanism::raw_mount_flags(*flags);
+                (flags & mechanism::MS_REMOUNT != 0)
+                    .then_some(flags & MountFlags::RDONLY.bits() != 0)
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// The rootfs-relative target an op mounts a usable procfs on, or `None` for
@@ -2746,36 +2824,72 @@ fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
 /// .flags(MS_BIND)` satisfy a requirement it does not meet, and the failure
 /// would arrive at launch instead of as the typed build error this machinery
 /// exists to give. A remount or a propagation change mounts nothing.
+///
+/// The map files are written, so a procfs that arrives read-only serves no
+/// route: a read-only bind, a raw procfs carrying `MS_RDONLY`, and a bind of a
+/// source mounted read-only. A bound tree must also be a procfs's root, since
+/// the map files are named from there. A bind of `/proc/sys` or `/proc/1`
+/// carries the procfs magic number and holds no `self` to name them under.
 fn procfs_op_target(op: &MountOp, needs_fresh: bool) -> Option<&CStr> {
     match (&op.action, op.action.arrival()?) {
         (MountAction::Procfs { target }, _) => Some(target),
+        (MountAction::Bind { read_only, .. }, _) if *read_only => None,
         (MountAction::Bind { source, target, .. }, _)
         | (MountAction::Raw { source, target, .. }, (_, Arrival::Tree)) => {
-            (!needs_fresh && is_procfs(source)).then_some(target.as_c_str())
+            (!needs_fresh && is_writable_procfs_root(source)).then_some(target.as_c_str())
         }
-        (MountAction::Raw { target, fstype, .. }, (_, Arrival::Fresh)) => {
-            (fstype.as_bytes() == b"proc").then_some(target.as_c_str())
+        (
+            MountAction::Raw {
+                target,
+                fstype,
+                flags,
+                ..
+            },
+            (_, Arrival::Fresh),
+        ) => {
+            let read_only = mechanism::raw_mount_flags(*flags) & MountFlags::RDONLY.bits() != 0;
+            (fstype.as_bytes() == b"proc" && !read_only).then_some(target.as_c_str())
         }
         _ => None,
     }
 }
 
-/// Whether the bind source is a procfs, by the filesystem's own magic number
-/// rather than by its path: the managed profile binds `/proc`, and a caller is
-/// free to bind a procfs mounted anywhere else.
+/// The inode number of a procfs's root directory, `PROC_ROOT_INO`, which every
+/// procfs instance gives its root and nothing else in it.
+const PROC_ROOT_INO: u64 = 1;
+
+/// Whether the bind source is the root of a procfs mounted writable, by the
+/// filesystem's own magic number rather than by its path: the managed profile
+/// binds `/proc`, and a caller is free to bind a procfs mounted anywhere else.
+///
+/// A bind takes its source mount's flags, and `mount(2)` ignores `MS_RDONLY` on
+/// the bind itself, so a source mounted read-only arrives read-only whatever the
+/// op says. All three questions go to one descriptor, so they describe one
+/// object.
 ///
 /// A source that cannot be interrogated is not one, which is the safe answer:
 /// the build then refuses rather than composing paths into a filesystem that
 /// holds no map files.
-fn is_procfs(source: &CStr) -> bool {
-    rustix::fs::statfs(source).is_ok_and(|stat| stat.f_type == rustix::fs::PROC_SUPER_MAGIC)
+fn is_writable_procfs_root(source: &CStr) -> bool {
+    let Ok(source) = rustix::fs::open(source, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) else {
+        return false;
+    };
+    let procfs =
+        rustix::fs::fstatfs(&source).is_ok_and(|stat| stat.f_type == rustix::fs::PROC_SUPER_MAGIC);
+    let root = rustix::fs::fstat(&source).is_ok_and(|stat| stat.st_ino == PROC_ROOT_INO);
+    let writable = rustix::fs::fstatvfs(&source)
+        .is_ok_and(|stat| !stat.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY));
+    procfs && root && writable
 }
 
 /// Whether a mount at `mount` hides an entry at `covered`: the same path, or a
 /// directory the covered path sits beneath.
 ///
-/// Both are rootfs-relative and carry no leading slash, so the comparison is a
-/// plain component-aligned prefix test.
+/// Both are rootfs-relative and carry no leading slash, as the launch freezes
+/// every target, so the comparison is a plain component-aligned prefix test.
+/// It is the one answer to whether a path is at or under a mount target, which
+/// the procfs requirement, the managed `resolv.conf` bind, and the placeholder
+/// bookkeeping all ask.
 fn covers(mount: &CStr, covered: &CStr) -> bool {
     let (mount, covered) = (mount.to_bytes(), covered.to_bytes());
     covered.starts_with(mount) && (covered.len() == mount.len() || covered[mount.len()] == b'/')
@@ -2797,6 +2911,13 @@ impl CageBuilder {
     /// a single file or device node as well as a directory; there it allows only
     /// the rights that act on a file, since there are no entries to list,
     /// create, or remove.
+    ///
+    /// The path names its target itself, without a symbolic link at any
+    /// component, the last included. A link in a root that is not fully trusted
+    /// could point anywhere in the sandbox, and a grant resolved through it
+    /// would cover wherever it pointed. A path that crosses one fails the
+    /// launch with `ELOOP`, reported against the grant. On a root whose `/lib`
+    /// is a link to `usr/lib`, grant `/usr/lib`, or `/usr` for both.
     ///
     /// The ruleset is enforced on a kernel that offers Landlock, best-effort
     /// down to the kernel's supported ABI; a kernel without the Landlock LSM
@@ -2871,12 +2992,21 @@ impl CageBuilder {
     /// [`Network::Host`], where it can reach the host's abstract sockets. The
     /// default is no scope.
     ///
-    /// A scope needs Landlock ABI 6 (Linux 6.12). On an older kernel that
-    /// offers Landlock it narrows away best-effort, as an unsupported
-    /// filesystem right does. On a kernel without the Landlock LSM it is a
-    /// setup error, as a grant is. A scope is not a grant: it enrolls no path
-    /// and no port, so the filesystem and the network stay as open as the
-    /// grants leave them.
+    /// A scope needs Landlock ABI 6 (Linux 6.12). What an older kernel does with
+    /// one depends on whether a namespace also bounds its reach:
+    ///
+    /// - Where one does, the scope is additive. A kernel that offers Landlock
+    ///   below ABI 6 narrows it away best-effort, as an unsupported filesystem
+    ///   right. A kernel without the Landlock LSM fails the launch with a setup
+    ///   error, as it does a grant.
+    /// - Where none does, the scope is the boundary: `Signal` without a PID
+    ///   namespace, and `AbstractUnixSocket` under [`Network::Host`]. Either
+    ///   kernel refuses the build with
+    ///   [`ConfigError::LandlockScopeUnenforceable`](crate::ConfigError::LandlockScopeUnenforceable),
+    ///   rather than run the command with that reach open.
+    ///
+    /// A scope is not a grant: it enrolls no path and no port, so the
+    /// filesystem and the network stay as open as the grants leave them.
     ///
     /// [`LandlockScope::Signal`]: crate::LandlockScope::Signal
     /// [`LandlockScope::AbstractUnixSocket`]: crate::LandlockScope::AbstractUnixSocket
@@ -2920,6 +3050,40 @@ impl CageBuilder {
     {
         self.hardening.keep_capabilities(caps);
         self
+    }
+
+    /// The Landlock filesystem grants, in the order they were configured: each
+    /// access set with the sandbox path it is granted beneath.
+    pub fn get_landlock_fs(&self) -> impl Iterator<Item = (crate::hardening::FsAccess, &Path)> {
+        self.hardening.fs_grants()
+    }
+
+    /// The Landlock network grants, in the order they were configured: each
+    /// access set with the TCP port it governs.
+    pub fn get_landlock_net(&self) -> impl Iterator<Item = (crate::hardening::NetAccess, u16)> {
+        self.hardening.net_grants()
+    }
+
+    /// The Landlock scopes requested, in the order
+    /// [`LandlockScope::ALL`](crate::LandlockScope::ALL) lists them; none by
+    /// default.
+    pub fn get_landlock_scope(&self) -> impl Iterator<Item = crate::hardening::LandlockScope> {
+        self.hardening.scopes()
+    }
+
+    /// The seccomp policy applied to the command, or `None` for no filter.
+    pub fn get_seccomp(&self) -> Option<&crate::hardening::SeccompPolicy> {
+        self.hardening.seccomp()
+    }
+
+    /// The capabilities the command keeps, or `None` where the capability sets
+    /// are left as the identity switch leaves them, which is the default.
+    ///
+    /// The reading of both capability setters: an empty list is
+    /// [`drop_all_capabilities`](Self::drop_all_capabilities), and a list of
+    /// names is [`keep_capabilities`](Self::keep_capabilities).
+    pub fn get_keep_capabilities(&self) -> Option<&[crate::hardening::Capability]> {
+        self.hardening.kept_capabilities()
     }
 }
 
@@ -2967,16 +3131,18 @@ fn validate_hostname(name: &OsStr) -> Result<CString, Error> {
     CString::new(name.as_bytes()).map_err(|_| invalid())
 }
 
-/// Validates a working directory: absolute, no NUL. Returns `None` for `/`,
-/// where no `chdir` is needed.
+/// Validates a working directory: an absolute path of plain components, as
+/// [`path::absolute_components`] holds every configured absolute path, with no
+/// NUL. Returns `None` for the root, where no `chdir` is needed.
+///
+/// A `..` is refused rather than left to `chdir`, as it is in a mount target:
+/// nothing composes a working directory with one on purpose.
 pub(crate) fn validate_workdir(path: &Path) -> Result<Option<CString>, Error> {
-    if !path.is_absolute() {
-        return Err(ConfigError::WorkdirNotAbsolute {
+    let components =
+        path::absolute_components(path).map_err(|_| ConfigError::WorkdirNotAbsolute {
             path: path.to_path_buf(),
-        }
-        .into());
-    }
-    if path == Path::new("/") {
+        })?;
+    if components.is_empty() {
         return Ok(None);
     }
     Ok(Some(cstring(path.as_os_str())?))
@@ -3643,13 +3809,13 @@ fn created_file_targets(ops: &[MountOp], root: &RootLayers<'_>) -> ManagedPlaceh
     };
     let overlay = matches!(root, RootLayers::Overlay { .. });
 
-    let mut mounted: Vec<PathBuf> = Vec::new();
+    let mut mounted: Vec<&CStr> = Vec::new();
     let mut paths = Vec::new();
     let mut whiteouts = Vec::new();
     for op in ops {
         if let Some(file) = &op.create_file {
             let relative = Path::new(OsStr::from_bytes(file.to_bytes()));
-            let covered = mounted.iter().any(|mount| relative.starts_with(mount));
+            let covered = mounted.iter().any(|mount| covers(mount, file));
             let presence = if overlay {
                 merged_presence(&layers, relative)
             } else {
@@ -3667,7 +3833,7 @@ fn created_file_targets(ops: &[MountOp], root: &RootLayers<'_>) -> ManagedPlaceh
             }
         }
         if let Some((target, _)) = op.action.arrival() {
-            mounted.push(PathBuf::from(OsStr::from_bytes(target.to_bytes())));
+            mounted.push(target);
         }
     }
     ManagedPlaceholders {
@@ -4057,6 +4223,25 @@ pub(crate) mod serde_os {
                 .into_iter()
                 .map(OsString::from)
                 .collect())
+        }
+    }
+
+    /// `OsString` as a string, for a record that only serializes.
+    // `pub(crate)` for the resolved-inputs record, whose hostname is one.
+    pub(crate) mod string {
+        use std::ffi::OsStr;
+
+        use serde::ser::Error as _;
+        use serde::{Serialize, Serializer};
+
+        pub(crate) fn serialize<S: Serializer>(
+            value: &OsStr,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            value
+                .to_str()
+                .ok_or_else(|| S::Error::custom("a non-UTF-8 value cannot be serialized"))?
+                .serialize(serializer)
         }
     }
 
@@ -4586,6 +4771,32 @@ mod tests {
         ));
     }
 
+    /// A working directory is a configured absolute path, held to the rule
+    /// every other one is: plain components, with `.` and repeated slashes
+    /// normalized away and a `..` refused.
+    #[test]
+    fn a_workdir_is_held_to_the_absolute_path_rule() {
+        let err = sh_in("/tmp")
+            .current_dir("/build/../etc")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::WorkdirNotAbsolute { .. })),
+            "{err}",
+        );
+        let workdir = |path: &str| {
+            sh_in("/tmp")
+                .current_dir(path)
+                .build()
+                .unwrap()
+                .plan
+                .workdir
+        };
+        assert_eq!(workdir("/build").as_deref(), Some(c"/build"));
+        assert_eq!(workdir("/"), None);
+        assert_eq!(workdir("/."), None, "the root, however it is spelled");
+    }
+
     #[test]
     fn build_rejects_an_empty_hostname() {
         let err = sh_in("/tmp").hostname("").build().unwrap_err();
@@ -4915,13 +5126,13 @@ mod tests {
     fn an_op_that_mounts_nothing_does_not_hide_a_procfs() {
         // A remount and a propagation change act on the mount already standing
         // at their target; neither brings a mount to rest over it. Each kept
-        // the managed procfs standing, so the profile is valid.
+        // the managed procfs standing, and writable, so the profile is valid.
         const MS_REMOUNT: u64 = 0x20;
         const MS_PRIVATE: u64 = 1 << 18;
-        const MS_RDONLY: u64 = 1;
+        const MS_NOEXEC: u64 = 8;
         for flags in [
-            MS_REMOUNT | MS_RDONLY,
-            MS_REMOUNT | u64::from(MountFlags::BIND.bits()) | MS_RDONLY,
+            MS_REMOUNT | MS_NOEXEC,
+            MS_REMOUNT | u64::from(MountFlags::BIND.bits()) | MS_NOEXEC,
             MS_PRIVATE,
         ] {
             sh_in("/tmp")
@@ -4940,6 +5151,122 @@ mod tests {
         assert!(
             matches!(err, Error::Config(ConfigError::NestedUsernsNeedsProcfs)),
             "{err}"
+        );
+    }
+
+    /// A mount hides its own target and what sits beneath it, aligned on whole
+    /// components, and every question of that shape reads the same answer: a
+    /// sibling sharing a prefix is not beneath it, at the managed
+    /// `resolv.conf` bind as at the placeholder bookkeeping.
+    #[test]
+    fn a_mount_covers_its_target_and_what_lies_beneath_it() {
+        assert!(covers(c"etc", c"etc"));
+        assert!(covers(c"etc", c"etc/resolv.conf"));
+        assert!(!covers(c"et", c"etc/resolv.conf"));
+        assert!(!covers(c"etc/resolv.conf", c"etc"));
+        assert!(!covers(c"etc/resolv", c"etc/resolv.conf"));
+
+        // A bind over a sibling whose name shares the prefix claims nothing,
+        // and the managed bind stands.
+        let sibling = Mount::Bind(Bind::new("/tmp", "/et"));
+        assert!(!claims_resolv_conf(&sibling));
+        assert!(claims_resolv_conf(&Mount::Bind(Bind::new("/tmp", "/etc"))));
+    }
+
+    /// The nested map is written through the procfs, so one that is standing
+    /// but cannot take the write is refused at build, as an absent one is,
+    /// rather than failing the launch with `EROFS` or `ENOENT`.
+    #[test]
+    fn a_procfs_the_nested_map_cannot_be_written_through_is_refused() {
+        const MS_RDONLY: u64 = 1;
+        const MS_REMOUNT: u64 = 0x20;
+        const MS_BIND: u64 = 0x1000;
+        let refused = |builder: CageBuilder, what: &str| {
+            let err = builder.build().unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::NestedUsernsNeedsProcfs)),
+                "{what}: {err}",
+            );
+        };
+        let opted_out = || sh_in("/tmp").managed_mounts(false);
+
+        refused(opted_out().bind_ro("/proc", "/proc"), "a read-only bind");
+        refused(
+            sh_in("/tmp")
+                .mount_proc(false)
+                .raw_mount(RawMount::new("/proc").fstype("proc").flags(MS_RDONLY)),
+            "a read-only raw procfs",
+        );
+        for remount in [MS_REMOUNT | MS_RDONLY, MS_REMOUNT | MS_BIND | MS_RDONLY] {
+            refused(
+                sh_in("/tmp").raw_mount(RawMount::new("/proc").flags(remount)),
+                "a read-only remount",
+            );
+        }
+        // Not the root of a procfs, though each carries its magic number: the
+        // map files are named under `self`, which neither holds.
+        refused(
+            opted_out().bind("/proc/sys", "/proc"),
+            "a bind of /proc/sys",
+        );
+        refused(
+            opted_out().bind("/proc/self", "/proc"),
+            "a bind of /proc/self",
+        );
+
+        // The last remount decides, and one that makes it writable again
+        // leaves a procfs the map can be written through.
+        sh_in("/tmp")
+            .raw_mount(RawMount::new("/proc").flags(MS_REMOUNT | MS_RDONLY))
+            .raw_mount(RawMount::new("/proc").flags(MS_REMOUNT))
+            .build()
+            .expect("a procfs remounted writable serves");
+        // A read-only remount elsewhere leaves this one as it was.
+        sh_in("/tmp")
+            .raw_mount(RawMount::new("/tmp").flags(MS_REMOUNT | MS_RDONLY))
+            .build()
+            .expect("a remount of another mount leaves the procfs writable");
+        opted_out()
+            .bind("/proc", "/proc")
+            .build()
+            .expect("a writable bind of a procfs root serves");
+    }
+
+    /// `mount(2)` discards the legacy magic number from the high half of its
+    /// flags before it reads them, and the magic's bits overlap `MS_PRIVATE`
+    /// and `MS_SLAVE`. A raw mount carrying it is the fresh mount the kernel
+    /// performs, not a propagation change.
+    #[test]
+    fn a_raw_mount_carrying_the_legacy_magic_is_read_as_the_kernel_reads_it() {
+        const MS_MGC_VAL: u32 = 0xC0ED_0000;
+        let magic = |flags: u32| Arrival::of_raw(MountFlags::from_bits_retain(MS_MGC_VAL | flags));
+        assert_eq!(magic(0), Some(Arrival::Fresh));
+        assert_eq!(magic(MountFlags::BIND.bits()), Some(Arrival::Tree));
+        assert_eq!(magic(0x20), None, "a remount");
+
+        sh_in("/tmp")
+            .mount_proc(false)
+            .raw_mount(
+                RawMount::new("/proc")
+                    .fstype("proc")
+                    .flags(u64::from(MS_MGC_VAL)),
+            )
+            .build()
+            .expect("a raw procfs carrying the magic is a procfs");
+        // Discarding the magic leaves the low half, `MS_RDONLY` included, as
+        // the caller gave it.
+        let err = sh_in("/tmp")
+            .mount_proc(false)
+            .raw_mount(
+                RawMount::new("/proc")
+                    .fstype("proc")
+                    .flags(u64::from(MS_MGC_VAL) | 1),
+            )
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::NestedUsernsNeedsProcfs)),
+            "{err}",
         );
     }
 
@@ -5095,7 +5422,7 @@ mod tests {
     /// A test delegate resolving whatever it is asked, recording nothing:
     /// the subordinate form resolves to a fixed allocation-shaped map.
     #[derive(Debug)]
-    struct FakeMapper;
+    pub(super) struct FakeMapper;
 
     impl crate::IdMapper for FakeMapper {
         fn resolve(&self, request: &IdentityMap) -> Result<crate::ResolvedMap, crate::IdMapError> {
@@ -5286,8 +5613,69 @@ mod tests {
         let run_as = cage.plan.run_as.as_ref().unwrap();
         assert_eq!(run_as.uid.as_raw(), 250);
         assert_eq!(run_as.gid.as_raw(), 250);
-        let groups: Vec<u32> = run_as.groups.iter().map(|group| group.as_raw()).collect();
+        let groups: Vec<u32> = run_as
+            .groups
+            .iter()
+            .flatten()
+            .map(|group| group.as_raw())
+            .collect();
         assert_eq!(groups, [250, 100]);
+    }
+
+    /// A range map whose gid list is the caller's own gid alone has the
+    /// single-identity map's gid map, which the shadow helpers establish by
+    /// denying `setgroups`. A run-as identity under it is valid and keeps the
+    /// group list it inherited, where a `setgroups` call would fail the launch;
+    /// a group list of its own is refused here, as under the single map.
+    #[test]
+    fn an_own_gid_alone_gid_map_sets_no_group_list() {
+        let own = |id: u32| {
+            vec![crate::IdRange {
+                inside: 0,
+                outside: id,
+                count: 1,
+            }]
+        };
+        let euid = rustix::process::geteuid().as_raw();
+        let egid = rustix::process::getegid().as_raw();
+        let mut uid = own(euid);
+        uid.push(crate::IdRange {
+            inside: 1,
+            outside: 100_000,
+            count: 65_536,
+        });
+        let own_gid = || {
+            sh_in("/tmp")
+                .identity_map(IdentityMap::ranges(uid.clone(), own(egid)))
+                .id_mapper(FakeMapper)
+        };
+
+        let cage = own_gid()
+            .run_as(Identity::new(250, 0))
+            .build()
+            .expect("a non-root uid under the caller's own gid builds");
+        let run_as = cage.plan.run_as.as_ref().unwrap();
+        assert_eq!(run_as.uid.as_raw(), 250);
+        assert!(run_as.groups.is_none(), "{:?}", run_as.groups);
+
+        let err = own_gid()
+            .run_as(Identity::new(250, 0).groups([0]))
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::RunAsGroupsWithSingleMap)),
+            "{err}",
+        );
+
+        // A single gid that is not the caller's own is a map a helper wrote
+        // from a subordinate grant, and the list is set as given.
+        let cage = sh_in("/tmp")
+            .identity_map(IdentityMap::ranges(uid.clone(), own(100_000)))
+            .id_mapper(FakeMapper)
+            .run_as(Identity::new(250, 0))
+            .build()
+            .expect("a subordinate gid builds");
+        assert_eq!(cage.plan.run_as.as_ref().unwrap().groups, Some(Vec::new()));
     }
 
     #[test]
@@ -6200,6 +6588,26 @@ value = 268435456
 "#,
     ];
 
+    /// Every value `network` can take, as a profile spells it.
+    ///
+    /// The values come from `rename_all` as the keys do, and the match is
+    /// exhaustive, so a variant added later fails to compile here until its
+    /// spelling is pinned.
+    #[test]
+    fn the_network_spellings_are_what_they_are() {
+        let spelling = |network: Network| match network {
+            Network::Isolated => "isolated",
+            Network::None => "none",
+            Network::Host => "host",
+        };
+        for network in [Network::Isolated, Network::None, Network::Host] {
+            let rendered = toml::Value::try_from(network).expect("a network serializes");
+            assert_eq!(rendered.as_str(), Some(spelling(network)));
+            let parsed: Network = rendered.try_into().expect("the spelling parses back");
+            assert_eq!(parsed, network);
+        }
+    }
+
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
     const EXPECTED_PROFILE_KEYS: [&str; 89] = [
@@ -6638,6 +7046,48 @@ read-only = true
             Some(Path::new("/srv/rootfs/alpine"))
         );
         assert_eq!(builder.command.as_deref(), Some(Path::new("/bin/sh")));
+    }
+
+    /// The conversion from a builder applies the policy deserialization does,
+    /// and hands the refusal back as the documented variant rather than as
+    /// the serde format's text.
+    #[test]
+    fn a_builder_converts_to_a_restricted_profile_or_names_what_it_forbids() {
+        let cases = [
+            (
+                "[[mount]]\nkind = \"bind\"\nsource = \"/etc\"\ntarget = \"/e\"\n",
+                "a bind mount",
+            ),
+            (
+                "[[mount]]\nkind = \"raw\"\ntarget = \"/raw\"\nfstype = \"tmpfs\"\n",
+                "a raw mount",
+            ),
+            ("network = \"host\"\n", "host networking"),
+            (
+                "[overlay]\nlower = [\"/srv/base\"]\nupper = \"/var/tmp/upper\"\n",
+                "an overlay root",
+            ),
+            ("pid-namespace = false\n", "the host PID namespace"),
+        ];
+        for (profile, forbidden) in cases {
+            let builder: CageBuilder = toml::from_str(profile).expect("a trusted load accepts it");
+            match RestrictedProfile::try_from(builder) {
+                Err(ConfigError::ProfileOperationForbidden { operation }) => {
+                    assert_eq!(operation, forbidden, "{profile}");
+                }
+                other => panic!("{profile}: expected the refusal, got {other:?}"),
+            }
+            let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
+            assert!(err.to_string().contains(forbidden), "{err}");
+        }
+
+        let allowed: CageBuilder =
+            toml::from_str("rootfs = \"/srv/rootfs\"\ncommand = \"/bin/sh\"\n").unwrap();
+        let restricted = RestrictedProfile::try_from(allowed).expect("nothing here is forbidden");
+        assert_eq!(
+            restricted.into_builder().get_command(),
+            Some(Path::new("/bin/sh"))
+        );
     }
 
     #[test]
@@ -7248,15 +7698,33 @@ groups = [250, 100]
         assert_eq!(format!("{original:?}"), format!("{restored:?}"));
     }
 
-    /// A build without the `subid` feature refuses a subordinate profile at
-    /// load time: no delegate could establish it, and an identity posture is
-    /// never silently downgraded.
-    #[cfg(not(feature = "subid"))]
+    /// A subordinate profile loads in every build, and the build decides: a
+    /// configured delegate that reports an allocation establishes it, and
+    /// without one a build lacking the `subid` feature refuses it by name
+    /// rather than downgrading the identity posture.
     #[test]
-    fn a_subordinate_profile_is_refused_without_the_subid_feature() {
+    fn a_subordinate_profile_loads_and_the_build_decides() {
         let profile = "rootfs = \"/tmp\"\ncommand = \"/bin/sh\"\nidentity-map = \"subordinate\"\n";
-        let err = toml::from_str::<CageBuilder>(profile).unwrap_err();
-        assert!(err.to_string().contains("subid"), "{err}");
+        let builder: CageBuilder = toml::from_str(profile).expect("every identity form loads");
+        assert_eq!(builder.identity_map, IdentityMap::Subordinate);
+        builder
+            .clone()
+            .id_mapper(tests::FakeMapper)
+            .build()
+            .expect("a delegate that reports an allocation establishes it");
+
+        #[cfg(not(feature = "subid"))]
+        {
+            let err = builder.build().unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::Config(ConfigError::IdentityMapUnavailable { reason, .. })
+                        if reason.contains("`subid` feature")
+                ),
+                "{err}",
+            );
+        }
     }
 
     #[test]
@@ -7339,6 +7807,70 @@ port = 8080
         // non-empty capability mask.
         assert!(hardening.seccomp.is_some());
         assert!(matches!(hardening.keep_caps, Some(bits) if bits != 0));
+    }
+
+    /// A consumer vetting a profile it did not write reads its hardening
+    /// posture back through the getters, as it reads every other setting.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_profiles_hardening_posture_reads_back_through_the_getters() {
+        use crate::hardening::{Capability, FsAccess, LandlockScope, NetAccess, SeccompPolicy};
+
+        let profile = format!("{HARDENED_PROFILE}\n");
+        let profile = profile.replacen(
+            "[hardening]\n",
+            "[hardening]\nlandlock-scope = [\"abstract-unix-socket\", \"signal\"]\n",
+            1,
+        );
+        let builder = toml::from_str::<RestrictedProfile>(&profile)
+            .expect("hardening passes the restricted policy")
+            .into_builder();
+
+        let fs: Vec<(FsAccess, &Path)> = builder.get_landlock_fs().collect();
+        assert_eq!(
+            fs,
+            [
+                (FsAccess::READ | FsAccess::EXECUTE, Path::new("/usr")),
+                (
+                    FsAccess::READ | FsAccess::WRITE | FsAccess::EXECUTE,
+                    Path::new("/work")
+                ),
+            ],
+        );
+        let net: Vec<(NetAccess, u16)> = builder.get_landlock_net().collect();
+        assert_eq!(
+            net,
+            [
+                (NetAccess::CONNECT, 443),
+                (NetAccess::BIND | NetAccess::CONNECT, 8080),
+            ],
+        );
+        let scopes: Vec<LandlockScope> = builder.get_landlock_scope().collect();
+        assert_eq!(
+            scopes,
+            [LandlockScope::Signal, LandlockScope::AbstractUnixSocket]
+        );
+        assert!(matches!(
+            builder.get_seccomp(),
+            Some(SeccompPolicy::Rules(_))
+        ));
+        assert_eq!(
+            builder.get_keep_capabilities(),
+            Some(&[Capability::NetBindService, Capability::SysChroot][..]),
+        );
+
+        // The defaults: nothing granted, scoped, filtered, or dropped.
+        let plain = Cage::builder().rootfs("/tmp").command("/bin/sh");
+        assert_eq!(plain.get_landlock_fs().count(), 0);
+        assert_eq!(plain.get_landlock_net().count(), 0);
+        assert_eq!(plain.get_landlock_scope().count(), 0);
+        assert!(plain.get_seccomp().is_none());
+        assert_eq!(plain.get_keep_capabilities(), None);
+        // Dropping every capability reads back as keeping none.
+        assert_eq!(
+            plain.drop_all_capabilities().get_keep_capabilities(),
+            Some(&[][..]),
+        );
     }
 
     #[cfg(feature = "hardening")]

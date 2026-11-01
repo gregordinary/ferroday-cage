@@ -85,7 +85,9 @@ The map files are reached by path, so establishing the nested map generally
 requires a procfs, and a profile that mounts none is refused at `build` with
 `ConfigError::NestedUsernsNeedsProcfs`. The managed profile mounts one by
 default, so this arises only for a profile that opts out of the managed mounts
-and supplies no procfs of its own.
+and supplies no procfs of its own. The map files are written, and named from
+the procfs's root. A procfs that ends up read-only, or a bind of a tree inside
+one such as `/proc/sys`, is refused the same way.
 
 The requirement follows the route the map takes, not the fact of nesting. A
 self-written map — the single-identity tier — needs one, and any procfs serves,
@@ -125,6 +127,15 @@ consults them in order when none is configured:
 A caller with site-specific machinery — a privileged broker of its own, a
 different helper — supplies its own implementation through
 [`CageBuilder::id_mapper`], and the bundled delegates step aside.
+
+A delegate decides which host ids a sandbox holds, so it holds each request to
+the caller's own authority. The request can come from an untrusted profile: a
+range `identity-map` and a `run-as` identity pass the restricted policy. The
+bundled delegates check the outside ids in `resolve` and refuse the rest:
+`DirectMapper` against the caller's capabilities and its namespace's map, and
+`SubidMapper` against the subordinate allocation. A delegate with privilege of
+its own must check them too. One that maps whatever it is asked lets a profile
+map host root into the sandbox.
 
 Every builder that establishes a range map takes the same delegate, through an
 `id_mapper` of its own. The Debian and Alpine provisioners launch their package
@@ -201,7 +212,9 @@ The helpers are not always setuid: several distributions grant them file
 capabilities instead, which works equally well, and
 [`host::range_map_blocker`] probes for a *working* helper rather than a mode
 bit. The probe names whichever condition blocks a range map, with the remedy
-in the message:
+in the message. `SubidMapper` refuses a range map at `build` on the same
+conditions, in the same words, so a provisioner refuses one before it downloads
+anything:
 
 - A caller running under `no_new_privs`, under which no helper gains its
   privilege.
@@ -216,9 +229,8 @@ wants `CAP_SETFCAP` for a uid map that names the parent namespace's uid 0 among
 its outside ids. Only a root caller's own uid is that, and a root caller's
 helper gains its capabilities from the caller rather than from the file.
 
- `Subordinate` on a build
-without the `subid` feature is refused the same way, at `build` for code and
-at load time for a profile.
+Without the `subid` feature, `Subordinate` needs a configured delegate that
+reports an allocation, and `build` refuses it without one.
 
 ## Ownership on the host
 
@@ -266,9 +278,12 @@ The switch sits within the hardening layer, after securebits, no-new-privileges,
 and Landlock and before the capability drop and the seccomp filter, so the
 command holds the identity from its first instruction and its descendants
 inherit it. Every id must be contained in the identity map —
-`build` rejects one that is not — and supplementary groups additionally
-require a range gid map, because establishing the single-identity map denies
-`setgroups` permanently.
+`build` rejects one that is not. Supplementary groups additionally require a
+gid map wider than the caller's own gid. A gid map of that gid alone is the
+single-identity map's, which is established by denying `setgroups` permanently.
+`newgidmap` denies it too when it writes a range map whose gid list is that one
+extent. Under such a map the command keeps the group list it inherited, and
+`build` refuses a run-as identity that names groups.
 
 A run-as identity also sets no-new-privileges, in every build of the library
 and whatever else the sandbox requests. The cleared capability set is only half
@@ -323,10 +338,12 @@ gid = [
 ]
 ```
 
-A profile requesting `subordinate` on a build without the `subid` feature is
-refused when it loads: a profile's identity posture is never silently
-downgraded by a library that cannot establish it. The delegate itself is
-code, not configuration, and is never part of a profile.
+Every form loads in every build of the library, and `build` decides whether a
+delegate can establish it. A profile requesting `subordinate` builds with a
+configured delegate that reports an allocation, and is refused at `build`
+without one on a build lacking the `subid` feature. A profile's identity
+posture is never silently downgraded. The delegate itself is code, not
+configuration, and is never part of a profile.
 
 [`CageBuilder::id_mapper`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.id_mapper
 [`host::range_map_blocker`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.range_map_blocker.html

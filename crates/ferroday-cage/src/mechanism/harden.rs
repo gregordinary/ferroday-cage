@@ -38,7 +38,7 @@
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 use rustix::thread::{CapabilitiesSecureBits, CapabilitySet, CapabilitySets};
 use syscalls::Sysno;
@@ -261,14 +261,15 @@ fn apply_landlock(plan: &HardeningPlan) -> Result<(), Failure> {
     // ABI-1 base rights, so an empty ruleset arises only for a request of
     // network grants and scopes alone on a kernel too old for either.
     //
-    // The two cases where that downgrade would leave the command genuinely
-    // unconfined are refused at build time instead, before any fork: the
-    // restriction fallback (`ensure_landlock_enforceable`) and a host-network
-    // cage (`ensure_host_net_enforceable`). What reaches here is a cage whose
-    // network namespace remains the boundary, which is why the drop is
-    // tolerated; `CageBuilder::landlock_net` states it for callers. A scope is
-    // additive in a sandbox and best-effort in a restriction, whose build drops it
-    // on a kernel that cannot enforce it.
+    // Every case where that downgrade would leave a reach genuinely unconfined
+    // is refused at build time instead, before any fork: a restriction's grants
+    // and the scopes it names (`ensure_landlock_enforceable`,
+    // `ensure_scopes_enforceable`), and a sandbox's network grant or scope with
+    // no namespace behind it (`ensure_sandbox_enforceable`). What reaches here
+    // is a request some namespace also bounds, or a restriction's default
+    // scopes, which its build already masked to this kernel; that is why the
+    // drop is tolerated. `CageBuilder::landlock_net` and
+    // `CageBuilder::landlock_scope` state it for callers.
     if handled_fs == 0 && handled_net == 0 && scoped == 0 {
         return Ok(());
     }
@@ -293,11 +294,22 @@ fn apply_landlock(plan: &HardeningPlan) -> Result<(), Failure> {
         }
         // Post-pivot the sandbox root is `/`, so the grant's absolute path
         // resolves within the sandbox. O_PATH opens the file or directory the
-        // rule is tied to, following a symbolic link to it.
-        let target = rustix::fs::open(
+        // rule is tied to. A sandbox's walk follows no link, the last component
+        // included: a planted `/var/lib/app -> /` would carry the grant to the
+        // whole sandbox view, so the walk answers ELOOP and the rule fails
+        // under its grant's name. A restriction resolves its host paths as the
+        // host does, through the links the host is laid out with.
+        let resolve = if plan.grants_follow_links {
+            ResolveFlags::empty()
+        } else {
+            ResolveFlags::NO_SYMLINKS
+        };
+        let target = super::resolve::openat2(
+            CWD,
             rule.path.as_c_str(),
             OFlags::PATH | OFlags::CLOEXEC,
             Mode::empty(),
+            resolve,
         )
         .map_err(failed)?;
         // The kernel refuses a rule on anything but a directory that allows a

@@ -1543,6 +1543,9 @@ pub ferroday_cage::ConfigError::IdentityMapUnavailable::source: core::option::Op
 pub ferroday_cage::ConfigError::LandlockGrantEmpty::grant: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockPathInvalid
 pub ferroday_cage::ConfigError::LandlockPathInvalid::path: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ConfigError::LandlockScopeUnenforceable
+pub ferroday_cage::ConfigError::LandlockScopeUnenforceable::abi: core::option::Option<i32>
+pub ferroday_cage::ConfigError::LandlockScopeUnenforceable::scope: &'static str
 #[non_exhaustive] pub ferroday_cage::ConfigError::ManagedMountsContradiction
 pub ferroday_cage::ConfigError::ManagedMountsContradiction::toggle: &'static str
 #[non_exhaustive] pub ferroday_cage::ConfigError::MountFlagsInvalid
@@ -1822,6 +1825,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Progress
 #[non_exhaustive] pub enum ferroday_cage::ResolvedHardening
 #[non_exhaustive] pub ferroday_cage::ResolvedHardening::Applied
 pub ferroday_cage::ResolvedHardening::Applied::keep_capabilities: core::option::Option<u64>
+pub ferroday_cage::ResolvedHardening::Applied::landlock_abi: core::option::Option<i32>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_fs: alloc::vec::Vec<ferroday_cage::ResolvedLandlockFs>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_net: alloc::vec::Vec<ferroday_cage::ResolvedLandlockNet>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_scope: u64
@@ -2161,11 +2165,19 @@ pub fn ferroday_cage::CageBuilder::stdout(self, ferroday_cage::Stdio) -> Self
 pub fn ferroday_cage::CageBuilder::stop_with_caller(self, bool) -> Self
 impl ferroday_cage::CageBuilder
 pub fn ferroday_cage::CageBuilder::drop_all_capabilities(self) -> Self
+pub fn ferroday_cage::CageBuilder::get_keep_capabilities(&self) -> core::option::Option<&[ferroday_cage::Capability]>
+pub fn ferroday_cage::CageBuilder::get_landlock_fs(&self) -> impl core::iter::traits::iterator::Iterator<Item = (ferroday_cage::FsAccess, &std::path::Path)>
+pub fn ferroday_cage::CageBuilder::get_landlock_net(&self) -> impl core::iter::traits::iterator::Iterator<Item = (ferroday_cage::NetAccess, u16)>
+pub fn ferroday_cage::CageBuilder::get_landlock_scope(&self) -> impl core::iter::traits::iterator::Iterator<Item = ferroday_cage::LandlockScope>
+pub fn ferroday_cage::CageBuilder::get_seccomp(&self) -> core::option::Option<&ferroday_cage::SeccompPolicy>
 pub fn ferroday_cage::CageBuilder::keep_capabilities<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::Capability>
 pub fn ferroday_cage::CageBuilder::landlock_fs(self, ferroday_cage::FsAccess, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::landlock_net(self, ferroday_cage::NetAccess, u16) -> Self
 pub fn ferroday_cage::CageBuilder::landlock_scope<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>
 pub fn ferroday_cage::CageBuilder::seccomp(self, ferroday_cage::SeccompPolicy) -> Self
+impl core::convert::TryFrom<ferroday_cage::CageBuilder> for ferroday_cage::RestrictedProfile
+pub type ferroday_cage::RestrictedProfile::Error = ferroday_cage::ConfigError
+pub fn ferroday_cage::RestrictedProfile::try_from(ferroday_cage::CageBuilder) -> core::result::Result<ferroday_cage::RestrictedProfile, ferroday_cage::ConfigError>
 impl core::default::Default for ferroday_cage::CageBuilder
 pub fn ferroday_cage::CageBuilder::default() -> Self
 impl core::marker::Freeze for ferroday_cage::CageBuilder
@@ -2542,10 +2554,12 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::RawMount
 #[non_exhaustive] pub struct ferroday_cage::ResolvedInputs
 pub ferroday_cage::ResolvedInputs::env: alloc::vec::Vec<(std::ffi::os_str::OsString, std::ffi::os_str::OsString)>
 pub ferroday_cage::ResolvedInputs::hardening: ferroday_cage::ResolvedHardening
+pub ferroday_cage::ResolvedInputs::hostname: std::ffi::os_str::OsString
 pub ferroday_cage::ResolvedInputs::identity: ferroday_cage::ResolvedIdentity
 pub ferroday_cage::ResolvedInputs::mounts: alloc::vec::Vec<ferroday_cage::ResolvedMount>
 pub ferroday_cage::ResolvedInputs::network: ferroday_cage::Network
 pub ferroday_cage::ResolvedInputs::no_new_privileges: bool
+pub ferroday_cage::ResolvedInputs::pid_namespace: bool
 pub ferroday_cage::ResolvedInputs::rlimits: alloc::vec::Vec<ferroday_cage::ResolvedRlimit>
 pub ferroday_cage::ResolvedInputs::root: ferroday_cage::ResolvedRoot
 pub ferroday_cage::ResolvedInputs::run_as: core::option::Option<ferroday_cage::Identity>
@@ -2614,6 +2628,9 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedStreams
 pub struct ferroday_cage::RestrictedProfile(_)
 impl ferroday_cage::RestrictedProfile
 pub fn ferroday_cage::RestrictedProfile::into_builder(self) -> ferroday_cage::CageBuilder
+impl core::convert::TryFrom<ferroday_cage::CageBuilder> for ferroday_cage::RestrictedProfile
+pub type ferroday_cage::RestrictedProfile::Error = ferroday_cage::ConfigError
+pub fn ferroday_cage::RestrictedProfile::try_from(ferroday_cage::CageBuilder) -> core::result::Result<ferroday_cage::RestrictedProfile, ferroday_cage::ConfigError>
 impl<'de> serde_core::de::Deserialize<'de> for ferroday_cage::RestrictedProfile
 pub fn ferroday_cage::RestrictedProfile::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 impl core::marker::Freeze for ferroday_cage::RestrictedProfile

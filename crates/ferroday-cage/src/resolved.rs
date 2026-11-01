@@ -103,10 +103,11 @@ pub struct ResolvedInputs {
     /// A switch to a non-root id clears the command's capabilities, unless a
     /// keep set carries some across it, which [`hardening`](Self::hardening)
     /// records. A configured identity of any id also sets
-    /// [`no_new_privileges`](Self::no_new_privileges). Under the
-    /// single-identity map no supplementary group can be set, and the command
-    /// keeps the list it inherited, every entry of which the map presents as
-    /// the overflow gid.
+    /// [`no_new_privileges`](Self::no_new_privileges). Under a gid map of the
+    /// caller's own gid alone, the single-identity map's or a range map's, no
+    /// supplementary group can be set. The command then keeps the list it
+    /// inherited, every entry of which the map does not hold presenting as the
+    /// overflow gid.
     pub run_as: Option<Identity>,
     /// Whether the command runs with the no-new-privileges flag set, so that a
     /// set-user-ID binary or a file capability grants nothing across
@@ -133,6 +134,22 @@ namespace the sandbox creates, not what may later be plugged into it.
 "
     )]
     pub network: Network,
+    /// Whether the command runs in a PID namespace of the sandbox's own, under
+    /// the sandbox's init.
+    ///
+    /// Without one the command shares the caller's PID namespace: `/proc` is
+    /// the host's, the command sees and can signal the caller's processes, and
+    /// its descendants can outlive it. `false` for a restriction, which creates
+    /// no namespace.
+    pub pid_namespace: bool,
+    /// The hostname the command sees.
+    ///
+    /// The one configured with [`hostname`](crate::CageBuilder::hostname), or
+    /// else the host's own: a sandbox's UTS namespace starts with the host's
+    /// name, and a restriction shares the host's. The host's is read when the
+    /// record is made, which is the name a launch made then inherits.
+    #[cfg_attr(feature = "serde", serde(with = "crate::spec::serde_os::string"))]
+    pub hostname: OsString,
     /// Where the command's three standard streams are wired.
     pub streams: ResolvedStreams,
     /// The resource limits applied to the command process, in the order they
@@ -288,7 +305,7 @@ pub struct ResolvedStreams {
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize),
-    serde(rename_all = "lowercase")
+    serde(rename_all = "kebab-case")
 )]
 pub enum ResolvedStdio {
     /// The stream is left as the launch inherited it.
@@ -356,9 +373,9 @@ pub enum ResolvedHardening {
         /// them; zero when none applies.
         ///
         /// A sandbox reports what it asked for, before the command stage masks it
-        /// to the running kernel's ABI. A restriction requests every scope and
-        /// drops at build those the kernel cannot enforce, so it reports what
-        /// the build kept.
+        /// to the running kernel's ABI. A restriction starts with every scope
+        /// and drops at build the default ones the kernel cannot enforce, so it
+        /// reports what the build kept.
         landlock_scope: u64,
         /// The installed seccomp filter's length in BPF instructions; `None`
         /// when no filter is installed.
@@ -374,6 +391,16 @@ pub enum ResolvedHardening {
         /// every capability of the namespace's root, or none at all for a
         /// non-root [`run_as`](ResolvedInputs::run_as).
         keep_capabilities: Option<u64>,
+        /// The Landlock ABI the running kernel supports, read when the record
+        /// is made.
+        ///
+        /// The grants and the scope above are what the posture requests, and
+        /// the command stage masks them to this ABI, so two hosts recording the
+        /// same requests can enforce different postures; this is what tells
+        /// them apart. `None` where the posture requests nothing of Landlock,
+        /// which the ABI then does not touch, and where the kernel offers no
+        /// Landlock, under which a request fails at launch.
+        landlock_abi: Option<i32>,
     },
 }
 
@@ -537,10 +564,12 @@ impl ResolvedInputs {
             identity: project_identity(plan),
             run_as: plan.run_as.as_ref().map(|run_as| {
                 Identity::new(run_as.uid.as_raw(), run_as.gid.as_raw())
-                    .groups(run_as.groups.iter().map(|gid| gid.as_raw()))
+                    .groups(run_as.groups.iter().flatten().map(|gid| gid.as_raw()))
             }),
             no_new_privileges: no_new_privileges(plan),
             network: plan.network,
+            pid_namespace: plan.pid_namespace,
+            hostname: project_hostname(plan),
             streams: ResolvedStreams {
                 stdin: project_stdio(&plan.stdin),
                 stdout: project_stdio(&plan.stdout),
@@ -572,6 +601,18 @@ fn project_root(plan: &LaunchPlan) -> ResolvedRoot {
         #[cfg(feature = "hardening")]
         Confinement::Restriction => ResolvedRoot::Host,
     }
+}
+
+/// Projects the hostname the command sees: the configured one, or the host's.
+///
+/// No configured name leaves the UTS namespace with the one it started with,
+/// which is the caller's, so that is read here.
+fn project_hostname(plan: &LaunchPlan) -> OsString {
+    let name = match &plan.hostname {
+        Some(name) => name.as_bytes().to_vec(),
+        None => rustix::system::uname().nodename().to_bytes().to_vec(),
+    };
+    OsString::from_vec(name)
 }
 
 /// Projects one stream's disposition onto its kind.
@@ -665,8 +706,18 @@ fn project_hardening(plan: &LaunchPlan) -> ResolvedHardening {
             landlock_scope: plan.hardening.landlock_scoped,
             seccomp_instructions: plan.hardening.seccomp.as_ref().map(Vec::len),
             keep_capabilities: plan.hardening.keep_caps,
+            landlock_abi: requests_landlock(&plan.hardening)
+                .then(crate::mechanism::probe_landlock_abi)
+                .flatten(),
         }
     }
+}
+
+/// Whether a hardening plan asks anything of Landlock: a grant of either kind,
+/// or a scope.
+#[cfg(feature = "hardening")]
+fn requests_landlock(plan: &crate::mechanism::HardeningPlan) -> bool {
+    !plan.landlock.is_empty() || !plan.landlock_net.is_empty() || plan.landlock_scoped != 0
 }
 
 /// Splits a frozen `NAME=value` entry back into its pair.
@@ -837,12 +888,13 @@ mod serde_tests {
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 52] = [
+    const EXPECTED_RECORD_KEYS: [&str; 55] = [
         "env",
         "env.SOURCE_DATE_EPOCH",
         "hardening",
         "hardening.keep-capabilities",
         "hardening.kind",
+        "hardening.landlock-abi",
         "hardening.landlock-fs",
         "hardening.landlock-fs[].access",
         "hardening.landlock-fs[].path",
@@ -851,6 +903,7 @@ mod serde_tests {
         "hardening.landlock-net[].port",
         "hardening.landlock-scope",
         "hardening.seccomp-instructions",
+        "hostname",
         "identity",
         "identity.gid",
         "identity.gid[].count",
@@ -872,6 +925,7 @@ mod serde_tests {
         "mounts[].target",
         "network",
         "no-new-privileges",
+        "pid-namespace",
         "rlimits",
         "rlimits[].hard",
         "rlimits[].resource",
@@ -956,6 +1010,8 @@ mod serde_tests {
             run_as: Some(Identity::new(1000, 1000).groups([1000, 27])),
             no_new_privileges: true,
             network: Network::Host,
+            pid_namespace: true,
+            hostname: OsString::from("builder"),
             streams,
             rlimits: vec![ResolvedRlimit {
                 resource: Resource::OpenFiles,
@@ -974,6 +1030,7 @@ mod serde_tests {
                 landlock_scope: 3,
                 seccomp_instructions: Some(4),
                 keep_capabilities: Some(5),
+                landlock_abi: Some(6),
             },
         };
         let overlaid = ResolvedInputs {
@@ -1073,6 +1130,28 @@ mod serde_tests {
         assert_eq!(keys, EXPECTED_RECORD_KEYS, "the record format's keys moved");
     }
 
+    /// Every value a stream's disposition can take in the record.
+    ///
+    /// The values come from `rename_all` as the keys do, and the match is
+    /// exhaustive, so a variant added later fails to compile here until its
+    /// spelling is pinned.
+    #[test]
+    fn the_stream_spellings_are_what_they_are() {
+        let spelling = |stdio: ResolvedStdio| match stdio {
+            ResolvedStdio::Inherit => "inherit",
+            ResolvedStdio::Null => "null",
+            ResolvedStdio::Fd => "fd",
+        };
+        for stdio in [
+            ResolvedStdio::Inherit,
+            ResolvedStdio::Null,
+            ResolvedStdio::Fd,
+        ] {
+            let rendered = toml::Value::try_from(stdio).expect("a disposition serializes");
+            assert_eq!(rendered.as_str(), Some(spelling(stdio)));
+        }
+    }
+
     /// The record a consumer stamps into provenance is a TOML document, and
     /// its shape is what that consumer's own format has to accommodate.
     #[test]
@@ -1087,6 +1166,7 @@ mod serde_tests {
             .managed_mounts(false)
             .base_env(false)
             .command("/bin/sh")
+            .hostname("builder")
             .env("SOURCE_DATE_EPOCH", "1700000000")
             .bind_ro("/etc", "/usr/src")
             .raw_mount(RawMount::new("/proc").fstype("proc").flags(2))
@@ -1101,13 +1181,17 @@ mod serde_tests {
         #[cfg(not(feature = "hardening"))]
         let hardening = "[hardening]\nkind = \"unavailable\"\n";
         // TOML puts bare keys ahead of tables, so `no-new-privileges`,
-        // `network` and `rlimits` lead whatever order the struct declares; the
-        // rest follow in declaration order. A `None` renders as an absent key,
-        // which is what TOML has: no `run-as` table here.
+        // `network`, `pid-namespace`, `hostname` and `rlimits` lead whatever
+        // order the struct declares; the rest follow in declaration order. A
+        // `None` renders as an absent key, which is what TOML has: no `run-as`
+        // table here, and no Landlock ABI for a posture that asks nothing of
+        // Landlock.
         assert_eq!(
             rendered,
             "no-new-privileges = false\n\
              network = \"isolated\"\n\
+             pid-namespace = true\n\
+             hostname = \"builder\"\n\
              rlimits = []\n\
              \n\
              [root]\n\
@@ -1370,6 +1454,67 @@ mod serde_tests {
             seccomp_instructions.is_some_and(|count| count > 0),
             "the curated policy compiles to a program: {seccomp_instructions:?}",
         );
+    }
+
+    /// The Landlock ABI is recorded beside a posture that asks for Landlock,
+    /// since the command stage masks the recorded requests to it, and not
+    /// beside one that asks nothing of Landlock, where it changes nothing.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_landlock_posture_records_the_abi_its_requests_are_masked_to() {
+        let abi_of = |builder: crate::CageBuilder| {
+            let cage = builder
+                .rootfs("/tmp")
+                .command("/bin/sh")
+                .build()
+                .expect("a valid sandbox configuration");
+            let crate::ResolvedHardening::Applied { landlock_abi, .. } =
+                cage.resolved_inputs().hardening
+            else {
+                panic!("a build with the feature reports an applied posture");
+            };
+            landlock_abi
+        };
+        let host = crate::host::landlock_abi();
+        assert_eq!(
+            abi_of(Cage::builder().landlock_fs(crate::FsAccess::READ, "/usr")),
+            host,
+        );
+        assert_eq!(
+            abi_of(Cage::builder().landlock_scope([crate::LandlockScope::Signal])),
+            host,
+        );
+        assert_eq!(
+            abi_of(Cage::builder().seccomp(crate::SeccompPolicy::Curated)),
+            None,
+            "a posture without Landlock records no ABI",
+        );
+    }
+
+    /// The UTS hostname and the PID namespace change what a build sees, so
+    /// both reach the record, the host's own name included where none is set.
+    #[test]
+    fn the_hostname_and_the_pid_namespace_reach_the_record() {
+        let built = |builder: crate::CageBuilder| {
+            builder
+                .rootfs("/tmp")
+                .command("/bin/sh")
+                .build()
+                .expect("a valid sandbox configuration")
+                .resolved_inputs()
+        };
+        let named = built(Cage::builder().hostname("builder").pid_namespace(false));
+        assert_eq!(named.hostname, "builder");
+        assert!(!named.pid_namespace);
+
+        let inherited = built(Cage::builder());
+        let host = rustix::system::uname();
+        assert_eq!(
+            std::os::unix::ffi::OsStrExt::as_bytes(inherited.hostname.as_os_str()),
+            host.nodename().to_bytes(),
+            "an unset hostname is the host's",
+        );
+        assert!(inherited.pid_namespace);
     }
 
     /// A sandbox that hardens nothing still reports the layer as available.

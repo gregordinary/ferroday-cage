@@ -95,6 +95,34 @@ fn landlock_allows_a_granted_path_and_denies_the_rest() {
 }
 
 #[test]
+fn a_restriction_grant_follows_a_host_link() {
+    if !common::landlock() {
+        return;
+    }
+    // A restriction's grants are host paths, resolved as the host resolves
+    // them: a grant naming a link covers what the link points at, as a grant on
+    // a merged-/usr host's `/lib` covers `/usr/lib`.
+    let tree = scratch("restrict-link");
+    std::fs::create_dir(tree.join("real")).unwrap();
+    std::fs::write(tree.join("real/file"), "through the link\n").unwrap();
+    std::os::unix::fs::symlink("real", tree.join("link")).unwrap();
+    let output = grant_system_trees(Restriction::builder())
+        .command("/bin/cat")
+        .arg(tree.join("real/file"))
+        .landlock_fs(FsAccess::READ, tree.join("link"))
+        .build()
+        .expect("a valid restriction configuration")
+        .output()
+        .expect("the restriction launches");
+    assert!(
+        output.status.success(),
+        "a grant through a host link must cover its target: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"through the link\n");
+}
+
+#[test]
 fn landlock_net_gates_a_tcp_connection() {
     if !common::landlock_net() {
         return;
@@ -677,6 +705,67 @@ fn a_syscall_answered_with_its_own_errno_reports_it() {
         String::from_utf8_lossy(&output.stdout),
         format!("{}\n{}\nthread\n", libc::ENOSYS, libc::EPERM),
     );
+}
+
+#[test]
+fn the_curated_policy_denies_a_namespace_and_starts_threads_and_processes() {
+    if !common::seccomp() {
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        common::require::SECCOMP.skip("no python3 on this host to make the calls with");
+        return;
+    };
+    // A host binary linked against the host's C library, which starts a thread
+    // with `clone3` and falls back to `clone` on `ENOSYS`. Each `unshare`
+    // reports the errno it got, and so does a raw `clone3`, which the kernel
+    // itself answers `EINVAL` for its empty arguments. The thread and the
+    // forked process report that they ran. Unsharing the descriptor table is
+    // not a namespace, so it stays allowed.
+    let script = format!(
+        "import ctypes, os, threading; libc = ctypes.CDLL(None, use_errno=True); \
+         print(ctypes.get_errno() if libc.unshare({newuser}) else 0); \
+         print(ctypes.get_errno() if libc.unshare({files}) else 0); \
+         libc.syscall({clone3}, 0, 0); print(ctypes.get_errno()); \
+         t = threading.Thread(target=int); t.start(); t.join(); print('thread'); \
+         pid = os.fork(); pid or os._exit(0); os.waitpid(pid, 0); print('fork')",
+        newuser = libc::CLONE_NEWUSER,
+        files = libc::CLONE_FILES,
+        clone3 = libc::SYS_clone3,
+    );
+    let run = |policy: SeccompPolicy| {
+        let output = Restriction::builder()
+            .command(python)
+            .args(["-c", &script])
+            .seccomp(policy)
+            .build()
+            .expect("a valid restriction configuration")
+            .output()
+            .expect("the restriction launches");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    assert_eq!(
+        run(SeccompPolicy::Curated),
+        format!("{}\n0\n{}\nthread\nfork\n", libc::EPERM, libc::ENOSYS),
+    );
+    // Where the host lets an unprivileged process create a user namespace, the
+    // same script under a policy without the rules creates one, which pins the
+    // refusals above on the curated policy rather than on the host.
+    if common::require::userns() {
+        let control = SeccompRules::denying([libc::SYS_acct]);
+        assert_eq!(
+            run(SeccompPolicy::Rules(control)),
+            format!("0\n0\n{}\nthread\nfork\n", libc::EINVAL),
+        );
+    }
 }
 
 #[test]

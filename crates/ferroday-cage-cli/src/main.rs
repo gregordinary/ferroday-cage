@@ -1360,7 +1360,7 @@ const FLAGS: &[Flag] = &[
             "Run the command as a non-root identity inside the",
             "sandbox, with optional supplementary groups. Every id",
             "must be contained in the identity map; groups need a",
-            "range gid map",
+            "gid map wider than the caller's own gid",
         ],
         take: Take::One(|options, flag, value| {
             options.run_as = Some(parse_run_as(&into_string(flag, value)?)?);

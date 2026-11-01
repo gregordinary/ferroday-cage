@@ -55,13 +55,20 @@ pub(crate) const MAX_EXTENTS: usize = 340;
 /// permit a process to write its own multi-id map — not even a process that
 /// was privileged before it unshared.
 ///
+/// Every form loads from a profile in every build of the library. Whether a
+/// delegate can establish it is decided at [`CageBuilder::build`], which
+/// refuses one no delegate can: a profile naming `subordinate` builds with a
+/// configured delegate that reports an allocation, with or without the
+/// `subid` feature.
+///
 /// [`CageBuilder::identity_map`]: crate::CageBuilder::identity_map
+/// [`CageBuilder::build`]: crate::CageBuilder::build
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "kebab-case", try_from = "profile::IdentityMapWire")
+    serde(rename_all = "kebab-case", deny_unknown_fields)
 )]
 pub enum IdentityMap {
     /// Root inside is the calling user outside, and no other id exists.
@@ -177,8 +184,8 @@ pub struct Identity {
     pub(crate) uid: u32,
     /// The gid the command runs as, a sandbox-inside id.
     pub(crate) gid: u32,
-    /// The supplementary groups, sandbox-inside ids. Requires a range gid
-    /// map: the single-identity map denies `setgroups`.
+    /// The supplementary groups, sandbox-inside ids. Requires a gid map wider
+    /// than the caller's own gid: the single-identity map denies `setgroups`.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
@@ -199,9 +206,10 @@ impl Identity {
 
     /// Sets the supplementary groups.
     ///
-    /// Supplementary groups require a range gid map; under the
-    /// single-identity map `setgroups` is denied and any groups are rejected
-    /// at build time.
+    /// Supplementary groups require a gid map wider than the caller's own
+    /// gid. A gid map of that gid alone is the single-identity map's, under
+    /// which `setgroups` is denied, so any groups are rejected at build time.
+    /// That holds for a range map whose gid list is that one extent too.
     pub fn groups<I: IntoIterator<Item = u32>>(mut self, groups: I) -> Identity {
         self.groups = groups.into_iter().collect();
         self
@@ -283,6 +291,20 @@ impl ResolvedMap {
 /// method to what it holds. One instance is shared between builders as an
 /// `Arc`, and one chosen at run time is passed as a `Box<dyn IdMapper>`.
 ///
+/// # Authority
+///
+/// A delegate decides which host ids a sandbox holds, so it holds every
+/// request to the caller's own authority. The request is configuration, and
+/// an untrusted profile can carry one: a range `identity-map` and a `run-as`
+/// identity pass the restricted policy a `RestrictedProfile` loads under. The
+/// bundled delegates check the outside ids in [`resolve`](Self::resolve) and
+/// refuse the rest. [`DirectMapper`] checks them against the caller's
+/// capabilities and its own namespace's map, and `SubidMapper` against the
+/// caller's subordinate allocation. A delegate with privilege of its own, such
+/// as a broker running as root, must check them too. One that maps whatever it
+/// is asked lets a profile map host ids the caller does not hold, host root
+/// among them, into the sandbox.
+///
 /// # Stability
 ///
 /// Every method added to this trait in a later release will carry a default
@@ -301,9 +323,11 @@ pub trait IdMapper: fmt::Debug + Send + Sync {
     /// The ranges this delegate can provide for the request.
     ///
     /// Called from [`CageBuilder::build`], so a map that cannot be satisfied
-    /// is a configuration error rather than a launch failure. The returned
-    /// map is validated against the same rules as an explicit
-    /// [`IdentityMap::Ranges`].
+    /// is a configuration error rather than a launch failure. A delegate
+    /// refuses here whatever it can already tell [`apply`](Self::apply) would
+    /// fail on: a helper it cannot run, a privilege it lacks, outside ids the
+    /// caller has no claim to. The returned map is validated against the same
+    /// rules as an explicit [`IdentityMap::Ranges`].
     ///
     /// [`CageBuilder::build`]: crate::CageBuilder::build
     fn resolve(&self, request: &IdentityMap) -> Result<ResolvedMap, IdMapError>;
@@ -473,6 +497,20 @@ pub(crate) fn maps_inside_id(ranges: &[IdRange], id: u32) -> bool {
     ranges
         .iter()
         .any(|range| id >= range.inside && id - range.inside < range.count)
+}
+
+/// Whether a gid map is the caller's own gid alone: one extent, of one id,
+/// naming the caller's effective gid.
+///
+/// That is the single-identity map's gid map, and the writers that hold no
+/// privilege over the parent namespace deny `setgroups` when they write it.
+/// The kernel requires the denial of a process writing its own map. shadow's
+/// `newgidmap` writes the denial for any map no subordinate grant covers, and
+/// a caller's own gid lies outside its subordinate allocation. No supplementary
+/// group list can then be set inside, so a run-as identity under such a map
+/// names none, whoever wrote it, and keeps the list it inherited.
+pub(crate) fn is_own_gid_alone(gid: &[IdRange]) -> bool {
+    matches!(gid, [only] if only.count == 1 && only.outside == rustix::process::getegid().as_raw())
 }
 
 /// Validates one extent list: non-empty, positive counts, no arithmetic
@@ -918,50 +956,6 @@ fn read_own_map(path: &str) -> Option<Vec<(u32, u32)>> {
     }
 }
 
-/// The serde profile forms.
-///
-/// Deserialization runs through a mirror type so that a build without the
-/// `subid` feature refuses a profile requesting the subordinate map at load
-/// time, with a message naming the feature — an identity posture is never
-/// silently downgraded by a library that cannot establish it.
-#[cfg(feature = "serde")]
-mod profile {
-    use super::{IdRange, IdentityMap};
-
-    /// The wire shape of [`IdentityMap`], deserialized then converted.
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-    pub(crate) enum IdentityMapWire {
-        Single,
-        Ranges {
-            uid: Vec<IdRange>,
-            gid: Vec<IdRange>,
-        },
-        Subordinate,
-    }
-
-    impl TryFrom<IdentityMapWire> for IdentityMap {
-        type Error = String;
-
-        fn try_from(wire: IdentityMapWire) -> Result<IdentityMap, String> {
-            Ok(match wire {
-                IdentityMapWire::Single => IdentityMap::Single,
-                IdentityMapWire::Ranges { uid, gid } => IdentityMap::Ranges { uid, gid },
-                #[cfg(feature = "subid")]
-                IdentityMapWire::Subordinate => IdentityMap::Subordinate,
-                #[cfg(not(feature = "subid"))]
-                IdentityMapWire::Subordinate => {
-                    return Err(
-                        "this profile requests the subordinate identity map, but the library \
-                         was built without the `subid` feature"
-                            .to_string(),
-                    );
-                }
-            })
-        }
-    }
-}
-
 #[cfg(feature = "subid")]
 pub use subid::SubidMapper;
 #[cfg(feature = "subid")]
@@ -985,25 +979,30 @@ mod subid {
     /// delegate that executes an external binary, which is why it lives
     /// behind the `subid` feature.
     ///
-    /// [`resolve`](IdMapper::resolve) determines the caller's allocation
-    /// with the NSS-aware `getsubids` query where available, falling back to
-    /// reading `/etc/subuid` and `/etc/subgid` only on hosts whose
-    /// `nsswitch.conf` names no other `subid` source — the same rule the
-    /// helpers themselves follow, so the fallback can never invent an
-    /// allocation an NSS module would deny. [`apply`](IdMapper::apply)
-    /// executes the helpers against the gated sandbox process.
+    /// [`resolve`](IdMapper::resolve) first refuses a host on which the helpers
+    /// cannot work at all: a caller under `no_new_privs`, a helper missing from
+    /// `PATH` or holding no privilege, or a subordinate file that is a symbolic
+    /// link. It asks the same question
+    /// [`host::range_map_blocker`](crate::host::range_map_blocker) asks, through
+    /// the same check, so the build refuses exactly the hosts the probe names.
+    /// It then determines the caller's allocation with the NSS-aware
+    /// `getsubids` query where available, falling back to reading `/etc/subuid`
+    /// and `/etc/subgid` only on hosts whose `nsswitch.conf` names no other
+    /// `subid` source — the same rule the helpers themselves follow, so the
+    /// fallback can never invent an allocation an NSS module would deny.
+    /// [`apply`](IdMapper::apply) executes the helpers against the gated
+    /// sandbox process.
     ///
     /// *Which* helpers is decided by the ambient `PATH`, which is worth knowing
     /// for a consumer running this from a daemon with an inherited environment.
     /// They are looked up by name among the absolute `PATH` entries — a relative
     /// entry is skipped rather than resolved against the process's working
-    /// directory — and the resolved absolute path is what executes.
-    /// [`host::range_map_blocker`](crate::host::range_map_blocker) judges a
-    /// helper's privilege through the same lookup, so the two agree on the same
-    /// `PATH`; a `PATH` that changes between the probe and the launch is the
-    /// caller's to keep still. The two auxiliary tools [`resolve`](IdMapper::resolve)
-    /// consults — `id` for the caller's user name, and `getsubids` for the
-    /// allocation itself — are resolved by the same rule.
+    /// directory — and the resolved absolute path is what executes. `resolve`
+    /// judges a helper's privilege through the same lookup, so the binary it
+    /// judged is the one `apply` runs; a `PATH` that changes between the build
+    /// and the launch is the caller's to keep still. The two auxiliary tools
+    /// `resolve` consults — `id` for the caller's user name, and `getsubids`
+    /// for the allocation itself — are resolved by the same rule.
     ///
     /// [`host::range_map_blocker`](crate::host::range_map_blocker) explains
     /// a host on which this delegate cannot work.
@@ -1020,15 +1019,13 @@ mod subid {
 
     impl IdMapper for SubidMapper {
         fn resolve(&self, request: &IdentityMap) -> Result<ResolvedMap, IdMapError> {
-            // The helpers hold their privilege as a setuid bit or a file
-            // capability, both of which an exec under no_new_privs ignores, so
-            // every map they were asked to write would fail with EPERM.
-            if !matches!(request, IdentityMap::Single) && super::no_new_privs() {
-                return Err(IdMapError::unsatisfiable(
-                    "the calling process runs under no_new_privs, so newuidmap and newgidmap \
-                     would run without the privilege they gain at exec"
-                        .to_string(),
-                ));
+            // A condition that stops the helpers themselves fails every map
+            // they are asked to write, so it is a refusal here rather than an
+            // `EPERM` or a missing binary at the launch.
+            if !matches!(request, IdentityMap::Single)
+                && let Some(blocker) = crate::host::helper_blocker()
+            {
+                return Err(IdMapError::unsatisfiable(blocker.to_string()));
             }
             match request {
                 IdentityMap::Single => Err(IdMapError::unsatisfiable(
@@ -1082,12 +1079,12 @@ mod subid {
     /// Executes one helper with the extent triples for one map file.
     ///
     /// The helper is resolved to an absolute path first, by the same lookup
-    /// [`host::range_map_blocker`](crate::host::range_map_blocker) uses to judge
-    /// its privilege, rather than handed to `Command` as a bare name for it to
-    /// resolve again on its own terms. The two would otherwise be free to differ
-    /// — `Command` searches every `PATH` entry, this lookup only the absolute
-    /// ones — and the probe's verdict would describe a binary that is not the
-    /// one that runs.
+    /// [`host::helper_blocker`](crate::host::helper_blocker) uses to judge its
+    /// privilege at `resolve`, rather than handed to `Command` as a bare name
+    /// for it to resolve again on its own terms. The two would otherwise be free
+    /// to differ — `Command` searches every `PATH` entry, this lookup only the
+    /// absolute ones — and the build's verdict would describe a binary that is
+    /// not the one that runs.
     fn run_helper(helper: &'static str, pid: u32, ranges: &[IdRange]) -> Result<(), IdMapError> {
         let resolved = crate::host::find_on_path(helper).ok_or_else(|| {
             IdMapError::helper_spawn(helper, Some(rustix::io::Errno::NOENT.into()))
@@ -1185,10 +1182,11 @@ mod subid {
 
     /// The caller's allocation for one id space, or why it could not be had.
     pub(crate) fn allocation(kind: Kind) -> Result<Vec<(u32, u32)>, AllocationUnusable> {
-        // The helpers match a subordinate entry by user name or by literal
-        // uid string, so the query tries both. The name lookup is delegated
-        // to `id`, whose NSS-aware resolution covers directory-service
-        // users that /etc/passwd does not list.
+        // The helpers honour a subordinate entry under the user name and one
+        // under the literal uid string alike, so the allocation is the entries
+        // of both keys. The name lookup is delegated to `id`, whose NSS-aware
+        // resolution covers directory-service users that /etc/passwd does not
+        // list.
         //
         // Resolved through `find_on_path` rather than by bare name, for the
         // reason that lookup exists: `Command`'s own search is `execvp`'s, which
@@ -1247,9 +1245,13 @@ mod subid {
         Failed(String),
     }
 
-    /// Queries `getsubids` for each key until one answers with ranges.
+    /// Queries `getsubids` for each key, collecting the ranges every one
+    /// answers with, in the order of the keys.
     ///
-    /// Output lines have the shape `index: owner start count`.
+    /// Output lines have the shape `index: owner start count`. A `getsubids`
+    /// asked for a user name lists the entries under that user's uid as well,
+    /// and asking for the uid then lists them again; the duplicate is harmless,
+    /// since composing the map skips ids an earlier entry already granted.
     ///
     /// The tool is resolved through
     /// [`find_on_path`](crate::host::find_on_path), the same lookup the helpers
@@ -1289,9 +1291,6 @@ mod subid {
                     ranges.push((start, count));
                 }
             }
-            if !ranges.is_empty() {
-                break;
-            }
         }
         Ok(ranges)
     }
@@ -1322,7 +1321,16 @@ mod subid {
     }
 
     /// Reads a subordinate file directly, collecting the ranges of every
-    /// entry whose owner field matches one of the keys.
+    /// entry whose owner field matches one of the keys, in file order.
+    ///
+    /// Every key counts, as it does for the helpers: `newuidmap` accepts an
+    /// extent inside an entry under the caller's user name or under the
+    /// caller's uid, and one spanning adjoining entries of either. A block
+    /// granted under both is collected twice, which composing the map
+    /// absorbs. shadow also honours an entry under another user name that
+    /// resolves to the same uid; that one is not collected, since telling it
+    /// apart would take a lookup of every owner in the file, and missing it
+    /// only refuses at build a map the helpers would have written.
     ///
     /// Only reached when the files are the host's authority; see
     /// [`subordinate_ranges`].
@@ -1331,9 +1339,6 @@ mod subid {
             return Vec::new();
         };
         let mut ranges = Vec::new();
-        // The key the file turned out to be written under, fixed by the first
-        // entry that yielded a range.
-        let mut matching: Option<&String> = None;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -1341,21 +1346,12 @@ mod subid {
             }
             let mut fields = line.split(':');
             let Some(owner) = fields.next() else { continue };
-            // The first key that answers owns the file, as `query_getsubids`
-            // has it: a host granting the same block under both the user name
-            // and the literal uid would otherwise yield each range twice, and
-            // the duplicate overlaps itself and fails the build with a message
-            // blaming a perfectly legal configuration.
-            let Some(answering) = keys.iter().find(|key| *key == owner) else {
-                continue;
-            };
-            if matching.is_some_and(|key| key != answering) {
+            if !keys.iter().any(|key| key == owner) {
                 continue;
             }
             if let (Some(start), Some(count)) = (fields.next(), fields.next())
                 && let (Ok(start), Ok(count)) = (start.parse(), count.parse())
             {
-                matching = Some(answering);
                 ranges.push((start, count));
             }
         }
@@ -1379,6 +1375,12 @@ mod subid {
 
     /// Composes the subordinate map: the caller's own id as inside id 0,
     /// then inside ids from 1 onward covering each allocated range in order.
+    ///
+    /// An outside id is mapped once. The part of an entry an earlier extent
+    /// already maps is skipped, so a block granted under both the user name
+    /// and the uid, or entries an administrator let overlap, compose to the
+    /// ids they grant between them rather than to a map the kernel refuses
+    /// for its overlap.
     fn compose_subordinate(own: u32, allocation: &[(u32, u32)]) -> Vec<IdRange> {
         let mut ranges = vec![IdRange {
             inside: 0,
@@ -1386,36 +1388,79 @@ mod subid {
             count: 1,
         }];
         let mut inside = 1u32;
-        for &(start, count) in allocation {
-            // A zero-count entry contributes nothing but is a legal line in a
-            // subordinate file; skipping it keeps the entries after it, which
-            // stopping would silently drop.
-            if count == 0 {
-                continue;
+        // A zero-count entry contributes nothing but is a legal line in a
+        // subordinate file; it has no unmapped part, so it is passed over and
+        // the entries after it are kept, which stopping would silently drop.
+        'entries: for &(start, count) in allocation {
+            for (start, count) in unmapped_parts(&ranges, start, count) {
+                // An allocation vast enough to exhaust the 32-bit inside space
+                // is truncated at the boundary; ids beyond it are
+                // unaddressable, and nothing after this entry can be addressed
+                // either.
+                let count = count.min(u32::MAX - inside);
+                if count == 0 {
+                    break 'entries;
+                }
+                // A map file carries at most MAX_EXTENTS lines, and an
+                // administrator is free to grant more separate ranges than
+                // that. Truncating keeps a legal host configuration working
+                // with a smaller map, where emitting them all would fail the
+                // build with a message blaming the delegate for the host's
+                // allocation.
+                if ranges.len() == super::MAX_EXTENTS {
+                    break 'entries;
+                }
+                ranges.push(IdRange {
+                    inside,
+                    outside: start,
+                    count,
+                });
+                inside += count;
             }
-            // An allocation vast enough to exhaust the 32-bit inside space is
-            // truncated at the boundary; ids beyond it are unaddressable, and
-            // nothing after this entry can be addressed either.
-            let count = count.min(u32::MAX - inside);
-            if count == 0 {
-                break;
-            }
-            // A map file carries at most MAX_EXTENTS lines, and an
-            // administrator is free to grant more separate ranges than that.
-            // Truncating keeps a legal host configuration working with a
-            // smaller map, where emitting them all would fail the build with a
-            // message blaming the delegate for the host's allocation.
-            if ranges.len() == super::MAX_EXTENTS {
-                break;
-            }
-            ranges.push(IdRange {
-                inside,
-                outside: start,
-                count,
-            });
-            inside += count;
         }
         ranges
+    }
+
+    /// The parts of the outside ids `start` onward, `count` of them, that no
+    /// extent in `mapped` maps yet, as `(start, count)` pairs in ascending
+    /// order.
+    ///
+    /// A span running past the last id is cut at it, as the entry's own
+    /// arithmetic cannot carry it further.
+    fn unmapped_parts(mapped: &[IdRange], start: u32, count: u32) -> Vec<(u32, u32)> {
+        if count == 0 {
+            return Vec::new();
+        }
+        // Inclusive bounds, so a span ending at the last id needs no id past it.
+        let mut parts = vec![(start, start.saturating_add(count - 1))];
+        for extent in mapped {
+            let taken_first = extent.outside;
+            let taken_last = extent
+                .outside
+                .saturating_add(extent.count.saturating_sub(1));
+            parts = parts
+                .into_iter()
+                .flat_map(|(first, last)| {
+                    if taken_last < first || taken_first > last {
+                        return vec![(first, last)];
+                    }
+                    // The subtractions cannot wrap: each runs only where the
+                    // taken span starts after `first` or ends before `last`.
+                    let mut kept = Vec::with_capacity(2);
+                    if first < taken_first {
+                        kept.push((first, taken_first - 1));
+                    }
+                    if taken_last < last {
+                        kept.push((taken_last + 1, last));
+                    }
+                    kept
+                })
+                .collect();
+        }
+        parts
+            .into_iter()
+            .map(|(first, last)| (first, (last - first).saturating_add(1)))
+            .collect()
     }
 
     #[cfg(test)]
@@ -1467,6 +1512,96 @@ mod subid {
                 .expect("a truncated map is still a valid one");
         }
 
+        /// `newuidmap` honours an entry under the caller's name and one under
+        /// the caller's uid alike, so the allocation is every entry of either,
+        /// in file order, and an entry of another owner is no part of it.
+        #[test]
+        fn every_entry_under_the_name_or_the_uid_is_the_allocation() {
+            let dir = crate::scratch::Scratch::new("subid-owners");
+            let path = dir.join("subuid");
+            std::fs::write(
+                &path,
+                "alice:100000:65536\n\
+                 bob:165536:65536\n\
+                 # a comment\n\
+                 1000:231072:65536\n\
+                 alice:300000:1000\n",
+            )
+            .unwrap();
+            let keys = ["alice".to_string(), "1000".to_string()];
+            assert_eq!(
+                parse_subid_file(path.to_str().unwrap(), &keys),
+                [(100000, 65536), (231072, 65536), (300000, 1000)],
+            );
+        }
+
+        /// A block granted under both the name and the uid is one grant, and
+        /// entries that overlap compose to the ids they grant between them: a
+        /// map naming an outside id twice is one the kernel refuses.
+        #[test]
+        fn an_outside_id_granted_twice_is_mapped_once() {
+            let duplicated = compose_subordinate(1000, &[(100000, 65536), (100000, 65536)]);
+            assert_eq!(
+                duplicated,
+                [
+                    IdRange {
+                        inside: 0,
+                        outside: 1000,
+                        count: 1
+                    },
+                    IdRange {
+                        inside: 1,
+                        outside: 100000,
+                        count: 65536
+                    },
+                ]
+            );
+
+            // An entry straddling an earlier one keeps the parts on either
+            // side of it, in order, and the caller's own id is not mapped a
+            // second time either.
+            let straddling = compose_subordinate(1000, &[(200, 100), (100, 400), (900, 200)]);
+            assert_eq!(
+                straddling,
+                [
+                    IdRange {
+                        inside: 0,
+                        outside: 1000,
+                        count: 1
+                    },
+                    IdRange {
+                        inside: 1,
+                        outside: 200,
+                        count: 100
+                    },
+                    IdRange {
+                        inside: 101,
+                        outside: 100,
+                        count: 100
+                    },
+                    IdRange {
+                        inside: 201,
+                        outside: 300,
+                        count: 200
+                    },
+                    IdRange {
+                        inside: 401,
+                        outside: 900,
+                        count: 100
+                    },
+                    IdRange {
+                        inside: 501,
+                        outside: 1001,
+                        count: 99
+                    },
+                ]
+            );
+            for map in [duplicated, straddling] {
+                crate::idmap::validate_resolved(&ResolvedMap::new(map.clone(), map))
+                    .expect("a composed map never overlaps itself");
+            }
+        }
+
         #[test]
         fn a_zero_count_allocation_entry_does_not_truncate_the_map() {
             // `user:100000:0` parses fine and grants nothing. Stopping there
@@ -1495,8 +1630,14 @@ mod subid {
 
 /// Resolves a range request through the bundled delegate chain:
 /// [`DirectMapper`] first, then the subordinate delegate when the `subid`
-/// feature is enabled. On failure the reason collects each delegate's
-/// refusal and the host probe's diagnosis, so the error names what to fix.
+/// feature is enabled. On failure the reason collects one refusal from each,
+/// so the error names what to fix.
+///
+/// The subordinate delegate's refusal is the host probe's diagnosis already:
+/// it refuses a host the helpers cannot work on with the condition
+/// [`host::range_map_blocker`](crate::host::range_map_blocker) names, and an
+/// unusable allocation in the probe's words. Without the feature the chain says
+/// that delegate is absent, which is the probe's one other diagnosis.
 ///
 /// Reached only through [`resolve_range_bundled`], which validates around it.
 fn resolve_default_chain(
@@ -1518,10 +1659,12 @@ fn resolve_default_chain(
             Err(err) => reasons.push(format!("subid: {}", ErrorChain::new(&err))),
         }
     }
-
-    if let Some(blocker) = crate::host::range_map_blocker() {
-        reasons.push(blocker.to_string());
-    }
+    #[cfg(not(feature = "subid"))]
+    reasons.push(
+        "subid: the library was built without the `subid` feature, whose delegate runs the \
+         shadow suite's helpers and reports a subordinate allocation"
+            .to_string(),
+    );
 
     Err(reasons.join("; "))
 }
@@ -2004,5 +2147,116 @@ mod tests {
         })
         .join()
         .expect("the no_new_privs thread asserts");
+    }
+
+    /// Marks the child run of the helper test below, carrying the text the
+    /// refusal must name.
+    #[cfg(feature = "subid")]
+    const HELPER_REFUSAL: &str = "FERRODAY_CAGE_TEST_HELPER_REFUSAL";
+
+    /// A host whose shadow helpers cannot work refuses a range map at build and
+    /// at a provisioner's preflight, naming the condition the probe names,
+    /// rather than passing both and failing at the launch.
+    ///
+    /// `PATH` decides which helpers there are, and it is the process's own, so
+    /// each case runs in a child process of this test binary with a `PATH` of
+    /// the case's making.
+    #[cfg(feature = "subid")]
+    #[test]
+    fn helpers_that_cannot_work_refuse_the_build_and_the_preflight() {
+        if let Some(expected) = std::env::var_os(HELPER_REFUSAL) {
+            let expected = expected.to_str().expect("the expectation is text");
+            let blocker = crate::host::helper_blocker().expect("the helpers cannot work here");
+            assert!(blocker.to_string().contains(expected), "{blocker}");
+            let effective = rustix::thread::capabilities(None)
+                .map(|sets| sets.effective)
+                .unwrap_or(rustix::thread::CapabilitySet::empty());
+            if !effective.contains(rustix::thread::CapabilitySet::SETUID) {
+                assert_eq!(crate::host::range_map_blocker(), Some(blocker.clone()));
+            }
+
+            let ranges = IdentityMap::ranges(
+                vec![range(0, rustix::process::geteuid().as_raw(), 1)],
+                vec![range(0, rustix::process::getegid().as_raw(), 1)],
+            );
+            for request in [IdentityMap::Subordinate, ranges] {
+                let refusal = SubidMapper::new()
+                    .resolve(&request)
+                    .expect_err("the delegate refuses what its helpers cannot write");
+                assert_eq!(refusal.to_string(), blocker.to_string());
+            }
+
+            let err = crate::Cage::builder()
+                .rootfs("/tmp")
+                .command("/bin/true")
+                .identity_map(IdentityMap::Subordinate)
+                .build()
+                .expect_err("the build refuses the map");
+            assert!(
+                matches!(
+                    &err,
+                    crate::Error::Config(ConfigError::IdentityMapUnavailable { reason, .. })
+                        if reason.contains(expected)
+                ),
+                "{err}",
+            );
+            // What the Debian and Alpine provisioners ask before they download.
+            #[cfg(any(feature = "debian", feature = "alpine"))]
+            {
+                let refusal = establishable(&IdentityMap::Subordinate, None)
+                    .expect_err("the preflight refuses the map");
+                assert!(refusal.to_string().contains(expected), "{refusal}");
+            }
+            return;
+        }
+
+        // The flag stops every helper first, so neither case below is
+        // reachable under it; the test above holds that case.
+        if no_new_privs() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let run = |path: &std::path::Path, expected: &str| {
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "idmap::tests::helpers_that_cannot_work_refuse_the_build_and_the_preflight",
+                    "--test-threads=1",
+                ])
+                .env("PATH", path)
+                .env(HELPER_REFUSAL, expected)
+                .output()
+                .expect("the child test process runs");
+            assert!(
+                output.status.success(),
+                "the child refused otherwise:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        };
+
+        // No helper on `PATH` at all.
+        let missing = Scratch::new("helpers-missing");
+        run(&missing, "newuidmap was not found on PATH");
+
+        // Helpers that are present but hold no privilege, beside the real tools
+        // the allocation query uses: the allocation answers as it does on this
+        // host, so the helpers are all that can refuse.
+        let stripped = Scratch::new("helpers-stripped");
+        for helper in ["newuidmap", "newgidmap"] {
+            let path = stripped.join(helper);
+            std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        for tool in ["id", "getsubids"] {
+            if let Some(real) = crate::host::find_on_path(tool) {
+                std::os::unix::fs::symlink(real, stripped.join(tool)).unwrap();
+            }
+        }
+        run(
+            &stripped,
+            "is neither setuid-root nor granted a file capability",
+        );
     }
 }

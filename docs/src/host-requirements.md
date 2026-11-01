@@ -111,42 +111,28 @@ is restricted on older kernels. This matters only when the base is cached on a
 filesystem that is already an overlay, as inside some container runtimes; a base
 on an ordinary filesystem is unaffected.
 
-### An unreproduced report: a parallel first touch
+### A transient on a parallel first touch
 
-A consumer has twice seen a heavily parallel build on an overlay root fail with
-`ENOENT` on a file that is present in the upper layer, and succeed on immediate
-retry. It is recorded here because an unreproduced report described accurately
-is worth more than an absent one, and because the shape it implicates is one
-another consumer could share.
+A heavily parallel build on an overlay root can fail with `ENOENT` on a file the
+upper layer holds, and pass on immediate retry. The file is momentarily
+unfindable rather than absent. The fault does not reproduce on demand, and its
+cause is unconfirmed.
 
-The transient itself is established, without any instrument. The same build
-stage's `./configure` had, minutes earlier and against the same layer,
-successfully compiled probes that included both of the files that later went
-missing. The file was momentarily unfindable rather than absent.
+Its observed shape is narrow. Each failure is an upper-side path in a directory
+both layers carry, one overlayfs assembles from both. Lower-side paths, opened
+far more often by the same processes, do not fail. Each failure comes from a
+parallel build in a fresh mount: one cage per command over a shared upper, so
+the build's lookups are the first its superblock sees.
 
-What distinguishes the failing case from that consumer's clean one is not
-emulation or load but **a fresh mount per command**. Their build root builds one
-cage per command, so a stage's serial configure warms one overlay superblock's
-dentry cache and that superblock is then destroyed; the parallel build that
-follows starts against a cold one. Their control does its serial configure and
-its parallel build inside a single mount, and so never performs a first-touch
-lookup under parallelism. Every reported failure has been an upper-side path, in
-a directory both layers carry — one that overlayfs must therefore assemble from
-both — while lower-side paths, opened orders of magnitude more often by the same
-processes in the same command, have never failed.
+The `overlay-race` example in the repository probes for it. It mounts, releases
+a storm of parallel first-touch lookups, unmounts, and repeats. Each storm probes
+an upper-only file, a file in an upper-only subdirectory, and a lower-only file,
+so a fault that misses all three evenly reads as a different one. `--warm` adds
+one serial lookup in the same mount before the storm, which tests the fresh
+mount as the cause.
 
-The `overlay-race` example in the repository is the harness: it mounts, releases
-a storm of parallel first-touch lookups, unmounts, and repeats, probing an
-upper-only file, an upper-only subdirectory, and a lower-only file in the same
-storm so a run that misses all three evenly can be told from one that reproduces
-the reported asymmetry. `--warm` adds a single serial lookup in the same mount
-before the storm, which is the direct test of the mount-per-command
-discriminator.
-
-It has not fired on the kernels tried here. Until it does, the practical advice
-is the one that costs nothing: where a pipeline runs several commands over one
-overlay upper, running them in one cage rather than one cage each removes the
-condition entirely, and is what the consumer's own unaffected path already does.
+Where a pipeline runs several commands over one overlay upper, running them in
+one cage rather than one cage each avoids the condition at no cost.
 
 ## Architecture
 

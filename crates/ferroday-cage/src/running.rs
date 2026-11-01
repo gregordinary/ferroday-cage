@@ -295,6 +295,18 @@ impl<'obs> Running<'obs> {
         self.pump(deadline, Some(wake))
     }
 
+    /// The status pipe, for a waiter that polls channels of its own and must
+    /// notice the command's exit among them.
+    ///
+    /// It becomes readable once the supervisor has reported the command's
+    /// exit, or has gone without reporting one; either way the outcome is
+    /// ready to be read. `None` means it has been read already. The terminal
+    /// relay polls it beside the session's terminal, which a descendant that
+    /// outlives the command can hold open without a PID namespace.
+    pub(crate) fn status_pipe(&self) -> Option<BorrowedFd<'_>> {
+        self.status.as_ref().map(AsFd::as_fd)
+    }
+
     /// Requests graceful termination: SIGTERM to the command.
     ///
     /// The signal is deliverable and trappable, docker-stop style; a

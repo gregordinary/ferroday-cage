@@ -26,6 +26,10 @@ the command runnable at all: with any Landlock grant configured, everything
 ungranted is denied, so the command's own binary, its interpreter, and its
 libraries need read and execute grants alongside the data paths it works on.
 
+A grant's path resolves as the host resolves it, through symbolic links. A grant
+on a merged-`/usr` host's `/lib` therefore covers `/usr/lib`. A sandbox refuses a
+link on a grant's path instead, because its root may not be trusted.
+
 ```rust,no_run
 # use ferroday_cage::{FsAccess, Restriction};
 # fn main() -> ferroday_cage::Result<()> {
@@ -97,10 +101,13 @@ restriction a Landlock domain, and any domain refuses ptrace access to the
 processes outside it. Name fewer scopes only for a command that needs that
 reach.
 
-On an older kernel the scopes are dropped, and signals and abstract sockets stay
-open. A Landlock grant still creates a domain there, and the curated seccomp
-policy still denies `ptrace` and `process_vm_readv`. A default sandbox closes
-all three through its PID and network namespaces.
+On an older kernel the default scopes are dropped, and signals and abstract
+sockets stay open. A Landlock grant still creates a domain there, and the
+curated seccomp policy still denies `ptrace` and `process_vm_readv`. Scopes a
+restriction names itself are refused there instead, with
+[`ConfigError::LandlockScopeUnenforceable`], since nothing else bounds those
+reaches. A default sandbox closes all three through its PID and network
+namespaces.
 
 The caller's terminal is not among them, because it is not a namespace question:
 a controlling terminal is reached through the session, so a cage and a
@@ -177,9 +184,10 @@ exactly as in the hardening layer. A kernel with no Landlock LSM refuses a
 restriction with any Landlock grant at build, with
 [`ConfigError::RestrictionLandlockUnenforceable`]. A kernel below ABI 4 refuses
 one with a network grant the same way. A seccomp-only restriction runs on
-either, without the scopes a kernel below ABI 6 cannot enforce.
-[`host::landlock_abi`] and [`host::seccomp_available`] report what the kernel
-offers.
+either, without the default scopes a kernel below ABI 6 cannot enforce. One
+that names its scopes is refused there instead, with
+[`ConfigError::LandlockScopeUnenforceable`]. [`host::landlock_abi`] and
+[`host::seccomp_available`] report what the kernel offers.
 
 ## On the command line
 
@@ -196,7 +204,7 @@ $ fcage --restrict \
 ```
 
 `--landlock-scope` replaces the default scopes, and an empty list turns them
-off. Alongside the grant flags, `--setenv`, `--no-base-env`, `--chdir`,
+off. Scopes named this way are refused on a kernel that cannot enforce them. Alongside the grant flags, `--setenv`, `--no-base-env`, `--chdir`,
 `--stdin`, `--rlimit`, `--timeout`, `--kill-after`, and `--stop-with-caller`
 behave as they do for a sandbox. [`rlimit`] matters more here than in a cage: without
 namespaces, a resource limit is the only thing bounding what the command
@@ -206,6 +214,7 @@ consumes.
 [`landlock_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_fs
 [`landlock_net`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_net
 [`ConfigError::RestrictionLandlockUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
+[`ConfigError::LandlockScopeUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
 [`landlock_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_scope
 [`seccomp`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.seccomp
 [`current_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.current_dir

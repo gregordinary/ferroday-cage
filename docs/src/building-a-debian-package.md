@@ -9,10 +9,10 @@ sandbox](ebuild-sandbox.md) falls out: a tool that bootstraps a Debian suite
 with build tooling and runs `dpkg-buildpackage` inside a cage. The library ships
 one as a worked example.
 
-Where the ebuild sandbox provisions a Gentoo stage3 from a tarball, this example
-bootstraps a Debian suite from the archive through the [Debian
-provisioner](debian.md); it is that provisioner's worked consumer, the way the
-ebuild sandbox is the [tarball provisioner](provisioning.md)'s.
+Where the ebuild sandbox provisions a Gentoo stage3 through the [Gentoo
+provisioner](gentoo.md), this example bootstraps a Debian suite from the archive
+through the [Debian provisioner](debian.md). It is that provisioner's worked
+consumer, as the ebuild sandbox is the Gentoo provisioner's.
 
 ```sh
 deb-build --rootfs ./trixie-build --cache ./deb-cache \
@@ -67,11 +67,9 @@ whole install set — toolchain, declared build dependencies, and their closure 
 with its own resolver. The build that follows runs offline, entirely from the
 build environment installed in the root.
 
-The alternative, running `apt-get build-dep` inside the cage, would need a
-`deb-src` line in the root's `sources.list` and an `apt-get update` before it
-could resolve anything, and would move dependency resolution to build time over
-the network. The bootstrap writes only a binary package line, so that path is
-deliberately not the one the example takes.
+The root's `sources.list` names binary packages only, with no `deb-src` line, so
+`apt-get build-dep` has nothing to resolve against inside the cage. The build
+needs neither it nor the network.
 
 Because the dependencies are baked into the root, changing them means
 provisioning a fresh `--rootfs`: an existing root is reused as it stands, with
