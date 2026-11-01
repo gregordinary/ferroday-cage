@@ -283,7 +283,7 @@ consumer upgrading can skip it.
   keyring that had made one. A plan for Debian 12 names its archive automatic
   signing key, where it named its stable release key.
 - A `debian` build depends on 23 crates, counting this one, where it depended on
-  163, and a `gentoo` build on 28: irongall has no dependencies of its own. Both
+  163, and a `gentoo` build on 24: irongall has no dependencies of its own. Both
   decode gzip through `miniz_oxide` alone, where `pgp` had selected `flate2`'s
   zlib-rs backend.
 - **Breaking.** A terminal launch allocates its pseudoterminal inside the
@@ -720,6 +720,9 @@ consumer upgrading can skip it.
 - Dependencies refreshed within their ranges. The `alpine` feature no longer
   enables `rsa`'s `std` feature, so an Alpine-only build carries neither
   `getrandom` nor `libc`.
+- `md-5` moves to 0.11, the `digest` generation `sha2` is on, so a `gentoo` build
+  carries one `digest` and the MD5 hasher is driven through the same `Digest`
+  trait as the SHA-2 ones.
 - `tools/rust_source.py` is the one reading of a source file the census tools
   take: every comment and every test-only item removed. `tools/check-seam.py`
   expands grouped imports and resolves `super::` paths, and finds 38 reaches

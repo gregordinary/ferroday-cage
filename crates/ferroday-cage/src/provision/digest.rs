@@ -14,13 +14,6 @@ use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256, Sha512};
 
-// `md-5` is on `digest 0.10` and `sha2` is on `digest 0.11`, so the two
-// `Digest` traits are distinct types and cannot be imported under one name. The
-// MD5 hasher therefore names its trait through this alias at each call rather
-// than through a bare `Digest` in scope.
-#[cfg(feature = "gentoo")]
-use md5::Digest as Md5Digest;
-
 /// The chunk size the streaming reads work in.
 #[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
 const CHUNK: usize = 64 * 1024;
@@ -138,7 +131,7 @@ impl Hasher {
             Algorithm::Sha256 => Hasher::Sha256(Sha256::new()),
             Algorithm::Sha512 => Hasher::Sha512(Sha512::new()),
             #[cfg(feature = "gentoo")]
-            Algorithm::Md5 => Hasher::Md5(Md5Digest::new()),
+            Algorithm::Md5 => Hasher::Md5(md5::Md5::new()),
         }
     }
 
@@ -148,7 +141,7 @@ impl Hasher {
             Hasher::Sha256(hasher) => hasher.update(bytes),
             Hasher::Sha512(hasher) => hasher.update(bytes),
             #[cfg(feature = "gentoo")]
-            Hasher::Md5(hasher) => Md5Digest::update(hasher, bytes),
+            Hasher::Md5(hasher) => hasher.update(bytes),
         }
     }
 
@@ -158,7 +151,7 @@ impl Hasher {
             Hasher::Sha256(hasher) => hex(&hasher.finalize()),
             Hasher::Sha512(hasher) => hex(&hasher.finalize()),
             #[cfg(feature = "gentoo")]
-            Hasher::Md5(hasher) => hex(&Md5Digest::finalize(hasher)),
+            Hasher::Md5(hasher) => hex(&hasher.finalize()),
         }
     }
 }
@@ -270,6 +263,11 @@ mod tests {
             Algorithm::Sha512.hex_of(b""),
             "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
              47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+        #[cfg(feature = "gentoo")]
+        assert_eq!(
+            Algorithm::Md5.hex_of(b""),
+            "d41d8cd98f00b204e9800998ecf8427e"
         );
     }
 
