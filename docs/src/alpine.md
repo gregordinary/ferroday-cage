@@ -126,7 +126,7 @@ use ferroday_cage::provision::{self, alpine::{Alpine, KeySet, Repository}};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let postmarketos = Repository::builder("v26.06")
-    .mirror("http://mirror.postmarketos.org/postmarketos")
+    .mirror("http://mirror.nura.eco/postmarketos")
     .keys(KeySet::postmarketos())
     .build()?;
 
@@ -143,6 +143,12 @@ postmarketOS is an overlay rather than a distribution — a postmarketOS root is
 Alpine's repositories plus its own — so it is configured as an additional
 repository and never as the primary. Its release cycle is its own: `v26.06`
 against Alpine's `v3.23`.
+
+The examples name `mirror.nura.eco`, the host that postmarketOS's own
+`mirror.postmarketos.org` redirects every request to. The bundled HTTP client
+follows a redirect to another host only where
+[`HttpFetch::cross_host_redirects`] allows it, and `fcage` has no flag for that.
+So a repository names the host that serves it.
 
 Both of its ways of overriding an Alpine package fall out of the merge rather
 than needing anything of their own. It republishes `akms` at `99990.3.0-r1`, a
@@ -617,7 +623,7 @@ the same way, and naming no components selects the shallower layout:
 $ fcage --rootfs ./pmos --provision-alpine v3.23 \
         --alpine-include alpine-base,postmarketos-baselayout \
         --alpine-repository 'release=v26.06 keys=postmarketos
-                             mirror=http://mirror.postmarketos.org/postmarketos'
+                             mirror=http://mirror.nura.eco/postmarketos'
 ```
 
 [`repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.AlpineBuilder.html#method.repository
@@ -630,3 +636,4 @@ $ fcage --rootfs ./pmos --provision-alpine v3.23 \
 [`overlay_rootfs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_rootfs
 [`Export::clamp_mtime`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/struct.Export.html#method.clamp_mtime
 [`source_date_epoch`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.AlpineBuilder.html#method.source_date_epoch
+[`HttpFetch::cross_host_redirects`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/struct.HttpFetch.html#method.cross_host_redirects

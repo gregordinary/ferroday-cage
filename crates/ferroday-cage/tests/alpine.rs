@@ -478,7 +478,7 @@ fn a_root_provisions_from_alpine_and_postmarketos_together() {
     let rootfs = common::scratch_dir("alpine-postmarketos").join("rootfs");
 
     let overlay = Repository::builder("v26.06")
-        .mirror("http://mirror.postmarketos.org/postmarketos")
+        .mirror("http://mirror.nura.eco/postmarketos")
         .keys(KeySet::postmarketos())
         .build()
         .expect("the repository validates");
@@ -518,7 +518,7 @@ fn a_root_provisions_from_alpine_and_postmarketos_together() {
         lines,
         [
             "http://dl-cdn.alpinelinux.org/alpine/v3.23/main",
-            "http://mirror.postmarketos.org/postmarketos/v26.06",
+            "http://mirror.nura.eco/postmarketos/v26.06",
         ],
         "{sources}",
     );
