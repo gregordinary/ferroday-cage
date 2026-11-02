@@ -1951,23 +1951,33 @@ mod tests {
         // inherited the descriptor would keep the lock held after the holder
         // let go -- a publish that returned, with its destination still locked
         // for as long as something it spawned lives on.
+        //
+        // The evidence is the child's own descriptor table, not a probe of the
+        // lock: a probe also fails while another test's child, forked and not
+        // yet executed, holds its copy of the descriptor.
+        use std::os::unix::fs::MetadataExt;
+
         let dir = Scratch::for_test("provision", "lock-cloexec");
         let path = dir.join("held.lock");
         let held = lock_exclusive(&path).expect("the lock is taken");
+        let lock = std::fs::metadata(&path).expect("the lock file is there");
+        // `spawn` returns once the command has executed, so what the child
+        // holds is what survived the exec.
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("a process is spawned while the lock is held");
-        drop(held);
-
-        let other = rustix::fs::open(&path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
-            .expect("the lock file opens");
-        // Probing the lock from outside the helper is the point of the test.
-        #[expect(clippy::disallowed_methods)]
-        let taken = rustix::fs::flock(&other, FlockOperation::NonBlockingLockExclusive);
+        let held_by_child = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .expect("the child's descriptors are listed")
+            .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
+            .any(|file| (file.dev(), file.ino()) == (lock.dev(), lock.ino()));
         let _ = child.kill();
         let _ = child.wait();
-        assert_eq!(taken, Ok(()), "the spawned process kept the lock held");
+        drop(held);
+        assert!(
+            !held_by_child,
+            "the spawned process holds the lock file open"
+        );
     }
 
     #[test]
