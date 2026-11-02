@@ -160,6 +160,14 @@ impl Release {
     /// `architecture` and every requested component, and — when
     /// `require_valid_until` is set — carries a parseable `Valid-Until` that
     /// has not passed.
+    ///
+    /// A release that lists no architectures, or no components, makes no claim
+    /// about them, and is read as offering every one, as apt reads it.
+    /// `apt-ftparchive release` writes neither field unless it is configured
+    /// to, so a local archive whose release states only its codename lists
+    /// neither. None of this widens what is fetched: an index is read only
+    /// where the release lists its digest, and one it does not list is refused
+    /// where it is asked for.
     pub(crate) fn check(
         &self,
         suite: &str,
@@ -168,14 +176,14 @@ impl Release {
         require_valid_until: bool,
     ) -> Result<(), Refusal> {
         self.check_suite(suite)?;
-        if !self.architectures.iter().any(|arch| arch == architecture) {
+        if !self.offers_architecture(architecture) {
             return Err(format!(
                 "the suite does not offer architecture {architecture} (offers {})",
                 self.architectures.join(", "),
             ));
         }
         for component in components {
-            if !self.components.iter().any(|offered| offered == component) {
+            if !self.offers_component(component) {
                 return Err(format!(
                     "the suite does not offer component {component} (offers {})",
                     self.components.join(", "),
@@ -184,6 +192,34 @@ impl Release {
         }
         self.check_freshness(require_valid_until)?;
         Ok(())
+    }
+
+    /// Whether the release offers `architecture`: one it lists, or any where it
+    /// lists none.
+    fn offers_architecture(&self, architecture: &str) -> bool {
+        self.architectures.is_empty()
+            || self
+                .architectures
+                .iter()
+                .any(|offered| offered == architecture)
+    }
+
+    /// Whether the release offers `component`: one it lists, or any where it
+    /// lists none.
+    ///
+    /// A listed component is offered under its own name and, where it carries
+    /// a `/`, under the part after the last one, as apt reads the field in
+    /// `debReleaseIndex::Load`. The Debian security archive is the case this
+    /// exists for: its release lists `updates/main`, its indexes are hashed
+    /// under `main/`, and every Debian system names it `main` in its sources.
+    fn offers_component(&self, component: &str) -> bool {
+        self.components.is_empty()
+            || self.components.iter().any(|offered| {
+                offered == component
+                    || offered
+                        .rsplit_once('/')
+                        .is_some_and(|(_, last)| last == component)
+            })
     }
 
     /// Requires the release's own `Suite:` or `Codename:` to equal the
@@ -539,6 +575,75 @@ SHA256:
         // The ranks order as apt's priorities do: 1, 100, 500.
         assert!(ReleasePriority::NotAutomatic < ReleasePriority::AutomaticUpgrades);
         assert!(ReleasePriority::AutomaticUpgrades < ReleasePriority::Default);
+    }
+
+    #[test]
+    fn a_prefixed_component_is_offered_under_its_last_segment() {
+        // The Debian security archive's release, as served: the components are
+        // listed with an `updates/` prefix, and the indexes are hashed without
+        // one. apt accepts `main` here, and so must the provisioner.
+        let body = "\
+Suite: testing-security
+Codename: forky-security
+Architectures: amd64 arm64
+Components: updates/main updates/contrib updates/non-free-firmware updates/non-free
+";
+        let release = Release::parse(body).unwrap();
+        let wanted = ["main", "contrib", "non-free", "non-free-firmware"].map(String::from);
+        release
+            .check("forky-security", "arm64", &wanted, false)
+            .expect("each component is offered under its last segment");
+        // The listed spelling is still offered as written.
+        release
+            .check(
+                "forky-security",
+                "arm64",
+                &["updates/main".to_string()],
+                false,
+            )
+            .expect("the advertised spelling is offered too");
+        // A suffix that merely ends the same way is not the segment.
+        let err = release
+            .check("forky-security", "arm64", &["ain".to_string()], false)
+            .unwrap_err();
+        assert!(err.contains("does not offer component ain"), "{err}");
+        // And an unprefixed component a release does not list stays refused.
+        let err = release
+            .check(
+                "forky-security",
+                "arm64",
+                &["restricted".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("offers updates/main, updates/contrib"),
+            "the refusal quotes the release's own spelling: {err}"
+        );
+    }
+
+    #[test]
+    fn a_release_listing_no_architectures_or_components_offers_every_one() {
+        // A release naming only its codename, as `apt-ftparchive release`
+        // writes one configured with nothing else.
+        let release = Release::parse("Codename: local\n").unwrap();
+        let wanted = ["main", "contrib"].map(String::from);
+        release
+            .check("local", "arm64", &wanted, false)
+            .expect("a release listing neither field offers every one");
+        // A listed field is a claim, and what it does not name stays refused.
+        let release = Release::parse("Codename: local\nArchitectures: amd64\n").unwrap();
+        let err = release.check("local", "arm64", &wanted, false).unwrap_err();
+        assert!(
+            err.contains("does not offer architecture arm64 (offers amd64)"),
+            "{err}"
+        );
+        let release = Release::parse("Codename: local\nComponents: main\n").unwrap();
+        let err = release.check("local", "arm64", &wanted, false).unwrap_err();
+        assert!(
+            err.contains("does not offer component contrib (offers main)"),
+            "{err}"
+        );
     }
 
     #[test]

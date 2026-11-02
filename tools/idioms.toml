@@ -135,6 +135,14 @@ package from a named release. A Debian package name holds no `/`, so the first \
 one ends the name and what follows is the release."""
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/provision/debian/release.rs"
+count = 1
+why = """\
+Not a path: a component a release lists, which is compared and never fetched. \
+apt offers one listed under a prefix, as the security archive lists \
+`updates/main`, under the part after its last `/` as well."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/src/provision/extract.rs"
 count = 1
 why = """\

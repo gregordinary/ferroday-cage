@@ -25,6 +25,17 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Fixed
+
+- A Debian release that lists a component under a prefix, as the security
+  archive lists `updates/main`, offers it under the part after the last `/` as
+  well, as apt reads the field. A repository naming `main` against
+  `debian-security` was refused before any index was read.
+- A Debian release with no `Architectures` field offers every architecture,
+  and one with no `Components` field every component, as apt reads them. Such a
+  release, which `apt-ftparchive release` writes unless configured otherwise,
+  was refused. An index the release lists no digest for is still refused.
+
 ## [0.5.0] - 2026-11-01
 
 `fcage` 0.6.0. Entries below marked **Breaking.** change the library's API and

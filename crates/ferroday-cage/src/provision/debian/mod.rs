@@ -4215,6 +4215,57 @@ mod tests {
     }
 
     #[test]
+    fn a_release_listing_no_architectures_or_components_is_held_to_its_digests() {
+        // A release naming only its codename, as `apt-ftparchive release`
+        // writes one configured with nothing else. It offers every
+        // architecture and component, and serves only the indexes it lists.
+        let index = index_stanza("tool", "1.0", "");
+        let release = format!(
+            "Codename: local\nSHA256:\n {} {} main/binary-amd64/Packages\n",
+            Algorithm::Sha256.hex_of(index.as_bytes()),
+            index.len(),
+        );
+        let archive = |components: &[&str]| {
+            let fetcher = Table {
+                bodies: [
+                    (
+                        "https://mirror.example/debian/dists/local/Release".to_string(),
+                        release.clone().into_bytes(),
+                    ),
+                    (
+                        "https://mirror.example/debian/dists/local/main/binary-amd64/Packages"
+                            .to_string(),
+                        index.clone().into_bytes(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                asked: std::sync::Arc::default(),
+            };
+            Debian::builder("local")
+                .architecture("amd64")
+                .components(components.iter().copied())
+                .mirror("https://mirror.example/debian")
+                .trust_unsigned(true)
+                .fetcher(fetcher)
+                .build()
+                .expect("the builder validates")
+        };
+        let available = archive(&["main"])
+            .available()
+            .expect("the listed index is read");
+        assert!(available.contains("tool"));
+        let err = archive(&["main", "contrib"])
+            .available()
+            .expect_err("the release lists no index for contrib");
+        assert!(
+            matches!(&err, DebianError::Release { reason, .. }
+                if reason.contains("no index for component contrib")),
+            "{err}",
+        );
+    }
+
+    #[test]
     fn a_verified_release_reports_the_mirror_the_digest_and_the_signing_key() {
         // The three facts a plan's archive record carries that the release body
         // does not itself state, checked against a real Debian release signed by
