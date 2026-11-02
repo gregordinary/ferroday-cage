@@ -25,6 +25,12 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-02
+
+`fcage` 0.6.0, unchanged. Its dependency on the library is a caret range over
+0.5.0, which 0.5.1 satisfies, so a fresh install of it builds against this
+release.
+
 ### Fixed
 
 - A Debian release that lists a component under a prefix, as the security
@@ -2460,7 +2466,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.3...v0.4.4
