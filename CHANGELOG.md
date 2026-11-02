@@ -25,6 +25,12 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-01
+
+`fcage` 0.6.0. Entries below marked **Breaking.** change the library's API and
+behaviour and `fcage`'s flags, exit codes and output, so both take a new minor
+version. `fcage` requires library 0.5.0.
+
 ### Security
 
 - Every launch, of a sandbox or a restriction, refuses a directory on a standard
@@ -2443,7 +2449,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.2...v0.4.3
