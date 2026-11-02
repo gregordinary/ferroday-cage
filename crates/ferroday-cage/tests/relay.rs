@@ -1081,11 +1081,18 @@ fn restricted_shell(script: &str) -> Option<ferroday_cage::Restriction> {
     // The command runs from the system trees, so they are what it is granted;
     // the pseudoterminal arrives as descriptors and needs no path at all. A
     // shell without job control opens `/dev/null` as a background job's input,
-    // so a script that starts one needs that too.
+    // so a script that starts one needs that too. It is granted for writing as
+    // well: a Rust program's runtime reopens a closed standard stream on
+    // `/dev/null`, read-write, before `main`, and aborts where it cannot. A
+    // script that closes its terminal and then runs `sleep` meets that where
+    // the coreutils are uutils, as Ubuntu's are.
     let mut builder = ferroday_cage::Restriction::builder()
         .command("/bin/sh")
         .args(["-c", script])
-        .landlock_fs(ferroday_cage::FsAccess::READ, "/dev/null");
+        .landlock_fs(
+            ferroday_cage::FsAccess::READ | ferroday_cage::FsAccess::WRITE,
+            "/dev/null",
+        );
     for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
         if std::path::Path::new(tree).exists() {
             builder = builder.landlock_fs(
