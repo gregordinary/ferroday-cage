@@ -1148,7 +1148,7 @@ consumer upgrading can skip it.
 - The `orchestrator`, `gentoo-binhost` and `fetch-sandbox` examples set
   `test = true`, so `cargo test` runs the tests that hold their documented
   invocations to the build.
-- `lzma-rust2` moves to 0.24, whose own reader accepts the memory limit. The xz
+- `lzma-rust2` moves to 0.25, whose own reader accepts the memory limit. The xz
   decode runs through that reader, and the reader this crate wrote over the
   sans-I/O decoder to apply the limit is gone. The cap, and what an archive over
   it does, are unchanged.

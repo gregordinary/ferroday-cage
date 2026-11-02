@@ -441,40 +441,22 @@ const XZ_CHUNK: usize = 64 * 1024;
 /// streams are decoded as one, which several producers emit and the format
 /// permits.
 ///
-/// Three things are this type's rather than the decoder's. A refusal is
-/// rewritten to name the bound in force, by [`refused_memory`]. An empty buffer
-/// is answered here, without reaching the decoder: it takes a read that
-/// produces nothing for the end of the block in progress, which is what a read
-/// into no space always produces. And the decoder reads through [`ReadFully`],
-/// because it takes a short read of a block's padding for a truncated stream.
-struct XzReader<R: Read>(lzma_rust2::XzReader<ReadFully<io::BufReader<R>>>);
+/// Two things are this type's rather than the decoder's. A refusal is rewritten
+/// to name the bound in force, by [`refused_memory`]. And an empty buffer is
+/// answered here, without reaching the decoder: it takes a read that produces
+/// nothing for the end of the block in progress, which is what a read into no
+/// space always produces.
+struct XzReader<R: Read>(lzma_rust2::XzReader<io::BufReader<R>>);
 
 impl<R: Read> XzReader<R> {
     /// Wraps `source`, positioned at the start of the first stream header.
     fn new(source: R) -> XzReader<R> {
         XzReader(lzma_rust2::XzReader::new_mem_limit(
-            ReadFully(io::BufReader::with_capacity(XZ_CHUNK, source)),
+            io::BufReader::with_capacity(XZ_CHUNK, source),
             // Several concatenated xz streams are one legal file.
             true,
             MAX_XZ_MEMORY_KB,
         ))
-    }
-}
-
-/// A reader whose reads come back short only at the end of its input.
-///
-/// `lzma-rust2` reads the one to three zero bytes that pad each block with a
-/// single `read`, and refuses the stream as truncated when that read returns
-/// fewer. A buffered source returns fewer whenever the padding straddles a
-/// refill, and a pipe or a socket whenever the bytes have not all arrived, so
-/// the same valid archive would decode or not depending on where its block
-/// boundaries fell. Every read here is filled by [`read_fully`], which makes a
-/// short read mean what the decoder takes it to mean.
-struct ReadFully<R>(R);
-
-impl<R: Read> Read for ReadFully<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        read_fully(&mut self.0, buf)
     }
 }
 
@@ -1051,12 +1033,11 @@ mod tests {
     #[test]
     fn block_padding_split_across_reads_still_decodes() {
         // Each block's compressed data is padded to a four-byte boundary with
-        // one to three zero bytes, which the decoder reads with one `read`. A
-        // source that answers a byte at a time splits every padding of two or
-        // three bytes across reads, which is where a buffered source splits
-        // one whenever a refill falls inside it. These blocks carry every
-        // padding width, including none, and none of it may decide whether a
-        // valid archive decodes.
+        // one to three zero bytes. A source that answers a byte at a time
+        // splits every padding of two or three bytes across reads, which is
+        // where a buffered source splits one whenever a refill falls inside
+        // it. These blocks carry every padding width, including none, and none
+        // of it may decide whether a valid archive decodes.
         let data: [&[u8]; 6] = [b"a", b"ab", b"abc", b"abcd", b"abcde", b"abcdef"];
         let blocks: Vec<Block<'_>> = data.iter().map(|data| Block::new(4096, data)).collect();
         let bytes = xz_stream(Check::Crc32, &blocks);
