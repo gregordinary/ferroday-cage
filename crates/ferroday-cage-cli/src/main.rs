@@ -409,7 +409,11 @@ const FLAGS: &[Flag] = &[
         long: "--debian-include",
         section: Section::Provisioning,
         placeholder: "L",
-        help: &["Extra packages to install (comma-separated, repeatable)"],
+        help: &[
+            "Extra packages to install (comma-separated, repeatable).",
+            "NAME/RELEASE installs NAME from the repository",
+            "configured with suite RELEASE",
+        ],
         take: Take::One(|options, flag, value| {
             extend_comma(&mut options.debian_include, &into_string(flag, value)?);
             Ok(())

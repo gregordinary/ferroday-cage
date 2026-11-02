@@ -820,7 +820,8 @@ consumer upgrading can skip it.
   be a nanosecond, which rounded to no time at all.
 - `fcage --help` states what `--restrict` requires, that `--restricted-profile`
   refuses an overlay root, and that `--path-lookup` relaxes the absolute-command
-  rule. Its synopsis lists the Gentoo listing modes.
+  rule. It names `--debian-include`'s `NAME/RELEASE` form, and its synopsis
+  lists the Gentoo listing modes.
 - A layered build no longer hides the links its base holds to directories. A
   package shipping `lib64/` or `sbin/` over a merged-usr base, as the Gentoo
   binhost's lvm2 does over a stage3, made real directories in the upper that hid
