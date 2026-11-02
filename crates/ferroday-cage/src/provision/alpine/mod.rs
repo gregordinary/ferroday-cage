@@ -39,6 +39,7 @@
 //! ```
 
 mod apk;
+mod base64;
 mod bootstrap;
 mod index;
 mod installed;

@@ -445,6 +445,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
+| Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode` |
 | Read a field-and-stanza document one stanza at a time, in place, or write a plan document and read its header and its number fields | `provision::document::parse`, `Stanza::get`, `Stanza::get_each`, `document::header`, `document::number` |
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |

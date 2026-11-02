@@ -694,7 +694,6 @@ dependencies = [
  "ruzstd",
  "seccompiler",
  "serde",
- "sha1",
  "sha2 0.11.1",
  "smoltcp",
  "syscalls",
@@ -904,9 +903,9 @@ dependencies = [
 
 [[package]]
 name = "irongall"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01cdc322a49145dc56449ef1ce5e1d8d9beb4b4dba255a1da80600caba604f22"
+checksum = "c655dc7fa3eddc5957acc1db9bc55700fa1551ecbdffcd39344f61871ab4771f"
 
 [[package]]
 name = "itoa"

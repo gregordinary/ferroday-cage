@@ -52,11 +52,11 @@
 //! See [`Anchor`](super::apk::Anchor), which is where a caller states which of
 //! the two it holds a container to.
 
-use rsa::pkcs1v15::Pkcs1v15Sign;
-use sha1::{Digest as _, Sha1};
+use irongall::hash::{Digest, HashFunction, Sha1};
 
 use super::AlpineError;
 use super::apk::Member;
+use super::base64;
 use super::keyring::KeySet;
 
 /// The prefix every signature member's name carries.
@@ -79,7 +79,7 @@ const IDENTITY_HEX_PREFIX: &str = "X1";
 /// that named it. `payload` is the segment's *raw compressed bytes*, as they
 /// lie in the file — the same payload the signature covers.
 pub(super) fn control_identity(payload: &[u8]) -> String {
-    identity(Sha1::digest(payload).as_slice())
+    identity(&Sha1::digest(payload))
 }
 
 /// The same spelling over a SHA-1 that is already in hand: `Q1` and its base64.
@@ -89,7 +89,7 @@ pub(super) fn control_identity(payload: &[u8]) -> String {
 /// payload this crate hashes, so the two callers meet here rather than each
 /// spelling the prefix.
 pub(super) fn identity(digest: &[u8]) -> String {
-    format!("{IDENTITY_PREFIX}{}", base64(digest))
+    format!("{IDENTITY_PREFIX}{}", base64::encode(digest))
 }
 
 /// The same identity in hexadecimal: `X1` and the SHA-1.
@@ -100,7 +100,7 @@ pub(super) fn identity(digest: &[u8]) -> String {
 pub(super) fn control_identity_hex(payload: &[u8]) -> String {
     format!(
         "{IDENTITY_HEX_PREFIX}{}",
-        crate::provision::digest::hex(Sha1::digest(payload).as_slice()),
+        crate::provision::digest::hex(&Sha1::digest(payload)),
     )
 }
 
@@ -113,7 +113,7 @@ pub(super) fn control_identity_hex(payload: &[u8]) -> String {
 /// is how `apk` itself finds the record an archived script belongs to.
 pub(super) fn identity_of_hex(spelled: &str) -> Option<String> {
     let hex = spelled.strip_prefix(IDENTITY_HEX_PREFIX)?.as_bytes();
-    if hex.len() != 2 * Sha1::output_size() {
+    if hex.len() != 2 * size_of::<<Sha1 as HashFunction>::Output>() {
         return None;
     }
     let nibble = |byte: u8| match byte {
@@ -128,32 +128,6 @@ pub(super) fn identity_of_hex(spelled: &str) -> Option<String> {
         .map(|&[high, low]| Some((nibble(high)? << 4) | nibble(low)?))
         .collect::<Option<Vec<u8>>>()?;
     Some(identity(&digest))
-}
-
-/// Encodes `bytes` as base64, RFC 4648 section 4: the standard alphabet, and
-/// padded.
-///
-/// Written here rather than taken from a crate because it is twenty lines and
-/// this is the workspace's only caller — irongall decodes the OpenPGP side's
-/// armor itself, and every other digest the crate renders is hexadecimal.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for group in bytes.chunks(3) {
-        let mut packed = 0u32;
-        for (at, byte) in group.iter().enumerate() {
-            packed |= u32::from(*byte) << (16 - 8 * at);
-        }
-        // One output character per six bits of input, and a pad character for
-        // each whole character the group has no bits for.
-        for at in 0..=group.len() {
-            out.push(ALPHABET[(packed >> (18 - 6 * at)) as usize & 0x3f] as char);
-        }
-        for _ in group.len()..3 {
-            out.push('=');
-        }
-    }
-    out
 }
 
 /// The digest an apk signature is taken over, named by the signature member.
@@ -172,13 +146,10 @@ impl Algorithm {
     /// The algorithm `token` names, or `None` for one this reader does not
     /// implement.
     ///
-    /// `RSA256` and `RSA512` are defined by the format and refused here. They
-    /// are not published for any release, and implementing them would put a
-    /// second, older generation of `sha2` into an `alpine`-only build purely
-    /// for a DER prefix: the crate's own SHA-256 is `sha2` 0.11 on `digest`
-    /// 0.11, while `rsa` 0.9 needs a digest on `digest` 0.10. When a repository
-    /// publishes one, that cost becomes worth paying and this is where it is
-    /// paid.
+    /// `RSA256` and `RSA512` are defined by the format and refused here. No
+    /// release publishes either, so no repository's signature could show that
+    /// this reader verifies them as `apk` does. When a repository publishes
+    /// one, this is where it is added.
     fn parse(token: &str) -> Option<Algorithm> {
         match token {
             "RSA" => Some(Algorithm::RsaSha1),
@@ -282,8 +253,7 @@ impl Signature {
         };
 
         let Algorithm::RsaSha1 = algorithm;
-        let digest = Sha1::digest(payload);
-        key.verify(Pkcs1v15Sign::new::<Sha1>(), &digest, &self.bytes)
+        key.verify(&Digest::Sha1(Sha1::digest(payload)), &self.bytes)
             .map_err(|err| {
                 AlpineError::signature(
                     subject,
@@ -405,25 +375,6 @@ impl Signatures {
 mod tests {
     use super::*;
     use crate::provision::alpine::fixtures;
-
-    #[test]
-    fn the_encoder_agrees_with_rfc_4648() {
-        // The section 10 test vectors, which is where the padding cases are.
-        for (plain, encoded) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(plain.as_bytes()), encoded, "{plain:?}");
-        }
-        // And the whole alphabet, so a transposed table is caught.
-        let all: Vec<u8> = (0u8..=255).collect();
-        assert!(base64(&all).starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"));
-    }
 
     #[test]
     fn a_control_identity_is_the_one_the_published_index_records() {

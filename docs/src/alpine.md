@@ -502,6 +502,11 @@ The key's *name* matters as much as its bytes: a signature names its key by
 exactly the file name the repository publishes it under, so a set holding the
 right key under the wrong name verifies nothing.
 
+[`KeySet::insert`] reads a key as `abuild-keygen` writes it: an RSA public key
+in a PEM `PUBLIC KEY` block. It refuses one whose modulus is narrower than 2048
+bits or wider than 8192, the bounds every RSA key the crate verifies with is
+held to.
+
 ### No freshness policy
 
 There is no equivalent of `allow_stale_release` either, because there is nothing

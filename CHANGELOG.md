@@ -412,7 +412,16 @@ consumer upgrading can skip it.
 - A `debian` build depends on 23 crates, counting this one, where it depended on
   163, and a `gentoo` build on 24: irongall has no dependencies of its own. Both
   decode gzip through `miniz_oxide` alone, where `pgp` had selected `flate2`'s
-  zlib-rs backend.
+  zlib-rs backend. An `alpine` build depends on 23, where it depended on 52: it
+  verifies an apk index's signature through irongall too, and no longer depends
+  on `rsa` or `sha1`.
+- **Breaking.** An Alpine signing key is read and verified by irongall, where
+  the `rsa` crate read it. `alpine::KeySet::insert` refuses a key whose modulus
+  is narrower than 2048 bits, the floor every RSA key the crate verifies with is
+  held to, or whose exponent is even, and accepts one up to 8192 bits, where the
+  ceiling was 4096. Every key Alpine and postmarketOS publish is 2048 or 4096
+  bits. A key is read only as `abuild-keygen` writes it, an RSA
+  `SubjectPublicKeyInfo` in a PEM `PUBLIC KEY` block.
 - **Breaking.** A terminal launch allocates its pseudoterminal inside the
   sandbox, from the `/dev/ptmx` the command sees, rather than on the host before
   the fork. `ttyname` now names the terminal, so `tty`, `who`, and `GPG_TTY`

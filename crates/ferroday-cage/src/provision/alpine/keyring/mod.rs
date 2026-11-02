@@ -35,11 +35,12 @@
 //! that package, so an architecture's set spans every release the archive still
 //! serves rather than only the current one.
 
+mod spki;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
-use rsa::RsaPublicKey;
-use rsa::pkcs8::DecodePublicKey;
+use irongall::rsa::PublicKey;
 
 use super::AlpineError;
 
@@ -155,7 +156,7 @@ pub struct KeySet {
 /// they supplied.
 #[derive(Clone)]
 struct Held {
-    key: RsaPublicKey,
+    key: PublicKey,
     pem: String,
 }
 
@@ -250,13 +251,14 @@ impl KeySet {
     /// # Errors
     ///
     /// Returns [`AlpineError::Config`] for a key that is not a PEM
-    /// `SubjectPublicKeyInfo` holding an RSA public key: a key set is the
+    /// `SubjectPublicKeyInfo` holding an RSA public key, or whose modulus is
+    /// narrower than 2048 bits or wider than 8192: a key set is the
     /// configuration a repository is verified under, and no signature has been
     /// read yet.
     pub fn insert(&mut self, name: impl Into<String>, pem: &str) -> Result<(), AlpineError> {
         let name = name.into();
-        let key = RsaPublicKey::from_public_key_pem(pem).map_err(|err| AlpineError::Config {
-            reason: format!("the key {name} is not a usable RSA public key: {err}"),
+        let key = spki::rsa_public_key(pem).map_err(|reason| AlpineError::Config {
+            reason: format!("the key {name} is not a usable RSA public key: {reason}"),
         })?;
         self.keys.insert(
             name,
@@ -280,7 +282,7 @@ impl KeySet {
     ///
     /// A signature names its key exactly, so this is an exact lookup: a set
     /// holding the same key under a different name verifies nothing.
-    pub(super) fn get(&self, name: &str) -> Option<&RsaPublicKey> {
+    pub(super) fn get(&self, name: &str) -> Option<&PublicKey> {
         self.keys.get(name).map(|held| &held.key)
     }
 

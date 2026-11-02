@@ -47,19 +47,15 @@ lzma-rust2 = { version = "0.24", optional = true, default-features = false, feat
 # the floor because 0.9.0 lets a block decode past `Block_Maximum_Size`, which
 # the window cap does not bound (RUSTSEC-2026-0344).
 ruzstd = { version = "0.9.1", optional = true, default-features = false, features = ["std", "hash"] }
-# The Debian and Gentoo userland add-on: OpenPGP verification of the archive's
-# signed documents (safe Rust, no dependencies), and the hashing their trust
-# chains are defined over -- SHA-256 for Debian's release chain, SHA-512 for
-# Gentoo's digest documents.
-irongall = { version = "0.1", optional = true }
+# The three userland add-ons' signature verification (safe Rust, no
+# dependencies): OpenPGP for the Debian and Gentoo archives' signed documents,
+# and RSA PKCS#1 v1.5 over SHA-1 for an apk index, whose SHA-1 the Alpine layer
+# takes from it too. And the hashing the archives' digests are defined over:
+# SHA-256 for Debian's release chain and an apk package's data, SHA-512 for
+# Gentoo's digest documents. 0.1.1 is the floor because it is the first release
+# whose RSA verifier is public.
+irongall = { version = "0.1.1", optional = true }
 sha2 = { version = "0.11", optional = true }
-# The Alpine userland add-on: RSA PKCS#1 v1.5 verification of the apk signature
-# (pure Rust, no C backend) and the SHA-1 the apk v2 chain is defined over.
-#
-# `sha1`'s `oid` feature is not on by default and is required: the digest type
-# reaches `Pkcs1v15Sign::new` for its DER prefix, not to hash.
-rsa = { version = "0.9.10", optional = true, default-features = false, features = ["pem"] }
-sha1 = { version = "0.10", optional = true, features = ["oid"] }
 # The Gentoo binary-package add-on: the MD5 portage writes into its own package
 # database -- an installed package's `CONTENTS` records one per file so portage
 # can tell an edited file from a merged one, and its `BINPKGMD5` records the
@@ -96,7 +92,7 @@ debian = ["tarball", "dep:irongall", "dep:sha2"]
 # The Alpine userland provisioner: bootstrap a release/architecture rootfs from
 # an apk repository, and postmarketOS's repositories beside it. Builds on the
 # tarball extractor for the packages' data segments.
-alpine = ["tarball", "dep:rsa", "dep:sha1", "dep:sha2"]
+alpine = ["tarball", "dep:irongall", "dep:sha2"]
 # The Gentoo userland provisioner: bootstrap a rootfs from a signed stage3
 # tarball, and install binary packages into it. It selects the Debian layer's
 # dependencies (OpenPGP for the signed pointer and digest documents, and the
@@ -314,3 +310,6 @@ lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "x
 # cannot sign. rPGP signs, with the RNG it needs.
 pgp = { version = "0.21", default-features = false }
 rand = "0.8"
+# The Alpine key reader's tests hold it to the `rsa` crate's reading of the same
+# PEM. rPGP depends on it already, so it adds nothing to the test build.
+rsa = { version = "0.9.10", default-features = false, features = ["pem"] }

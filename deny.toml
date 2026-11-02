@@ -32,12 +32,11 @@ allow = [
 [advisories]
 ignore = [
     # Marvin Attack: a timing sidechannel in the `rsa` crate. It enters the
-    # graph directly under `alpine`, which verifies an apk index signature with
-    # it, and through `pgp`, which the tests sign throwaway documents with. The
-    # attack recovers an RSA *private* key from the timing of private key
-    # operations (signing, decryption), and the library performs none: it
-    # verifies a signature against a public key it ships, over material the
-    # mirror published. The tests' RSA keys are generated for one run and guard
+    # graph only under the tests: through `pgp`, which they sign throwaway
+    # documents with, and directly, for the Alpine key reader's comparison
+    # against it. The library itself never depends on it. The attack recovers
+    # an RSA *private* key from the timing of private key operations (signing,
+    # decryption), and the tests' RSA keys are generated for one run and guard
     # nothing. So the sidechannel reaches nothing secret. No fixed `rsa` release
     # exists yet; this is revisited when one does.
     { id = "RUSTSEC-2023-0071", reason = "verification-only; no RSA private key is ever used" },
