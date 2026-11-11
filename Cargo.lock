@@ -903,9 +903,9 @@ dependencies = [
 
 [[package]]
 name = "irongall"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c655dc7fa3eddc5957acc1db9bc55700fa1551ecbdffcd39344f61871ab4771f"
+checksum = "2eacff866dddc4fda7e345e8bc28d4cdab21948d85d76bf0f3cf548a14a8093f"
 
 [[package]]
 name = "itoa"

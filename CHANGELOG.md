@@ -25,6 +25,17 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Security
+
+- The library requires irongall 0.1.2, with which the Debian and Gentoo layers
+  verify an archive's signed documents. irongall 0.1.0 and 0.1.1, which earlier
+  releases admitted, could disregard a revocation, or a newer self-signature
+  narrowing an older one, that an unsigned change to its certificate left in
+  place, and so accept a signature made with a key the certificate withdraws.
+  The library reads certificates only from the keyrings it embeds and the files
+  its caller names, so earlier releases were exposed only through a keyring
+  file that someone other than the caller could alter.
+
 ## [0.5.1] - 2026-11-02
 
 `fcage` 0.6.0, unchanged. Its dependency on the library is a caret range over
