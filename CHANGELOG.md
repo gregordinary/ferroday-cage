@@ -25,6 +25,12 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-10
+
+`fcage` 0.6.1, which requires library 0.5.2 and changes nothing else.
+`cargo install --locked` builds `fcage` from the lockfile it was published with,
+which for 0.6.0 names irongall 0.1.1 and for 0.6.1 names 0.1.2.
+
 ### Security
 
 - The library requires irongall 0.1.2, with which the Debian and Gentoo layers
@@ -2477,7 +2483,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.4...v0.4.5
