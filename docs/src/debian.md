@@ -634,8 +634,9 @@ let repository = Repository::builder("trixie")
 
 The `Release` carries `Date`, the required field naming when the pool was
 published. A client reads it to tell how old a snapshot is, and to check its own
-clock against the archive's. One that finds no `Date` reports the release as
-malformed rather than as merely undated.
+clock against the archive's. apt reads a release that states no `Date` with a
+warning, and a bootstrap refuses one from a snapshot mirror, since an undated
+release cannot be placed before the moment the snapshot names.
 
 The release carries no `Valid-Until`, the separate and optional field, so it
 never expires. A pool stays usable for as long as its packages are wanted,
