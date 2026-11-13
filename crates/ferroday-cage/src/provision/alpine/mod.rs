@@ -1411,11 +1411,10 @@ fn parse_index(
     // describe` of the tree the index was built from, postmarketOS a timestamp,
     // and the format defines neither. Alpine's is what binds the index to the
     // release it was fetched as, since one key signs many releases; the record
-    // keeps whatever was written.
+    // keeps what was written, on one line.
     let description = metadata
         .member("DESCRIPTION")
-        .map(|member| String::from_utf8_lossy(&member.data).trim().to_string())
-        .filter(|description| !description.is_empty());
+        .and_then(|member| description_of(&member.data));
     release::check(
         url,
         repository.release(),
@@ -1427,6 +1426,24 @@ fn parse_index(
         return Err(AlpineError::index(url, reason));
     }
     Ok((records, metadata.signed_by, description))
+}
+
+/// An index's `DESCRIPTION` member as a plan records it, or `None` where it
+/// holds nothing but whitespace.
+///
+/// Each run of whitespace in it, a line break included, is one space, and none
+/// leads or trails. A plan document's field is one line, and a member of
+/// several lines would otherwise resolve and then make the plan impossible to
+/// write. `apk` prints the member as it stands where it reports an index it
+/// read, and records it nowhere in the root, so this is the only record of it
+/// there is. No index Alpine or postmarketOS publishes describes itself in
+/// more than one line; a repository of the caller's own may.
+fn description_of(member: &[u8]) -> Option<String> {
+    let description = String::from_utf8_lossy(member)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!description.is_empty()).then_some(description)
 }
 
 /// An observer of an Alpine bootstrap's progress.
@@ -3306,6 +3323,37 @@ mod tests {
                     && reason.contains("\"aarch64\"")
                     && reason.contains("\"x86_64\"")),
             "{err}",
+        );
+    }
+
+    #[test]
+    fn an_index_description_is_recorded_on_one_line() {
+        // A repository of the caller's own may describe an index in several
+        // lines, which a plan document's field cannot carry; the resolution
+        // records it on one rather than becoming a plan no document can hold.
+        assert_eq!(
+            description_of(b"v3.23.5-111-g2a2e55ba802\n").as_deref(),
+            Some("v3.23.5-111-g2a2e55ba802"),
+        );
+        let several = description_of(b"  built by\r\n\n  the caller\tat noon \n")
+            .expect("the member describes something");
+        assert_eq!(several, "built by the caller at noon");
+        assert_eq!(description_of(b" \n\t "), None);
+
+        let mut plan = provisioner(&["busybox"])
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect("busybox resolves");
+        plan.indexes[0].description = Some(several.clone());
+        let document = plan.to_document().expect("the plan is writable");
+        assert_eq!(
+            Plan::parse_document(&document)
+                .expect("the document reads back")
+                .indexes[0]
+                .description
+                .as_deref(),
+            Some(several.as_str()),
         );
     }
 

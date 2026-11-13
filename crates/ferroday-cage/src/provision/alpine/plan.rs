@@ -144,7 +144,8 @@ pub struct ResolvedIndex {
     /// key rotation looks like; this names the one that actually verified rather
     /// than the first the container happens to list.
     pub signed_by: String,
-    /// The index's `DESCRIPTION` member, as written, when it carries one.
+    /// The index's `DESCRIPTION` member, when it carries one, with each run of
+    /// whitespace in it written as one space.
     ///
     /// A build string rather than a date or a validity window: Alpine writes
     /// `git describe` of the tree the index was built from, of the form
@@ -153,6 +154,10 @@ pub struct ResolvedIndex {
     /// a freshness signal. An index Alpine signed is held to describe the
     /// release it was fetched as before it is read; what another publisher
     /// writes here is recorded and not read.
+    ///
+    /// A line break is one of those runs, since a plan document's field is one
+    /// line; no index Alpine or postmarketOS publishes describes itself in more
+    /// than one.
     pub description: Option<String>,
     /// Fields this index's stanza carried that this version does not know.
     ///

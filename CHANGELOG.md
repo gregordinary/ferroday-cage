@@ -869,6 +869,10 @@ consumer upgrading can skip it.
   `.`, `..`, or holding a `/` or a NUL. A bootstrap writes each key to the
   root's `/etc/apk/keys` under its name, which such a name placed elsewhere or
   failed to place. The refusal quotes the name.
+- An Alpine resolution records an index's `DESCRIPTION` with each run of
+  whitespace in it, line breaks included, as one space. A description of
+  several lines, which a repository of the caller's own may write, resolved
+  and then made the plan impossible to write as a document.
 
 ### Internal
 
