@@ -5028,20 +5028,11 @@ fn toml_diagnostic(error: &impl std::fmt::Display) -> String {
 /// Loads a profile into a builder, alongside the metadata the CLI reconciles
 /// against its own flags.
 ///
-/// With `override_command`, the profile's command and arguments are dropped
-/// before it is deserialized: when the command line names a command of its own,
-/// it overrides the profile's as a unit, never mixed with the profile's
-/// arguments.
-///
 /// With `restricted`, the profile is deserialized under the library's
 /// [`RestrictedProfile`] policy, which refuses the operations that map host
 /// resources into the sandbox or share a host namespace; otherwise it is
 /// trusted as code-equivalent configuration.
-fn load_profile(
-    path: &Path,
-    override_command: bool,
-    restricted: bool,
-) -> Result<(CageBuilder, ProfileMeta), String> {
+fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, ProfileMeta), String> {
     let text = std::fs::read_to_string(path).map_err(|err| {
         format!(
             "cannot read profile {}: {}",
@@ -5049,17 +5040,13 @@ fn load_profile(
             ErrorChain::new(&err)
         )
     })?;
-    let mut table: toml::Table = text.parse().map_err(|err| {
+    let table: toml::Table = text.parse().map_err(|err| {
         format!(
             "cannot parse profile {}: {}",
             path.display(),
             toml_diagnostic(&err)
         )
     })?;
-    if override_command {
-        table.remove("command");
-        table.remove("args");
-    }
     let meta = ProfileMeta {
         sets_term: table
             .get("env")
@@ -5308,12 +5295,8 @@ impl Launch {
         let mut profile_sets_stop_with_caller = false;
         let mut builder = match &options.profile {
             Some(path) => {
-                let (builder, meta) = load_profile(
-                    path,
-                    !options.command_line.is_empty(),
-                    options.profile_restricted,
-                )
-                .map_err(fail)?;
+                let (builder, meta) =
+                    load_profile(path, options.profile_restricted).map_err(fail)?;
                 profile_sets_term = meta.sets_term;
                 profile_network_host = meta.network_host;
                 profile_sets_stop_with_caller = meta.sets_stop_with_caller;
@@ -5375,9 +5358,14 @@ impl Launch {
             }
             builder = builder.overlay(overlay);
         }
+        // A command on the command line replaces a profile's as a unit, never
+        // mixed with the profile's arguments.
         let mut command_line = options.command_line.into_iter();
         if let Some(command) = command_line.next() {
-            builder = builder.command(PathBuf::from(command)).args(command_line);
+            builder = builder
+                .clear_args()
+                .command(PathBuf::from(command))
+                .args(command_line);
         }
         if let Some(base) = options.base_env {
             builder = builder.base_env(base);
@@ -7864,14 +7852,39 @@ mod tests {
             "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\nstop-with-caller = false\n",
         )
         .expect("the profile is written");
-        let (_, meta) = load_profile(&stated, false, false).expect("the profile loads");
+        let (_, meta) = load_profile(&stated, false).expect("the profile loads");
         assert!(meta.sets_stop_with_caller);
 
         let silent = dir.join("silent.toml");
         std::fs::write(&silent, "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\n")
             .expect("the profile is written");
-        let (_, meta) = load_profile(&silent, false, false).expect("the profile loads");
+        let (_, meta) = load_profile(&silent, false).expect("the profile loads");
         assert!(!meta.sets_stop_with_caller);
+    }
+
+    #[test]
+    fn a_command_on_the_command_line_replaces_the_profiles_as_a_unit() {
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-profile-command");
+        let profile = dir.join("profile.toml");
+        std::fs::write(
+            &profile,
+            "rootfs = \"/tmp\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 3\"]\n",
+        )
+        .expect("the profile is written");
+        let profile = profile.to_str().expect("a UTF-8 scratch path");
+        let prepared = |args: &[&str]| {
+            Launch::prepare(*run_options(args)).unwrap_or_else(|_| panic!("{args:?} composes"))
+        };
+        // The profile's own command keeps its arguments.
+        let launch = prepared(&["--profile", profile]);
+        assert_eq!(launch.builder.get_command(), Some(Path::new("/bin/sh")));
+        assert_eq!(launch.builder.get_args(), ["-c", "exit 3"]);
+        // One on the command line takes none of them.
+        let launch = prepared(&["--profile", profile, "/bin/echo", "hello"]);
+        assert_eq!(launch.builder.get_command(), Some(Path::new("/bin/echo")));
+        assert_eq!(launch.builder.get_args(), ["hello"]);
+        let launch = prepared(&["--profile", profile, "/bin/true"]);
+        assert!(launch.builder.get_args().is_empty());
     }
 
     #[test]
@@ -7901,11 +7914,11 @@ mod tests {
         ] {
             std::fs::write(&profile, format!("rootfs = \"/tmp\"\n{table}"))
                 .expect("the profile is written");
-            let Err(error) = load_profile(&profile, false, true) else {
+            let Err(error) = load_profile(&profile, true) else {
                 panic!("--restricted-profile accepted {table}");
             };
             assert!(error.contains(refused), "{error}");
-            assert!(load_profile(&profile, false, false).is_ok(), "{table}");
+            assert!(load_profile(&profile, false).is_ok(), "{table}");
         }
     }
 
