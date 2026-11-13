@@ -91,24 +91,36 @@ right tool for a command whose output volume the caller does not control:
 use ferroday_cage::{Cage, Observer};
 
 /// Keeps at most `LIMIT` bytes of each stream and counts the rest.
+#[derive(Default)]
 struct Capped {
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
     dropped: usize,
 }
 
 const LIMIT: usize = 1 << 20;
 
+/// Keeps what of `chunk` fits in `kept` below `LIMIT`, and returns how much
+/// did not.
+fn keep(kept: &mut Vec<u8>, chunk: &[u8]) -> usize {
+    let room = LIMIT.saturating_sub(kept.len());
+    let (fits, spilled) = chunk.split_at(chunk.len().min(room));
+    kept.extend_from_slice(fits);
+    spilled.len()
+}
+
 impl Observer for Capped {
     fn stdout(&mut self, chunk: &[u8]) {
-        let room = LIMIT.saturating_sub(self.stdout.len());
-        let (kept, spilled) = chunk.split_at(chunk.len().min(room));
-        self.stdout.extend_from_slice(kept);
-        self.dropped += spilled.len();
+        self.dropped += keep(&mut self.stdout, chunk);
+    }
+
+    fn stderr(&mut self, chunk: &[u8]) {
+        self.dropped += keep(&mut self.stderr, chunk);
     }
 }
 
 fn main() -> ferroday_cage::Result<()> {
-    let mut capped = Capped { stdout: Vec::new(), dropped: 0 };
+    let mut capped = Capped::default();
     let cage = Cage::builder()
         .rootfs("/srv/rootfs/alpine")
         .command("/usr/bin/analyze")
@@ -122,8 +134,8 @@ fn main() -> ferroday_cage::Result<()> {
 ```
 
 The command still runs to completion — the pump keeps draining the pipes, so
-nothing blocks — but the caller's memory use is bounded by `LIMIT` regardless
-of what the command writes. Bounding the *time* as well is
+nothing blocks — but the caller keeps at most `LIMIT` bytes of each stream,
+whatever the command writes. Bounding the *time* as well is
 [`wait_deadline`](process-model.md)'s job, and bounding what the command can
 consume while it runs is [`rlimit`](hardening.md#resource-limits)'s.
 
@@ -133,8 +145,8 @@ Alongside the command's output, an observer receives the library's own
 launch milestones through `progress`, a third callback with an empty default
 body. Each launch reports a `Progress` value at three points, in order:
 
-- **`Launching`** — the sandbox's channels are created and its launch stage
-  is forked.
+- **`Launching`** — the launch has begun, before the sandbox's channels are
+  created and its launch stage is forked.
 - **`Supervised`** — the namespaces exist and the supervisor is published.
   For a direct launch the command is about to run; for a held launch (the
   [userspace-networking](userspace-networking.md) seam) this is the gate,
@@ -165,9 +177,9 @@ the trait.
 ## How delivery works
 
 Delivery is synchronous and starts no thread. Captured output is pumped inside
-the blocking calls — `run_with` itself, or the handle's `wait`,
-`wait_deadline`, and `wait_timeout` — with a single `poll` over the capture
-pipes, on the calling thread. The library starts threads only for a network
+the calls that serve the handle — `run_with` itself, or the handle's `wait`,
+`wait_deadline`, and `wait_timeout`, and the non-blocking `try_wait` — with a
+single `poll` over the capture pipes, on the calling thread. The library starts threads only for a network
 stack's pump and a batch download's workers, which [Embedding in a
 runtime](embedding.md) describes. Delivery has three practical consequences:
 

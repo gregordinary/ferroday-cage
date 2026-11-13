@@ -306,8 +306,9 @@ the path it is bound at.
 [`Repository::builder`](https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Repository.html#method.builder)
 [`mirror_fallback`](https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.RepositoryBuilder.html#method.mirror_fallback)
 does the same for any repository. Backstops are tried in order when the live
-mirror reports a resource missing. That is what happens to a version that has
-rotated off the live pool:
+mirror reports a resource missing, fails at the transport, or answers with an
+unsuccessful HTTP status. A version that has rotated off the live pool is the
+first of those:
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Debian;
@@ -1189,9 +1190,12 @@ selects, and the base is not selected.
 A pin the archives cannot supply fails the resolve or the bootstrap with
 `DebianError::Pin`, before the closure is computed and before anything is
 downloaded. It names every package that could not be held at once, in name
-order, since one archive publish moves many together. For each it says which of
-three things happened. The archives offer another version, offer no version of
-it at all, or record different bytes for the one pinned.
+order, since one archive publish moves many together. For each it says what
+happened. The archives offer another version, or no version of it at all. They
+record different bytes for the one pinned, or no digest under the pin's
+algorithm. An install list entry written `name/release` names a release that
+offers another version. Or a package the resolution selects depends on a
+version the pin does not meet.
 
 A live mirror serving a single version per suite will move past a pin as soon as
 it publishes. A [snapshot mirror](#installing-a-plan-without-resolving-again) is

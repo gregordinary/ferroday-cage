@@ -291,8 +291,8 @@ leave two builds — one on a rootfs, one on an overlay over the same base —
 looking identical.
 
 `identity`, `run-as`, `present-as`, `no-new-privileges`, `network`,
-`network-filter`, `pid-namespace`, `hostname`, `streams`, `rlimits`, and
-`hardening` are the posture the launch puts the command under, and each
+`network-filter`, `pid-namespace`, `hostname`, `streams`, `rlimits`, `cgroup`,
+and `hardening` are the posture the launch puts the command under, and each
 changes what a build produces:
 
 - **`identity`** — the identity map: which ids exist inside the sandbox. A
@@ -329,6 +329,11 @@ changes what a build produces:
   progress display.
 - **`rlimits`** — a build that adapts its parallelism to `RLIMIT_NOFILE`, or
   fails a link under `RLIMIT_AS`, produces different output.
+- **`cgroup`** — the delegated directory each launch's cgroup is created
+  beneath and the limits it holds the sandbox's whole process tree to, or the
+  limits a launch runs without where they are not required. A build held to
+  `memory.max` or `pids.max` can fail where an unlimited one finishes. The key
+  is absent where the configuration names neither a parent nor a limit.
 - **`hardening`** — the subtlest, and the one most worth recording: a seccomp
   policy changes which syscalls succeed, and a configure test that probes a
   syscall reads the refusal as an absent feature. The Landlock grants are

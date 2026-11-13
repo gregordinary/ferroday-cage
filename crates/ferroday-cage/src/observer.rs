@@ -20,7 +20,7 @@ use crate::status::{ExitStatus, ResourceUsage};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Progress {
-    /// The launch has begun: the sandbox's channels are created and its
+    /// The launch has begun, before the sandbox's channels are created and its
     /// launch stage is forked.
     Launching,
     /// The sandbox's namespaces exist and its supervisor is published. For a
@@ -37,10 +37,10 @@ pub enum Progress {
 /// An observer is borrowed by [`Cage::run_with`] or [`Cage::spawn_with`],
 /// which capture the command's standard output and standard error into
 /// pipes. The library delivers the captured bytes by calling the observer
-/// on the caller's own thread, from inside the blocking calls —
-/// [`Cage::run_with`] itself, or [`Running::wait`] and its deadline
-/// variants. No internal thread is spawned, and output flows only while one
-/// of those calls is pumping.
+/// on the caller's own thread, from inside the calls that serve the handle —
+/// [`Cage::run_with`] itself, or [`Running::wait`], its deadline variants,
+/// and the non-blocking [`Running::try_wait`]. No internal thread is spawned,
+/// and output flows only while one of those calls is pumping.
 ///
 /// Chunks are delivered exactly as they are read from the pipes: they are
 /// not lines, they are not UTF-8, and their boundaries carry no meaning. An
@@ -77,6 +77,7 @@ pub enum Progress {
 /// [`Cage::run_with`]: crate::Cage::run_with
 /// [`Cage::spawn_with`]: crate::Cage::spawn_with
 /// [`Running::wait`]: crate::Running::wait
+/// [`Running::try_wait`]: crate::Running::try_wait
 pub trait Observer {
     /// Receives a chunk of the command's standard output.
     fn stdout(&mut self, chunk: &[u8]) {
