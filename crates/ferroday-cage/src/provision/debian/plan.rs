@@ -987,6 +987,33 @@ Source: local-suite
     }
 
     #[test]
+    fn a_plan_header_reaches_a_refusal_with_its_control_characters_escaped() {
+        // A document is a file the caller may have taken from elsewhere, and
+        // nothing holds its header to an alphabet.
+        let hostile = crate::failure::hostile::TEXT;
+        for field in ["suite", "architecture"] {
+            let mut plan = sample();
+            match field {
+                "suite" => plan.suite = hostile.to_string(),
+                _ => plan.architecture = hostile.to_string(),
+            }
+            let refusals = [
+                super::super::validate_plan(&plan, "trixie", "arm64", 2, false, &[], &[]),
+                super::super::validate_pin(&plan, "trixie", "arm64", false),
+            ];
+            for refused in refusals {
+                match refused {
+                    Err(DebianError::Config { reason }) => {
+                        assert!(reason.contains(field), "{reason}");
+                        crate::failure::hostile::assert_escaped(&reason);
+                    }
+                    other => panic!("expected a {field} refusal, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_missing_required_field_names_the_stanza_it_is_missing_from() {
         let document = sample()
             .to_document()

@@ -136,6 +136,10 @@ consumer upgrading can skip it.
   already quoted its suite and codename. A trusted-unsigned release is a
   mirror's text, and a deadline the release parser accepts may carry any text
   before its weekday's comma and after its zone.
+- A Debian plan or pin stating a suite or an architecture other than the
+  bootstrap's is refused quoting what it states, with its control characters
+  escaped. A plan document is a file the caller may have taken from elsewhere,
+  and nothing holds its header to an alphabet.
 
 ### Added
 

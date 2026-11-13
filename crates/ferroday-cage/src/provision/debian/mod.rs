@@ -311,6 +311,12 @@ fn validate_selection(
 /// A plan describes a resolution that already happened, so a setting shaping a
 /// resolution is a contradiction rather than a refinement, and picking a silent
 /// precedence between the two would produce a rootfs matching neither.
+///
+/// A refusal quotes the suite and the architecture the plan states with `{:?}`:
+/// a document is a file the caller may have taken from elsewhere, and nothing
+/// holds its header to an alphabet. The configured suite and architecture have
+/// passed [`coordinate::check`], and are named bare. [`validate_pin`] quotes a
+/// pin's the same way.
 fn validate_plan(
     plan: &Plan,
     suite: &str,
@@ -344,13 +350,13 @@ fn validate_plan(
     }
     if plan.suite != suite {
         return contradiction(format!(
-            "the plan resolves suite {} but the bootstrap is configured for {suite}",
+            "the plan resolves suite {:?} but the bootstrap is configured for {suite}",
             plan.suite,
         ));
     }
     if plan.architecture != architecture {
         return contradiction(format!(
-            "the plan resolves architecture {} but the bootstrap is configured for \
+            "the plan resolves architecture {:?} but the bootstrap is configured for \
              {architecture}",
             plan.architecture,
         ));
@@ -419,13 +425,13 @@ fn validate_pin(
     }
     if pin.suite != suite {
         return contradiction(format!(
-            "the pin resolves suite {} but the bootstrap is configured for {suite}",
+            "the pin resolves suite {:?} but the bootstrap is configured for {suite}",
             pin.suite,
         ));
     }
     if pin.architecture != architecture {
         return contradiction(format!(
-            "the pin resolves architecture {} but the bootstrap is configured for \
+            "the pin resolves architecture {:?} but the bootstrap is configured for \
              {architecture}",
             pin.architecture,
         ));
