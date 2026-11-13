@@ -873,6 +873,12 @@ consumer upgrading can skip it.
   whitespace in it, line breaks included, as one space. A description of
   several lines, which a repository of the caller's own may write, resolved
   and then made the plan impossible to write as a document.
+- A gzip stream followed by zero bytes to its end is read as `gzip` reads it,
+  the zeros as padding. `bsdtar` leaves them when it writes a compressed
+  archive to a pipe, filling its last record, and every such `.tar.gz` was
+  refused as a gzip stream that does not decode. Zeros a member or anything
+  else follows, and other bytes after the last member, are refused as before,
+  as `gzip` complains of them.
 
 ### Internal
 

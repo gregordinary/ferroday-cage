@@ -11,6 +11,8 @@
 //! skippable frame). `ruzstd`'s `StreamingDecoder` decodes a single frame, so
 //! [`ZstdReader`] drives one decoder per frame, and compares a frame's
 //! content checksum, where the frame carries one, as the frame ends.
+//! [`GzipReader`] walks gzip's members itself, so the zero padding a writer
+//! leaves after the last one reads as `gzip` reads it.
 //!
 //! Two of the three formats let a hostile archive name its own memory cost, in
 //! a header far smaller than the allocation it asks for. A zstd frame declares
@@ -30,7 +32,7 @@
 
 use std::cell::Cell;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, BufRead, Read};
 use std::rc::Rc;
 
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
@@ -169,11 +171,9 @@ pub(crate) fn decoder<'r>(mut source: impl Read + 'r) -> io::Result<(Codec, Box<
         // single-member decoder stops silently at the first member's end. A tar
         // reader tolerates a missing terminator at end of input, so a truncated
         // read there provisions an incomplete rootfs without an error.
-        Codec::Gzip => Box::new(guard(
-            "the gzip stream does not decode",
-            stream,
-            flate2::read::MultiGzDecoder::new,
-        )),
+        Codec::Gzip => Box::new(guard("the gzip stream does not decode", stream, |source| {
+            GzipReader::new(io::BufReader::with_capacity(GZIP_BUFFER, source))
+        })),
         // Every block of every stream declares its own dictionary and every one
         // is allocated, so the decode runs under a memory budget the decoder
         // checks against each block header before it allocates. Multiple
@@ -370,6 +370,149 @@ impl<R: Read> Read for Watched<R> {
             self.failed.set(Some(err));
             stand_in
         })
+    }
+}
+
+/// The buffer a gzip stream's compressed bytes are read through, the size
+/// `flate2`'s own readers use.
+const GZIP_BUFFER: usize = 32 * 1024;
+
+/// A gzip reader that decodes every member of a stream, and reads the zero
+/// padding a writer may leave after the last one as `gzip` reads it.
+///
+/// A member decodes through `flate2`'s single-member decoder, which consumes
+/// no more of `source` than the member holds, so where the member ends is where
+/// the walk looks for what follows. `gzip` reads any run of zero bytes from
+/// there to the end of the stream as padding and says nothing about it, and
+/// `bsdtar` leaves exactly that when it writes a compressed archive through a
+/// pipe: it fills its last ten-kibibyte record with zeros after compressing.
+/// `flate2`'s own multi-member reader takes the first zero for the start of
+/// another member and refuses the stream.
+///
+/// What is accepted is what `gzip` 1.12 accepts without a word, as measured,
+/// and nothing more. Zeros, however many, to the end of the stream are read
+/// past. A zero followed by anything else, zeros between two members, and any
+/// other bytes after a member are each a stream `gzip` exits nonzero on, and
+/// each is refused here: the zeros as padding that ends before the stream does,
+/// the rest as the member header they fail to be.
+struct GzipReader<R: BufRead> {
+    state: Gzip<R>,
+}
+
+/// Where a [`GzipReader`] is in its stream.
+enum Gzip<R: BufRead> {
+    /// Before a member: at the start of the stream, or past the end of one.
+    Between {
+        source: R,
+        /// Whether no member has been read yet, where nothing can be padding.
+        first: bool,
+    },
+    /// Inside a member. The decoder is far larger than the other states, so it
+    /// is boxed rather than sizing every state by it.
+    Member(Box<flate2::bufread::GzDecoder<R>>),
+    /// Every member has been read, and whatever followed them was padding.
+    Done,
+    /// A failure ended the stream. A read after one fails again rather than
+    /// answering the end of input that the stream did not reach.
+    Failed,
+}
+
+/// What follows the end of a gzip member, or the start of the stream.
+enum Next {
+    /// Nothing: the stream ends.
+    End,
+    /// A zero byte, which is padding to the end of the stream or nothing.
+    Padding,
+    /// Anything else, which is a member or a malformed stream.
+    Member,
+}
+
+impl<R: BufRead> GzipReader<R> {
+    /// A reader positioned at the start of `source`'s first member.
+    fn new(source: R) -> GzipReader<R> {
+        GzipReader {
+            state: Gzip::Between {
+                source,
+                first: true,
+            },
+        }
+    }
+}
+
+impl<R: BufRead> Read for GzipReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A zero-length request is not end of stream, and the member handover
+        // below reads a zero-byte decoder read as one.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let next = match &mut self.state {
+                Gzip::Done => return Ok(0),
+                Gzip::Failed => {
+                    return Err(io::Error::other(
+                        "the gzip stream ended at an earlier failure",
+                    ));
+                }
+                // A failed read leaves the member in place: an interrupted one
+                // is retried by whoever reads this, from where it stopped.
+                Gzip::Member(member) => {
+                    let read = member.read(buf)?;
+                    if read > 0 {
+                        return Ok(read);
+                    }
+                    // The member has ended, its checksum and length held, and
+                    // its source is positioned just past it.
+                    let Gzip::Member(member) = std::mem::replace(&mut self.state, Gzip::Failed)
+                    else {
+                        unreachable!("the state was just matched as a member");
+                    };
+                    self.state = Gzip::Between {
+                        source: member.into_inner(),
+                        first: false,
+                    };
+                    continue;
+                }
+                Gzip::Between { source, first } => match source.fill_buf()?.first() {
+                    None => Next::End,
+                    Some(0) if !*first => Next::Padding,
+                    Some(_) => Next::Member,
+                },
+            };
+            match next {
+                Next::End => self.state = Gzip::Done,
+                Next::Padding => {
+                    let Gzip::Between { source, .. } = &mut self.state else {
+                        unreachable!("padding is found between members");
+                    };
+                    loop {
+                        let held = source.fill_buf()?;
+                        if held.is_empty() {
+                            break;
+                        }
+                        if held.iter().any(|byte| *byte != 0) {
+                            self.state = Gzip::Failed;
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "zero bytes after the last gzip member are followed by more than \
+                                 zeros",
+                            ));
+                        }
+                        let read = held.len();
+                        source.consume(read);
+                    }
+                    self.state = Gzip::Done;
+                }
+                Next::Member => {
+                    let Gzip::Between { source, .. } =
+                        std::mem::replace(&mut self.state, Gzip::Failed)
+                    else {
+                        unreachable!("a member is found between members");
+                    };
+                    self.state = Gzip::Member(Box::new(flate2::bufread::GzDecoder::new(source)));
+                }
+            }
+        }
     }
 }
 
@@ -789,6 +932,64 @@ mod tests {
         let mut expected = first.clone();
         expected.extend_from_slice(&second);
         assert_eq!(decoded, expected, "both members decoded");
+    }
+
+    /// `bytes` as one gzip member.
+    fn gzip_member(bytes: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn zero_padding_after_the_last_gzip_member_is_read_as_gzip_reads_it() {
+        // What gzip 1.12 reads silently, measured: any run of zeros from the
+        // last member's end to the end of the stream, which bsdtar leaves when
+        // it fills a record after compressing.
+        let first = tar_of("first", b"one\n");
+        let second = tar_of("second", b"two\n");
+        for zeros in [1, 4, 10_117] {
+            let mut stream = gzip_member(&first);
+            stream.resize(stream.len() + zeros, 0);
+            assert_eq!(
+                decode_all(&stream).expect("padding is read past"),
+                first,
+                "{zeros}"
+            );
+
+            let mut stream = gzip_member(&first);
+            stream.extend_from_slice(&gzip_member(&second));
+            stream.resize(stream.len() + zeros, 0);
+            assert_eq!(
+                decode_all(&stream).expect("both members, then padding"),
+                [&first[..], &second].concat(),
+                "{zeros}",
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_after_a_gzip_member_that_gzip_complains_of_are_refused() {
+        // Each of these makes gzip 1.12 exit nonzero, as "trailing garbage
+        // ignored" or "unexpected end of file": zeros that a member follows,
+        // zeros that anything but zeros follows, and bytes that are not zeros
+        // and not a member.
+        let member = gzip_member(&tar_of("first", b"one\n"));
+        let between = [&member[..], &[0u8; 16], &member].concat();
+        let then_junk = [&member[..], &[0u8; 16], b"x"].concat();
+        let junk = [&member[..], b"ABCD"].concat();
+        let lone = [&member[..], &[0xff]].concat();
+        for (case, stream) in [
+            ("zeros between members", between),
+            ("zeros then junk", then_junk),
+            ("junk", junk),
+            ("one stray byte", lone),
+        ] {
+            decode_all(&stream).expect_err(case);
+        }
     }
 
     #[test]
