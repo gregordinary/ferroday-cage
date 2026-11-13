@@ -1808,10 +1808,56 @@ $ fcage --rootfs ./trixie --provision-debian trixie \
 $ fcage --rootfs ./trixie /usr/bin/dpkg --list
 ```
 
-The `--debian-arch`, `--debian-mirror`, `--debian-components`,
-`--debian-include`, `--debian-extract-only`, `--debian-cache`, and
-`--debian-keyring` options map onto the builder. `--debian-include` and
-`--debian-components` take comma-separated lists, and each can be repeated.
+The `--debian-arch`, `--debian-mirror`, `--debian-mirror-fallback`,
+`--debian-components`, `--debian-include`, `--debian-exclude`,
+`--debian-base-priority`, `--debian-extract-only`, `--debian-cache`,
+`--debian-keyring`, `--debian-trust-unsigned`, `--debian-allow-stale-release`,
+`--debian-pre-configure-overlay`, `--debian-identity-map`, and
+`--debian-source-date-epoch` options map onto the builder.
+`--debian-include`, `--debian-exclude`, and `--debian-components` take
+comma-separated lists, and each can be repeated. `--debian-mirror-fallback`
+can be repeated too, and its URLs are tried in order. `--debian-base-priority`
+takes `required`, `important`, `standard`, `optional`, or `extra`.
+`--debian-identity-map` takes a map in the form `--identity-map` does.
+[Trust](#trust) takes an unsigned archive only over `file://` or `https://`,
+and `fcage` fetches nothing over `https://`, so every mirror of a run given
+`--debian-trust-unsigned` is a `file://` one.
+
+`--debian-plan FILE` installs exactly what the plan document `FILE` names,
+resolving nothing, as [Installing a plan without resolving
+again](#installing-a-plan-without-resolving-again) describes.
+`--debian-pin FILE` holds a resolution to the versions `FILE` records, as
+[Holding a resolution to a plan's
+versions](#holding-a-resolution-to-a-plans-versions) describes. A plan has
+no resolution to shape, so `--debian-plan` is refused beside
+`--debian-include`, `--debian-exclude`, `--debian-base-priority`, or
+`--debian-pin`.
+
+`--debian-repository SPEC` adds a [repository](#repositories), merged into the
+same resolution, and can be repeated. `SPEC` is space-separated fields, each
+`key=value` or a bare key:
+
+| Field | Meaning |
+| --- | --- |
+| `suite=S` | The suite the repository publishes. Required. |
+| `mirror=URL` | Its primary mirror. Required, and given once. |
+| `mirror-fallback=URL` | A further mirror for the same repository, tried in order. Repeatable. |
+| `components=A,B` | Its components, `main` where none is named. |
+| `keyring=PATH` | The keyring its release is verified against. |
+| `name=NAME` | The stem of the files it writes into the finished tree. |
+| `trust-unsigned` | Accept the repository unsigned, its mirrors `file://` ones. |
+| `allow-stale-release` | Accept a signed release whose validity has expired. |
+
+A repository names its trust anchor, `keyring=` or `trust-unsigned`. The two
+bare fields take no value: `trust-unsigned=false` is refused rather than read
+as turning the setting off.
+
+```console
+$ fcage --rootfs ./trixie --provision-debian trixie \
+        --debian-include my-package \
+        --debian-repository 'suite=trixie mirror=file:///srv/my-debs
+                             trust-unsigned name=local'
+```
 
 [`keyring`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.keyring
 [`trust_unsigned`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.trust_unsigned

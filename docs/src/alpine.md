@@ -734,12 +734,16 @@ $ fcage --rootfs ./alpine /usr/bin/cc --version
 
 The `--alpine-arch`, `--alpine-mirror`, `--alpine-mirror-fallback`,
 `--alpine-components`, `--alpine-include`, `--alpine-exclude`,
-`--alpine-extract-only`, `--alpine-cache`, `--alpine-keys`,
-`--alpine-pre-configure-overlay`, `--alpine-identity-map`,
+`--alpine-plan`, `--alpine-pin`, `--alpine-extract-only`, `--alpine-cache`,
+`--alpine-keys`, `--alpine-pre-configure-overlay`, `--alpine-identity-map`,
 `--alpine-source-date-epoch` and `--alpine-repository` options map onto the
-builder. `--alpine-include`,
-`--alpine-exclude` and `--alpine-components` take comma-separated lists and may
-be repeated.
+builder. `--alpine-include`, `--alpine-exclude` and `--alpine-components` take
+comma-separated lists and may be repeated. `--alpine-plan FILE` installs
+exactly what the plan document `FILE` names, as [`plan`] does, and
+`--alpine-pin FILE` holds a resolution to the versions `FILE` records, as
+[`pin`] does. `--alpine-plan` is refused beside `--alpine-include`,
+`--alpine-exclude`, or `--alpine-pin`, which shape the resolution a plan
+replaces.
 
 `--alpine-keys` takes `alpine`, `postmarketos`, or a directory read the way
 `apk` reads `/etc/apk/keys`: every file in it is a PEM public key held under its
