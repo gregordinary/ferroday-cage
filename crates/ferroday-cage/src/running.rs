@@ -575,20 +575,22 @@ impl<'obs> Running<'obs> {
         if let Some(foreground) = &mut self.foreground {
             foreground.hand_back();
         }
+        if let Some(pidfd) = self.reap.take() {
+            // Reap the launch stage through its pidfd, so the wait targets
+            // exactly that process and cannot alias a pid a concurrent reaper
+            // freed and the OS recycled. Best-effort: the launch stage exits
+            // right after the status write, and an application-wide child
+            // reaper may even have collected it first. Reaped before the
+            // cgroup below is removed, since the stage joined the cgroup, and
+            // the kernel removes none that still holds a process.
+            let _ = mechanism::reap_via_pidfd(pidfd.as_fd());
+        }
         // The cgroup's own account of the tree, read once the outcome is known
         // and before the cgroup is removed, which dropping it does.
         if let Some(cgroup) = self.cgroup.take()
             && let Some(usage) = &mut self.usage
         {
             usage.absorb(cgroup.usage());
-        }
-        if let Some(pidfd) = self.reap.take() {
-            // Reap the launch stage through its pidfd, so the wait targets
-            // exactly that process and cannot alias a pid a concurrent reaper
-            // freed and the OS recycled. Best-effort: the launch stage exits
-            // right after the status write, and an application-wide child
-            // reaper may even have collected it first.
-            let _ = mechanism::reap_via_pidfd(pidfd.as_fd());
         }
         if let Some(outcome) = self.outcome {
             return Ok(outcome);
