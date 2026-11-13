@@ -684,6 +684,9 @@ consumer upgrading can skip it.
   the parser applies. It left out the cgroup flags and those of the unix-socket
   restriction, which a restriction takes. A flag a restriction refuses is named
   in the refusal, where a family of flags was.
+- `fcage` refuses a launch whose command no sandbox would run, a relative path
+  or a name with no `PATH` to look it up in, before a `--provision-*` flag
+  provisions its root, rather than after.
 
 ### Internal
 

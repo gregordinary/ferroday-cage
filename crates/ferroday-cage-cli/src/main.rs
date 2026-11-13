@@ -5164,11 +5164,14 @@ fn export_rootfs(
 /// Provisions the root filesystem where the run asks for one, then builds and
 /// runs the sandbox, mapping the outcome onto the exit status.
 ///
-/// Everything a launch can be refused for without its root filesystem is
-/// settled before a provisioner runs: the provisioner's own configuration, the
-/// profile, the network stack's configuration, and the standard streams. A
-/// mistake in any of them is then reported at once rather than after a
-/// bootstrap that took minutes, and a refused run provisions nothing.
+/// What `fcage` can refuse a launch for without its root filesystem is settled
+/// before a provisioner runs: the provisioner's own configuration, the
+/// profile and its agreement with the flags, the network stack's
+/// configuration, the standard streams, and the command. A mistake in any of
+/// them is then reported at once rather than after a bootstrap that took
+/// minutes, and a refused run provisions nothing. The rest of the sandbox's
+/// configuration is checked when the sandbox is built, over the root the
+/// provisioner published.
 fn run(options: Options) -> ExitCode {
     if options.restrict {
         return run_restricted(options);
@@ -5241,7 +5244,8 @@ impl Launch {
     /// The builder only records settings, so composing it before the root is
     /// provisioned changes nothing it does. What is checked here is what would
     /// otherwise surface after a bootstrap: the stack's configuration, the
-    /// profile, the profile against the flags, and the standard streams.
+    /// profile, the profile against the flags, the standard streams, and the
+    /// command.
     fn prepare(options: Options) -> Result<Launch, ExitCode> {
         let stack = if options.netstack {
             Some(netstack_from(&options).map_err(fail)?)
@@ -5439,6 +5443,8 @@ impl Launch {
                 .map_err(|output::ReaderGone| ExitCode::from(output::broken_pipe()))?;
         }
 
+        settle_command(&builder).map_err(|error| Failure::Cage(error).report())?;
+
         // Every launch hands the sandbox `fcage`'s own standard streams, unless
         // a terminal replaces all three, so each is judged now and any that is a
         // file is relayed once the launch starts. A terminal without the
@@ -5553,6 +5559,32 @@ fn start<B: Launcher, T>(
     say_unapplied_cgroup(&B::resolved_inputs(&built))
         .map_err(|output::ReaderGone| Failure::ReaderGone)?;
     Ok(spawn(&built)?)
+}
+
+/// Refuses the command `builder` would run where its build would, without the
+/// root filesystem the build needs.
+///
+/// The command's rule is the library's: an absolute path, or a bare name that
+/// path lookup finds a `PATH` entry to search. It asks nothing of the root, and
+/// a build checks it before it reads one, so a launch of this command alone over
+/// an empty root, under the same environment and lookup, is refused for it
+/// exactly where the real build would be. An empty root creates nothing on the
+/// host, so building one has no effect outside this process.
+fn settle_command(builder: &CageBuilder) -> Result<(), Error> {
+    let Some(command) = builder.get_command() else {
+        // No command at all is the build's own refusal, which it makes the same
+        // way here.
+        return Cage::builder().empty_rootfs().build().map(drop);
+    };
+    Cage::builder()
+        .empty_rootfs()
+        .command(command)
+        .args(builder.get_args())
+        .base_env(builder.get_base_env())
+        .envs(builder.get_envs())
+        .path_lookup(builder.get_path_lookup())
+        .build()
+        .map(drop)
 }
 
 /// The host's `TERM`, where a launch passes it to the command.
@@ -8370,9 +8402,10 @@ mod tests {
 
     #[test]
     fn a_launch_is_checked_before_its_root_is_provisioned() {
-        // A typo in a profile, or a stack configuration the stack refuses, is
-        // reported before a provisioner spends minutes on a root the launch
-        // then cannot use, and the root is not provisioned at all.
+        // A typo in a profile, a stack configuration the stack refuses, or a
+        // command no build would run, is reported before a provisioner spends
+        // minutes on a root the launch then cannot use, and the root is not
+        // provisioned at all.
         let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-checked-first");
         let tarball = dir.join("root.tar");
         std::fs::write(
@@ -8387,8 +8420,12 @@ mod tests {
         std::fs::write(&profile, "rootfs = \"/tmp\"\nnot-a-key = 1\n")
             .expect("the profile is written");
         let path = |path: &Path| path.to_str().expect("a UTF-8 scratch path").to_string();
-        for (case, extra) in [
-            ("profile", vec!["--profile".to_string(), path(&profile)]),
+        for (case, extra, command) in [
+            (
+                "profile",
+                vec!["--profile".to_string(), path(&profile)],
+                "/bin/true",
+            ),
             (
                 "stack",
                 vec![
@@ -8396,6 +8433,13 @@ mod tests {
                     "--netstack-no-ipv4".to_string(),
                     "--netstack-no-ipv6".to_string(),
                 ],
+                "/bin/true",
+            ),
+            ("relative command", Vec::new(), "bin/true"),
+            (
+                "unsearchable name",
+                vec!["--path-lookup".to_string(), "--no-base-env".to_string()],
+                "true",
             ),
         ] {
             let rootfs = dir.join(case);
@@ -8406,7 +8450,7 @@ mod tests {
                 path(&tarball),
             ];
             args.extend(extra);
-            args.push("/bin/true".to_string());
+            args.push(command.to_string());
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             assert_eq!(run(*run_options(&args)), ExitCode::from(FAILED), "{case}");
             assert!(
