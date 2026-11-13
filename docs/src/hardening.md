@@ -547,7 +547,8 @@ The cgroup does three things besides the limits:
   `cpu.stat`, its peak memory from `memory.peak`, its peak process count from
   `pids.peak`, and its OOM kills from `memory.events`. These count every
   process the cgroup held, an orphan collected outside the sandbox included,
-  and the launching process's own pages are not among them.
+  and the launching process's own pages are not among them. They are read for
+  a killed sandbox too, whose init a kill ends before it reports.
 - **A kill that reaches every process.** `Running::kill` also writes
   `cgroup.kill`, where the kernel has it (Linux 5.14). Without a PID namespace,
   that is what ends the descendants that left the command's process tree.

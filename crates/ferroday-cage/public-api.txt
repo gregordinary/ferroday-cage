@@ -2935,9 +2935,9 @@ pub ferroday_cage::ResourceUsage::cgroup_peak_memory_bytes: core::option::Option
 pub ferroday_cage::ResourceUsage::cgroup_peak_processes: core::option::Option<u64>
 pub ferroday_cage::ResourceUsage::cgroup_system_time: core::option::Option<core::time::Duration>
 pub ferroday_cage::ResourceUsage::cgroup_user_time: core::option::Option<core::time::Duration>
-pub ferroday_cage::ResourceUsage::peak_rss_bytes: u64
-pub ferroday_cage::ResourceUsage::system_time: core::time::Duration
-pub ferroday_cage::ResourceUsage::user_time: core::time::Duration
+pub ferroday_cage::ResourceUsage::peak_rss_bytes: core::option::Option<u64>
+pub ferroday_cage::ResourceUsage::system_time: core::option::Option<core::time::Duration>
+pub ferroday_cage::ResourceUsage::user_time: core::option::Option<core::time::Duration>
 impl core::marker::Freeze for ferroday_cage::ResourceUsage
 impl core::marker::Send for ferroday_cage::ResourceUsage
 impl core::marker::Sync for ferroday_cage::ResourceUsage

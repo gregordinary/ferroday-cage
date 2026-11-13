@@ -472,11 +472,12 @@ impl<'obs> Running<'obs> {
     /// memory, once a wait has returned the command's outcome.
     ///
     /// [`ResourceUsage`] says which processes it covers. `None` before the
-    /// outcome is known, and for an outcome the supervisor did not report:
-    /// under a PID namespace a [`kill`](Self::kill) ends the init that would
-    /// have reported it, so a killed sandbox has an outcome and no usage.
-    /// Without one the kill ends only the command, and its usage is reported
-    /// as for any other exit.
+    /// outcome is known, and where neither source reported a figure. Under a
+    /// PID namespace a [`kill`](Self::kill) ends the init that would have
+    /// reported the collected processes' figures, so a killed sandbox reports
+    /// only what its cgroup read for the whole tree, and without a cgroup it
+    /// reports no usage at all. Without a PID namespace the kill ends only the
+    /// command, and its usage is reported as for any other exit.
     pub fn usage(&self) -> Option<ResourceUsage> {
         self.usage
     }
@@ -586,11 +587,10 @@ impl<'obs> Running<'obs> {
             let _ = mechanism::reap_via_pidfd(pidfd.as_fd());
         }
         // The cgroup's own account of the tree, read once the outcome is known
-        // and before the cgroup is removed, which dropping it does.
-        if let Some(cgroup) = self.cgroup.take()
-            && let Some(usage) = &mut self.usage
-        {
-            usage.absorb(cgroup.usage());
+        // and before the cgroup is removed, which dropping it does. It stands
+        // alone where the supervisor reported nothing, as after a kill.
+        if let Some(cgroup) = self.cgroup.take() {
+            self.usage = ResourceUsage::joined(self.usage, cgroup.usage());
         }
         if let Some(outcome) = self.outcome {
             return Ok(outcome);

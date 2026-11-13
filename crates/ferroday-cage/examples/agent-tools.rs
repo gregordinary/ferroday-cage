@@ -660,32 +660,39 @@ fn answer(mut connection: TcpStream) {
 }
 
 /// Reports how the command ended and what it used, on standard error.
+///
+/// The whole tree's figures are a cgroup's, and they are reported for a killed
+/// command too. The collected processes' figures are the sandbox's init's,
+/// which a kill ends before it reports.
 fn report(status: ExitStatus, usage: Option<ResourceUsage>) {
     eprintln!("agent-tools: the command's status: {status}");
     let Some(usage) = usage else {
         return;
     };
     let mebibytes = |bytes: u64| bytes as f64 / f64::from(1 << 20);
-    match (
+    if let (Some(user), Some(system), Some(memory), Some(processes)) = (
         usage.cgroup_user_time,
         usage.cgroup_system_time,
         usage.cgroup_peak_memory_bytes,
         usage.cgroup_peak_processes,
     ) {
-        (Some(user), Some(system), Some(memory), Some(processes)) => eprintln!(
+        eprintln!(
             "agent-tools: the whole tree used {:.2} s of user time and {:.2} s of system \
              time, and held at most {:.1} MiB of memory and {processes} processes",
             user.as_secs_f64(),
             system.as_secs_f64(),
             mebibytes(memory),
-        ),
-        _ => eprintln!(
+        );
+    } else if let (Some(user), Some(system), Some(peak)) =
+        (usage.user_time, usage.system_time, usage.peak_rss_bytes)
+    {
+        eprintln!(
             "agent-tools: the command and its descendants used {:.2} s of user time and \
              {:.2} s of system time, and the largest process held {:.1} MiB",
-            usage.user_time.as_secs_f64(),
-            usage.system_time.as_secs_f64(),
-            mebibytes(usage.peak_rss_bytes),
-        ),
+            user.as_secs_f64(),
+            system.as_secs_f64(),
+            mebibytes(peak),
+        );
     }
     match usage.cgroup_oom_kills {
         None | Some(0) => {}

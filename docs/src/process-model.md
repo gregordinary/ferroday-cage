@@ -210,7 +210,9 @@ at all.
 The library does the waiting, so it also reports what the wait would have told
 the caller. [`Running::usage`] returns a [`ResourceUsage`]: user and system
 processor time, and the largest peak resident set size any one process reached.
-[`Output`] carries the same value.
+[`Output`] carries the same value. A sandbox in a [cgroup of its
+own](hardening.md#limits-on-the-whole-tree) also reports what its whole tree
+used, read from the cgroup.
 
 The supervisor reads the figures from the kernel right after it collects the
 command's exit. They cover every process collected by then:
@@ -222,8 +224,9 @@ command's exit. They cover every process collected by then:
   it. An orphan reparents outside the sandbox and is not counted.
 
 A process still running when the command exits is not counted. A kill under a
-PID namespace ends the init before it reports, so a killed sandbox has an
-outcome and no usage.
+PID namespace ends the init before it reports, so a killed sandbox has none of
+these figures. Its cgroup's figures for the whole tree are still reported, and
+a killed sandbox without a cgroup has an outcome and no usage.
 
 The peak resident set has a floor: the resident set the calling process had
 when it launched the sandbox, its heap and stacks above all. The launch forks

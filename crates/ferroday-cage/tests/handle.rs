@@ -177,8 +177,17 @@ fn a_core_dump_is_reported_as_the_kernel_reported_it() {
     assert!(!killed.core_dumped(), "{killed}");
 }
 
+/// The collected processes' processor time, user and system together.
 fn cpu(usage: ferroday_cage::ResourceUsage) -> Duration {
-    usage.user_time + usage.system_time
+    let reported = |time: Option<Duration>| time.expect("the init reports the processor time");
+    reported(usage.user_time) + reported(usage.system_time)
+}
+
+/// The collected processes' peak resident set.
+fn peak(usage: ferroday_cage::ResourceUsage) -> u64 {
+    usage
+        .peak_rss_bytes
+        .expect("the init reports the peak resident set")
 }
 
 #[test]
@@ -194,8 +203,8 @@ fn the_usage_reports_processor_time_and_peak_memory() {
         .output()
         .expect("the sandbox runs to completion")
         .usage
-        .expect("the init reports the usage")
-        .peak_rss_bytes;
+        .expect("the init reports the usage");
+    let floor = peak(floor);
     let buffer_mib = (floor >> 20) + 64;
     // `dd` reads into a buffer of its block size, so the whole buffer is
     // resident; it runs as a child the shell waits for.
@@ -208,10 +217,10 @@ fn the_usage_reports_processor_time_and_peak_memory() {
     let usage = output.usage.expect("the init reports the usage");
     assert!(cpu(usage) >= LOOP_FLOOR, "{usage:?}");
     assert!(
-        usage.peak_rss_bytes >= buffer_mib << 20,
+        peak(usage) >= buffer_mib << 20,
         "a {buffer_mib} MiB buffer over a floor of {floor} bytes: {usage:?}"
     );
-    assert_eq!(usage.peak_rss_bytes % 1024, 0, "{usage:?}");
+    assert_eq!(peak(usage) % 1024, 0, "{usage:?}");
 
     // The handle reports the same figure once its wait has returned.
     let mut running = sh(rootfs, CPU_LOOP).spawn().expect("the sandbox launches");
@@ -361,7 +370,7 @@ fn helper_report_peak() {
         .output()
         .expect("the sandbox runs to completion");
     let usage = output.usage.expect("the init reports the usage");
-    println!("peak={}", usage.peak_rss_bytes);
+    println!("peak={}", peak(usage));
     std::hint::black_box(&held);
 }
 

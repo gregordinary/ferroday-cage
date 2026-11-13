@@ -213,10 +213,10 @@ consumer upgrading can skip it.
   carries it as `usage`. The supervisor reads it after collecting the command's
   exit, so it covers every process collected by then, which under a PID
   namespace includes the orphans the init collected. A kill under a PID
-  namespace reports no usage. The peak is never below the resident set the
-  calling process had at the launch: the command's image before its `execve` is
-  a copy of the caller, and the kernel counts the replaced image's peak toward
-  the command.
+  namespace leaves these three fields `None`. The peak is never below the
+  resident set the calling process had at the launch: the command's image
+  before its `execve` is a copy of the caller, and the kernel counts the
+  replaced image's peak toward the command.
 - `CageBuilder::empty_rootfs` roots a sandbox on an empty tmpfs of its own, for
   a sandbox composed from binds that needs no root directory on the host. The
   launch writes nothing on the host, and the root itself becomes read-only once
@@ -283,7 +283,8 @@ consumer upgrading can skip it.
   it creates any namespace. `cgroup_limit` holds the whole tree to a
   `CgroupLimit`: `memory.max`, `memory.swap.max`, `pids.max`, `cpu.max`, or
   `cpu.weight`. `ResourceUsage` gains the tree's processor time, peak memory,
-  peak process count and OOM kills, read from the cgroup. `Running::kill` and
+  peak process count and OOM kills, read from the cgroup, and reported for a
+  killed sandbox as well. `Running::kill` and
   `KillHandle::kill` also write `cgroup.kill`, which reaches descendants that
   left the command's process tree. The handle removes the cgroup once nothing is
   left in it. A launch the parent cannot serve fails with `Error::CgroupRefused`

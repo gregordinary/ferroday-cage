@@ -281,9 +281,10 @@ agent-tools: the whole tree used 0.16 s of user time and 1.98 s of system time, 
 agent-tools: the memory limit ended a process of the tree
 ```
 
-A command that ignores the request to stop is killed, and has a status and no
-usage. The kill ends the sandbox's init before it reports, as [The process
-model](process-model.md#resource-usage) sets out.
+A command that ignores the request to stop is killed. The kill ends the
+sandbox's init before it reports, as [The process
+model](process-model.md#resource-usage) sets out, so a killed command reports
+the whole tree's figures under a cgroup and none otherwise.
 
 The example exits with the command's own exit code, or 128 plus the number of
 the signal that ended it. A command that outlives `--timeout` gives 124, as

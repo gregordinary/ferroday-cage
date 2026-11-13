@@ -164,10 +164,21 @@ impl fmt::Display for ExitStatus {
 /// memory.
 ///
 /// Reported by [`Running::usage`] and carried on [`Output::usage`] once the
-/// command's exit has been collected. The supervisor reads it from the kernel
-/// (`getrusage` over its reaped children) right after it collects that exit,
-/// so it covers the command and every descendant that had exited and been
-/// collected by then:
+/// command's exit has been collected. It holds two sets of figures, each
+/// `None` where its source reported nothing:
+///
+/// - **The collected processes'**, [`user_time`](Self::user_time),
+///   [`system_time`](Self::system_time) and
+///   [`peak_rss_bytes`](Self::peak_rss_bytes). The supervisor reads them from
+///   the kernel (`getrusage` over its reaped children) right after it collects
+///   the command's exit, so they cover the command and every descendant that
+///   had exited and been collected by then.
+/// - **The whole tree's**, the `cgroup_` fields, read from the sandbox's
+///   cgroup where the launch has one: see
+///   [`CageBuilder::cgroup_parent`](crate::CageBuilder::cgroup_parent).
+///
+/// Which descendants the collected processes' figures cover depends on the PID
+/// namespace:
 ///
 /// - Under a PID namespace, the default, the sandbox's init collects every
 ///   process of the namespace that exits, so a descendant counts whether the
@@ -177,20 +188,23 @@ impl fmt::Display for ExitStatus {
 ///
 /// A process still running when the command exits is not counted: under a PID
 /// namespace the teardown ends it, and without one it runs on outside the
-/// sandbox.
+/// sandbox. A [`kill`](crate::Running::kill) under a PID namespace ends the
+/// init before it reports, so a killed sandbox has none of these figures, and
+/// only a cgroup's account of it remains.
 ///
 /// [`Running::usage`]: crate::Running::usage
 /// [`Output::usage`]: crate::Output::usage
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct ResourceUsage {
-    /// Processor time the processes spent in user mode, summed over them.
-    pub user_time: Duration,
-    /// Processor time the kernel spent on the processes' behalf, summed over
-    /// them.
-    pub system_time: Duration,
-    /// The largest resident set size any one of the processes reached, in
-    /// bytes.
+    /// Processor time the collected processes spent in user mode, summed over
+    /// them. `None` where the supervisor reported no usage.
+    pub user_time: Option<Duration>,
+    /// Processor time the kernel spent on the collected processes' behalf,
+    /// summed over them. `None` where the supervisor reported no usage.
+    pub system_time: Option<Duration>,
+    /// The largest resident set size any one of the collected processes
+    /// reached, in bytes. `None` where the supervisor reported no usage.
     ///
     /// The peak of the largest process, not a sum: two processes that each
     /// held 100 MiB report 100 MiB, whether or not they ran at once. The
@@ -208,10 +222,9 @@ pub struct ResourceUsage {
     /// keeps no figure that leaves the replaced image out and that a process
     /// without privilege can read, so a peak below the launching process's own
     /// is not one this field can show.
-    pub peak_rss_bytes: u64,
+    pub peak_rss_bytes: Option<u64>,
     /// Processor time the whole tree spent in user mode, read from the
-    /// sandbox's cgroup (`cpu.stat`), where the launch has one: see
-    /// [`CageBuilder::cgroup_parent`](crate::CageBuilder::cgroup_parent).
+    /// sandbox's cgroup (`cpu.stat`).
     ///
     /// Where [`user_time`](Self::user_time) counts the processes the sandbox
     /// collected, this counts every process the cgroup held: without a PID
@@ -246,13 +259,70 @@ pub struct ResourceUsage {
 }
 
 impl ResourceUsage {
-    /// Takes in what the sandbox's cgroup read for the whole tree.
-    pub(crate) fn absorb(&mut self, tree: crate::cgroup::CgroupUsage) {
-        self.cgroup_user_time = tree.user_time;
-        self.cgroup_system_time = tree.system_time;
-        self.cgroup_peak_memory_bytes = tree.peak_memory_bytes;
-        self.cgroup_peak_processes = tree.peak_processes;
-        self.cgroup_oom_kills = tree.oom_kills;
+    /// What the supervisor read for the processes it collected, before
+    /// anything is read from a cgroup.
+    pub(crate) fn of_processes(
+        user_time: Duration,
+        system_time: Duration,
+        peak_rss_bytes: u64,
+    ) -> ResourceUsage {
+        ResourceUsage {
+            user_time: Some(user_time),
+            system_time: Some(system_time),
+            peak_rss_bytes: Some(peak_rss_bytes),
+            cgroup_user_time: None,
+            cgroup_system_time: None,
+            cgroup_peak_memory_bytes: None,
+            cgroup_peak_processes: None,
+            cgroup_oom_kills: None,
+        }
+    }
+
+    /// What the supervisor reported, `processes`, joined with what the
+    /// sandbox's cgroup read for the whole tree: `None` only where neither
+    /// holds a figure.
+    ///
+    /// A killed sandbox under a PID namespace has no report from its
+    /// supervisor, and its cgroup's figures are then the whole account.
+    pub(crate) fn joined(
+        processes: Option<ResourceUsage>,
+        tree: crate::cgroup::CgroupUsage,
+    ) -> Option<ResourceUsage> {
+        let crate::cgroup::CgroupUsage {
+            user_time,
+            system_time,
+            peak_memory_bytes,
+            peak_processes,
+            oom_kills,
+        } = tree;
+        let joined = ResourceUsage {
+            cgroup_user_time: user_time,
+            cgroup_system_time: system_time,
+            cgroup_peak_memory_bytes: peak_memory_bytes,
+            cgroup_peak_processes: peak_processes,
+            cgroup_oom_kills: oom_kills,
+            ..processes.unwrap_or(ResourceUsage {
+                user_time: None,
+                system_time: None,
+                peak_rss_bytes: None,
+                cgroup_user_time: None,
+                cgroup_system_time: None,
+                cgroup_peak_memory_bytes: None,
+                cgroup_peak_processes: None,
+                cgroup_oom_kills: None,
+            })
+        };
+        let figures = [
+            joined.user_time.is_some(),
+            joined.system_time.is_some(),
+            joined.peak_rss_bytes.is_some(),
+            joined.cgroup_user_time.is_some(),
+            joined.cgroup_system_time.is_some(),
+            joined.cgroup_peak_memory_bytes.is_some(),
+            joined.cgroup_peak_processes.is_some(),
+            joined.cgroup_oom_kills.is_some(),
+        ];
+        figures.contains(&true).then_some(joined)
     }
 }
 
@@ -292,6 +362,36 @@ mod tests {
         // SIGKILL and SIGTERM, the two a caller most often sees.
         assert_eq!(ExitStatus::signaled(9).shell_code(), 137);
         assert_eq!(ExitStatus::signaled(15).shell_code(), 143);
+    }
+
+    #[test]
+    fn a_cgroup_s_figures_stand_alone_where_the_supervisor_reported_none() {
+        let tree = crate::cgroup::CgroupUsage {
+            user_time: Some(Duration::from_millis(30)),
+            peak_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        let killed = ResourceUsage::joined(None, tree).expect("the cgroup has figures");
+        assert_eq!(killed.user_time, None);
+        assert_eq!(killed.peak_rss_bytes, None);
+        assert_eq!(killed.cgroup_user_time, Some(Duration::from_millis(30)));
+        assert_eq!(killed.cgroup_peak_memory_bytes, Some(1 << 20));
+
+        let reported = ResourceUsage::of_processes(Duration::from_millis(20), Duration::ZERO, 4096);
+        let joined = ResourceUsage::joined(Some(reported), tree).expect("both have figures");
+        assert_eq!(joined.user_time, Some(Duration::from_millis(20)));
+        assert_eq!(joined.cgroup_user_time, Some(Duration::from_millis(30)));
+
+        let unread = crate::cgroup::CgroupUsage::default();
+        assert_eq!(
+            ResourceUsage::joined(None, unread),
+            None,
+            "nothing to report"
+        );
+        assert_eq!(
+            ResourceUsage::joined(Some(reported), unread),
+            Some(reported)
+        );
     }
 
     #[test]

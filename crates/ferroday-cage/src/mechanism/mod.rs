@@ -1328,16 +1328,11 @@ pub(crate) fn decode_status(
     };
     let usage = match word(8) {
         0 => None,
-        1 => Some(ResourceUsage {
-            user_time: Duration::from_micros(wide(12)),
-            system_time: Duration::from_micros(wide(20)),
-            peak_rss_bytes: wide(28).saturating_mul(1024),
-            cgroup_user_time: None,
-            cgroup_system_time: None,
-            cgroup_peak_memory_bytes: None,
-            cgroup_peak_processes: None,
-            cgroup_oom_kills: None,
-        }),
+        1 => Some(ResourceUsage::of_processes(
+            Duration::from_micros(wide(12)),
+            Duration::from_micros(wide(20)),
+            wide(28).saturating_mul(1024),
+        )),
         _ => return None,
     };
     Some((status, usage))
@@ -2722,15 +2717,15 @@ mod tests {
         let decoded = decoded.expect("the usage was written");
         assert_eq!(
             decoded.user_time,
-            Duration::from_micros(usage.utime.micros())
+            Some(Duration::from_micros(usage.utime.micros()))
         );
         assert_eq!(
             decoded.system_time,
-            Duration::from_micros(usage.stime.micros())
+            Some(Duration::from_micros(usage.stime.micros()))
         );
         assert_eq!(
             decoded.peak_rss_bytes,
-            u64::try_from(usage.maxrss).expect("a size is not negative") * 1024
+            Some(u64::try_from(usage.maxrss).expect("a size is not negative") * 1024)
         );
     }
 

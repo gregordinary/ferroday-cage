@@ -139,6 +139,33 @@ fn a_memory_limit_ends_the_tree_and_is_reported_as_an_oom_kill() {
 }
 
 #[test]
+fn a_killed_sandbox_reports_what_its_cgroup_read() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let mut running = sh_in(parent, "exec sleep 30")
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn()
+        .expect("the sandbox launches");
+    running.kill().expect("the kill is delivered");
+    let status = running.wait().expect("the outcome is collected");
+    assert_eq!(status.signal(), Some(9));
+    // The kill ended the init before it reported, so only the cgroup's account
+    // of the tree remains.
+    let usage = running
+        .usage()
+        .expect("the cgroup reports the tree's usage");
+    assert_eq!(usage.user_time, None, "{usage:?}");
+    assert_eq!(usage.peak_rss_bytes, None, "{usage:?}");
+    assert!(usage.cgroup_user_time.is_some(), "{usage:?}");
+    assert!(usage.cgroup_peak_processes.is_some(), "{usage:?}");
+}
+
+#[test]
 fn a_kill_reaches_a_descendant_that_left_the_command_without_a_pid_namespace() {
     if !common::require::userns() {
         return;
