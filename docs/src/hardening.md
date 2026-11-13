@@ -25,8 +25,10 @@ every build.
 ## Landlock filesystem rules
 
 [`landlock_fs`] grants a set of accesses beneath a path. Configuring any grant
-enrolls the sandbox in Landlock: from then on the command reaches a path only
-where a grant allows it, and every other path is denied.
+enrolls the sandbox in Landlock: from then on the command reads, writes, and
+executes files, and lists, creates, removes, and renames entries, only where a
+grant allows it. Landlock does not govern a file's metadata, as [What this
+boundary does not cover](#what-this-boundary-does-not-cover) sets out.
 
 ```rust,no_run
 # use ferroday_cage::{Cage, FsAccess};
@@ -436,7 +438,7 @@ cpu-time = { soft = 10, hard = "unlimited" }
 
 ## What this boundary does not cover
 
-Two things a reader configuring the strongest posture on this page might
+Three things a reader configuring the strongest posture on this page might
 reasonably assume are covered, and are not:
 
 - **Resource governance beyond the per-process axis.** The limits above are
@@ -455,9 +457,18 @@ reasonably assume are covered, and are not:
   The root is mounted `nosuid`, so what the command writes into the tree cannot
   be executed back with elevated ids — but the tree's contents are still the
   command's to change.
+- **A file's metadata, under Landlock.** Landlock governs a file's contents and
+  a directory's entries. It does not govern `chmod`, `chown`, extended
+  attributes, timestamps, `stat`, or `chdir`, which reach any path the command
+  can name. A read-only grant over a writable bind of a home directory still
+  lets the command make the files beneath it world-writable. Two rights arrive
+  late: truncation is governed from Landlock ABI 3 (Linux 6.2), and device
+  `ioctl` from ABI 5 (Linux 6.10). Below those a grant leaves them unrestricted.
+  A tree whose metadata the command must not change is bound read-only, or not
+  at all.
 
-Neither gap is silent: what the layer does enforce, it enforces completely,
-and what it does not, it does not claim.
+None of the three is silent: the layer states what it does not enforce, here
+and beside each control.
 
 ## In a profile
 

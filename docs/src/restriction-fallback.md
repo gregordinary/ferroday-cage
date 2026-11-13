@@ -22,9 +22,11 @@ Landlock or seccomp from the kernel, not user namespaces.
 
 [`Restriction`] mirrors the cage's builder shape. Because there is no
 private rootfs, every path is a host path — including the grants that make
-the command runnable at all: with any Landlock grant configured, everything
-ungranted is denied, so the command's own binary, its interpreter, and its
-libraries need read and execute grants alongside the data paths it works on.
+the command runnable at all: with any Landlock grant configured, reading and
+executing a file needs a grant, so the command's own binary, its interpreter,
+and its libraries need read and execute grants alongside the data paths it
+works on. As in a sandbox, Landlock leaves a file's metadata ungoverned, as
+[Hardening](hardening.md#what-this-boundary-does-not-cover) sets out.
 
 A grant's path resolves as the host resolves it, through symbolic links. A grant
 on a merged-`/usr` host's `/lib` therefore covers `/usr/lib`. A sandbox refuses a

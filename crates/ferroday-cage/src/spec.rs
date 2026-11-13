@@ -3211,13 +3211,20 @@ impl CageBuilder {
     /// Grants `access` beneath `path` under a Landlock ruleset.
     ///
     /// Configuring any grant enrolls the sandbox in Landlock: the command may
-    /// then reach a path only where a grant allows it, and everything else on
-    /// the filesystem is denied. `path` is a sandbox path (absolute, resolved
-    /// after the pivot), so grants describe the mounted view — the rootfs, the
-    /// binds, and the `/proc`, `/dev`, and `/tmp` mounts alike. A grant may name
-    /// a single file or device node as well as a directory; there it allows only
-    /// the rights that act on a file, since there are no entries to list,
-    /// create, or remove.
+    /// then read, write, and execute files, and list, create, remove, and
+    /// rename entries, only where a grant allows it. `path` is a sandbox path
+    /// (absolute, resolved after the pivot), so grants describe the mounted
+    /// view — the rootfs, the binds, and the `/proc`, `/dev`, and `/tmp` mounts
+    /// alike. A grant may name a single file or device node as well as a
+    /// directory; there it allows only the rights that act on a file, since
+    /// there are no entries to list, create, or remove.
+    ///
+    /// Landlock does not govern a file's metadata. `chmod`, `chown`, extended
+    /// attributes, timestamps, `stat`, and `chdir` reach any path the command
+    /// can name, so a read-only grant over a writable bind still lets the
+    /// command change the modes and owners beneath it. Truncation is governed
+    /// from Landlock ABI 3 and device `ioctl` from ABI 5; an older kernel
+    /// leaves them unrestricted.
     ///
     /// The path names its target itself, without a symbolic link at any
     /// component, the last included. A link in a root that is not fully trusted

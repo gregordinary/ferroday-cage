@@ -511,9 +511,9 @@ impl RestrictionBuilder {
     /// ruleset.
     ///
     /// Configuring any grant enrolls the command in Landlock: it may then
-    /// reach a path only where a grant allows it, and everything else on the
-    /// host filesystem is denied. A runnable command therefore needs grants
-    /// covering its own binary and libraries — commonly
+    /// read, write, and execute files, and list, create, remove, and rename
+    /// entries, only where a grant allows it. A runnable command therefore
+    /// needs grants covering its own binary and libraries — commonly
     /// `FsAccess::READ | FsAccess::EXECUTE` on `/usr`, `/bin`, and `/lib` —
     /// alongside the data paths it works on. A grant may name a single file or
     /// device node as well as a directory; there it allows only the rights that
@@ -524,6 +524,11 @@ impl RestrictionBuilder {
     /// therefore covers whatever a link on its path points at when the command
     /// starts, including a link an earlier run left in a directory it could
     /// write.
+    ///
+    /// Landlock does not govern a file's metadata, as
+    /// [`CageBuilder::landlock_fs`](crate::CageBuilder::landlock_fs) states:
+    /// `chmod`, `chown`, extended attributes, timestamps, `stat`, and `chdir`
+    /// reach any host path the command can name.
     ///
     /// The ruleset is enforced on a kernel that offers Landlock, best-effort
     /// down to the kernel's supported ABI. A filesystem grant keeps its ABI-1
