@@ -452,6 +452,17 @@ consumer upgrading can skip it.
   digest the file no longer had, so a bootstrap from them failed its digest
   check. A refused publish changes nothing: every `.deb` is staged and checked
   before any lands.
+- A layered Debian resolution, through `resolve_layer` or `stage_layer`, no
+  longer reports a plan whose upgrades break a dependency of another selected
+  package or of a package the base keeps. Upgrading a base package replaces the
+  base's version, together with every name that version supplied, its own and
+  those it provides. A base package whose dependency an upgrade breaks is
+  upgraded too, where apt would upgrade it. A dependency still unmet fails the
+  resolution with `DebianError::Resolve`, whichever order `include` names
+  packages in, and its `DebianEvent::Unsatisfiable` names the package, the
+  dependency, and the upgrade that replaced what met it. Such a plan was
+  installed under dpkg's `--force-depends`, leaving the root with a package
+  whose dependency nothing satisfied.
 - An Alpine bootstrap refuses two packages that ship one path as a directory
   and as an entry that is not one, whichever is unpacked first and whatever
   their `replaces` say, as `apk` does. The later one previously replaced the

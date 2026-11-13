@@ -209,13 +209,16 @@ an `include`.
 
 ### What a resolution refuses
 
-A dependency nothing can satisfy fails the resolution. Four cases reach it:
+A dependency nothing can satisfy fails the resolution. Five cases reach it:
 
 - A name no configured archive carries.
 - A name carried only at a version the declared constraint rules out.
 - One an exclusion removed that a hard dependency needed.
 - One a [pin](#holding-a-resolution-to-a-plans-versions) holds at a version the
   declared constraint rules out.
+- In a [layered build](#layered-build-roots), one that nothing the base keeps and
+  nothing the increment installs satisfies, such as a version the increment
+  replaces.
 
 Installing anyway would succeed, since dpkg configures with `--force-depends`,
 and leave a root whose packages cannot work. The resolution refuses instead.
@@ -1395,6 +1398,20 @@ over only the delta. Most components share build-dependencies already present in
 `base + toolchain`, so that delta is small, which is the point.
 [`resolve_layer`] previews it without staging, the layered counterpart of
 [`resolve`], so a build-root cache can be keyed on the increment inline.
+
+A base package the increment needs a newer version of is upgraded into the
+increment, as apt would upgrade it. The upgrade replaces the base's version, and
+takes with it every name that version supplied, its own and the ones it
+`Provides`. The resolution holds the root it produces to every hard dependency
+it carries: of each package the increment installs, and of each package the base
+keeps. A package the base keeps whose dependency an upgrade breaks is upgraded
+too, where the archives offer a version apt would take. A layer removes nothing
+from its base, so a dependency that is still unmet refuses the resolution. The
+refusal names the package whose dependency it is, the dependency as declared,
+what the root holds for it, and the upgrade that took the old version away. A
+dependency is held to the finished root, so it is refused whether the resolution
+meets it before or after the upgrade that breaks it, whatever order the install
+list names packages in.
 
 A plan reproduces a layer exactly as it reproduces a whole root. Keep the one
 [`resolve_layer`] returned and hand it back through [`plan`] alongside the same

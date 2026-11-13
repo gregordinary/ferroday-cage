@@ -13,26 +13,35 @@
 //! orchestration lives in the [parent module](super) beside the full-bootstrap
 //! pipeline it reuses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use super::DebianError;
-use super::index::parse_provides;
+use super::index::{Dependency, Provided, is_package_name, parse_provides, parse_relations};
 use crate::provision::document;
 
-/// What a base layer supplies, as the resolver has to ask about it.
+/// What a base layer supplies, and what its packages need, as the resolver has
+/// to ask about it.
 ///
-/// Two questions, so two maps. *Does the base supply this name, at a version a
-/// dependency accepts?* is asked of every name, real or virtual, each mapped
-/// to every version it is available at. One name can carry more than one
-/// version because a name can be supplied more than one way — as a real
-/// package, and as a virtual that one or more packages `Provides`. A `None`
-/// version is a bare `Provides`, which Debian Policy 7.5 says satisfies only
-/// an unversioned dependency.
+/// *Does the base supply this name, at a version a dependency accepts?* is
+/// asked of every name, real or virtual, each mapped to every [`Supply`] of it.
+/// One name can be supplied more than one way — as a real package, and as a
+/// virtual that one or more packages `Provides` — so it can be supplied at more
+/// than one version. A `None` version is a bare `Provides`, which Debian Policy
+/// 7.5 says satisfies only an unversioned dependency.
 ///
-/// *Which version of this package is installed?* is asked of real packages
-/// alone, since it decides what a dependency the base does not meet may
-/// upgrade the package to, and a virtual name is not a package to upgrade.
+/// Each supply records the package it comes from, because an increment can
+/// replace that package. Selecting another version of a name the base has
+/// installed replaces the installed version, and everything that version
+/// supplied goes with it, its own name and its `Provides` alike. The resolver
+/// asks which supplies its selection leaves standing.
+///
+/// *Which version of this package is installed, and what does it depend on?*
+/// is asked of real packages alone. The version decides what a dependency the
+/// base does not meet may upgrade the package to, and a virtual name is not a
+/// package to upgrade. The dependencies, its `Pre-Depends` and its `Depends`,
+/// are what a package the base keeps needs of the root the increment is
+/// installed into.
 ///
 /// The versions matter because a base is provisioned once and resolved against
 /// later: `libc6 (>= 2.43)` is not answered by "the base has a libc6", and
@@ -40,31 +49,78 @@ use crate::provision::document;
 /// fail the compile.
 #[derive(Debug, Default)]
 pub(super) struct InstalledSet {
-    supplies: HashMap<String, Vec<Option<String>>>,
-    installed: HashMap<String, String>,
+    supplies: HashMap<String, Vec<Supply>>,
+    /// Every installed package this layer can name, in name order, so a check
+    /// over all of them meets them in an order nothing else decides.
+    packages: BTreeMap<String, Installed>,
+}
+
+/// One way a base layer supplies a name: as the package of that name, or as a
+/// virtual that a package `Provides`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Supply {
+    /// The installed package the supply comes from: the name itself for a real
+    /// package, and the providing package for a virtual.
+    pub(super) provider: String,
+    /// The version the name is supplied at, `None` for a bare `Provides`.
+    pub(super) version: Option<String>,
+}
+
+/// One installed package of a base layer.
+#[derive(Debug, Default)]
+struct Installed {
+    /// The version, where the status database states one.
+    version: Option<String>,
+    /// Its `Pre-Depends`, then its `Depends`.
+    relations: Vec<Dependency>,
 }
 
 impl InstalledSet {
-    /// Records the real package `name` installed at `version`, which it also
-    /// supplies. A stanza with no `Version`, or one outside the alphabet
+    /// Records the real package `name` installed at `version` and depending
+    /// on `relations`. It also supplies its own name.
+    ///
+    /// `name` is one [`is_package_name`] admits: a refusal names a package
+    /// whose dependency the merged root leaves unmet bare, and this is the
+    /// list of packages the root is checked for.
+    ///
+    /// A stanza with no `Version`, or one outside the alphabet
     /// [`version::is_version`](super::version::is_version) admits, is malformed
     /// rather than versionless, and is recorded as a bare supply: it still
     /// satisfies unversioned dependencies, no versioned one silently, and is no
     /// version to upgrade from or to name in a refusal.
-    pub(super) fn install(&mut self, name: &str, version: Option<&str>) {
-        self.supply(name, version);
-        if let Some(version) = version {
-            self.installed.insert(name.to_string(), version.to_string());
+    ///
+    /// A name recorded twice, as a status database records a package
+    /// installed for two architectures, keeps the first version stated and
+    /// both stanzas' relations.
+    pub(super) fn install(
+        &mut self,
+        name: &str,
+        version: Option<&str>,
+        relations: Vec<Dependency>,
+    ) {
+        self.supply(name, name, version);
+        let installed = self.packages.entry(name.to_string()).or_default();
+        if installed.version.is_none() {
+            installed.version = version.map(str::to_string);
         }
+        installed.relations.extend(relations);
     }
 
-    /// Records that the base supplies `name` at `version`, `None` for a bare
-    /// `Provides`.
-    pub(super) fn supply(&mut self, name: &str, version: Option<&str>) {
+    /// Records that the installed package `provider` supplies `provided`.
+    pub(super) fn provide(&mut self, provider: &str, provided: &Provided) {
+        self.supply(&provided.name, provider, provided.version.as_deref());
+    }
+
+    /// Records that the installed package `provider` supplies `name` at
+    /// `version`, `None` for a bare `Provides`.
+    pub(super) fn supply(&mut self, name: &str, provider: &str, version: Option<&str>) {
         self.supplies
             .entry(name.to_string())
             .or_default()
-            .push(version.map(str::to_string));
+            .push(Supply {
+                provider: provider.to_string(),
+                version: version.map(str::to_string),
+            });
     }
 
     /// Whether the base supplies `name` at all, by a real package or a virtual.
@@ -72,15 +128,25 @@ impl InstalledSet {
         self.supplies.contains_key(name)
     }
 
-    /// Every version the base supplies `name` at, or `None` where it supplies
-    /// no such name.
-    pub(super) fn supplied(&self, name: &str) -> Option<&[Option<String>]> {
-        self.supplies.get(name).map(Vec::as_slice)
+    /// Every supply of `name` the base holds, empty where it supplies no such
+    /// name.
+    pub(super) fn supplied(&self, name: &str) -> &[Supply] {
+        self.supplies.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// The version of the real package `name` the base has installed.
     pub(super) fn installed(&self, name: &str) -> Option<&str> {
-        self.installed.get(name).map(String::as_str)
+        self.packages
+            .get(name)
+            .and_then(|installed| installed.version.as_deref())
+    }
+
+    /// Every real package [`install`](Self::install) recorded, with its
+    /// `Pre-Depends` and `Depends`, in name order.
+    pub(super) fn packages(&self) -> impl Iterator<Item = (&str, &[Dependency])> {
+        self.packages
+            .iter()
+            .map(|(name, installed)| (name.as_str(), installed.relations.as_slice()))
     }
 
     /// Whether the base supplies nothing at all.
@@ -89,12 +155,14 @@ impl InstalledSet {
     }
 }
 
-/// Reads a base layer's already-installed set: every configured package and the
-/// virtual packages those packages provide, each with the version it supplies.
+/// Reads a base layer's already-installed set: every configured package, with
+/// its dependencies, and the virtual packages those packages provide, each with
+/// the version it supplies and the package supplying it.
 ///
-/// The set seeds a delta resolution as pre-satisfied, so the increment
-/// [`Debian::stage_layer`] resolves closes only over packages the base does not
-/// carry. It is read from the base's own dpkg status database
+/// The set seeds a delta resolution, so the increment [`Debian::stage_layer`]
+/// resolves closes only over packages the base does not carry, except where it
+/// replaces one, and holds what the base keeps to working beside the increment.
+/// It is read from the base's own dpkg status database
 /// (`<base>/var/lib/dpkg/status`), keeping the ids the resolver assumes and the
 /// files the base actually holds in agreement, and requiring the caller to
 /// thread nothing.
@@ -135,7 +203,15 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
 
     let mut installed = InstalledSet::default();
     for stanza in document::parse(&text) {
-        let (Some(name), Some(status)) = (stanza.get("Package"), stanza.get("Status")) else {
+        let [name, status, version, provides, pre_depends, depends] = stanza.get_each([
+            "Package",
+            "Status",
+            "Version",
+            "Provides",
+            "Pre-Depends",
+            "Depends",
+        ]);
+        let (Some(name), Some(status)) = (name, status) else {
             continue;
         };
         // Anything short of present-and-configured is not a dependency the
@@ -145,20 +221,29 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
         }
         // A version dpkg would not have written is read as none: the database
         // is the base's own text, which its scripts could write too.
-        let version = stanza.get("Version");
-        installed.install(
-            &name,
-            version
-                .as_deref()
-                .filter(|version| super::version::is_version(version)),
-        );
+        let version = version
+            .as_deref()
+            .filter(|version| super::version::is_version(version));
+        if is_package_name(&name) {
+            let relations = [pre_depends, depends]
+                .into_iter()
+                .flatten()
+                .flat_map(|value| parse_relations(&value))
+                .collect();
+            installed.install(&name, version, relations);
+        } else {
+            // A name policy does not admit still supplies itself, so nothing
+            // installs it again. It is no package this layer names, though: no
+            // index this layer reads offers it, so no increment replaces it,
+            // and a refusal names a package bare, so its own dependencies are
+            // left out of the merged root's check.
+            installed.supply(&name, &name, version);
+        }
         // A package's provided virtuals satisfy dependencies named against them,
         // so folding them into the same map lets one lookup in the resolver
         // cover a base that satisfies a group either by real name or by virtual.
-        if let Some(provides) = stanza.get("Provides") {
-            for provided in parse_provides(&provides) {
-                installed.supply(&provided.name, provided.version.as_deref());
-            }
+        for provided in provides.iter().flat_map(|value| parse_provides(value)) {
+            installed.provide(&name, &provided);
         }
     }
 
@@ -184,6 +269,28 @@ mod tests {
         std::fs::create_dir_all(&dpkg).unwrap();
         std::fs::write(dpkg.join("status"), status).unwrap();
     }
+
+    /// Each supply of `name` as `(provider, version)`, for an assertion.
+    fn supplies<'s>(set: &'s InstalledSet, name: &str) -> Vec<(&'s str, Option<&'s str>)> {
+        set.supplied(name)
+            .iter()
+            .map(|supply| (supply.provider.as_str(), supply.version.as_deref()))
+            .collect()
+    }
+
+    /// Each installed package's relations, rendered by name, for an assertion.
+    fn relations(set: &InstalledSet) -> Vec<(&str, Vec<Vec<&str>>)> {
+        set.packages()
+            .map(|(name, relations)| {
+                let groups = relations
+                    .iter()
+                    .map(|group| group.iter().map(|atom| atom.name.as_str()).collect())
+                    .collect();
+                (name, groups)
+            })
+            .collect()
+    }
+
     #[test]
     fn read_installed_set_collects_configured_names_and_provides() {
         // Two configured packages, one carrying a Provides, and one half-installed
@@ -197,12 +304,13 @@ mod tests {
              Package: half\nStatus: install ok unpacked\nVersion: 1.0\n",
         );
         let set = read_installed_set(&dir).expect("the status database reads");
-        assert_eq!(set.supplied("libc6").unwrap(), &[Some("2.41".to_string())]);
-        assert_eq!(set.supplied("mawk").unwrap(), &[Some("1.3".to_string())]);
+        assert_eq!(supplies(&set, "libc6"), [("libc6", Some("2.41"))]);
+        assert_eq!(supplies(&set, "mawk"), [("mawk", Some("1.3"))]);
         // The virtual is present, and bare: `Provides: awk` names no version,
         // so it answers an unversioned dependency and no versioned one. It is
-        // no installed package, so nothing upgrades it.
-        assert_eq!(set.supplied("awk").unwrap(), &[None]);
+        // no installed package, so nothing upgrades it, and it comes from mawk,
+        // so an increment replacing mawk takes it away.
+        assert_eq!(supplies(&set, "awk"), [("mawk", None)]);
         assert_eq!(set.installed("awk"), None);
         assert_eq!(set.installed("libc6"), Some("2.41"));
         assert!(
@@ -221,7 +329,7 @@ mod tests {
             &format!("Package: libfoo1\nStatus: install ok installed\nVersion: {hostile}\n"),
         );
         let set = read_installed_set(&dir).expect("the status database reads");
-        assert_eq!(set.supplied("libfoo1").unwrap(), &[None]);
+        assert_eq!(supplies(&set, "libfoo1"), [("libfoo1", None)]);
         assert_eq!(set.installed("libfoo1"), None);
     }
 
@@ -234,12 +342,60 @@ mod tests {
              Provides: libfoo (= 1.4)\n",
         );
         let set = read_installed_set(&dir).expect("the status database reads");
-        assert_eq!(
-            set.supplied("libfoo1").unwrap(),
-            &[Some("1.4-2".to_string())]
-        );
-        assert_eq!(set.supplied("libfoo").unwrap(), &[Some("1.4".to_string())]);
+        assert_eq!(supplies(&set, "libfoo1"), [("libfoo1", Some("1.4-2"))]);
+        assert_eq!(supplies(&set, "libfoo"), [("libfoo1", Some("1.4"))]);
         assert_eq!(set.installed("libfoo"), None);
+    }
+
+    #[test]
+    fn a_configured_package_records_its_pre_depends_then_its_depends() {
+        // What a package the base keeps needs of the merged root, read with the
+        // index's own relation grammar: alternatives, constraints, and an
+        // architecture qualifier parsed away. A package short of configured
+        // records nothing.
+        let dir = Scratch::for_test("layer", "relations");
+        base_with_status(
+            &dir,
+            "Package: libc-bin\nStatus: install ok installed\nVersion: 2.41-10\n\
+             Depends: libc6 (>> 2.41), libc6 (<< 2.42)\nPre-Depends: perl:any | awk\n\n\
+             Package: libc6\nStatus: install ok installed\nVersion: 2.41-10\n\n\
+             Package: half\nStatus: install ok unpacked\nVersion: 1.0\nDepends: libc6\n",
+        );
+        let set = read_installed_set(&dir).expect("the status database reads");
+        assert_eq!(
+            relations(&set),
+            [
+                (
+                    "libc-bin",
+                    vec![vec!["perl", "awk"], vec!["libc6"], vec!["libc6"]]
+                ),
+                ("libc6", vec![]),
+            ],
+        );
+        let (_, libc_bin) = set.packages().next().unwrap();
+        let constraint = libc_bin[2][0].constraint.as_ref().unwrap();
+        assert_eq!(constraint.to_string(), "<< 2.42");
+    }
+
+    #[test]
+    fn a_name_policy_does_not_admit_supplies_itself_and_is_no_package() {
+        // Such a name reaches no index this layer reads, so nothing replaces
+        // it, and a refusal could not name it bare. It still answers what it
+        // supplies, so nothing installs it again.
+        let dir = Scratch::for_test("layer", "unnamed");
+        let hostile = crate::failure::hostile::TEXT;
+        base_with_status(
+            &dir,
+            &format!(
+                "Package: {hostile}\nStatus: install ok installed\nVersion: 1.0\n\
+                 Depends: libc6 (= 9)\nProvides: awk\n"
+            ),
+        );
+        let set = read_installed_set(&dir).expect("the status database reads");
+        assert_eq!(supplies(&set, hostile), [(hostile, Some("1.0"))]);
+        assert_eq!(supplies(&set, "awk"), [(hostile, None)]);
+        assert_eq!(set.installed(hostile), None);
+        assert_eq!(set.packages().count(), 0);
     }
 
     #[test]

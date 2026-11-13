@@ -777,8 +777,9 @@ pub(crate) fn sources<'a>(
     })
 }
 
-/// Parses a `Depends`/`Pre-Depends` value into a list of relationships.
-fn parse_relations(value: &str) -> Vec<Dependency> {
+/// Parses a `Depends`/`Pre-Depends` value into a list of relationships, as an
+/// index states one or a status database records it.
+pub(super) fn parse_relations(value: &str) -> Vec<Dependency> {
     value
         .split(',')
         .filter_map(|group| {

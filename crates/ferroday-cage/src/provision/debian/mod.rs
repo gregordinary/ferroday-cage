@@ -591,6 +591,15 @@ impl Debian {
     /// in the plan is archive-verified, exactly as [`resolve`](Self::resolve)
     /// reports.
     ///
+    /// A base package the increment upgrades is replaced, along with every name
+    /// the replaced version supplied, and the plan is held to every hard
+    /// dependency of the root it produces: those of the packages it installs,
+    /// and those of the packages the base keeps. A package the base keeps
+    /// whose dependency an upgrade breaks is upgraded with it where apt would
+    /// upgrade it. What is still unmet is refused, reported as a
+    /// [`DebianEvent::Unsatisfiable`] like any other refusal, since a layer
+    /// removes nothing from its base.
+    ///
     /// Like [`resolve`](Self::resolve) it downloads no package and runs nothing,
     /// so it needs neither a `qemu-user` binfmt handler nor an establishable
     /// identity map; it reads only the base's status database and the archives'
@@ -1377,7 +1386,8 @@ impl DebianBuilder {
     /// previews the same increment. The base's already-installed set is read
     /// from its own dpkg status database, so the resolver treats every package
     /// the base configured — and the virtuals they provide — as satisfied and
-    /// closes over only the delta.
+    /// closes over only the delta, holding what the base keeps to working
+    /// beside it.
     ///
     /// The base and its layers must share a suite and architecture, and must use
     /// the same [`identity_map`](Self::identity_map): a base configured under the
@@ -1921,9 +1931,11 @@ fn report_refusals(
 /// The caller's packages are closed against the merged index while
 /// `assume_installed` — the base layer's configured set, and the virtuals it
 /// provides — is treated as satisfied, so only the delta the base does not
-/// already carry is selected. There is no base-system seed and no `apt`: the
-/// base supplies both. This is [`resolve_packages`]'s read-merge-and-report
-/// structure with the priority seed replaced by the base's installed set.
+/// already carry is selected, and the root base and delta make together is
+/// held to every dependency it carries, as [`resolve::resolve_seeded`]
+/// describes. There is no base-system seed and no `apt`: the base supplies
+/// both. This is [`resolve_packages`]'s read-merge-and-report structure with
+/// the priority seed replaced by the base's installed set.
 fn resolve_delta(
     config: &Bootstrap<'_>,
     assume_installed: &InstalledSet,
@@ -3132,25 +3144,27 @@ pub enum DebianEvent<'a> {
     Resolving,
     /// A dependency the resolver could not satisfy: a name no configured
     /// archive carries, a name it carries only at a version the constraint
-    /// rules out, one an exclusion removed that a hard dependency needed, or
-    /// one a [`pin`](DebianBuilder::pin) holds at a version that cannot answer
-    /// what was asked of it.
+    /// rules out, one an exclusion removed that a hard dependency needed, one a
+    /// [`pin`](DebianBuilder::pin) holds at a version that cannot answer what
+    /// was asked of it, or, in a layered build, one that nothing the base keeps
+    /// and nothing the increment installs satisfies.
     ///
     /// Reported for every such refusal before the run fails, so a caller fixing
     /// an install list sees the whole list rather than the first entry of it.
     /// The failure that follows carries the same set as one sentence.
     #[non_exhaustive]
     Unsatisfiable {
-        /// What could not be supplied: the dependency group as the archive
-        /// declares it, alternatives included, or the package name where the
-        /// caller named one directly.
+        /// What could not be supplied: the dependency group as the archive,
+        /// or a layered build's base, declares it, alternatives included, or
+        /// the package name where the caller named one directly.
         requirement: &'a str,
-        /// Who asked for it: the selected package whose dependency it was, or
-        /// the install list.
+        /// Who asked for it: the selected package whose dependency it was, a
+        /// package a layered build's base keeps, or the install list.
         required_by: &'a str,
         /// What the wall was, as the clause following "and": that the name is
         /// absent, that it is excluded, what is available instead of what
-        /// the constraint asked for, or the version the pin holds it at.
+        /// the constraint asked for, the version the pin holds it at, or the
+        /// upgrade that replaced what satisfied it.
         reason: &'a str,
     },
     /// The dependency closure has been resolved, carrying the plan the

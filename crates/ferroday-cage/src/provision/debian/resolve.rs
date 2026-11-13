@@ -21,6 +21,13 @@
 //! dependency dropped here was never selected, so nothing downstream is in a
 //! position to notice.
 //!
+//! The same holds for a layered resolve's root as a whole. dpkg configures an
+//! increment with `--force-depends`, so the resolve is the only step that can
+//! notice an upgrade in the increment breaking a package the base keeps, or a
+//! dependency the base answered until the upgrade replaced what answered it.
+//! [`resolve_seeded`] therefore holds the merged root to every hard dependency
+//! it carries before it reports a selection.
+//!
 //! Every such refusal is collected and reported, and the resolution fails once
 //! with all of them named. A caller correcting an install list wants the whole
 //! list of what the archive cannot give them; learning them one run at a time
@@ -36,7 +43,8 @@
 //! release where that meets them, as apt's `pkgDepCache::SetCandidateRelease`
 //! does. A layered resolve takes a name its base has installed at the
 //! installed version, and upgrades it only where a dependency needs a newer
-//! one and apt would take that newer one over the installed one.
+//! one, or an upgrade of another package breaks one of its own, and apt would
+//! take that newer one over the installed one.
 //!
 //! A name a [pin](super::DebianBuilder::pin) holds resolves to its pinned
 //! version by every one of those routes, since the [`Index`] answers each of
@@ -50,7 +58,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use super::index::{DepAtom, Dependency, Index, Package};
-use super::layer::InstalledSet;
+use super::layer::{InstalledSet, Supply};
 use super::pin::{UnheldPin, UnheldReason};
 use super::version::Constraint;
 
@@ -97,7 +105,9 @@ pub(crate) enum Refusal {
     },
     /// No alternative of a hard dependency group can be satisfied: the archive
     /// offers none of the names, or offers them only at versions the declared
-    /// constraint rules out, and the base layer supplies none either.
+    /// constraint rules out, and the base layer supplies none either. Where the
+    /// base supplied one until the increment replaced the package supplying it,
+    /// the refusal is [`Broken`](Self::Broken) instead.
     ///
     /// Reported rather than dropped. dpkg configures with `--force-depends`, so
     /// installing anyway would succeed and leave a root whose packages cannot
@@ -128,24 +138,79 @@ pub(crate) enum Refusal {
         /// The pin, and what was asked of it.
         unheld: UnheldPin,
     },
+    /// A layered resolution's root leaves a hard dependency unmet: nothing the
+    /// base keeps and nothing the increment installs satisfies it.
+    ///
+    /// The increment replaces each base package it selects another version of,
+    /// and everything the replaced version supplied goes with it, its own name
+    /// and its `Provides` alike. A dependency the replaced version met is then
+    /// met only where what replaces it, or something else in the root, meets
+    /// it too. A package the base keeps whose dependency the increment breaks
+    /// is upgraded with it where apt would upgrade it, and refused here where
+    /// nothing would: a layer installs over its base and removes nothing from
+    /// it.
+    Broken {
+        /// The dependency group as declared, alternatives included.
+        requirement: String,
+        /// Whose dependency it is: a package the increment selects, a package
+        /// the base keeps, or the install list, for an entry the base answered.
+        required_by: String,
+        /// What the root holds for the group's names, when it holds anything:
+        /// what the increment installs, and what the base keeps.
+        offered: Option<String>,
+        /// The replacements that took away a supply meeting the group, in name
+        /// order. Empty where none did, which is a package the base keeps
+        /// whose dependency the base itself left unmet.
+        replaced: Vec<Replacement>,
+    },
+}
+
+/// A base package an increment replaces, as [`Refusal::Broken`] names it.
+///
+/// Each part is named bare. The name and the version taken in its place are
+/// the index's, held to policy's alphabet as the index is read; the version
+/// replaced is the base's status database's, held to the same alphabet as the
+/// database is read, and absent where it states none that alphabet admits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Replacement {
+    /// The package.
+    pub(crate) package: String,
+    /// The version the base has installed, where its status database states
+    /// one.
+    pub(crate) installed: Option<String>,
+    /// The version the increment installs in its place.
+    pub(crate) version: String,
+}
+
+impl fmt::Display for Replacement {
+    /// Writes `libcore 1.0 with 2.0`, or `libcore with 2.0` where the base's
+    /// version is unknown, for the clause a refusal composes it into.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.installed {
+            Some(installed) => write!(f, "{} {installed} with {}", self.package, self.version),
+            None => write!(f, "{} with {}", self.package, self.version),
+        }
+    }
 }
 
 impl Refusal {
-    /// What could not be supplied: the dependency group as the archive declares
-    /// it, or the package name where the caller named one directly.
+    /// What could not be supplied: the dependency group as the archive, or a
+    /// base layer's status database, declares it, or the package name where
+    /// the caller named one directly.
     pub(crate) fn requirement(&self) -> &str {
         match self {
             Refusal::PackageNotFound { name } | Refusal::ExcludedAndIncluded { name } => name,
             Refusal::NotInRelease { entry, .. } => entry,
             Refusal::ExcludedButRequired { package, .. } => package,
-            Refusal::Unsatisfiable { requirement, .. } | Refusal::Pinned { requirement, .. } => {
-                requirement
-            }
+            Refusal::Unsatisfiable { requirement, .. }
+            | Refusal::Pinned { requirement, .. }
+            | Refusal::Broken { requirement, .. } => requirement,
         }
     }
 
-    /// Who asked for it: the selected package whose dependency it was, or
-    /// [`THE_INSTALL_LIST`] where the caller asked directly.
+    /// Who asked for it: the selected package whose dependency it was, a
+    /// package the base keeps, or [`THE_INSTALL_LIST`] where the caller asked
+    /// directly.
     pub(crate) fn required_by(&self) -> &str {
         match self {
             Refusal::PackageNotFound { .. }
@@ -153,7 +218,8 @@ impl Refusal {
             | Refusal::NotInRelease { .. } => THE_INSTALL_LIST,
             Refusal::ExcludedButRequired { required_by, .. }
             | Refusal::Unsatisfiable { required_by, .. }
-            | Refusal::Pinned { required_by, .. } => required_by,
+            | Refusal::Pinned { required_by, .. }
+            | Refusal::Broken { required_by, .. } => required_by,
         }
     }
 
@@ -193,6 +259,26 @@ impl Refusal {
                         pin.algorithm().name(),
                     ),
                     _ => format!("the pin holds {package} at {version}"),
+                }
+            }
+            Refusal::Broken {
+                offered, replaced, ..
+            } => {
+                let offered = offered
+                    .as_ref()
+                    .map(|offered| format!(" (offered: {offered:?})"))
+                    .unwrap_or_default();
+                if replaced.is_empty() {
+                    format!(
+                        "nothing the base layer keeps or the increment installs satisfies \
+                         it{offered}"
+                    )
+                } else {
+                    let replaced: Vec<String> = replaced.iter().map(ToString::to_string).collect();
+                    format!(
+                        "the increment replaces {}, leaving nothing that satisfies it{offered}",
+                        replaced.join(" and "),
+                    )
                 }
             }
         }
@@ -298,16 +384,47 @@ pub(crate) fn resolve(
 ///
 /// This is [`resolve`] with one additive input. `assume_installed` holds the
 /// names a base layer already supplies — every package configured in it, plus
-/// the virtual packages those packages `Provides`. A name in that set is
-/// skipped as a seed, satisfies any dependency group naming it at a version
-/// the group accepts, and is otherwise re-selected only as an upgrade, so the
-/// resolution closes only over what the base does not already carry. A caller
-/// `include` the base already supplies is likewise satisfied by the base rather
-/// than pulled again, unless it names a release whose version the base does
-/// not hold. [`resolve`] passes an empty set, so a full bootstrap is
-/// unaffected. Because a configured base is dependency-complete, the
-/// transitive dependencies of an assumed package are themselves assumed, so
-/// declining to walk them omits nothing the increment needs.
+/// the virtual packages those packages `Provides` — and what each of its
+/// packages depends on. A name in that set is skipped as a seed, satisfies any
+/// dependency group naming it at a version the group accepts, and is otherwise
+/// re-selected only as an upgrade, so the resolution closes only over what the
+/// base does not already carry. A caller `include` the base already supplies is
+/// likewise satisfied by the base rather than pulled again, unless it names a
+/// release whose version the base does not hold. [`resolve`] passes an empty
+/// set, so a full bootstrap is unaffected. Because a configured base is
+/// dependency-complete, the transitive dependencies of a package the base keeps
+/// are themselves kept, so declining to walk them omits nothing the increment
+/// needs.
+///
+/// # The merged set
+///
+/// The root a layered resolution produces is the increment *and* what the base
+/// keeps of its own. The increment replaces each base package it selects
+/// another version of, and everything the replaced version supplied goes with
+/// it: its own name, and every name it `Provides`. A dependency answers only to
+/// what is left, the increment's packages and the base's supplies that no
+/// replacement took away, so a selection made late in the walk can take away
+/// what answered a dependency resolved earlier, and can break a package the
+/// base keeps.
+///
+/// So the walk ends with a check of the merged set, which runs until a pass of
+/// it selects nothing:
+///
+/// - Every group of every selected package, and every install list entry the
+///   base answered, is resolved again against what is left. One a replacement
+///   broke is answered as the walk would have answered it had the replacement
+///   come first, which selects what it needs, and the walk closes over that.
+/// - Every group of every package the base keeps is held to what is left. A
+///   package with a group nothing answers is upgraded where [`Candidates::of`]
+///   offers it an upgrade, as apt upgrades an installed package whose
+///   dependency an upgrade breaks, and the walk closes over the upgrade, which
+///   replaces the package in turn.
+///
+/// What still has no answer is refused as [`Refusal::Broken`]. The walk and the
+/// check select by the same rules, so the order of the install list does not
+/// decide what a replacement breaks: a dependency the walk met before the
+/// replacement that breaks it is answered by its next alternative, or refused,
+/// exactly as one it met after.
 ///
 /// # Refusals
 ///
@@ -345,9 +462,10 @@ pub(crate) fn resolve_seeded(
         installed: assume_installed,
         targeted: HashMap::new(),
     };
-    let mut selected: BTreeMap<String, Package> = BTreeMap::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
     let mut refusals = Refusals::default();
+    // The install list's entries the base answers rather than the increment,
+    // which the merged set's check asks about again.
+    let mut answered: Vec<String> = Vec::new();
 
     // The entries naming a release switch their names' candidates before
     // anything is selected, as apt switches them when it reads the command
@@ -394,6 +512,7 @@ pub(crate) fn resolve_seeded(
             .installed(name)
             .is_some_and(|version| super::version::compare(version, &package.version).is_eq())
         {
+            answered.push(name.to_string());
             asked.push(None);
             continue;
         }
@@ -401,16 +520,26 @@ pub(crate) fn resolve_seeded(
         asked.push(Some(name));
     }
 
+    let mut closure = Closure {
+        candidates,
+        excluded,
+        selected: BTreeMap::new(),
+        queue: VecDeque::new(),
+        refusals,
+        refused: HashSet::new(),
+        answered,
+    };
+
     // Seed the whole base set before closing over anything, so a virtual
     // dependency encountered during the closure sees every base package as an
     // already-selected candidate provider. An excluded base package is simply
     // not seeded, and one the layer already carries is left to the base.
     for name in base {
-        if excluded.contains(name.as_str()) || assume_installed.contains(name) {
+        if closure.excluded.contains(name.as_str()) || assume_installed.contains(name) {
             continue;
         }
-        if let Some(package) = candidates.of(name) {
-            add(&mut selected, &mut queue, package);
+        if let Some(package) = closure.candidates.of(name) {
+            add(&mut closure.selected, &mut closure.queue, package);
         }
     }
     for (entry, name) in includes.iter().zip(asked) {
@@ -420,58 +549,182 @@ pub(crate) fn resolve_seeded(
         // A requested package the base already supplies is satisfied by the
         // base and needs no re-selection into the increment, unless the entry
         // switched it to a version the base does not hold.
-        if assume_installed.contains(name) && !candidates.is_targeted(name) {
+        if assume_installed.contains(name) && !closure.candidates.is_targeted(name) {
+            closure.answered.push(name.to_string());
             continue;
         }
-        if let Some(package) = candidates.of(name) {
-            add(&mut selected, &mut queue, package);
+        if let Some(package) = closure.candidates.of(name) {
+            add(&mut closure.selected, &mut closure.queue, package);
         } else if let Some(provider) =
             // A caller `include` names a package, never a constrained version,
             // so it asks the unversioned question.
             first_available_provider(
-                &candidates,
-                &DepAtom {
-                    name: name.to_string(),
-                    constraint: None,
-                },
-                &excluded,
+                &closure.candidates,
+                &unversioned(name),
+                &closure.excluded,
             )
         {
-            let package = candidates
+            let package = closure
+                .candidates
                 .of(&provider)
                 .expect("a provider is a real package");
-            add(&mut selected, &mut queue, package);
+            add(&mut closure.selected, &mut closure.queue, package);
         } else {
-            refusals.push(Refusal::PackageNotFound {
+            closure.refusals.push(Refusal::PackageNotFound {
                 name: entry.clone(),
             });
         }
     }
 
-    while let Some(name) = queue.pop_front() {
-        // Clone the relationships so the closure can mutate `selected` freely.
-        let package = &selected[&name];
-        let relations: Vec<Dependency> = package
-            .pre_depends
-            .iter()
-            .chain(package.depends.iter())
-            .cloned()
-            .collect();
-        for group in &relations {
-            if let Some(refusal) = resolve_group(
-                &candidates,
-                group,
-                &excluded,
-                &name,
-                &mut selected,
-                &mut queue,
-            ) {
-                refusals.push(refusal);
+    loop {
+        closure.walk();
+        if !closure.settle() {
+            break;
+        }
+    }
+    (closure.selected.into_values().collect(), closure.refusals)
+}
+
+/// The dependency an install list entry naming `name` states: the name, at any
+/// version.
+fn unversioned(name: &str) -> DepAtom {
+    DepAtom {
+        name: name.to_string(),
+        constraint: None,
+    }
+}
+
+/// One resolution under way: what it has selected, what it has still to walk,
+/// and what it has refused.
+struct Closure<'a> {
+    candidates: Candidates<'a>,
+    excluded: HashSet<&'a str>,
+    selected: BTreeMap<String, Package>,
+    /// The selected packages whose groups the walk has still to resolve.
+    queue: VecDeque<String>,
+    refusals: Refusals,
+    /// Every group refused so far, by who declares it and its place among
+    /// their groups, so the merged set's check does not refuse a group the
+    /// walk already refused a second time.
+    refused: HashSet<(String, usize)>,
+    /// The install list's entries the base answered rather than the
+    /// increment, by name.
+    answered: Vec<String>,
+}
+
+impl Closure<'_> {
+    /// Resolves every group of every package selected since the walk last
+    /// ran, and of every package those select in turn.
+    fn walk(&mut self) {
+        while let Some(name) = self.queue.pop_front() {
+            for (at, group) in relations(&self.selected[&name]).iter().enumerate() {
+                self.resolve(&name, at, group);
             }
         }
     }
 
-    (selected.into_values().collect(), refusals)
+    /// Resolves `group`, the `at`th of the groups `required_by` declares,
+    /// and records its refusal, where it is refused, once.
+    fn resolve(&mut self, required_by: &str, at: usize, group: &Dependency) {
+        let key = (required_by.to_string(), at);
+        if self.refused.contains(&key) {
+            return;
+        }
+        if let Some(refusal) = resolve_group(
+            &self.candidates,
+            group,
+            &self.excluded,
+            required_by,
+            &mut self.selected,
+            &mut self.queue,
+        ) {
+            self.refused.insert(key);
+            self.refusals.push(refusal);
+        }
+    }
+
+    /// One pass of the merged set's check, as [`resolve_seeded`] describes it.
+    ///
+    /// Returns whether the pass selected anything, which leaves the walk to
+    /// close over it and the check to run again. A pass that selected nothing
+    /// is the last, and refuses what the base keeps that is still broken. Only
+    /// that pass refuses it, since an earlier pass's selection can answer a
+    /// group of the base's that a later one leaves broken. The groups of
+    /// selected packages are refused as they are met, as the walk refuses
+    /// them: nothing selected later answers a group no candidate answers.
+    fn settle(&mut self) -> bool {
+        for (at, name) in self.answered.clone().iter().enumerate() {
+            self.resolve(THE_INSTALL_LIST, at, &vec![unversioned(name)]);
+        }
+        let names: Vec<String> = self.selected.keys().cloned().collect();
+        for name in &names {
+            for (at, group) in relations(&self.selected[name]).iter().enumerate() {
+                self.resolve(name, at, group);
+            }
+        }
+        if !self.queue.is_empty() {
+            return true;
+        }
+
+        let installed = self.candidates.installed;
+        let mut broken = Vec::new();
+        for (name, groups) in installed.packages() {
+            if self.selected.contains_key(name) {
+                continue;
+            }
+            for group in groups {
+                if group
+                    .iter()
+                    .any(|atom| merged_satisfies(&self.candidates, &self.selected, atom))
+                {
+                    continue;
+                }
+                if let Some(upgrade) = self.upgrade(name) {
+                    add(&mut self.selected, &mut self.queue, &upgrade);
+                    break;
+                }
+                broken.push(Refusal::Broken {
+                    requirement: render_group(group),
+                    required_by: name.to_string(),
+                    offered: describe_merged(&self.candidates, &self.selected, group),
+                    replaced: replacements(installed, &self.selected, group),
+                });
+            }
+        }
+        if !self.queue.is_empty() {
+            return true;
+        }
+        for refusal in broken {
+            self.refusals.push(refusal);
+        }
+        false
+    }
+
+    /// The version a package the base keeps is upgraded to where the merged
+    /// set breaks one of its dependencies: the one [`Candidates::of`] offers,
+    /// as apt upgrades an installed package an upgrade breaks.
+    ///
+    /// `None` for a package the caller excluded, and for one whose installed
+    /// version the status database does not state, which is no version to
+    /// upgrade from.
+    fn upgrade(&self, name: &str) -> Option<Package> {
+        if self.excluded.contains(name) || self.candidates.installed.installed(name).is_none() {
+            return None;
+        }
+        self.candidates.of(name).cloned()
+    }
+}
+
+/// A package's hard dependency groups, its `Pre-Depends` then its `Depends`,
+/// held apart from the package so the selection can change while they are
+/// walked.
+fn relations(package: &Package) -> Vec<Dependency> {
+    package
+        .pre_depends
+        .iter()
+        .chain(package.depends.iter())
+        .cloned()
+        .collect()
 }
 
 /// Splits an install list entry into the package it names and the release it
@@ -551,7 +804,7 @@ impl<'a> Candidates<'a> {
             .collect();
         for group in groups {
             let met = group.iter().any(|atom| {
-                base_satisfies(self.installed, atom)
+                self.base_supplies(atom)
                     || self.of(&atom.name).is_some_and(|candidate| {
                         meets(atom.constraint.as_ref(), &candidate.version)
                             && self.installable(candidate, excluded)
@@ -599,7 +852,7 @@ impl<'a> Candidates<'a> {
             .chain(package.depends.iter())
             .all(|group| {
                 group.iter().any(|atom| {
-                    base_satisfies(self.installed, atom)
+                    self.base_supplies(atom)
                         || (!excluded.contains(atom.name.as_str())
                             && self.of(&atom.name).is_some_and(|candidate| {
                                 meets(atom.constraint.as_ref(), &candidate.version)
@@ -607,6 +860,14 @@ impl<'a> Candidates<'a> {
                         || first_available_provider(self, atom, excluded).is_some()
                 })
             })
+    }
+
+    /// Whether the base, whole, supplies `atom`.
+    ///
+    /// The question an install list entry's switch asks: it is asked before
+    /// anything is selected, so no replacement has taken a supply away yet.
+    fn base_supplies(&self, atom: &DepAtom) -> bool {
+        base_satisfies(self.installed, &BTreeMap::new(), atom)
     }
 }
 
@@ -632,8 +893,11 @@ impl<'a> Candidates<'a> {
 ///
 /// A group whose satisfier the base layer already supplies is satisfied by the
 /// base and pulls nothing, provided the base supplies it at a version the
-/// constraint accepts. Where it does not, the name is upgraded into the
-/// increment only as [`Candidates::of`] allows.
+/// constraint accepts and the selection has not replaced the package supplying
+/// it. Where it does not, the name is upgraded into the increment only as
+/// [`Candidates::of`] allows. A group nothing answers where a supply the
+/// selection took away would have is refused as [`Refusal::Broken`], naming
+/// the replacement, since that is what is in the way.
 ///
 /// A name the pin holds answers only at its pinned version. A group left
 /// unsatisfied where an alternative names a pinned package at a version the
@@ -656,10 +920,11 @@ fn resolve_group(
     // covers a group the base satisfies either way — and carries the versions,
     // so a constrained group is answered by the version actually there rather
     // than by the name being present.
-    for atom in group {
-        if base_satisfies(candidates.installed, atom) || selected_satisfies(index, selected, atom) {
-            return None;
-        }
+    if group
+        .iter()
+        .any(|atom| merged_satisfies(candidates, selected, atom))
+    {
+        return None;
     }
     // Try each alternative in order, preferring the real package named then a
     // provider — the resolver's existing discipline. Remember an excluded name
@@ -725,13 +990,26 @@ fn resolve_group(
         }),
         // Nothing was excluded or pinned, and nothing satisfies the group: the
         // archive offers none of these names, or offers them only at versions
-        // the constraint rules out. Either way the closure is incomplete, and
+        // the constraint rules out, and the base supplies none, or supplied one
+        // the selection replaced. Either way the closure is incomplete, and
         // shipping it would produce a root whose packages cannot work.
-        (None, None) => Some(Refusal::Unsatisfiable {
-            requirement: render_group(group),
-            required_by: required_by.to_string(),
-            available: describe_available(candidates, group),
-        }),
+        (None, None) => {
+            let replaced = replacements(candidates.installed, selected, group);
+            Some(if replaced.is_empty() {
+                Refusal::Unsatisfiable {
+                    requirement: render_group(group),
+                    required_by: required_by.to_string(),
+                    available: describe_available(candidates, selected, group),
+                }
+            } else {
+                Refusal::Broken {
+                    requirement: render_group(group),
+                    required_by: required_by.to_string(),
+                    offered: describe_merged(candidates, selected, group),
+                    replaced,
+                }
+            })
+        }
     }
 }
 
@@ -741,24 +1019,81 @@ fn meets(constraint: Option<&Constraint>, version: &str) -> bool {
     constraint.is_none_or(|c| c.satisfied_by(version))
 }
 
-/// Whether the base layer supplies `atom` — the name, at a version its
-/// constraint accepts.
+/// Whether a name supplied at `version` answers `constraint`: [`meets`] for a
+/// supply that states a version.
 ///
-/// A bare `Provides` records `None`, which supplies only an unversioned
+/// A bare `Provides` states none, which supplies only an unversioned
 /// dependency: Policy 7.5 gives an unversioned provide no version to compare,
 /// so it cannot answer a versioned question.
-fn base_satisfies(assume_installed: &InstalledSet, atom: &DepAtom) -> bool {
-    let Some(versions) = assume_installed.supplied(&atom.name) else {
-        return false;
-    };
-    match atom.constraint.as_ref() {
-        None => true,
-        Some(constraint) => versions.iter().any(|version| {
-            version
-                .as_deref()
-                .is_some_and(|v| constraint.satisfied_by(v))
-        }),
+fn answers(version: Option<&str>, constraint: Option<&Constraint>) -> bool {
+    match version {
+        Some(version) => meets(constraint, version),
+        None => constraint.is_none(),
     }
+}
+
+/// Whether the root a resolution produces satisfies `atom`: a package it
+/// selected, or one of the base's supplies its selection leaves standing.
+fn merged_satisfies(
+    candidates: &Candidates<'_>,
+    selected: &BTreeMap<String, Package>,
+    atom: &DepAtom,
+) -> bool {
+    base_satisfies(candidates.installed, selected, atom)
+        || selected_satisfies(candidates.index, selected, atom)
+}
+
+/// The base's supplies of `name` that `selected` leaves standing: every one
+/// but those of a package the selection replaces, which takes them away.
+fn kept<'s>(
+    installed: &'s InstalledSet,
+    selected: &'s BTreeMap<String, Package>,
+    name: &str,
+) -> impl Iterator<Item = &'s Supply> {
+    installed
+        .supplied(name)
+        .iter()
+        .filter(|supply| !selected.contains_key(&supply.provider))
+}
+
+/// Whether what the base keeps beside `selected` supplies `atom` — the name, at
+/// a version its constraint accepts.
+fn base_satisfies(
+    installed: &InstalledSet,
+    selected: &BTreeMap<String, Package>,
+    atom: &DepAtom,
+) -> bool {
+    kept(installed, selected, &atom.name)
+        .any(|supply| answers(supply.version.as_deref(), atom.constraint.as_ref()))
+}
+
+/// The base packages `selected` replaces that supplied one of `group`'s names
+/// at a version its alternative accepts, in name order: what took away an
+/// answer the group had in the base.
+fn replacements(
+    installed: &InstalledSet,
+    selected: &BTreeMap<String, Package>,
+    group: &Dependency,
+) -> Vec<Replacement> {
+    let mut replaced: BTreeMap<&str, Replacement> = BTreeMap::new();
+    for atom in group {
+        for supply in installed.supplied(&atom.name) {
+            if !answers(supply.version.as_deref(), atom.constraint.as_ref()) {
+                continue;
+            }
+            let Some(package) = selected.get(&supply.provider) else {
+                continue;
+            };
+            replaced
+                .entry(package.name.as_str())
+                .or_insert_with(|| Replacement {
+                    package: package.name.clone(),
+                    installed: installed.installed(&package.name).map(str::to_string),
+                    version: package.version.clone(),
+                });
+        }
+    }
+    replaced.into_values().collect()
 }
 
 /// Whether the already-selected packages satisfy `atom`, by real name or by a
@@ -783,16 +1118,10 @@ fn provides_satisfies(package: &Package, atom: &DepAtom) -> bool {
         .provides
         .iter()
         .filter(|provided| provided.name == atom.name)
-        .any(|provided| match atom.constraint.as_ref() {
-            None => true,
-            Some(constraint) => provided
-                .version
-                .as_deref()
-                .is_some_and(|v| constraint.satisfied_by(v)),
-        })
+        .any(|provided| answers(provided.version.as_deref(), atom.constraint.as_ref()))
 }
 
-/// Renders a dependency group the way the archive declares it, so the error
+/// Renders a dependency group the way its package declares it, so the error
 /// names what was asked for rather than a reconstruction of it.
 fn render_group(group: &Dependency) -> String {
     group
@@ -806,14 +1135,18 @@ fn render_group(group: &Dependency) -> String {
 }
 
 /// What is actually available for a group's names, for the error's evidence
-/// line: what the archives offer, and what the base has.
+/// line: what the archives offer, and what the base keeps.
 ///
 /// This is what separates the two failures a reader has to tell apart — a name
 /// no archive carries, and a name carried at the wrong version. A version a
 /// release other than the candidate's offers is named with its release, since
 /// that is the one an install list entry written `name/release` would take.
 /// `None` when the group's names are simply absent everywhere.
-fn describe_available(candidates: &Candidates<'_>, group: &Dependency) -> Option<String> {
+fn describe_available(
+    candidates: &Candidates<'_>,
+    selected: &BTreeMap<String, Package>,
+    group: &Dependency,
+) -> Option<String> {
     let index = candidates.index;
     let mut found: Vec<String> = Vec::new();
     for atom in group {
@@ -835,19 +1168,60 @@ fn describe_available(candidates: &Candidates<'_>, group: &Dependency) -> Option
                 ));
             }
         }
-        if let Some(versions) = candidates.installed.supplied(&atom.name) {
-            let rendered: Vec<&str> = versions
-                .iter()
-                .map(|v| v.as_deref().unwrap_or("no version"))
-                .collect();
-            found.push(format!(
-                "{} {} in the base layer",
-                atom.name,
-                rendered.join(", ")
-            ));
-        }
+        found.extend(base_kept(candidates.installed, selected, &atom.name));
     }
     (!found.is_empty()).then(|| found.join("; "))
+}
+
+/// What the root a layered resolution produces holds for a group's names, for
+/// a [`Refusal::Broken`]: what the increment installs, by real name or by
+/// `Provides`, and what the base keeps. `None` where it holds none of them.
+fn describe_merged(
+    candidates: &Candidates<'_>,
+    selected: &BTreeMap<String, Package>,
+    group: &Dependency,
+) -> Option<String> {
+    let mut found: Vec<String> = Vec::new();
+    for atom in group {
+        let mut versions: Vec<&str> = Vec::new();
+        if let Some(package) = selected.get(&atom.name) {
+            versions.push(&package.version);
+        }
+        for provider in candidates.index.providers(&atom.name) {
+            let Some(package) = selected.get(provider) else {
+                continue;
+            };
+            versions.extend(
+                package
+                    .provides
+                    .iter()
+                    .filter(|provided| provided.name == atom.name)
+                    .map(|provided| provided.version.as_deref().unwrap_or("no version")),
+            );
+        }
+        if !versions.is_empty() {
+            found.push(format!(
+                "{} {} in the increment",
+                atom.name,
+                versions.join(", ")
+            ));
+        }
+        found.extend(base_kept(candidates.installed, selected, &atom.name));
+    }
+    (!found.is_empty()).then(|| found.join("; "))
+}
+
+/// The versions the base keeps `name` at beside `selected`, as an evidence line
+/// names them, or `None` where it keeps none.
+fn base_kept(
+    installed: &InstalledSet,
+    selected: &BTreeMap<String, Package>,
+    name: &str,
+) -> Option<String> {
+    let versions: Vec<&str> = kept(installed, selected, name)
+        .map(|supply| supply.version.as_deref().unwrap_or("no version"))
+        .collect();
+    (!versions.is_empty()).then(|| format!("{name} {} in the base layer", versions.join(", ")))
 }
 
 /// The first provider of `atom`'s virtual name that is not excluded and whose
@@ -1132,7 +1506,7 @@ mod tests {
     fn assumed(names: &[&str]) -> InstalledSet {
         let mut set = InstalledSet::default();
         for name in names {
-            set.install(name, Some("1.0"));
+            set.install(name, Some("1.0"), Vec::new());
         }
         set
     }
@@ -1142,9 +1516,36 @@ mod tests {
     fn assumed_at(entries: &[(&str, &str)]) -> InstalledSet {
         let mut set = InstalledSet::default();
         for (name, version) in entries {
-            set.install(name, Some(version));
+            set.install(name, Some(version), Vec::new());
         }
         set
+    }
+
+    /// Builds an assume-installed set from `(name, version, depends)`, each
+    /// package depending on what a `Depends` field stating `depends` would,
+    /// for the cases where what the base keeps needs something of the root.
+    fn base_depending(entries: &[(&str, &str, &str)]) -> InstalledSet {
+        let mut set = InstalledSet::default();
+        for (name, version, depends) in entries {
+            set.install(
+                name,
+                Some(version),
+                super::super::index::parse_relations(depends),
+            );
+        }
+        set
+    }
+
+    /// Resolves `includes` over `base` in the order given and in the reverse
+    /// order, for a test holding that the order decides nothing.
+    fn both_orders(
+        index: &Index,
+        includes: &[&str],
+        base: &InstalledSet,
+    ) -> [(Vec<Package>, Refusals); 2] {
+        let forward: Vec<String> = includes.iter().map(|name| name.to_string()).collect();
+        let reverse: Vec<String> = forward.iter().rev().cloned().collect();
+        [forward, reverse].map(|includes| resolve_seeded(index, &[], &includes, &[], base))
     }
 
     #[test]
@@ -1804,6 +2205,217 @@ mod tests {
         );
         let refused: Vec<&str> = refusals.iter().map(Refusal::requirement).collect();
         assert_eq!(refused, ["from-main (>= 1.1~)", "old (<< 2.0)"]);
+    }
+
+    /// An index offering an upgrade of `libcore` to 2.0, `app-new` needing it,
+    /// and whatever `extra` adds.
+    fn libcore_upgrade(extra: &str) -> Index {
+        index(&format!(
+            "{}{}{extra}",
+            stanza_at("libcore", "2.0", "", ""),
+            stanza_at("app-new", "1.0", "libcore (>= 2.0)", ""),
+        ))
+    }
+
+    #[test]
+    fn an_upgrade_breaking_a_selected_dependency_is_refused_in_either_order() {
+        // The base has libcore 1.0. app-new needs 2.0, so the layer upgrades
+        // it, and app-old needs exactly the 1.0 the upgrade replaces. The two
+        // cannot share a root, and apt refuses them together. The walk meets
+        // app-old's dependency before the upgrade in one order and after it in
+        // the other, and refuses it the same way in both.
+        let index = libcore_upgrade(&stanza_at("app-old", "1.0", "libcore (= 1.0)", ""));
+        let base = assumed_at(&[("libcore", "1.0")]);
+        for resolution in both_orders(&index, &["app-new", "app-old"], &base) {
+            let refusal = resolution.into_refusal();
+            assert!(matches!(refusal, Refusal::Broken { .. }), "{refusal}");
+            assert_eq!(
+                refusal.to_string(),
+                "app-old requires \"libcore (= 1.0)\", and the increment replaces libcore 1.0 \
+                 with 2.0, leaving nothing that satisfies it (offered: \"libcore 2.0 in the \
+                 increment\")",
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_an_upgrade_breaks_takes_its_next_alternative_in_either_order() {
+        // app-old takes libcore 1.0 or libcompat. Once app-new's upgrade
+        // replaces libcore 1.0, libcompat answers, whichever entry comes first:
+        // the check asks again what the walk answered from the base.
+        let index = libcore_upgrade(&format!(
+            "{}{}",
+            stanza_at("app-old", "1.0", "libcore (= 1.0) | libcompat", ""),
+            stanza_at("libcompat", "1.0", "", ""),
+        ));
+        let base = assumed_at(&[("libcore", "1.0")]);
+        for resolution in both_orders(&index, &["app-new", "app-old"], &base) {
+            let selected = resolution.into_packages();
+            assert_eq!(
+                names(&selected),
+                ["app-new", "app-old", "libcompat", "libcore"]
+            );
+        }
+    }
+
+    #[test]
+    fn an_upgrade_takes_away_the_versioned_provides_it_replaces() {
+        // The base's libv 1 provides v at 1, and the libv 2 the layer upgrades
+        // it to provides v at 2. needs-v1 asks for v at 1, which went with the
+        // libv it replaced.
+        let index = index(&format!(
+            "{}{}{}",
+            stanza_at("libv", "2", "", "Provides: v (= 2)"),
+            stanza_at("needs-v1", "1.0", "v (= 1)", ""),
+            stanza_at("wants-libv2", "1.0", "libv (>= 2)", ""),
+        ));
+        let mut base = assumed_at(&[("libv", "1")]);
+        base.supply("v", "libv", Some("1"));
+        for resolution in both_orders(&index, &["wants-libv2", "needs-v1"], &base) {
+            assert_eq!(
+                resolution.into_refusal().to_string(),
+                "needs-v1 requires \"v (= 1)\", and the increment replaces libv 1 with 2, \
+                 leaving nothing that satisfies it (offered: \"v 2 in the increment\")",
+            );
+        }
+    }
+
+    #[test]
+    fn an_install_list_entry_the_base_answered_is_asked_again_after_an_upgrade() {
+        // The base's mawk 1.3 provides awk, which answers the entry. The mawk
+        // 1.4 app needs provides nothing, so gawk answers it instead, as apt
+        // takes it; with no other provider, the entry is refused, naming the
+        // upgrade that took awk away.
+        let text = format!(
+            "{}{}",
+            stanza_at("mawk", "1.4", "", ""),
+            stanza_at("app", "1.0", "mawk (>= 1.4)", ""),
+        );
+        let mut base = assumed_at(&[("mawk", "1.3")]);
+        base.supply("awk", "mawk", None);
+        let with_gawk = index(&format!("{text}{}", stanza("gawk", "", "Provides: awk")));
+        for resolution in both_orders(&with_gawk, &["awk", "app"], &base) {
+            assert_eq!(names(&resolution.into_packages()), ["app", "gawk", "mawk"]);
+        }
+        for resolution in both_orders(&index(&text), &["awk", "app"], &base) {
+            let refusal = resolution.into_refusal();
+            assert_eq!(refusal.required_by(), THE_INSTALL_LIST);
+            assert_eq!(
+                refusal.reason(),
+                "the increment replaces mawk 1.3 with 1.4, leaving nothing that satisfies it",
+            );
+        }
+    }
+
+    #[test]
+    fn a_base_package_an_upgrade_breaks_is_upgraded_with_it() {
+        // The base's dep 1.0 needs exactly the libcore 1.0 the layer upgrades
+        // for app-new, and the archive's dep 1.1 needs the 2.0 that replaces
+        // it. apt upgrades dep with libcore, and so does the layer.
+        let index = libcore_upgrade(&stanza_at("dep", "1.1", "libcore (= 2.0)", ""));
+        let base = base_depending(&[("libcore", "1.0", ""), ("dep", "1.0", "libcore (= 1.0)")]);
+        let selected = resolve_seeded(&index, &[], &["app-new".into()], &[], &base)
+            .expecting("dep is upgraded with libcore");
+        assert_eq!(
+            chosen(&selected),
+            [
+                ("app-new".into(), "1.0".into(), 0),
+                ("dep".into(), "1.1".into(), 0),
+                ("libcore".into(), "2.0".into(), 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn upgrading_libc6_upgrades_the_libc_bin_that_holds_its_range() {
+        // libc-bin holds libc6 to one upstream version, so a layer upgrading
+        // libc6 past it upgrades libc-bin too, as apt does.
+        let index = index(&format!(
+            "{}{}{}",
+            stanza_at("libc6", "2.42-1", "", ""),
+            stanza_at("libc-bin", "2.42-1", "libc6 (>> 2.42), libc6 (<< 2.43)", ""),
+            stanza_at("app", "1.0", "libc6 (>= 2.42)", ""),
+        ));
+        let base = base_depending(&[
+            ("libc6", "2.41-10", ""),
+            ("libc-bin", "2.41-10", "libc6 (>> 2.41), libc6 (<< 2.42)"),
+        ]);
+        let selected = resolve_seeded(&index, &[], &["app".into()], &[], &base)
+            .expecting("libc-bin is upgraded with libc6");
+        assert_eq!(
+            chosen(&selected),
+            [
+                ("app".into(), "1.0".into(), 0),
+                ("libc-bin".into(), "2.42-1".into(), 0),
+                ("libc6".into(), "2.42-1".into(), 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_base_package_an_upgrade_breaks_and_nothing_upgrades_is_refused() {
+        // The archive's dep is the version the base holds, so nothing replaces
+        // it. apt removes dep to install app-new; a layer removes nothing from
+        // its base, so it refuses, naming dep and the upgrade that broke it.
+        let index = libcore_upgrade(&stanza_at("dep", "1.0", "libcore (= 1.0)", ""));
+        let base = base_depending(&[("libcore", "1.0", ""), ("dep", "1.0", "libcore (= 1.0)")]);
+        let refusal = resolve_seeded(&index, &[], &["app-new".into()], &[], &base).into_refusal();
+        assert_eq!(
+            refusal.to_string(),
+            "dep requires \"libcore (= 1.0)\", and the increment replaces libcore 1.0 with \
+             2.0, leaving nothing that satisfies it (offered: \"libcore 2.0 in the \
+             increment\")",
+        );
+        // An excluded package is not one to upgrade either.
+        let index = libcore_upgrade(&stanza_at("dep", "1.1", "libcore (= 2.0)", ""));
+        let refusal =
+            resolve_seeded(&index, &[], &["app-new".into()], &["dep".into()], &base).into_refusal();
+        assert_eq!(refusal.required_by(), "dep");
+    }
+
+    #[test]
+    fn an_upgrade_that_breaks_nothing_leaves_the_base_as_it_was() {
+        // dep accepts any libcore from 1.0, so the upgrade breaks nothing, and
+        // the base keeps dep 1.0 though the archive offers 1.1: only a broken
+        // dependency is a reason to upgrade what the base keeps.
+        let index = libcore_upgrade(&stanza_at("dep", "1.1", "libcore (>= 1.0)", ""));
+        let base = base_depending(&[("libcore", "1.0", ""), ("dep", "1.0", "libcore (>= 1.0)")]);
+        let selected = resolve_seeded(&index, &[], &["app-new".into()], &[], &base)
+            .expecting("the upgrade breaks nothing");
+        assert_eq!(names(&selected), ["app-new", "libcore"]);
+    }
+
+    #[test]
+    fn a_base_package_whose_dependency_the_base_left_unmet_is_refused() {
+        // Nothing the increment selects broke it, and nothing in the root
+        // answers it: the base itself left dep's dependency unmet. apt refuses
+        // to act on such a system, and the refusal names no replacement.
+        let index = index(&stanza("tool", "", ""));
+        let base = base_depending(&[("dep", "1.0", "absent")]);
+        let refusal = resolve_seeded(&index, &[], &["tool".into()], &[], &base).into_refusal();
+        assert_eq!(
+            refusal.to_string(),
+            "dep requires \"absent\", and nothing the base layer keeps or the increment \
+             installs satisfies it",
+        );
+    }
+
+    #[test]
+    fn a_relation_a_base_records_reaches_a_refusal_with_its_control_characters_escaped() {
+        // A base package's relations are its status database's text, which
+        // the base's own scripts can write.
+        let hostile = crate::failure::hostile::TEXT;
+        let base = base_depending(&[("dep", "1.0", hostile)]);
+        let refusal = resolve_seeded(
+            &index(&stanza("tool", "", "")),
+            &[],
+            &["tool".into()],
+            &[],
+            &base,
+        )
+        .into_refusal();
+        assert_eq!(refusal.required_by(), "dep");
+        crate::failure::hostile::assert_escaped(&refusal.to_string());
     }
 
     /// The pin a refusal could not hold, or a panic naming what came back.

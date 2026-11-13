@@ -1532,6 +1532,77 @@ fn hermetic_resolve_layer_requires_a_configured_base() {
 }
 
 #[test]
+fn hermetic_resolve_layer_holds_the_merged_root_to_every_dependency() {
+    // The base has libcore 1.0 configured. app-new needs 2.0, so the layer
+    // upgrades libcore, and the upgrade replaces the 1.0 that app-old needs
+    // exactly: no plan installs both, whichever the install list names first.
+    // A package the base keeps whose dependency the upgrade breaks is upgraded
+    // with it, where the archive offers a version that works beside it.
+    let dir = common::scratch_dir("debian-layer-merged-root");
+    let mirror = write_repo(
+        &dir.join("repo"),
+        "trixie",
+        "amd64",
+        &[
+            at_version("libcore", "2.0", payload("libcore")),
+            Pkg::ordinary("app-old", payload("app-old")).depending_on("libcore (= 1.0)"),
+            Pkg::ordinary("app-new", payload("app-new")).depending_on("libcore (>= 2.0)"),
+            at_version("dep", "1.1", payload("dep")).depending_on("libcore (= 2.0)"),
+        ],
+    );
+    let base = |name: &str, status: &str| {
+        let base = dir.join(name);
+        std::fs::create_dir_all(base.join("var/lib/dpkg")).unwrap();
+        std::fs::write(base.join("var/lib/dpkg/status"), status).unwrap();
+        base
+    };
+    let layered = |base: &Path, includes: &[&str]| {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(mirror.clone())
+            .trust_unsigned(true)
+            .base_layer(base)
+            .include(includes.iter().copied())
+            .build()
+            .expect("the builder validates")
+            .resolve_layer()
+    };
+
+    let libcore = base(
+        "base-libcore",
+        "Package: libcore\nStatus: install ok installed\nVersion: 1.0\n",
+    );
+    for includes in [["app-new", "app-old"], ["app-old", "app-new"]] {
+        match layered(&libcore, &includes) {
+            Err(DebianError::Resolve { reason, .. }) => assert_eq!(
+                reason,
+                "app-old requires \"libcore (= 1.0)\", and the increment replaces libcore 1.0 \
+                 with 2.0, leaving nothing that satisfies it (offered: \"libcore 2.0 in the \
+                 increment\")",
+                "{includes:?}",
+            ),
+            other => panic!("{includes:?}: expected the merged root refused, got {other:?}"),
+        }
+    }
+
+    let dependent = base(
+        "base-dependent",
+        "Package: libcore\nStatus: install ok installed\nVersion: 1.0\n\n\
+         Package: dep\nStatus: install ok installed\nVersion: 1.0\nDepends: libcore (= 1.0)\n",
+    );
+    let plan = layered(&dependent, &["app-new"]).expect("dep is upgraded with libcore");
+    let planned: Vec<(&str, &str)> = plan
+        .packages
+        .iter()
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect();
+    assert_eq!(
+        planned,
+        [("app-new", "1.0"), ("dep", "1.1"), ("libcore", "2.0")]
+    );
+}
+
+#[test]
 fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
     // When every requested package is already in the base, the increment is
     // empty: stage_layer installs nothing, launches no dpkg wave, and returns a
