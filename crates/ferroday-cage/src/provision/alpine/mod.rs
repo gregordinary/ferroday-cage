@@ -195,7 +195,7 @@ pub struct Alpine {
     /// The repositories, the primary first, in the order a merge applies them.
     repositories: Vec<Repository>,
     /// The packages the caller asked for, which is the whole seed of a
-    /// resolution.
+    /// resolution: sorted and without a repeat, since it is a set.
     world: Vec<String>,
     /// The packages that are never selected.
     excludes: Vec<String>,
@@ -689,7 +689,9 @@ impl AlpineBuilder {
     /// name it to get it.
     ///
     /// This is the set written to `/etc/apk/world` in the finished rootfs — what
-    /// the root asked for, as against the closure it resolved to.
+    /// the root asked for, as against the closure it resolved to. It is a set:
+    /// the order packages are named in changes neither the closure nor the
+    /// file, which lists them sorted, as `apk` writes it.
     ///
     /// # Errors
     ///
@@ -1081,11 +1083,14 @@ impl AlpineBuilder {
         if let Some(pin) = &self.pin {
             validate_pin(pin, &architecture)?;
         }
+        let mut world = self.includes;
+        world.sort();
+        world.dedup();
 
         Ok(Alpine {
             architecture,
             repositories,
-            world: self.includes,
+            world,
             excludes: self.excludes,
             pins: match &self.pin {
                 Some(plan) => Pins::of(plan)?,
@@ -1781,7 +1786,10 @@ fn install(
         Some(plan) => plan.packages.iter().map(|p| p.name.clone()).collect(),
         None => alpine.world.clone(),
     };
-    let world = joined(base.map_or(&[], layer::Base::world), wanted);
+    // Sorted as `apk` writes it, so the merged root's file is one list rather
+    // than the base's followed by the increment's.
+    let mut world = joined(base.map_or(&[], layer::Base::world), wanted);
+    world.sort();
     let sources = joined(
         base.map_or(&[], layer::Base::repositories),
         alpine
@@ -3743,6 +3751,34 @@ mod tests {
         assert!(
             matches!(&err, AlpineError::Config { reason } if reason.contains("twice")),
             "{err}",
+        );
+    }
+
+    #[test]
+    fn the_order_include_names_packages_in_changes_nothing() {
+        // Against Alpine's published index: one plan, and one world, whichever
+        // order the packages were named in.
+        let forward = ["alpine-base", "build-base", "musl"];
+        let mut backward = forward;
+        backward.reverse();
+        let plan = |world: &[&str]| {
+            provisioner(world)
+                .build()
+                .expect("the bootstrap configures")
+                .resolve()
+                .expect("the closure resolves")
+                .to_document()
+                .expect("the plan renders")
+        };
+        assert_eq!(plan(&forward), plan(&backward));
+
+        let built = provisioner(&["musl", "alpine-base", "musl"])
+            .build()
+            .expect("the bootstrap configures");
+        assert_eq!(
+            built.world,
+            ["alpine-base", "musl"],
+            "what /etc/apk/world lists"
         );
     }
 

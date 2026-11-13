@@ -38,8 +38,43 @@
 //! debug package states that it needs exactly the build it was split from. Both
 //! hold when `alsa-lib` is present at that version, and a bare `!name` with no
 //! constraint is the special case where any version at all breaks it.
+//!
+//! # One package per name a version is offered for
+//!
+//! A root holds one package for a name that is a package's own, or that a
+//! package provides at a version: apk refuses `icu-data-en` beside
+//! `icu-data-full`, which both provide `icu-data=78.1-r0`, and the package `x`
+//! beside anything else that provides `x`. Packages that provide a name at no
+//! version share it, which is how alternatives that rank themselves with `k:`
+//! coexist.
+//!
+//! The closure is built one dependency at a time, so it can take one provider
+//! for a name and later, for another name, a package that answers the first
+//! one too. apk's solver weighs the whole closure instead, and installs
+//! `icu-data-full` alone for a closure that asks for `icu-data` and for
+//! `icu-data-full` by name. So where a closure holds two packages for such a
+//! name, it is resolved again, changing as little as settles it:
+//!
+//! 1. Each of them taken first, as though it had been requested. That is
+//!    enough for `icu-data`: with `icu-data-full` taken first, `icu-data` is
+//!    already answered.
+//! 2. Failing that, each kept and the others set aside. A package set aside is
+//!    not taken for any name, and nor is a provider that needs one by a
+//!    requirement of its own, which is how `nginx-mod-devel-kit` comes to be
+//!    answered by itself rather than by `openresty-mod-devel-kit` once
+//!    `openresty` is set aside. Each such closure is searched in the same way.
+//!
+//! Within each step the packages are tried in the order the ranking above puts
+//! them for the name, and the first closure that holds one package per name is
+//! the answer. A package that offers the name at no version, without a provider
+//! priority, is tried only where the closure needs it by its own name, which is
+//! when apk lets it answer one. Where no closure holds, the resolution is
+//! refused, naming the packages, rather than installing two packages apk would
+//! never install together. This is a search over the packages that contend
+//! rather than apk's solver; for every package of Alpine's own `main` and
+//! `community`, resolved alone, it keeps the packages apk keeps.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 
 use super::index::{Dependency, Index, Record};
@@ -92,6 +127,14 @@ pub(super) enum ResolveError {
         declared_by: String,
         /// The package and version that broke it.
         present: String,
+    },
+    /// The closure holds more than one package for a name only one may answer:
+    /// a package's own name, or a name provided at a version.
+    Contended {
+        /// The name more than one package answers.
+        name: String,
+        /// Each package answering it, with the version it answers at.
+        answers: Vec<String>,
     },
     /// A delta resolution would install a second version of a package the base
     /// layer already carries.
@@ -170,6 +213,12 @@ impl fmt::Display for ResolveError {
                 f,
                 "{declared_by} refuses {dependency}, and the closure holds {present}",
             ),
+            ResolveError::Contended { name, answers } => write!(
+                f,
+                "{name} is answered by {}, and a root holds one package for a name that is a \
+                 package's own or is provided at a version; name the one to install",
+                answers.join(" and "),
+            ),
             ResolveError::WouldUpgrade {
                 name,
                 installed,
@@ -192,8 +241,15 @@ impl fmt::Display for ResolveError {
 ///
 /// `world` is the set the caller asked for, which is the whole seed: apk has no
 /// priority field and no essential flag, so a closure holds what was requested
-/// and what that requires and nothing else. The returned records are ordered by
-/// name, so one resolution of one archive state is one value.
+/// and what that requires and nothing else. It is a set, as apk reads and
+/// writes it, so it is seeded in name order: which provider one requested
+/// package's dependency takes cannot then depend on the order the caller named
+/// the packages in. The returned records are ordered by name, so one resolution
+/// of one archive state is one value.
+///
+/// A closure that would hold two packages for a name only one may answer is
+/// resolved again as the module documentation describes, and refused where no
+/// closure holds one.
 ///
 /// `installed` is empty for a whole root and is a base layer's packages for the
 /// increment of a layered build. Each of those answers its own name at its own
@@ -213,8 +269,9 @@ impl fmt::Display for ResolveError {
 /// Returns a [`ResolveError`] for a requested name nothing offers, a dependency
 /// no offered version satisfies, a name whose only providers cannot be chosen
 /// between, a `!` entry the closure breaks, an exclusion that leaves a
-/// dependency unsatisfiable, or a dependency that needs a newer version of a
-/// package the base already carries.
+/// dependency unsatisfiable, a name more than one package answers where only one
+/// may, or a dependency that needs a newer version of a package the base already
+/// carries.
 pub(super) fn resolve<'a>(
     index: &Index,
     world: &[String],
@@ -222,25 +279,189 @@ pub(super) fn resolve<'a>(
     installed: impl IntoIterator<Item = &'a Record>,
 ) -> Result<Vec<Record>, ResolveError> {
     let excluded: Vec<&str> = excludes.iter().map(String::as_str).collect();
+    let mut seeds: Vec<&str> = world.iter().map(String::as_str).collect();
+    seeds.sort_unstable();
+    seeds.dedup();
+    if let Some(name) = seeds.iter().find(|name| excluded.contains(name)) {
+        return Err(ResolveError::ExcludedAndIncluded {
+            name: (*name).to_string(),
+        });
+    }
+    let closing = Closing {
+        index,
+        seeds: &seeds,
+        excluded: &excluded,
+        installed: installed.into_iter().collect(),
+    };
+    let mut budget = MAX_CLOSURES;
+    let selection = search(&closing, &BTreeSet::new(), &BTreeSet::new(), &mut budget)?;
+    Ok(selection.packages.into_values().collect())
+}
+
+/// How many closures one resolution may build while it looks for one that holds
+/// a single package per name only one may answer.
+///
+/// Each is a whole closure, and each name two packages contend for multiplies
+/// the alternatives, so the search is bounded rather than left to the shape of
+/// the index. Alpine's own indexes need two or three where they need any.
+const MAX_CLOSURES: usize = 64;
+
+/// What every closure of one resolution is built from.
+struct Closing<'i, 'w> {
+    /// The merged index the closure is drawn from.
+    index: &'i Index,
+    /// The requested names, in name order and without a repeat.
+    seeds: &'w [&'w str],
+    /// The packages the caller excluded.
+    excluded: &'w [&'w str],
+    /// The packages a base layer already carries.
+    installed: Vec<&'i Record>,
+}
+
+/// The packages one closure may not take.
+#[derive(Clone, Copy)]
+struct Barred<'a> {
+    /// What the caller excluded, which a dependency nothing else answers is
+    /// refused over.
+    excluded: &'a [&'a str],
+    /// What a search for one package per contended name set aside for this
+    /// closure; see [`search`].
+    forbidden: &'a BTreeSet<String>,
+}
+
+impl Barred<'_> {
+    /// Whether `record` is set aside: forbidden itself, or needing by a
+    /// requirement of its own a name only forbidden packages answer.
+    ///
+    /// The second is what keeps a closure from taking a provider only to fail
+    /// one step later on what it needs: `openresty-mod-devel-kit` provides
+    /// `nginx-mod-devel-kit` at a higher version than the package of that name,
+    /// and requires `openresty`.
+    fn sets_aside(&self, index: &Index, record: &Record) -> bool {
+        if self.forbidden.is_empty() {
+            return false;
+        }
+        self.forbidden.contains(&record.name)
+            || record.depends.iter().any(|entry| {
+                let answers = candidates(index, &entry.name);
+                !entry.conflict
+                    && !answers.is_empty()
+                    && answers
+                        .iter()
+                        .all(|answer| self.forbidden.contains(&answer.package.name))
+            })
+    }
+}
+
+/// Builds the closure of `closing` with the packages in `held` taken first and
+/// those in `forbidden` set aside, and where it holds two packages for a name
+/// only one may answer, builds it again in the two steps the module
+/// documentation describes: each of them held, then each held with the others
+/// forbidden.
+///
+/// The first closure that holds one package per such name is the answer, so the
+/// greedy closure is kept wherever it already does. A second-step retry forbids
+/// a package the closure before it held and never one already held, so the
+/// forbidden set only grows and the search ends; `budget` bounds how many
+/// closures it builds. Where no alternative holds, the refusal is the first
+/// closure's own: it is the one the requested packages led to.
+fn search(
+    closing: &Closing<'_, '_>,
+    held: &BTreeSet<String>,
+    forbidden: &BTreeSet<String>,
+    budget: &mut usize,
+) -> Result<Selection, ResolveError> {
+    *budget = budget.saturating_sub(1);
+    let selection = close(closing, held, forbidden)?;
+    let Some((name, contenders)) = contention(&selection) else {
+        return Ok(selection);
+    };
+    let alternatives = alternatives(closing, &selection, &name, &contenders);
+    let with = |package: &String| {
+        let mut taken = held.clone();
+        taken.insert(package.clone());
+        taken
+    };
+    for package in alternatives
+        .iter()
+        .filter(|package| !held.contains(*package))
+    {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        if let Ok(selection) = close(closing, &with(package), forbidden)
+            && contention(&selection).is_none()
+        {
+            return Ok(selection);
+        }
+    }
+    for package in &alternatives {
+        if *budget == 0 {
+            break;
+        }
+        let others: Vec<&String> = contenders
+            .iter()
+            .filter(|other| *other != package)
+            .collect();
+        if others.iter().any(|other| held.contains(*other)) {
+            continue;
+        }
+        let mut aside = forbidden.clone();
+        aside.extend(others.into_iter().cloned());
+        if let Ok(selection) = search(closing, &with(package), &aside, budget) {
+            return Ok(selection);
+        }
+    }
+    Err(ResolveError::Contended {
+        answers: selection.offers[&name]
+            .iter()
+            .filter(|offer| contenders.contains(&offer.package))
+            .map(Offer::to_string)
+            .collect(),
+        name,
+    })
+}
+
+/// The closure of `closing`, with the packages in `held` taken before any name
+/// is answered and those in `forbidden` never taken.
+///
+/// A held package is taken as itself rather than as an answer to its name, and
+/// before the requested names, so a requested name it answers is already
+/// answered: apk installs `p2` alone for a world of `x` and `p2` where `p2`
+/// provides `x`.
+fn close(
+    closing: &Closing<'_, '_>,
+    held: &BTreeSet<String>,
+    forbidden: &BTreeSet<String>,
+) -> Result<Selection, ResolveError> {
+    let Closing { index, seeds, .. } = *closing;
+    let barred = Barred {
+        excluded: closing.excluded,
+        forbidden,
+    };
     let mut selection = Selection::new();
-    for record in installed {
-        selection.assume(record.clone());
+    for record in &closing.installed {
+        selection.assume((*record).clone());
     }
     let mut queue: VecDeque<String> = VecDeque::new();
 
-    for name in world {
-        if excluded.contains(&name.as_str()) {
-            return Err(ResolveError::ExcludedAndIncluded { name: name.clone() });
-        }
+    for name in held {
+        let record = index
+            .get(name)
+            .expect("a held package is one the index offers");
+        add(&mut selection, &mut queue, record);
+    }
+    for name in seeds {
         // A requested name carries no constraint, so it is a dependency that
         // accepts any version — which is what makes one path serve the seed and
         // the closure alike.
         let wanted = Dependency {
-            name: name.clone(),
+            name: (*name).to_string(),
             constraint: None,
             conflict: false,
         };
-        select(index, &wanted, None, &excluded, &mut selection, &mut queue)?;
+        select(index, &wanted, None, barred, &mut selection, &mut queue)?;
     }
 
     while let Some(name) = queue.pop_front() {
@@ -259,16 +480,87 @@ pub(super) fn resolve<'a>(
                 index,
                 dependency,
                 Some(&name),
-                &excluded,
+                barred,
                 &mut selection,
                 &mut queue,
             )?;
         }
     }
 
-    install_if(index, &excluded, &mut selection, &mut queue)?;
+    install_if(index, barred, &mut selection, &mut queue)?;
     conflicts(&selection)?;
-    Ok(selection.packages.into_values().collect())
+    Ok(selection)
+}
+
+/// The first name, in name order, that more than one of the closure's packages
+/// answer where only one may, with the packages that contend for it.
+///
+/// Only one may where a package of that name is in the closure, or where a
+/// package provides it at a version. A name that only base packages contend for
+/// is the base's, which already exists; one the increment contends for is
+/// reported, since the merged root would hold both.
+fn contention(selection: &Selection) -> Option<(String, BTreeSet<String>)> {
+    let mut names: Vec<&String> = selection.offers.keys().collect();
+    names.sort_unstable();
+    names.into_iter().find_map(|name| {
+        let offers = &selection.offers[name];
+        let increment = |offer: &Offer| selection.packages.contains_key(&offer.package);
+        let mut contenders = BTreeSet::new();
+        for one in offers {
+            for other in offers {
+                if one.contends_with(other) && (increment(one) || increment(other)) {
+                    contenders.insert(one.package.clone());
+                    contenders.insert(other.package.clone());
+                }
+            }
+        }
+        (!contenders.is_empty()).then(|| (name.clone(), contenders))
+    })
+}
+
+/// The packages contending for `name` in `selection` that a closure may be
+/// built around, best first by the ranking the module documents.
+///
+/// One a base layer carries is not an alternative, since the base cannot be
+/// changed. Neither is one that offers `name` at no version without a provider
+/// priority, unless the closure needs it by its own name: apk chooses such a
+/// package for a name only where something already requires it.
+fn alternatives(
+    closing: &Closing<'_, '_>,
+    selection: &Selection,
+    name: &str,
+    contenders: &BTreeSet<String>,
+) -> Vec<String> {
+    let named = |package: &str| {
+        closing.seeds.contains(&package)
+            || selection.packages.values().any(|record| {
+                record
+                    .depends
+                    .iter()
+                    .any(|entry| !entry.conflict && entry.name == package)
+            })
+    };
+    let candidates = candidates(closing.index, name);
+    let mut eligible: Vec<&Candidate<'_>> = candidates
+        .iter()
+        .filter(|candidate| {
+            let package = candidate.package.name.as_str();
+            contenders.contains(package)
+                && !selection.assumed.contains_key(package)
+                && (candidate.offers.is_some()
+                    || candidate.package.provider_priority.is_some()
+                    || named(package))
+        })
+        .collect();
+    eligible.sort_by(|a, b| match (better(a, b), better(b, a)) {
+        (true, _) => std::cmp::Ordering::Less,
+        (_, true) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    });
+    eligible
+        .into_iter()
+        .map(|candidate| candidate.package.name.clone())
+        .collect()
 }
 
 /// Satisfies one dependency, extending the selection where it is not already
@@ -277,7 +569,7 @@ fn select(
     index: &Index,
     dependency: &Dependency,
     required_by: Option<&str>,
-    excluded: &[&str],
+    barred: Barred<'_>,
     selection: &mut Selection,
     queue: &mut VecDeque<String>,
 ) -> Result<(), ResolveError> {
@@ -301,8 +593,11 @@ fn select(
     let mut excluded_one = false;
     let mut accepted: Vec<&Candidate<'_>> = Vec::new();
     for candidate in &candidates {
-        if excluded.contains(&candidate.package.name.as_str()) {
+        if barred.excluded.contains(&candidate.package.name.as_str()) {
             excluded_one = true;
+            continue;
+        }
+        if barred.sets_aside(index, candidate.package) {
             continue;
         }
         if dependency.accepts(candidate.offers) {
@@ -332,26 +627,35 @@ fn select(
     // A base layer already carrying a candidate means installing that candidate
     // would leave two versions of one package in the merged root: the base's own
     // offer was consulted first, at the top of this function, and did not satisfy
-    // the entry. Such a candidate cannot be taken, so it is dropped here rather
-    // than being ranked and then refused — a *different* provider that satisfies
-    // the entry without an upgrade is a resolution, and one apk's own solver
-    // would find. Only when every candidate would upgrade something the base
-    // carries is there nothing left to do but stop, and the refusal then names
-    // the highest-ranked of them, which is the one that was asked for.
+    // the entry. So does a base carrying a package that contends with the
+    // candidate for the name, since a root holds one of the two: apk would purge
+    // the base's, which an increment cannot. Such a candidate cannot be taken, so
+    // it is dropped here rather than being ranked and then refused — a
+    // *different* provider that satisfies the entry without either is a
+    // resolution, and one apk's own solver would find. Only when every candidate
+    // would displace something the base carries is there nothing left to do but
+    // stop, and the refusal then names what the base carries in the way of the
+    // highest-ranked of them, which is the one that was asked for.
     let installable: Vec<&Candidate<'_>> = accepted
         .iter()
         .copied()
-        .filter(|candidate| !selection.assumed.contains_key(&candidate.package.name))
+        .filter(|candidate| {
+            selection
+                .carried_in_the_way(&dependency.name, candidate)
+                .is_none()
+        })
         .collect();
     let Some(best) = best(&installable) else {
         let carried = selection
-            .assumed
-            .get(&highest.package.name)
-            .expect("no candidate is installable, so the highest is one the base carries");
+            .carried_in_the_way(&dependency.name, highest)
+            .expect("no candidate is installable, so the base carries one in the highest's way");
         return Err(ResolveError::WouldUpgrade {
-            name: highest.package.name.clone(),
+            name: carried.name.clone(),
             installed: carried.version.clone(),
-            offered: highest.package.version.clone(),
+            offered: highest
+                .offers
+                .unwrap_or(&highest.package.version)
+                .to_string(),
             dependency: dependency.to_string(),
             required_by: required_by.map(str::to_string),
         });
@@ -394,7 +698,7 @@ fn select(
 /// here rather than left to be inferred.
 fn install_if(
     index: &Index,
-    excluded: &[&str],
+    barred: Barred<'_>,
     selection: &mut Selection,
     queue: &mut VecDeque<String>,
 ) -> Result<(), ResolveError> {
@@ -406,7 +710,8 @@ fn install_if(
                 // A base layer already carrying it needs no second copy, and its
                 // own installation ran whatever condition it declared.
                 || selection.assumed.contains_key(&record.name)
-                || excluded.contains(&record.name.as_str())
+                || barred.excluded.contains(&record.name.as_str())
+                || barred.sets_aside(index, record)
             {
                 continue;
             }
@@ -432,7 +737,7 @@ fn install_if(
         while let Some(name) = queue.pop_front() {
             let requirements = selection.packages[&name].depends.clone();
             for dependency in requirements.iter().filter(|entry| !entry.conflict) {
-                select(index, dependency, Some(&name), excluded, selection, queue)?;
+                select(index, dependency, Some(&name), barred, selection, queue)?;
             }
         }
     }
@@ -570,6 +875,30 @@ struct Offer {
     own_name: bool,
 }
 
+impl Offer {
+    /// The offer `candidate` makes for `name`.
+    fn of(name: &str, candidate: &Candidate<'_>) -> Offer {
+        Offer {
+            package: candidate.package.name.clone(),
+            version: candidate.offers.map(str::to_string),
+            own_name: candidate.package.name == name,
+        }
+    }
+
+    /// Whether this offer and `other`, from another package, cannot both answer
+    /// their name in one root.
+    ///
+    /// The rule apk applies, as the module documentation states it: a package's
+    /// own name contends with every other answer to it, and two answers at a
+    /// version contend with each other. Two answers at no version share the
+    /// name.
+    fn contends_with(&self, other: &Offer) -> bool {
+        let exclusive = |offer: &Offer| offer.own_name || offer.version.is_some();
+        self.package != other.package
+            && (self.own_name || other.own_name || (exclusive(self) && exclusive(other)))
+    }
+}
+
 impl fmt::Display for Offer {
     /// Names the package and the version it offers, for the refusals that quote
     /// what broke them.
@@ -618,6 +947,22 @@ impl Selection {
     fn assume(&mut self, record: Record) {
         self.answer(&record);
         self.assumed.insert(record.name.clone(), record);
+    }
+
+    /// The package a base layer carries that `candidate` cannot be installed
+    /// beside as an answer to `name`: the candidate itself, or a package that
+    /// contends with it for the name.
+    fn carried_in_the_way(&self, name: &str, candidate: &Candidate<'_>) -> Option<&Record> {
+        if let Some(carried) = self.assumed.get(&candidate.package.name) {
+            return Some(carried);
+        }
+        let offer = Offer::of(name, candidate);
+        self.offers
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|carried| carried.contends_with(&offer))
+            .find_map(|carried| self.assumed.get(&carried.package))
     }
 
     /// Records everything one package answers to.
@@ -911,21 +1256,58 @@ mod tests {
 
     #[test]
     fn an_alternative_provider_is_taken_before_an_upgrade_is_refused() {
-        // The base carries `lib` too old for the constraint, and the index
-        // offers both a newer `lib` and a different package providing the same
-        // name at a version that already satisfies it. Refusing on the
-        // highest-ranked candidate alone would refuse a resolution that exists;
-        // apk's own solver finds it.
+        // The base answers `lib` through `shim`, at no version, so not for the
+        // constraint. The highest-ranked candidate is the package `lib`, which a
+        // root cannot hold beside another answer to its own name: apk would
+        // purge `shim` for it, and an increment cannot. A provider at a version
+        // shares the name with `shim`'s, so it is the resolution that exists.
+        let index = merged(&[
+            ("app", "1.0-r0", "D:lib>=2.0-r0"),
+            ("lib", "4.0-r0", ""),
+            ("other-lib", "1.0-r0", "p:lib=3.0-r0"),
+        ]);
+        let base = carried(&[("shim", "1.0-r0", "p:lib\nk:1")]);
+        assert_eq!(
+            resolved_over(&index, &["app"], &[], &base).unwrap(),
+            ["app", "other-lib"],
+        );
+
+        let index = merged(&[
+            ("app", "1.0-r0", "D:lib>=2.0-r0"),
+            ("lib", "2.0-r0", ""),
+            ("other-lib", "1.0-r0", "p:lib=3.0-r0"),
+            ("third-lib", "1.0-r0", "p:lib=2.5-r0"),
+        ]);
+        let base = carried(&[("base-lib", "1.0-r0", "p:lib=1.0-r0")]);
+        // Every offer at a version contends with the base's own, which apk would
+        // purge and an increment cannot, so this is the upgrade it would be,
+        // named against what the base carries.
+        match resolved_over(&index, &["app"], &[], &base) {
+            Err(ResolveError::WouldUpgrade {
+                name,
+                installed,
+                offered,
+                ..
+            }) => {
+                assert_eq!(name, "base-lib");
+                assert_eq!(installed, "1.0-r0");
+                assert_eq!(offered, "3.0-r0", "the highest-ranked offer");
+            }
+            other => panic!("expected an upgrade refusal, got {other:?}"),
+        }
+
+        // A provider of the base's own package name contends with it too: apk
+        // purges `lib` to install `other-lib` here.
         let index = merged(&[
             ("app", "1.0-r0", "D:lib>=2.0-r0"),
             ("lib", "2.0-r0", ""),
             ("other-lib", "1.0-r0", "p:lib=3.0-r0"),
         ]);
         let base = carried(&[("lib", "1.0-r0", "")]);
-        assert_eq!(
-            resolved_over(&index, &["app"], &[], &base).unwrap(),
-            ["app", "other-lib"],
-        );
+        assert!(matches!(
+            resolved_over(&index, &["app"], &[], &base),
+            Err(ResolveError::WouldUpgrade { name, .. }) if name == "lib",
+        ));
 
         // And with no alternative there is still nothing to do but stop, naming
         // the candidate that was asked for.
@@ -1232,5 +1614,199 @@ mod tests {
             ("pb", "1.0-r0", "p:virt=1.0-r0"),
         ]);
         assert_eq!(closure(&index, &["app"]), ["app", "one", "pa", "two"]);
+    }
+
+    #[test]
+    fn a_closure_is_one_value_whatever_order_its_world_is_named_in() {
+        // `p1` and `p2` both answer `x` at no version, which they may share,
+        // and only `p2` answers `y`. Taken in the order named, `b` first had
+        // `p2` answer `x` too and left `p1` out; `a` first took `p1` for `x`,
+        // as its priority asks. apk installs both, whichever order it is told.
+        let index = merged(&[
+            ("a", "1.0-r0", "D:x"),
+            ("b", "1.0-r0", "D:y"),
+            ("p1", "1.0-r0", "p:x\nk:10"),
+            ("p2", "1.0-r0", "p:x y=1"),
+        ]);
+        for world in [&["a", "b"][..], &["b", "a"], &["b", "a", "b"]] {
+            assert_eq!(closure(&index, world), ["a", "b", "p1", "p2"], "{world:?}");
+        }
+    }
+
+    #[test]
+    fn a_closure_holds_one_package_for_a_name_offered_at_a_version() {
+        // `p1` offers `x` at 2 and `p2` at 1, and only `p2` answers `y`. Taking
+        // the highest offer for `x` first and `p2` for `y` after would hold two
+        // packages for `x`, which apk never installs: it takes `p2` alone, and
+        // so does this, whichever order the world is named in.
+        let index = merged(&[
+            ("a", "1.0-r0", "D:x"),
+            ("b", "1.0-r0", "D:y"),
+            ("p1", "1.0-r0", "p:x=2"),
+            ("p2", "1.0-r0", "p:x=1 y=1"),
+        ]);
+        for world in [&["a", "b"][..], &["b", "a"]] {
+            assert_eq!(closure(&index, world), ["a", "b", "p2"], "{world:?}");
+        }
+
+        // The package `x` and a provider of `x` contend in the same way.
+        let index = merged(&[
+            ("a", "1.0-r0", "D:x"),
+            ("b", "1.0-r0", "D:y"),
+            ("x", "2.0-r0", ""),
+            ("p2", "1.0-r0", "p:x=1 y=1"),
+        ]);
+        for world in [&["a", "b"][..], &["b", "a"]] {
+            assert_eq!(closure(&index, world), ["a", "b", "p2"], "{world:?}");
+        }
+        // And naming both leaves the provider, as apk does.
+        assert_eq!(closure(&index, &["x", "p2"]), ["p2"]);
+        assert_eq!(closure(&index, &["p2", "x"]), ["p2"]);
+    }
+
+    #[test]
+    fn alpine_s_icu_data_is_answered_by_the_package_named_for_it() {
+        // Alpine's own case: a KDE application needs `icu-data`, which
+        // `icu-data-en` answers first by its priority, and a Qt package needs
+        // `icu-data-full` by name. Both provide `icu-data=78.1-r0`; apk
+        // installs `icu-data-full` alone, in either order.
+        let index = merged(&[
+            ("kde-app", "1.0-r0", "D:icu-data"),
+            ("qt-dev", "1.0-r0", "D:icu-data-full"),
+            ("icu-data-en", "78.1-r0", "k:100\np:icu-data=78.1-r0"),
+            ("icu-data-full", "78.1-r0", "k:10\np:icu-data=78.1-r0"),
+        ]);
+        for world in [&["kde-app", "qt-dev"][..], &["qt-dev", "kde-app"]] {
+            assert_eq!(
+                closure(&index, world),
+                ["icu-data-full", "kde-app", "qt-dev"],
+                "{world:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_closure_no_alternative_holds_is_refused_naming_the_packages() {
+        // `a` needs the offer only `p1` makes, and `b` the name only `p2`
+        // answers: apk refuses the pair, and so does this.
+        let index = merged(&[
+            ("a", "1.0-r0", "D:x>=2"),
+            ("b", "1.0-r0", "D:y"),
+            ("p1", "1.0-r0", "p:x=2"),
+            ("p2", "1.0-r0", "p:x=1 y=1"),
+        ]);
+        for world in [&["a", "b"][..], &["b", "a"]] {
+            match resolved(&index, world, &[]) {
+                Err(ResolveError::Contended { name, answers }) => {
+                    assert_eq!(name, "x");
+                    assert_eq!(answers, ["p1 at 2", "p2 at 1"], "{world:?}");
+                }
+                other => panic!("{world:?}: expected a contention, got {other:?}"),
+            }
+        }
+        let err = resolved(&index, &["a", "b"], &[]).expect_err("refused");
+        assert!(err.to_string().contains("name the one to install"), "{err}");
+
+        // Two providers of one name at one version are no different.
+        let index = merged(&[("p1", "1.0-r0", "p:x=1"), ("p2", "1.0-r0", "p:x=1")]);
+        assert!(matches!(
+            resolved(&index, &["p1", "p2"], &[]),
+            Err(ResolveError::Contended { .. }),
+        ));
+
+        // The package `x` contends with a provider of `x` at no version, too,
+        // and a provider that offers no version and no priority is not one apk
+        // would choose for `x`, so nothing settles it.
+        let index = merged(&[
+            ("a", "1.0-r0", "D:x"),
+            ("b", "1.0-r0", "D:y"),
+            ("x", "2.0-r0", ""),
+            ("p2", "1.0-r0", "p:x y=1"),
+        ]);
+        assert!(matches!(
+            resolved(&index, &["a", "b"], &[]),
+            Err(ResolveError::Contended { name, .. }) if name == "x",
+        ));
+    }
+
+    #[test]
+    fn a_contention_only_the_base_holds_is_the_base_s() {
+        // A base that already holds two packages for one name exists; refusing
+        // to layer over it would name something the increment did not do.
+        let index = merged(&[("app", "1.0-r0", "")]);
+        let base = carried(&[("p1", "1.0-r0", "p:x=1"), ("p2", "1.0-r0", "p:x=2")]);
+        assert_eq!(
+            resolved_over(&index, &["app"], &[], &base).unwrap(),
+            ["app"]
+        );
+    }
+
+    #[test]
+    fn a_provider_needing_a_package_set_aside_is_not_taken() {
+        // Alpine's nginx and openresty, reduced. `openresty-kit` offers `kit`
+        // at a higher version than `kit` itself, so it ranks first, and needs
+        // `openresty`, which contends with `nginx` for `cmd:nginx`. apk
+        // installs `kit` and `nginx` and no openresty.
+        let index = merged(&[
+            ("mod", "1.30-r0", "D:nginx=1.30-r0 kit"),
+            ("nginx", "1.30-r0", "p:cmd:nginx=1.30-r0"),
+            ("openresty", "1.31-r0", "p:nginx cmd:nginx=1.31-r0"),
+            ("kit", "1.30-r0", "D:nginx=1.30-r0"),
+            (
+                "openresty-kit",
+                "1.31-r0",
+                "D:cmd:nginx openresty\np:kit=1.31-r0",
+            ),
+        ]);
+        assert_eq!(closure(&index, &["mod"]), ["kit", "mod", "nginx"]);
+    }
+
+    #[test]
+    fn a_package_needed_by_its_own_name_may_answer_a_name_at_no_version() {
+        // Alpine's opencv-dev needs `blas-dev` and `openblas-dev`, which
+        // provides `blas-dev` at no version and declares no priority. apk lets
+        // it answer `blas-dev`, since it is installed anyway, rather than hold
+        // it beside the package `blas-dev`.
+        let index = merged(&[
+            ("app", "1.0-r0", "D:blas-dev openblas-dev"),
+            ("blas-dev", "3.12-r0", ""),
+            ("openblas-dev", "0.3-r0", "p:blas-dev"),
+        ]);
+        assert_eq!(closure(&index, &["app"]), ["app", "openblas-dev"]);
+
+        // Needed by its own name, as against for another name it answers,
+        // which is the case apk refuses above.
+        let index = merged(&[
+            ("a", "1.0-r0", "D:x"),
+            ("b", "1.0-r0", "D:p2"),
+            ("x", "2.0-r0", ""),
+            ("p2", "1.0-r0", "p:x"),
+        ]);
+        assert_eq!(closure(&index, &["a", "b"]), ["a", "b", "p2"]);
+    }
+
+    #[test]
+    fn a_contender_taken_first_is_preferred_to_one_set_aside() {
+        // Alpine's jack and pipewire-jack, reduced. `so:libjack` ranks `jack`
+        // first and `pc:jack` ranks `pipewire-jack-dev` first, which needs
+        // `pipewire-jack`, and the two contend for `jack`. Taking
+        // `pipewire-jack` first settles it, since it answers `so:libjack` too;
+        // apk installs exactly that, rather than keeping `jack` and setting the
+        // pipewire packages aside.
+        let index = merged(&[
+            ("app", "1.0-r0", "D:so:libjack pc:jack"),
+            ("jack", "1.9-r0", "p:so:libjack=0.999"),
+            ("pipewire-jack", "1.6-r0", "p:jack=1.6-r0 so:libjack=0.3"),
+            ("jack-dev", "1.9-r0", "D:jack=1.9-r0\np:pc:jack=1.9"),
+            (
+                "pipewire-jack-dev",
+                "1.6-r0",
+                "D:pipewire-jack=1.6-r0\np:jack-dev=1.6-r0 pc:jack=3.1",
+            ),
+        ]);
+        assert_eq!(
+            closure(&index, &["app"]),
+            ["app", "pipewire-jack", "pipewire-jack-dev"],
+        );
     }
 }

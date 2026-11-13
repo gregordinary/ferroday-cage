@@ -97,6 +97,17 @@ empty root.
 in the closure genuinely requires fails the resolve rather than producing a
 broken root.
 
+`include` names a set. The order it names packages in changes neither the
+closure nor `/etc/apk/world`, which lists them sorted, as `apk` writes it.
+
+A root holds one package for a name that is a package's own, or that a package
+provides at a version, as `apk` installs it. `icu-data-en` and `icu-data-full`
+both provide `icu-data=78.1-r0`, so a closure that needs `icu-data` and needs
+`icu-data-full` by name holds `icu-data-full` alone. The resolver answers one
+dependency at a time. Where its closure holds two such packages, it resolves
+again, keeping each in turn and setting the others aside. A closure no choice
+settles fails the resolve with `AlpineError::Resolve`, naming the packages.
+
 ## Repositories
 
 A bootstrap resolves against one or more repositories. The builder's `mirror`,
