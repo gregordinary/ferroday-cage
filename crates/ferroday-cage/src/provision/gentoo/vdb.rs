@@ -260,7 +260,7 @@ fn extract_image(
                 let target = recordable(entry.link_target.clone()).map_err(|why| {
                     ProvisionError::from(GentooError::container(
                         container,
-                        format!("ships a link at {path} whose target {why}"),
+                        format!("ships a link at {path:?} whose target {why}"),
                     ))
                 })?;
                 Laid::Link(path, target, entry.mtime)

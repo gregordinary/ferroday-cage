@@ -351,10 +351,12 @@ impl Installed {
 ///
 /// Returns [`GentooError::Database`] for a tree whose `/var/db/pkg` holds
 /// something that is not a package entry — a directory that does not name a
-/// `name-version`, one carrying no `SLOT`, or one whose runtime dependencies do
-/// not parse — and [`GentooError::Io`] where the tree could not be read. A
-/// root with no `/var/db/pkg` at all reports no packages rather than failing:
-/// an empty answer is a true one about a directory that is not there.
+/// `name-version`, one naming a category or a package the package manager
+/// specification does not permit, one carrying no `SLOT`, or one whose runtime
+/// dependencies do not parse — and [`GentooError::Io`] where the tree could
+/// not be read. A root with no `/var/db/pkg` at all reports no packages rather
+/// than failing: an empty answer is a true one about a directory that is not
+/// there.
 ///
 /// # Example
 ///
@@ -484,6 +486,17 @@ fn read_entry(
             format!("{dir:?} does not name a package and a version"),
         ));
     };
+    // The two directory names are whatever the tree holds, and the name they
+    // spell is what a resolution reports a package by, bare. Holding it to the
+    // specification's alphabet is what lets it be named so: none of its
+    // characters is a control character. The version is held by the split.
+    let name = format!("{category}/{package}");
+    if !atom::is_package(&name) {
+        return Err(GentooError::database(
+            at,
+            format!("{dir:?} names a package the package manager specification does not permit"),
+        ));
+    }
     // Each file of an entry is one of a binary package's metadata files, which
     // a container holds to `MAX_METADATA_BYTES` together; one past that alone
     // is not one portage wrote.
@@ -495,24 +508,19 @@ fn read_entry(
     };
     // What an installed package requires is the state the root arrived in,
     // and not this layer's to hold it to.
-    let (package, _) = read_package(
-        format!("{category}/{package}"),
-        version,
-        field,
-        |unreadable| {
-            GentooError::database(
-                at,
-                match unreadable {
-                    Unreadable::NoSlot => {
-                        format!("{dir} names a package but carries no {SLOT_FILE} file")
-                    }
-                    Unreadable::Dependencies { file, reason } => {
-                        format!("{dir}/{file} cannot be read: {reason}")
-                    }
-                },
-            )
-        },
-    )?;
+    let (package, _) = read_package(name, version, field, |unreadable| {
+        GentooError::database(
+            at,
+            match unreadable {
+                Unreadable::NoSlot => {
+                    format!("{dir:?} names a package but carries no {SLOT_FILE} file")
+                }
+                Unreadable::Dependencies { file, reason } => {
+                    format!("{dir:?} states a {file} that cannot be read: {reason}")
+                }
+            },
+        )
+    })?;
     Ok(package)
 }
 
@@ -927,6 +935,26 @@ mod tests {
         let err = installed(&*dir).expect_err("an entry with no SLOT is refused");
         assert!(matches!(err, GentooError::Database { .. }), "{err:?}");
         assert!(err.to_string().contains("SLOT"), "{err}");
+    }
+
+    #[test]
+    fn a_database_name_outside_the_alphabet_is_refused_with_its_control_characters_escaped() {
+        // The directory names are whatever anything run in the root left
+        // there, and a resolution names the package they spell bare. One the
+        // specification does not permit is refused where it is read, and the
+        // refusal quotes it.
+        let hostile = crate::failure::hostile::TEXT;
+        for (category, pf) in [
+            (hostile, "zlib-1.3.1".to_string()),
+            ("sys-libs", format!("zlib{hostile}-1.3.1")),
+        ] {
+            let dir = Scratch::for_test("gentoo-installed", "hostile-name");
+            entry(&dir, category, &pf, Some("0"), "amd64");
+            let err = installed(&*dir).expect_err("the name is refused");
+            assert!(matches!(err, GentooError::Database { .. }), "{err:?}");
+            assert!(err.to_string().contains("does not permit"), "{err}");
+            crate::failure::hostile::assert_escaped(&crate::ErrorChain::new(&err).to_string());
+        }
     }
 
     #[test]

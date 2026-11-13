@@ -649,6 +649,14 @@ consumer upgrading can skip it.
   new `package` field, and quotes the path with `{:?}`. The path is the
   package's own spelling, and its message wrote it to the terminal raw,
   control characters included.
+- `gentoo::installed`, and the Gentoo layer reading a root before it installs
+  into one, refuse a package database entry whose category or package name
+  the package manager specification does not permit, with
+  `GentooError::Database`. A resolution names a root's packages bare, so a
+  directory name holding a control character reached the terminal raw. A
+  container's `CATEGORY`, `PF` and `CHOST`, the `CHOST`s a root's database
+  states, and a link path a container ships are quoted with `{:?}` where a
+  refusal names them.
 
 ### Internal
 

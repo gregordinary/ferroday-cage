@@ -798,7 +798,7 @@ fn check_identity(
         return Err(GentooError::container(
             path,
             format!(
-                "is {named}, and what was asked for is {wanted}; the signature holds and the \
+                "is {named:?}, and what was asked for is {wanted}; the signature holds and the \
                  package is not the one the index named",
             ),
         ));
@@ -844,16 +844,19 @@ fn check_target(
             "carries no CHOST, so it cannot say what it was built for",
         ));
     };
+    // Both sides are quoted: the container's is a field of metadata nothing
+    // holds to an alphabet, and the root's are what its database's `CHOST`
+    // files say, which anything run in the root may have written.
     if !targets.is_empty() && !targets.contains(&chost) {
         let root = targets
             .iter()
-            .map(String::as_str)
+            .map(|target| format!("{target:?}"))
             .collect::<Vec<_>>()
             .join(", ");
         return Err(GentooError::container(
             path,
             format!(
-                "was built for {chost}, and the root's packages were built for {root}; the \
+                "was built for {chost:?}, and the root's packages were built for {root}; the \
                  signature holds and the package is not one this root can run",
             ),
         ));
@@ -1668,6 +1671,44 @@ mod tests {
         )
         .expect_err("a container cut short is refused");
         assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_identity_or_a_target_reaches_a_refusal_with_its_control_characters_escaped() {
+        // The container's identity and target are fields of its metadata,
+        // which nothing holds to an alphabet, and the root's targets are what
+        // its database's `CHOST` files say.
+        let hostile = crate::failure::hostile::TEXT;
+        let category = format!("sys-libs{hostile}");
+        for (tag, metadata, targets) in [
+            (
+                "hostile-category",
+                metadata_with(&[("CATEGORY", Some(&category))]),
+                root_targets(),
+            ),
+            (
+                "hostile-chost",
+                metadata_with(&[("CHOST", Some(hostile))]),
+                root_targets(),
+            ),
+            (
+                "hostile-root-target",
+                Built::ordinary().metadata,
+                BTreeSet::from([hostile.to_string()]),
+            ),
+        ] {
+            let built = Built {
+                metadata,
+                ..Built::ordinary()
+            };
+            let err = open_into(tag, built, &planned(CPV, 1), &targets)
+                .expect_err("the container is refused");
+            assert!(
+                matches!(err, GentooError::Container { .. }),
+                "{tag}: {err:?}"
+            );
+            crate::failure::hostile::assert_escaped(&crate::ErrorChain::new(&err).to_string());
+        }
     }
 
     #[test]
