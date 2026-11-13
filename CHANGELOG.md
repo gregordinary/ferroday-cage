@@ -264,6 +264,12 @@ consumer upgrading can skip it.
   joins it. Profiles take a `[cgroup]` table, which `RestrictedProfile` refuses
   where it names a parent, and `fcage` takes `--cgroup-parent DIR` and `--cgroup
   LIMIT=VALUE`.
+- An `agent-tools` example and a guide chapter for it: a sandbox for a coding
+  agent's tool commands, over the host's own root or an empty one, with the
+  working tree writable and its hooks read-only, the caller's own identity, one
+  loopback port the example serves, the curated seccomp roster and the
+  unix-socket restriction, and cgroup or per-process limits.
+  `examples/agent-tools.toml` gives `fcage` the same sandbox.
 
 ### Changed
 

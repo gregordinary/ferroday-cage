@@ -199,6 +199,8 @@ interface.
   [An empty root](how-the-sandbox-is-built.md#an-empty-root).
 - Run over the host's own tree, read-only, with credentials and sockets hidden:
   [The host's own root](how-the-sandbox-is-built.md#the-hosts-own-root).
+- Confine the commands a coding agent runs, with one service as their way out:
+  [Confining an agent's tool commands](agent-tools.md).
 - Stream the command's output to your own code: [Streaming
   output](streaming.md).
 - Wait with deadlines, stop gracefully, kill outright, and tie the

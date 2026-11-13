@@ -32,6 +32,7 @@ macro_rules! chapters {
 // `SUMMARY.md` is the table of contents and carries no code, and the test below
 // knows it. Everything else the guide publishes is here.
 chapters! {
+    "agent-tools.md" => agent_tools,
     "alpine.md" => alpine,
     "building-a-debian-package.md" => building_a_debian_package,
     "building-an-orchestrator.md" => building_an_orchestrator,

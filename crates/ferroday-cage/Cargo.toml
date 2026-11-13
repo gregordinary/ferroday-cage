@@ -298,6 +298,17 @@ test = true
 name = "musl-build"
 required-features = ["alpine"]
 
+# A worked consumer: a sandbox for a coding agent's tool commands, over the
+# host's own root with a presented identity, a listener on the sandbox's
+# loopback, the hardening layer's seccomp roster and unix-socket restriction,
+# and cgroup or per-process limits. It needs the `hardening` feature. Its tests
+# hold the command lines it documents, and the fcage profile beside it, to the
+# sandbox it builds, and `test` runs them.
+[[example]]
+name = "agent-tools"
+required-features = ["hardening"]
+test = true
+
 [dev-dependencies]
 # The workspace's shared test fixtures and harnesses: the root filesystem, the
 # scratch directories, the skip rule, the tar, `ar`, and repository builders,

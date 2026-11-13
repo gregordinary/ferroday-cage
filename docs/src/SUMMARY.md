@@ -17,6 +17,7 @@
 - [Hardening](hardening.md)
 - [The restriction fallback](restriction-fallback.md)
 - [Userspace networking](userspace-networking.md)
+- [Confining an agent's tool commands](agent-tools.md)
 - [Provisioning a rootfs](provisioning.md)
 - [An ebuild development sandbox](ebuild-sandbox.md)
 - [A Debian userland](debian.md)

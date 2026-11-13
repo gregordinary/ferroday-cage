@@ -75,7 +75,8 @@ calls for the hardening layer, which adds Landlock filesystem rules, seccomp
 syscall filters, and capability drops on request — the default profile alone is
 not a hardening boundary against hostile code. See [Hardening](hardening.md),
 and for hosts that cannot create user namespaces at all, [the restriction
-fallback](restriction-fallback.md).
+fallback](restriction-fallback.md). [Confining an agent's tool
+commands](agent-tools.md) puts the layer to work for a coding agent.
 
 ## Requirements
 

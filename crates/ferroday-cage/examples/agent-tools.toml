@@ -1,0 +1,39 @@
+# A coding agent's tool commands, confined as the agent-tools example confines
+# them. The working tree, its protected paths, and the command come from the
+# command line:
+#
+#   fcage --profile agent-tools.toml \
+#       --bind "$PWD" "$PWD" --chdir "$PWD" --hide "$PWD/.env" \
+#       --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
+#       --forward-loopback 8080 127.0.0.1:8080 -- git status
+#
+# The host's own tree is the root, read-only. /home, /root, /run, /var/run and
+# /var/tmp are hidden, and Landlock refuses the command the pathname sockets
+# left in view where the kernel enforces it (Landlock ABI 9).
+host-rootfs = true
+
+# The command runs as the caller's own uid and gid, with no capabilities.
+present-as = "own"
+
+# A network namespace of the sandbox's own. Its loopback is the one way out,
+# through a port the caller serves with --forward-loopback.
+network = "isolated"
+
+stdin = "null"
+stop-with-caller = true
+path-lookup = true
+
+[env]
+# The home directory is hidden, so the command's home is its own /tmp, empty at
+# each launch.
+HOME = "/tmp"
+
+[hardening]
+seccomp = "curated"
+
+# Per-process limits. Where a delegated cgroup is available, --cgroup-parent
+# and --cgroup add limits on the whole tree.
+[rlimit]
+core-dump = 0
+data = 4294967296
+processes = 1024
