@@ -413,6 +413,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Write into an overlay upper where the mounted overlay would place it | `provision::containment::copy_up`, which the extractor and `Rooted::over` take over a base |
 | Is this entry an overlay whiteout, or this directory opaque? | `provision::containment::is_whiteout`, `containment::is_opaque` |
 | Is this extended attribute the host's rather than the tree's? | `provision::containment::host_assigned_xattr` |
+| Read an entry's extended attributes, or restate an access control list or a file capability for the other side of an identity map | `provision::xattr::read_all`, `xattr::Acl` (`Acl::narrowed` where it cannot be restated), `xattr::capability_mapped` |
 | Open the regular file a walk just inspected, refusing whatever took its name | `provision::containment::open_typed_file` |
 | Open a named pipe just created, to set its metadata through a descriptor | `provision::containment::open_created_fifo` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |

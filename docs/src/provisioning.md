@@ -354,6 +354,10 @@ subsystem's `security.ima` and `security.evm`, and overlayfs's own `overlay.*`
 bookkeeping. They describe the host the tree sat on, and they differ between two
 hosts holding the same tree.
 
+Each attribute is a `SCHILY.xattr.` pax record. A record's keyword ends at its
+first `=`, so a name holding one is spelled as GNU `tar` spells it, `=` as
+`%3D` and `%` as `%25`, and GNU `tar` restores the name whole.
+
 Member names match `tar -C rootfs .`. The archive leads with a `./` directory
 entry for the root and every other member is `./`-prefixed (`./etc/`,
 `./etc/hostname`). A consumer that selects a member by path or strips leading
@@ -410,7 +414,8 @@ only case where the default would surprise anyone.
 
 An export records the tree as it is, so what a provisioning sandbox contributed
 to the tree is what the archive carries. A launch over a plain root filesystem
-leaves its mount points behind and nothing else:
+leaves its mount points behind, and the links its `symlink` mounts make, and
+nothing else:
 
 | Path | What is left | Mode |
 | --- | --- | --- |
@@ -443,9 +448,11 @@ entry at that path keeps it untouched, whether it is a file or a symbolic link.
 The bind covers it for the sandbox's life and reveals it again afterwards.
 
 A caller's own `bind` or `raw_mount` is the case where a *directory* target is
-created and stays, as `0755`. That is worth knowing when the tree being written
-into is the one being shipped. A bind declared for the duration of a build
-leaves its mount point in the artifact.
+created and stays, as `0755`. A caller's `symlink` mount stays too: it is a
+link made in the tree rather than a mount over it, so nothing takes it back
+when the sandbox exits. That is worth knowing when the tree being written into
+is the one being shipped. A bind declared for the duration of a build leaves
+its mount point in the artifact, and a link its link.
 
 Where a launch must leave the tree untouched entirely, root it on an overlay.
 Every mount point, and every write the command makes, lands in the upper rather
@@ -525,14 +532,38 @@ fixing every symbolic link's at `0777`.
 Several names for one file are copied as hard links onto the first name. A tree
 therefore keeps the sharing it was written with, and its data is streamed once.
 That is what lets a tree exported by `Export`, which coalesces hard links of its
-own, come back through `CopyIn` unchanged.
+own, come back through `CopyIn` unchanged. A second name that the tree already
+holds as the first, as `bin/x` and `usr/bin/x` are one name through
+merged-usr's `bin -> usr/bin`, is already copied.
+
+Extended attributes are copied where the tree's root can set them: `user.`
+attributes, POSIX access control lists, and a file's capabilities. Each is given
+once the entry's ownership and mode are, so the `chown` that clears a capability
+comes before it, and a directory's are given once its contents are written, so
+nothing the copy creates inside it inherits its default list. A list's named
+users and groups, and the user a capability is rooted at, are read through the
+map as an owner is, so the copy names whom the source named. A capability the
+source holds in its plain form lands rooted at the tree's root, which is the
+most a user namespace's root can grant.
+
+What the tree's root cannot set is left off and named in the report: a
+`trusted.` attribute, a `security.` attribute other than a capability, a
+`system.` attribute other than an access control list, anything a symbolic link
+holds, and a list or a capability naming an id the map has no id for. A list
+left off is not dropped as though it were never there. Where a list has a mask,
+the group bits of a mode are the mask, and the mode alone would give the owning
+group what the mask allows. The entry is given the list's narrowing instead: the
+owning group keeps what the list gave it, and the named users and groups lose
+what they had. A directory's default list is narrowed the same way. The
+attributes the host assigns are left for the destination's host to assign, as
+an export leaves them out.
 
 Character and block devices and sockets cannot be copied. A device node needs a
 privilege the copy does not hold whatever map it is under. A socket's inode is
 created by the process that binds it, and is meaningless without it. Rather
 than dropping those in silence, the run returns a `CopyReport` naming every
-entry it left out and what each one was. A tree that ends up missing something
-therefore says so.
+entry it left out and what each one was, and every attribute it did not give.
+A tree that ends up missing something therefore says so.
 
 A source file that changes size while it is being read fails the run with
 `ProvisionError::SourceChanged`. The frame's length is committed before the data
@@ -655,12 +686,25 @@ filesystem:
   times are applied after their contents, so they survive extraction.
 - **Device nodes and sockets are skipped.** They cannot be created without
   privilege, and the sandbox assembles its own minimal `/dev` at launch.
-  FIFOs are extracted. Extended attributes are not applied.
+  FIFOs are extracted. Of the extended attributes an archive records, the
+  POSIX access control lists an `Export` writes are applied; see below.
 - A later entry for the same path replaces the earlier one, matching tar's
   behavior. Sparse members fail with `ProvisionError::EntryUnsupported`,
   whichever GNU format wrote them. That is the old `S` type, and the pax
   formats 0.0, 0.1 and 1.0, whose headers claim a regular file. Multi-volume
   members fail the same way.
+
+An access control list an archive records as
+`SCHILY.xattr.system.posix_acl_access`, or a directory's default list as
+`SCHILY.xattr.system.posix_acl_default`, is applied once the entry's mode is,
+and a directory's once its contents are written. Its named users and groups
+are the ids the tree means, as an export reads them inside the map, so each is
+read through the map to the host's. The single-identity map holds only root
+inside, the calling user. A list naming an id the map has no host id for, or
+one the destination's filesystem holds no lists for, is given as its narrowing
+instead: the owning group keeps what the list gave it, rather than the mask the
+mode's group bits show. No other extended attribute is applied. A capability
+needs a privilege the extraction does not hold.
 
 Extraction imposes no size or entry-count quota. Where the archive comes from an
 untrusted source, bound disk usage externally.

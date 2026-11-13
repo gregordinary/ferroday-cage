@@ -1026,6 +1026,18 @@ impl<F: core::ops::function::FnMut(ferroday_cage::provision::gentoo::GentooEvent
 pub fn F::cancelled(&mut self) -> bool
 pub fn F::progress(&mut self, ferroday_cage::provision::gentoo::GentooEvent<'_>)
 pub fn ferroday_cage::provision::gentoo::installed(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::gentoo::Installed, ferroday_cage::provision::gentoo::GentooError>
+#[non_exhaustive] pub enum ferroday_cage::provision::AttributeSkip
+pub ferroday_cage::provision::AttributeSkip::UnmappedId
+pub ferroday_cage::provision::AttributeSkip::Unsettable
+impl core::fmt::Display for ferroday_cage::provision::AttributeSkip
+pub fn ferroday_cage::provision::AttributeSkip::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::AttributeSkip
+impl core::marker::Send for ferroday_cage::provision::AttributeSkip
+impl core::marker::Sync for ferroday_cage::provision::AttributeSkip
+impl core::marker::Unpin for ferroday_cage::provision::AttributeSkip
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::AttributeSkip
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::AttributeSkip
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::AttributeSkip
 #[non_exhaustive] pub enum ferroday_cage::provision::ExportKind
 pub ferroday_cage::provision::ExportKind::Directory
 pub ferroday_cage::provision::ExportKind::File
@@ -1225,6 +1237,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::provision::CopyIn
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::CopyIn
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::CopyIn
 #[non_exhaustive] pub struct ferroday_cage::provision::CopyReport
+pub ferroday_cage::provision::CopyReport::attributes: alloc::vec::Vec<ferroday_cage::provision::SkippedAttribute>
 pub ferroday_cage::provision::CopyReport::skipped: alloc::vec::Vec<ferroday_cage::provision::SkippedEntry>
 impl core::marker::Freeze for ferroday_cage::provision::CopyReport
 impl core::marker::Send for ferroday_cage::provision::CopyReport
@@ -1362,6 +1375,17 @@ impl core::marker::Unpin for ferroday_cage::provision::Remove
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::Remove
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Remove
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Remove
+#[non_exhaustive] pub struct ferroday_cage::provision::SkippedAttribute
+pub ferroday_cage::provision::SkippedAttribute::name: std::ffi::os_str::OsString
+pub ferroday_cage::provision::SkippedAttribute::path: std::path::PathBuf
+pub ferroday_cage::provision::SkippedAttribute::reason: ferroday_cage::provision::AttributeSkip
+impl core::marker::Freeze for ferroday_cage::provision::SkippedAttribute
+impl core::marker::Send for ferroday_cage::provision::SkippedAttribute
+impl core::marker::Sync for ferroday_cage::provision::SkippedAttribute
+impl core::marker::Unpin for ferroday_cage::provision::SkippedAttribute
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::SkippedAttribute
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::SkippedAttribute
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::SkippedAttribute
 #[non_exhaustive] pub struct ferroday_cage::provision::SkippedEntry
 pub ferroday_cage::provision::SkippedEntry::kind: ferroday_cage::provision::SkippedKind
 pub ferroday_cage::provision::SkippedEntry::path: std::path::PathBuf

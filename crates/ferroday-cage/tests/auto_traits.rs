@@ -100,6 +100,8 @@ const _: () = assert_send_sync::<ferroday_cage::provision::CopyIn>();
 const _: () = assert_send_sync::<ferroday_cage::provision::CopyReport>();
 const _: () = assert_send_sync::<ferroday_cage::provision::SkippedEntry>();
 const _: () = assert_send_sync::<ferroday_cage::provision::SkippedKind>();
+const _: () = assert_send_sync::<ferroday_cage::provision::SkippedAttribute>();
+const _: () = assert_send_sync::<ferroday_cage::provision::AttributeSkip>();
 #[cfg(feature = "tarball")]
 const _: () = assert_send_sync::<ferroday_cage::provision::Export<'_>>();
 // The entry an export's filter is offered, and what it says the entry is. Both

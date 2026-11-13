@@ -103,7 +103,14 @@ enum Source {
 /// - Character and block devices are skipped: they cannot be created without
 ///   privilege, and the sandbox assembles its own minimal `/dev`. FIFOs are
 ///   extracted; a tar archive has no socket entry type. GNU volume labels,
-///   which are archive metadata, are skipped. Extended attributes are not
+///   which are archive metadata, are skipped.
+/// - Of the extended attributes an archive records, the POSIX access control
+///   lists an [`Export`](super::Export) writes are applied, a directory's once
+///   its contents are written. Their named users and groups are read through
+///   the single-identity map, under which only root inside, the calling user,
+///   has a host id. A list naming anyone else, or one the filesystem cannot
+///   hold, is given as its narrowing: the owning group keeps what the list
+///   gave it rather than the mask its mode shows. No other attribute is
 ///   applied.
 /// - A later entry for the same path replaces the earlier one, as with
 ///   tar itself. Sparse and multi-volume members are unsupported and fail

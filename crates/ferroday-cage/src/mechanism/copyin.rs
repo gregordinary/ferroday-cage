@@ -35,17 +35,19 @@
 //!   creates it, or adopts the directory or in-root alias of one the root
 //!   already has there, and every later frame lands inside it until the
 //!   matching [`COPY_LEAVE`].
-//! - [`COPY_LEAVE`]: the current directory is finished. The child applies its
-//!   deferred ownership, mode, and modification time if it created the
-//!   directory, and closes it.
-//! - [`COPY_FILE`]: a regular file. Its name, metadata, and then exactly `size`
-//!   bytes of data follow.
+//! - [`COPY_LEAVE`]: the current directory is finished. Its attribute block
+//!   follows. The child applies the deferred ownership, mode, and modification
+//!   time, and then the attributes, if it created the directory; it reads the
+//!   block past for one it adopted. Then it closes the directory.
+//! - [`COPY_FILE`]: a regular file. Its name, metadata, exactly `size` bytes of
+//!   data, and its attribute block follow.
 //! - [`COPY_SYMLINK`]: a symbolic link. Its name, metadata, and target follow.
 //!   The child applies the ownership and the modification time; the mode goes
 //!   unused, since the kernel fixes a symlink's own at 0777.
-//! - [`COPY_FIFO`]: a named pipe. Its name and metadata follow, and the child
-//!   applies them through a descriptor for the pipe it created, opened without
-//!   waiting for a peer that a copy has no reason to expect.
+//! - [`COPY_FIFO`]: a named pipe. Its name, metadata, and attribute block
+//!   follow, and the child applies them through a descriptor for the pipe it
+//!   created, opened without waiting for a peer that a copy has no reason to
+//!   expect.
 //! - [`COPY_LINK`]: a second or later name for a file already created. Its own
 //!   name and the first name's path, relative to the destination root, follow.
 //!   Metadata is the inode's and is already applied, so none is sent.
@@ -56,6 +58,17 @@
 //!   give them: a layered build, the base's owner for each directory it carried
 //!   up into the upper; the Alpine layer, the owner each package states.
 //! - [`COPY_END`]: the tree is finished.
+//!
+//! An attribute block is a count, then each extended attribute as its name and
+//! its value, each led by its length: the name's in two bytes, held to
+//! `XATTR_NAME_MAX`, the value's in four, held to `XATTR_SIZE_MAX`
+//! ([`bounds`](super::bounds)). The child gives each to the entry through the
+//! descriptor it holds, after the ownership and the mode, so a capability is
+//! set after the `chown` that would clear it. What the block holds is the
+//! parent's decision: the attributes the sandbox's root can set, each restated
+//! for the map (see `provision::xattr`). A directory's comes when it is left,
+//! once everything inside it is created, so a default access control list it
+//! carries is not inherited by the entries the copy creates there.
 //!
 //! [`COPY_LINK`] and [`COPY_OWN`] are the frames that carry a path rather than
 //! a single component. A hard link's two names may sit in different
@@ -94,7 +107,7 @@ use rustix::net::{AddressFamily, RecvFlags, SocketFlags, SocketType};
 use rustix::process::{Pid, Signal};
 
 use super::ChildMap;
-use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
+use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_NAME_MAX, XATTR_SIZE_MAX};
 use super::child::MapFailure;
 use super::frame;
 use super::sys::{self, Fork};
@@ -105,15 +118,16 @@ use crate::wire::wire_enum;
 
 /// Frame tag: enter a directory.
 pub(crate) const COPY_DIR: u8 = 1;
-/// Frame tag: the current directory is finished.
+/// Frame tag: the current directory is finished, followed by its attribute
+/// block.
 pub(crate) const COPY_LEAVE: u8 = 2;
-/// Frame tag: a regular file, followed by its data.
+/// Frame tag: a regular file, followed by its data and its attribute block.
 pub(crate) const COPY_FILE: u8 = 3;
 /// Frame tag: a symbolic link, followed by its target.
 pub(crate) const COPY_SYMLINK: u8 = 4;
 /// Frame tag: the tree is finished.
 pub(crate) const COPY_END: u8 = 5;
-/// Frame tag: a named pipe.
+/// Frame tag: a named pipe, followed by its attribute block.
 pub(crate) const COPY_FIFO: u8 = 6;
 /// Frame tag: another name for a file already created, followed by the first
 /// name's path relative to the destination root.
@@ -173,6 +187,9 @@ wire_enum! {
         /// An entry the root already holds could not be reached to be given
         /// its owner.
         Own = 21 => "opening an entry the root already holds, to give it its owner",
+        /// An extended attribute could not be given to an entry the copy
+        /// created.
+        Xattr = 22 => "giving an entry an extended attribute, which the destination's filesystem may not hold",
     }
 }
 
@@ -514,6 +531,9 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                     .ok_or((CopyStep::ReadFrame, Errno::INVAL))?;
                 if level.created {
                     apply_meta(current.as_fd(), &level.meta)?;
+                    apply_xattrs(stream, Some(current.as_fd()))?;
+                } else {
+                    apply_xattrs(stream, None)?;
                 }
                 current = level.parent;
                 trail.restore(level.trail);
@@ -538,6 +558,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 .map_err(|errno| (CopyStep::Create, errno))?;
                 copy_data(stream, file.as_fd(), size)?;
                 apply_meta(file.as_fd(), &meta)?;
+                apply_xattrs(stream, Some(file.as_fd()))?;
             }
             COPY_SYMLINK => {
                 let (name, meta) = read_named(stream)?;
@@ -585,6 +606,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 let fifo = containment::open_created_fifo(current.as_fd(), name)
                     .map_err(|errno| (CopyStep::Fifo, errno))?;
                 apply_meta(fifo.as_fd(), &meta)?;
+                apply_xattrs(stream, Some(fifo.as_fd()))?;
             }
             COPY_LINK => {
                 let name = read_bare_name(stream)?;
@@ -942,6 +964,49 @@ fn apply_meta(fd: BorrowedFd<'_>, meta: &Meta) -> Result<(), (CopyStep, Errno)> 
     .map_err(|errno| (CopyStep::Metadata, errno))
 }
 
+/// Reads an attribute block from the stream and gives each attribute to the
+/// entry `fd` holds, or reads the block past where there is no entry to give
+/// it to: a directory the copy adopted rather than created.
+///
+/// The value is read into a buffer of [`XATTR_SIZE_MAX`], the kernel's own
+/// bound, so a frame declaring more is a stream the child does not understand.
+/// So is a name that is empty or carries a NUL. A failure to set one is the
+/// copy's failure: the parent sends only attributes the sandbox's root can set,
+/// so one the destination refuses is a filesystem that cannot hold what the
+/// source does, which is not something to pass over in silence.
+///
+/// Kept out of line, so its buffer is on the stack only while a block is read.
+#[inline(never)]
+fn apply_xattrs(
+    stream: BorrowedFd<'_>,
+    fd: Option<BorrowedFd<'_>>,
+) -> Result<(), (CopyStep, Errno)> {
+    let mut count = [0u8; 2];
+    read_full(stream, &mut count)?;
+    let mut value = [0u8; XATTR_SIZE_MAX];
+    for _ in 0..u16::from_le_bytes(count) {
+        let mut raw = [0u8; XATTR_NAME_MAX];
+        let len = read_bytes_u16(stream, &mut raw)?.len();
+        if len == 0 {
+            return Err((CopyStep::BadName, Errno::INVAL));
+        }
+        let mut terminated = [0u8; XATTR_NAME_MAX + 1];
+        let name = cstr_in(&mut terminated, &raw[..len])?;
+        let mut size = [0u8; 4];
+        read_full(stream, &mut size)?;
+        let size = usize::try_from(u32::from_le_bytes(size)).unwrap_or(usize::MAX);
+        if size > value.len() {
+            return Err((CopyStep::ReadFrame, Errno::TOOBIG));
+        }
+        read_full(stream, &mut value[..size])?;
+        if let Some(fd) = fd {
+            fs::fsetxattr(fd, name, &value[..size], fs::XattrFlags::empty())
+                .map_err(|errno| (CopyStep::Xattr, errno))?;
+        }
+    }
+    Ok(())
+}
+
 /// Applies a modification time to an entry named relative to an open directory,
 /// without following a symbolic link.
 ///
@@ -1240,8 +1305,17 @@ mod tests {
         frame
     }
 
-    /// One `COPY_FILE` frame holding `data`, owned by the caller.
+    /// A `COPY_LEAVE` frame with an empty attribute block.
+    const LEAVE: [u8; 3] = [COPY_LEAVE, 0, 0];
+
+    /// One `COPY_FILE` frame holding `data`, owned by the caller, with no
+    /// attributes.
     fn file_frame(name: &[u8], mode: u32, data: &[u8]) -> Vec<u8> {
+        file_frame_with(name, mode, data, &[])
+    }
+
+    /// One `COPY_FILE` frame holding `data` and the attributes `xattrs`.
+    fn file_frame_with(name: &[u8], mode: u32, data: &[u8], xattrs: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut frame = vec![COPY_FILE];
         frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
         frame.extend_from_slice(name);
@@ -1251,7 +1325,20 @@ mod tests {
         frame.extend_from_slice(&0i64.to_le_bytes());
         frame.extend_from_slice(&(data.len() as u64).to_le_bytes());
         frame.extend_from_slice(data);
+        frame.extend(attribute_block(xattrs));
         frame
+    }
+
+    /// An attribute block holding `xattrs`.
+    fn attribute_block(xattrs: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut block = (xattrs.len() as u16).to_le_bytes().to_vec();
+        for (name, value) in xattrs {
+            block.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            block.extend_from_slice(name);
+            block.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            block.extend_from_slice(value);
+        }
+        block
     }
 
     /// One `COPY_LINK` frame: `name` as a second name for the file at `anchor`.
@@ -1440,9 +1527,9 @@ mod tests {
         .unwrap();
 
         let mut frames = dir_frame(b"etc", 0o700);
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
         frames.extend(dir_frame(b"new", 0o750));
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
         frames.push(COPY_END);
         assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
 
@@ -1472,12 +1559,12 @@ mod tests {
 
         let mut frames = dir_frame(b"bin", 0o755);
         frames.extend(file_frame(b"tool", 0o755, b"#!/bin/sh\n"));
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
         frames.extend(dir_frame(b"var", 0o755));
         frames.extend(dir_frame(b"run", 0o755));
         frames.extend(file_frame(b"marker", 0o644, b"in the root's /run\n"));
-        frames.push(COPY_LEAVE);
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
+        frames.extend(LEAVE);
         frames.push(COPY_END);
         assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
 
@@ -1514,8 +1601,8 @@ mod tests {
         let mut frames = dir_frame(b"var", 0o755);
         frames.extend(dir_frame(b"run", 0o755));
         frames.extend(file_frame(b"first", 0o644, b"shared\n"));
-        frames.push(COPY_LEAVE);
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
+        frames.extend(LEAVE);
         frames.extend(link_frame(b"second", b"var/run/first"));
         frames.push(COPY_END);
         assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
@@ -1525,6 +1612,95 @@ mod tests {
             ino("second"),
             ino("run/first"),
             "the link is not onto the root's file"
+        );
+    }
+
+    /// The value of the attribute `name` on `path`, `None` where it holds none.
+    fn attribute(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+        let mut value = vec![0u8; 256];
+        match rustix::fs::lgetxattr(path, name, &mut value[..]) {
+            Ok(read) => {
+                value.truncate(read);
+                Some(value)
+            }
+            Err(Errno::NODATA) => None,
+            Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
+        }
+    }
+
+    /// An attribute block gives a file its attributes after its data and
+    /// metadata, gives a directory the copy created its own once it is left,
+    /// and is read past for a directory the root already had, which keeps
+    /// what it holds.
+    #[test]
+    fn an_attribute_block_lands_on_the_entry_the_copy_created() {
+        let dir = Scratch::new("copyin-attributes");
+        if rustix::fs::setxattr(
+            dir.path(),
+            "user.probe",
+            b"x",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_err()
+        {
+            ferroday_cage_testkit::require::premise_unmet(
+                "this filesystem holds no user extended attributes",
+            );
+            return;
+        }
+        std::fs::create_dir(dir.join("kept")).unwrap();
+        let block = |value: &[u8]| attribute_block(&[(b"user.origin", value)]);
+
+        let mut frames = dir_frame(b"made", 0o755);
+        frames.extend(file_frame_with(
+            b"file",
+            0o644,
+            b"contents\n",
+            &[(b"user.origin", b"the file")],
+        ));
+        frames.push(COPY_LEAVE);
+        frames.extend(block(b"the directory"));
+        frames.extend(dir_frame(b"kept", 0o700));
+        frames.push(COPY_LEAVE);
+        frames.extend(block(b"not the root's"));
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+
+        assert_eq!(
+            attribute(&dir.join("made/file"), "user.origin").as_deref(),
+            Some(&b"the file"[..]),
+        );
+        assert_eq!(std::fs::read(dir.join("made/file")).unwrap(), b"contents\n");
+        assert_eq!(
+            attribute(&dir.join("made"), "user.origin").as_deref(),
+            Some(&b"the directory"[..]),
+        );
+        assert_eq!(attribute(&dir.join("kept"), "user.origin"), None);
+    }
+
+    /// A block declaring a value past the kernel's own bound, or a name that is
+    /// empty, is a stream the child does not understand.
+    #[test]
+    fn an_attribute_block_past_its_bounds_is_refused() {
+        let mut frames = file_frame(b"file", 0o644, b"");
+        frames.truncate(frames.len() - 2);
+        frames.extend_from_slice(&1u16.to_le_bytes());
+        frames.extend_from_slice(&6u16.to_le_bytes());
+        frames.extend_from_slice(b"user.x");
+        frames.extend_from_slice(&(XATTR_SIZE_MAX as u32 + 1).to_le_bytes());
+        assert_eq!(
+            consume_frames("copyin-attribute-oversized", &frames),
+            Err((CopyStep::ReadFrame, Errno::TOOBIG)),
+        );
+
+        let mut frames = file_frame(b"file", 0o644, b"");
+        frames.truncate(frames.len() - 2);
+        frames.extend_from_slice(&1u16.to_le_bytes());
+        frames.extend_from_slice(&0u16.to_le_bytes());
+        frames.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            consume_frames("copyin-attribute-unnamed", &frames),
+            Err((CopyStep::BadName, Errno::INVAL)),
         );
     }
 
@@ -1539,12 +1715,12 @@ mod tests {
 
         let mut frames = dir_frame(b"bin", 0o755);
         frames.extend(file_frame(b"x", 0o755, b"#!/bin/sh\n"));
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
         frames.extend(dir_frame(b"usr", 0o755));
         frames.extend(dir_frame(b"bin", 0o755));
         frames.extend(link_frame(b"x", b"bin/x"));
-        frames.push(COPY_LEAVE);
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
+        frames.extend(LEAVE);
         // And a link naming itself.
         frames.extend(file_frame(b"self", 0o644, b"once\n"));
         frames.extend(link_frame(b"self", b"self"));
@@ -1569,7 +1745,7 @@ mod tests {
         let mut frames = Vec::new();
         for name in [&b"was-a-file"[..], b"was-dangling"] {
             frames.extend(dir_frame(name, 0o755));
-            frames.push(COPY_LEAVE);
+            frames.extend(LEAVE);
         }
         frames.push(COPY_END);
         assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
@@ -1621,7 +1797,7 @@ mod tests {
 
         // The balanced stream the writer actually produces is accepted.
         let mut frames = dir_frame(b"sub", 0o755);
-        frames.push(COPY_LEAVE);
+        frames.extend(LEAVE);
         frames.push(COPY_END);
         assert_eq!(consume_frames("copyin-balanced", &frames), Ok(()));
     }

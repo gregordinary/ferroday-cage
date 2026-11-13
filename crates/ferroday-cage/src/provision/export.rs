@@ -35,7 +35,7 @@ use super::containment;
 use super::identity::compose_child_map;
 use super::tar::{
     BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
-    ustar_block,
+    ustar_block, xattr_keyword,
 };
 use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
@@ -56,7 +56,9 @@ use crate::{IdMapper, IdentityMap};
 /// everything but symlinks — ACLs and file capabilities included — since the
 /// kernel confines a symlink's attributes to the `security` and `trusted`
 /// namespaces, which an unprivileged export can neither read in full nor an
-/// unprivileged extraction restore. The attributes the host assigns rather than
+/// unprivileged extraction restore. Each is a `SCHILY.xattr.` pax record, its
+/// name spelled as GNU tar spells it where it holds an `=` or a `%`, so GNU tar
+/// restores it whole. The attributes the host assigns rather than
 /// the tree carries are left out: security-module labels, integrity
 /// measurements, and overlayfs's own bookkeeping. Character and block devices,
 /// FIFOs, and sockets are skipped, as a deployed image's runtime provides its
@@ -918,10 +920,7 @@ impl<'f, W: Write> TarWriter<'f, W> {
             pax.extend_from_slice(&pax_record(b"gid", meta.gid.to_string().as_bytes()));
         }
         for (name, value) in xattrs {
-            let mut key = Vec::with_capacity(b"SCHILY.xattr.".len() + name.len());
-            key.extend_from_slice(b"SCHILY.xattr.");
-            key.extend_from_slice(name);
-            pax.extend_from_slice(&pax_record(&key, value));
+            pax.extend_from_slice(&pax_record(&xattr_keyword(name), value));
         }
 
         if !pax.is_empty() {

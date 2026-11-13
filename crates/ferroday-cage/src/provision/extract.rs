@@ -22,7 +22,10 @@
 //! permission bits apply verbatim, and entry types that cannot be created
 //! without privilege — character and block devices — are skipped, as the
 //! sandbox assembles its own `/dev`. (A tar archive has no socket entry
-//! type; GNU volume labels, archive metadata, are skipped too.)
+//! type; GNU volume labels, archive metadata, are skipped too.) Of the
+//! extended attributes an archive records, the POSIX access control lists are
+//! applied ([`apply_lists`]), since a mode laid down without its list can give
+//! the owning group more than the list did; no other attribute is.
 //!
 //! A layered build extracts into an overlay upper over a base it never
 //! writes, and [`Extraction::over`] names that base: every entry is then
@@ -31,7 +34,7 @@
 //! it writes beneath keeps the ownership and attributes the base gives it.
 //! [`overlay_tree`] takes the base the same way.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(any(feature = "debian", feature = "alpine"))]
@@ -43,7 +46,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::Timespec;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags, Timestamps, UTIME_OMIT};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, ResolveFlags, Timestamps, UTIME_OMIT, XattrFlags,
+};
 use rustix::io::Errno;
 
 use crate::path::{self, LeadingSlash, Refused};
@@ -52,9 +57,10 @@ use super::ProvisionError;
 #[cfg(any(feature = "debian", feature = "alpine"))]
 use super::compress::read_fully;
 use super::containment::{self, Made, Reached};
-use super::copyin::{Owed, reown};
+use super::copyin::{Owed, Translation, reown};
 use super::identity::Ownership;
 use super::tar::{Entry, TarReader};
+use super::xattr::{self, Acl};
 
 /// How every path an extraction writes through is resolved: inside the root,
 /// with an absolute link re-anchored there, as the root filesystem resolves it
@@ -108,6 +114,67 @@ pub(crate) enum Placement {
 struct DirMeta {
     mode: u32,
     mtime: Option<i64>,
+    /// The access control list the entry records, in the archive's form.
+    acl_access: Option<Vec<u8>>,
+    /// The default list the entry records, in the archive's form. Applied once
+    /// every entry is written, as the mode is, so no entry the extraction
+    /// creates beneath the directory inherits it.
+    acl_default: Option<Vec<u8>>,
+}
+
+impl DirMeta {
+    /// A mode and a modification time, with no access control list.
+    fn of(mode: u32, mtime: Option<i64>) -> DirMeta {
+        DirMeta {
+            mode,
+            mtime,
+            acl_access: None,
+            acl_default: None,
+        }
+    }
+
+    /// What a directory entry records about the directory.
+    fn of_entry(entry: &Entry) -> DirMeta {
+        DirMeta {
+            mode: entry.mode,
+            mtime: Some(entry.mtime),
+            acl_access: entry.acl_access.clone(),
+            acl_default: entry.acl_default.clone(),
+        }
+    }
+}
+
+/// The ids the access control lists an archive records name, read across the
+/// map the root is owned through, resolved the first time a list names one.
+///
+/// A list's named entries hold ids as its writer read them. An
+/// [`Export`](super::Export) reads inside the map, so they are the ids the root
+/// means, and the extraction writes as the calling user outside it, where the
+/// kernel reads them as the host's. Each is read through the map first. The
+/// map is the one [`Extraction::owned_through`] names, the single-identity map
+/// unless one is named, under which only root inside has a host id.
+struct ListIds<'a> {
+    ownership: &'a Ownership,
+    resolved: OnceCell<Option<Translation>>,
+}
+
+impl ListIds<'_> {
+    fn new(ownership: &Ownership) -> ListIds<'_> {
+        ListIds {
+            ownership,
+            resolved: OnceCell::new(),
+        }
+    }
+
+    /// The list `acl` with its named ids read across the map, or `None` where
+    /// one has no host id, or the map cannot be resolved at all.
+    fn on_host(&self, acl: &Acl) -> Option<Acl> {
+        let ids = self
+            .resolved
+            .get_or_init(|| Translation::of_ownership(self.ownership).ok())
+            .as_ref()?;
+        acl.mapped(|id| ids.host_uid(id), |id| ids.host_gid(id))
+    }
 }
 
 /// The tree entries are written into: the extraction root, and the base it is
@@ -122,6 +189,8 @@ struct Tree<'a> {
     /// the calling user cannot give them, recorded for the walk's caller to give
     /// through the map once its writes are done.
     owed: &'a RefCell<Vec<Owed>>,
+    /// The ids an entry's access control list names, read across the map.
+    lists: &'a ListIds<'a>,
 }
 
 /// An extraction into one root directory, across one or more archives.
@@ -250,7 +319,7 @@ impl Extraction {
     /// set it.
     #[cfg(any(feature = "debian", feature = "alpine"))]
     pub(crate) fn root_mode(mut self, mode: u32) -> Extraction {
-        self.root_meta = Some(DirMeta { mode, mtime: None });
+        self.root_meta = Some(DirMeta::of(mode, None));
         self.root_mode_fixed = true;
         self
     }
@@ -290,10 +359,12 @@ impl Extraction {
         archive: &mut TarReader<R>,
         on_entry: &mut OnEntry<'_>,
     ) -> Result<(), ProvisionError> {
+        let lists = ListIds::new(&self.ownership);
         let tree = Tree {
             root: self.root_fd.as_fd(),
             lower: self.lower_fd.as_ref().map(AsFd::as_fd),
             owed: &self.owed,
+            lists: &lists,
         };
         while let Some(mut entry) = archive.next_entry()? {
             match entry.typeflag {
@@ -353,10 +424,7 @@ impl Extraction {
                 // unless the caller fixed the root's mode instead.
                 if entry.typeflag == b'5' {
                     if !self.root_mode_fixed {
-                        self.root_meta = Some(DirMeta {
-                            mode: entry.mode,
-                            mtime: Some(entry.mtime),
-                        });
+                        self.root_meta = Some(DirMeta::of_entry(&entry));
                     }
                     continue;
                 }
@@ -394,10 +462,10 @@ impl Extraction {
     /// `root` names the extraction root in an error, and is where that child
     /// opens it.
     pub(crate) fn finalize(self, root: &Path) -> Result<(), ProvisionError> {
-        apply_dir_meta(self.root_fd.as_fd(), self.dir_meta)?;
+        let lists = ListIds::new(&self.ownership);
+        apply_dir_meta(self.root_fd.as_fd(), self.dir_meta, &lists)?;
         if let Some(meta) = self.root_meta {
-            apply_meta_fd(self.root_fd.as_fd(), &meta)
-                .map_err(|errno| ProvisionError::io("finalizing", root, errno.into()))?;
+            apply_meta_fd(self.root_fd.as_fd(), &meta, &lists, root)?;
         }
         reown(root, &self.owed.into_inner(), &self.ownership)
     }
@@ -542,14 +610,11 @@ fn place_made(
         owed.borrow_mut().push(record);
     }
     let meta = match made.copied {
-        Some(stat) => DirMeta {
-            mode: stat.st_mode & 0o7777,
-            mtime: Some(containment::modified(stat).tv_sec),
-        },
-        None => DirMeta {
-            mode: IMPLIED_DIR_MODE,
-            mtime: None,
-        },
+        Some(stat) => DirMeta::of(
+            stat.st_mode & 0o7777,
+            Some(containment::modified(stat).tv_sec),
+        ),
+        None => DirMeta::of(IMPLIED_DIR_MODE, None),
     };
     dir_meta.entry(made.path.to_vec()).or_insert(meta);
     Ok(())
@@ -804,6 +869,14 @@ fn extract_file<R: Read>(
             errno.into(),
         )
     })?;
+    apply_lists(
+        file.as_fd(),
+        entry.mode,
+        entry.acl_access.as_deref(),
+        None,
+        tree.lists,
+        &bytes_to_path(&entry.path),
+    )?;
     rustix::fs::futimens(&file, &timestamps(entry.mtime)).map_err(|errno| {
         ProvisionError::io(
             "setting the times of",
@@ -814,8 +887,8 @@ fn extract_file<R: Read>(
     Ok(())
 }
 
-/// Extracts a directory entry; its mode and mtime are recorded for the
-/// deferred pass.
+/// Extracts a directory entry; its mode, mtime, and access control lists are
+/// recorded for the deferred pass.
 fn extract_dir(
     tree: Tree<'_>,
     entry: &Entry,
@@ -853,13 +926,7 @@ fn extract_dir(
         }
     }
 
-    dir_meta.insert(
-        join(components),
-        DirMeta {
-            mode: entry.mode,
-            mtime: Some(entry.mtime),
-        },
-    );
+    dir_meta.insert(join(components), DirMeta::of_entry(entry));
     Ok(())
 }
 
@@ -987,6 +1054,14 @@ fn extract_fifo(
             errno.into(),
         )
     })?;
+    apply_lists(
+        pipe.as_fd(),
+        entry.mode,
+        entry.acl_access.as_deref(),
+        None,
+        tree.lists,
+        &bytes_to_path(&entry.path),
+    )?;
     rustix::fs::futimens(&pipe, &timestamps(entry.mtime)).map_err(|errno| {
         ProvisionError::io(
             "setting the times of",
@@ -1044,6 +1119,7 @@ fn remove_at(parent: &OwnedFd, leaf: &CString, entry_path: &[u8]) -> Result<(), 
 fn apply_dir_meta(
     root: BorrowedFd<'_>,
     dir_meta: HashMap<Vec<u8>, DirMeta>,
+    lists: &ListIds<'_>,
 ) -> Result<(), ProvisionError> {
     let mut entries: Vec<(Vec<u8>, DirMeta)> = dir_meta.into_iter().collect();
     entries.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
@@ -1066,9 +1142,7 @@ fn apply_dir_meta(
                 ));
             }
         };
-        apply_meta_fd(fd.as_fd(), &meta).map_err(|errno| {
-            ProvisionError::io("finalizing", bytes_to_path(&path), errno.into())
-        })?;
+        apply_meta_fd(fd.as_fd(), &meta, lists, &bytes_to_path(&path))?;
     }
     Ok(())
 }
@@ -1091,11 +1165,92 @@ fn open_dir_meta_fd(root: BorrowedFd<'_>, components: &[&[u8]]) -> Result<OwnedF
     )
 }
 
-/// Applies a directory's deferred mode and mtime through its fd.
-fn apply_meta_fd(fd: BorrowedFd<'_>, meta: &DirMeta) -> Result<(), Errno> {
-    rustix::fs::fchmod(fd, Mode::from_raw_mode(meta.mode))?;
+/// Applies a directory's deferred mode, access control lists, and mtime
+/// through its fd. `path` names the directory in an error.
+fn apply_meta_fd(
+    fd: BorrowedFd<'_>,
+    meta: &DirMeta,
+    lists: &ListIds<'_>,
+    path: &Path,
+) -> Result<(), ProvisionError> {
+    let finalizing = |errno: Errno| ProvisionError::io("finalizing", path, errno.into());
+    rustix::fs::fchmod(fd, Mode::from_raw_mode(meta.mode)).map_err(finalizing)?;
+    apply_lists(
+        fd,
+        meta.mode,
+        meta.acl_access.as_deref(),
+        meta.acl_default.as_deref(),
+        lists,
+        path,
+    )?;
     if let Some(mtime) = meta.mtime {
-        rustix::fs::futimens(fd, &timestamps(mtime))?;
+        rustix::fs::futimens(fd, &timestamps(mtime)).map_err(finalizing)?;
+    }
+    Ok(())
+}
+
+/// Gives the entry `fd` holds the access control lists its archive entry
+/// records, its `mode` already applied: `access`, the entry's own list, and
+/// `default`, a directory's default list.
+///
+/// Each list's named ids are read across the map first ([`ListIds`]). A list
+/// naming an id the map has no host id for cannot be given as it stands, and
+/// neither can one the filesystem holds no lists for. The access list is then
+/// given as its narrowing ([`Acl::narrowed`]), which is a mode: where a list
+/// has a mask, the mode's group bits are the mask, and the mode alone would
+/// give the owning group what the mask allows rather than what the list gave
+/// it. A default list is given as its narrowing where the map is what stands
+/// in the way, so what the directory's new entries inherit is no more open
+/// than the archive recorded; a filesystem without lists holds no default at
+/// all.
+///
+/// A list the archive records in a form the kernel does not store refuses the
+/// entry, since nothing about the entry's access could then be relied on.
+fn apply_lists(
+    fd: BorrowedFd<'_>,
+    mode: u32,
+    access: Option<&[u8]>,
+    default: Option<&[u8]>,
+    lists: &ListIds<'_>,
+    path: &Path,
+) -> Result<(), ProvisionError> {
+    let setting =
+        |errno: Errno| ProvisionError::io("setting the access control list of", path, errno.into());
+    let parse = |value: &[u8]| {
+        Acl::parse(value).ok_or_else(|| ProvisionError::EntryRefused {
+            path: path.to_path_buf(),
+            reason: "the access control list it records is not one the kernel stores".to_string(),
+        })
+    };
+    if let Some(value) = access {
+        let acl = parse(value)?;
+        let given = match lists.on_host(&acl) {
+            Some(on_host) => {
+                match rustix::fs::fsetxattr(
+                    fd,
+                    xattr::ACCESS_ACL,
+                    &on_host.encode(),
+                    XattrFlags::empty(),
+                ) {
+                    Ok(()) => true,
+                    Err(Errno::NOTSUP) => false,
+                    Err(errno) => return Err(setting(errno)),
+                }
+            }
+            None => false,
+        };
+        if !given {
+            let narrowed = acl.narrowed().mode_of(mode);
+            rustix::fs::fchmod(fd, Mode::from_raw_mode(narrowed)).map_err(setting)?;
+        }
+    }
+    if let Some(value) = default {
+        let acl = parse(value)?;
+        let list = lists.on_host(&acl).unwrap_or_else(|| acl.narrowed());
+        match rustix::fs::fsetxattr(fd, xattr::DEFAULT_ACL, &list.encode(), XattrFlags::empty()) {
+            Ok(()) | Err(Errno::NOTSUP) => {}
+            Err(errno) => return Err(setting(errno)),
+        }
     }
     Ok(())
 }
@@ -1211,7 +1366,10 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// because it mirrors an export. And it lays only what configuration for the
 /// scripts that run next consists of, its extended attributes left behind, with
 /// no report of the rest, where a `CopyIn` copies any tree and names what it
-/// leaves out.
+/// leaves out. An access control list left behind is not dropped as though it
+/// were never there: the entry is given the list's narrowing as its mode, so
+/// the owning group keeps what the list gave it rather than the mask the
+/// mode's group bits show.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 pub(crate) fn overlay_tree(
     root: &Path,
@@ -1222,14 +1380,17 @@ pub(crate) fn overlay_tree(
     let lower_fd = over.map(|(lower, _)| open_root(lower)).transpose()?;
     let source_fd = open_root(source)?;
     let owed = RefCell::new(Vec::new());
+    let ownership = over.map_or_else(Ownership::default, |(_, ownership)| ownership.clone());
+    let lists = ListIds::new(&ownership);
     let tree = Tree {
         root: root_fd.as_fd(),
         lower: lower_fd.as_ref().map(AsFd::as_fd),
         owed: &owed,
+        lists: &lists,
     };
     let mut dir_meta = HashMap::new();
     overlay_dir(tree, source_fd, source, &mut dir_meta)?;
-    apply_dir_meta(root_fd.as_fd(), dir_meta)?;
+    apply_dir_meta(root_fd.as_fd(), dir_meta, &lists)?;
     match over {
         Some((_, ownership)) => reown(root, &owed.into_inner(), ownership),
         None => Ok(()),
@@ -1292,7 +1453,18 @@ fn overlay_dir(
             rustix::fs::statat(&level.dir, &leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| {
                 ProvisionError::io("inspecting the overlay entry", &entry, errno.into())
             })?;
-        let mode = stat.st_mode & 0o7777;
+        // The source's access control list is left behind, so the mode the
+        // entry is given is the list's narrowing: where the list has a mask,
+        // the mode alone would give the owning group what the mask allows.
+        let narrowed = |fd: BorrowedFd<'_>| {
+            xattr::narrowed_mode(fd, stat.st_mode & 0o7777).map_err(|errno| {
+                ProvisionError::io(
+                    "reading the overlay entry's access control list",
+                    &entry,
+                    errno.into(),
+                )
+            })
+        };
 
         // A name a directory listing returns is a single component other than
         // `.` or `..`, so the pushed component is always a safe leaf.
@@ -1306,7 +1478,6 @@ fn overlay_dir(
                 overlay_symlink(tree, &target, &components, dir_meta)?;
             }
             FileType::Directory => {
-                overlay_mkdir(tree, mode, &components, dir_meta)?;
                 let dir = rustix::fs::openat(
                     &level.dir,
                     &leaf,
@@ -1316,6 +1487,7 @@ fn overlay_dir(
                 .map_err(|errno| {
                     ProvisionError::io("reading the overlay directory", &entry, errno.into())
                 })?;
+                overlay_mkdir(tree, narrowed(dir.as_fd())?, &components, dir_meta)?;
                 stack.push(overlay_level(dir, entry)?);
                 continue;
             }
@@ -1331,6 +1503,7 @@ fn overlay_dir(
                             ProvisionError::io("reading the overlay file", &entry, errno.into())
                         }
                     })?;
+                let mode = narrowed(file.as_fd())?;
                 overlay_file(tree, File::from(file), &entry, mode, &components, dir_meta)?;
             }
             _ => {}
@@ -1401,7 +1574,7 @@ fn overlay_mkdir(
         }
     };
     if created {
-        dir_meta.insert(path, DirMeta { mode, mtime: None });
+        dir_meta.insert(path, DirMeta::of(mode, None));
     }
     Ok(())
 }
@@ -1604,6 +1777,53 @@ mod tests {
         assert_eq!(mode_of(&upper.join("srv")), 0o555);
         assert_eq!(fs::read(upper.join("srv/conf")).unwrap(), b"setting\n");
         writable(&upper);
+    }
+
+    #[test]
+    fn an_overlay_entry_whose_list_is_left_behind_is_given_its_narrowing() {
+        // `group::---,mask::rw-` shows as group `rw-` in the mode. The overlay
+        // lays no list, so the mode alone would give the owning group the mask.
+        let base = Scratch::for_test("overlay", "access-list");
+        let root = base.join("root");
+        let source = base.join("source");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let secret = source.join("secret");
+        fs::write(&secret, b"for one user\n").unwrap();
+        let none = u32::MAX;
+        let mut list = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 6u16, none),
+            (
+                0x02,
+                6,
+                rustix::process::geteuid().as_raw().wrapping_add(4242),
+            ),
+            (0x04, 0, none),
+            (0x10, 6, none),
+            (0x20, 0, none),
+        ] {
+            list.extend_from_slice(&tag.to_le_bytes());
+            list.extend_from_slice(&perm.to_le_bytes());
+            list.extend_from_slice(&id.to_le_bytes());
+        }
+        if rustix::fs::setxattr(
+            &secret,
+            "system.posix_acl_access",
+            &list,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_err()
+        {
+            ferroday_cage_testkit::require::premise_unmet(
+                "this filesystem holds no POSIX access control lists",
+            );
+            return;
+        }
+        assert_eq!(mode_of(&secret), 0o660, "the source's mode shows the mask");
+
+        overlay_tree(&root, &source, None).expect("the overlay applies");
+        assert_eq!(mode_of(&root.join("secret")), 0o600);
     }
 
     #[test]
@@ -1823,6 +2043,197 @@ mod mode_tests {
             assert!(found.file_type().is_fifo(), "{name}");
             assert_eq!(found.permissions().mode() & 0o7777, mode, "{name}");
         }
+    }
+}
+
+// The access control lists an archive records, which the extractor applies
+// rather than leaving the mode to stand for them.
+#[cfg(test)]
+mod list_tests {
+    use super::{Placement, TarReader, extract_archive};
+    use crate::scratch::Scratch;
+    use ferroday_cage_testkit::tar::Tar;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    const NONE: u32 = u32::MAX;
+
+    /// A list's attribute value from `(tag, perm, id)` triples.
+    fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut value = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&perm.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    /// `user::rw-,user:<named>:rw-,group::---,mask::rw-,other::---`, whose
+    /// mode shows the mask as the group's bits.
+    fn masked(named: u32) -> Vec<u8> {
+        acl(&[
+            (0x01, 6, NONE),
+            (0x02, 6, named),
+            (0x04, 0, NONE),
+            (0x10, 6, NONE),
+            (0x20, 0, NONE),
+        ])
+    }
+
+    /// One pax record, its value bytes as they stand.
+    fn record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let content = [b" ", key, b"=", value, b"\n"].concat();
+        let mut length = content.len();
+        while length.to_string().len() + content.len() != length {
+            length = length.to_string().len() + content.len();
+        }
+        [length.to_string().as_bytes(), &content].concat()
+    }
+
+    /// `user::rwx,user:<named>:rwx,group::---,mask::rwx,other::---`, a
+    /// directory's list of the same shape.
+    fn masked_dir(named: u32) -> Vec<u8> {
+        acl(&[
+            (0x01, 7, NONE),
+            (0x02, 7, named),
+            (0x04, 0, NONE),
+            (0x10, 7, NONE),
+            (0x20, 0, NONE),
+        ])
+    }
+
+    /// Appends a pax header carrying `records` for the entry after it.
+    fn pax(tar: &mut Tar, records: &[u8]) {
+        tar.header(b"pax", b'x', 0o644, records.len() as u64, 0, b"")
+            .body(records);
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    fn list_of(path: &Path, name: &str) -> Option<Vec<u8>> {
+        let mut value = vec![0u8; 1024];
+        match rustix::fs::lgetxattr(path, name, &mut value[..]) {
+            Ok(read) => {
+                value.truncate(read);
+                Some(value)
+            }
+            Err(rustix::io::Errno::NODATA) => None,
+            Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
+        }
+    }
+
+    /// Whether the filesystem `dir` is on holds access control lists.
+    fn holds_lists(dir: &Path) -> bool {
+        let probe = dir.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let held = rustix::fs::setxattr(
+            &probe,
+            "system.posix_acl_access",
+            &acl(&[(0x01, 6, NONE), (0x04, 4, NONE), (0x20, 4, NONE)]),
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_ok();
+        std::fs::remove_file(&probe).unwrap();
+        held
+    }
+
+    #[test]
+    fn an_access_control_list_the_archive_records_is_applied_or_narrowed() {
+        // Under the single-identity map root inside is the calling user, so a
+        // list naming root inside lands naming the caller, and a list naming
+        // anyone else cannot land at all. That one is narrowed rather than
+        // dropped: its mode's group bits are its mask, and the owning group's
+        // own entry is `---`.
+        let root = Scratch::for_test("extract", "access-lists");
+        if !holds_lists(&root) {
+            ferroday_cage_testkit::require::premise_unmet(
+                "this filesystem holds no POSIX access control lists",
+            );
+            return;
+        }
+        let caller = rustix::process::geteuid().as_raw();
+        let mut tar = Tar::new();
+        pax(
+            &mut tar,
+            &record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
+        );
+        tar.file("shared", 0o660, b"for root\n");
+        pax(
+            &mut tar,
+            &record(b"SCHILY.xattr.system.posix_acl_access", &masked(4242)),
+        );
+        tar.file("narrowed", 0o4660, b"for someone else\n");
+        // A directory's default list waits for the deferred pass, so the file
+        // extracted beneath it inherits none.
+        pax(
+            &mut tar,
+            &[
+                record(b"SCHILY.xattr.system.posix_acl_access", &masked_dir(0)),
+                record(b"SCHILY.xattr.system.posix_acl_default", &masked_dir(0)),
+            ]
+            .concat(),
+        );
+        tar.dir("dir", 0o770).file("dir/inside", 0o644, b"plain\n");
+        extract_archive(
+            &mut TarReader::new(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect("the archive extracts");
+
+        assert_eq!(
+            list_of(&root.join("shared"), "system.posix_acl_access"),
+            Some(masked(caller)),
+        );
+        assert_eq!(mode_of(&root.join("shared")), 0o660);
+
+        assert_eq!(
+            list_of(&root.join("narrowed"), "system.posix_acl_access"),
+            None
+        );
+        assert_eq!(
+            mode_of(&root.join("narrowed")),
+            0o4600,
+            "the owning group was given the mask rather than its own entry",
+        );
+
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            assert_eq!(
+                list_of(&root.join("dir"), name),
+                Some(masked_dir(caller)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            list_of(&root.join("dir/inside"), "system.posix_acl_access"),
+            None
+        );
+        assert_eq!(mode_of(&root.join("dir/inside")), 0o644);
+    }
+
+    #[test]
+    fn a_list_the_kernel_would_not_store_refuses_its_entry() {
+        let root = Scratch::for_test("extract", "malformed-list");
+        let mut tar = Tar::new();
+        pax(
+            &mut tar,
+            &record(b"SCHILY.xattr.system.posix_acl_access", b"not a list"),
+        );
+        tar.file("file", 0o640, b"x");
+        let err = extract_archive(
+            &mut TarReader::new(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect_err("a malformed list is refused");
+        assert!(err.to_string().contains("access control list"), "{err}",);
     }
 }
 

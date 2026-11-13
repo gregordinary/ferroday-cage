@@ -98,6 +98,19 @@ pub(crate) struct Entry {
     /// written.
     #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub checksum_sha1: Option<[u8; 20]>,
+    /// The POSIX access control list a `SCHILY.xattr.system.posix_acl_access`
+    /// record states for this entry, as the attribute's own value: the kernel's
+    /// binary form, its named ids as the archive's writer read them.
+    ///
+    /// An [`Export`](super::Export) writes one for every entry that carries a
+    /// list. It is read for the extractor, which gives the entry the list
+    /// rather than the mode alone: where a list has a mask, the mode's group
+    /// bits are the mask, and the mode alone would give the owning group what
+    /// the mask allows.
+    pub acl_access: Option<Vec<u8>>,
+    /// The default list a `SCHILY.xattr.system.posix_acl_default` record states
+    /// for a directory, in the same form, read for the same reason.
+    pub acl_default: Option<Vec<u8>>,
 }
 
 /// Whether entries of type `typeflag` carry a data stream.
@@ -121,6 +134,8 @@ struct PaxRecords {
     uname: Option<Vec<u8>>,
     gname: Option<Vec<u8>>,
     checksum_sha1: Option<[u8; 20]>,
+    acl_access: Option<Vec<u8>>,
+    acl_default: Option<Vec<u8>>,
     /// Whether any `GNU.sparse.*` record was present, which makes the entry a
     /// GNU sparse member in one of the pax formats.
     gnu_sparse: bool,
@@ -144,6 +159,11 @@ impl PaxRecords {
             uname: other.uname.clone().or_else(|| self.uname.clone()),
             gname: other.gname.clone().or_else(|| self.gname.clone()),
             checksum_sha1: other.checksum_sha1.or(self.checksum_sha1),
+            acl_access: other.acl_access.clone().or_else(|| self.acl_access.clone()),
+            acl_default: other
+                .acl_default
+                .clone()
+                .or_else(|| self.acl_default.clone()),
             gnu_sparse: other.gnu_sparse || self.gnu_sparse,
         }
     }
@@ -360,6 +380,8 @@ impl<R: Read> TarReader<R> {
                         entry.gname = gname;
                     }
                     entry.checksum_sha1 = pax.checksum_sha1;
+                    entry.acl_access = pax.acl_access;
+                    entry.acl_default = pax.acl_default;
                     // A pax sparse member says `0` in its header; see
                     // `Entry::typeflag`. Its size is still the stored length,
                     // so the reader reads past it as it would any member.
@@ -704,6 +726,8 @@ fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
         mtime,
         // Stated by a pax record only; a ustar header has no field for it.
         checksum_sha1: None,
+        acl_access: None,
+        acl_default: None,
     })
 }
 
@@ -914,6 +938,17 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             // presence is recorded: the member is refused rather than
             // reassembled, so the map's values are never read.
             _ if key.starts_with(b"GNU.sparse.") => records.gnu_sparse = true,
+            // An extended attribute, its name spelled as GNU tar spells it in a
+            // keyword. Only the two access control lists are read; every other
+            // attribute is one the extractor does not apply.
+            _ if key.starts_with(XATTR_KEYWORD) => {
+                let name = xattr_name(&key[XATTR_KEYWORD.len()..]);
+                if name == b"system.posix_acl_access" {
+                    records.acl_access = Some(value.to_vec());
+                } else if name == b"system.posix_acl_default" {
+                    records.acl_default = Some(value.to_vec());
+                }
+            }
             _ => {}
         }
     }
@@ -924,6 +959,57 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
 // block size, the field offsets, and the octal encoding, so they are one
 // module: two files describing one header layout drift, and a header this
 // crate writes is one this crate reads back in `export_tar`'s round trip.
+
+/// The prefix of the pax keyword that records an extended attribute, the name
+/// following it.
+pub(crate) const XATTR_KEYWORD: &[u8] = b"SCHILY.xattr.";
+
+/// The pax keyword recording the extended attribute `name`, spelled as GNU tar
+/// spells it.
+///
+/// A pax record's keyword ends at its first `=`, so a name holding one cannot
+/// be written as it stands: the record would read back as a shorter name with
+/// the rest of the name in its value. GNU tar writes `=` as `%3D` and, so that
+/// the escape is unambiguous, `%` as `%25`, and reads both back. Spelling a name
+/// the same way means GNU tar and this crate's reader ([`xattr_name`]) restore
+/// it exactly.
+pub(crate) fn xattr_keyword(name: &[u8]) -> Vec<u8> {
+    let mut keyword = XATTR_KEYWORD.to_vec();
+    for &byte in name {
+        match byte {
+            b'%' => keyword.extend_from_slice(b"%25"),
+            b'=' => keyword.extend_from_slice(b"%3D"),
+            byte => keyword.push(byte),
+        }
+    }
+    keyword
+}
+
+/// The attribute name a `SCHILY.xattr.` keyword's remainder spells, its
+/// `%3D` and `%25` read back as GNU tar reads them ([`xattr_keyword`]). Any
+/// other `%` stands for itself.
+fn xattr_name(spelled: &[u8]) -> Vec<u8> {
+    let mut name = Vec::with_capacity(spelled.len());
+    let mut at = 0;
+    while at < spelled.len() {
+        match &spelled[at..] {
+            [b'%', b'3', b'D', ..] => {
+                name.push(b'=');
+                at += 3;
+            }
+            [b'%', b'2', b'5', ..] => {
+                name.push(b'%');
+                at += 3;
+            }
+            [byte, ..] => {
+                name.push(*byte);
+                at += 1;
+            }
+            [] => break,
+        }
+    }
+    name
+}
 
 /// The largest size the ustar octal `size` field holds (`8^11 - 1`); a larger
 /// file needs a pax `size` record.
@@ -1082,6 +1168,51 @@ mod tests {
         assert_eq!(records.path.as_deref(), Some(&b"some/long/file/name"[..]));
         assert_eq!(records.size, Some(1234567890));
         assert_eq!(records.mtime, Some(1720000000));
+    }
+
+    #[test]
+    fn an_attribute_name_holding_an_equals_sign_survives_its_keyword() {
+        // A keyword ends at the first `=`, so a name holding one is spelled as
+        // GNU tar spells it, and read back the same way.
+        for name in [&b"user.a=b"[..], b"user.100%", b"user.%3D", b"user.plain"] {
+            let keyword = xattr_keyword(name);
+            assert!(!keyword.contains(&b'='), "{keyword:?}");
+            assert_eq!(xattr_name(&keyword[XATTR_KEYWORD.len()..]), name);
+        }
+        assert_eq!(xattr_keyword(b"user.a=b%c"), b"SCHILY.xattr.user.a%3Db%25c");
+    }
+
+    #[test]
+    fn the_access_control_list_records_are_read_and_no_other_attribute() {
+        let mut data = Vec::new();
+        for (key, value) in [
+            (
+                &b"SCHILY.xattr.system.posix_acl_access"[..],
+                &b"\x02\0\0\0list"[..],
+            ),
+            (
+                b"SCHILY.xattr.system.posix_acl_default",
+                b"\x02\0\0\0default",
+            ),
+            (b"SCHILY.xattr.user.comment", b"ignored"),
+        ] {
+            let mut record = key.to_vec();
+            record.push(b'=');
+            record.extend_from_slice(value);
+            record.push(b'\n');
+            let mut length = record.len() + 3;
+            if length.to_string().len() + 1 + record.len() != length {
+                length += 1;
+            }
+            data.extend_from_slice(format!("{length} ").as_bytes());
+            data.extend_from_slice(&record);
+        }
+        let records = parse_pax(&data).unwrap();
+        assert_eq!(records.acl_access.as_deref(), Some(&b"\x02\0\0\0list"[..]));
+        assert_eq!(
+            records.acl_default.as_deref(),
+            Some(&b"\x02\0\0\0default"[..])
+        );
     }
 
     #[test]

@@ -324,9 +324,10 @@ pub(super) use layered::{Reached, copy_up, mark_opaque, modified, owed};
 /// host's policy, and it differs between two hosts holding the same tree.
 ///
 /// The one answer to the question. An export leaves these out of the archive,
-/// so one tree's archive is the same from any host, and a layered build's
-/// carry leaves them off the upper's copy of a base directory, as the overlay's
-/// own copy-up does.
+/// so one tree's archive is the same from any host; a copy into a root leaves
+/// them off what it creates, as the destination's host labels it afresh; and a
+/// layered build's carry leaves them off the upper's copy of a base directory,
+/// as the overlay's own copy-up does.
 ///
 /// Most of these an unprivileged sandbox cannot set at all. A `user.overlay.`
 /// one is the exception: on a root filesystem that is a plain directory, a
@@ -334,7 +335,6 @@ pub(super) use layered::{Reached, copy_up, mark_opaque, modified, owed};
 /// same, since an overlay mounted with `userxattr`, as every one this library
 /// mounts is, reads that namespace as its own bookkeeping. A carried
 /// `user.overlay.opaque` would hide a lower layer's directory there.
-#[cfg(feature = "tarball")]
 pub(super) fn host_assigned_xattr(name: &[u8]) -> bool {
     matches!(
         name,
@@ -363,14 +363,11 @@ mod layered {
         open_dir,
     };
     use crate::provision::copyin::{Owed, Owner};
+    use crate::provision::xattr::{self, read_sized};
 
     /// The extended attributes that hold a POSIX access control list: one for
     /// the directory itself, and the default its new entries inherit.
-    const ACLS: [&CStr; 2] = [c"system.posix_acl_access", c"system.posix_acl_default"];
-
-    /// How many times a listing or a value is read again after it grew between
-    /// asking its size and reading it.
-    const XATTR_ATTEMPTS: u32 = 3;
+    const ACLS: [&CStr; 2] = [xattr::ACCESS_ACL, xattr::DEFAULT_ACL];
 
     /// How many symbolic links one [`copy_up`] walk follows before it leaves the
     /// rest to the kernel, which refuses the loop itself. The kernel's own bound,
@@ -728,35 +725,6 @@ mod layered {
             }
         }
         Ok(())
-    }
-
-    /// Reads a listing or a value whose length `query` answers, through `read`,
-    /// which fills the buffer it is given and answers the length it filled.
-    ///
-    /// The length can change between the asking and the reading, which the
-    /// read answers with `ERANGE`; it is asked again a few times before that is
-    /// reported. A filesystem without extended attributes has none to read.
-    fn read_sized(
-        mut query: impl FnMut() -> Result<usize, Errno>,
-        mut read: impl FnMut(&mut [u8]) -> Result<usize, Errno>,
-    ) -> Result<Vec<u8>, Errno> {
-        for _ in 0..XATTR_ATTEMPTS {
-            let size = match query() {
-                Ok(size) => size,
-                Err(Errno::NOTSUP) => return Ok(Vec::new()),
-                Err(errno) => return Err(errno),
-            };
-            let mut buffer = vec![0u8; size];
-            match read(&mut buffer) {
-                Ok(read) => {
-                    buffer.truncate(read);
-                    return Ok(buffer);
-                }
-                Err(Errno::RANGE) => continue,
-                Err(errno) => return Err(errno),
-            }
-        }
-        Err(Errno::RANGE)
     }
 
     /// The ownership the directory a carry made is owed, where the lower's

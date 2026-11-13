@@ -1681,6 +1681,274 @@ fn a_copy_creates_a_named_pipe() {
     assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
 }
 
+/// A POSIX access control list's attribute value, from `(tag, perm, id)`
+/// triples: user-obj 0x01, user 0x02, group-obj 0x04, group 0x08, mask 0x10,
+/// other 0x20.
+fn acl_value(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut value = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        value.extend_from_slice(&tag.to_le_bytes());
+        value.extend_from_slice(&perm.to_le_bytes());
+        value.extend_from_slice(&id.to_le_bytes());
+    }
+    value
+}
+
+/// The value of the attribute `name` on `path`, `None` where it holds none.
+fn xattr_of(path: &Path, name: &str) -> Option<Vec<u8>> {
+    let mut value = vec![0u8; 4096];
+    match rustix::fs::lgetxattr(path, name, &mut value[..]) {
+        Ok(read) => {
+            value.truncate(read);
+            Some(value)
+        }
+        Err(rustix::io::Errno::NODATA) => None,
+        Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
+    }
+}
+
+/// A copy gives each entry the attributes it carries, `user.` ones and access
+/// control lists, a list with a mask and named entries included, and a
+/// directory's default list. Under the single map the caller's own ids are the
+/// rootfs's root, so a list naming the caller names the rootfs's root inside
+/// and reads back from the host exactly as the source's does.
+#[test]
+fn a_copy_carries_user_attributes_and_access_control_lists() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("copyin-attributes");
+    let source = dir.join("source");
+    let shared = source.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    let notes = shared.join("notes");
+    std::fs::write(&notes, b"for the group\n").unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let gid = rustix::process::getegid().as_raw();
+    const NONE: u32 = u32::MAX;
+    let access = acl_value(&[
+        (0x01, 6, NONE),
+        (0x02, 4, uid),
+        (0x04, 0, NONE),
+        (0x08, 4, gid),
+        (0x10, 4, NONE),
+        (0x20, 0, NONE),
+    ]);
+    let set = |path: &Path, name: &str, value: &[u8]| {
+        rustix::fs::lsetxattr(path, name, value, rustix::fs::XattrFlags::empty()).is_ok()
+    };
+    if !set(&notes, "system.posix_acl_access", &access) {
+        common::require::premise_unmet("this filesystem holds no POSIX access control lists");
+        return;
+    }
+    if !set_user_xattr(&notes, b"user.comment", b"kept") {
+        common::require::premise_unmet("this filesystem holds no user extended attributes");
+        return;
+    }
+    let default = acl_value(&[
+        (0x01, 7, NONE),
+        (0x02, 5, uid),
+        (0x04, 5, NONE),
+        (0x10, 5, NONE),
+        (0x20, 0, NONE),
+    ]);
+    assert!(set(&shared, "system.posix_acl_default", &default));
+    assert!(set_user_xattr(&shared, b"user.purpose", b"sharing"));
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let report = provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(report.attributes.is_empty(), "{:?}", report.attributes);
+
+    let copied = rootfs.join("shared/notes");
+    for name in ["system.posix_acl_access", "user.comment"] {
+        assert_eq!(xattr_of(&copied, name), xattr_of(&notes, name), "{name}");
+    }
+    for name in ["system.posix_acl_default", "user.purpose"] {
+        assert_eq!(
+            xattr_of(&rootfs.join("shared"), name),
+            xattr_of(&shared, name),
+            "{name}",
+        );
+    }
+    // The mode shows the mask, as the source's does.
+    assert_eq!(
+        std::fs::symlink_metadata(&copied)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640,
+    );
+}
+
+/// An access control list naming a user the map has no id for cannot be
+/// carried, and is named in the report. Its mask is what the mode's group bits
+/// show, so the entry is given the list's narrowing rather than the mode
+/// alone: the owning group keeps the nothing the list gave it.
+#[test]
+fn a_copy_names_a_list_it_cannot_carry_and_narrows_the_entry_instead() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("copyin-attributes-unmapped");
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let secret = source.join("secret");
+    std::fs::write(&secret, b"for one user\n").unwrap();
+    // Any user but the caller is one the single map has no id for.
+    let other = rustix::process::geteuid().as_raw().wrapping_add(4242);
+    const NONE: u32 = u32::MAX;
+    let access = acl_value(&[
+        (0x01, 6, NONE),
+        (0x02, 6, other),
+        (0x04, 0, NONE),
+        (0x10, 6, NONE),
+        (0x20, 0, NONE),
+    ]);
+    if rustix::fs::lsetxattr(
+        &secret,
+        "system.posix_acl_access",
+        &access,
+        rustix::fs::XattrFlags::empty(),
+    )
+    .is_err()
+    {
+        common::require::premise_unmet("this filesystem holds no POSIX access control lists");
+        return;
+    }
+    assert_eq!(
+        std::fs::symlink_metadata(&secret)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o660,
+        "the source's mode shows the mask",
+    );
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let report = provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(report.attributes.len(), 1, "{:?}", report.attributes);
+    let skipped = &report.attributes[0];
+    assert_eq!(skipped.path, secret);
+    assert_eq!(skipped.name, "system.posix_acl_access");
+    assert_eq!(skipped.reason, provision::AttributeSkip::UnmappedId);
+    assert!(
+        skipped.reason.to_string().contains("identity map"),
+        "{}",
+        skipped.reason,
+    );
+
+    let copied = rootfs.join("secret");
+    assert_eq!(xattr_of(&copied, "system.posix_acl_access"), None);
+    assert_eq!(
+        std::fs::symlink_metadata(&copied)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "the owning group was given the mask rather than its own entry",
+    );
+}
+
+/// An export records an access control list as the attribute it is, and the
+/// crate's own extractor applies it, so a tree exported and provisioned again
+/// keeps who may read what. Under the single map the caller is root inside, so
+/// a list naming the caller is recorded naming root and lands naming the
+/// caller again.
+#[test]
+fn an_exported_access_control_list_is_applied_where_the_archive_is_extracted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("acl-round-trip");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let shared = root.join("shared");
+    std::fs::write(&shared, b"for the named user\n").unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    const NONE: u32 = u32::MAX;
+    let list = acl_value(&[
+        (0x01, 6, NONE),
+        (0x02, 6, uid),
+        (0x04, 0, NONE),
+        (0x10, 6, NONE),
+        (0x20, 0, NONE),
+    ]);
+    if rustix::fs::lsetxattr(
+        &shared,
+        "system.posix_acl_access",
+        &list,
+        rustix::fs::XattrFlags::empty(),
+    )
+    .is_err()
+    {
+        common::require::premise_unmet("this filesystem holds no POSIX access control lists");
+        return;
+    }
+
+    let mut out = Vec::new();
+    provision::export_tar(&root, &mut out, IdentityMap::Single).expect("the export succeeds");
+    let dest = dir.join("provisioned");
+    provision::ensure(
+        &dest,
+        &mut provision::Tarball::from_reader(std::io::Cursor::new(out)),
+    )
+    .expect("the archive provisions");
+
+    let landed = dest.join("shared");
+    assert_eq!(xattr_of(&landed, "system.posix_acl_access"), Some(list));
+    assert_eq!(
+        std::fs::symlink_metadata(&landed)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o660,
+    );
+}
+
+/// A pax keyword ends at its first `=`, so an attribute whose name holds one is
+/// spelled as GNU tar spells it, `%3D`, with `%` itself as `%25`, and GNU tar
+/// reads it back whole.
+#[test]
+fn an_attribute_name_holding_an_equals_sign_is_spelled_as_gnu_tar_spells_it() {
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("xattr-keyword");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file"), b"x").unwrap();
+    if !set_user_xattr(&root.join("file"), b"user.a=b%c", b"the value") {
+        common::require::premise_unmet("this filesystem holds no user extended attributes");
+        return;
+    }
+    let mut out = Vec::new();
+    provision::export_tar(&root, &mut out, IdentityMap::Single).expect("the export succeeds");
+    let entries = parse_tar(&out);
+    let index = by_path(&entries);
+    assert_eq!(
+        index[&b"./file"[..]].xattrs,
+        vec![(b"user.a%3Db%25c".to_vec(), b"the value".to_vec())],
+    );
+}
+
 /// An entry the copy cannot create is named in the report rather than dropped
 /// in silence.
 #[test]

@@ -34,3 +34,15 @@ pub(crate) const DATA_BUF: usize = 65536;
 /// not fit, and the launch reads a link already at the op's path back into a
 /// buffer of this size to compare it.
 pub(crate) const LINK_BUF: usize = 4096;
+
+/// The longest name an extended attribute may have, the kernel's
+/// `XATTR_NAME_MAX`.
+pub(crate) const XATTR_NAME_MAX: usize = 255;
+
+/// The largest value an extended attribute may hold, and the longest list of
+/// names one entry may carry: the kernel's `XATTR_SIZE_MAX` and
+/// `XATTR_LIST_MAX`, which are the same.
+///
+/// The export's child reads a list and a value into buffers of this size, and
+/// the copy-in child reads a value into one.
+pub(crate) const XATTR_SIZE_MAX: usize = 65536;

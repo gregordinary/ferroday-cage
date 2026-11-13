@@ -57,7 +57,7 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::process::{Pid, Signal};
 
 use super::ChildMap;
-use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX};
+use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_SIZE_MAX};
 use super::child::MapFailure;
 use super::frame;
 use super::sys::{self, Fork};
@@ -326,9 +326,6 @@ fn export_child(
 
 /// The directory-iteration buffer, one per open level.
 const DIRENTS_BUF: usize = 2048;
-/// The bound on an extended-attribute name list and on a single value, both
-/// capped by the kernel at 64 KiB.
-const XATTR_BUF: usize = 65536;
 /// The bytes of entry names the walk can hold at once: those of every
 /// directory it is inside, since each is read whole and sorted before its
 /// entries are visited.
@@ -546,7 +543,7 @@ impl Walker<'_> {
     /// emits an empty block.
     fn emit_xattrs(&self, fd: BorrowedFd<'_>) -> Result<(), (ExportStep, Errno)> {
         let stream = self.stream;
-        let mut names = [0u8; XATTR_BUF];
+        let mut names = [0u8; XATTR_SIZE_MAX];
         let list_len = match fs::flistxattr(fd, &mut names[..]) {
             Ok(len) => len,
             Err(Errno::NOTSUP) | Err(Errno::NODATA) => 0,
@@ -559,7 +556,7 @@ impl Walker<'_> {
         let count = u16::try_from(count).map_err(|_| (ExportStep::Xattr, Errno::RANGE))?;
         put(stream, &count.to_le_bytes())?;
 
-        let mut value = [0u8; XATTR_BUF];
+        let mut value = [0u8; XATTR_SIZE_MAX];
         let mut start = 0;
         for (i, byte) in list.iter().enumerate() {
             if *byte != 0 {

@@ -97,12 +97,13 @@ pub(crate) mod rooted;
 mod tar;
 #[cfg(feature = "tarball")]
 mod tarball;
+mod xattr;
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
 pub use available::Available;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub(crate) use cache::PackageCache;
-pub use copyin::{CopyIn, CopyReport, SkippedEntry, SkippedKind};
+pub use copyin::{AttributeSkip, CopyIn, CopyReport, SkippedAttribute, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, ExportEntry, ExportKind, export_tar};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
