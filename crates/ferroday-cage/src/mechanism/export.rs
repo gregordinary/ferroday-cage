@@ -750,8 +750,6 @@ pub(crate) fn kill_export(export: &ExportChild) {
 mod tests {
     use std::io::Read;
 
-    use rustix::event::{PollFd, PollFlags, Timespec};
-
     use super::*;
     use crate::scratch::Scratch;
 
@@ -931,14 +929,11 @@ mod tests {
         // The caller's own copy goes; the child's is all that could keep the
         // pipe open now.
         drop(bystander_write);
-        let mut fds = [PollFd::new(&bystander_read, PollFlags::IN)];
-        let timeout = Timespec {
-            tv_sec: 10,
-            tv_nsec: 0,
-        };
-        rustix::event::poll(&mut fds, Some(&timeout)).expect("the poll completes");
         assert!(
-            !fds[0].revents().is_empty(),
+            ferroday_cage_testkit::fd::readable_by(
+                &bystander_read,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+            ),
             "the export child still holds the caller's descriptor",
         );
         let mut byte = [0u8; 1];
