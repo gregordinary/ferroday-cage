@@ -91,6 +91,14 @@ A Landlock network grant governs `connect` to every TCP port, loopback
 included. A sandbox carrying one grants `NetAccess::CONNECT` on the listener's
 port, or the command's connection is refused.
 
+`fcage --forward-loopback PORT TARGET` is the command-line form, over the same
+call. `PORT` is an `ADDRESS:PORT` or a bare port on `127.0.0.1`, and `TARGET` is
+an absolute path naming a unix socket or an `ADDRESS:PORT` on the host. `fcage`
+accepts each connection the command makes and copies it to the target on threads
+of its own. A target that refuses a connection is reported on standard error and
+the command's connection closed. The flag is repeatable, needs the isolated
+network, and composes with `--netstack`.
+
 ## The native stack
 
 With the `netstack` feature, [`NetStack`] is the library's own stack, attached

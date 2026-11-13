@@ -87,8 +87,10 @@ directory among them, is refused before anything starts.
 
 The isolated network is loopback-only by default. `--netstack` attaches a native userspace
 TCP/IP stack for IPv4 and IPv6 with no helper binary, outbound and to any port
-`--netstack-publish` opens on the host. `--share-net` gives the command the host's network
-instead.
+`--netstack-publish` opens on the host. `--forward-loopback PORT TARGET` gives the command
+one way out instead. The command connects to `PORT` on its loopback, and `fcage` carries each
+connection to a unix socket or an address on the host. `--share-net` gives the command the
+host's network.
 
 A sandbox composed from host binds needs no root directory. `--empty-rootfs` roots it on an
 empty filesystem of its own, which the mount flags populate and which becomes read-only once

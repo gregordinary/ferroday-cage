@@ -120,6 +120,9 @@ consumer upgrading can skip it.
   anything else is refused with the new `Error::ListenRefused`, whose
   `ListenRefusal` says why, and a failure to make the listener is the new
   `Error::Listen`.
+- `fcage --forward-loopback PORT TARGET` listens on the sandbox's loopback at
+  `PORT` and carries each connection the command makes there to `TARGET` on the
+  host, a unix socket's absolute path or an `ADDRESS:PORT` (`ferroday-cage-cli`).
 - `CageBuilder::present_as` presents the caller to the command as another
   identity under the single-identity map. The command sees the caller as the
   given uid and gid rather than as root, or, with `PresentedIdentity::Own`, as

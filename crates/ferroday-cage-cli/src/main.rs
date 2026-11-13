@@ -41,6 +41,7 @@
 //! publishes the enumerations they print. `tools/parity.toml` records the whole
 //! comparison, setting by setting, and a check holds it to the code.
 
+mod forward;
 mod output;
 mod streams;
 mod terminal;
@@ -58,10 +59,10 @@ use ferroday_cage::provision::{ProvisionError, ProvisionEvent, Provisioned, Prov
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ErrorChain, ExitStatus, FsAccess, IdRange,
-    Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, Network, Overlay,
-    PresentedIdentity, RawMount, Resource, RestrictedProfile, Restriction, RestrictionBuilder,
-    Running, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
-    Symlink,
+    Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, NetStackHandle,
+    Network, Overlay, PresentedIdentity, RawMount, Resource, RestrictedProfile, Restriction,
+    RestrictionBuilder, Running, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy,
+    SeccompRules, Stdio, Symlink,
 };
 use serde::Deserialize as _;
 
@@ -1604,6 +1605,41 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--forward-loopback",
+        section: Section::Networking,
+        placeholder: "PORT TARGET",
+        help: &[
+            "Listen on the sandbox's loopback at PORT, an",
+            "ADDRESS:PORT or a bare PORT on 127.0.0.1, and carry",
+            "each TCP connection the command makes there to TARGET",
+            "on the host: an absolute path naming a unix socket,",
+            "or an ADDRESS:PORT (repeatable). Needs the isolated",
+            "network",
+        ],
+        needs: "a sandbox port and a target",
+        take: Take::Two(|options, flag, value, second| {
+            let address = parse_host_address(flag, &into_string(flag, value)?)?;
+            // The library refuses both at the listen; refused here, each is
+            // the usage error it is.
+            if !address.ip().is_loopback() {
+                return Err(format!(
+                    "{flag}: {} is not a loopback address; the listener is on the \
+                     sandbox's loopback",
+                    address.ip()
+                ));
+            }
+            if address.port() == 0 {
+                return Err(format!(
+                    "{flag}: the port must not be 0; it names the port the command connects to"
+                ));
+            }
+            let target = forward::Target::parse(flag, &into_string(flag, second)?)?;
+            options.forwards.push((address, target));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--netstack",
         section: Section::Networking,
         help: &[
@@ -1751,7 +1787,7 @@ const FLAGS: &[Flag] = &[
         ],
         needs: "a host address and a guest port",
         take: Take::Two(|options, flag, value, second| {
-            let host = parse_publish_host(&into_string(flag, value)?)?;
+            let host = parse_host_address(flag, &into_string(flag, value)?)?;
             let guest_port = parse_port(flag, &into_string(flag, second)?)?;
             // The library refuses it at build; refused here, it is the usage
             // error it is. Port 0 on the host side asks the kernel for a free
@@ -2417,6 +2453,8 @@ struct Options {
     netstack_host_loopback: bool,
     netstack_host_ports: Vec<u16>,
     netstack_publish: Vec<(SocketAddr, u16)>,
+    /// The `--forward-loopback` listeners, each with its target on the host.
+    forwards: Vec<(SocketAddr, forward::Target)>,
 }
 
 /// The capability posture requested on the command line.
@@ -2933,6 +2971,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack_host_loopback: false,
         netstack_host_ports: Vec::new(),
         netstack_publish: Vec::new(),
+        forwards: Vec::new(),
     };
 
     while let Some(arg) = args.next() {
@@ -3052,6 +3091,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             (options.path_lookup.is_some(), "the path-lookup options"),
             (options.netstack, "--netstack"),
             (has_netstack_modifiers(&options), "the --netstack-* options"),
+            (!options.forwards.is_empty(), "--forward-loopback"),
         ];
         for (given, name) in conflicts {
             if given {
@@ -3087,6 +3127,19 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     }
     if !options.netstack && has_netstack_modifiers(&options) {
         return Err("the --netstack-* options require --netstack".to_string());
+    }
+    // A forward listens on the isolated network's loopback, which neither of
+    // the other two networks gives the sandbox.
+    if !options.forwards.is_empty() {
+        match options.network {
+            Some(Network::Host) => {
+                return Err("--forward-loopback cannot be used with --share-net".to_string());
+            }
+            Some(Network::None) => {
+                return Err("--forward-loopback cannot be used with --deny-net".to_string());
+            }
+            _ => {}
+        }
     }
 
     // A plain rootfs, an overlay root, and an empty root are alternatives; the
@@ -3812,22 +3865,21 @@ fn has_netstack_modifiers(options: &Options) -> bool {
         || !options.netstack_publish.is_empty()
 }
 
-/// Parses the host half of `--netstack-publish`: an `ADDRESS:PORT`, with an
-/// IPv6 address in brackets, or a bare `PORT`, which listens on `127.0.0.1`.
+/// Parses the address a listener of `fcage`'s binds: the host half of
+/// `--netstack-publish`, or the sandbox half of `--forward-loopback`. Either is
+/// an `ADDRESS:PORT`, with an IPv6 address in brackets, or a bare `PORT`, which
+/// listens on `127.0.0.1`.
 ///
-/// The bare form is the loopback because a published port is reachable by
-/// whatever reaches its address, and the address that reaches least is the one
-/// to fall back on. Anything wider is spelled out.
-fn parse_publish_host(value: &str) -> Result<SocketAddr, String> {
+/// The bare form is the loopback because a listener is reachable by whatever
+/// reaches its address, and the address that reaches least is the one to fall
+/// back on. Anything wider is spelled out.
+fn parse_host_address(flag: &str, value: &str) -> Result<SocketAddr, String> {
     if let Ok(port) = value.parse::<u16>() {
         return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
     }
-    value.parse::<SocketAddr>().map_err(|_| {
-        format!(
-            "--netstack-publish expects ADDRESS:PORT or a bare PORT for the host side, \
-             not {value:?}"
-        )
-    })
+    value
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("{flag} expects ADDRESS:PORT or a bare PORT, not {value:?}"))
 }
 
 /// Parses an IPv4 `address/prefix` for `--netstack-cidr`.
@@ -5081,6 +5133,8 @@ struct Launch {
     timeout: Option<Duration>,
     kill_after: Duration,
     publications: Vec<(SocketAddr, u16)>,
+    /// The `--forward-loopback` listeners and their targets.
+    forwards: Vec<(SocketAddr, forward::Target)>,
 }
 
 impl Launch {
@@ -5125,6 +5179,11 @@ impl Launch {
         if options.netstack && options.network.is_none() && profile_network_host {
             return Err(usage_error(format_args!(
                 "--netstack cannot be used with a profile that sets network = \"host\""
+            )));
+        }
+        if !options.forwards.is_empty() && options.network.is_none() && profile_network_host {
+            return Err(usage_error(format_args!(
+                "--forward-loopback cannot be used with a profile that sets network = \"host\""
             )));
         }
 
@@ -5275,8 +5334,9 @@ impl Launch {
         // a terminal replaces all three, so each is judged now and any that is a
         // file is relayed once the launch starts. A terminal without the
         // network stack is driven by the library's terminal launch, which
-        // takes no stream of `fcage`'s at all.
-        let streams = if options.terminal && stack.is_none() {
+        // takes no stream of `fcage`'s at all. A launch held at the pending
+        // seam, for the stack or a forward, takes the streams in either case.
+        let streams = if options.terminal && stack.is_none() && options.forwards.is_empty() {
             None
         } else {
             Some(judge_streams(&builder, &CAGE_STREAMS, options.terminal)?)
@@ -5290,6 +5350,7 @@ impl Launch {
             timeout: options.timeout,
             kill_after: options.kill_after,
             publications: options.netstack_publish,
+            forwards: options.forwards,
         })
     }
 
@@ -5303,6 +5364,7 @@ impl Launch {
             timeout,
             kill_after,
             publications,
+            forwards,
         } = self;
         let Some(judged) = streams else {
             return run_on_a_terminal(builder, timeout, kill_after);
@@ -5311,11 +5373,12 @@ impl Launch {
             Ok(routed) => routed,
             Err(code) => return code,
         };
-        if let Some(stack) = stack {
-            return run_with_netstack(
+        if stack.is_some() || !forwards.is_empty() {
+            return run_pending(
                 builder,
                 stack,
                 &publications,
+                forwards,
                 terminal,
                 timeout,
                 kill_after,
@@ -5521,21 +5584,28 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
     stack.build()
 }
 
-/// Builds and runs a sandbox with the native network stack attached at the
-/// pending seam: build, hold the command, attach the stack, then release it
-/// so the network is up before the command's first instruction.
-fn run_with_netstack(
+/// Builds and runs a sandbox held at the pending seam: build, hold the command,
+/// attach the native network stack and make the `--forward-loopback`
+/// listeners, then release it, so the network and the listeners are up before
+/// the command's first instruction.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parts of one launch, each a field of `Launch`, which hands them over whole"
+)]
+fn run_pending(
     builder: CageBuilder,
-    stack: NetStack,
+    stack: Option<NetStack>,
     publications: &[(SocketAddr, u16)],
+    forwards: Vec<(SocketAddr, forward::Target)>,
     terminal: bool,
     timeout: Option<Duration>,
     kill_after: Duration,
     relay: streams::StreamRelay,
 ) -> ExitCode {
-    // Blocked before the stack's own thread exists, so that thread inherits the
-    // mask and no process-directed signal can be delivered behind the relay's
-    // back. Nothing is allocated for a run without a terminal.
+    // Blocked before the stack's own thread and the forwards' exist, so those
+    // threads inherit the mask and no process-directed signal can be delivered
+    // behind the relay's back. Nothing is allocated for a run without a
+    // terminal.
     let signals = if terminal {
         match Signals::install() {
             Ok(signals) => Some(signals),
@@ -5550,8 +5620,9 @@ fn run_with_netstack(
     };
 
     // Hold the command at the gate, attach the stack to the sandbox's
-    // namespace, then release the command. A failed attach drops the
-    // pending launch, which tears the sandbox down.
+    // namespace and make the listeners on its loopback, then release the
+    // command. A failure drops the pending launch, which tears the sandbox
+    // down.
     //
     // With a terminal, the primary comes back here rather than out of
     // `proceed`: the sandbox allocates the pseudoterminal and sends its primary
@@ -5567,17 +5638,43 @@ fn run_with_netstack(
         Ok(held) => held,
         Err(error) => return finish(relay, Err(error.into())),
     };
-    let handle = match stack.attach(&pending) {
+    let handle = match stack.map(|stack| stack.attach(&pending)).transpose() {
         Ok(handle) => handle,
         Err(error) => return finish(relay, Err(Failure::Fcage(error.into()))),
     };
+    // Stops what the run started, once the sandbox is gone or was never
+    // released: the forwards first, since nothing reaches their listeners
+    // without the sandbox, then the stack. A stack that does not stop cleanly
+    // is reported; it loses no data, so it is a warning rather than the run's
+    // outcome, and it is returned for the caller to print once the stream
+    // relays have delivered the command's output.
+    let stop = |forwards: Vec<forward::Forward>, handle: Option<NetStackHandle>| {
+        for forward in forwards {
+            forward.stop();
+        }
+        handle.map(NetStackHandle::stop).transpose()
+    };
+    let mut started = Vec::with_capacity(forwards.len());
+    for (address, target) in forwards {
+        match forward::Forward::start(&pending, address, target) {
+            Ok(forward) => started.push(forward),
+            Err(failure) => {
+                drop(pending);
+                let _ = stop(started, handle);
+                return finish(relay, Err(failure));
+            }
+        }
+    }
     // A publication that left the port to the kernel is useless until the
     // caller knows which one it got. Said before the command is released, and
     // before a terminal session takes the caller's terminal into raw mode. A
     // reader that has gone is told nothing, so the command is not released:
     // dropping the pending launch tears the sandbox down, and the stack stops
     // with it.
-    for ((requested, guest_port), bound) in publications.iter().zip(handle.published()) {
+    let published = handle
+        .as_ref()
+        .map_or_else(Vec::new, |handle| handle.published().to_vec());
+    for ((requested, guest_port), bound) in publications.iter().zip(published) {
         if requested.port() == 0
             && output::say(format_args!(
                 "fcage: publishing the sandbox's port {guest_port} on {bound}"
@@ -5586,13 +5683,16 @@ fn run_with_netstack(
         {
             drop(pending);
             // A stack that does not stop cleanly has nowhere left to say so.
-            let _ = handle.stop();
+            let _ = stop(started, handle);
             return finish(relay, Err(Failure::ReaderGone));
         }
     }
     let running = match pending.proceed() {
         Ok(running) => running,
-        Err(error) => return finish(relay, Err(error.into())),
+        Err(error) => {
+            let _ = stop(started, handle);
+            return finish(relay, Err(error.into()));
+        }
     };
 
     // The relay when a terminal was allocated, the plain wait otherwise. Both
@@ -5603,13 +5703,11 @@ fn run_with_netstack(
         }
         _ => wait_with_deadline(running, timeout, kill_after).map_err(Failure::from),
     };
-    let stopped = handle.stop();
+    let stopped = stop(started, handle);
     let delivered = settle(relay);
-    // The stack is torn down after the command; a failure here loses no data,
-    // so it is a warning, not the run's outcome. Printed after the stream
-    // relays have delivered the command's output, so it lands after that
-    // output, and after the terminal relay has restored the caller's terminal,
-    // so it is not stair-stepped.
+    // Printed after the stream relays have delivered the command's output, so
+    // it lands after that output, and after the terminal relay has restored the
+    // caller's terminal, so it is not stair-stepped.
     if let Err(error) = stopped {
         output::report(format_args!(
             "fcage: the network stack did not stop cleanly: {}",
@@ -9172,23 +9270,90 @@ mod tests {
     }
 
     #[test]
+    fn a_forward_listens_on_a_loopback_port_of_the_isolated_network() {
+        let options = parse_run(&[
+            "--rootfs",
+            "/r",
+            "--forward-loopback",
+            "4100",
+            "/run/egress.sock",
+            "--forward-loopback",
+            "[::1]:80",
+            "127.0.0.1:8080",
+            "/bin/true",
+        ])
+        .expect("two forwards");
+        assert_eq!(
+            options.forwards,
+            vec![
+                (
+                    "127.0.0.1:4100".parse().unwrap(),
+                    forward::Target::Unix(PathBuf::from("/run/egress.sock")),
+                ),
+                (
+                    "[::1]:80".parse().unwrap(),
+                    forward::Target::Tcp("127.0.0.1:8080".parse().unwrap()),
+                ),
+            ]
+        );
+        for (args, expected) in [
+            (
+                &["--forward-loopback", "10.0.0.1:80", "/s"][..],
+                "is not a loopback address",
+            ),
+            (&["--forward-loopback", "0", "/s"], "must not be 0"),
+            (
+                &["--forward-loopback", "80", "relative.sock"],
+                "absolute path",
+            ),
+            (
+                &["--share-net", "--forward-loopback", "80", "/s"],
+                "--forward-loopback cannot be used with --share-net",
+            ),
+            (
+                &["--deny-net", "--forward-loopback", "80", "/s"],
+                "--forward-loopback cannot be used with --deny-net",
+            ),
+        ] {
+            let mut full = vec!["--rootfs", "/r"];
+            full.extend_from_slice(args);
+            full.push("/bin/true");
+            let err = parse_error(&full);
+            assert!(err.contains(expected), "{args:?}: {err}");
+        }
+        let err = parse_error(&[
+            "--restrict",
+            "--landlock-ro",
+            "/",
+            "--forward-loopback",
+            "80",
+            "/s",
+            "/bin/true",
+        ]);
+        assert!(
+            err.contains("--forward-loopback cannot be used with --restrict"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_published_host_side_is_an_address_or_a_loopback_port() {
         // A bare port stays on loopback, the address that reaches least; any
         // wider exposure is written out.
         assert_eq!(
-            parse_publish_host("8080").expect("a bare port"),
+            parse_host_address("--netstack-publish", "8080").expect("a bare port"),
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
         );
         assert_eq!(
-            parse_publish_host("0.0.0.0:8080").expect("an explicit wildcard"),
+            parse_host_address("--netstack-publish", "0.0.0.0:8080").expect("an explicit wildcard"),
             "0.0.0.0:8080".parse::<SocketAddr>().unwrap(),
         );
         assert!(
-            parse_publish_host("::1:8080").is_err(),
+            parse_host_address("--netstack-publish", "::1:8080").is_err(),
             "IPv6 needs brackets"
         );
         assert!(
-            parse_publish_host("localhost:8080").is_err(),
+            parse_host_address("--netstack-publish", "localhost:8080").is_err(),
             "no name lookup"
         );
         let err = parse_run(&[
