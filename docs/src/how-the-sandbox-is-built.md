@@ -92,16 +92,23 @@ sequence itself.
 11. **Mount the root.** `pivot_root` requires the new root to be a mount
     point. A plain root filesystem is bind-mounted onto itself, recursively,
     which makes it one without a staging directory. An overlay root is mounted
-    over its base. The canonical path validated at build time is resolved here,
-    inside the new namespace. The kernel requires bind sources and targets to be
-    attached in the caller's own mount namespace, so a descriptor opened before
-    the unshare cannot anchor this step. An [empty root](#an-empty-root) has no
-    path: it is a tmpfs created for the launch.
+    over its base. The canonical path validated at build time is opened here,
+    inside the new namespace, refusing a symbolic link at any component. The
+    path held none when it was validated, so a link there was put in place
+    since, by whatever can write a directory the path runs through, and the
+    launch fails rather than mount what the link names. The root is mounted onto
+    that descriptor, and the init carries on through a descriptor of the new
+    mount, so the path is not resolved again. The kernel requires bind sources
+    and targets to be attached in the caller's own mount namespace, so a
+    descriptor opened before the unshare cannot anchor this step. An [empty
+    root](#an-empty-root) has no path: it is a tmpfs created for the launch.
 12. **The mount profile.** The init executes the frozen mount operations in
     order: the fresh `/proc`, the minimal `/dev`, the `/tmp` tmpfs, the
     caller's own mounts, and the `resolv.conf` bind, as configured. Bind
-    sources are host paths and resolve normally — the host
-    tree is still mounted. Targets resolve against the new root with
+    sources are host paths, canonical at build time, and are opened as the
+    root's path is, refusing a symbolic link, while the host tree is still
+    mounted; each bind is cloned from that descriptor. Targets resolve against
+    the new root with
     `openat2` and `RESOLVE_IN_ROOT`, so a symlink inside the rootfs — even
     an absolute one — resolves within the rootfs and can never address the
     host; the mount syscalls then reach the resolved target through its

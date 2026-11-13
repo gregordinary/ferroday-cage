@@ -709,6 +709,13 @@ consumer upgrading can skip it.
   port socket by a count of the flows using it. Each lookup searched the other
   table, so every datagram a guest sent cost the product of the two tables'
   sizes.
+- A launch opens the rootfs, an overlay's base and every bind source without
+  following a symbolic link, and mounts from the descriptor. The build freezes
+  each as its canonical path, and each launch resolved that path again,
+  following links: a sandbox that could write a directory a later launch's
+  bind source runs through could replace a component with a link, and the next
+  launch of the same plan bound whatever the link named. Such a launch now fails
+  at that mount with `ELOOP`.
 
 ### Internal
 

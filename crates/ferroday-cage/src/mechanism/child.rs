@@ -1610,12 +1610,13 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     // the rootfs onto itself; an overlay-rooted cage mounts an overlay over the
     // rootfs, whose own directory is the overlay's read-only lower, so writes
     // land in the disposable upper and the base stays pristine. Either way the
-    // canonical path frozen at build time is resolved here, inside the new
-    // namespace: `mount` refuses sources and targets whose mounts are not
-    // attached in the caller's namespace, so a descriptor opened before
-    // `unshare` cannot anchor this step. The overlay mounts as root inside the
-    // now-established identity map, so its copy-up ownership resolves against
-    // that map. An empty root has no path; see `mount_empty_root`.
+    // canonical path frozen at build time is opened here, inside the new
+    // namespace, without following a link (see `open_frozen`): a mount refuses
+    // sources and targets whose mounts are not attached in the caller's
+    // namespace, so a descriptor opened before `unshare` cannot anchor this
+    // step. The overlay mounts as root inside the now-established identity
+    // map, so its copy-up ownership resolves against that map. An empty root
+    // has no path; see `mount_empty_root`.
     //
     // Each root carries `nosuid`; see `nosuid_root`. An overlay and an empty
     // root take it at their own mount, where the flag applies directly and no
@@ -1625,27 +1626,25 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     // bind and whatever it carried along and nothing the caller went on to
     // mount: a caller's bind keeps its source's flags.
     //
-    // The descriptor anchors both the mount-target resolution below and the
-    // pivot. Opening a path root anew lands on top of the mount stack, the new
-    // mount.
+    // The root is mounted detached and attached onto the descriptor of the
+    // path, and the descriptor of the mount itself anchors both the
+    // mount-target resolution below and the pivot, so no path names the root
+    // again.
     let newroot = match &plan.root {
         RootPlan::Bind(rootfs) => {
-            mount::mount_bind_recursive(rootfs, rootfs)
-                .map_err(|errno| (SetupStep::BindRootfs, errno, 0))?;
-            let newroot = open_root(rootfs)?;
+            let failed = |errno| (SetupStep::BindRootfs, errno, 0);
+            let rootfs = open_frozen(rootfs, OFlags::DIRECTORY).map_err(failed)?;
+            let newroot = clone_tree(rootfs.as_fd()).map_err(failed)?;
+            attach(newroot.as_fd(), rootfs.as_fd()).map_err(failed)?;
             nosuid_root(newroot.as_fd()).map_err(|errno| (SetupStep::NosuidRootfs, errno, 0))?;
             newroot
         }
         RootPlan::Overlay { base, overlay } => {
-            mount::mount(
-                c"overlay",
-                base.as_c_str(),
-                c"overlay",
-                MountFlags::NOSUID,
-                overlay.options.as_c_str(),
-            )
-            .map_err(|errno| (SetupStep::MountOverlayRoot, errno, 0))?;
-            open_root(base)?
+            let failed = |errno| (SetupStep::MountOverlayRoot, errno, 0);
+            let base = open_frozen(base, OFlags::DIRECTORY).map_err(failed)?;
+            let newroot = mount_overlay(overlay.options.as_c_str()).map_err(failed)?;
+            attach(newroot.as_fd(), base.as_fd()).map_err(failed)?;
+            newroot
         }
         RootPlan::Empty => {
             mount_empty_root().map_err(|errno| (SetupStep::MountEmptyRoot, errno, 0))?
@@ -2808,16 +2807,42 @@ const HIDDEN_FILE_MODE: u32 = 0o644;
 /// Makes the tree at `target` read-only where it stands: a clone of it, every
 /// mount beneath it included, read-only, bound onto it.
 fn read_only_in_place(target: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
-    let tree = mount::open_tree(
-        target,
+    let tree = clone_tree(target).map_err(|errno| (SetupStep::ReadOnlyPath, errno))?;
+    attach_tree(tree, target, true, SetupStep::ReadOnlyPath)
+}
+
+/// Clones the tree `at` names, every mount beneath it included, detached.
+fn clone_tree(at: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
+    mount::open_tree(
+        at,
         c"",
         mount::OpenTreeFlags::OPEN_TREE_CLONE
             | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC
             | mount::OpenTreeFlags::AT_RECURSIVE
             | mount::OpenTreeFlags::AT_EMPTY_PATH,
     )
-    .map_err(|errno| (SetupStep::ReadOnlyPath, errno))?;
-    attach_tree(tree, target, true, SetupStep::ReadOnlyPath)
+}
+
+/// Opens a host path the build froze canonical, for a mount to act on the
+/// descriptor, refusing a symbolic link at any component of it.
+///
+/// The build resolves the rootfs, the overlay's base and every bind source to
+/// its canonical path, which holds no link, and a launch reaches the path again
+/// only here. A link met there was put in place since, by whatever can write a
+/// directory the path runs through: a sandbox an earlier launch of the same
+/// plan bound such a directory into writable, for one. Followed, it would mount
+/// whatever it names, `~/.ssh` as readily as the tree the plan named. The
+/// kernel refuses it instead, with `ELOOP`, and the launch fails at the mount
+/// the path was for. The mount then acts on the descriptor, so nothing
+/// resolves the path a second time.
+fn open_frozen(path: &CStr, oflags: OFlags) -> Result<OwnedFd, Errno> {
+    resolve::openat2(
+        fs::CWD,
+        path,
+        OFlags::PATH | OFlags::CLOEXEC | oflags,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    )
 }
 
 /// Attaches the detached mount `mount` names onto the mount target `target`
@@ -2849,10 +2874,12 @@ fn links_to(dir: BorrowedFd<'_>, leaf: &CStr, content: &CStr) -> bool {
 /// Binds the host tree at `source`, with every mount beneath it, onto the
 /// mount target `target` names, read-only throughout when `read_only` asks.
 ///
-/// The tree is cloned detached first (`open_tree` with `OPEN_TREE_CLONE`), made
-/// read-only while detached, and only then attached (`move_mount`) onto the
-/// descriptor the target was resolved to. Nothing between the bind and its
-/// restriction resolves a path again. Remounting by path after an ordinary
+/// The source is opened without following a link; see [`open_frozen`]. The
+/// tree is cloned detached from that descriptor (`open_tree` with
+/// `OPEN_TREE_CLONE`), made read-only while detached, and only then attached
+/// (`move_mount`) onto the descriptor the target was resolved to. Nothing
+/// between the bind and its restriction resolves a path again. Remounting by
+/// path after an ordinary
 /// bind would: a sandbox sharing a writable root could rename and symlink in
 /// that window, and land the read-only flag on a mount of its choosing while
 /// this bind stayed writable. Restricted before it is attached, the bind is
@@ -2867,14 +2894,9 @@ fn links_to(dir: BorrowedFd<'_>, leaf: &CStr, content: &CStr) -> bool {
 /// is writable for that moment, and only the bind itself is covered: its
 /// submounts keep their own flags.
 fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (SetupStep, Errno)> {
-    let tree = mount::open_tree(
-        fs::CWD,
-        source,
-        mount::OpenTreeFlags::OPEN_TREE_CLONE
-            | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC
-            | mount::OpenTreeFlags::AT_RECURSIVE,
-    )
-    .map_err(|errno| (SetupStep::BindMount, errno))?;
+    let failed = |errno| (SetupStep::BindMount, errno);
+    let source = open_frozen(source, OFlags::empty()).map_err(failed)?;
+    let tree = clone_tree(source.as_fd()).map_err(failed)?;
     attach_tree(tree, target, read_only, SetupStep::BindMount)
 }
 
@@ -2931,14 +2953,53 @@ fn nosuid_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
     }
 }
 
-/// Opens the root mount a path root was just mounted at.
-fn open_root(path: &CStr) -> Result<OwnedFd, Failure> {
-    rustix::fs::open(
-        path,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+/// The directory, in a tmpfs of the sandbox's own, that [`mount_overlay`]
+/// mounts an overlay on before it clones it.
+const OVERLAY_MOUNT_POINT: &CStr = c"overlay";
+
+/// Mounts an overlay with `options` and returns a descriptor of it, attached
+/// nowhere.
+///
+/// `mount(2)` is the call the overlay probe makes, with the same option string,
+/// and it mounts only onto a path. The path here is a directory in a tmpfs of
+/// the sandbox's own, attached for the moment on top of `/`, where no lookup
+/// crosses it (see [`mount_empty_root`]), so nothing outside this process can
+/// reach it or replace it. The overlay is cloned from there, the clone keeping
+/// its flags, and the tmpfs is detached again with the original in it.
+fn mount_overlay(options: &CStr) -> Result<OwnedFd, Errno> {
+    let scratch = empty_tmpfs(
+        mount::MountAttrFlags::MOUNT_ATTR_NOSUID
+            | mount::MountAttrFlags::MOUNT_ATTR_NODEV
+            | mount::MountAttrFlags::MOUNT_ATTR_NOEXEC,
+    )?;
+    fs::mkdirat(&scratch, OVERLAY_MOUNT_POINT, Mode::from_raw_mode(0o700))?;
+    attach_over_root(scratch.as_fd())?;
+    let clone = fs::openat(
+        &scratch,
+        OVERLAY_MOUNT_POINT,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| (SetupStep::EnterRootfs, errno, 0))
+    .and_then(|at| {
+        mount::mount(
+            c"overlay",
+            fd_path(&at).as_cstr(),
+            c"overlay",
+            MountFlags::NOSUID,
+            options,
+        )
+    })
+    .and_then(|()| {
+        mount::open_tree(
+            &scratch,
+            OVERLAY_MOUNT_POINT,
+            mount::OpenTreeFlags::OPEN_TREE_CLONE | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC,
+        )
+    });
+    let detached = mount::unmount(fd_path(&scratch).as_cstr(), UnmountFlags::DETACH);
+    let clone = clone?;
+    detached?;
+    Ok(clone)
 }
 
 /// Mounts the tmpfs an empty root is made of, and returns a descriptor of it.

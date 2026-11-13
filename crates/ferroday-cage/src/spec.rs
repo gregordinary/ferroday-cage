@@ -4735,12 +4735,17 @@ impl Lowering {
             "/dev".to_string(),
         );
         for device in DEV_DEVICES {
+            // Canonical, as every bind source is, since the launch opens it
+            // without following a link. A device the host lacks keeps its
+            // name, and the launch fails at its bind.
+            let source = PathBuf::from(format!("/dev/{device}"));
+            let source = std::fs::canonicalize(&source).unwrap_or(source);
             self.push(
                 MountOp {
                     dirs: Vec::new(),
                     create_file: Some(rel_cstring(&["dev", device])?),
                     action: MountAction::Bind {
-                        source: cstring(OsStr::new(&format!("/dev/{device}")))?,
+                        source: cstring(source.as_os_str())?,
                         target: rel_cstring(&["dev", device])?,
                         read_only: false,
                     },

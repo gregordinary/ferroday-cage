@@ -1435,6 +1435,61 @@ fn a_file_target_beneath_a_hide_of_nothing_leaves_no_placeholder_behind() {
     );
 }
 
+/// A bind source the build froze is opened at every launch without following a
+/// link, so a sandbox that turns it into one cannot redirect the next launch.
+///
+/// The plan binds a working tree writable and a directory inside that tree
+/// read-only. The first launch's command, which may write the tree, replaces
+/// the inner directory with a link to a directory the plan never named. The
+/// second launch of the same plan is refused at that bind rather than binding
+/// what the link names.
+#[test]
+fn a_bind_source_a_sandbox_replaced_with_a_link_is_refused_at_the_next_launch() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("frozen-source-link");
+    let work = dir.join("work");
+    let secret = dir.join("secret");
+    std::fs::create_dir_all(work.join("config")).unwrap();
+    std::fs::create_dir_all(&secret).unwrap();
+    std::fs::write(work.join("config/file"), b"configured\n").unwrap();
+    std::fs::write(secret.join("file"), b"secret\n").unwrap();
+    let script = format!(
+        "cat /etc/app/file && mv /work/config /work/config.old && ln -s {} /work/config",
+        secret.display(),
+    );
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .bind(&work, "/work")
+        .bind_ro(work.join("config"), "/etc/app")
+        .command("/bin/sh")
+        .args(["-c", &script])
+        .build()
+        .expect("a valid sandbox configuration");
+
+    let first = cage.output().expect("the first launch runs");
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(first.stdout, b"configured\n");
+    assert!(
+        std::fs::symlink_metadata(work.join("config"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the first launch left a link where the bind source was",
+    );
+
+    let err = cage.output().expect_err("the second launch is refused");
+    assert!(
+        matches!(
+            &err,
+            Error::Setup { step: SetupStep::BindMount, source, .. }
+                if source.raw_os_error() == Some(Errno::LOOP.raw_os_error())
+        ),
+        "{err:?}"
+    );
+}
+
 /// Binds the fixture's userland read-only into whatever root `builder` names.
 fn fixture_userland(
     builder: ferroday_cage::CageBuilder,

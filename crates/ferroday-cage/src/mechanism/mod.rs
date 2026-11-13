@@ -274,13 +274,13 @@ pub(crate) enum RootPlan {
     Host,
     /// The canonical rootfs, bound onto itself.
     ///
-    /// The sandbox stage resolves the path anew inside its own mount
-    /// namespace: a descriptor opened before `unshare` still references the
-    /// original namespace's mounts, and `mount` refuses bind sources and
-    /// targets that are not attached in the caller's namespace.
+    /// The sandbox stage opens the path anew inside its own mount namespace,
+    /// without following a link: a descriptor opened before `unshare` still
+    /// references the original namespace's mounts, and a mount refuses sources
+    /// and targets that are not attached in the caller's namespace.
     Bind(CString),
     /// An overlay mounted over the canonical rootfs, which is its read-only
-    /// base lower, so writes land in a disposable upper. The path is resolved
+    /// base lower, so writes land in a disposable upper. The path is opened
     /// anew as [`Bind`](Self::Bind)'s is.
     Overlay {
         /// The canonical rootfs the overlay is mounted over.
@@ -1127,8 +1127,8 @@ pub(crate) enum MountAction {
     /// Recursively bind a host path onto a rootfs target.
     Bind {
         /// Absolute host source path, canonicalized at build time and
-        /// resolved by the sandbox stage before the pivot, while the host
-        /// view is still mounted.
+        /// opened by the sandbox stage before the pivot, while the host view
+        /// is still mounted, without following a link.
         source: CString,
         /// Rootfs-relative mount target.
         target: CString,
