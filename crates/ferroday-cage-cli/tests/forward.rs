@@ -193,6 +193,17 @@ impl Session {
     /// Starts `fcage` with `flags`, a forward to `target`, and `script` as the
     /// command's shell script.
     fn start(rootfs: &std::path::Path, flags: &[&str], target: &str, script: &str) -> Session {
+        Session::start_with_stderr(rootfs, flags, target, script, Stdio::piped())
+    }
+
+    /// [`start`](Self::start), with `fcage`'s standard error on `stderr`.
+    fn start_with_stderr(
+        rootfs: &std::path::Path,
+        flags: &[&str],
+        target: &str,
+        script: &str,
+        stderr: Stdio,
+    ) -> Session {
         let mut command = Command::new(FCAGE);
         command
             .args(["--rootfs", rootfs.to_str().expect("a UTF-8 fixture path")])
@@ -201,7 +212,7 @@ impl Session {
             .args(["--", "/bin/sh", "-c", script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(stderr);
         let mut child = common::spawn_grouped(&mut command);
         let input = child.stdin.take();
         let output = child.stdout.take().expect("the output is piped");
@@ -738,4 +749,65 @@ fn a_forward_holds_its_budget_on_one_thread_and_resets_what_is_past_it() {
         "the budget is reported once: {stderr}"
     );
     drop(held);
+}
+
+#[test]
+fn a_forward_carries_connections_while_nothing_reads_its_reports() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // `fcage`'s standard error is a pipe already full, which nothing reads
+    // until the run is over. Nothing listens at the target at first, so the
+    // forward reports the command's first connection refused. The target then
+    // comes up, and the command's second connection is carried while that
+    // report still waits for a reader.
+    let dir = common::scratch_dir("fcage-forward-unread-reports");
+    let (_dir, socket) = short_socket_path(&dir, "late.sock");
+    let (unread, stderr) = std::io::pipe().expect("a pipe for standard error");
+    rustix::io::ioctl_fionbio(&stderr, true).expect("the pipe can be filled");
+    let mut filled = 0;
+    while let Ok(written) = (&stderr).write(&[b'.'; 4096]) {
+        filled += written;
+    }
+    while (&stderr).write(b".").is_ok() {
+        filled += 1;
+    }
+    rustix::io::ioctl_fionbio(&stderr, false).expect("the pipe blocks again");
+
+    let mut session = Session::start_with_stderr(
+        rootfs,
+        &[],
+        &socket,
+        "echo ready; read go; nc 127.0.0.1 4100 </dev/null; echo refused; read again; \
+         echo from-the-sandbox | nc 127.0.0.1 4100",
+        Stdio::from(stderr),
+    );
+    session.expect_line("ready");
+    session.send("go");
+    session.expect_line("refused");
+    let listener = UnixListener::bind(&socket).expect("the target socket binds");
+    let answered = answer_one(move || listener.accept().map(|(connection, _)| connection));
+    session.send("again");
+    session.expect_line("FROM-THE-SANDBOX");
+    assert_eq!(
+        answered.join().expect("the target thread finishes"),
+        "from-the-sandbox\n"
+    );
+
+    // The run ends once its report is written, which takes a reader.
+    let reader = std::thread::spawn(move || {
+        let mut written = Vec::new();
+        (&unread)
+            .read_to_end(&mut written)
+            .expect("standard error reads to its end");
+        written
+    });
+    let output = session.finish(PATIENCE);
+    let written = reader.join().expect("the reader finishes");
+    let stderr = String::from_utf8_lossy(&written[filled..]);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert!(
+        stderr.contains("connecting to the target"),
+        "the refused target is reported: {stderr}"
+    );
 }

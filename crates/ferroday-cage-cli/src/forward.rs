@@ -18,6 +18,15 @@
 //! keeps the sandbox's network namespace alive, and resets every connection it
 //! holds: the run's end ends every forwarded connection.
 //!
+//! # Reports
+//!
+//! A forward reports on standard error, and never waits on it to: its thread
+//! carries every connection, and a reader that stops taking standard error
+//! must not stall them. Its lines go through a [`Reporter`] to the one thread
+//! every forward of a run shares, which writes them, and drops and counts any
+//! past what it holds; see [`output`](crate::output). The run's end waits for that
+//! thread to write what it holds before `fcage` writes its own last lines.
+//!
 //! # Bounds
 //!
 //! - A forward holds at most [`MAX_CONNECTIONS`] connections at once, counting
@@ -96,7 +105,8 @@ use rustix::net::{
 };
 use rustix::pipe::{self, PipeFlags};
 
-use crate::{Failure, output};
+use crate::Failure;
+use crate::output::{Reporter, Reports};
 
 /// The most connections one forward holds at once, counting those whose
 /// connection to the target is still being made. A connection accepted past it
@@ -225,6 +235,65 @@ enum Attempt {
     Busy,
 }
 
+/// A run's forwards, and the thread that writes their reports.
+pub(crate) struct Forwards {
+    /// Each forward, running.
+    running: Vec<Forward>,
+    /// The thread writing their reports; `None` for a run without a forward.
+    reports: Option<Reports>,
+}
+
+impl Forwards {
+    /// Starts a forward for each of `wanted` on the pending sandbox's
+    /// loopback, and the one thread that writes their reports.
+    ///
+    /// A failure stops what had started, and is the run's.
+    pub(crate) fn start(
+        pending: &Pending<'_>,
+        wanted: Vec<(SocketAddr, Target)>,
+    ) -> Result<Forwards, Failure> {
+        let mut forwards = Forwards {
+            running: Vec::with_capacity(wanted.len()),
+            reports: None,
+        };
+        if wanted.is_empty() {
+            return Ok(forwards);
+        }
+        let reports = Reports::start().map_err(|err| {
+            Failure::Fcage(
+                format!(
+                    "starting the thread that writes the forwards' reports: {}",
+                    ErrorChain::new(&err)
+                )
+                .into(),
+            )
+        })?;
+        let reporter = reports.reporter();
+        forwards.reports = Some(reports);
+        for (address, target) in wanted {
+            match Forward::start(pending, address, target, reporter.clone()) {
+                Ok(forward) => forwards.running.push(forward),
+                Err(failure) => {
+                    drop(reporter);
+                    forwards.stop();
+                    return Err(failure);
+                }
+            }
+        }
+        Ok(forwards)
+    }
+
+    /// Ends every forward, then waits for their reports to be written.
+    pub(crate) fn stop(self) {
+        for forward in self.running {
+            forward.stop();
+        }
+        if let Some(reports) = self.reports {
+            reports.finish();
+        }
+    }
+}
+
 /// A running forward: its thread, and the pipe that stops it.
 pub(crate) struct Forward {
     /// The forward's thread.
@@ -241,10 +310,11 @@ impl Forward {
     /// error. A failure to start the forward around it is `fcage`'s own, and
     /// leaves nothing behind: a thread that does not start drops what it was
     /// handed, the listener and the stop pipe's read end with it.
-    pub(crate) fn start(
+    fn start(
         pending: &Pending<'_>,
         address: SocketAddr,
         target: Target,
+        reporter: Reporter,
     ) -> Result<Forward, Failure> {
         let listener = pending.listen(address)?;
         let own = |op: &str, err: io::Error| {
@@ -258,7 +328,7 @@ impl Forward {
         };
         let (stop_read, stop) = pipe::pipe_with(PipeFlags::CLOEXEC)
             .map_err(|errno| own("creating the stop pipe", errno.into()))?;
-        let relay = Relay::new(listener, stop_read, address, target.clone())
+        let relay = Relay::new(listener, stop_read, address, target.clone(), reporter)
             .map_err(|err| own("making the listener non-blocking", err))?;
         let thread = std::thread::Builder::new()
             .name("fcage-forward".to_string())
@@ -273,7 +343,7 @@ impl Forward {
     ///
     /// The thread never waits on a peer, so the join is bounded whatever the
     /// target or the command's end of a connection is doing.
-    pub(crate) fn stop(self) {
+    fn stop(self) {
         drop(self.stop);
         let _ = self.thread.join();
     }
@@ -289,6 +359,8 @@ struct Relay {
     address: SocketAddr,
     /// Where each connection goes.
     target: Target,
+    /// Where its reports go.
+    reporter: Reporter,
     /// Whether the last poll found the listener readable.
     listener_ready: bool,
     /// When a listener sitting out an accept failure is polled again; `None`
@@ -333,6 +405,7 @@ impl Relay {
         stop: OwnedFd,
         address: SocketAddr,
         target: Target,
+        reporter: Reporter,
     ) -> io::Result<Relay> {
         listener.set_nonblocking(true)?;
         Ok(Relay {
@@ -340,6 +413,7 @@ impl Relay {
             stop,
             address,
             target,
+            reporter,
             listener_ready: false,
             listener_resumes: None,
             accept_failing: false,
@@ -571,9 +645,10 @@ impl Relay {
         self.report(format_args!("{op}: {}", ErrorChain::new(err)));
     }
 
-    /// Writes a line about the forward on standard error, naming it.
+    /// Reports a line about the forward on standard error, naming it, without
+    /// waiting on standard error's reader.
     fn report(&self, line: fmt::Arguments<'_>) {
-        output::report(format_args!(
+        self.reporter.report(format_args!(
             "fcage: forwarding the sandbox's {} to {}: {line}",
             self.address, self.target
         ));
@@ -855,25 +930,61 @@ impl Direction {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::output::tests::Kept;
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use super::*;
-
     /// A relay over a listener of the host's own, standing in for the
-    /// sandbox's, the listener's address, and the write end of its stop pipe.
-    fn relay(target: &TcpListener) -> (Relay, SocketAddr, OwnedFd) {
+    /// sandbox's, the listener's address, the write end of its stop pipe, and
+    /// what it reports.
+    fn relay(target: &TcpListener) -> (Relay, SocketAddr, OwnedFd, Heard) {
         relay_to(target.local_addr().expect("the target has an address"))
     }
 
     /// [`relay`], toward `target` whether or not anything listens there.
-    fn relay_to(target: SocketAddr) -> (Relay, SocketAddr, OwnedFd) {
+    fn relay_to(target: SocketAddr) -> (Relay, SocketAddr, OwnedFd, Heard) {
+        let heard = Heard::new();
+        let (relay, address, stop) = relay_reporting(target, heard.reports.reporter());
+        (relay, address, stop, heard)
+    }
+
+    /// [`relay_to`], reporting to `reporter`.
+    fn relay_reporting(target: SocketAddr, reporter: Reporter) -> (Relay, SocketAddr, OwnedFd) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("the listener binds");
         let address = listener.local_addr().expect("the listener has an address");
         let (stop_read, stop) = pipe::pipe_with(PipeFlags::CLOEXEC).expect("the stop pipe opens");
-        let relay = Relay::new(listener, stop_read, address, Target::Tcp(target))
+        let relay = Relay::new(listener, stop_read, address, Target::Tcp(target), reporter)
             .expect("the relay is made");
         (relay, address, stop)
+    }
+
+    /// What a relay under test reports, kept in memory.
+    struct Heard {
+        /// The thread writing the reports.
+        reports: Reports,
+        /// What it has written.
+        written: Kept,
+    }
+
+    impl Heard {
+        fn new() -> Heard {
+            let written = Kept::default();
+            let reports = Reports::start_to(written.clone()).expect("the reports thread starts");
+            Heard { reports, written }
+        }
+
+        /// The lines reported, each without the prefix naming the forward.
+        /// The relay must be gone, since the lines are complete only once
+        /// every reporter is.
+        fn lines(self) -> Vec<String> {
+            self.reports.finish();
+            self.written
+                .text()
+                .lines()
+                .map(|line| line.splitn(3, ": ").nth(2).unwrap_or(line).to_owned())
+                .collect()
+        }
     }
 
     /// How a connection read to its end ended.
@@ -916,7 +1027,7 @@ mod tests {
     #[test]
     fn a_connection_the_target_has_not_taken_by_its_deadline_is_reset() {
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
-        let (mut relay, address, _stop) = relay(&target);
+        let (mut relay, address, _stop, heard) = relay(&target);
         let command = TcpStream::connect(address).expect("the command connects");
 
         // Accepted, with its connect to the target under way: a non-blocking
@@ -933,6 +1044,11 @@ mod tests {
         assert!(relay.connecting.is_empty(), "held past its deadline");
         assert!(relay.carried.is_empty());
         assert_eq!(read_to_end(command), (Vec::new(), Ending::Reset));
+        drop(relay);
+        assert_eq!(
+            heard.lines(),
+            ["connecting to the target: not connected within 30s"]
+        );
     }
 
     #[test]
@@ -943,7 +1059,7 @@ mod tests {
         let address = TcpListener::bind("127.0.0.1:0")
             .and_then(|gone| gone.local_addr())
             .expect("an address nothing listens at");
-        let (relay, listening, stop) = relay_to(address);
+        let (relay, listening, stop, _heard) = relay_to(address);
         let thread = std::thread::spawn(move || relay.run());
         let command = TcpStream::connect(listening).expect("the command connects");
         assert_eq!(read_to_end(command), (Vec::new(), Ending::Reset));
@@ -956,7 +1072,7 @@ mod tests {
         // A target that comes back after a run of failures has its next
         // failure reported again, so the report says when it went down anew.
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
-        let (mut relay, address, _stop) = relay(&target);
+        let (mut relay, address, _stop, _heard) = relay(&target);
         relay.connect_failing = true;
         let _command = TcpStream::connect(address).expect("the command connects");
         relay.accept(Instant::now());
@@ -974,7 +1090,7 @@ mod tests {
         // The command reads to the end of the connection, so an end of stream
         // where the target reset would pass the cut-off reply off as whole.
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
-        let (relay, address, stop) = relay(&target);
+        let (relay, address, stop, _heard) = relay(&target);
         let thread = std::thread::spawn(move || relay.run());
         let mut command = TcpStream::connect(address).expect("the command connects");
         let (mut connection, _) = target.accept().expect("the relay connects to the target");
@@ -1059,7 +1175,7 @@ mod tests {
         let address = TcpListener::bind("127.0.0.1:0")
             .and_then(|gone| gone.local_addr())
             .expect("an address nothing listens at");
-        let (mut relay, listening, _stop) = relay_to(address);
+        let (mut relay, listening, _stop, heard) = relay_to(address);
         let command = TcpStream::connect(listening).expect("the command connects");
         relay.accept(Instant::now());
         serve_until(&mut relay, "the connect ended", |relay| {
@@ -1071,6 +1187,11 @@ mod tests {
             "the refusal began no run of failures"
         );
         assert_eq!(read_to_end(command), (Vec::new(), Ending::Reset));
+        drop(relay);
+        assert_eq!(
+            heard.lines(),
+            ["connecting to the target: Connection refused (os error 111)"]
+        );
     }
 
     #[test]
@@ -1079,7 +1200,7 @@ mod tests {
         // it, all before the relay has found its connect ended: `SO_ERROR`
         // answers `ECONNRESET` in place of the connect's success.
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
-        let (mut relay, address, _stop) = relay(&target);
+        let (mut relay, address, _stop, heard) = relay(&target);
         relay.connect_failing = true;
         let (command, mut connection) = accepted_at_the_target(&mut relay, &target, address);
         connection
@@ -1104,6 +1225,8 @@ mod tests {
             read_to_end(command),
             (b"the first part of a reply".to_vec(), Ending::Reset)
         );
+        drop(relay);
+        assert!(heard.lines().is_empty(), "the target's reset was reported");
     }
 
     #[test]
@@ -1112,7 +1235,7 @@ mod tests {
         // relay has found its connect ended: `SO_ERROR` answers the connect's
         // success, and the reply and its end reach the command in order.
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
-        let (mut relay, address, _stop) = relay(&target);
+        let (mut relay, address, _stop, heard) = relay(&target);
         let (command, mut connection) = accepted_at_the_target(&mut relay, &target, address);
         connection
             .write_all(b"a reply")
@@ -1125,8 +1248,13 @@ mod tests {
         serve_until(&mut relay, "the connection ended", |relay| {
             relay.connecting.is_empty() && relay.carried.is_empty()
         });
-        assert!(!relay.connect_failing, "the connection was reported");
+        assert!(
+            !relay.connect_failing,
+            "the connection began a run of failures"
+        );
         assert_eq!(read_to_end(command), (b"a reply".to_vec(), Ending::Closed));
+        drop(relay);
+        assert!(heard.lines().is_empty(), "the connection was reported");
     }
 
     #[test]
@@ -1134,7 +1262,7 @@ mod tests {
         // Nothing here polls, so a connect to the target that the kernel has
         // made is still one the relay is making: the budget counts both.
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
-        let (mut relay, address, _stop) = relay(&target);
+        let (mut relay, address, _stop, heard) = relay(&target);
         let held: Vec<TcpStream> = (0..MAX_CONNECTIONS)
             .map(|_| {
                 let command = TcpStream::connect(address).expect("the command connects");
@@ -1156,13 +1284,86 @@ mod tests {
         );
         assert!(relay.refused);
         assert_eq!(read_to_end(past), (Vec::new(), Ending::Reset));
-        drop(held);
+        let again = TcpStream::connect(address).expect("the command connects");
+        relay.accept(Instant::now());
+        assert_eq!(read_to_end(again), (Vec::new(), Ending::Reset));
+        drop((held, relay));
+        assert_eq!(
+            heard.lines(),
+            [format!(
+                "reset a connection past the budget of {MAX_CONNECTIONS} open at once; any \
+                 further one is reset without a report"
+            )]
+        );
+    }
+
+    #[test]
+    fn reports_standard_error_does_not_take_never_stall_a_connection() {
+        // Standard error is a pipe already full, which nobody reads until the
+        // end. A target that refuses the first connection is reported, and
+        // the second connection, to a target that has come up since, is
+        // carried all the same.
+        let address = TcpListener::bind("127.0.0.1:0")
+            .and_then(|gone| gone.local_addr())
+            .expect("an address nothing listens at yet");
+        let (unread, stderr) = io::pipe().expect("a pipe stands in for standard error");
+        rustix::io::ioctl_fionbio(&stderr, true).expect("the pipe can be filled");
+        let mut filled = 0;
+        loop {
+            match (&stderr).write(&[0x2e; 4096]) {
+                Ok(written) => filled += written,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the pipe cannot be filled: {error}"),
+            }
+        }
+        while (&stderr).write(b".").is_ok() {
+            filled += 1;
+        }
+        rustix::io::ioctl_fionbio(&stderr, false).expect("the pipe blocks again");
+        let reports = Reports::start_to(stderr).expect("the reports thread starts");
+        let (relay, listening, stop) = relay_reporting(address, reports.reporter());
+        let thread = std::thread::spawn(move || relay.run());
+
+        let refused = TcpStream::connect(listening).expect("the command connects");
+        assert_eq!(read_to_end(refused), (Vec::new(), Ending::Reset));
+        let target = TcpListener::bind(address).expect("the target comes up at its address");
+        let answered = std::thread::spawn(move || {
+            let (mut connection, _) = target.accept().expect("the relay connects");
+            connection
+                .write_all(b"carried")
+                .expect("the target replies");
+        });
+        let carried = TcpStream::connect(listening).expect("the command connects");
+        carried
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the command ends its request");
+        assert_eq!(read_to_end(carried), (b"carried".to_vec(), Ending::Closed));
+        answered.join().expect("the target thread ends cleanly");
+
+        // The report waited for standard error's reader, and arrives once
+        // there is one, behind what filled the pipe.
+        let reader = std::thread::spawn(move || {
+            let mut written = Vec::new();
+            (&unread)
+                .read_to_end(&mut written)
+                .expect("the pipe reads to its end");
+            written
+        });
+        drop(stop);
+        joined_within(&thread, Duration::from_secs(5), "the relay");
+        reports.finish();
+        let written = reader.join().expect("the reader ends cleanly");
+        let said = String::from_utf8_lossy(&written[filled..]);
+        assert!(
+            said.contains("connecting to the target: Connection refused"),
+            "the refusal was not reported: {said:?}"
+        );
     }
 
     #[test]
     fn a_stop_ends_the_relay_while_its_target_reads_nothing() {
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
-        let (relay, address, stop) = relay(&target);
+        let (relay, address, stop, _heard) = relay(&target);
         let thread = std::thread::spawn(move || relay.run());
 
         // The command sends without end, and the target takes the connection

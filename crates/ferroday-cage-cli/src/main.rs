@@ -5890,27 +5890,24 @@ fn run_pending(
     };
     // Stops what the run started, once the sandbox is gone or was never
     // released: the forwards first, since nothing reaches their listeners
-    // without the sandbox, then the stack. A stack that does not stop cleanly
+    // without the sandbox, with their reports written, then the stack. A stack that does not stop cleanly
     // is reported; it loses no data, so it is a warning rather than the run's
     // outcome, and it is returned for the caller to print once the stream
     // relays have delivered the command's output.
-    let stop = |forwards: Vec<forward::Forward>, handle: Option<NetStackHandle>| {
-        for forward in forwards {
-            forward.stop();
+    let stop = |forwards: Option<forward::Forwards>, handle: Option<NetStackHandle>| {
+        if let Some(forwards) = forwards {
+            forwards.stop();
         }
         handle.map(NetStackHandle::stop).transpose()
     };
-    let mut started = Vec::with_capacity(forwards.len());
-    for (address, target) in forwards {
-        match forward::Forward::start(&pending, address, target) {
-            Ok(forward) => started.push(forward),
-            Err(failure) => {
-                drop(pending);
-                let _ = stop(started, handle);
-                return finish(relay, Err(failure));
-            }
+    let started = match forward::Forwards::start(&pending, forwards) {
+        Ok(started) => Some(started),
+        Err(failure) => {
+            drop(pending);
+            let _ = stop(None, handle);
+            return finish(relay, Err(failure));
         }
-    }
+    };
     // A publication that left the port to the kernel is useless until the
     // caller knows which one it got. Said before the command is released, and
     // before a terminal session takes the caller's terminal into raw mode. A

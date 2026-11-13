@@ -241,7 +241,10 @@ consumer upgrading can skip it.
   a connection to the target is made again. A connection that ends any other
   way than with both directions ended in order, a failure of either side or the
   run's end among them, is reset on each side the forward holds, so neither
-  peer takes a cut-off stream for a complete one (`ferroday-cage-cli`).
+  peer takes a cut-off stream for a complete one. A forward's reports never
+  wait on standard error: a reader that stops reading stalls no connection,
+  and a report past the 64 still waiting is dropped and counted in a line of
+  its own (`ferroday-cage-cli`).
 - `CageBuilder::host_rootfs` roots a sandbox on the host's own filesystem,
   read-only: the launch clones the host's mount tree inside the sandbox's mount
   namespace and makes every mount of it read-only and `nosuid`. It hides

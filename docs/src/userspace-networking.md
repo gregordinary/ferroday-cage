@@ -113,6 +113,11 @@ reply. Its bounds are the network stack's for a published port:
   then.
 - Each direction holds at most 64 KiB on its way across, so a peer that stops
   reading stalls only the direction toward it.
+- A forward never waits on standard error to report. Its reports go to one
+  thread of `fcage`'s that writes them, so a reader that stops reading stalls
+  no connection. A report past the 64 still waiting is dropped, and the number
+  dropped is reported once the rest are written. The run's end waits for the
+  reports to be written.
 
 A connection ends in order once both directions have ended, and every other
 end resets it: a failure of either side resets the other, as the network stack

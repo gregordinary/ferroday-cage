@@ -593,7 +593,7 @@ report name a package and its version bare.
 | Name, in an error or a progress report, a string a mirror, an index, a package, or a sandbox supplied | `{:?}`, which escapes a control character, as the `failure` module states, unless an alphabet without control characters already admitted the value |
 | Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |
-| Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, `say`, `report` |
+| Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, `say`, `report`, and `Reports` for a thread that must not wait on standard error's reader |
 | Make a scratch tree for a test that leaves nothing to accumulate | `scratch::Scratch`, removed when it drops, or from a test suite `common::scratch_dir`, emptied when the next run reuses it, and `common::ranged_scratch` for a tree of subordinate-owned entries |
 | What happens when a run's timeout runs out? | `relay::Escalation` |
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |

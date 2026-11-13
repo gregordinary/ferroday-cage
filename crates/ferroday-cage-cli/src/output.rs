@@ -23,10 +23,26 @@
 //! Any other failure to write a diagnostic is dropped. There is nowhere left to
 //! report it, and the exit code carries the outcome whatever became of the
 //! words.
+//!
+//! # Reports from a thread that carries data
+//!
+//! Each of the above writes standard error where it is called, and waits for
+//! as long as the reader takes. A thread that carries data, such as a
+//! forward's, must not: a reader that stops reading, a pipe nobody drains or a
+//! terminal held by flow control, would stall every connection the thread
+//! carries. Such a thread reports through a [`Reporter`] instead, which hands
+//! the line to a [`Reports`] thread that writes it, and never waits. Where the
+//! writer already holds [`QUEUED_REPORTS`] lines, the line is dropped and
+//! counted, and the writer says how many it dropped once it has written what
+//! it held, so a lost report is never a silent one.
 
 use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::thread::JoinHandle;
 
 use ferroday_cage::{ErrorChain, ExitStatus};
 
@@ -115,5 +131,228 @@ pub fn stdout_status(subject: &str, written: io::Result<()>) -> u8 {
             ));
             crate::FAILED
         }
+    }
+}
+
+/// The most lines a [`Reports`] writer holds for standard error before a
+/// further one is dropped.
+///
+/// The lines are a forward's reports, each the first of a run of failures, so
+/// a run fills this only while standard error takes nothing at all. The bound
+/// is what a reader that never reads can make `fcage` hold.
+pub const QUEUED_REPORTS: usize = 64;
+
+/// A thread of `fcage`'s own that writes lines on standard error for threads
+/// that must not wait on its reader, and the [`Reporter`] they hand them to.
+///
+/// [`finish`](Self::finish) ends it once every reporter is gone.
+pub struct Reports {
+    /// The reporter that [`reporter`](Self::reporter) clones.
+    reporter: Reporter,
+    /// The thread writing the lines.
+    writer: JoinHandle<()>,
+}
+
+/// Where a thread that must not wait on standard error hands its lines: to the
+/// [`Reports`] thread it came from.
+#[derive(Clone)]
+pub struct Reporter {
+    /// The lines on their way to the writer.
+    queue: SyncSender<String>,
+    /// The lines dropped since the writer last said how many it dropped.
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Reports {
+    /// Starts the thread writing on standard error.
+    pub fn start() -> io::Result<Reports> {
+        Reports::start_to(io::stderr())
+    }
+
+    /// Starts the thread writing on `out`.
+    pub fn start_to(out: impl Write + Send + 'static) -> io::Result<Reports> {
+        let (queue, lines) = std::sync::mpsc::sync_channel(QUEUED_REPORTS);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&dropped);
+        let writer = std::thread::Builder::new()
+            .name("fcage-reports".into())
+            .spawn(move || write_reports(out, &lines, &counted))?;
+        Ok(Reports {
+            reporter: Reporter { queue, dropped },
+            writer,
+        })
+    }
+
+    /// A reporter whose lines this writes.
+    pub fn reporter(&self) -> Reporter {
+        self.reporter.clone()
+    }
+
+    /// Writes what is still queued, and returns once the writer has, which is
+    /// once every [`Reporter`] is gone too.
+    ///
+    /// The wait is on standard error's reader, as every line `fcage` writes
+    /// there of its own waits on it; what is lost by not waiting is a report
+    /// nothing would count. `fcage` finishes the reports before it writes its
+    /// own last lines, so those follow the reports.
+    pub fn finish(self) {
+        drop(self.reporter);
+        // A writer that panicked has nothing left to write.
+        let _ = self.writer.join();
+    }
+}
+
+impl Reporter {
+    /// Hands `line` to the writer, or drops and counts it where the writer
+    /// holds [`QUEUED_REPORTS`] lines already. Never waits.
+    pub fn report(&self, line: fmt::Arguments<'_>) {
+        match self.queue.try_send(line.to_string()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            // The writer is gone only where it panicked; the line goes with it.
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+/// The [`Reports`] thread: writes each line as it arrives, and says how many
+/// were dropped each time it has written everything queued, until every
+/// [`Reporter`] is gone.
+///
+/// A line arrives behind the ones queued before it, so the count of those
+/// dropped while the queue was full follows every line that was queued when
+/// they were. A reader gone loses the words, as [`report`] does.
+fn write_reports(mut out: impl Write, lines: &Receiver<String>, dropped: &AtomicUsize) {
+    loop {
+        let line = match lines.try_recv() {
+            Ok(line) => line,
+            Err(TryRecvError::Empty) => {
+                say_dropped(&mut out, dropped);
+                match lines.recv() {
+                    Ok(line) => line,
+                    Err(_) => break,
+                }
+            }
+            Err(TryRecvError::Disconnected) => break,
+        };
+        let _ = say_to(&mut out, format_args!("{line}"));
+    }
+    say_dropped(&mut out, dropped);
+}
+
+/// Says how many lines were dropped since it last said, where any were.
+fn say_dropped(out: &mut dyn Write, dropped: &AtomicUsize) {
+    let count = dropped.swap(0, Ordering::Relaxed);
+    if count > 0 {
+        let plural = if count == 1 { "" } else { "s" };
+        let _ = say_to(
+            out,
+            format_args!(
+                "fcage: dropped {count} report{plural} while standard error was not taking them"
+            ),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::{Mutex, mpsc};
+
+    use super::*;
+
+    /// A writer that keeps everything written, for a test to read back once
+    /// the writing is done.
+    #[derive(Clone, Default)]
+    pub(crate) struct Kept(Arc<Mutex<Vec<u8>>>);
+
+    impl Kept {
+        /// Everything written so far, as text.
+        pub(crate) fn text(&self) -> String {
+            let written = self.0.lock().expect("nothing panicked holding the output");
+            String::from_utf8_lossy(&written).into_owned()
+        }
+    }
+
+    impl Write for Kept {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("nothing panicked holding the output")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A [`Kept`] that holds its first write until the test lets it go.
+    struct Gate {
+        /// Told once the first write has begun.
+        entered: Option<mpsc::Sender<()>>,
+        /// Waited on before the first write completes.
+        release: Option<mpsc::Receiver<()>>,
+        /// Everything written.
+        written: Kept,
+    }
+
+    impl Write for Gate {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let (Some(entered), Some(release)) = (self.entered.take(), self.release.take()) {
+                entered.send(()).expect("the test waits for the write");
+                release.recv().expect("the test lets the write go");
+            }
+            self.written.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_reporter_never_waits_and_counts_what_it_drops() {
+        let (entered, has_entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let written = Kept::default();
+        let reports = Reports::start_to(Gate {
+            entered: Some(entered),
+            release: Some(released),
+            written: written.clone(),
+        })
+        .expect("the writer starts");
+        let reporter = reports.reporter();
+
+        // The writer takes the first line and is held writing it, so the queue
+        // holds the next `QUEUED_REPORTS`, and the rest are dropped. None of
+        // the reports waits.
+        reporter.report(format_args!("line 0"));
+        has_entered.recv().expect("the writer takes the first line");
+        for at in 1..=QUEUED_REPORTS + 3 {
+            reporter.report(format_args!("line {at}"));
+        }
+        release.send(()).expect("the writer is waiting");
+        drop(reporter);
+        reports.finish();
+
+        let written = written.text();
+        let mut expected: Vec<String> = (0..=QUEUED_REPORTS)
+            .map(|at| format!("line {at}"))
+            .collect();
+        expected
+            .push("fcage: dropped 3 reports while standard error was not taking them".to_string());
+        assert_eq!(written.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn finishing_writes_what_is_queued() {
+        let written = Kept::default();
+        let reports = Reports::start_to(written.clone()).expect("the writer starts");
+        reports.reporter().report(format_args!("the last word"));
+        reports.finish();
+        assert_eq!(written.text(), "the last word\n");
     }
 }
