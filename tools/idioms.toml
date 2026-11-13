@@ -533,3 +533,28 @@ why = """\
 The answer's own table: `fs_access_for_abi`, `net_access_for_abi` and \
 `scope_for_abi`, one comparison for each ABI that brought a right or a \
 scope."""
+
+[[idiom]]
+name = "a bootstrap's source date epoch held to the epoch"
+pattern = '\bepoch < 0\b'
+answer = """\
+`provision::settings::check_source_date_epoch`, which every bootstrap builder \
+asks when it is built. The tools that read `SOURCE_DATE_EPOCH` date from the \
+clock when it is negative, so a reproducible date a check let past would be \
+quietly ignored, and two checks are two places to keep the rule and its \
+reason the same."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/settings.rs"
+count = 1
+why = "The answer."
+
+[[idiom.site]]
+path = "crates/ferroday-cage-cli/src/main.rs"
+count = 1
+why = """\
+`fcage`'s parse of `--debian-source-date-epoch` and \
+`--alpine-source-date-epoch`, which refuses a negative date as a usage error \
+naming the flag rather than as a bootstrap that cannot be built. The answer is \
+the library's own and not public, and the builder still refuses what this \
+might let past, so the two cannot disagree in effect."""

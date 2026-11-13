@@ -3969,16 +3969,19 @@ fn parse_epoch(flag: &str, value: &str) -> Result<i64, String> {
 /// gives a bootstrap: a timestamp, as [`parse_epoch`] reads one, that is not
 /// negative.
 ///
-/// Each bootstrap refuses a negative date when it is built, because the account
-/// tools read `SOURCE_DATE_EPOCH` as an unsigned count. Refused here too, so the
-/// mistake is the usage error it is rather than a bootstrap that cannot be
-/// built.
+/// A second answer to whether a bootstrap's date is acceptable, and a
+/// deliberate one. The library's answer is each bootstrap builder's own
+/// refusal of a negative date when it is built, which `fcage` meets only once
+/// it has assembled the builder, as a failure to provision. Asked here, the
+/// mistake is the usage error it is, naming the flag. The rule is the
+/// library's, and so is the reason given for it, and the builder still refuses
+/// a date this lets past. `tools/idioms.toml` records the pair.
 fn parse_source_date_epoch(flag: &str, value: &str) -> Result<i64, String> {
     let epoch = parse_epoch(flag, value)?;
     if epoch < 0 {
         return Err(format!(
             "{flag}: {epoch} is before 1970, and the tools that read SOURCE_DATE_EPOCH \
-             take it as an unsigned count of seconds"
+             date from the clock instead, as /etc/shadow records days since 1970"
         ));
     }
     Ok(epoch)
