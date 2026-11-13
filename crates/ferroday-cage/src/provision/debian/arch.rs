@@ -138,9 +138,8 @@ pub(crate) fn preflight_foreign(host: &str, target: &str) -> Result<(), DebianEr
     if runs_natively(host, target) {
         return Ok(());
     }
-    binfmt::preflight(host, target, qemu_interpreter(target)).map_err(|refusal| {
-        refusal.into_error(|reason| DebianError::Config { reason }, DebianError::io)
-    })
+    binfmt::preflight(host, target, qemu_interpreter(target))
+        .map_err(|refusal| refusal.into_error(DebianError::config, DebianError::io))
 }
 
 /// The `qemu-user` interpreter the kernel will execute `architecture` binaries

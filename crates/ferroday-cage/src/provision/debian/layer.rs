@@ -184,13 +184,11 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
     let text = match super::bootstrap::read_base_status(base) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(DebianError::Config {
-                reason: format!(
-                    "the base layer at {} has no dpkg status database; a base layer must be a fully \
+            return Err(DebianError::config(format!(
+                "the base layer at {} has no dpkg status database; a base layer must be a fully \
                  configured bootstrap, not extract-only",
-                    base.display(),
-                ),
-            });
+                base.display(),
+            )));
         }
         Err(source) => {
             return Err(DebianError::io(
@@ -248,13 +246,11 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
     }
 
     if installed.is_empty() {
-        return Err(DebianError::Config {
-            reason: format!(
-                "the base layer at {} lists no configured packages; a base layer must be a fully \
+        return Err(DebianError::config(format!(
+            "the base layer at {} lists no configured packages; a base layer must be a fully \
              configured bootstrap, not extract-only",
-                base.display(),
-            ),
-        });
+            base.display(),
+        )));
     }
     Ok(installed)
 }

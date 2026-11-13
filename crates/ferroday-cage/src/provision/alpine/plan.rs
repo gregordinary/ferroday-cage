@@ -432,7 +432,7 @@ impl Plan {
 
         for package in &self.packages {
             if package.index >= self.indexes.len() {
-                return Err(plan_document(format!(
+                return Err(AlpineError::plan_document(format!(
                     "the package {} names index {}, and the plan records {}",
                     package.name,
                     package.index,
@@ -491,7 +491,7 @@ impl Plan {
     /// and the architecture is recorded in the root's installed database.
     pub fn parse_document(text: &str) -> Result<Plan, AlpineError> {
         let (header, rest) =
-            document::header(document::parse(text), FORMAT).map_err(plan_document)?;
+            document::header(document::parse(text), FORMAT).map_err(AlpineError::plan_document)?;
         let mut plan = Plan {
             release: required(header.get("Release"), "Release", "the header")?,
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
@@ -504,10 +504,11 @@ impl Plan {
             if let Some(name) = stanza.get("Package") {
                 // Quoted until `unaddressable` below has admitted the name.
                 let at_package = format!("the package {name:?}");
-                let at = number::<usize>(stanza.get("Index"), "Index", &at_package)?
-                    .ok_or_else(|| plan_document(format!("{at_package} names no index")))?;
+                let at = number::<usize>(stanza.get("Index"), "Index", &at_package)?.ok_or_else(
+                    || AlpineError::plan_document(format!("{at_package} names no index")),
+                )?;
                 if at >= plan.indexes.len() {
-                    return Err(plan_document(format!(
+                    return Err(AlpineError::plan_document(format!(
                         "{at_package} names index {at}, which the document does not carry — \
                          index stanzas must precede the packages that refer to them",
                     )));
@@ -541,14 +542,14 @@ impl Plan {
                     .unaddressable()
                     .or_else(|| package.foreign_to(&plan.architecture))
                 {
-                    return Err(plan_document(reason));
+                    return Err(AlpineError::plan_document(reason));
                 }
                 plan.packages.push(package);
                 continue;
             }
 
             let at = stanza.get("Index").ok_or_else(|| {
-                plan_document("a stanza is neither a package nor an index".to_string())
+                AlpineError::plan_document("a stanza is neither a package nor an index".to_string())
             })?;
             // The number is written out so the document reads on its own, and
             // checked rather than trusted: a document whose indexes are out of
@@ -556,7 +557,7 @@ impl Plan {
             // held to the spelling the writer gives it, as every number is.
             let expected = plan.indexes.len();
             if at != expected.to_string() {
-                return Err(plan_document(format!(
+                return Err(AlpineError::plan_document(format!(
                     "the index stanzas are numbered out of order: expected {expected}, found \
                      {at:?}",
                 )));
@@ -569,7 +570,7 @@ impl Plan {
                 sha256: {
                     let value = required(stanza.get("SHA256"), "SHA256", &at_index)?;
                     Digest::new(Algorithm::Sha256, &value).ok_or_else(|| {
-                        plan_document(format!(
+                        AlpineError::plan_document(format!(
                             "{at_index} states the SHA256 {value:?}, which is not a SHA-256 \
                              digest in lowercase hex"
                         ))
@@ -640,12 +641,12 @@ impl Plan {
 /// The rule is [`Draft::render`]'s and is shared with every other layer; only
 /// whose document the refusal is about belongs here.
 fn render(stanza: &Draft, out: &mut String) -> Result<(), AlpineError> {
-    stanza.render(out).map_err(plan_document)
+    stanza.render(out).map_err(AlpineError::plan_document)
 }
 
 /// Reads a required field, reporting a refusal the same way.
 fn required(value: Option<Cow<'_, str>>, field: &str, at: &str) -> Result<String, AlpineError> {
-    document::required(value.as_deref(), field, at).map_err(plan_document)
+    document::required(value.as_deref(), field, at).map_err(AlpineError::plan_document)
 }
 
 /// Reads an optional numeric field, reporting a refusal the same way.
@@ -656,12 +657,7 @@ fn number<T: std::str::FromStr + std::fmt::Display>(
     field: &str,
     at: &str,
 ) -> Result<Option<T>, AlpineError> {
-    document::number(value.as_deref(), field, at).map_err(plan_document)
-}
-
-/// Builds the document error.
-fn plan_document(reason: String) -> AlpineError {
-    AlpineError::PlanDocument { reason }
+    document::number(value.as_deref(), field, at).map_err(AlpineError::plan_document)
 }
 
 #[cfg(test)]

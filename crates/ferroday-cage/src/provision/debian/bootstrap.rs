@@ -910,7 +910,7 @@ fn found_dates(
     beneath: Option<&Rooted>,
 ) -> Result<Option<accounts::Dates>, DebianError> {
     epoch
-        .map(|_| accounts::account_dates(tree, beneath).map_err(accounts_failure))
+        .map(|_| accounts::account_dates(tree, beneath).map_err(DebianError::from))
         .transpose()
 }
 
@@ -931,12 +931,7 @@ fn date_accounts(tree: &Rooted, found: &accounts::Dates, epoch: i64) -> Result<(
         return Ok(());
     }
     let day = accounts::last_change_day(epoch);
-    accounts::redate(tree, found, day.as_bytes(), |field| field == b"0").map_err(accounts_failure)
-}
-
-/// An accounts step's failure, reported as this layer's own.
-fn accounts_failure(failure: accounts::Failure) -> DebianError {
-    DebianError::io(failure.op, failure.path, failure.source)
+    accounts::redate(tree, found, day.as_bytes(), |field| field == b"0").map_err(DebianError::from)
 }
 
 /// Removes what the configure waves leave that belongs to their run rather

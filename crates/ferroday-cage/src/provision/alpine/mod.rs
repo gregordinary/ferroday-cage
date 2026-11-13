@@ -78,15 +78,15 @@ use super::identity::Ownership;
 // `super::layer` is the shared one; this module has a `layer` of its own, which
 // reads a provisioned base rather than describing how a cage is rooted on it.
 use super::layer::{Rooting, Staging};
+use super::layer_error::layer_error;
 use super::observe::layer_observer;
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
-    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
+    Available, BuildLayer, Delegate, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
     ProvisionError, ProvisionRequest, Provisioner, Stream, compose_mirrors, fetch_first,
     mirror_url,
 };
-use crate::failure::path_io_error;
 use crate::{IdMapper, IdentityMap};
 use bootstrap::{Declared, ScriptSubject};
 use index::{Index, Record};
@@ -169,19 +169,6 @@ pub fn host_architecture() -> String {
         other => other,
     }
     .to_string()
-}
-
-/// Checks one archive coordinate, reporting a refusal as this layer's
-/// configuration failure.
-///
-/// The rule is [`coordinate::check`]'s and is shared with every other layer;
-/// only whose configuration the refusal is about belongs here.
-pub(super) fn check_coordinate(
-    what: &str,
-    value: &str,
-    nesting: Nesting,
-) -> Result<(), AlpineError> {
-    coordinate::check(what, value, nesting).map_err(|reason| AlpineError::Config { reason })
 }
 
 /// An Alpine userland provisioner.
@@ -327,12 +314,11 @@ impl Alpine {
         observer: &mut dyn AlpineObserver,
     ) -> Result<Plan, AlpineError> {
         if self.world.is_empty() {
-            return Err(AlpineError::Config {
-                reason: "a resolution installs the packages named with include(), and none were \
+            return Err(AlpineError::config(
+                "a resolution installs the packages named with include(), and none were \
                          named; apk has no priority field, so there is no set the repositories \
-                         nominate on the caller's behalf"
-                    .to_string(),
-            });
+                         nominate on the caller's behalf",
+            ));
         }
         let (records, indexes) = self.read_indexes(observer)?;
         observer.progress(AlpineEvent::Resolving);
@@ -387,12 +373,10 @@ impl Alpine {
     /// was made rather than only that something was missing.
     fn read_base_layer(&self, entry: &str) -> Result<layer::Base, AlpineError> {
         let Some(base) = self.base_layer.as_deref() else {
-            return Err(AlpineError::Config {
-                reason: format!(
-                    "{entry} stages over a base root, and none was set with \
+            return Err(AlpineError::config(format!(
+                "{entry} stages over a base root, and none was set with \
                      AlpineBuilder::base_layer",
-                ),
-            });
+            )));
         };
         layer::Base::read(base, &self.architecture)
     }
@@ -533,8 +517,10 @@ impl Alpine {
         // The same fail-early posture the full bootstrap takes, and then the
         // base itself: reading it refuses a tree that is not a provisioned root
         // before anything is created or downloaded.
-        preflight(self).map_err(wrap)?;
-        let base = self.read_base_layer("stage_layer").map_err(wrap)?;
+        preflight(self).map_err(ProvisionError::from)?;
+        let base = self
+            .read_base_layer("stage_layer")
+            .map_err(ProvisionError::from)?;
 
         // The guard is taken as the upper is created, not on the way out, so a
         // failure below disposes of a partly-installed increment instead of
@@ -551,7 +537,7 @@ impl Alpine {
         // cage on the result meets the primitive's own check.
         if !self.extract_only {
             super::layer::overlay_preflight(upper)
-                .map_err(|reason| wrap(AlpineError::Config { reason }))?;
+                .map_err(|reason| ProvisionError::from(AlpineError::config(reason)))?;
         }
 
         install(self, upper, Some(&base), observer)?;
@@ -1011,12 +997,10 @@ impl AlpineBuilder {
         if let Some(epoch) = self.source_date_epoch
             && epoch < 0
         {
-            return Err(AlpineError::Config {
-                reason: format!(
-                    "the source date epoch {epoch} is negative, and /etc/shadow records days \
+            return Err(AlpineError::config(format!(
+                "the source date epoch {epoch} is negative, and /etc/shadow records days \
                      since 1970"
-                ),
-            });
+            )));
         }
         // A plan states which architecture it is for, so a builder that names
         // none adopts it: refusing a plan the caller never contradicted, over a
@@ -1031,11 +1015,12 @@ impl AlpineBuilder {
             (None, Some(plan)) => plan.architecture.clone(),
             (None, None) => host_architecture(),
         };
-        check_coordinate(
+        coordinate::check(
             "the bootstrap's architecture",
             &architecture,
             Nesting::Single,
-        )?;
+        )
+        .map_err(AlpineError::config)?;
 
         let keys = match self.keys {
             Some(keys) => keys,
@@ -1045,28 +1030,24 @@ impl AlpineBuilder {
             self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()),
             self.fallbacks,
         )
-        .map_err(|reason| AlpineError::Config { reason })?;
+        .map_err(AlpineError::config)?;
         let components = self.components.unwrap_or_else(|| vec!["main".to_string()]);
 
         for name in self.includes.iter().chain(&self.excludes) {
             // Before the version operators, so `foo@edge>=1` is reported for
             // the tag, which is the part with no remedy here.
             if name.contains('@') {
-                return Err(AlpineError::Config {
-                    reason: format!(
-                        "{name:?} names a repository tag, and the repositories configured here \
+                return Err(AlpineError::config(format!(
+                    "{name:?} names a repository tag, and the repositories configured here \
                          carry none; a name resolves against every configured repository, the \
                          highest version winning",
-                    ),
-                });
+                )));
             }
             if name.contains(['<', '>', '=', '~']) {
-                return Err(AlpineError::Config {
-                    reason: format!(
-                        "{name:?} names a package and a version, and include() and exclude() \
+                return Err(AlpineError::config(format!(
+                    "{name:?} names a package and a version, and include() and exclude() \
                          name packages; hold a resolution to a version with pin() instead",
-                    ),
-                });
+                )));
             }
         }
 
@@ -1165,7 +1146,7 @@ fn index_slots<'a>(repositories: &'a [Repository], architecture: &str) -> Vec<In
 /// A refusal quotes the architecture the pin states, as [`validate_plan`] quotes
 /// a plan's.
 fn validate_pin(pin: &Plan, architecture: &str) -> Result<(), AlpineError> {
-    let contradiction = |reason: String| Err(AlpineError::Config { reason });
+    let contradiction = |reason: String| Err(AlpineError::config(reason));
     if pin.architecture != architecture {
         return contradiction(format!(
             "the pin resolves architecture {:?} but the bootstrap is configured for \
@@ -1199,7 +1180,7 @@ fn validate_pin(pin: &Plan, architecture: &str) -> Result<(), AlpineError> {
 /// states with `{:?}`: a document is a file the caller may have taken from
 /// elsewhere, and nothing holds its header or its index stanzas to an alphabet.
 /// The configured architecture, releases and components have passed
-/// [`check_coordinate`], and are named bare. A package is named bare once
+/// [`coordinate::check`](crate::provision::coordinate::check), and are named bare. A package is named bare once
 /// [`PlannedPackage::unaddressable`] has admitted its name, which is the first
 /// thing asked of it.
 fn validate_plan(
@@ -1210,7 +1191,7 @@ fn validate_plan(
     includes: &[String],
     excludes: &[String],
 ) -> Result<(), AlpineError> {
-    let contradiction = |reason: String| Err(AlpineError::Config { reason });
+    let contradiction = |reason: String| Err(AlpineError::config(reason));
     if !includes.is_empty() {
         return contradiction(
             "a plan already names every package to install, so include() has nothing to add; \
@@ -1590,11 +1571,10 @@ impl Observed<'_> {
         // asks -- hundreds of packages the base already carries — and read as
         // the plan it would install. `resolve_layer` is its read half.
         if self.alpine.base_layer.is_some() {
-            return Err(AlpineError::Config {
-                reason: "a provisioner with a base layer resolves an increment, and is read \
-                         through Alpine::resolve_layer rather than through Alpine::resolve"
-                    .to_string(),
-            });
+            return Err(AlpineError::config(
+                "a provisioner with a base layer resolves an increment, and is read \
+                         through Alpine::resolve_layer rather than through Alpine::resolve",
+            ));
         }
         self.alpine.resolve_over(None, self.sink)
     }
@@ -1666,7 +1646,7 @@ fn preflight(alpine: &Alpine) -> Result<(), AlpineError> {
     }
     preflight_foreign(&host_architecture(), &alpine.architecture)?;
     super::layer::sandbox_preflight(&alpine.identity_map, alpine.id_mapper.as_ref())
-        .map_err(|reason| AlpineError::Config { reason })
+        .map_err(AlpineError::config)
 }
 
 /// The whole bootstrap: preflight, then install into the staging tree.
@@ -1679,13 +1659,12 @@ fn bootstrap_release(
     // would quietly bootstrap a whole root into a directory the caller meant as
     // an increment over that base.
     if alpine.base_layer.is_some() {
-        return Err(wrap(AlpineError::Config {
-            reason: "a provisioner with a base layer stages an increment, and is used through \
-                     Alpine::stage_layer rather than through provision::ensure"
-                .to_string(),
-        }));
+        return Err(ProvisionError::from(AlpineError::config(
+            "a provisioner with a base layer stages an increment, and is used through \
+                     Alpine::stage_layer rather than through provision::ensure",
+        )));
     }
-    preflight(alpine).map_err(wrap)?;
+    preflight(alpine).map_err(ProvisionError::from)?;
     install(alpine, staging, None, observer)
 }
 
@@ -1708,7 +1687,9 @@ fn install(
     // re-projected, so an observer sees the same event either way.
     let plan = match alpine.plan.clone() {
         Some(plan) => plan,
-        None => alpine.resolve_over(base, observer).map_err(wrap)?,
+        None => alpine
+            .resolve_over(base, observer)
+            .map_err(ProvisionError::from)?,
     };
     observer.progress(AlpineEvent::Resolved { plan: &plan });
 
@@ -1743,7 +1724,7 @@ fn install(
             Rooted::open(base.path()).map_err(AlpineError::at("opening the base", base.path()))
         })
         .transpose()
-        .map_err(wrap)?;
+        .map_err(ProvisionError::from)?;
     // What a directory the host side carries up from the base is re-owned
     // through: the map the install scripts run under.
     let ownership = Ownership::new(&alpine.identity_map, alpine.id_mapper.as_ref());
@@ -1769,13 +1750,11 @@ fn install(
             .filter(|name| carried.contains(name))
             .collect();
         if !doubled.is_empty() {
-            return Err(wrap(AlpineError::Config {
-                reason: format!(
-                    "the increment would install {}, which the base layer already carries; an \
+            return Err(ProvisionError::from(AlpineError::config(format!(
+                "the increment would install {}, which the base layer already carries; an \
                      increment installs over a base rather than replacing part of it",
-                    doubled.join(", "),
-                ),
-            }));
+                doubled.join(", "),
+            ))));
         }
         // An increment with nothing in it needs no download and no script — but
         // it still writes its state, so what a caller reads back from the
@@ -1784,7 +1763,7 @@ fn install(
         // so writing it runs nothing.
         if plan.packages.is_empty() {
             let database = installed::Database::carrying(base.carried());
-            return bootstrap::register(into, &database, &state).map_err(wrap);
+            return bootstrap::register(into, &database, &state).map_err(ProvisionError::from);
         }
     }
 
@@ -1821,18 +1800,20 @@ fn install(
     if alpine.extract_only {
         // Registration is a file format here rather than a program's output, so
         // an extract-only root still knows what it holds.
-        return bootstrap::register(into, &database, &state).map_err(wrap);
+        return bootstrap::register(into, &database, &state).map_err(ProvisionError::from);
     }
     // A base's own trigger-watching packages fire for the directories this
     // install created, which is what `apk` does: a trigger belongs to the root
     // rather than to the transaction. Their scripts are read out of the base's
     // archive once, and each subject borrows its own.
     let archived = match base {
-        Some(base) => base.trigger_scripts().map_err(wrap)?,
+        Some(base) => base.trigger_scripts().map_err(ProvisionError::from)?,
         None => Vec::new(),
     };
     let watching = match base {
-        Some(base) => base.trigger_subjects(&archived).map_err(wrap)?,
+        Some(base) => base
+            .trigger_subjects(&archived)
+            .map_err(ProvisionError::from)?,
         None => Vec::new(),
     };
     bootstrap::configure(
@@ -1849,7 +1830,7 @@ fn install(
         &state,
         observer,
     )
-    .map_err(wrap)
+    .map_err(ProvisionError::from)
 }
 
 /// A base layer's lines and this run's, in that order and without a repeat.
@@ -1905,37 +1886,31 @@ fn acquire(
         Vec::with_capacity(plan.packages.len());
     for planned in &plan.packages {
         let index = plan.indexes.get(planned.index).ok_or_else(|| {
-            wrap(AlpineError::Config {
-                reason: format!(
-                    "the plan attributes {} to index {}, and records {}",
-                    planned.name,
-                    planned.index,
-                    plan.indexes.len(),
-                ),
-            })
+            ProvisionError::from(AlpineError::config(format!(
+                "the plan attributes {} to index {}, and records {}",
+                planned.name,
+                planned.index,
+                plan.indexes.len(),
+            )))
         })?;
         let mirrors = slots
             .get(planned.index)
             .map(|slot| repositories[slot.origin].mirrors.as_slice())
             .ok_or_else(|| {
-                wrap(AlpineError::Config {
-                    reason: format!(
-                        "the plan attributes {} to index {}, and the configured repositories \
+                ProvisionError::from(AlpineError::config(format!(
+                    "the plan attributes {} to index {}, and the configured repositories \
                          publish {}",
-                        planned.name,
-                        planned.index,
-                        slots.len(),
-                    ),
-                })
+                    planned.name,
+                    planned.index,
+                    slots.len(),
+                )))
             })?;
         let name = planned.cache_name().ok_or_else(|| {
-            wrap(AlpineError::Config {
-                reason: format!(
-                    "the plan states {:?} with the control identity {:?}, which names no cache \
+            ProvisionError::from(AlpineError::config(format!(
+                "the plan states {:?} with the control identity {:?}, which names no cache \
                      entry",
-                    planned.name, planned.control_identity,
-                ),
-            })
+                planned.name, planned.control_identity,
+            )))
         })?;
         sources.push((index, mirrors, cache.join(name)));
     }
@@ -1978,7 +1953,7 @@ fn acquire(
                 .map(|(held, _)| held)
         },
     )
-    .map_err(|failure| failure.into_provision(wrap))
+    .map_err(|failure| failure.into_provision(ProvisionError::from))
 }
 
 /// Reads a cached `.apk` and holds it to the plan entry it answers.
@@ -2031,12 +2006,12 @@ fn read_acquired(
     // because a plan is a document a caller may have edited, and a plan whose
     // fields contradict the package it names should be refused rather than
     // silently overruled by the digest.
-    let stated = |what: &str, want: &str, got: &str| AlpineError::Config {
-        reason: format!(
+    let stated = |what: &str, want: &str, got: &str| {
+        AlpineError::config(format!(
             "the plan names {} at {what} {want:?}, and the package it identifies states \
                  {got:?}",
             planned.name,
-        ),
+        ))
     };
     if package.info.name != planned.name {
         return Err(stated("package", &planned.name, &package.info.name));
@@ -2166,7 +2141,7 @@ fn lay_down(
         let (held, mut file) = cache::open_entry(&found.path)
             .map_err(AlpineError::at("reading a package", &found.path))
             .and_then(|file| read_acquired(file, &found.path, &found.planned, architecture))
-            .map_err(wrap)?;
+            .map_err(ProvisionError::from)?;
         observer.progress(AlpineEvent::Extracting {
             package: &held.package.info.name,
         });
@@ -2309,7 +2284,7 @@ fn lay_package<R: std::io::Read>(
             .map_err(|err| ProvisionError::io("inspecting", tree.path(relative), err))?;
         if stat.is_some_and(|stat| rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir()) {
             let claimant = database.record(at).name.clone();
-            return Err(wrap(AlpineError::Collision {
+            return Err(ProvisionError::from(AlpineError::Collision {
                 owner,
                 directory: Some(claimant.clone()),
                 claimant,
@@ -2354,7 +2329,7 @@ fn record_entry(
         _ => Shape::File,
     };
     let collision = |database: &mut Database, owner, directory| {
-        wrap(AlpineError::Collision {
+        ProvisionError::from(AlpineError::Collision {
             owner,
             claimant: database.record(at).name.clone(),
             path: String::from_utf8_lossy(&path).into_owned(),
@@ -2401,9 +2376,8 @@ fn preflight_foreign(host: &str, target: &str) -> Result<(), AlpineError> {
     if host == target || (host == "x86_64" && target == "x86") {
         return Ok(());
     }
-    binfmt::preflight(host, target, qemu_interpreter(target)).map_err(|refusal| {
-        refusal.into_error(|reason| AlpineError::Config { reason }, AlpineError::io)
-    })
+    binfmt::preflight(host, target, qemu_interpreter(target))
+        .map_err(|refusal| refusal.into_error(AlpineError::config, AlpineError::io))
 }
 
 /// The `qemu-user` interpreter that runs `architecture`'s binaries, by the name
@@ -2420,14 +2394,6 @@ fn qemu_interpreter(architecture: &str) -> Option<&'static str> {
         "loongarch64" => "loongarch64",
         _ => return None,
     })
-}
-
-/// Surfaces a layer failure through the shared provisioning error.
-fn wrap(error: AlpineError) -> ProvisionError {
-    match error {
-        AlpineError::Cancelled => ProvisionError::Cancelled,
-        other => ProvisionError::other(other),
-    }
 }
 
 /// A failure provisioning an Alpine rootfs.
@@ -2625,22 +2591,7 @@ impl AlpineError {
     }
 }
 
-path_io_error!(AlpineError);
-
-impl Failover for AlpineError {
-    /// Reaches through the wrapper this layer carries a transport failure in.
-    /// A failure that is not a `Fetch` one at all — a signature or digest
-    /// mismatch over bytes that did arrive — never advances a walk.
-    fn is_failover(&self) -> bool {
-        matches!(self, AlpineError::Fetch(fetch) if fetch.is_failover())
-    }
-}
-
-impl From<FetchError> for AlpineError {
-    fn from(err: FetchError) -> AlpineError {
-        AlpineError::Fetch(err)
-    }
-}
+layer_error!(AlpineError, accounts);
 
 impl From<resolve::ResolveError> for AlpineError {
     fn from(err: resolve::ResolveError) -> AlpineError {

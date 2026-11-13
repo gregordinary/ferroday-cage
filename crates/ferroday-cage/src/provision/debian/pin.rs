@@ -68,13 +68,11 @@ impl Pins {
     /// one; a hand-written document can.
     pub(super) fn of(plan: &Plan) -> Result<Pins, DebianError> {
         if let Some((first, again)) = plan.named_twice() {
-            return Err(DebianError::Config {
-                reason: format!(
-                    "the pin names the package {} twice, at {} and at {}, so there is no \
+            return Err(DebianError::config(format!(
+                "the pin names the package {} twice, at {} and at {}, so there is no \
                      version to hold it at",
-                    again.name, first.version, again.version,
-                ),
-            });
+                again.name, first.version, again.version,
+            )));
         }
         let by_name = plan
             .packages

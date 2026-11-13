@@ -119,8 +119,8 @@ impl Base {
     /// [`AlpineError::Io`] when a file that is there cannot be read.
     pub(super) fn read(path: &Path, architecture: &str) -> Result<Base, AlpineError> {
         let tree = Rooted::open(path).map_err(AlpineError::at("opening the base layer", path))?;
-        let refuse = |reason: String| AlpineError::Config {
-            reason: format!("the base layer at {}: {reason}", path.display()),
+        let refuse = |reason: String| {
+            AlpineError::config(format!("the base layer at {}: {reason}", path.display()))
         };
 
         let database = format!("{DB_DIR}/{INSTALLED}");
@@ -373,9 +373,10 @@ impl Base {
 
     /// A refusal of this base as a base, naming where it sits.
     fn refusal(&self, reason: String) -> AlpineError {
-        AlpineError::Config {
-            reason: format!("the base layer at {}: {reason}", self.path.display()),
-        }
+        AlpineError::config(format!(
+            "the base layer at {}: {reason}",
+            self.path.display()
+        ))
     }
 }
 
@@ -428,12 +429,10 @@ fn read_scripts(tree: &Rooted, base: &Path) -> Result<Vec<u8>, AlpineError> {
                 format!("inflates past the {MAX_SCRIPTS} bytes it may hold")
             }
         };
-        AlpineError::Config {
-            reason: format!(
-                "the base layer at {}: its {SCRIPTS_GZ} {why}",
-                base.display()
-            ),
-        }
+        AlpineError::config(format!(
+            "the base layer at {}: its {SCRIPTS_GZ} {why}",
+            base.display()
+        ))
     })
 }
 

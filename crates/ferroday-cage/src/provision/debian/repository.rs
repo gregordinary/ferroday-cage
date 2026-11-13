@@ -22,9 +22,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::bootstrap::{self, PACKAGE_KEYRING_STEM, TRUST_ANCHOR_STEM};
-use super::check_coordinate;
 use super::{DebianError, EMBEDDED_KEYRING};
 use crate::provision::compose_mirrors;
+use crate::provision::coordinate;
 use crate::provision::coordinate::Nesting;
 use crate::provision::openpgp::Keyring;
 
@@ -239,22 +239,22 @@ impl Repository {
     /// literally would let `HTTP://` name the same plaintext transport and slip
     /// past.
     fn validate(&self) -> Result<(), DebianError> {
-        check_coordinate("the repository's suite", &self.suite, Nesting::Nested)?;
+        coordinate::check("the repository's suite", &self.suite, Nesting::Nested)
+            .map_err(DebianError::config)?;
         for component in &self.components {
-            check_coordinate("the repository's component", component, Nesting::Nested)?;
+            coordinate::check("the repository's component", component, Nesting::Nested)
+                .map_err(DebianError::config)?;
         }
         if self.trust_unsigned() {
             for mirror in &self.mirrors {
                 if !is_authenticated_transport(mirror) {
-                    return Err(DebianError::Config {
-                        reason: format!(
-                            "trust_unsigned cannot be used with the mirror {mirror}: skipping the \
+                    return Err(DebianError::config(format!(
+                        "trust_unsigned cannot be used with the mirror {mirror}: skipping the \
                          archive signature leaves authenticity to the transport alone, and only \
                          file:// (local, under your control) and https:// (which authenticates the \
                          server) supply any; use one of those, or drop trust_unsigned so the \
                          signature is checked"
-                        ),
-                    });
+                    )));
                 }
             }
         }
@@ -420,12 +420,11 @@ impl RepositoryBuilder {
     /// Returns [`DebianError::Io`] when the keyring cannot be read.
     pub fn build(self) -> Result<Repository, DebianError> {
         let Some(primary) = self.mirror else {
-            return Err(DebianError::Config {
-                reason: "a repository needs a mirror URL; set one with mirror()".to_string(),
-            });
+            return Err(DebianError::config(
+                "a repository needs a mirror URL; set one with mirror()",
+            ));
         };
-        let mirrors = compose_mirrors(primary, self.fallbacks)
-            .map_err(|reason| DebianError::Config { reason })?;
+        let mirrors = compose_mirrors(primary, self.fallbacks).map_err(DebianError::config)?;
 
         let components = if self.components.is_empty() {
             vec!["main".to_string()]
@@ -442,11 +441,10 @@ impl RepositoryBuilder {
             self.trust_unsigned,
             "reading the repository keyring",
             || {
-                Err(DebianError::Config {
-                    reason: "a signed repository needs a keyring; set one with keyring(), or \
-                             trust it unsigned with trust_unsigned(true)"
-                        .to_string(),
-                })
+                Err(DebianError::config(
+                    "a signed repository needs a keyring; set one with keyring(), or \
+                             trust it unsigned with trust_unsigned(true)",
+                ))
             },
         )?;
 
@@ -482,13 +480,11 @@ pub(crate) fn trust_anchor(
     neither: impl FnOnce() -> Result<Trust, DebianError>,
 ) -> Result<Trust, DebianError> {
     match keyring {
-        Some(path) if trust_unsigned => Err(DebianError::Config {
-            reason: format!(
-                "the keyring {} and trust_unsigned(true) were both given, so it is not clear \
+        Some(path) if trust_unsigned => Err(DebianError::config(format!(
+            "the keyring {} and trust_unsigned(true) were both given, so it is not clear \
                  whether the release is to be verified; drop one of the two",
-                path.display()
-            ),
-        }),
+            path.display()
+        ))),
         Some(path) => Ok(Trust::Signed(read_keyring(path, op)?)),
         None if trust_unsigned => Ok(Trust::Unsigned),
         None => neither(),
@@ -507,11 +503,11 @@ pub(crate) fn trust_anchor(
 /// `op` names the read in the error a failure to read the file reports.
 pub(crate) fn read_keyring(path: &Path, op: &'static str) -> Result<Vec<u8>, DebianError> {
     let bytes = std::fs::read(path).map_err(DebianError::at(op, path))?;
-    Keyring::parse(&bytes).map_err(|err| DebianError::Config {
-        reason: format!(
+    Keyring::parse(&bytes).map_err(|err| {
+        DebianError::config(format!(
             "the keyring {} is not usable as a trust anchor: {err}",
             path.display()
-        ),
+        ))
     })?;
     Ok(bytes)
 }
@@ -542,7 +538,7 @@ fn is_authenticated_transport(url: &str) -> bool {
 /// cannot traverse out of `sources.list.d` or the keyrings directory when the
 /// finished rootfs's sources are written.
 ///
-/// The name is one directory entry, so it passes [`check_coordinate`] as a
+/// The name is one directory entry, so it passes [`coordinate::check`](crate::provision::coordinate::check) as a
 /// [`Nesting::Single`] value first: that is where the empty name, the traversal,
 /// the separator, and the shapes a deb822 field cannot carry are refused, and
 /// refusing them here as well would be a second answer to a question already
@@ -551,19 +547,17 @@ fn is_authenticated_transport(url: &str) -> bool {
 /// finished rootfs, where a caller's locale-dependent or shell-significant
 /// character is a liability rather than merely unusual.
 fn validate_name(name: &str) -> Result<(), DebianError> {
-    check_coordinate("the repository name", name, Nesting::Single)?;
+    coordinate::check("the repository name", name, Nesting::Single).map_err(DebianError::config)?;
     if name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
     {
         Ok(())
     } else {
-        Err(DebianError::Config {
-            reason: format!(
-                "the repository name {name:?} is not a portable file-name stem: use ASCII letters, \
+        Err(DebianError::config(format!(
+            "the repository name {name:?} is not a portable file-name stem: use ASCII letters, \
              digits, and '.', '-', '_'"
-            ),
-        })
+        )))
     }
 }
 
@@ -595,22 +589,18 @@ pub(crate) fn validate_distinct_entries(repositories: &[Repository]) -> Result<(
     for (index, repository) in repositories.iter().enumerate().skip(1) {
         let stem = repository.entry_stem(index);
         if stem == PACKAGE_KEYRING_STEM {
-            return Err(DebianError::Config {
-                reason: format!(
-                    "the keyring {:?} belongs to the debian-archive-keyring package, whose \
+            return Err(DebianError::config(format!(
+                "the keyring {:?} belongs to the debian-archive-keyring package, whose \
                      upgrades would replace the repository's: give the repository another name",
-                    bootstrap::keyring_path(&stem)
-                ),
-            });
+                bootstrap::keyring_path(&stem)
+            )));
         }
         if seen.contains(&stem) {
-            return Err(DebianError::Config {
-                reason: format!(
-                    "two repositories would both write the keyring {:?}: \
+            return Err(DebianError::config(format!(
+                "two repositories would both write the keyring {:?}: \
                      give each repository a distinct name",
-                    bootstrap::keyring_path(&stem)
-                ),
-            });
+                bootstrap::keyring_path(&stem)
+            )));
         }
         seen.push(stem);
     }

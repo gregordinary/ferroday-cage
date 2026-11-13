@@ -25,9 +25,10 @@
 use crate::provision::mirror_url;
 use std::fmt;
 
+use super::AlpineError;
 use super::keyring::KeySet;
-use super::{AlpineError, check_coordinate};
 use crate::provision::compose_mirrors;
+use crate::provision::coordinate;
 use crate::provision::coordinate::Nesting;
 
 /// The file an apk repository publishes its catalogue as.
@@ -162,19 +163,19 @@ impl Repository {
     /// has none in practice, so a repository always carries keys and the check
     /// is that the set is not empty.
     fn validate(&self) -> Result<(), AlpineError> {
-        check_coordinate("the repository's release", &self.release, Nesting::Nested)?;
+        coordinate::check("the repository's release", &self.release, Nesting::Nested)
+            .map_err(AlpineError::config)?;
         for component in &self.components {
-            check_coordinate("the repository's component", component, Nesting::Nested)?;
+            coordinate::check("the repository's component", component, Nesting::Nested)
+                .map_err(AlpineError::config)?;
         }
         if self.keys.is_empty() {
-            return Err(AlpineError::Config {
-                reason: format!(
-                    "the repository {} has an empty key set, so nothing it serves could be \
+            return Err(AlpineError::config(format!(
+                "the repository {} has an empty key set, so nothing it serves could be \
                      verified; build one with KeySet::alpine, KeySet::postmarketos, or \
                      KeySet::insert",
-                    self.release,
-                ),
-            });
+                self.release,
+            )));
         }
         Ok(())
     }
@@ -279,19 +280,17 @@ impl RepositoryBuilder {
     /// `extra-repos` tree of releases.
     pub fn build(self) -> Result<Repository, AlpineError> {
         let Some(primary) = self.mirror else {
-            return Err(AlpineError::Config {
-                reason: "a repository needs a mirror URL; set one with mirror()".to_string(),
-            });
+            return Err(AlpineError::config(
+                "a repository needs a mirror URL; set one with mirror()",
+            ));
         };
         let Some(keys) = self.keys else {
-            return Err(AlpineError::Config {
-                reason: "a repository needs the keys its signatures are verified against; set \
-                     them with keys(), from KeySet::alpine or KeySet::postmarketos"
-                    .to_string(),
-            });
+            return Err(AlpineError::config(
+                "a repository needs the keys its signatures are verified against; set \
+                     them with keys(), from KeySet::alpine or KeySet::postmarketos",
+            ));
         };
-        let mirrors = compose_mirrors(primary, self.fallbacks)
-            .map_err(|reason| AlpineError::Config { reason })?;
+        let mirrors = compose_mirrors(primary, self.fallbacks).map_err(AlpineError::config)?;
 
         let repository = Repository {
             mirrors,

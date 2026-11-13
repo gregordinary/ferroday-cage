@@ -166,6 +166,8 @@ pub fn ferroday_cage::provision::alpine::AlpineError::at(&'static str, impl core
 pub fn ferroday_cage::provision::alpine::AlpineError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::alpine::AlpineError
 impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::alpine::AlpineError
 pub fn ferroday_cage::provision::alpine::AlpineError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::alpine::AlpineError
+impl core::convert::From<ferroday_cage::provision::alpine::AlpineError> for ferroday_cage::provision::ProvisionError
+pub fn ferroday_cage::provision::ProvisionError::from(ferroday_cage::provision::alpine::AlpineError) -> ferroday_cage::provision::ProvisionError
 impl core::error::Error for ferroday_cage::provision::alpine::AlpineError
 pub fn ferroday_cage::provision::alpine::AlpineError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::provision::alpine::AlpineError
@@ -446,7 +448,9 @@ pub fn ferroday_cage::provision::debian::DebianError::io(&'static str, impl core
 impl core::convert::From<ferroday_cage::Error> for ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::Error) -> Self
 impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::debian::DebianError
-pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> Self
+pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::debian::DebianError
+impl core::convert::From<ferroday_cage::provision::debian::DebianError> for ferroday_cage::provision::ProvisionError
+pub fn ferroday_cage::provision::ProvisionError::from(ferroday_cage::provision::debian::DebianError) -> ferroday_cage::provision::ProvisionError
 impl core::error::Error for ferroday_cage::provision::debian::DebianError
 pub fn ferroday_cage::provision::debian::DebianError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for ferroday_cage::provision::debian::DebianError
@@ -1125,7 +1129,7 @@ pub fn ferroday_cage::provision::FetchError::url(impl core::convert::Into<alloc:
 impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::alpine::AlpineError
 pub fn ferroday_cage::provision::alpine::AlpineError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::alpine::AlpineError
 impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::debian::DebianError
-pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> Self
+pub fn ferroday_cage::provision::debian::DebianError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::debian::DebianError
 impl core::convert::From<ferroday_cage::provision::FetchError> for ferroday_cage::provision::gentoo::GentooError
 pub fn ferroday_cage::provision::gentoo::GentooError::from(ferroday_cage::provision::FetchError) -> ferroday_cage::provision::gentoo::GentooError
 impl core::error::Error for ferroday_cage::provision::FetchError
@@ -1188,6 +1192,10 @@ pub fn ferroday_cage::provision::ProvisionError::at(&'static str, impl core::con
 pub fn ferroday_cage::provision::ProvisionError::io(&'static str, impl core::convert::Into<std::path::PathBuf>, core::io::error::Error) -> ferroday_cage::provision::ProvisionError
 impl ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::other(impl core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>) -> ferroday_cage::provision::ProvisionError
+impl core::convert::From<ferroday_cage::provision::alpine::AlpineError> for ferroday_cage::provision::ProvisionError
+pub fn ferroday_cage::provision::ProvisionError::from(ferroday_cage::provision::alpine::AlpineError) -> ferroday_cage::provision::ProvisionError
+impl core::convert::From<ferroday_cage::provision::debian::DebianError> for ferroday_cage::provision::ProvisionError
+pub fn ferroday_cage::provision::ProvisionError::from(ferroday_cage::provision::debian::DebianError) -> ferroday_cage::provision::ProvisionError
 impl core::convert::From<ferroday_cage::provision::gentoo::GentooError> for ferroday_cage::provision::ProvisionError
 pub fn ferroday_cage::provision::ProvisionError::from(ferroday_cage::provision::gentoo::GentooError) -> ferroday_cage::provision::ProvisionError
 impl core::error::Error for ferroday_cage::provision::ProvisionError

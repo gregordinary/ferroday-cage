@@ -387,6 +387,9 @@ consumer upgrading can skip it.
   replay an expired release. `fcage` gains `--debian-snapshot-fallback` and a
   `snapshot-fallback=` field of `--debian-repository`, each tried after every
   plain backstop (`ferroday-cage-cli`).
+- `ProvisionError` converts from `DebianError` and `AlpineError`, as it does
+  from `GentooError`: a cancellation becomes `ProvisionError::Cancelled`, and
+  any other failure the layer's own error boxed as `ProvisionError::Other`.
 
 ### Changed
 

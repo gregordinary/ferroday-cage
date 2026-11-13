@@ -191,7 +191,7 @@ pub(super) fn configure(
     // What the accounts' dates were before any script ran, so that afterwards
     // the ones the run wrote can be told from the ones it found.
     let found = match site.source_date_epoch {
-        Some(_) => Some(accounts::account_dates(&tree, state.beneath).map_err(accounts_failure)?),
+        Some(_) => Some(accounts::account_dates(&tree, state.beneath).map_err(AlpineError::from)?),
         None => None,
     };
 
@@ -271,8 +271,8 @@ fn reown_declared(
         return Ok(false);
     }
     let [passwd, group] = accounts::ACCOUNTS;
-    let users = accounts::ids(tree, state.beneath, passwd).map_err(accounts_failure)?;
-    let groups = accounts::ids(tree, state.beneath, group).map_err(accounts_failure)?;
+    let users = accounts::ids(tree, state.beneath, passwd).map_err(AlpineError::from)?;
+    let groups = accounts::ids(tree, state.beneath, group).map_err(AlpineError::from)?;
     let mut owed = Vec::new();
     for entry in declared {
         let uid = users.get(&entry.uname).copied().unwrap_or(entry.uid);
@@ -338,7 +338,7 @@ fn clear_run_state(tree: &Rooted) -> Result<(), AlpineError> {
 /// [holds one](is_day).
 fn date_accounts(tree: &Rooted, found: &accounts::Dates, epoch: i64) -> Result<(), AlpineError> {
     let day = accounts::last_change_day(epoch);
-    accounts::redate(tree, found, day.as_bytes(), is_day).map_err(accounts_failure)
+    accounts::redate(tree, found, day.as_bytes(), is_day).map_err(AlpineError::from)
 }
 
 /// Whether a last-change field holds a day: a decimal number other than zero.
@@ -348,11 +348,6 @@ fn date_accounts(tree: &Rooted, found: &accounts::Dates, epoch: i64) -> Result<(
 /// zero, and dating it would withdraw the demand.
 fn is_day(field: &[u8]) -> bool {
     field.iter().all(u8::is_ascii_digit) && field.iter().any(|&digit| digit != b'0')
-}
-
-/// An accounts step's failure, reported as this layer's own.
-fn accounts_failure(failure: accounts::Failure) -> AlpineError {
-    AlpineError::io(failure.op, failure.path, failure.source)
 }
 
 /// Runs the `.trigger` script of every package whose watched paths the finished
@@ -705,14 +700,12 @@ impl ScriptSubject<'_> {
             .map(String::as_str)
             .collect();
         if matched.len() > MAX_TRIGGER_MATCHES {
-            return Err(AlpineError::Config {
-                reason: format!(
-                    "the {} trigger matches {} directories, and a trigger runs with at most \
+            return Err(AlpineError::config(format!(
+                "the {} trigger matches {} directories, and a trigger runs with at most \
                      {MAX_TRIGGER_MATCHES} of them as its arguments",
-                    self.name,
-                    matched.len(),
-                ),
-            });
+                self.name,
+                matched.len(),
+            )));
         }
         Ok(matched)
     }

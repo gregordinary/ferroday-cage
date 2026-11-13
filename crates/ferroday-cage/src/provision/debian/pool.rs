@@ -76,11 +76,11 @@ use rustix::fs::FileType;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
-use super::check_coordinate;
 use super::{DebianError, MAX_UNSIZED_INDEX, arch, deb, release, version};
 use crate::ErrorChain;
 use crate::provision::ProvisionError;
 use crate::provision::cache;
+use crate::provision::coordinate;
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm, Digest};
 use crate::provision::document::{self, Stanza};
@@ -324,11 +324,10 @@ impl Pool {
     /// checked as the path it becomes.
     fn checked_suite(&self) -> Result<&str, DebianError> {
         let Some(suite) = self.suite.as_deref() else {
-            return Err(DebianError::Config {
-                reason: "no suite was given for the pool".to_string(),
-            });
+            return Err(DebianError::config("no suite was given for the pool"));
         };
-        check_coordinate("the pool's suite", suite, Nesting::Nested)?;
+        coordinate::check("the pool's suite", suite, Nesting::Nested)
+            .map_err(DebianError::config)?;
         Ok(suite)
     }
 
@@ -450,8 +449,10 @@ impl Pool {
             Some(architecture) => architecture,
             None => arch::host_architecture(),
         };
-        check_coordinate("the pool's component", &self.component, Nesting::Nested)?;
-        check_coordinate("the pool's architecture", &architecture, Nesting::Single)?;
+        coordinate::check("the pool's component", &self.component, Nesting::Nested)
+            .map_err(DebianError::config)?;
+        coordinate::check("the pool's architecture", &architecture, Nesting::Single)
+            .map_err(DebianError::config)?;
         for (label, value) in [
             ("origin", &self.origin),
             ("label", &self.label),
@@ -505,17 +506,15 @@ struct Claims<'a> {
 /// call site, and the way to have no `Origin` is not to set one.
 fn checked_identity(label: &str, value: &str) -> Result<(), DebianError> {
     if value.trim().is_empty() {
-        return Err(DebianError::Config {
-            reason: format!("the pool's {label} is empty; leave it unset instead"),
-        });
+        return Err(DebianError::config(format!(
+            "the pool's {label} is empty; leave it unset instead"
+        )));
     }
     if value.chars().any(|character| character.is_ascii_control()) {
-        return Err(DebianError::Config {
-            reason: format!(
-                "the pool's {label} {value:?} contains a control character, which would end \
+        return Err(DebianError::config(format!(
+            "the pool's {label} {value:?} contains a control character, which would end \
                  the release field it is written into",
-            ),
-        });
+        )));
     }
     Ok(())
 }

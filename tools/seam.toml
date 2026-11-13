@@ -59,12 +59,6 @@ its causes: an index that does not decompress, and a `.deb` the pool cannot \
 read."""
 
 [[layer.reach]]
-name = "failure"
-count = 1
-kind = "internal"
-why = "`failure::path_io_error!`, which declares the layer's `io` and `at` constructors."
-
-[[layer.reach]]
 name = "roster"
 count = 1
 kind = "internal"
@@ -104,12 +98,6 @@ kind = "public"
 why = "As in the Debian layer, for a container's and a base layer's reasons."
 
 [[layer.reach]]
-name = "failure"
-count = 1
-kind = "internal"
-why = "`failure::path_io_error!`, as in the Debian layer."
-
-[[layer.reach]]
 name = "roster"
 count = 1
 kind = "internal"
@@ -138,12 +126,6 @@ name = "ErrorChain"
 count = 1
 kind = "public"
 why = "As in the other two layers, for a container's reasons."
-
-[[layer.reach]]
-name = "failure"
-count = 1
-kind = "internal"
-why = "`failure::path_io_error!`, as in the other two layers."
 
 [[layer.reach]]
 name = "path"

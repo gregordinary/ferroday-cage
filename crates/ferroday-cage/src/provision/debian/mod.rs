@@ -72,14 +72,14 @@ use super::document::Carried;
 use super::extract::{Extraction, Placement};
 use super::identity::Ownership;
 use super::layer::Staging;
+use super::layer_error::layer_error;
 use super::observe::layer_observer;
 use super::rooted::Rooted;
 use super::{
-    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
+    Available, BuildLayer, Delegate, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
     ProvisionError, ProvisionRequest, Provisioner, Staged, Stream, compose_mirrors, fetch_bounded,
     fetch_first, mirror_url, walk_mirrors,
 };
-use crate::failure::path_io_error;
 use crate::provision::digest::{Algorithm, Digest};
 use crate::status::ExitStatus;
 use crate::{IdMapper, IdentityMap};
@@ -250,21 +250,6 @@ impl Debian {
     }
 }
 
-/// [`coordinate::check`], with its refusal reported as this layer's
-/// configuration failure.
-///
-/// The check itself is shared, because a value that becomes a directory in a URL
-/// is refused for the same reasons whichever archive publishes it. What is not
-/// shared is the error: it reports a reason, and each layer says whose
-/// configuration the reason is about.
-pub(super) fn check_coordinate(
-    what: &str,
-    value: &str,
-    nesting: Nesting,
-) -> Result<(), DebianError> {
-    coordinate::check(what, value, nesting).map_err(|reason| DebianError::Config { reason })
-}
-
 /// Refuses an install list entry naming a release no repository publishes,
 /// and an exclusion naming a release at all.
 ///
@@ -289,21 +274,17 @@ fn validate_selection(
                 .iter()
                 .any(|repository| repository.suite == release)
         {
-            return Err(DebianError::Config {
-                reason: format!(
-                    "the include {entry:?} asks for a package from the release {release:?}, and \
+            return Err(DebianError::config(format!(
+                "the include {entry:?} asks for a package from the release {release:?}, and \
                      no configured repository publishes that suite"
-                ),
-            });
+            )));
         }
     }
     if let Some(entry) = excludes.iter().find(|entry| entry.contains('/')) {
-        return Err(DebianError::Config {
-            reason: format!(
-                "the exclude {entry:?} names a release, and an exclusion removes a package \
+        return Err(DebianError::config(format!(
+            "the exclude {entry:?} names a release, and an exclusion removes a package \
                  whichever release would supply it; name the package alone"
-            ),
-        });
+        )));
     }
     Ok(())
 }
@@ -329,7 +310,7 @@ fn validate_plan(
     includes: &[String],
     excludes: &[String],
 ) -> Result<(), DebianError> {
-    let contradiction = |reason: String| Err(DebianError::Config { reason });
+    let contradiction = |reason: String| Err(DebianError::config(reason));
     if !includes.is_empty() {
         return contradiction(
             "a plan already names every package to install, so include() has nothing to \
@@ -428,7 +409,7 @@ fn validate_pin(
     architecture: &str,
     plan_set: bool,
 ) -> Result<(), DebianError> {
-    let contradiction = |reason: String| Err(DebianError::Config { reason });
+    let contradiction = |reason: String| Err(DebianError::config(reason));
     if plan_set {
         return contradiction(
             "plan() installs a resolved plan instead of resolving, so there is no resolution \
@@ -637,10 +618,9 @@ impl Debian {
         observer: &mut dyn DebianObserver,
     ) -> Result<Plan, DebianError> {
         let Some(base) = self.base_layer.clone() else {
-            return Err(DebianError::Config {
-                reason: "resolve_layer requires a base layer set with DebianBuilder::base_layer"
-                    .to_string(),
-            });
+            return Err(DebianError::config(
+                "resolve_layer requires a base layer set with DebianBuilder::base_layer",
+            ));
         };
         // Reading the base's set is what refuses a base that is not a
         // configured bootstrap, so it runs whether or not a plan makes the
@@ -719,22 +699,22 @@ impl Debian {
         // otherwise. Cloned rather than borrowed: the configuration is borrowed
         // out of the same value below, and the base is one path.
         let Some(base) = self.base_layer.clone() else {
-            return Err(wrap(DebianError::Config {
-                reason: "stage_layer requires a base layer set with DebianBuilder::base_layer"
-                    .to_string(),
-            }));
+            return Err(ProvisionError::from(DebianError::config(
+                "stage_layer requires a base layer set with DebianBuilder::base_layer",
+            )));
         };
 
         // Preflights before any download, the same fail-early posture the full
         // bootstrap takes: the increment's configure wave runs the target's
         // binaries, and a range map must be establishable.
-        arch::preflight_foreign(&arch::host_architecture(), &self.architecture).map_err(wrap)?;
+        arch::preflight_foreign(&arch::host_architecture(), &self.architecture)
+            .map_err(ProvisionError::from)?;
         super::layer::sandbox_preflight(&self.identity_map, self.id_mapper.as_ref())
-            .map_err(|reason| wrap(DebianError::Config { reason }))?;
+            .map_err(|reason| ProvisionError::from(DebianError::config(reason)))?;
 
         // The base's configured set seeds the resolver, and reading it refuses a
         // base that is not a configured bootstrap.
-        let assume_installed = layer::read_installed_set(&base).map_err(wrap)?;
+        let assume_installed = layer::read_installed_set(&base).map_err(ProvisionError::from)?;
 
         // Create the upper and refuse a host that cannot establish an
         // unprivileged overlay on its filesystem, before any download. The
@@ -745,7 +725,7 @@ impl Debian {
         // there is the caller's.
         let staging = Staging::begin(upper, self.identity_map.clone(), self.id_mapper.clone())?;
         super::layer::overlay_preflight(upper)
-            .map_err(|reason| wrap(DebianError::Config { reason }))?;
+            .map_err(|reason| ProvisionError::from(DebianError::config(reason)))?;
 
         // The archives cache: the caller's shared one, or a sibling of the
         // upper, which goes with this frame however it ends.
@@ -767,7 +747,8 @@ impl Debian {
             }
             None => {
                 let (packages, _archives) =
-                    resolve_delta(&config, &assume_installed, fetcher, observer).map_err(wrap)?;
+                    resolve_delta(&config, &assume_installed, fetcher, observer)
+                        .map_err(ProvisionError::from)?;
                 packages.iter().map(Wanted::from_package).collect()
             }
         };
@@ -782,7 +763,7 @@ impl Debian {
             if let Some(source) = config.overlay {
                 let ownership = Ownership::new(config.identity_map, config.id_mapper);
                 super::extract::overlay_tree(upper, source, Some((&base, &ownership)))
-                    .map_err(|err| wrap(DebianError::Overlay(err)))?;
+                    .map_err(|err| ProvisionError::from(DebianError::Overlay(err)))?;
             }
             return Ok(staging.finish());
         }
@@ -814,7 +795,8 @@ impl Debian {
             env: &env,
             source_date_epoch: config.source_date_epoch,
         };
-        bootstrap::configure_delta(&base, upper, &wave, config.overlay, observer).map_err(wrap)?;
+        bootstrap::configure_delta(&base, upper, &wave, config.overlay, observer)
+            .map_err(ProvisionError::from)?;
 
         // The read-only archives bind left an empty mount point in the upper.
         // Removed as the empty directory it is: anything else at the name is
@@ -1519,27 +1501,22 @@ impl DebianBuilder {
     /// [`keyring`](Self::keyring) cannot be read.
     pub fn build(self) -> Result<Debian, DebianError> {
         if self.suite.trim().is_empty() {
-            return Err(DebianError::Config {
-                reason: "no suite was given".to_string(),
-            });
+            return Err(DebianError::config("no suite was given"));
         }
         if self.extract_only && self.base_layer.is_some() {
-            return Err(DebianError::Config {
-                reason: "extract_only runs no dpkg, and a layered build registers its increment \
+            return Err(DebianError::config(
+                "extract_only runs no dpkg, and a layered build registers its increment \
                          in the base's dpkg database only by running it, so the increment's files \
-                         would be in the merged root and in no database; drop one of the two"
-                    .to_string(),
-            });
+                         would be in the merged root and in no database; drop one of the two",
+            ));
         }
         if let Some(epoch) = self.source_date_epoch
             && epoch < 0
         {
-            return Err(DebianError::Config {
-                reason: format!(
-                    "the source date epoch {epoch} is negative, and the tools that read \
+            return Err(DebianError::config(format!(
+                "the source date epoch {epoch} is negative, and the tools that read \
                      SOURCE_DATE_EPOCH date from the clock instead"
-                ),
-            });
+            )));
         }
         // A plan states which architecture it is for, so a builder that names
         // none adopts it: refusing a plan the caller never contradicted, over a
@@ -1555,11 +1532,12 @@ impl DebianBuilder {
         // merged-usr layout, so it passes the same check the suite and the
         // components do at repository construction. It is a single segment: the
         // archive spells it `binary-<architecture>`, one directory deep.
-        check_coordinate(
+        coordinate::check(
             "the bootstrap's architecture",
             &architecture,
             Nesting::Single,
-        )?;
+        )
+        .map_err(DebianError::config)?;
         // The primary's anchor: the caller's keyring, the decision to trust it
         // unsigned, or the embedded archive keyring where the caller named
         // neither. Naming both is refused before the keyring is read.
@@ -1582,7 +1560,7 @@ impl DebianBuilder {
             self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()),
             self.fallbacks,
         )
-        .map_err(|reason| DebianError::Config { reason })?;
+        .map_err(DebianError::config)?;
         let primary = Repository::primary(
             self.suite.clone(),
             mirrors,
@@ -1770,9 +1748,10 @@ fn bootstrap_suite(
     } = config;
     // A full bootstrap must be able to run the target's binaries.
     if !extract_only {
-        arch::preflight_foreign(&arch::host_architecture(), architecture).map_err(wrap)?;
+        arch::preflight_foreign(&arch::host_architecture(), architecture)
+            .map_err(ProvisionError::from)?;
         super::layer::sandbox_preflight(identity_map, id_mapper)
-            .map_err(|reason| wrap(DebianError::Config { reason }))?;
+            .map_err(|reason| ProvisionError::from(DebianError::config(reason)))?;
     }
 
     let packages = match plan {
@@ -1788,7 +1767,7 @@ fn bootstrap_suite(
         // state goes to the `Resolved` event and no further.
         None => {
             let (packages, _archives) =
-                resolve_packages(config, fetcher, observer).map_err(wrap)?;
+                resolve_packages(config, fetcher, observer).map_err(ProvisionError::from)?;
             packages
                 .iter()
                 .map(Wanted::from_package)
@@ -1816,7 +1795,8 @@ fn bootstrap_suite(
             env: &env,
             source_date_epoch,
         };
-        bootstrap::configure(staging, &wave, repositories, overlay, observer).map_err(wrap)?;
+        bootstrap::configure(staging, &wave, repositories, overlay, observer)
+            .map_err(ProvisionError::from)?;
         // The read-only bind mount left an empty mount point in the rootfs.
         // Removed as the empty directory it is: anything else at the name is
         // not the launch's to take.
@@ -2388,16 +2368,6 @@ fn fetch_release_document<'r>(
     )
 }
 
-impl Failover for DebianError {
-    /// Reaches through the wrapper this layer carries a transport failure in.
-    /// A failure that is not a `Fetch` one at all — a digest or signature
-    /// mismatch over bytes that did arrive — never advances a walk, and falls
-    /// out of the same match.
-    fn is_failover(&self) -> bool {
-        matches!(self, DebianError::Fetch(fetch) if fetch.is_failover())
-    }
-}
-
 /// Downloads (or reuses from cache) and verifies every selected package.
 ///
 /// Each package's bytes are fetched from its own repository's mirrors — the
@@ -2448,7 +2418,7 @@ fn acquire_debs(
         |at, mirror| mirror_url(mirror, &packages[at].filename),
         |at, mut file, subject| verify_deb(&mut file, &entries[at], subject, &packages[at].digests),
     )
-    .map_err(|failure| failure.into_provision(wrap))?;
+    .map_err(|failure| failure.into_provision(ProvisionError::from))?;
 
     Ok(packages
         .iter()
@@ -2701,7 +2671,7 @@ fn extract_packages(
             &path.display().to_string(),
             &installable.digests,
         )
-        .map_err(wrap)?;
+        .map_err(ProvisionError::from)?;
         deb::extract_deb(
             &path,
             &mut file,
@@ -2724,7 +2694,7 @@ fn extract_packages(
         )?;
     }
     if let Some((package, components)) = malformed {
-        return Err(wrap(DebianError::MalformedEntry {
+        return Err(ProvisionError::from(DebianError::MalformedEntry {
             package: package.to_string(),
             path: absolute_path(&components),
         }));
@@ -2857,20 +2827,6 @@ fn absolute_path(components: &[Vec<u8>]) -> String {
         path.push_str(&String::from_utf8_lossy(component));
     }
     path
-}
-
-/// Surfaces a [`DebianError`] through the shared provisioning error.
-///
-/// A cancellation is the run's own outcome rather than a layer failure, so it
-/// becomes the shared [`ProvisionError::Cancelled`] a caller matches on
-/// whichever provisioner they drove; everything else is boxed into
-/// [`ProvisionError::Other`], the way a provisioner outside the core surfaces
-/// its own failures.
-fn wrap(error: DebianError) -> ProvisionError {
-    match error {
-        DebianError::Cancelled => ProvisionError::Cancelled,
-        other => ProvisionError::other(other),
-    }
 }
 
 /// A progress and cancellation sink for a Debian bootstrap.
@@ -3228,8 +3184,9 @@ pub enum DebianError {
     },
 }
 
-path_io_error! {
+layer_error! {
     DebianError,
+    accounts,
     /// This is the form the bootstrap's host-side steps use, where the path is
     /// composed from a contained tree and the operation is known before the
     /// call that might fail.
@@ -3338,12 +3295,6 @@ impl std::error::Error for DebianError {
             DebianError::Io { source, .. } => Some(source),
             _ => None,
         }
-    }
-}
-
-impl From<FetchError> for DebianError {
-    fn from(err: FetchError) -> Self {
-        DebianError::Fetch(err)
     }
 }
 

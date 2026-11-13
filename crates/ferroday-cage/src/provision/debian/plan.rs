@@ -350,7 +350,9 @@ impl Plan {
         header.put("Suite", &self.suite);
         header.put("Architecture", &self.architecture);
         header.put_carried(&self.carried);
-        header.render(&mut out).map_err(document)?;
+        header
+            .render(&mut out)
+            .map_err(DebianError::plan_document)?;
 
         for (index, archive) in self.archives.iter().enumerate() {
             let mut stanza = Draft::new();
@@ -367,12 +369,14 @@ impl Plan {
             stanza.put_allowing_empty("Signed-By", &archive.signed_by.join(" "));
             stanza.put_allowing_empty("Signing-Key", &archive.signing_key.join(" "));
             stanza.put_carried(&archive.carried);
-            stanza.render(&mut out).map_err(document)?;
+            stanza
+                .render(&mut out)
+                .map_err(DebianError::plan_document)?;
         }
 
         for package in &self.packages {
             if package.archive >= self.archives.len() {
-                return Err(document(format!(
+                return Err(DebianError::plan_document(format!(
                     "the package {} names archive {}, and the plan records {}",
                     package.name,
                     package.archive,
@@ -404,7 +408,9 @@ impl Plan {
             stanza.put_optional("Size", size.as_deref());
             stanza.put_optional("SHA512", digest(Algorithm::Sha512));
             stanza.put_carried(&package.carried);
-            stanza.render(&mut out).map_err(document)?;
+            stanza
+                .render(&mut out)
+                .map_err(DebianError::plan_document)?;
         }
         Ok(out)
     }
@@ -427,7 +433,8 @@ impl Plan {
     /// alphabet Debian policy gives a package name, or a package whose pool
     /// path or digest is not one a fetch could be composed from.
     pub fn parse_document(text: &str) -> Result<Plan, DebianError> {
-        let (header, rest) = document::header(document::parse(text), FORMAT).map_err(document)?;
+        let (header, rest) =
+            document::header(document::parse(text), FORMAT).map_err(DebianError::plan_document)?;
         let mut plan = Plan {
             suite: required(header.get("Suite"), "Suite", "the header")?,
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
@@ -440,13 +447,15 @@ impl Plan {
             if let Some(name) = stanza.get("Package") {
                 // Before the name is in any message: each one below names it.
                 if let Some(reason) = unpermitted_name(&name) {
-                    return Err(document(reason));
+                    return Err(DebianError::plan_document(reason));
                 }
                 let at_package = format!("the package {name}");
                 let at = number::<usize>(stanza.get("Archive"), "Archive", &at_package)?
-                    .ok_or_else(|| document(format!("the package {name} names no archive")))?;
+                    .ok_or_else(|| {
+                        DebianError::plan_document(format!("the package {name} names no archive"))
+                    })?;
                 if at >= plan.archives.len() {
-                    return Err(document(format!(
+                    return Err(DebianError::plan_document(format!(
                         "the package {name} names archive {at}, which the document does not \
                          carry — archive stanzas must precede the packages that refer to them",
                     )));
@@ -476,14 +485,16 @@ impl Plan {
                     carried: document::carried(&stanza, PACKAGE_FIELDS),
                 };
                 if let Some(reason) = package.unaddressable() {
-                    return Err(document(reason));
+                    return Err(DebianError::plan_document(reason));
                 }
                 plan.packages.push(package);
                 continue;
             }
 
             let index = stanza.get("Archive").ok_or_else(|| {
-                document("a stanza is neither a package nor an archive".to_string())
+                DebianError::plan_document(
+                    "a stanza is neither a package nor an archive".to_string(),
+                )
             })?;
             // The index is written out so the document reads on its own, and
             // checked rather than trusted: a document whose archives are out of
@@ -491,7 +502,7 @@ impl Plan {
             // held to the spelling the writer gives it, as every number is.
             let expected = plan.archives.len();
             if index != expected.to_string() {
-                return Err(document(format!(
+                return Err(DebianError::plan_document(format!(
                     "the archive stanzas are numbered out of order: expected {expected}, \
                      found {index:?}",
                 )));
@@ -505,7 +516,7 @@ impl Plan {
                     let value =
                         required(stanza.get("Release-SHA256"), "Release-SHA256", &at_archive)?;
                     Digest::new(Algorithm::Sha256, &value).ok_or_else(|| {
-                        document(format!(
+                        DebianError::plan_document(format!(
                             "{at_archive} states the Release-SHA256 {value:?}, which is not a \
                              SHA-256 digest in lowercase hex"
                         ))
@@ -608,16 +619,16 @@ fn planned_digest(stanza: &document::Stanza<'_>, at: &str) -> Result<Digest, Deb
     let mut stated = RECORDED
         .iter()
         .filter_map(|(algorithm, field)| Some((*algorithm, *field, stanza.get(field)?)));
-    let (algorithm, field, value) = stated
-        .next()
-        .ok_or_else(|| document(format!("{at} states neither a SHA256 nor a SHA512")))?;
+    let (algorithm, field, value) = stated.next().ok_or_else(|| {
+        DebianError::plan_document(format!("{at} states neither a SHA256 nor a SHA512"))
+    })?;
     if stated.next().is_some() {
-        return Err(document(format!(
+        return Err(DebianError::plan_document(format!(
             "{at} states both a SHA256 and a SHA512, and a plan records one"
         )));
     }
     Digest::new(algorithm, &value).ok_or_else(|| {
-        document(format!(
+        DebianError::plan_document(format!(
             "{at} states the {field} {value:?}, which is not a {} digest in lowercase hex",
             algorithm.name(),
         ))
@@ -630,7 +641,7 @@ fn planned_digest(stanza: &document::Stanza<'_>, at: &str) -> Result<Digest, Deb
 /// The rule is [`document::required`]'s and is shared with every other layer;
 /// only whose document the refusal is about belongs here.
 fn required(value: Option<Cow<'_, str>>, field: &str, at: &str) -> Result<String, DebianError> {
-    document::required(value.as_deref(), field, at).map_err(document)
+    document::required(value.as_deref(), field, at).map_err(DebianError::plan_document)
 }
 
 /// Reads an optional numeric field, reporting a refusal the same way.
@@ -641,12 +652,7 @@ fn number<T: std::str::FromStr + std::fmt::Display>(
     field: &str,
     at: &str,
 ) -> Result<Option<T>, DebianError> {
-    document::number(value.as_deref(), field, at).map_err(document)
-}
-
-/// Builds the document error.
-fn document(reason: String) -> DebianError {
-    DebianError::PlanDocument { reason }
+    document::number(value.as_deref(), field, at).map_err(DebianError::plan_document)
 }
 
 #[cfg(test)]

@@ -83,6 +83,8 @@ mod fetch;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod http;
 mod identity;
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+mod layer_error;
 #[cfg(feature = "tarball")]
 pub(crate) mod number;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]

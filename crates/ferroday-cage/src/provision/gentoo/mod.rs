@@ -101,6 +101,7 @@ use super::compress;
 use super::coordinate::{self, Nesting};
 use super::digest::{self, Digest};
 use super::layer::{BuildLayer, Staging};
+use super::layer_error::layer_error;
 use super::observe::layer_observer;
 use super::openpgp::{Keyring, OpenPgpError};
 use super::rooted::Rooted;
@@ -110,7 +111,6 @@ use super::{
     walk_mirrors,
 };
 use crate::IdentityMap;
-use crate::failure::path_io_error;
 
 /// The archive the layer reads unless the caller names another.
 const DEFAULT_MIRROR: &str = "http://distfiles.gentoo.org";
@@ -462,14 +462,6 @@ pub enum GentooError {
 }
 
 impl GentooError {
-    /// A configuration that cannot be provisioned from, naming what to do
-    /// instead.
-    pub(crate) fn config(reason: impl Into<String>) -> GentooError {
-        GentooError::Config {
-            reason: reason.into(),
-        }
-    }
-
     /// A refused signature, naming what was being verified and why it was not
     /// accepted.
     ///
@@ -520,22 +512,7 @@ impl GentooError {
     }
 }
 
-path_io_error!(GentooError);
-
-impl Failover for GentooError {
-    /// Reaches through the wrapper this layer carries a transport failure in.
-    /// A failure that is not a `Fetch` one at all — a signature or digest
-    /// mismatch over bytes that did arrive — never advances a walk.
-    fn is_failover(&self) -> bool {
-        matches!(self, GentooError::Fetch(fetch) if fetch.is_failover())
-    }
-}
-
-impl From<FetchError> for GentooError {
-    fn from(err: FetchError) -> GentooError {
-        GentooError::Fetch(err)
-    }
-}
+layer_error!(GentooError);
 
 impl fmt::Display for GentooError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -619,18 +596,6 @@ impl std::error::Error for GentooError {
             } => Some(source),
             GentooError::Io { source, .. } => Some(source),
             _ => None,
-        }
-    }
-}
-
-impl From<GentooError> for super::ProvisionError {
-    /// A cancellation is the run's own outcome rather than a layer failure, so
-    /// it surfaces as the shared variant a caller matches on whichever
-    /// provisioner they drove; everything else is this layer's.
-    fn from(err: GentooError) -> super::ProvisionError {
-        match err {
-            GentooError::Cancelled => super::ProvisionError::Cancelled,
-            other => super::ProvisionError::other(other),
         }
     }
 }

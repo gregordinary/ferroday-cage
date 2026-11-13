@@ -583,6 +583,7 @@ report name a package and its version bare.
 | Stop watching a channel a `poll` loop has finished with | leave it out of the polled slice, as the `poll` module states |
 | Stop watching a channel the running handle's readiness set holds | `running::Readiness::close`, which takes it out of the epoll set before closing it, since a fork's copy of the descriptor would keep the registration |
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
+| Declare what every archive layer's error has: its constructors, the failover question, and the conversions from a fetch failure and into a provisioning one | `provision::layer_error::layer_error!`, over `failure::path_io_error!` |
 | Name, in an error or a progress report, a string a mirror, an index, a package, or a sandbox supplied | `{:?}`, which escapes a control character, as the `failure` module states, unless an alphabet without control characters already admitted the value |
 | Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |

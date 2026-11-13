@@ -385,7 +385,7 @@ impl Plan {
     /// index would have guaranteed is checked here.
     pub fn parse_document(text: &str) -> Result<Plan, GentooError> {
         let (header, rest) =
-            document::header(document::parse(text), FORMAT).map_err(plan_document)?;
+            document::header(document::parse(text), FORMAT).map_err(GentooError::plan_document)?;
         let mut plan = Plan {
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             binhost: required(header.get("Binhost"), "Binhost", "the header")?,
@@ -405,18 +405,19 @@ impl Plan {
         };
 
         for stanza in rest {
-            let name = stanza
-                .get("Package")
-                .ok_or_else(|| plan_document("a stanza after the header names no package"))?;
+            let name = stanza.get("Package").ok_or_else(|| {
+                GentooError::plan_document("a stanza after the header names no package")
+            })?;
             let at = format!("the package {name:?}");
             let package = PlannedPackage {
                 name: name.to_string(),
                 version: required(stanza.get("Version"), "Version", &at)?,
-                build_id: number::<u64>(stanza.get("Build-Id"), "Build-Id", &at)?
-                    .ok_or_else(|| plan_document(format!("{at} states no Build-Id")))?,
+                build_id: number::<u64>(stanza.get("Build-Id"), "Build-Id", &at)?.ok_or_else(
+                    || GentooError::plan_document(format!("{at} states no Build-Id")),
+                )?,
                 path: required(stanza.get("Path"), "Path", &at)?,
                 size: number::<u64>(stanza.get("Size"), "Size", &at)?
-                    .ok_or_else(|| plan_document(format!("{at} states no Size")))?,
+                    .ok_or_else(|| GentooError::plan_document(format!("{at} states no Size")))?,
                 md5: required(stanza.get("MD5"), "MD5", &at)?,
                 slot: required(stanza.get("Slot"), "Slot", &at)?,
                 use_flags: stanza.get("Use").unwrap_or_default().to_string(),
@@ -424,11 +425,13 @@ impl Plan {
                 rdepend: stanza.get("Rdepend").unwrap_or_default().to_string(),
                 pdepend: stanza.get("Pdepend").unwrap_or_default().to_string(),
                 build_time: number::<i64>(stanza.get("Build-Time"), "Build-Time", &at)?
-                    .ok_or_else(|| plan_document(format!("{at} states no Build-Time")))?,
+                    .ok_or_else(|| {
+                        GentooError::plan_document(format!("{at} states no Build-Time"))
+                    })?,
                 carried: document::carried(&stanza, PACKAGE_FIELDS),
             };
             if let Some(reason) = package.unusable() {
-                return Err(plan_document(reason));
+                return Err(GentooError::plan_document(reason));
             }
             plan.packages.push(package);
         }
@@ -463,12 +466,12 @@ fn non_empty(value: &str) -> Option<&str> {
 
 /// Renders one stanza, reporting a value the format cannot carry.
 fn render(stanza: &Draft, out: &mut String) -> Result<(), GentooError> {
-    stanza.render(out).map_err(plan_document)
+    stanza.render(out).map_err(GentooError::plan_document)
 }
 
 /// Reads a required field, or reports which stanza it was missing from.
 fn required(value: Option<Cow<'_, str>>, field: &str, at: &str) -> Result<String, GentooError> {
-    document::required(value.as_deref(), field, at).map_err(plan_document)
+    document::required(value.as_deref(), field, at).map_err(GentooError::plan_document)
 }
 
 /// Reads an optional numeric field, refusing one that is present and
@@ -481,14 +484,7 @@ fn number<T: std::str::FromStr + std::fmt::Display>(
     field: &str,
     at: &str,
 ) -> Result<Option<T>, GentooError> {
-    document::number(value.as_deref(), field, at).map_err(plan_document)
-}
-
-/// A document this library cannot read or write.
-fn plan_document(reason: impl Into<String>) -> GentooError {
-    GentooError::PlanDocument {
-        reason: reason.into(),
-    }
+    document::number(value.as_deref(), field, at).map_err(GentooError::plan_document)
 }
 
 #[cfg(test)]
