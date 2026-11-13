@@ -17,9 +17,8 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use ferroday_cage::{Cage, CageBuilder, Network, ResolvedNetworkFilter};
+use ferroday_cage::{Network, ResolvedNetworkFilter};
 
 /// Set inside the sandbox to make a probe test probe rather than return.
 const PROBE: &str = "FERRODAY_CAGE_TEST_NETWORK_FILTER_PROBE";
@@ -237,32 +236,12 @@ fn probe_compat() {
     println!("probe done");
 }
 
-/// An empty root holding the host's userland: bound in read-only, with the
-/// merged-`/usr` links made as the host has them, so this test binary runs
-/// inside as it runs outside.
-fn host_userland() -> CageBuilder {
-    let mut builder = Cage::builder().empty_rootfs().bind_ro("/usr", "/usr");
-    for top in ["/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"] {
-        let path = Path::new(top);
-        let Ok(meta) = path.symlink_metadata() else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(path).expect("a readable host link");
-            builder = builder.symlink(target, top);
-        } else if meta.is_dir() {
-            builder = builder.bind_ro(top, top);
-        }
-    }
-    builder
-}
-
 /// Runs the probe test `test` in a sandbox under `network`, returning what it
 /// reported and what the sandbox's provenance record says its network filter
 /// refuses.
 fn probe(network: Network, test: &str) -> (Report, Option<ResolvedNetworkFilter>) {
     let exe = std::env::current_exe().expect("the test binary has a path");
-    let cage = host_userland()
+    let cage = common::host_userland()
         .command(PROBE_PATH)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(PROBE, "1")
@@ -451,7 +430,7 @@ fn an_isolated_network_closes_the_32_bit_entry_points() {
 #[cfg(feature = "hardening")]
 fn report_under(test: &str, key: &str, policy: Option<ferroday_cage::SeccompPolicy>) -> String {
     let exe = std::env::current_exe().expect("the test binary has a path");
-    let mut builder = host_userland()
+    let mut builder = common::host_userland()
         .command(PROBE_PATH)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(PROBE, "1")

@@ -315,8 +315,8 @@ therefore replaces the crate page with that line's metadata.
   the terminal relay's signals. The relay's signals block the relayed set and
   open the descriptor those signals arrive on. `fcage` has none. The only other
   `unsafe` is in test code that drives the kernel directly: `tests/keyring.rs`,
-  `tests/relay.rs`, `tests/network_filter.rs`, and the testkit's pseudoterminal
-  harness.
+  `tests/relay.rs`, `tests/network_filter.rs`, `tests/process.rs`, and the
+  testkit's pseudoterminal harness.
 - **Every `unsafe` block states its invariant.** Every crate in the workspace
   denies `unsafe` by default. Each block that needs it carries a `SAFETY:`
   comment stating the invariant it relies on, which
@@ -470,7 +470,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |
 | Name a filesystem entry no concurrent caller can collide with | `host::unique_hex` |
 | Fill a buffer from the kernel's randomness | `host::fill_random` |
-| Fork, exec, exit, or change signal state without libc | `mechanism::sys` |
+| Fork, exec, exit, change signal state, or read signals from a descriptor, without libc | `mechanism::sys` |
 | Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
 | Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |

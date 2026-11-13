@@ -279,14 +279,22 @@ pub enum Network {
 /// a shell inside the sandbox running jobs of its own, which takes `tcsetpgrp`
 /// on a terminal whose session that shell shares.
 ///
-/// Under `Inherit` on standard input both work, and both work by reaching into
-/// the caller's session — the second by the sandbox taking the caller's
-/// terminal's foreground process group, a shell inside the sandbox competing
-/// with the caller's own shell for one terminal. Under `Null` or `Fd` neither
-/// works: the sandbox is outside the caller's session, and the session it has
-/// instead owns no terminal to run jobs against. A caller that wants to stop
-/// such a command on an interrupt uses
-/// [`Running::terminate`](crate::Running::terminate) or
+/// Under `Inherit` on standard input the sandbox stays in the caller's
+/// session, so a shell inside it runs jobs of its own on the caller's
+/// terminal, competing with the caller's own shell for it. With a PID
+/// namespace, the default, the sandbox is a process group of its own in that
+/// session, which keeps the caller's group out of reach of the signals the
+/// sandbox sends its own. Where the caller's group holds the terminal's
+/// foreground at the launch, the launch lends the sandbox's group the
+/// foreground until the outcome is collected: an interrupt typed at the
+/// terminal reaches the sandbox, and `^Z` does not suspend it. Without a PID
+/// namespace the command is in the caller's own process group, and the
+/// caller's shell manages it as any job.
+///
+/// Under `Null` or `Fd` neither sense works: the sandbox is outside the
+/// caller's session, and the session it has instead owns no terminal to run
+/// jobs against. A caller that wants to stop such a command on an interrupt
+/// uses [`Running::terminate`](crate::Running::terminate) or
 /// [`Running::kill`](crate::Running::kill).
 ///
 /// [`Cage::spawn_terminal`] is the posture where the second sense works without
@@ -301,7 +309,8 @@ pub enum Stdio {
     /// This is the default for all three.
     ///
     /// On standard input it also keeps the command in the caller's session,
-    /// and with it the caller's controlling terminal. A launch refuses a
+    /// and with it the caller's controlling terminal; see
+    /// [Job control](#job-control). A launch refuses a
     /// caller's stream that is a directory; see
     /// [A stream that is a directory](#a-stream-that-is-a-directory).
     #[default]
@@ -653,7 +662,8 @@ impl Cage {
     /// [`Pending`] handle — the userspace-network seam.
     ///
     /// The namespaces are created and the supervisor is published, but the
-    /// command is held at a gate just before `execve`. The returned handle
+    /// command is held at a gate before its own confinement and its `execve`.
+    /// The returned handle
     /// exposes [`netns_pid`](Pending::netns_pid), a process in the sandbox's
     /// network namespace, so a caller can attach a userspace network stack
     /// (`pasta`, `slirp4netns`) to `/proc/<pid>/ns/net` before releasing the
@@ -666,10 +676,11 @@ impl Cage {
     /// under [`Network::Host`] the sandbox shares the host's network
     /// namespace and there is nothing to attach.
     ///
-    /// The call returns once the command is at the gate, with every namespace
-    /// and mount in place, so a setup step that fails up to there, a refused
-    /// mount or a failed pivot, is its error. One that fails past the gate, in
-    /// the identity switch, the hardening, or the exec, is `proceed`'s.
+    /// The call returns once the command is at the gate, with the sandbox's
+    /// namespaces and mounts in place, so a setup step that fails up to there,
+    /// a refused mount or a failed pivot, is its error. One that fails past the
+    /// gate, in the command's nested user namespace, the identity switch, the
+    /// hardening, or the exec, is `proceed`'s.
     ///
     /// A caller that needs no pause uses [`spawn`](Self::spawn) instead; this
     /// entry point exists for the attach-then-run sequence.
@@ -1713,6 +1724,14 @@ impl CageBuilder {
     /// the command's descendants can outlive it, and
     /// [`kill`](crate::Running::kill) reaches only the command process
     /// itself.
+    ///
+    /// Without one the command can also signal every process of the calling
+    /// user's, the caller among them: it names them in the PID namespace they
+    /// share, and it is in the caller's process group when it inherits the
+    /// caller's standard input. The `hardening` feature's
+    /// `LandlockScope::Signal` is the bound on that reach. With one, a sandbox
+    /// that keeps the caller's session runs in a process group of its own,
+    /// and the caller's processes are out of its sight.
     ///
     /// When output is captured, those surviving descendants also govern
     /// capture's endpoint: a descendant holding the command's streams keeps

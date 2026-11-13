@@ -16,7 +16,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub use ferroday_cage_testkit::process::{
-    finish_bounded, process_exists, run_bounded, spawn_grouped, wait_gone,
+    cpu_ticks, finish_bounded, process_exists, run_bounded, spawn_grouped, wait_gone,
 };
 pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;
@@ -77,6 +77,30 @@ fn provision_fixture(
     rootfs: &std::path::Path,
 ) -> Result<ferroday_cage::provision::Provisioned, ferroday_cage::provision::ProvisionError> {
     ferroday_cage::provision::ensure(rootfs, &mut ferroday_cage::provision::Tarball::new(tarball))
+}
+
+/// An empty root holding the host's userland: `/usr` bound in read-only, and
+/// the top-level directories beside it bound or linked as the host has them,
+/// merged-`/usr` links included. A host binary, this test binary among them,
+/// runs inside as it runs outside, which is how a test makes a call no tool in
+/// the fixture root makes.
+pub fn host_userland() -> ferroday_cage::CageBuilder {
+    let mut builder = ferroday_cage::Cage::builder()
+        .empty_rootfs()
+        .bind_ro("/usr", "/usr");
+    for top in ["/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"] {
+        let path = std::path::Path::new(top);
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(path).expect("a readable host link");
+            builder = builder.symlink(target, top);
+        } else if meta.is_dir() {
+            builder = builder.bind_ro(top, top);
+        }
+    }
+    builder
 }
 
 /// Whether the kernel offers Landlock. The probe is the hardening layer's,

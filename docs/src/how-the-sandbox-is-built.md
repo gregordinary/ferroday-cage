@@ -22,10 +22,13 @@ sequence itself.
 ## The setup sequence
 
 1. **Reset the signal state.** Every signal disposition returns to its
-   default and the signal mask empties, immediately after the first fork.
-   The caller's ignored dispositions would otherwise survive into the
-   command, and an inherited signal handler must never run inside these
-   tightly constrained processes.
+   default immediately after the first fork, which leaves every signal
+   blocked until then. The caller's ignored dispositions would otherwise
+   survive into the command, and an inherited signal handler must never run
+   inside these tightly constrained processes. The launch stage keeps every
+   signal but the faults blocked for as long as it lives. Each process it
+   forks sets its own mask: the command starts with none blocked, and the init
+   blocks only `SIGCHLD`, which it reads from a descriptor.
 2. **Unshare.** One `unshare` call creates user, mount, PID, UTS, IPC, and
    cgroup namespaces, plus a network namespace unless the host network is
    shared. The user namespace is owned by the process with full
@@ -59,19 +62,28 @@ sequence itself.
    opens a pidfd for it, and passes it back to the caller — the anchor for
    `kill`, immune to pid reuse. The remaining steps run in the init, inside
    all the new namespaces.
-7. **Hostname.** When a hostname is configured, `sethostname` sets it in the
+7. **Leave the caller's process group.** A launch that does not inherit the
+   caller's standard input, and every terminal launch, starts a session of
+   its own with `setsid`. One that inherits it stays in the caller's session
+   and moves into a process group of its own with `setpgid`, so a signal the
+   sandbox sends its own group stays in the sandbox. Where the caller's group
+   held its terminal's foreground at the launch, the init then gives its own
+   group the foreground with `tcsetpgrp`, before the command exists, and the
+   caller takes it back once the outcome is collected. See [Signals and the
+   caller](process-model.md#signals-and-the-caller).
+8. **Hostname.** When a hostname is configured, `sethostname` sets it in the
    new UTS namespace; otherwise the sandbox keeps the host's hostname, and
    either way a change inside the sandbox never reaches the host.
-8. **Loopback.** In an isolated network namespace the only interface is
+9. **Loopback.** In an isolated network namespace the only interface is
    loopback, which starts down; the init brings it up with the
    interface-flags ioctls on a throwaway datagram socket. To give the
    isolated namespace outbound connectivity, a caller attaches a userspace
    network stack at the seam described in
    [Userspace networking](userspace-networking.md).
-9. **Privatize propagation.** Mount propagation for the inherited tree is
-   made recursively private, so nothing done here propagates back to the
-   host, and because `pivot_root` refuses to operate under shared mounts.
-10. **Mount the root.** `pivot_root` requires the new root to be a mount
+10. **Privatize propagation.** Mount propagation for the inherited tree is
+    made recursively private, so nothing done here propagates back to the
+    host, and because `pivot_root` refuses to operate under shared mounts.
+11. **Mount the root.** `pivot_root` requires the new root to be a mount
     point. A plain root filesystem is bind-mounted onto itself, recursively,
     which makes it one without a staging directory. An overlay root is mounted
     over its base. The canonical path validated at build time is resolved here,
@@ -79,7 +91,7 @@ sequence itself.
     attached in the caller's own mount namespace, so a descriptor opened before
     the unshare cannot anchor this step. An [empty root](#an-empty-root) has no
     path: it is a tmpfs created for the launch.
-11. **The mount profile.** The init executes the frozen mount operations in
+12. **The mount profile.** The init executes the frozen mount operations in
     order: the fresh `/proc`, the minimal `/dev`, the `/tmp` tmpfs, the
     caller's own mounts, and the `resolv.conf` bind, as configured. Bind
     sources are host paths and resolve normally — the host
@@ -95,17 +107,19 @@ sequence itself.
     5.12, which lacks `mount_setattr`, only the top mount is made read-only
     (carrying along the flags the user namespace holds locked) and any
     submounts of the source keep their own flags. The restriction becomes a
-    boundary at step 13, where the command enters a nested user namespace and
+    boundary at step 14, where the command enters a nested user namespace and
     the kernel locks it — see [A read-only bind is a
     boundary](#a-read-only-bind-is-a-boundary). An empty root is made read-only
     once the profile is in place.
-12. **Pivot.** The init enters the new mount and calls
+13. **Pivot.** The init enters the new mount and calls
     `pivot_root(".", ".")`, stacking the old root on the same mount point,
     then lazily detaches the old root and changes directory to the new `/`.
     When the step completes, the host filesystem is no longer reachable
     from the sandbox's view.
-13. **Fork and exec.** After changing to the configured working directory,
-    the init forks the command process — PID 2. The command wires its standard
+14. **Fork and exec.** After changing to the configured working directory,
+    the init forks the command process — PID 2. Where step 7 gave the sandbox
+    a process group of its own, it waits for the launch stage to exit first.
+    The command wires its standard
     streams per the configuration, applies the configured [resource
     limits](hardening.md#resource-limits), and enters a nested user namespace
     (below). It then installs the [network filter](#the-network-filter) where

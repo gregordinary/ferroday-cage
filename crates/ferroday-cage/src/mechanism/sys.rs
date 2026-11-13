@@ -1,6 +1,6 @@
 //! The process-level system calls the launch path makes itself: fork, exec,
-//! exit, a signal's disposition, the signal mask, and what reaped children
-//! used.
+//! exit, a signal's disposition, the signal mask, a descriptor signals are
+//! read from, and what reaped children used.
 //!
 //! rustix keeps these in a module reserved for libc-like runtimes, whose name
 //! it does not hold stable for anyone else, so they are issued here through the
@@ -16,7 +16,9 @@
 //! applies. An architecture outside the gate does not build.
 
 use std::ffi::{CStr, c_long, c_ulong};
+use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 
+use rustix::fs::OFlags;
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal};
 use syscalls::Sysno;
@@ -30,14 +32,26 @@ pub(crate) enum Fork {
     ParentOf(Pid),
 }
 
+/// Which side of a [`fork_with_pidfd`] a process is on.
+#[derive(Debug)]
+pub(crate) enum PidfdFork {
+    /// The new process.
+    Child,
+    /// The process that called [`fork_with_pidfd`]: the new process's pid, and
+    /// a pidfd for it.
+    ParentOf(Pid, OwnedFd),
+}
+
+/// `CLONE_PIDFD`: the kernel opens a pidfd for the new process as it creates
+/// it, and stores the descriptor where the parent-tid argument points.
+const CLONE_PIDFD: usize = 0x1000;
+
 /// Forks the calling process: `clone` with `SIGCHLD` as the exit signal and
 /// no other flag, which is what the `fork` system call is on the architectures
 /// that still have one.
 ///
 /// Every other argument is zero, and with no flag that reads them the kernel
-/// ignores them. That is also what makes the call architecture-neutral: the
-/// order of `clone`'s pointer arguments differs between architectures, and
-/// none of them is read.
+/// ignores them.
 ///
 /// Every signal is blocked across the call, as `posix_spawn` blocks them. The
 /// child process is a copy of one whose handlers are still installed in it,
@@ -56,24 +70,76 @@ pub(crate) enum Fork {
 /// [`child`](super::child) permits after a fork: no allocation, no lock, no
 /// libc, no panic.
 pub(crate) unsafe fn fork() -> Result<Fork, Errno> {
-    let exit_signal = Signal::CHILD.as_raw() as usize;
+    // SAFETY: no flag reads a pointer argument, and the caller's contract is
+    // this function's.
+    let pid = unsafe { clone_process(0, std::ptr::null_mut()) }?;
+    Ok(match pid {
+        Some(child) => Fork::ParentOf(child),
+        None => Fork::Child,
+    })
+}
+
+/// [`fork`], with a pidfd for the new process opened by the same call.
+///
+/// The kernel opens the pidfd as it creates the process, so it refers to that
+/// process from its first instant. A pidfd opened afterwards with
+/// `pidfd_open` names whatever holds the pid by then, which, once something
+/// else in the caller has reaped the child, can be an unrelated process.
+///
+/// `clone` with `CLONE_PIDFD` rather than `clone3`, which carries the same
+/// flag. Both arrived before the crate's kernel floor, and the container
+/// runtimes' default seccomp profiles answer `clone3` with `ENOSYS` so that
+/// their C libraries fall back to `clone`. The descriptor is stored through the
+/// parent-tid argument, which is `clone`'s third on every architecture the
+/// build admits; the arguments whose order differs between them, the child-tid
+/// pointer and the thread pointer, are not read.
+///
+/// The descriptor is close-on-exec. The kernel stores its number into the
+/// parent's memory after the child's memory was copied, and installs it in the
+/// parent's descriptor table alone, so the child holds no copy of it.
+///
+/// # Safety
+///
+/// As for [`fork`].
+pub(crate) unsafe fn fork_with_pidfd() -> Result<PidfdFork, Errno> {
+    let mut pidfd: i32 = -1;
+    // SAFETY: `pidfd` is a live local the kernel writes one `int` to, in this
+    // process only, and the caller's contract is this function's.
+    let pid = unsafe { clone_process(CLONE_PIDFD, &raw mut pidfd) }?;
+    Ok(match pid {
+        // SAFETY: the kernel stored a fresh descriptor, owned by this process
+        // and by nothing else, where `CLONE_PIDFD` asked it to.
+        Some(child) => PidfdFork::ParentOf(child, unsafe { OwnedFd::from_raw_fd(pidfd) }),
+        None => PidfdFork::Child,
+    })
+}
+
+/// The `clone` both forks make: `flags` with `SIGCHLD` as the exit signal,
+/// `parent_tid` as the third argument, and every other argument zero, with
+/// every signal blocked across the call. `None` in the child, and the child's
+/// pid in the parent.
+///
+/// # Safety
+///
+/// As for [`fork`]; and `parent_tid` is null or valid for the write a flag in
+/// `flags` asks of it.
+unsafe fn clone_process(flags: usize, parent_tid: *mut i32) -> Result<Option<Pid>, Errno> {
+    let flags = flags | Signal::CHILD.as_raw() as usize;
     // SAFETY: blocking signals runs nothing. The mask is the calling thread's
     // own, and the previous one is restored below on every path that returns
     // in this process.
     let previous = unsafe { sigprocmask(How::SetMask, Some(&SigSet::all())) }?;
-    // SAFETY: `clone` with only an exit signal duplicates the process as
-    // `fork` does; it reads no pointer argument, so the zeros are never
-    // dereferenced. What the child may do afterwards is the caller's contract.
+    // SAFETY: `clone` with an exit signal duplicates the process as `fork`
+    // does; it writes `parent_tid` only for a flag that asks it to, which the
+    // caller vouches for, and reads no other pointer. What the child may do
+    // afterwards is the caller's contract.
     let pid =
-        unsafe { syscalls::syscall!(Sysno::clone, exit_signal, 0usize, 0usize, 0usize, 0usize) }
+        unsafe { syscalls::syscall!(Sysno::clone, flags, 0usize, parent_tid, 0usize, 0usize) }
             .map_err(errno);
     // The kernel answers 0 in the child and the child's pid, which is never 0,
     // in the parent.
-    let forked = pid.map(|pid| match Pid::from_raw(pid as i32) {
-        Some(child) => Fork::ParentOf(child),
-        None => Fork::Child,
-    });
-    if !matches!(forked, Ok(Fork::Child)) {
+    let forked = pid.map(|pid| Pid::from_raw(pid as i32));
+    if !matches!(forked, Ok(None)) {
         // SAFETY: `previous` is the mask this thread ran under before the
         // block above, so restoring it lets run only what could run then. The
         // call cannot fail with a live set of the kernel's size, and a failure
@@ -81,6 +147,19 @@ pub(crate) unsafe fn fork() -> Result<Fork, Errno> {
         let _ = unsafe { sigprocmask(How::SetMask, Some(&previous)) };
     }
     forked
+}
+
+/// Sends `signal` to every process the caller may signal, except itself and
+/// the init of its PID namespace: `kill(-1, signal)`.
+///
+/// Sent by the init of a PID namespace, it reaches every other process of the
+/// namespace, and of any namespace nested in it. rustix's `Pid` cannot spell
+/// `-1`.
+pub(crate) fn kill_all(signal: Signal) -> Result<(), Errno> {
+    // SAFETY: the call takes two integers and touches no memory.
+    unsafe { syscalls::syscall!(Sysno::kill, -1i32, signal.as_raw()) }
+        .map(|_| ())
+        .map_err(errno)
 }
 
 /// Replaces the process image, returning only the reason it could not.
@@ -289,6 +368,68 @@ pub(crate) unsafe fn sigprocmask(how: How, set: Option<&SigSet>) -> Result<SigSe
     }
     .map_err(errno)?;
     Ok(previous)
+}
+
+/// Runs `call` with `signals` blocked in the calling thread, and puts the
+/// thread's mask back as it was.
+///
+/// For a call whose effect depends on a signal being blocked rather than on
+/// what the signal would do, on a thread of the caller's that must not be left
+/// with the block: the kernel lets a background process group take a terminal's
+/// foreground without raising `SIGTTOU` only while the caller blocks or ignores
+/// it, which [`Foreground`](super::Foreground) relies on. A signal of the set
+/// that arrives meanwhile is delivered as the mask comes back, as it would have
+/// been without the block.
+pub(crate) fn with_blocked<T>(signals: &SigSet, call: impl FnOnce() -> T) -> Result<T, Errno> {
+    // SAFETY: blocking signals runs nothing.
+    let previous = unsafe { sigprocmask(How::Block, Some(signals)) }?;
+    let result = call();
+    // SAFETY: `previous` is the mask this thread ran under before the block,
+    // so restoring it lets run only what could run before the call, a moment
+    // late. A failure leaves the thread blocked rather than run anything.
+    let _ = unsafe { sigprocmask(How::SetMask, Some(&previous)) };
+    Ok(result)
+}
+
+/// `SFD_CLOEXEC`, so no exec'd descendant inherits a signal descriptor.
+///
+/// `signalfd4` takes the `O_*` bits under other names: `SFD_CLOEXEC` is
+/// `O_CLOEXEC` and `SFD_NONBLOCK` is `O_NONBLOCK`. Those values differ by
+/// architecture, so both are read from rustix's per-target table rather than
+/// written out here.
+const SFD_CLOEXEC: usize = OFlags::CLOEXEC.bits() as usize;
+/// `SFD_NONBLOCK`, so draining a signal descriptor never blocks.
+const SFD_NONBLOCK: usize = OFlags::NONBLOCK.bits() as usize;
+
+/// The size of one `struct signalfd_siginfo`, the record a signal descriptor
+/// yields per signal. Its first field is the signal number as a `__u32` in the
+/// host's own byte order, and the struct is padded to a size the kernel
+/// promises not to change.
+pub(crate) const SIGINFO_LEN: usize = 128;
+
+/// Opens a descriptor that yields the signals of `signals` as records of
+/// [`SIGINFO_LEN`] bytes, non-blocking and close-on-exec.
+///
+/// The set must be blocked in the threads it is meant for: a signal that is not
+/// blocked is acted on as it arrives and never reaches the descriptor. Reading
+/// a record dequeues the signal it describes.
+pub(crate) fn signalfd(signals: &SigSet) -> Result<OwnedFd, Errno> {
+    // SAFETY: `signals` is a live reference to the kernel's own `sigset_t`
+    // layout, and the size passed alongside it is that type's, which is what
+    // `signalfd4` compares against. The first argument, -1, asks for a new
+    // descriptor rather than modifying an existing one.
+    let fd = unsafe {
+        syscalls::syscall!(
+            Sysno::signalfd4,
+            -1i32,
+            std::ptr::from_ref(signals),
+            size_of::<SigSet>(),
+            SFD_CLOEXEC | SFD_NONBLOCK
+        )
+    }
+    .map_err(errno)?;
+    // SAFETY: the call returned a fresh descriptor this process owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
 /// Sends `signal` to the thread `tid` of this process, rather than to the
@@ -566,6 +707,66 @@ mod tests {
         // A tenth of the spin, so a loaded host's preemption does not fail it.
         assert!(used >= 20_000, "the child's spin counted {used} µs");
         assert!(after.maxrss > 0, "a reaped child has a resident set");
+    }
+
+    #[test]
+    fn a_forks_pidfd_names_the_child_after_another_wait_collects_it() {
+        use std::os::fd::AsFd as _;
+
+        use rustix::process::{WaitId, WaitIdOptions};
+
+        // SAFETY: the child calls only `exit_group`.
+        match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
+            PidfdFork::Child => exit_group(42),
+            PidfdFork::ParentOf(child, pidfd) => {
+                // A wait elsewhere in the caller collects the child first, by
+                // pid, as an application-wide reaper would.
+                let status =
+                    rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty())
+                        .expect("the child is collected")
+                        .expect("the child reported a status")
+                        .1;
+                assert_eq!(status.exit_status(), Some(42));
+                // The pidfd still names that child, exited and collected,
+                // rather than whatever takes its pid next.
+                assert!(super::super::has_exited(pidfd.as_fd()));
+                assert_eq!(
+                    rustix::process::waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED)
+                        .err(),
+                    Some(Errno::CHILD),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_signal_descriptor_reads_a_blocked_signal() {
+        // On a thread of the test's own, so the runner's threads keep their
+        // masks.
+        std::thread::spawn(|| {
+            let usr1 = SigSet::of(&[Signal::USR1]);
+            let read = with_blocked(&usr1, || {
+                let signals = signalfd(&usr1).expect("the descriptor opens");
+                let mut record = [0u8; SIGINFO_LEN];
+                let empty = rustix::io::read(&signals, &mut record);
+                // SAFETY: SIGUSR1 is blocked in this thread, so it is made
+                // pending rather than delivered, and the thread is this one.
+                unsafe { tkill(rustix::thread::gettid(), Signal::USR1) }
+                    .expect("the signal is sent");
+                let read = rustix::io::read(&signals, &mut record);
+                let number = i32::from_ne_bytes(record[0..4].try_into().expect("four bytes"));
+                (empty, read, number)
+            })
+            .expect("the mask blocks");
+            assert_eq!(read.0, Err(Errno::AGAIN), "nothing was pending yet");
+            assert_eq!(read.1, Ok(SIGINFO_LEN));
+            assert_eq!(read.2, Signal::USR1.as_raw());
+            // SAFETY: reading the mask changes nothing.
+            let after = unsafe { sigprocmask(How::Block, None) }.expect("the mask reads");
+            assert!(!after.contains(Signal::USR1), "the block outlived the call");
+        })
+        .join()
+        .expect("the descriptor thread ran");
     }
 
     #[test]

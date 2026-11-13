@@ -12,7 +12,9 @@ caller
     (exits immediately)     sweeps descriptors, replaces the session
                             keyring, establishes the identity map,
                             publishes the supervisor
-    └── init  (PID 1)       sets the sandbox up, then supervises
+    └── init  (PID 1)       leaves the caller's process group or
+                            session, sets the sandbox up, then
+                            supervises
         └── command (PID 2) execs the configured command
 ```
 
@@ -36,13 +38,17 @@ The init:
 The init's exit destroys the PID namespace, and the kernel then kills every
 process remaining in it. The sandbox's lifetime is therefore the command's
 lifetime: a process the command leaves behind cannot outlive the launch,
-and cannot keep [`run`] from returning.
+and cannot keep [`run`] from returning. That holds for a process tracing the
+command too. A tracer holds the command's exit until it lets go, so once the
+command has exited, the init ends the namespace's other processes, the tracer
+with them.
 
 With [`pid_namespace(false)`], there is no init: the command process is itself
 the supervisor, and the launch stage remains outside the sandbox as its parent
 until the outcome arrives. It collects that outcome and watches the caller's
 handle, as the init would. The command shares the host's PID space, and its
-descendants are ordinary host processes that can outlive it.
+descendants are ordinary host processes that can outlive it. A descendant
+tracing the command holds the outcome until it lets go.
 
 ## What the command starts with
 
@@ -116,8 +122,10 @@ returns once the supervisor has exited, which with a PID namespace follows the
 namespace's teardown.
 
 Dropping the handle without waiting does not kill the sandbox and does not
-collect its outcome. Prefer waiting, including after a kill, which also drains
-any output produced before it. A file bind's target that the launch created in
+collect its outcome. It does give back the caller's terminal, where the launch
+lent it to the sandbox; see [Signals and the caller](#signals-and-the-caller).
+Prefer waiting, including after a kill, which also drains any output produced
+before it. A file bind's target that the launch created in
 the root goes once the sandbox is gone. A handle dropped while the sandbox runs
 leaves it, since removing it would unmount the running sandbox's bind.
 
@@ -126,12 +134,34 @@ leaves it, since removing it would unmount the running sandbox's bind.
 The library installs no signal handlers — how the embedding application
 responds to its own signals is application policy. The defined behavior:
 
-- **A command that inherits the caller's standard input shares the caller's
-  process group and session.** A terminal `^C` reaches the foreground process
-  group, which includes the command. An interactive command exits with the
-  foreground job, exactly as it would outside the sandbox. Any other standard
-  input, and every terminal launch, gives the sandbox a session of its own. See
+- **A command that inherits the caller's standard input stays in the caller's
+  session, in a process group of its own.** The init moves the sandbox into a
+  group of its own before the command exists. A signal the command sends its
+  own group, `kill(0, sig)`, reaches the sandbox alone, and no group of the
+  caller's is visible from its PID namespace. Any other standard input, and
+  every terminal launch, gives the sandbox a session of its own. See
   [Stream dispositions](streaming.md#stream-dispositions).
+- **The caller lends the sandbox its terminal.** Where standard input is the
+  caller's controlling terminal and the caller's group holds its foreground, the
+  sandbox's group takes the foreground before the command runs. A `^C` typed at
+  the terminal then reaches the command, which reads the terminal as a
+  foreground job does. The caller's group is a background job meanwhile. A
+  process in it that reads the terminal stops until its shell resumes it, as
+  the pager at the far end of a pipeline does. A caller in the background of
+  its terminal lends nothing.
+- **The foreground comes back to the caller.** The wait that collects the
+  outcome gives it back, and so does dropping the handle. A sandbox still
+  running then is in the background of the terminal. A read of the terminal
+  there fails or stops the reader, and a `^C` reaches the caller's group again.
+  A `^Z` typed while the sandbox holds the terminal does nothing, as [the
+  caller's terminal](streaming.md#the-dispositions-and-the-callers-terminal)
+  explains.
+- **Without a PID namespace, a command that inherits the caller's standard
+  input shares the caller's process group**, as it shares the caller's PID
+  space. It can name the caller's processes directly, so a group of its own
+  would bound nothing.
+  [`LandlockScope::Signal`] is the bound on that reach. A `^C` typed at the
+  terminal reaches the caller and the command alike.
 - **The library's own processes outlive the signals sent to the caller's
   process group.** The init is immune to them as PID 1 of its namespace.
   Without a PID namespace, the launch stage stays in the caller's process group
@@ -156,13 +186,11 @@ responds to its own signals is application policy. The defined behavior:
 
 ## Reaping and zombies
 
-Inside the sandbox, orphaned processes reparent to the init and are
-collected on its next wake-up: when the command exits, when control
-traffic arrives, or on the init's reaping tick, which fires once per
-second while the sandbox runs. A zombie therefore lingers for at most
-about a second, regardless of how long the command runs; teardown at
-command exit clears everything. Without a PID namespace, orphaned
-processes reparent to the host's init as usual.
+Inside the sandbox, orphaned processes reparent to the init, which collects
+each as soon as it exits: every child's exit wakes the init with a `SIGCHLD`,
+however long the command runs. Teardown at command exit clears everything.
+Without a PID namespace, orphaned processes reparent to the host's init as
+usual.
 
 On the caller's side, a launch never leaks a zombie when it is waited: the
 short-lived launch stage is collected during `spawn` (or by `wait`, without a
@@ -206,3 +234,4 @@ peak below the caller's own is therefore not one the field can show.
 [`ResourceUsage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.ResourceUsage.html
 [`Output`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Output.html
 [`pid_namespace(false)`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.pid_namespace
+[`LandlockScope::Signal`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.LandlockScope.html#variant.Signal

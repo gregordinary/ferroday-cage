@@ -1,12 +1,34 @@
 //! Integration tests for the process model: the PID namespace, the library
 //! init, and the scrubbed process state the command starts with.
+//!
+//! The traced-exit tests need a call no tool in the fixture root makes, so
+//! their command is this test binary, run again inside a sandbox on an empty
+//! root holding the host's own userland, as a probe.
 
 mod common;
 
-use std::time::Duration;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::process::Stdio as HostStdio;
+use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, ConfigError, Error, Limit, Resource};
+use ferroday_cage::{Cage, ConfigError, Error, Limit, Resource, Stdio};
 use rustix::process::Pid;
+
+/// Set inside the sandbox, and in the probe's own child, to make a probe test
+/// probe rather than return. Its value names the probe's part.
+const PROBE: &str = "FERRODAY_CAGE_TEST_PROCESS_PROBE";
+
+/// How long the tracer probe holds the command's exit, in milliseconds.
+const HOLD: &str = "FERRODAY_CAGE_TEST_PROCESS_HOLD_MS";
+
+/// The pid the tracer probe seizes.
+const TRACEE: &str = "FERRODAY_CAGE_TEST_PROCESS_TRACEE";
+
+/// Where this test binary is bound inside the sandbox.
+const PROBE_PATH: &str = "/probe";
+
+/// The exit code of the traced command, which the outcome must carry.
+const TRACED_EXIT: i32 = 7;
 
 #[test]
 fn the_command_is_pid_2_under_the_library_init() {
@@ -84,18 +106,17 @@ fn exit_codes_round_trip_without_a_pid_namespace() {
 }
 
 #[test]
-fn orphaned_descendants_are_reaped_within_the_tick() {
+fn orphaned_descendants_are_reaped_while_the_command_runs() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
     // A subshell backgrounds a child and exits, orphaning the child onto
-    // the init, where its exit leaves a zombie. The init's reaping tick
-    // must collect it while the command still runs — not at command exit —
-    // so after a grace period longer than the tick, no process in the
-    // namespace may be in the zombie state.
+    // the init, where its exit leaves a zombie. The init must collect it while
+    // the command still runs — not at command exit — so after a grace period,
+    // no process in the namespace may be in the zombie state.
     let script = r#"
         (: &)
-        sleep 2
+        sleep 1
         ! grep -l ') Z ' /proc/[0-9]*/stat 2>/dev/null
     "#;
     let status = Cage::builder()
@@ -211,19 +232,36 @@ fn parent_of(pid: u32) -> Pid {
 }
 
 #[test]
-fn the_command_keeps_the_callers_process_group() {
+fn the_command_shares_the_inits_process_group_under_a_pid_namespace() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    // The command stays in the caller's process group and session, which is
-    // what routes a terminal ^C to it. From inside the PID namespace an
-    // outside process group has no mapping, so the pgrp field of
-    // /proc/self/stat reads 0 — a group of the sandbox's own would read as
-    // a namespace-local pid instead.
+    // A command that inherits the caller's standard input keeps the caller's
+    // session. Under a PID namespace it is in the init's process group, which
+    // the init made its own: the pgrp field of /proc/self/stat reads the
+    // init's pid, 1. A command left in the caller's group would read 0 there,
+    // since an outside group has no mapping in the namespace.
     let status = Cage::builder()
         .rootfs(rootfs)
         .command("/bin/sh")
-        .args(["-c", r#"[ "$(cut -d' ' -f5 /proc/$$/stat)" = 0 ]"#])
+        .args(["-c", r#"[ "$(cut -d' ' -f5 /proc/$$/stat)" = 1 ]"#])
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect("the sandbox launches");
+    assert!(status.success(), "expected the init's process group");
+
+    // Without a PID namespace the command shares the caller's PID space, and
+    // its process group with it.
+    let caller = rustix::process::getpgrp().as_raw_nonzero().get();
+    let status = Cage::builder()
+        .rootfs(rootfs)
+        .pid_namespace(false)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!(r#"[ "$(cut -d' ' -f5 /proc/$$/stat)" = {caller} ]"#),
+        ])
         .build()
         .expect("a valid sandbox configuration")
         .run()
@@ -414,4 +452,179 @@ fn a_command_that_leaves_the_supervisors_process_group_is_still_waited_for() {
              (pid_namespace = {pid_namespace})",
         );
     }
+}
+
+/// The probe's command: starts a tracer of itself, waits until the tracer has
+/// seized it, and exits with [`TRACED_EXIT`], leaving its exit held by the
+/// tracer.
+#[test]
+fn probe_traced_command() {
+    if std::env::var(PROBE).as_deref() != Ok("command") {
+        return;
+    }
+    let me = std::process::id();
+    let mut tracer = std::process::Command::new(PROBE_PATH)
+        .args(["--exact", "probe_tracer", "--nocapture", "--test-threads=1"])
+        .env(PROBE, "tracer")
+        .env(TRACEE, me.to_string())
+        .stdin(HostStdio::piped())
+        .stdout(HostStdio::null())
+        .stderr(HostStdio::piped())
+        .spawn()
+        .expect("the tracer starts");
+    let tracer_pid = Pid::from_raw(i32::try_from(tracer.id()).expect("a pid fits"))
+        .expect("a child's pid is positive");
+    // The tracer is no ancestor of this process, so Yama's relational scope
+    // admits it only by name.
+    rustix::process::set_ptracer(rustix::process::PTracer::ProcessID(tracer_pid))
+        .expect("the tracer is named");
+    let mut go = tracer.stdin.take().expect("the tracer's input is piped");
+    go.write_all(b"go\n").expect("the tracer is told to seize");
+    // The report is on the tracer's standard error, where its harness writes
+    // nothing of its own unless it fails.
+    let report = BufReader::new(tracer.stderr.take().expect("the tracer's errors are piped"));
+    let seized = report
+        .lines()
+        .map(|line| line.expect("the tracer's report reads"))
+        .any(|line| line == "seized");
+    assert!(seized, "the tracer did not seize this process");
+    std::process::exit(TRACED_EXIT);
+}
+
+/// The probe's tracer: seizes the command once told to, says so on its
+/// standard error, and holds it for [`HOLD`] milliseconds.
+#[test]
+#[expect(unsafe_code)]
+fn probe_tracer() {
+    if std::env::var(PROBE).as_deref() != Ok("tracer") {
+        return;
+    }
+    let tracee: libc::pid_t = std::env::var(TRACEE)
+        .expect("the tracee is named")
+        .parse()
+        .expect("a pid");
+    let hold: u64 = std::env::var(HOLD)
+        .expect("the hold is set")
+        .parse()
+        .expect("a duration");
+    let mut go = String::new();
+    std::io::stdin()
+        .read_line(&mut go)
+        .expect("the command says when");
+    // SAFETY: `PTRACE_SEIZE` takes the pid and two null arguments, and reads
+    // or writes no memory of this process.
+    let seized = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SEIZE,
+            tracee,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    assert_eq!(seized, 0, "{}", std::io::Error::last_os_error());
+    eprintln!("seized");
+    std::thread::sleep(Duration::from_millis(hold));
+}
+
+/// A sandbox whose command exits with its exit held by a tracer it started,
+/// which holds it for `hold`.
+fn traced_exit(pid_namespace: bool, hold: Duration) -> Cage {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    common::host_userland()
+        .pid_namespace(pid_namespace)
+        .command(PROBE_PATH)
+        .args([
+            "--exact",
+            "probe_traced_command",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE, "command")
+        .env(HOLD, hold.as_millis().to_string())
+        .bind_ro(&exe, PROBE_PATH)
+        .resolv_conf(false)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .build()
+        .expect("a valid sandbox configuration")
+}
+
+#[test]
+fn a_tracer_holding_the_commands_exit_does_not_hold_the_outcome() {
+    if !common::require::userns() {
+        return;
+    }
+    // A process tracing the command holds its exit, which its parent's wait
+    // then cannot see, and with a held exit the init cannot report. The init
+    // ends the namespace's other processes once the command's pidfd says it
+    // has exited, as its own exit would have a moment later, and the tracer
+    // goes with them. A tracer holding on for a minute must not hold the
+    // outcome for any of it.
+    let mut running = traced_exit(true, Duration::from_secs(60))
+        .spawn()
+        .expect("the sandbox launches");
+    match running.wait_timeout(Duration::from_secs(30)) {
+        Ok(Some(status)) => assert_eq!(status.code(), Some(TRACED_EXIT), "{status}"),
+        other => {
+            let _ = running.kill();
+            panic!("the traced command's outcome was not reported: {other:?}");
+        }
+    }
+}
+
+/// How many clock ticks the launch stage may use over the second it is watched
+/// below. One spinning on a readable pidfd uses the whole second, a hundred
+/// ticks.
+const IDLE_TICKS: u64 = 20;
+
+#[test]
+fn without_a_pid_namespace_the_launch_stage_sleeps_while_a_tracer_holds_the_exit() {
+    if !common::require::userns() {
+        return;
+    }
+    // Without a PID namespace the launch stage collects the command's outcome
+    // from outside, and the tracer is a host process the launch does not
+    // govern, so the stage waits for it to let go. The command's pidfd turns
+    // readable at its exit and stays so; polled on, it would wake the stage on
+    // every pass of its loop for as long as the tracer holds.
+    let mut running = traced_exit(false, Duration::from_secs(5))
+        .spawn()
+        .expect("the sandbox launches");
+    let command = running.pid();
+    let launch_stage = parent_of(command);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !is_zombie(command) {
+        if Instant::now() >= deadline {
+            let _ = running.kill();
+            panic!("the command never exited under its tracer");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let launch_stage = u32::try_from(launch_stage.as_raw_nonzero().get()).expect("a pid fits");
+    let before = common::cpu_ticks(launch_stage).expect("the launch stage is alive");
+    std::thread::sleep(Duration::from_secs(1));
+    let after = common::cpu_ticks(launch_stage).expect("the launch stage is alive");
+    assert!(
+        after - before < IDLE_TICKS,
+        "the launch stage spun: {} ticks while the tracer held the exit",
+        after - before,
+    );
+    match running.wait_timeout(Duration::from_secs(30)) {
+        Ok(Some(status)) => assert_eq!(status.code(), Some(TRACED_EXIT), "{status}"),
+        other => {
+            let _ = running.kill();
+            panic!("the outcome was not reported once the tracer let go: {other:?}");
+        }
+    }
+}
+
+/// Whether the host process `pid` is a zombie: exited, and not yet collected.
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, rest) = stat.rsplit_once(')')?;
+            rest.split_whitespace().next().map(|state| state == "Z")
+        })
+        .unwrap_or(false)
 }

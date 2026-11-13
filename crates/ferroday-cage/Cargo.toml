@@ -130,6 +130,10 @@ name = "process"
 required-features = ["tarball"]
 
 [[test]]
+name = "process_group"
+required-features = ["tarball"]
+
+[[test]]
 name = "streams"
 required-features = ["tarball"]
 

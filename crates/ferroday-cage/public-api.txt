@@ -2072,6 +2072,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SeccompPolicy
 #[non_exhaustive] #[repr(u32)] pub enum ferroday_cage::SetupStep
 pub ferroday_cage::SetupStep::AllocateTerminal = 56
 pub ferroday_cage::SetupStep::AwaitIdentityMap = 38
+pub ferroday_cage::SetupStep::AwaitLaunchStage = 63
 pub ferroday_cage::SetupStep::AwaitNestedIdentityMap = 51
 pub ferroday_cage::SetupStep::AwaitNetworkStack = 37
 pub ferroday_cage::SetupStep::BindMount = 14
@@ -2104,6 +2105,7 @@ pub ferroday_cage::SetupStep::NestedMapGate = 53
 pub ferroday_cage::SetupStep::NestedUnshare = 47
 pub ferroday_cage::SetupStep::NestedWriteGidMap = 49
 pub ferroday_cage::SetupStep::NestedWriteUidMap = 50
+pub ferroday_cage::SetupStep::NewProcessGroup = 61
 pub ferroday_cage::SetupStep::NewSession = 45
 pub ferroday_cage::SetupStep::NosuidRootfs = 54
 pub ferroday_cage::SetupStep::OpenMountTarget = 11
@@ -2125,6 +2127,7 @@ pub ferroday_cage::SetupStep::SetRlimit = 44
 pub ferroday_cage::SetupStep::SetSecurebits = 39
 pub ferroday_cage::SetupStep::SetUid = 42
 pub ferroday_cage::SetupStep::SweepFds = 27
+pub ferroday_cage::SetupStep::TakeForeground = 62
 pub ferroday_cage::SetupStep::Unshare = 1
 pub ferroday_cage::SetupStep::WatchCommand = 29
 pub ferroday_cage::SetupStep::WireStdio = 30

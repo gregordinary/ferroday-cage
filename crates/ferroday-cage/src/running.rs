@@ -49,6 +49,15 @@ const PUMP_BUF: usize = 8192;
 /// bind's target stays there too, since removing it would unmount the running
 /// sandbox's bind. Prefer waiting — including after a kill.
 ///
+/// Where the launch gave the sandbox the foreground of the caller's terminal
+/// (see [`Stdio`](crate::Stdio)), the wait that observes the outcome gives it
+/// back to the caller's process group, and so does dropping the handle. A
+/// sandbox still running when its handle is dropped runs on in the background
+/// of the terminal, where a read of it fails or stops the reader, and a `^C`
+/// typed at it reaches the caller's group rather than the sandbox. While the
+/// sandbox holds the terminal, the caller's group is the background job: a
+/// process in it that reads the terminal stops until its shell resumes it.
+///
 /// The escalation recipe, for callers that need a bounded stop:
 ///
 /// ```no_run
@@ -117,6 +126,11 @@ pub struct Running<'obs> {
     /// created in the root, if any. See
     /// [`LaunchPlan::managed_placeholders`].
     _placeholders: PlaceholderGuard,
+    /// The caller's terminal, where the launch lent the sandbox its
+    /// foreground: handed back once a wait observes the outcome, or when the
+    /// handle drops. A field with a `Drop` of its own rather than a `Drop` on
+    /// the handle, for the reason [`PlaceholderGuard`] gives.
+    foreground: Option<mechanism::Foreground>,
 }
 
 /// Which channel one of the pump's poll slots watches, and where its readiness
@@ -244,6 +258,7 @@ impl<'obs> Running<'obs> {
             supervisor_exited: false,
             buf,
             _placeholders: placeholders,
+            foreground: launched.foreground,
         }
     }
 
@@ -444,6 +459,11 @@ impl<'obs> Running<'obs> {
     /// the kill took the supervisor and, with it, the namespace — and the
     /// outcome is termination by SIGKILL. Unprovoked, it is an error.
     fn resolve(&mut self) -> Result<ExitStatus, Error> {
+        // Every process of the sandbox is gone once the channels settle, so the
+        // terminal it held goes back to the caller's process group.
+        if let Some(foreground) = &mut self.foreground {
+            foreground.hand_back();
+        }
         if let Some(pidfd) = self.reap.take() {
             // Reap the launch stage through its pidfd, so the wait targets
             // exactly that process and cannot alias a pid a concurrent reaper
@@ -869,7 +889,8 @@ impl KillHandle {
 ///
 /// Returned by [`Cage::spawn_pending`] and [`Cage::spawn_pending_with`]. The
 /// sandbox's namespaces and mounts are in place and its supervisor is
-/// published, but the command is held at a gate just before `execve`. [`netns_pid`](Self::netns_pid) is a
+/// published, but the command is held at a gate before its own confinement and
+/// its `execve`. [`netns_pid`](Self::netns_pid) is a
 /// host pid of a process in the sandbox's network namespace, the target a
 /// userspace network stack (`pasta`, `slirp4netns`) joins through
 /// `/proc/<pid>/ns/net`; the process is alive until the handle is consumed or
@@ -1285,6 +1306,7 @@ mod tests {
                 stdout: Some(stdout),
                 stderr: None,
                 reap: None,
+                foreground: None,
             },
             Some(&mut observer),
             PlaceholderGuard::default(),

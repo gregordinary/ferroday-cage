@@ -112,8 +112,10 @@ wire_enum! {
         SweepFds = 27 => "sweeping inherited file descriptors",
         /// Fork the command process.
         ForkCommand = 28 => "forking the command process",
-        /// Open a pidfd for the command process.
-        WatchCommand = 29 => "opening a pidfd for the command process",
+        /// Open the descriptors the supervisor watches the command through: a
+        /// pidfd for the command, and the descriptor its children's `SIGCHLD`
+        /// arrives on.
+        WatchCommand = 29 => "opening the descriptors the supervisor watches the command through",
         /// Wire the command's standard streams.
         WireStdio = 30 => "wiring the command's standard streams",
         /// Drop or reduce the command's capabilities.
@@ -188,6 +190,16 @@ wire_enum! {
         MountEmptyRoot = 59 => "mounting the empty root",
         /// Make an empty root read-only once the mount profile is in place.
         ReadOnlyEmptyRoot = 60 => "making the empty root read-only",
+        /// Move a sandbox that keeps the caller's session into a process group
+        /// of its own, out of the caller's.
+        NewProcessGroup = 61 => "moving the sandbox into a process group of its own",
+        /// Make the sandbox's process group the foreground of the caller's
+        /// terminal, which the caller lends it for the launch.
+        TakeForeground = 62 => "giving the sandbox's process group the terminal's foreground",
+        /// Wait for the launch stage to exit before the command is forked,
+        /// where the sandbox has a process group of its own in the caller's
+        /// session.
+        AwaitLaunchStage = 63 => "waiting for the launch stage to exit",
     }
 }
 

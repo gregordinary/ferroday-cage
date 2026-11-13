@@ -124,9 +124,13 @@ with it.
 
 A sandbox's PID and network namespaces hide the calling user's other processes.
 With them go two reaches that no grant governs: signals, and connections to
-abstract `AF_UNIX` sockets. [`pid_namespace(false)`] gives the first back, and
-[`Network::Host`] the second. [`landlock_scope`] takes either away again,
-confining it to the processes the sandbox started:
+abstract `AF_UNIX` sockets. Under a PID namespace the sandbox also runs in a
+process group or a session of its own, so a signal it sends to its own group
+reaches its own processes alone. [`pid_namespace(false)`] gives the first reach
+back. The command then shares the host's PID space, where it can signal every
+process of the calling user's, the caller among them. [`Network::Host`] gives
+the second back. [`landlock_scope`] takes either
+away again, confining it to the processes the sandbox started:
 
 ```rust,no_run
 # use ferroday_cage::{Cage, LandlockScope};

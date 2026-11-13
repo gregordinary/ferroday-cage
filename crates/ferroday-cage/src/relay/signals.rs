@@ -2,22 +2,19 @@
 //!
 //! # `unsafe`
 //!
-//! Two calls, and rustix offers a program like this one a safe wrapper for
-//! neither. The signal mask is set through the launch mechanism's
-//! [`sys::sigprocmask`], and `signalfd` goes through the `syscalls` conduit the
-//! crate already carries for `mount_setattr` and the seccomp install. Both are
-//! of the shape "pass a pointer to a live local of matching size", and neither
-//! creates, frees, or aliases anything.
+//! One call, the signal mask, which rustix offers a program like this one no
+//! safe wrapper for. It is set through the launch mechanism's
+//! [`sys::sigprocmask`], whose shape is "pass a pointer to a live local of
+//! matching size", and it creates, frees, or aliases nothing. The descriptor
+//! the signals are read from is the mechanism's [`sys::signalfd`].
 
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 
-use rustix::fs::OFlags;
 use rustix::io::Errno;
 use rustix::process::Signal;
-use syscalls::Sysno;
 
 use super::RelayError;
 use crate::mechanism::sys::{self, How, SigSet};
@@ -50,21 +47,6 @@ pub(super) const RELAYED: [Signal; 8] = [
     Signal::CONT,
     Signal::TTOU,
 ];
-
-/// The size of one `struct signalfd_siginfo`, whose first field is the signal
-/// number as a `__u32` in the host's own byte order. The struct is padded to a
-/// fixed size the kernel promises not to change.
-const SIGINFO_LEN: usize = 128;
-
-/// `SFD_CLOEXEC`, so no exec'd descendant inherits the signal descriptor.
-///
-/// `signalfd4` takes the `O_*` bits under other names: `SFD_CLOEXEC` is
-/// `O_CLOEXEC` and `SFD_NONBLOCK` is `O_NONBLOCK`. Those values differ by
-/// architecture, so both are read from rustix's per-target table rather than
-/// written out here.
-const SFD_CLOEXEC: usize = OFlags::CLOEXEC.bits() as usize;
-/// `SFD_NONBLOCK`, so draining the descriptor never blocks the loop.
-const SFD_NONBLOCK: usize = OFlags::NONBLOCK.bits() as usize;
 
 /// The relay's signals, blocked process-wide and readable as a descriptor.
 ///
@@ -154,7 +136,7 @@ impl Signals {
     /// drain it would leave the process unable to answer `SIGINT` or `SIGTERM`
     /// at all.
     pub fn install() -> Result<Signals, RelayError> {
-        Signals::install_with(open_signalfd)
+        Signals::install_with(sys::signalfd)
     }
 
     /// The body of [`install`](Self::install), with the descriptor opened by
@@ -214,7 +196,7 @@ impl Signals {
     /// with nothing else ready, is however long the deadline is. Unreachable
     /// today, since only the blocked set can arrive and all of it is named.
     pub(super) fn next(&self) -> Result<Option<Signal>, RelayError> {
-        let mut record = [0u8; SIGINFO_LEN];
+        let mut record = [0u8; sys::SIGINFO_LEN];
         loop {
             match rustix::io::read(&self.fd, &mut record) {
                 Ok(0) => return Ok(None),
@@ -237,32 +219,6 @@ impl Signals {
             }
         }
     }
-}
-
-/// Opens a `signalfd` reading `blocked`, non-blocking and close-on-exec.
-///
-/// The one call [`Signals::install`] makes that the kernel can refuse for a
-/// reason outside this crate: descriptor exhaustion, or a seccomp policy that
-/// does not permit `signalfd4`.
-fn open_signalfd(blocked: &SigSet) -> Result<OwnedFd, Errno> {
-    // SAFETY: `blocked` is a live reference, and `SigSet` is a transparent
-    // wrapper over the kernel's own `sigset_t` -- so the pointer is one to that
-    // type and the size passed alongside it is that type's, which is what
-    // `signalfd4` compares against. The first argument, -1, asks for a new
-    // descriptor rather than modifying an existing one, and the call returns an
-    // owned file descriptor on success.
-    let fd = unsafe {
-        syscalls::syscall!(
-            Sysno::signalfd4,
-            -1i32,
-            std::ptr::from_ref(blocked),
-            size_of::<SigSet>(),
-            SFD_CLOEXEC | SFD_NONBLOCK
-        )
-    }
-    .map_err(sys::errno)?;
-    // SAFETY: the syscall returned a fresh, owned file descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
 #[cfg(test)]

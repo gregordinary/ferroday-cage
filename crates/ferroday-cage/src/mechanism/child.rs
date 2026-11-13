@@ -8,14 +8,14 @@
 //! pidfd back to the caller over the control socket.
 //!
 //! With a PID namespace (the default), the process A forks is the sandbox
-//! init — PID 1 inside the namespace. It performs the sandbox setup
-//! (identity maps, hostname, loopback, the mount profile over a fresh
-//! procfs, the pivot), forks the command as PID 2, and then supervises:
-//! collecting orphaned descendants, forwarding termination requests,
-//! watching the control socket for caller exit, and reporting the command's
-//! wait status over the status pipe before exiting. Its exit tears the
-//! namespace down, so processes the command left running are terminated by
-//! the kernel.
+//! init — PID 1 inside the namespace. It leaves the caller's session or
+//! process group, performs the sandbox setup (identity maps, hostname,
+//! loopback, the mount profile over a fresh procfs, the pivot), forks the
+//! command as PID 2 once stage A is gone, and then supervises: collecting
+//! orphaned descendants, forwarding termination requests, watching the
+//! control socket for caller exit, and reporting the command's wait status
+//! over the status pipe before exiting. Its exit tears the namespace down, so
+//! processes the command left running are terminated by the kernel.
 //!
 //! Without a PID namespace there is no init, and the command process is itself
 //! the supervisor the caller's handle anchors on. Stage A forks that one
@@ -65,7 +65,7 @@ use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 
-use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{self, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags};
 use rustix::io::Errno;
 use rustix::ioctl;
@@ -74,6 +74,7 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::process::Pid;
 use rustix::process::Signal;
 use rustix::process::{self, PidfdFlags, WaitOptions, WaitStatus};
+use rustix::termios;
 use rustix::thread;
 use syscalls::Sysno;
 
@@ -142,6 +143,18 @@ pub(super) struct Context<'a> {
     /// The sandbox end of the terminal channel, when this is a terminal launch:
     /// the primary of the pseudoterminal goes back to the caller over it.
     pub(super) terminal_channel_fd: Option<BorrowedFd<'a>>,
+    /// Whether the init makes its process group the foreground of the caller's
+    /// terminal, standard input: the caller decided at the launch that it
+    /// lends the terminal, as [`Foreground`](super::Foreground) describes.
+    pub(super) take_foreground: bool,
+}
+
+impl Context<'_> {
+    /// Whether the init takes a process group of its own in the caller's
+    /// session; see [`LaunchPlan::own_process_group`].
+    fn own_process_group(&self) -> bool {
+        self.plan.own_process_group(self.terminal.is_some())
+    }
 }
 
 /// A failed setup step: the step, the errno, and the 1-based index of the
@@ -179,8 +192,10 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // outlives the setup as the command's supervisor, which must not end
     // because a signal was sent to that group. Blocked from the fork on, a
     // signal that arrives waits until the supervisor ignores it, which
-    // discards it; see `ignore_outside_signals`.
-    reset_signals(&SigSet::all().without(&SUPERVISOR_KEEPS))
+    // discards it; see `ignore_outside_signals`. `SIGCHLD` stays blocked
+    // too, for good: the supervisor reads it from a descriptor, and one
+    // delivered at its default disposition before that would be discarded.
+    reset_signals(&SigSet::all().without(&SUPERVISOR_FAULTS))
         .map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
 
     // New namespaces, owned by the new user namespace, over which this
@@ -244,6 +259,18 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // fork so that this stage and the command are its only holders.
     let seam = nested_seam(procfs)?;
 
+    // Where the init takes a process group of its own, it forks the command
+    // only once this stage is gone, and watches for that through a pidfd of
+    // this stage that it inherits; see `await_launch_stage`.
+    let launch_stage = if context.own_process_group() {
+        Some(
+            process::pidfd_open(process::getpid(), PidfdFlags::empty())
+                .map_err(|errno| (SetupStep::AwaitLaunchStage, errno, 0))?,
+        )
+    } else {
+        None
+    };
+
     let fork_step = if plan.pid_namespace {
         SetupStep::ForkInit
     } else {
@@ -253,10 +280,12 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // only, per this module's constraints, and never returns.
     match unsafe { sys::fork() }.map_err(|errno| (fork_step, errno, 0))? {
         sys::Fork::Child => {
-            unblock_signals().map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
             if plan.pid_namespace {
-                stage_init(context)
+                // The init unblocks its own signals, once it has left the
+                // caller's process group; see `take_process_group`.
+                stage_init(context, launch_stage)
             } else {
+                unblock_signals().map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
                 // The command keeps its own end of the gate and drops the
                 // delegate's side of the seam, which is not its to hold.
                 let gate = seam.map(|seam| {
@@ -277,6 +306,7 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                 // again in this process.
                 unsafe { rustix::io::close(channel.as_raw_fd()) };
             }
+            drop(launch_stage);
             let pidfd = match publish_supervised(context, child) {
                 Ok(pidfd) => pidfd,
                 Err(errno) => {
@@ -310,10 +340,22 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                 // The init supervises itself from inside the namespace;
                 // this stage's work is done.
                 sys::exit_group(0)
-            } else {
-                supervisor_hygiene(context, Role::Outside);
-                supervise(context, pidfd.as_fd(), child, Role::Outside)
             }
+            let children = match watch_children() {
+                Ok(children) => children,
+                Err(errno) => {
+                    abandon_command(child);
+                    return Err((SetupStep::WatchCommand, errno, 0));
+                }
+            };
+            supervisor_hygiene(context, Role::Outside);
+            supervise(
+                context,
+                pidfd.as_fd(),
+                children.as_fd(),
+                child,
+                Role::Outside,
+            )
         }
     }
 }
@@ -354,11 +396,88 @@ fn publish_supervised(context: &Context<'_>, child: Pid) -> Result<OwnedFd, Errn
 /// standard-input disposition would otherwise leave the launch in the caller's.
 /// [`open_terminal`] takes that terminal later, once the root it is allocated
 /// from is in place.
+///
+/// A launch that keeps the caller's session leaves only the caller's process
+/// group, where it has a PID namespace; see [`take_process_group`].
 fn start_own_session(context: &Context<'_>) -> Result<(), Failure> {
     if context.plan.own_session || context.terminal.is_some() {
         process::setsid()
             .map(|_| ())
             .map_err(|errno| (SetupStep::NewSession, errno, 0))?;
+    }
+    Ok(())
+}
+
+/// Moves the sandbox into a process group of its own, in the caller's session,
+/// and gives that group the caller's terminal where the caller lent it.
+///
+/// A signal sent to a process group reaches every member, whatever PID
+/// namespace it sends from: `kill(0, sig)` goes to the sender's own group with
+/// no namespace filter, and a command running as the caller's own uid passes
+/// the permission check. A sandbox left in the caller's group could therefore
+/// signal the caller and every process beside it, the way an interrupt typed at
+/// the terminal reaches them all. In a group of its own, a signal it sends to
+/// its group reaches the sandbox's own processes, and one sent to any other
+/// group names a group its PID namespace cannot see. The command and every
+/// process it starts inherit the group.
+///
+/// Only the launches that keep the caller's session need this, and only where
+/// the sandbox has a PID namespace; see
+/// [`LaunchPlan::own_process_group`](super::LaunchPlan::own_process_group).
+/// A session of the sandbox's own is a process group of its own already, and
+/// without a PID namespace the command shares the caller's PID space and can
+/// name the caller's processes directly, which a group does not change.
+///
+/// The group takes the terminal's foreground when
+/// [`take_foreground`](Context::take_foreground) says the caller lent it, so a
+/// `^C` typed at the terminal reaches the command and a read of the terminal
+/// is not a background read. It does so before the command exists, so the
+/// command never touches the terminal from a background group.
+///
+/// Called by the init, first, with every signal still blocked as the fork left
+/// it, and that is a requirement rather than an order of convenience. The group
+/// is a background group of the terminal until the call that makes it the
+/// foreground, and the kernel answers that call from a background group by
+/// sending `SIGTTOU` to the group and restarting the call, unless the caller
+/// blocks or ignores the signal. The init, the namespace's PID 1, ignores a
+/// signal at its default disposition, so with `SIGTTOU` unblocked the call
+/// would restart forever. Blocked, the kernel lets the call through.
+///
+/// The init's own `setpgid` creates the group, and the launch stage does not
+/// set it a second time from outside, as a shell does for a job it is about to
+/// hand the terminal. A shell needs the second call because the shell itself
+/// acts on the group next; here nothing outside the init acts on it before the
+/// init has created it, and the init takes the foreground itself.
+fn take_process_group(context: &Context<'_>) -> Result<(), Failure> {
+    if !context.own_process_group() {
+        return Ok(());
+    }
+    process::setpgid(None, None).map_err(|errno| (SetupStep::NewProcessGroup, errno, 0))?;
+    if context.take_foreground {
+        termios::tcsetpgrp(rustix::stdio::stdin(), process::getpgrp())
+            .map_err(|errno| (SetupStep::TakeForeground, errno, 0))?;
+    }
+    Ok(())
+}
+
+/// Waits until the launch stage has exited, through the pidfd of it the init
+/// inherited.
+///
+/// The launch stage, in the caller's process group, is the init's parent until
+/// it exits, and its exit is what usually leaves the sandbox's group without a
+/// member whose parent is in another group of the same session: an orphaned
+/// group, in the kernel's terms. The kernel discards the terminal's stop
+/// signals for such a group, which is what makes `^Z` harmless there. At the
+/// moment a group becomes orphaned, though, it sends `SIGHUP` and then
+/// `SIGCONT` to the whole group if any member is stopped. A command forked
+/// before the launch stage exits could be stopped by a `^Z` in that window and
+/// then hung up as the stage exits. Forked only afterwards, the command is
+/// never a member at that moment, and the init itself is never stopped by the
+/// terminal.
+fn await_launch_stage(launch_stage: Option<OwnedFd>) -> Result<(), Failure> {
+    if let Some(stage) = launch_stage {
+        super::await_exit(stage.as_fd())
+            .map_err(|errno| (SetupStep::AwaitLaunchStage, errno, 0))?;
     }
     Ok(())
 }
@@ -415,10 +534,24 @@ fn open_terminal(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     Ok(Some(replica))
 }
 
-/// Stage init: PID 1 of the new PID namespace. Sets the sandbox up, forks
-/// the command as PID 2, and supervises it from inside.
-fn stage_init(context: &Context<'_>) -> ! {
-    if let Err((step, errno, detail)) = start_own_session(context) {
+/// Stage init: PID 1 of the new PID namespace. Leaves the caller's session or
+/// process group, sets the sandbox up, forks the command as PID 2 once the
+/// launch stage is gone, and supervises it from inside.
+///
+/// `launch_stage` is a pidfd of the launch stage, present where the init takes
+/// a process group of its own; see [`await_launch_stage`].
+///
+/// Entered with every signal blocked, as the fork left it. The mask is
+/// replaced only once [`take_process_group`] is behind it, and with the
+/// supervisor's own mask rather than an empty one: `SIGCHLD` stays blocked for
+/// the descriptor [`supervise`] reads it from.
+fn stage_init(context: &Context<'_>, launch_stage: Option<OwnedFd>) -> ! {
+    let detached = start_own_session(context)
+        .and_then(|()| take_process_group(context))
+        .and_then(|()| {
+            replace_mask(&SUPERVISOR_MASK).map_err(|errno| (SetupStep::ResetSignals, errno, 0))
+        });
+    if let Err((step, errno, detail)) = detached {
         report(context.report_fd, step, errno, detail);
         sys::exit_group(127)
     }
@@ -446,6 +579,10 @@ fn stage_init(context: &Context<'_>) -> ! {
             sys::exit_group(127)
         }
     };
+    if let Err((step, errno, detail)) = await_launch_stage(launch_stage) {
+        report(context.report_fd, step, errno, detail);
+        sys::exit_group(127)
+    }
 
     // SAFETY: as at every fork here: the child process touches only frozen
     // data and raw syscalls, and never returns.
@@ -474,11 +611,13 @@ fn stage_init(context: &Context<'_>) -> ! {
             // process drops its copy before it settles in to supervise, which
             // never returns and so never drops anything.
             drop(replica);
-            // The command's pidfd is what lets the supervisor sleep in one
-            // poll; opened before anything else so a failure is still
-            // reportable.
-            let pidfd = match process::pidfd_open(command, PidfdFlags::empty()) {
-                Ok(pidfd) => pidfd,
+            // The descriptors the supervisor sleeps on, the command's pidfd
+            // and its children's signals; opened before anything else so a
+            // failure is still reportable.
+            let watched = process::pidfd_open(command, PidfdFlags::empty())
+                .and_then(|pidfd| watch_children().map(|children| (pidfd, children)));
+            let (pidfd, children) = match watched {
+                Ok(watched) => watched,
                 Err(errno) => {
                     report(context.report_fd, SetupStep::WatchCommand, errno, 0);
                     sys::exit_group(127)
@@ -504,7 +643,13 @@ fn stage_init(context: &Context<'_>) -> ! {
                 }
             }
             supervisor_hygiene(context, Role::Init);
-            supervise(context, pidfd.as_fd(), command, Role::Init)
+            supervise(
+                context,
+                pidfd.as_fd(),
+                children.as_fd(),
+                command,
+                Role::Init,
+            )
         }
     }
 }
@@ -1610,19 +1755,15 @@ fn supervisor_hygiene(context: &Context<'_>, role: Role) {
     }
 }
 
-/// The signals the outside supervisor leaves at their defaults, where it
-/// ignores every other.
+/// The signals that report the supervisor's own failure, which the outside
+/// supervisor leaves at their defaults and unblocked: the faults the kernel
+/// raises on an instruction it executes, which it delivers whatever the
+/// disposition, and `SIGABRT`.
 ///
-/// `SIGCHLD`, because its disposition decides who reaps the supervisor's
-/// children: ignored, the kernel would collect the command itself, and the
-/// supervisor's wait would never see its status. And the signals that report
-/// this process's own failure: the faults the kernel raises on an instruction
-/// it executes, which it delivers whatever the disposition, and `SIGABRT`.
 /// `SIGKILL` and `SIGSTOP` take no disposition at all. Another process can
 /// therefore still end this one by sending it one of these, as it can with
 /// `SIGKILL`.
-const SUPERVISOR_KEEPS: [Signal; 8] = [
-    Signal::CHILD,
+const SUPERVISOR_FAULTS: [Signal; 7] = [
     Signal::SEGV,
     Signal::BUS,
     Signal::ILL,
@@ -1632,8 +1773,18 @@ const SUPERVISOR_KEEPS: [Signal; 8] = [
     Signal::ABORT,
 ];
 
-/// Ignores every signal but [`SUPERVISOR_KEEPS`], then unblocks them all: the
-/// outside supervisor's immunity, the one the init has as PID 1.
+/// The signal mask every supervisor runs under: `SIGCHLD` alone.
+///
+/// The supervisor reads `SIGCHLD` from a descriptor, which sees a signal only
+/// while it is blocked; see [`watch_children`]. Its disposition stays the
+/// default in every process here, because the disposition decides who reaps
+/// the supervisor's children: ignored, the kernel would collect the command
+/// itself, and the supervisor's wait would never see its status.
+const SUPERVISOR_MASK: SigSet = SigSet::of(&[Signal::CHILD]);
+
+/// Ignores every signal but `SIGCHLD` and [`SUPERVISOR_FAULTS`], then unblocks
+/// all but `SIGCHLD`: the outside supervisor's immunity, the one the init has
+/// as PID 1.
 ///
 /// The init is immune by construction. A namespace's PID 1 is never sent a
 /// signal it has left at the default, from inside the namespace or above it,
@@ -1662,7 +1813,11 @@ fn ignore_outside_signals() -> Result<(), Errno> {
         // SAFETY: the numbers are non-zero and within the kernel's signal
         // range on every architecture.
         let signal = unsafe { Signal::from_raw_unchecked(number) };
-        if signal == Signal::KILL || signal == Signal::STOP || SUPERVISOR_KEEPS.contains(&signal) {
+        if signal == Signal::KILL
+            || signal == Signal::STOP
+            || signal == Signal::CHILD
+            || SUPERVISOR_FAULTS.contains(&signal)
+        {
             continue;
         }
         match sys::set_disposition(signal, Disposition::Ignore) {
@@ -1671,25 +1826,49 @@ fn ignore_outside_signals() -> Result<(), Errno> {
             Err(errno) => return Err(errno),
         }
     }
-    // SAFETY: every signal unblocked here was just ignored or keeps its
-    // default, so unblocking it runs no handler; the process is
-    // single-threaded.
-    unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::empty())) }?;
-    Ok(())
+    // Every signal unblocked here was just ignored or keeps its default.
+    replace_mask(&SUPERVISOR_MASK)
 }
 
-/// Empties the signal mask of a process the launch stage or the init just
-/// forked.
+/// Empties the signal mask of the command, freshly forked.
 ///
 /// [`sys::fork`] leaves every signal blocked in the child process. The
 /// dispositions it inherited are its parent process's, which
 /// [`reset_signals`] put back to the default and which nothing has set since,
-/// so unblocking runs nothing: the init and the command start with the empty
-/// mask a process ordinarily has.
+/// so unblocking runs nothing: the command starts with the empty mask a
+/// process ordinarily has.
 fn unblock_signals() -> Result<(), Errno> {
-    // SAFETY: every disposition is the default, so unblocking runs no handler;
-    // the process is single-threaded and freshly forked.
-    unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::empty())) }.map(|_| ())
+    replace_mask(&SigSet::empty())
+}
+
+/// Replaces the signal mask of this process, every disposition of which is the
+/// default or ignored: it was freshly forked from a process whose dispositions
+/// [`reset_signals`] put back to the default.
+fn replace_mask(mask: &SigSet) -> Result<(), Errno> {
+    // SAFETY: no disposition here names a handler, so unblocking runs none;
+    // the process is single-threaded.
+    unsafe { sys::sigprocmask(How::SetMask, Some(mask)) }.map(|_| ())
+}
+
+/// Opens the descriptor a supervisor reads its children's `SIGCHLD` from.
+///
+/// The kernel sends `SIGCHLD` to a parent whenever a child exits, stops, or
+/// continues, and when a tracer lets go of a child's exit that it was holding.
+/// Read from a descriptor in the supervisor's poll, it wakes the supervisor for
+/// each of them, including an orphan's exit once the orphan is the init's.
+/// [`SUPERVISOR_MASK`] keeps it blocked from before the command is forked, so
+/// one sent before the descriptor exists waits for it.
+fn watch_children() -> Result<OwnedFd, Errno> {
+    sys::signalfd(&SUPERVISOR_MASK)
+}
+
+/// Reads every record a signal descriptor holds, without waiting for one.
+///
+/// Reading dequeues the signal, so a descriptor drained before the waits it
+/// woke the supervisor for becomes readable again for any change after them.
+fn drain_signals(signals: BorrowedFd<'_>) {
+    let mut record = [0u8; sys::SIGINFO_LEN];
+    while matches!(rustix::io::read(signals, &mut record), Ok(read) if read > 0) {}
 }
 
 /// Ignores `SIGPIPE`, so a write to a channel whose reader is gone fails with
@@ -1706,59 +1885,109 @@ pub(super) fn ignore_sigpipe() -> Result<(), Errno> {
     sys::set_disposition(Signal::PIPE, Disposition::Ignore)
 }
 
-/// How often the in-namespace init wakes to collect orphaned descendants.
-const REAP_TICK: Timespec = Timespec {
-    tv_sec: 1,
-    tv_nsec: 0,
-};
+/// A channel of the supervisor's poll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// The descriptor the children's `SIGCHLD` arrives on.
+    Children,
+    /// The supervised process's pidfd, until it first reports an exit.
+    Exit,
+    /// The control socket, until it hangs up.
+    Control,
+}
 
 /// The supervisor loop: reap, forward, watch, report.
 ///
-/// Sleeps in one poll over the control socket and the supervised process's
-/// pidfd. Control traffic is a termination request (SIGTERM to the command)
-/// or a hangup — the caller exited or dropped the last handle — which stops
-/// the sandbox when `stop_with_caller` is set and is otherwise ignored.
-/// When the supervised process exits, its wait status goes out over the
-/// status pipe and the supervisor exits; as namespace init, that exit makes
-/// the kernel kill every remaining namespace member.
+/// Sleeps in one poll over the children's signal descriptor, the supervised
+/// process's pidfd, and the control socket. Control traffic is a termination
+/// request (SIGTERM to the command) or a hangup — the caller exited or dropped
+/// the last handle — which stops the sandbox when `stop_with_caller` is set and
+/// is otherwise ignored. When the supervised process exits, its wait status
+/// goes out over the status pipe and the supervisor exits; as namespace init,
+/// that exit makes the kernel kill every remaining namespace member.
 ///
-/// Zombies are collected on every wake. As init, the poll also wakes on
-/// [`REAP_TICK`]: an orphaned descendant reparents to the init and its exit
-/// raises no poll event of its own, so the tick bounds how long its zombie
-/// can linger — without it, a long-lived sandbox whose command keeps
-/// orphaning children would accumulate zombies until the command exited.
-fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Role) -> ! {
-    // Outside the namespace no tick is needed: the supervised command is
-    // the only child this process can ever have, and orphans reparent to
-    // the host init, not here.
-    let timeout = match role {
-        Role::Init => Some(&REAP_TICK),
-        Role::Outside => None,
+/// Every child's exit, stop, or continuation wakes the poll through
+/// `SIGCHLD`, so a zombie is collected as soon as it exits, an orphan that
+/// reparented to the init included.
+///
+/// # A held exit
+///
+/// The pidfd turns readable once the supervised process has exited, and stays
+/// readable from then on, so it is polled only until it first reports. Its
+/// exit is not always collectable by then: a process tracing it with `ptrace`
+/// holds its exit until it lets go, and until then a wait of its parent's does
+/// not see it at all. As the init, the supervisor then ends every other process
+/// of the namespace, as its own exit would a moment later: the tracer goes with
+/// them, which lets go of the exit, and the `SIGCHLD` that follows wakes the
+/// collection. Outside, the tracer is a host process the launch does not
+/// govern, so the supervisor sleeps until the tracer lets go on its own.
+///
+/// # Stops
+///
+/// As the init, the supervisor continues a child that a terminal's `^Z`
+/// stopped. The sandbox's process group is in the caller's session when the
+/// sandbox keeps it; see [`take_process_group`]. Where the group's members
+/// have no parent in another group of that session, the kernel discards a stop
+/// sent by the terminal; where they do, as when the caller's reaper is a
+/// subreaper in the same session, `^Z` would stop the command with nothing in
+/// the sandbox to resume it. A stop by `SIGTTIN` or `SIGTTOU`, which the
+/// terminal sends a background read or write, is left alone: the call that
+/// raised it would raise it again as soon as the process continued. Outside,
+/// the command shares the caller's process group, a stop of it is the
+/// caller's job control, and the supervisor does not ask about stops.
+fn supervise(
+    context: &Context<'_>,
+    exit: BorrowedFd<'_>,
+    children: BorrowedFd<'_>,
+    child: Pid,
+    role: Role,
+) -> ! {
+    let stops = match role {
+        Role::Init => WaitOptions::UNTRACED,
+        Role::Outside => WaitOptions::empty(),
     };
+    let mut watch_exit = true;
     let mut watch_control = true;
+    let mut released = false;
     loop {
-        // The pidfd entry is always last, so its readiness index is stable
-        // whether or not the control socket is still watched.
+        // Only the live channels are polled, gathered to the front: a retired
+        // pidfd would be ready on every pass.
+        let mut watched = [Watch::Children; 3];
         let mut fds = [
-            PollFd::new(&context.control_fd, PollFlags::IN),
-            PollFd::new(&pidfd, PollFlags::IN),
+            PollFd::new(&children, PollFlags::IN),
+            PollFd::new(&children, PollFlags::IN),
+            PollFd::new(&children, PollFlags::IN),
         ];
-        let watched = if watch_control {
-            &mut fds[..]
-        } else {
-            &mut fds[1..]
-        };
-        match rustix::event::poll(watched, timeout) {
+        let mut live = 1;
+        if watch_exit {
+            watched[live] = Watch::Exit;
+            fds[live] = PollFd::new(&exit, PollFlags::IN);
+            live += 1;
+        }
+        if watch_control {
+            watched[live] = Watch::Control;
+            fds[live] = PollFd::new(&context.control_fd, PollFlags::IN);
+            live += 1;
+        }
+        match rustix::event::poll(&mut fds[..live], None) {
             Ok(_) => {}
             Err(Errno::INTR) => continue,
             // An unpollable descriptor set has no recovery; exit visibly.
             // As init the exit also tears the namespace down.
             Err(_) => sys::exit_group(127),
         }
+        let ready = |watch: Watch| {
+            watched[..live]
+                .iter()
+                .zip(&fds)
+                .any(|(&slot, fd)| slot == watch && !fd.revents().is_empty())
+        };
 
-        let control_ready = watch_control && !fds[0].revents().is_empty();
+        if ready(Watch::Exit) {
+            watch_exit = false;
+        }
 
-        if control_ready {
+        if ready(Watch::Control) {
             let mut byte = [0u8; 1];
             match rustix::io::read(context.control_fd, &mut byte) {
                 // Hangup: every caller-side handle is gone.
@@ -1785,7 +2014,7 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
                         // Termination is a request to the command, not the
                         // namespace: SIGTERM is deliverable and trappable
                         // there, docker-stop style. ESRCH means it already
-                        // exited; the pidfd wake handles the rest.
+                        // exited; the wait below handles the rest.
                         let _ = process::kill_process(child, Signal::TERM);
                     }
                 }
@@ -1794,9 +2023,13 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
             }
         }
 
-        // Collect zombies on every wake — control traffic, the tick, or
-        // the supervised process's exit, which ends supervision: its wait
-        // status goes out over the status pipe.
+        // The signals first, then the waits they announced: a child that
+        // changes state after the drain sends one more, which wakes the next
+        // poll.
+        drain_signals(children);
+
+        // Collect zombies on every wake. The supervised process's exit ends
+        // supervision: its wait status goes out over the status pipe.
         //
         // `wait` rather than `waitpid(None, ...)`: rustix renders the latter as
         // pid 0, which is "any child in *this process's* process group" and not
@@ -1807,21 +2040,34 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
         // exited, and the loop below reads that as "something else reaped it"
         // and exits without a status.
         loop {
-            match process::wait(WaitOptions::NOHANG) {
+            match process::wait(WaitOptions::NOHANG | stops) {
+                Ok(Some((pid, status))) if status.stopped() => {
+                    // A stopped child is this process's unreaped child, so
+                    // its pid names nothing else.
+                    if status.stopping_signal() == Some(Signal::TSTP.as_raw()) {
+                        let _ = process::kill_process(pid, Signal::CONT);
+                    }
+                }
                 Ok(Some((pid, status))) if pid == child => {
                     collect_exited();
                     report_status(context.status_fd, status);
                     sys::exit_group(0)
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) | Err(Errno::INTR) => {}
                 Ok(None) => break,
-                Err(Errno::INTR) => continue,
                 // No children left yet no status for the supervised
                 // process: something else reaped it. Unreportable;
                 // exiting without a record surfaces as a lost
                 // supervisor.
                 Err(_) => sys::exit_group(127),
             }
+        }
+
+        // The supervised process has exited, and no wait could collect it: a
+        // tracer holds its exit. See "A held exit" above.
+        if !watch_exit && !released && role == Role::Init {
+            let _ = sys::kill_all(Signal::KILL);
+            released = true;
         }
     }
 }

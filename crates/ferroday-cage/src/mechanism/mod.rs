@@ -137,7 +137,7 @@ use rustix::mount::{MountFlags, MountPropagationFlags};
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::pipe::{self, PipeFlags};
 use rustix::process::Signal;
-use rustix::process::{self, Pid, PidfdFlags, WaitId, WaitIdOptions, WaitOptions, WaitStatus};
+use rustix::process::{self, Pid, WaitId, WaitIdOptions, WaitOptions, WaitStatus};
 use rustix::thread::UnshareFlags;
 
 use crate::error::{Error, SetupStep};
@@ -146,7 +146,7 @@ use crate::idmap::{IdMapper, ResolvedMap};
 use crate::observer::Progress;
 use crate::status::{ExitStatus, ResourceUsage};
 use crate::terminal::Terminal;
-use sys::Fork;
+use sys::PidfdFork;
 
 /// What the launch stages build around the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,6 +627,147 @@ pub(crate) struct LaunchPlan {
     /// Present only with the `hardening` feature.
     #[cfg(feature = "hardening")]
     pub(crate) hardening: HardeningPlan,
+}
+
+impl LaunchPlan {
+    /// Whether a launch of this plan gives the sandbox a process group of its
+    /// own in the caller's session: a launch that keeps the caller's session,
+    /// with a PID namespace. `terminal` is whether the launch is a terminal
+    /// launch, which is a property of the launch rather than of the plan.
+    ///
+    /// A launch that does not keep the caller's session gets a session of its
+    /// own, which is a process group of its own already: any standard input
+    /// but [`Inherit`](StdioPlan::Inherit), and every terminal launch. Without a
+    /// PID namespace the command shares the caller's PID space and can name
+    /// the caller's processes directly, so a group of its own would bound
+    /// nothing there; the hardening layer's `LandlockScope::Signal` is that
+    /// reach's bound.
+    pub(crate) fn own_process_group(&self, terminal: bool) -> bool {
+        self.pid_namespace && !self.own_session && !terminal
+    }
+}
+
+/// The caller's terminal, lent to the sandbox's process group for as long as
+/// the sandbox runs.
+///
+/// A sandbox that keeps the caller's session under a PID namespace runs in a
+/// process group of its own (see
+/// [`LaunchPlan::own_process_group`]). Where the caller's standard input is its
+/// controlling terminal and the caller's own process group holds that
+/// terminal's foreground, the caller lends the foreground to the sandbox: the
+/// init takes it for the sandbox's group before the command exists. A `^C`
+/// typed at the terminal then reaches the command, as it reached the caller's
+/// job before, and the caller's group stays out of reach of what the command
+/// sends to its own. The caller's group is a background job of the terminal
+/// meanwhile, so a process in it that reads the terminal stops until its shell
+/// resumes it.
+///
+/// This is the caller's half: the decision, made at the launch rather than at
+/// build because it is a property of the caller's process at that moment, and
+/// the return of the foreground once the sandbox is gone. The terminal is held
+/// as a duplicate of the caller's descriptor 0 taken at the launch, so what the
+/// caller does with its own descriptor 0 afterwards changes nothing here.
+///
+/// [`hand_back`](Self::hand_back) returns the foreground, at most once, and
+/// dropping a `Foreground` hands it back too. A handle hands it back once a
+/// wait has observed the sandbox's outcome, and a launch that fails hands it
+/// back once its processes have ended. A handle dropped while the sandbox runs
+/// hands it back then: the terminal is the caller's, and a caller that kept
+/// running in the background of its own terminal would be stopped by the
+/// kernel at its first read of it. The sandbox runs on in the background from
+/// then, where a read of the terminal fails or stops the reader, and a `^C` no
+/// longer reaches it.
+pub(crate) struct Foreground {
+    /// The caller's terminal, until the foreground is handed back.
+    terminal: Option<OwnedFd>,
+    /// The caller's process group, which held the foreground at the launch.
+    caller: Pid,
+    /// The sandbox's process group: the init's host pid, once the launch has
+    /// published it.
+    sandbox: Option<Pid>,
+}
+
+impl Foreground {
+    /// Decides whether a launch of `plan` lends the caller's terminal, and
+    /// takes the terminal if it does. `terminal` is whether the launch is a
+    /// terminal launch.
+    ///
+    /// The caller lends it when the sandbox takes a process group of its own,
+    /// its standard input is the caller's controlling terminal, and the
+    /// caller's own process group is the terminal's foreground group. A caller
+    /// in the background of its terminal, or whose standard input is no
+    /// terminal, lends nothing, and the sandbox's group is a background group
+    /// of whatever terminal it has.
+    fn lend(plan: &LaunchPlan, terminal: bool) -> Result<Option<Foreground>, Error> {
+        if !plan.own_process_group(terminal) {
+            return Ok(None);
+        }
+        let stdin = rustix::stdio::stdin();
+        let caller = process::getpgrp();
+        // A terminal that is not this process's controlling terminal answers
+        // `ENOTTY`, and one whose foreground group is outside this process's
+        // PID namespace answers zero, which rustix reports as an error too.
+        match rustix::termios::tcgetpgrp(stdin) {
+            Ok(holder) if holder == caller => {}
+            _ => return Ok(None),
+        }
+        // Close-on-exec, and above the standard streams' numbers.
+        let terminal = stdin
+            .try_clone_to_owned()
+            .map_err(|source| Error::Spawn { source })?;
+        Ok(Some(Foreground {
+            terminal: Some(terminal),
+            caller,
+            sandbox: None,
+        }))
+    }
+
+    /// Records the sandbox's process group, the init's host pid, once the
+    /// launch has published the init.
+    fn lent_to(&mut self, init: u32) {
+        self.sandbox = i32::try_from(init).ok().and_then(Pid::from_raw);
+    }
+
+    /// Gives the terminal's foreground back to the caller's process group, the
+    /// first time it is called.
+    ///
+    /// It takes the foreground back only from the sandbox: when the terminal's
+    /// foreground group is the sandbox's own, or a group with no process left
+    /// in it, which is where a shell inside the sandbox can leave it once the
+    /// sandbox is gone. Any other group holding it has been given it since, by
+    /// the caller's shell after a stop of the caller for instance, and keeps
+    /// it.
+    ///
+    /// The caller's group is in the background of its terminal until the call
+    /// returns, and the kernel stops a background group that takes the
+    /// foreground, with `SIGTTOU`, unless the calling thread blocks or ignores
+    /// it. The signal is blocked in the calling thread for the call alone.
+    /// Best-effort: a terminal the session no longer controls refuses the call,
+    /// and there is nothing to give back.
+    pub(crate) fn hand_back(&mut self) {
+        let Some(terminal) = self.terminal.take() else {
+            return;
+        };
+        let Ok(holder) = rustix::termios::tcgetpgrp(&terminal) else {
+            return;
+        };
+        if holder == self.caller {
+            return;
+        }
+        let lent = Some(holder) == self.sandbox
+            || process::test_kill_process_group(holder) == Err(Errno::SRCH);
+        if lent {
+            let _ = sys::with_blocked(&sys::SigSet::of(&[Signal::TTOU]), || {
+                rustix::termios::tcsetpgrp(&terminal, self.caller)
+            });
+        }
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        self.hand_back();
+    }
 }
 
 /// A single BPF instruction, the unit of a compiled seccomp program.
@@ -1193,16 +1334,20 @@ pub(crate) struct Launched {
     /// rather than a raw pid so the deferred reap targets exactly this process
     /// and cannot alias a pid a concurrent reaper freed and the OS recycled.
     pub(crate) reap: Option<OwnedFd>,
+    /// The caller's terminal, where the launch lent the sandbox its
+    /// foreground, for the handle to hand back.
+    pub(crate) foreground: Option<Foreground>,
 }
 
 /// The launch stage as the caller holds it.
 ///
-/// The pidfd is taken the moment the fork returns, while the stage is an
-/// unreaped child process whose pid can name nothing else. Every later signal
-/// and reap goes through it, so neither can reach a process that took the pid
-/// after an application-wide reaper collected the stage first. The pid is kept
-/// beside it for the identity-map delegate, which names the process it maps by
-/// number and runs while the stage is blocked at the map gate, alive.
+/// The pidfd is opened by the fork itself, so it refers to the stage from the
+/// stage's first instant, whatever else in the caller waits for children. Every
+/// signal and reap goes through it, so neither can reach a process that took
+/// the pid after an application-wide reaper collected the stage first. The pid
+/// is kept beside it for the identity-map delegate, which names the process it
+/// maps by number and runs while the stage is blocked at the map gate, alive,
+/// so the number names the stage while the delegate uses it.
 struct LaunchStage {
     /// The stage's pid, for the delegate.
     pid: Pid,
@@ -1250,6 +1395,10 @@ struct ParentSide {
     /// the sandbox sends the primary of the pseudoterminal it allocated over
     /// it, and [`receive_primary`] takes it.
     terminal: Option<OwnedFd>,
+    /// The caller's terminal, where the launch lends the sandbox its
+    /// foreground. Dropped with the rest of this on a launch that fails, which
+    /// hands the foreground back.
+    foreground: Option<Foreground>,
 }
 
 /// The payload byte the primary rides on over the terminal channel. Its value
@@ -1437,6 +1586,9 @@ pub(super) fn abandon_gated_child(child: Pid) {
 /// blocks on before `execve`; a `terminal` launch additionally carries the
 /// terminal channel, over which the sandbox sends the primary of the
 /// pseudoterminal it allocates for itself.
+///
+/// The caller's terminal is lent to the sandbox here, as [`Foreground`]
+/// decides, and the decision travels to the init in the context.
 fn fork_launch(
     plan: &LaunchPlan,
     observe: bool,
@@ -1444,6 +1596,7 @@ fn fork_launch(
     terminal: Option<&Terminal>,
 ) -> Result<ParentSide, Error> {
     refuse_directory_streams(plan, observe, terminal.is_some())?;
+    let foreground = Foreground::lend(plan, terminal.is_some())?;
 
     // Pre-fork marshaling, caller side. The pointer arrays and identity-map
     // lines are the last pieces the sandbox stages need; they are assembled
@@ -1536,9 +1689,9 @@ fn fork_launch(
     // on its own stack and runs `child::stage_a`, which performs raw rustix
     // syscalls over the data frozen above — no allocation, no locking, no
     // libc — and never returns: every path ends in `execve` or `exit_group`.
-    match unsafe { sys::fork() } {
+    match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(spawn_error(errno)),
-        Ok(Fork::Child) => {
+        Ok(PidfdFork::Child) => {
             let context = child::Context {
                 plan,
                 argv: &argv,
@@ -1560,21 +1713,11 @@ fn fork_launch(
                 terminal_channel_fd: terminal_channel
                     .as_ref()
                     .map(|(_, sandbox)| sandbox.as_fd()),
+                take_foreground: foreground.is_some(),
             };
             child::stage_a(&context)
         }
-        Ok(Fork::ParentOf(stage_a)) => {
-            // The pidfd first, while the stage is an unreaped child and its
-            // pid names nothing else; the kill and reap below go by pid for
-            // that same reason.
-            let pidfd = match process::pidfd_open(stage_a, PidfdFlags::empty()) {
-                Ok(pidfd) => pidfd,
-                Err(errno) => {
-                    let _ = process::kill_process(stage_a, Signal::KILL);
-                    let _ = wait_for_exit(stage_a);
-                    return Err(spawn_error(errno));
-                }
-            };
+        Ok(PidfdFork::ParentOf(stage_a, pidfd)) => {
             // Close the caller's copies of the sandbox-side ends: from here
             // on, end-of-file on each read side means the sandbox's copies
             // are gone.
@@ -1615,6 +1758,7 @@ fn fork_launch(
                 proceed_write,
                 map_gate,
                 terminal,
+                foreground,
             })
         }
     }
@@ -1819,7 +1963,10 @@ pub(crate) fn spawn(
     // published sandbox always has a fully mapped user namespace.
     establish_identity_map(plan, &mut parent)?;
     let received = receive_supervisor(&parent.host_sock);
-    if received.is_ok() {
+    if let Ok((_, pid)) = &received {
+        if let Some(foreground) = &mut parent.foreground {
+            foreground.lent_to(*pid);
+        }
         progress(Progress::Supervised);
     }
     let report = read_report(&parent.report_read, created, plan.ops.len());
@@ -1855,6 +2002,7 @@ pub(crate) fn spawn(
                     stdout: parent.stdout,
                     stderr: parent.stderr,
                     reap: reap_after(plan.pid_namespace, parent.stage),
+                    foreground: parent.foreground,
                 },
                 primary,
             ))
@@ -1956,6 +2104,10 @@ pub(crate) struct PendingLaunch {
     proceed_write: OwnedFd,
     /// Whether the sandbox has its own PID namespace, deciding the reap.
     pid_namespace: bool,
+    /// The caller's terminal, where the launch lent the sandbox its
+    /// foreground. Handed to the running handle at proceed, and handed back
+    /// when the launch fails or is abandoned.
+    foreground: Option<Foreground>,
     /// The mount labels, for naming a setup step that fails after release.
     op_labels: Vec<String>,
     /// The command label, for naming an exec step that fails after release.
@@ -1977,12 +2129,17 @@ pub(crate) struct PendingLaunch {
 /// Launches the sandbox but holds the command at the gate before `execve`,
 /// returning once the command is there.
 ///
-/// The command says it is held only with every setup step behind it: the
-/// namespaces and the mounts are in place, a terminal's primary is sent, and
-/// with a PID namespace the init is supervising. A setup failure before that
-/// (a denied `unshare`, a refused mount) surfaces here as the typed error; one
-/// after it (the identity switch, the hardening, the exec) is deferred to
+/// The command says it is held only with every step ahead of the gate behind
+/// it: the sandbox's namespaces and mounts are in place, and a terminal's
+/// primary is sent. A setup failure before that (a denied `unshare`, a refused
+/// mount) surfaces here as the typed error; one after it (the command's nested
+/// user namespace, the identity switch, the hardening, the exec) is deferred to
 /// [`PendingLaunch::proceed`], where the report is read again.
+///
+/// With a PID namespace the init supervises the held command, except under a
+/// range map. There the init is the delegate for the command's nested identity
+/// map, and waits at that map's gate, which the command reaches only once it
+/// is released; it supervises from then on.
 ///
 /// `created` as for [`spawn`]. Every target is reported before the command is
 /// held, so a pending launch has them all.
@@ -2027,6 +2184,9 @@ pub(crate) fn spawn_pending(
             };
         }
     };
+    if let Some(foreground) = &mut parent.foreground {
+        foreground.lent_to(pid);
+    }
     progress(Progress::Supervised);
 
     match read_report(&parent.report_read, created, plan.ops.len()) {
@@ -2083,6 +2243,7 @@ pub(crate) fn spawn_pending(
             stderr: parent.stderr,
             proceed_write,
             pid_namespace: plan.pid_namespace,
+            foreground: parent.foreground,
             op_labels: plan.op_labels.clone(),
             exec_label: plan.exec_label.clone(),
             rlimit_labels: plan.rlimit_labels.clone(),
@@ -2138,6 +2299,7 @@ impl PendingLaunch {
                     stdout: self.stdout,
                     stderr: self.stderr,
                     reap: reap_after(self.pid_namespace, self.stage),
+                    foreground: self.foreground,
                 })
             }
             Ok(Report::SetupFailed {

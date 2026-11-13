@@ -242,7 +242,9 @@ streams the caller handed it — and closing it therefore takes all three.
 **Standard input decides the session.** `Stdio::Inherit` hands the command the
 caller's standard input, so it stays in the caller's session, where the terminal
 is reachable as file descriptor 0 and equally as `/dev/tty`, the same terminal
-by another name. `Stdio::Null` and `Stdio::from_fd` do not, so the command runs
+by another name. Under a PID namespace it is in a process group of its own
+there. The signals it sends its own group stay in the sandbox, as [Signals and
+the caller](process-model.md#signals-and-the-caller) describes. `Stdio::Null` and `Stdio::from_fd` do not, so the command runs
 in a session of its own with no controlling terminal at all: `/dev/tty` fails
 with `ENXIO`, and `TIOCSTI` — the ioctl that pushes characters into a terminal's
 input queue for the caller's shell to run afterwards — is refused on every
@@ -265,12 +267,21 @@ suspends it, `fg` resumes it. *Sandbox-session job control* is a shell inside
 the sandbox running jobs of its own, which takes `tcsetpgrp` on a terminal whose
 session that shell shares.
 
-Under `Stdio::Inherit` both work, and both work by reaching into the caller's
-session — the second by the sandbox taking the caller's terminal's foreground
-process group, a shell inside the sandbox competing with the caller's own shell
-for one terminal. Under `Stdio::Null` or `Stdio::from_fd` neither does: the
-sandbox is outside the caller's session, and the session it has instead owns no
-terminal to run jobs against. A caller that wants to stop such a sandbox on an
+Under `Stdio::Inherit` the sandbox is in the caller's session. A shell inside
+it runs jobs of its own on the caller's terminal, competing with the caller's
+own shell for it. With a PID namespace, the default, the sandbox is a process
+group of its own there. The caller lends it the terminal's foreground for the
+launch. An interrupt typed at the terminal reaches the sandbox, and `^Z` does
+not suspend it. Once the launch stage has exited, no member of the sandbox's
+group has a parent in another group of the session. The kernel discards a
+terminal's stop for such a group. Where the caller's reaper is a subreaper in
+the same session, the stop reaches the command, and the init continues it.
+Without a PID namespace the command is in the caller's own process group. The
+caller's shell then manages it as it does any job.
+
+Under `Stdio::Null` or `Stdio::from_fd` neither sense works. The sandbox is
+outside the caller's session, and the session it has instead owns no terminal
+to run jobs against. A caller that wants to stop such a sandbox on an
 interrupt calls [`Running::terminate`] or [`Running::kill`], or ties the sandbox
 to its own life with
 [`stop_with_caller`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.stop_with_caller).
