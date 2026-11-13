@@ -79,6 +79,7 @@ use flate2::write::GzEncoder;
 use super::check_coordinate;
 use super::{DebianError, MAX_UNSIZED_INDEX, arch, deb, release, version};
 use crate::ErrorChain;
+use crate::provision::ProvisionError;
 use crate::provision::cache;
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm, Digest};
@@ -957,8 +958,8 @@ fn index_deb(
 
     // Where the .deb belongs in the pool is what its own control stanza says it
     // is, so the location is settled before anything is written.
-    let control = deb::read_control_from(deb_path, &mut source)
-        .map_err(|err| bad(ErrorChain::new(&err).to_string()))?;
+    let control =
+        deb::read_control_from(deb_path, &mut source).map_err(|err| unreadable(deb_path, err))?;
     let offered = identity(&control, architecture).map_err(bad)?;
     if retained.get(&offered.name).is_some_and(|kept| {
         version::compare(&offered.version, &kept.version) == std::cmp::Ordering::Less
@@ -1074,8 +1075,7 @@ fn control_of(
     };
     file.rewind()
         .map_err(DebianError::at("reading a .deb in the pool", path))?;
-    let control =
-        deb::read_control_from(path, file).map_err(|err| bad(ErrorChain::new(&err).to_string()))?;
+    let control = deb::read_control_from(path, file).map_err(|err| unreadable(deb_path, err))?;
     if identity(&control, architecture).map_err(bad)? != *expected {
         return Err(bad(
             "it changed while it was being published, and now names a different package"
@@ -1083,6 +1083,22 @@ fn control_of(
         ));
     }
     Ok(control)
+}
+
+/// A failure to read a `.deb`'s control member, as the pool reports it.
+///
+/// A read of the file that failed is the host's, [`DebianError::Io`], naming the
+/// file it was reading. Anything else is the package's, [`DebianError::Deb`],
+/// naming `deb_path`, the `.deb` the caller offered, since that is the file at
+/// fault.
+fn unreadable(deb_path: &Path, err: ProvisionError) -> DebianError {
+    match err {
+        ProvisionError::Io { op, path, source } => DebianError::io(op, path, source),
+        other => DebianError::Deb {
+            path: deb_path.to_path_buf(),
+            reason: ErrorChain::new(&other).to_string(),
+        },
+    }
 }
 
 /// Reads back what the pool's own copy of a `.deb` says about itself: its

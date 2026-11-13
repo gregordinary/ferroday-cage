@@ -50,10 +50,11 @@ const CONTROL_MEMBER_LIMIT: u64 = 16 * 1024 * 1024;
 /// Extracts the `data.tar` member of the `.deb` at `path`, which `deb` reads,
 /// into an ongoing extraction.
 ///
-/// `path` names the package in a failure and is not opened. `on_entry` is forwarded to the extractor for every extracted entry, so
-/// the caller can record ownership for the dpkg statoverride. Extraction
-/// shares the caller's [`Extraction`], so directory metadata is applied once
-/// across every package rather than per package.
+/// `path` names the package in a failure and is not opened. `on_entry` is
+/// forwarded to the extractor for every extracted entry, so the caller can
+/// record ownership for the dpkg statoverride. Extraction shares the caller's
+/// [`Extraction`], so directory metadata is applied once across every package
+/// rather than per package.
 ///
 /// The member is streamed rather than buffered: the container is seeked to it,
 /// and the decompressor and the tar reader are stacked directly on the file. So
@@ -65,9 +66,7 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     extraction: &mut Extraction,
     on_entry: &mut OnEntry<'_>,
 ) -> Result<(), ProvisionError> {
-    let size = seek_to_member(deb, "data.tar", None, &|reason: String| {
-        deb_error(path, &reason)
-    })?;
+    let (_, size) = seek_to_member(path, deb, "data.tar", None)?;
     // Bounded by the member's declared size, so the tar stream ends where the
     // member ends instead of running on into the container's next header.
     let member = deb.take(size);
@@ -76,8 +75,9 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     extraction.extract(&mut archive, on_entry)
 }
 
-/// Positions `deb` at the data of its first member whose name begins with
-/// `member`, and returns that member's declared size.
+/// Positions `deb`, which reads the `.deb` at `path`, at the data of its first
+/// member whose name begins with `member`, and returns where in the `.deb` that
+/// data begins and the size the member declares.
 ///
 /// The name is matched as a prefix because a `.deb`'s compressed members carry
 /// the compression as a suffix — `control.tar.xz`, `data.tar.zst` — and which
@@ -94,17 +94,16 @@ pub(crate) fn extract_deb<R: Read + Seek>(
 /// before that size is used for anything, so a header claiming more than any
 /// real member holds is refused rather than acted on.
 ///
-/// A structural problem is reported through `bad`, which names the `.deb` the
-/// caller is reading; an I/O failure is reported against the member being sought.
+/// A container the reader refuses is [`ProvisionError::Archive`], at the offset
+/// in the `.deb` where what it refuses begins. A read that fails is
+/// [`ProvisionError::Io`] naming `path`.
 fn seek_to_member<R: Read + Seek>(
+    path: &Path,
     deb: &mut R,
     member: &str,
     limit: Option<u64>,
-    bad: &dyn Fn(String) -> ProvisionError,
-) -> Result<u64, ProvisionError> {
-    let io = |err: io::Error| {
-        ProvisionError::io("reading a member of the package", Path::new(member), err)
-    };
+) -> Result<(u64, u64), ProvisionError> {
+    let io = |err: io::Error| ProvisionError::io("reading", path, err);
 
     // The end offset bounds every member size, so a header claiming more than
     // the file holds is refused before anything is read on its word.
@@ -112,10 +111,17 @@ fn seek_to_member<R: Read + Seek>(
     deb.rewind().map_err(io)?;
 
     let mut magic = [0u8; AR_MAGIC.len()];
-    deb.read_exact(&mut magic)
-        .map_err(|_| bad("not an ar archive (bad magic)".to_string()))?;
+    deb.read_exact(&mut magic).map_err(|err| match err.kind() {
+        io::ErrorKind::UnexpectedEof => {
+            refused(0, "the .deb is shorter than an ar archive's magic")
+        }
+        _ => io(err),
+    })?;
     if magic != AR_MAGIC {
-        return Err(bad("not an ar archive (bad magic)".to_string()));
+        return Err(refused(
+            0,
+            "the .deb is not an ar archive: its magic is wrong",
+        ));
     }
 
     let mut offset = AR_MAGIC.len() as u64;
@@ -129,37 +135,68 @@ fn seek_to_member<R: Read + Seek>(
             if tail.iter().all(|byte| *byte == b'\n') {
                 break;
             }
-            return Err(bad("a truncated member header".to_string()));
+            return Err(refused(
+                offset,
+                "the .deb's ar container ends inside a member header",
+            ));
         }
 
         let mut header = [0u8; AR_HEADER];
         deb.read_exact(&mut header).map_err(io)?;
         if &header[58..60] != b"`\n" {
-            return Err(bad("a member header lacks its magic".to_string()));
+            return Err(refused(
+                offset,
+                "a member header of the .deb's ar container lacks its magic",
+            ));
         }
         let name = ar_name(&header[0..16]);
-        let size: u64 = ascii_field(&header[48..58])
-            .parse()
-            .map_err(|_| bad("a member size is not a number".to_string()))?;
+        let size: u64 = ascii_field(&header[48..58]).parse().map_err(|_| {
+            refused(
+                offset,
+                "a member size in the .deb's ar container is not a number",
+            )
+        })?;
 
         let wanted = name.starts_with(member);
-        if wanted && limit.is_some_and(|limit| size > limit) {
-            return Err(bad(format!("the {member} member is implausibly large")));
+        if let Some(limit) = limit.filter(|limit| wanted && size > *limit) {
+            return Err(refused(
+                offset,
+                format!(
+                    "the .deb's {member} member declares {size} bytes, more than the {limit} \
+                     accepted for it"
+                ),
+            ));
         }
-        let end = (offset + AR_HEADER as u64)
+        let data = offset + AR_HEADER as u64;
+        let end = data
             .checked_add(size)
             .filter(|end| *end <= length)
-            .ok_or_else(|| bad("a member size runs past the archive".to_string()))?;
+            .ok_or_else(|| {
+                refused(
+                    offset,
+                    "a member of the .deb's ar container runs past its end",
+                )
+            })?;
 
         if wanted {
-            return Ok(size);
+            return Ok((data, size));
         }
 
         // Members are padded to an even offset with a single newline.
         offset = end + (size & 1);
         deb.seek(SeekFrom::Start(offset)).map_err(io)?;
     }
-    Err(bad(format!("no {member} member")))
+    Err(refused(length, format!("the .deb has no {member} member")))
+}
+
+/// Builds [`ProvisionError::Archive`] for a `.deb` refused for what it
+/// declares, `offset` bytes into it.
+fn refused(offset: u64, reason: impl Into<String>) -> ProvisionError {
+    ProvisionError::Archive {
+        offset,
+        reason: reason.into(),
+        source: None,
+    }
 }
 
 /// Reads a `.deb`'s control stanza: the `control` member of its `control.tar`.
@@ -187,26 +224,16 @@ pub(crate) fn read_control_from<R: Read + Seek>(
     path: &Path,
     deb: &mut R,
 ) -> Result<String, ProvisionError> {
-    let size = seek_to_member(
-        deb,
-        "control.tar",
-        Some(CONTROL_MEMBER_LIMIT),
-        &|reason: String| control_error(&reason),
-    )?;
+    let (at, size) = seek_to_member(path, deb, "control.tar", Some(CONTROL_MEMBER_LIMIT))?;
     let mut member = vec![0u8; size as usize];
-    deb.read_exact(&mut member).map_err(|err| {
-        ProvisionError::io(
-            "reading the control member of the package",
-            Path::new("control.tar"),
-            err,
-        )
-    })?;
-    control_from_tar(path, &member)
+    deb.read_exact(&mut member)
+        .map_err(|err| ProvisionError::io("reading", path, err))?;
+    control_from_tar(path, at, &member)
 }
 
 /// Reads the `control` entry out of the `control.tar` member of the `.deb` at
-/// `path`, held in memory.
-fn control_from_tar(path: &Path, member: &[u8]) -> Result<String, ProvisionError> {
+/// `path`, held in memory, which begins `at` bytes into the `.deb`.
+fn control_from_tar(path: &Path, at: u64, member: &[u8]) -> Result<String, ProvisionError> {
     let (_, decoded) = compress::decoder(member).map_err(|err| tar::read_failure(path, 0, err))?;
     let mut archive = TarReader::new(decoded.take(CONTROL_MEMBER_LIMIT), path);
     while let Some(entry) = archive.next_entry()? {
@@ -221,14 +248,9 @@ fn control_from_tar(path: &Path, member: &[u8]) -> Result<String, ProvisionError
         }
         let bytes = archive.read_entry(CONTROL_MEMBER_LIMIT)?;
         return String::from_utf8(bytes)
-            .map_err(|_| control_error("the control file is not UTF-8"));
+            .map_err(|_| refused(at, "the .deb's control file is not UTF-8"));
     }
-    Err(control_error("the control.tar has no control member"))
-}
-
-/// Builds an error for a malformed `.deb` presented to [`read_control_from`].
-fn control_error(reason: &str) -> ProvisionError {
-    ProvisionError::other(format!("the .deb control member is unreadable: {reason}"))
+    Err(refused(at, "the .deb's control.tar has no control file"))
 }
 
 /// Trims an `ar` member name: trailing spaces and the GNU terminator slash.
@@ -246,11 +268,6 @@ fn ascii_field(field: &[u8]) -> String {
     String::from_utf8_lossy(field).trim().to_string()
 }
 
-/// Builds a package-scoped extraction error.
-fn deb_error(path: &Path, reason: &str) -> ProvisionError {
-    ProvisionError::other(format!("the .deb {path:?} is malformed: {reason}"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -262,10 +279,8 @@ mod tests {
     /// returns it with the bytes the member holds.
     fn member_of(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
         let mut cursor = Cursor::new(archive);
-        let size = seek_to_member(&mut cursor, member, None, &|reason: String| {
-            ProvisionError::other(reason)
-        })
-        .map_err(|err| ErrorChain::new(&err).to_string())?;
+        let (_, size) = seek_to_member(Path::new("tool.deb"), &mut cursor, member, None)
+            .map_err(|err| ErrorChain::new(&err).to_string())?;
         let mut bytes = vec![0u8; size as usize];
         cursor
             .read_exact(&mut bytes)
@@ -289,6 +304,51 @@ mod tests {
         assert_eq!(member_of(&archive, "debian-binary").unwrap(), b"2.0\n");
     }
 
+    /// A `.deb` on a medium that fails every read past its first `good`
+    /// bytes, as a file on a failing disk does.
+    struct FailingPast {
+        inner: Cursor<Vec<u8>>,
+        good: u64,
+    }
+
+    impl Read for FailingPast {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let left = self.good.saturating_sub(self.inner.position());
+            if left == 0 {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            self.inner.read(&mut buf[..want])
+        }
+    }
+
+    impl Seek for FailingPast {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn a_read_that_fails_is_the_hosts_failure_naming_the_deb() {
+        // Before the container's magic, and inside the control member: either
+        // way the failure is the file's, not the package's, and it names the
+        // file rather than a member of it.
+        let archive = deb(b"Package: tool\n", 4096, false);
+        for good in [0, 100] {
+            let mut failing = FailingPast {
+                inner: Cursor::new(archive.clone()),
+                good,
+            };
+            match read_control_from(Path::new("/pool/tool.deb"), &mut failing) {
+                Err(ProvisionError::Io { path, source, .. }) => {
+                    assert_eq!(path, Path::new("/pool/tool.deb"), "{good}");
+                    assert_eq!(source.raw_os_error(), Some(5), "{good}");
+                }
+                other => panic!("{good}: expected the host's failure, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn a_member_the_archive_does_not_carry_is_reported_by_name() {
         let archive = ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n")]);
@@ -299,7 +359,7 @@ mod tests {
     #[test]
     fn a_non_ar_input_is_rejected() {
         let reason = member_of(b"not an ar archive at all", "data.tar").unwrap_err();
-        assert!(reason.contains("bad magic"), "{reason}");
+        assert!(reason.contains("its magic is wrong"), "{reason}");
     }
 
     #[test]
@@ -315,7 +375,7 @@ mod tests {
         header[59] = b'\n';
         archive.extend_from_slice(&header);
         let reason = member_of(&archive, "data.tar").unwrap_err();
-        assert!(reason.contains("runs past the archive"), "{reason}");
+        assert!(reason.contains("runs past its end"), "{reason}");
     }
 
     /// A single-entry uncompressed tar holding `./control`, the shape of a
@@ -485,7 +545,7 @@ mod tests {
         assert!(
             ErrorChain::new(&err)
                 .to_string()
-                .contains("implausibly large"),
+                .contains("more than the 16777216 accepted"),
             "{err}"
         );
     }

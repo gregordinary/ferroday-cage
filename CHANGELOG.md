@@ -490,6 +490,13 @@ consumer upgrading can skip it.
   variant's new `source` field, as the Debian layer reports an index. The
   failure was flattened into the reason, and an index that decompresses past
   the bound read the same way as one that does not decompress.
+- **Breaking.** A `.deb` whose `ar` container the Debian layer refuses is
+  reported as `ProvisionError::Archive`, at the offset in the `.deb` of what it
+  refuses, and a read of a `.deb` that fails as `ProvisionError::Io` naming the
+  file. Both were `ProvisionError::Other` around a message, and a failed read
+  named a member or a package as though it were the path. `Pool::publish`
+  reports a `.deb` it cannot read as `DebianError::Io`, the OS error its cause,
+  where it was `DebianError::Deb` with the error flattened into the reason.
 
 ### Fixed
 
