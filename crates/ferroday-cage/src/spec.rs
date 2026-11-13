@@ -8324,9 +8324,12 @@ read-only = true
         //   key set is asserted on its own, which is what catches a bind entry
         //   that started rendering a raw mount's field.
         //
-        // `rootfs` and `overlay` are alternatives — setting either clears the
-        // other — so the full key set is the union of a plain-rooted and an
-        // overlay-rooted profile.
+        // `rootfs`, `overlay`, and `empty-rootfs` are alternatives — setting any
+        // clears the others — so the full key set is the union of a
+        // plain-rooted, an overlay-rooted, and an empty-rooted profile. The
+        // identity keys are rendered together though no build would accept
+        // `present-as` beside a range map: a profile renders what it holds,
+        // and the build is what refuses the combination.
         let builder = Cage::builder()
             .rootfs("/srv/rootfs")
             .command("/bin/sh")
@@ -8348,6 +8351,7 @@ read-only = true
             .rlimit(Resource::CpuTime, 10, Limit::UNLIMITED)
             .identity_map(IdentityMap::Subordinate)
             .run_as(Identity::new(250, 250).groups([250]))
+            .present_as(PresentedIdentity::ids(1000, 1000))
             .env("K", "V")
             .bind("/host", "/guest")
             .bind_ro("/host-ro", "/guest-ro")
@@ -8357,13 +8361,15 @@ read-only = true
                     .fstype("tmpfs")
                     .flags(1)
                     .data("mode=1777"),
-            );
+            )
+            .symlink("usr/bin", "/bin");
         let overlaid = builder.clone().overlay(
             Overlay::new()
                 .lower("/srv/base")
                 .upper("/tmp/upper")
                 .work("/tmp/work"),
         );
+        let emptied = builder.clone().empty_rootfs();
 
         let render = |builder: &CageBuilder| -> toml::Table {
             toml::to_string(builder)
@@ -8373,10 +8379,12 @@ read-only = true
         };
         let table = render(&builder);
         let overlay_table = render(&overlaid);
+        let empty_table = render(&emptied);
 
         let mut keys: Vec<&str> = table
             .keys()
             .chain(overlay_table.keys())
+            .chain(empty_table.keys())
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
@@ -8387,6 +8395,7 @@ read-only = true
                 "args",
                 "base-env",
                 "command",
+                "empty-rootfs",
                 "env",
                 "hostname",
                 "identity-map",
@@ -8399,6 +8408,7 @@ read-only = true
                 "overlay",
                 "path-lookup",
                 "pid-namespace",
+                "present-as",
                 "resolv-conf",
                 "rlimit",
                 "rootfs",
@@ -8455,6 +8465,11 @@ read-only = true
             mount_entry(2),
             ["data", "flags", "fstype", "kind", "source", "target"],
         );
+        assert_eq!(mount_entry(3), ["kind", "path", "target"]);
+        // Each alternative root renders only its own key, so the three are
+        // never written into one profile.
+        assert!(table.contains_key("rootfs") && !table.contains_key("empty-rootfs"));
+        assert!(!empty_table.contains_key("rootfs") && !empty_table.contains_key("overlay"));
     }
 
     #[test]
