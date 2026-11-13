@@ -518,6 +518,56 @@ fn exports_subordinate_ownership_at_intended_ids() {
     provision::remove(&dir).expect("the range-mapped tree should be removable");
 }
 
+/// A tree built under the subordinate map and exported through the default
+/// single-identity one is refused, naming the entry that map does not hold,
+/// rather than archived with that entry owned by `nobody`.
+#[cfg(feature = "subid")]
+#[test]
+fn an_export_through_a_map_the_tree_was_not_built_under_is_refused() {
+    use ferroday_cage::Cage;
+
+    if !common::require::userns() {
+        return;
+    }
+    if !common::require::range_map() {
+        return;
+    }
+    let Some(rootfs) = fixture_rootfs() else {
+        return;
+    };
+
+    let dir = scratch("map-mismatch");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("probe"), b"owned").unwrap();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .bind(&work, "/work")
+        .command("/bin/sh")
+        .args(["-c", "chown 42:42 /work/probe"])
+        .identity_map(IdentityMap::Subordinate)
+        .build()
+        .expect("the sandbox should build");
+    assert!(
+        cage.run().expect("the sandbox should launch").success(),
+        "chown in the cage failed"
+    );
+
+    let mut out = Vec::new();
+    match provision::Export::new(&work).write_to(&mut out) {
+        Err(provision::ProvisionError::EntryRefused { path, reason, .. }) => {
+            assert_eq!(path, work.join("probe"));
+            assert!(reason.contains("another map"), "{reason}");
+        }
+        other => panic!("expected the entry refused, got {other:?}"),
+    }
+    // Through the map it was built under, the same tree exports.
+    provision::export_tar(&work, &mut Vec::new(), IdentityMap::Subordinate)
+        .expect("the export through the right map succeeds");
+
+    provision::remove(&dir).expect("the range-mapped tree should be removable");
+}
+
 /// The explicit-mapper variants export and remove a foreign-owned tree through a
 /// caller-supplied delegate, the path a site with its own mapper takes. The
 /// bundled `SubidMapper` stands in for a custom one; it exercises the same

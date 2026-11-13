@@ -32,11 +32,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::containment;
+use super::copyin::Translation;
 use super::identity::compose_child_map;
 use super::tar::{
     BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
     pax_record, ustar_block, xattr_keyword,
 };
+use super::xattr::{ACCESS_ACL, Acl, DEFAULT_ACL};
 use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
 use crate::mechanism::{
@@ -82,6 +84,17 @@ use crate::{IdMapper, IdentityMap};
 /// [`ProvisionError::SourceChanged`], naming the file: the archive would
 /// otherwise carry it cut or zero-padded. A name that stops holding the file
 /// the walk inspected, before the walk opens it, fails the export too.
+///
+/// Every entry is read through the map, and the kernel reports an owner the
+/// map does not hold, and an id an access control list names that it does not
+/// hold, as its overflow id: 65534 unless the host sets another. Where the map
+/// holds no inside id 65534, as the single-identity map holds root alone, that
+/// id can only be one the map does not hold, so the export refuses the entry
+/// with [`ProvisionError::EntryRefused`], naming it: the tree was built under
+/// another map. Where the map holds it, as the subordinate map does, it is an
+/// id the tree may mean, and an entry the map does not hold is recorded as
+/// owned by it, indistinguishably. Naming the map the tree was built under is
+/// what keeps an archive from holding such an entry.
 ///
 /// A file is archived at its length, a sparse file's holes as the zeros they
 /// read as, and the export holds the archive to no ceiling. A tree untrusted
@@ -285,9 +298,11 @@ impl<'a> Export<'a> {
     ///
     /// [`ProvisionError::ExportUnprivileged`] when the tree needs a range map
     /// and no delegate can establish one; [`ProvisionError::SourceChanged`] for
-    /// a file that grew or shrank while it was read; and
-    /// [`ProvisionError::Io`] for a failure of the export machinery, of the
-    /// in-map reader, or of `writer`.
+    /// a file that grew or shrank while it was read;
+    /// [`ProvisionError::EntryRefused`] for an entry owned by, or whose access
+    /// control list names, an id the map does not hold, where the map does not
+    /// hold the overflow id either; and [`ProvisionError::Io`] for a failure of
+    /// the export machinery, of the in-map reader, or of `writer`.
     pub fn write_to<W: Write>(self, writer: W) -> Result<(), ProvisionError> {
         export_inner(
             &self.rootfs,
@@ -447,6 +462,7 @@ fn export_inner<W: Write>(
             reason,
         })?;
 
+    let overflow = Overflow::of(&Translation::of(&source.child_map()));
     let child = match start_export(&rootfs_c, source.child_map()) {
         Ok(child) => child,
         Err(StartError::Spawn(errno)) => {
@@ -465,7 +481,14 @@ fn export_inner<W: Write>(
         }
     };
 
-    let result = drive(child.stream(), writer, rootfs, clamp_mtime, filter);
+    let result = drive(
+        child.stream(),
+        writer,
+        rootfs,
+        clamp_mtime,
+        filter,
+        overflow,
+    );
 
     // Reap the child regardless. A walk failure already surfaced as a frame; a
     // failure to reap is not worth masking the export's own outcome.
@@ -483,6 +506,7 @@ fn drive<W: Write>(
     rootfs: &Path,
     clamp_mtime: Option<i64>,
     filter: Option<&EntryPredicate<'_>>,
+    overflow: Overflow,
 ) -> Result<(), ProvisionError> {
     // The stream is duplicated so it can be owned by a buffered reader while the
     // child retains its own descriptor for reaping. Close-on-exec like the
@@ -491,10 +515,19 @@ fn drive<W: Write>(
     let dup = rustix::io::fcntl_dupfd_cloexec(stream, 0)
         .map_err(|errno| ProvisionError::io("exporting", rootfs, errno.into()))?;
     let mut reader = BufReader::new(std::fs::File::from(dup));
-    let mut tar = TarWriter::new(BufWriter::new(writer), clamp_mtime, filter);
+    let mut tar = TarWriter::new(BufWriter::new(writer), clamp_mtime, filter).overflow(overflow);
 
     let read_err = |e: io::Error| ProvisionError::io("reading the exported tree", rootfs, e);
     let write_err = |e: io::Error| ProvisionError::io("writing the archive", rootfs, e);
+    // A failure of an entry's own names the entry, as the tree holds it.
+    let failed = |e: EncodeError, tar: &TarWriter<'_, _>, meta: &Meta| match e {
+        EncodeError::Read(e) => read_err(e),
+        EncodeError::Write(e) => write_err(e),
+        EncodeError::Unmapped(reason) => ProvisionError::EntryRefused {
+            path: tar.host_path(rootfs, &meta.name),
+            reason,
+        },
+    };
 
     loop {
         let tag = match read_u8(&mut reader) {
@@ -504,13 +537,13 @@ fn drive<W: Write>(
         match tag {
             FRAME_DIR => {
                 let meta = read_meta(&mut reader, false).map_err(read_err)?;
-                tar.enter_dir(&meta).map_err(write_err)?;
+                tar.enter_dir(&meta).map_err(|e| failed(e, &tar, &meta))?;
             }
             FRAME_FILE => {
                 let meta = read_meta(&mut reader, true).map_err(read_err)?;
                 let written = tar
                     .file(&meta, &mut reader)
-                    .map_err(|e| classify(e, read_err, write_err))?;
+                    .map_err(|e| failed(e, &tar, &meta))?;
                 // The child's word on whether the file held what it recorded.
                 // It matters only for data that went into the archive: an
                 // excluded file, or a later name of one already written, adds
@@ -525,7 +558,7 @@ fn drive<W: Write>(
             }
             FRAME_SYMLINK => {
                 let meta = read_symlink(&mut reader).map_err(read_err)?;
-                tar.symlink(&meta).map_err(write_err)?;
+                tar.symlink(&meta).map_err(|e| failed(e, &tar, &meta))?;
             }
             FRAME_LEAVE => tar.leave_dir(),
             FRAME_END => {
@@ -555,19 +588,6 @@ fn drive<W: Write>(
                 )));
             }
         }
-    }
-}
-
-/// Distinguishes a read failure (the stream half of a file copy) from a write
-/// failure (the archive half), so each is attributed correctly.
-fn classify(
-    e: CopyError,
-    read_err: impl Fn(io::Error) -> ProvisionError,
-    write_err: impl Fn(io::Error) -> ProvisionError,
-) -> ProvisionError {
-    match e {
-        CopyError::Read(e) => read_err(e),
-        CopyError::Write(e) => write_err(e),
     }
 }
 
@@ -704,6 +724,9 @@ struct TarWriter<'f, W: Write> {
     /// dropped, and a file's data is read off the stream and discarded so the
     /// next frame starts where it should.
     pruned: u32,
+    /// The ids an entry the map does not hold reads as, where the map does not
+    /// hold them itself.
+    overflow: Overflow,
 }
 
 impl<'f, W: Write> TarWriter<'f, W> {
@@ -715,7 +738,51 @@ impl<'f, W: Write> TarWriter<'f, W> {
             epoch,
             filter,
             pruned: 0,
+            overflow: Overflow::default(),
         }
+    }
+
+    /// Refuses an entry that reads as owned by, or whose access control list
+    /// names, an id of `overflow`.
+    fn overflow(mut self, overflow: Overflow) -> TarWriter<'f, W> {
+        self.overflow = overflow;
+        self
+    }
+
+    /// Refuses `meta` where it holds an id the map the export reads through
+    /// does not hold, which [`Overflow`] says how to tell.
+    fn check_mapped(&self, meta: &Meta) -> Result<(), EncodeError> {
+        let Overflow { uid, gid } = self.overflow;
+        if Some(meta.uid) == uid || Some(meta.gid) == gid {
+            return Err(EncodeError::Unmapped(format!(
+                "it reads as owned by {}:{}, and the identity map the export reads through \
+                 holds neither the owner it has nor that id, which the kernel reports such an \
+                 owner as: the tree was built under another map",
+                meta.uid, meta.gid,
+            )));
+        }
+        for (name, value) in &meta.xattrs {
+            if name.as_slice() != ACCESS_ACL.to_bytes() && name.as_slice() != DEFAULT_ACL.to_bytes()
+            {
+                continue;
+            }
+            let names_overflow = Acl::parse(value).is_some_and(|acl| {
+                acl.mapped(
+                    |id| (Some(id) != uid).then_some(id),
+                    |id| (Some(id) != gid).then_some(id),
+                )
+                .is_none()
+            });
+            if names_overflow {
+                return Err(EncodeError::Unmapped(format!(
+                    "its {} names an id the identity map the export reads through holds \
+                     neither as itself nor as the id the kernel reports it as: the tree was \
+                     built under another map",
+                    String::from_utf8_lossy(name),
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Whether the caller's filter keeps the entry named `name` in the current
@@ -792,7 +859,7 @@ impl<'f, W: Write> TarWriter<'f, W> {
     /// A directory the filter excludes takes its whole subtree with it, which
     /// is what makes one rule enough to drop a build cache or a mount point's
     /// contents.
-    fn enter_dir(&mut self, meta: &Meta) -> io::Result<()> {
+    fn enter_dir(&mut self, meta: &Meta) -> Result<(), EncodeError> {
         if self.pruned > 0 {
             self.pruned += 1;
             return Ok(());
@@ -801,10 +868,12 @@ impl<'f, W: Write> TarWriter<'f, W> {
             self.pruned = 1;
             return Ok(());
         }
+        self.check_mapped(meta)?;
         let mut path = self.child_path(&meta.name);
         self.stack.push(meta.name.clone());
         path.push(b'/');
         self.write_entry(&path, b'5', meta, 0, &[], &meta.xattrs)
+            .map_err(EncodeError::Write)
     }
 
     /// Ascends out of the current directory, or out of one level of an excluded
@@ -825,26 +894,27 @@ impl<'f, W: Write> TarWriter<'f, W> {
     ///
     /// Reports whether the data went into the archive, which is when a change
     /// to the file while it was read matters.
-    fn file(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<bool, CopyError> {
+    fn file(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<bool, EncodeError> {
         if self.pruned > 0 || !self.keeps(&meta.name, ExportKind::File, meta) {
             discard(reader, meta.size)?;
             return Ok(false);
         }
+        self.check_mapped(meta)?;
         let path = self.child_path(&meta.name);
         if meta.nlink > 1 {
             if let Some(first) = self.hardlinks.get(&(meta.dev, meta.ino)) {
                 let first = first.clone();
                 self.write_entry(&path, b'1', meta, 0, &first, &meta.xattrs)
-                    .map_err(CopyError::Write)?;
+                    .map_err(EncodeError::Write)?;
                 discard(reader, meta.size)?;
                 return Ok(false);
             }
             self.hardlinks.insert((meta.dev, meta.ino), path.clone());
         }
         self.write_entry(&path, b'0', meta, meta.size, &[], &meta.xattrs)
-            .map_err(CopyError::Write)?;
+            .map_err(EncodeError::Write)?;
         copy_data(reader, &mut self.out, meta.size)?;
-        pad(&mut self.out, meta.size).map_err(CopyError::Write)?;
+        pad(&mut self.out, meta.size).map_err(EncodeError::Write)?;
         Ok(true)
     }
 
@@ -861,12 +931,14 @@ impl<'f, W: Write> TarWriter<'f, W> {
     }
 
     /// Emits a symlink entry.
-    fn symlink(&mut self, meta: &Meta) -> io::Result<()> {
+    fn symlink(&mut self, meta: &Meta) -> Result<(), EncodeError> {
         if self.pruned > 0 || !self.keeps(&meta.name, ExportKind::Symlink, meta) {
             return Ok(());
         }
+        self.check_mapped(meta)?;
         let path = self.child_path(&meta.name);
         self.write_entry(&path, b'2', meta, 0, &meta.link_target, &meta.xattrs)
+            .map_err(EncodeError::Write)
     }
 
     /// Writes two zero blocks: the archive terminator.
@@ -963,23 +1035,52 @@ impl<'f, W: Write> TarWriter<'f, W> {
     }
 }
 
-/// A failed file-data copy, tagged with which side failed.
+/// Why the encoder stopped on an entry.
 #[derive(Debug)]
-enum CopyError {
+enum EncodeError {
+    /// The frame stream could not be read.
     Read(io::Error),
+    /// The archive could not be written.
     Write(io::Error),
+    /// The entry holds an id the map does not hold, for the reason given.
+    Unmapped(String),
+}
+
+/// The ids an export refuses an entry for: the overflow uid and gid, each
+/// where the map the export reads through does not hold it.
+///
+/// The kernel reports an owner a user namespace's map does not hold, and an id
+/// an access control list names that it does not hold, as the overflow id. A
+/// map that does not hold that id itself has no entry of its own that reads as
+/// it, so one that does is an entry outside the map. A map that holds it
+/// leaves the two indistinguishable, and `None` records nothing to refuse.
+#[derive(Debug, Clone, Copy, Default)]
+struct Overflow {
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+impl Overflow {
+    /// The overflow ids `translation` does not hold.
+    fn of(translation: &Translation) -> Overflow {
+        let (uid, gid) = crate::host::overflow_ids();
+        Overflow {
+            uid: (!translation.holds_uid(uid)).then_some(uid),
+            gid: (!translation.holds_gid(gid)).then_some(gid),
+        }
+    }
 }
 
 /// Copies exactly `n` bytes from the stream to the archive.
-fn copy_data(reader: &mut impl Read, out: &mut impl Write, n: u64) -> Result<(), CopyError> {
+fn copy_data(reader: &mut impl Read, out: &mut impl Write, n: u64) -> Result<(), EncodeError> {
     let mut remaining = n;
     let mut buf = [0u8; 1 << 16];
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
         reader
             .read_exact(&mut buf[..want])
-            .map_err(CopyError::Read)?;
-        out.write_all(&buf[..want]).map_err(CopyError::Write)?;
+            .map_err(EncodeError::Read)?;
+        out.write_all(&buf[..want]).map_err(EncodeError::Write)?;
         remaining -= want as u64;
     }
     Ok(())
@@ -987,14 +1088,14 @@ fn copy_data(reader: &mut impl Read, out: &mut impl Write, n: u64) -> Result<(),
 
 /// Reads and discards exactly `n` bytes from the stream (a coalesced
 /// hardlink's data).
-fn discard(reader: &mut impl Read, n: u64) -> Result<(), CopyError> {
+fn discard(reader: &mut impl Read, n: u64) -> Result<(), EncodeError> {
     let mut remaining = n;
     let mut buf = [0u8; 1 << 16];
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
         reader
             .read_exact(&mut buf[..want])
-            .map_err(CopyError::Read)?;
+            .map_err(EncodeError::Read)?;
         remaining -= want as u64;
     }
     Ok(())
@@ -1687,18 +1788,35 @@ mod tests {
     /// A metadata frame for a regular file named `name` holding `data`,
     /// followed by the data and the child's status byte.
     fn file_frame(name: &[u8], data: &[u8], status: u8) -> Vec<u8> {
+        owned_file_frame(name, (0, 0), &[], data, status)
+    }
+
+    /// [`file_frame`], owned by `owner` and carrying `xattrs`.
+    fn owned_file_frame(
+        name: &[u8],
+        (uid, gid): (u32, u32),
+        xattrs: &[(&[u8], Vec<u8>)],
+        data: &[u8],
+        status: u8,
+    ) -> Vec<u8> {
         let mut frame = vec![FRAME_FILE];
         frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
         frame.extend_from_slice(name);
         frame.extend_from_slice(&0o100_644u32.to_le_bytes());
-        frame.extend_from_slice(&0u32.to_le_bytes());
-        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&uid.to_le_bytes());
+        frame.extend_from_slice(&gid.to_le_bytes());
         frame.extend_from_slice(&1_700_000_000i64.to_le_bytes());
         frame.extend_from_slice(&(data.len() as u64).to_le_bytes());
         frame.extend_from_slice(&7u64.to_le_bytes());
         frame.extend_from_slice(&99u64.to_le_bytes());
         frame.extend_from_slice(&1u64.to_le_bytes());
-        frame.extend_from_slice(&0u16.to_le_bytes());
+        frame.extend_from_slice(&(xattrs.len() as u16).to_le_bytes());
+        for (name, value) in xattrs {
+            frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            frame.extend_from_slice(name);
+            frame.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            frame.extend_from_slice(value);
+        }
         frame.extend_from_slice(data);
         frame.push(status);
         frame
@@ -1709,6 +1827,15 @@ mod tests {
     fn drive_frames(
         frames: &[u8],
         filter: Option<&EntryPredicate<'_>>,
+    ) -> Result<(), ProvisionError> {
+        drive_frames_through(frames, filter, Overflow::default())
+    }
+
+    /// [`drive_frames`], refusing what `overflow` names.
+    fn drive_frames_through(
+        frames: &[u8],
+        filter: Option<&EntryPredicate<'_>>,
+        overflow: Overflow,
     ) -> Result<(), ProvisionError> {
         let mut stream = vec![FRAME_DIR];
         stream.extend_from_slice(&1u16.to_le_bytes());
@@ -1729,7 +1856,64 @@ mod tests {
             Path::new("/srv/rootfs"),
             None,
             filter,
+            overflow,
         )
+    }
+
+    #[test]
+    fn an_entry_reading_as_the_overflow_id_is_refused_where_the_map_holds_none() {
+        // Under the single-identity map an owner outside it reads as 65534,
+        // which that map has no entry of its own for: the tree was built under
+        // another map, and recording every such entry as `nobody` would be an
+        // archive of a tree that never existed.
+        let single = Overflow {
+            uid: Some(65534),
+            gid: Some(65534),
+        };
+        let file =
+            |owner, xattrs: &[(&[u8], Vec<u8>)]| owned_file_frame(b"probe", owner, xattrs, b"x", 0);
+        drive_frames_through(&file((0, 0), &[]), None, single).expect("a mapped entry exports");
+        for owner in [(65534, 65534), (65534, 0), (0, 65534)] {
+            match drive_frames_through(&file(owner, &[]), None, single) {
+                Err(ProvisionError::EntryRefused { path, reason }) => {
+                    assert_eq!(path, Path::new("/srv/rootfs/probe"));
+                    assert!(reason.contains("another map"), "{reason}");
+                }
+                other => panic!("expected {owner:?} refused, got {other:?}"),
+            }
+        }
+
+        // An access control list naming the id is refused the same way, and
+        // one naming only mapped ids is not.
+        let acl = |named: u32| {
+            let mut value = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in [
+                (0x01u16, 6u16, u32::MAX),
+                (0x08, 4, named),
+                (0x04, 4, u32::MAX),
+                (0x10, 4, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ] {
+                value.extend_from_slice(&tag.to_le_bytes());
+                value.extend_from_slice(&perm.to_le_bytes());
+                value.extend_from_slice(&id.to_le_bytes());
+            }
+            value
+        };
+        let listed = |named| file((0, 0), &[(ACCESS_ACL.to_bytes(), acl(named))]);
+        drive_frames_through(&listed(0), None, single).expect("a list naming root exports");
+        assert!(matches!(
+            drive_frames_through(&listed(65534), None, single),
+            Err(ProvisionError::EntryRefused { .. }),
+        ));
+
+        // Where the map holds the id, it is one the tree may mean; and an
+        // excluded entry adds nothing to the archive to refuse.
+        drive_frames_through(&file((65534, 65534), &[]), None, Overflow::default())
+            .expect("an id the map holds exports");
+        let keep = |entry: &ExportEntry<'_>| entry.path() != Path::new("/probe");
+        drive_frames_through(&file((65534, 65534), &[]), Some(&keep), single)
+            .expect("an excluded entry is not refused");
     }
 
     #[test]

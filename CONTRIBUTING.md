@@ -533,6 +533,7 @@ report name a package and its version bare.
 | Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork with the limits on it and a leaf beneath it, which the launch stage joins through the leaf's `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |
 | Would a launch beneath this parent be refused its cgroup, and why? | `host::cgroup_blocker`, which carries out `cgroup::Cgroup::create` and a join through `mechanism::probe_cgroup_join`, with every errno read by `cgroup::refusal` as the launch's own are |
 | Which cgroup does this process run in? | `host::own_cgroup`, over `host::MountEntry::parse` |
+| Which ids does the kernel report an owner as to a namespace whose map does not hold it? | `host::overflow_ids` |
 | Stop a provisioning run on `SIGINT`, removing what it staged | `provision::Interrupt`, which an observer answers `ProvisionObserver::cancelled` from |
 | Which cgroup limit does `NAME=VALUE` spell? | `CgroupLimit`'s `FromStr`, whose names are the keys of a profile's `[cgroup]` table |
 | Read this process's mount table | `host::MountEntry::parse`, one line of the kernel's `mountinfo` at a time |

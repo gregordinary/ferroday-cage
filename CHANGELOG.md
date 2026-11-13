@@ -903,6 +903,13 @@ consumer upgrading can skip it.
   one more for every killed run: a stage3 download several hundred megabytes
   long among them. A staging file is held under an `flock` for as long as it is
   being written, so only one nothing is writing is removed.
+- An export refuses an entry owned by, or whose access control list names, an
+  id the identity map it reads through does not hold, where that map does not
+  hold the kernel's overflow id either, as the default single-identity map does
+  not. It fails with `ProvisionError::EntryRefused` naming the entry, where it
+  recorded the entry as owned by 65534: a tree built under the subordinate map
+  and exported with the default map was archived with every entry the caller
+  did not own given to `nobody`.
 
 ### Internal
 

@@ -1053,7 +1053,7 @@ impl Translation {
     }
 
     /// The extents the child's map establishes.
-    fn of(map: &ChildMap<'_>) -> Translation {
+    pub(super) fn of(map: &ChildMap<'_>) -> Translation {
         match map {
             // The one-id map the child writes itself: the calling user is root
             // inside and nothing else is mapped.
@@ -1098,7 +1098,7 @@ impl Translation {
     }
 
     /// Whether the map holds the inside uid `inside`.
-    fn holds_uid(&self, inside: u32) -> bool {
+    pub(super) fn holds_uid(&self, inside: u32) -> bool {
         holds(&self.uid, inside)
     }
 
@@ -1115,7 +1115,7 @@ impl Translation {
     }
 
     /// Whether the map holds the inside gid `inside`.
-    fn holds_gid(&self, inside: u32) -> bool {
+    pub(super) fn holds_gid(&self, inside: u32) -> bool {
         holds(&self.gid, inside)
     }
 }

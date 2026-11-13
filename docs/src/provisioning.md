@@ -266,6 +266,14 @@ attributes are its own.
 The map is named explicitly and must be the one the tree was built under. The
 host offset ids then round-trip to the ids the tree intends.
 
+The kernel reports an owner the map does not hold as its overflow id, 65534
+unless the host sets another, and an access control list naming one the same
+way. Under a map that holds no id 65534, the single-identity map among them,
+that id can only be one the map does not hold. The export then refuses the entry
+with `ProvisionError::EntryRefused`, naming it, since the tree was built under
+another map. A map that holds 65534, as the subordinate map does, cannot tell
+such an entry from one the tree means as `nobody`, and records it owned by 65534.
+
 Under the single-identity map, which is the default, the export records every
 entry as root. That map gives its one id, the calling user who wrote the tree,
 uid 0.

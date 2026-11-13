@@ -526,6 +526,24 @@ fn sysctl_value(path: &str) -> Option<i64> {
     contents.split_whitespace().next()?.parse().ok()
 }
 
+/// The ids the kernel presents an owner or a group as to a user namespace whose
+/// map does not hold it: the overflow uid and gid, `nobody` and `nogroup`.
+///
+/// Read from `/proc/sys/kernel/overflowuid` and `overflowgid`, which a host may
+/// set, and 65534 each, the kernel's default, where either cannot be read.
+#[cfg(feature = "tarball")]
+pub(crate) fn overflow_ids() -> (u32, u32) {
+    let read = |path| {
+        sysctl_value(path)
+            .and_then(|id| u32::try_from(id).ok())
+            .unwrap_or(65534)
+    };
+    (
+        read("/proc/sys/kernel/overflowuid"),
+        read("/proc/sys/kernel/overflowgid"),
+    )
+}
+
 /// A host condition known to make a uid/gid range map unavailable.
 ///
 /// The single-identity map needs none of this; the conditions concern the
