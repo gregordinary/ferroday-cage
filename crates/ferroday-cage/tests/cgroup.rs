@@ -46,6 +46,7 @@ fn delegated() -> Option<&'static Path> {
                     parent.display()
                 )
             })?;
+        wait_vacated(&parent, Duration::from_secs(10))?;
         // The probe leaves the controllers the limits need enabled, as a
         // launch does, so the leaf offers pids to the refusal test below.
         match host::cgroup_blocker(&parent, &LIMITS) {
@@ -64,6 +65,36 @@ fn delegated() -> Option<&'static Path> {
             ));
             None
         }
+    }
+}
+
+/// Waits up to `within` for `cgroup` to hold no thread once the process has
+/// moved out of it, and names the threads still there if it does not.
+///
+/// A process that moves takes its threads with it, except one already
+/// exiting, which the kernel leaves where it was until its exit completes.
+/// The test harness ends a test's thread as the test ends, so a test here that
+/// needs no delegated cgroup can be ending as the process moves. Until its
+/// thread has gone, the cgroup holds a task of its own, and refuses to enable
+/// a controller for its children, which the probe reports as
+/// [`CgroupRefusal::ParentHoldsProcesses`]. The thread does not appear in
+/// `cgroup.procs`, which lists only a thread group's leader.
+fn wait_vacated(cgroup: &Path, within: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    loop {
+        let threads = std::fs::read_to_string(cgroup.join("cgroup.threads"))
+            .map_err(|err| format!("{} lists no threads: {err}", cgroup.display()))?;
+        if threads.trim().is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{} still holds the threads {} the tests' move left behind",
+                cgroup.display(),
+                threads.split_whitespace().collect::<Vec<_>>().join(", "),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
