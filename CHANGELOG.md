@@ -270,6 +270,11 @@ consumer upgrading can skip it.
   loopback port the example serves, the curated seccomp roster and the
   unix-socket restriction, and cgroup or per-process limits.
   `examples/agent-tools.toml` gives `fcage` the same sandbox.
+- `DebianEvent::Index` reports, once a resolution has read every configured
+  repository's index, how many packages the merged index offers and how many
+  stanzas it left out as ones the layer cannot act on, which it left out
+  without a word before. `fcage` prints both, as it prints a Gentoo binhost
+  index's (`ferroday-cage-cli`).
 
 ### Changed
 

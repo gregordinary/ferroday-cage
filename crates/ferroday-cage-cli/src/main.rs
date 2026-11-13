@@ -6358,6 +6358,15 @@ impl<W: std::io::Write> Progress<W> {
         use ferroday_cage::provision::debian::DebianEvent;
         match event {
             DebianEvent::Fetching { url, .. } => self.line(format_args!("fcage: fetching {url}")),
+            DebianEvent::Index {
+                packages, skipped, ..
+            } => self.line(format_args!(
+                "fcage: the indexes offer {packages} packages{}",
+                match skipped {
+                    0 => String::new(),
+                    skipped => format!(", skipping {skipped} stanzas this layer cannot act on"),
+                },
+            )),
             DebianEvent::Resolving => self.line(format_args!("fcage: resolving the package set")),
             DebianEvent::Unsatisfiable {
                 requirement,

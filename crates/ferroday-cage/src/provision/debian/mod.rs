@@ -2023,6 +2023,10 @@ fn merged_index(
         architecture,
         pins,
     );
+    observer.progress(DebianEvent::Index {
+        packages: index.package_count(),
+        skipped: index.skipped(),
+    });
     // Before the closure is computed, so a pin the archives have moved past
     // refuses the resolution rather than being quietly resolved around.
     pins.check(&index)?;
@@ -3174,6 +3178,23 @@ pub enum DebianEvent<'a> {
         /// The raw output bytes; not line-buffered, not guaranteed UTF-8.
         bytes: &'a [u8],
     },
+    /// Every configured repository's index has been read and merged into the
+    /// package set a resolution draws from.
+    ///
+    /// Reported once per resolution, before the closure is computed. Installing
+    /// a [`plan`](DebianBuilder::plan) reads no index and reports none.
+    #[non_exhaustive]
+    Index {
+        /// How many packages the merged index offers, each name counted once.
+        packages: usize,
+        /// How many stanzas were read and not kept, because this layer cannot
+        /// act on them: a stanza missing its package's name, version,
+        /// architecture, pool path, or SHA-256, or one whose pool path would
+        /// leave the mirror or whose digest is not lowercase hex. A package left
+        /// out this way is one a resolution cannot select. A live archive
+        /// reports zero.
+        skipped: usize,
+    },
 }
 
 /// An error from bootstrapping a Debian userland.
@@ -3834,6 +3855,46 @@ mod tests {
             .build()
             .expect("the builder validates");
         (debian, asked)
+    }
+
+    #[test]
+    fn the_merged_index_reports_what_it_offers_and_what_it_left_out() {
+        /// Records every `Index` event as its two counts.
+        struct Counts(Vec<(usize, usize)>);
+        impl DebianObserver for Counts {
+            fn progress(&mut self, event: DebianEvent<'_>) {
+                if let DebianEvent::Index { packages, skipped } = event {
+                    self.0.push((packages, skipped));
+                }
+            }
+        }
+
+        let digest = "0".repeat(64);
+        let stanza = |name: &str, architecture: &str, filename: &str, sha256: &str| {
+            format!(
+                "Package: {name}\nVersion: 1\nArchitecture: {architecture}\n\
+                 Filename: {filename}\nSHA256: {sha256}\n\n"
+            )
+        };
+        let index = [
+            stanza("kept", "amd64", "pool/kept.deb", &digest),
+            stanza("also-kept", "all", "pool/also-kept.deb", &digest),
+            // Another architecture's is not this bootstrap's, and not counted.
+            stanza("foreign", "arm64", "pool/foreign.deb", &digest),
+            // Each of these is one this layer cannot act on.
+            stanza("escaping", "amd64", "../../etc/passwd", &digest),
+            stanza("undigested", "amd64", "pool/undigested.deb", "not-a-digest"),
+            "Version: 1\nArchitecture: amd64\n\n".to_string(),
+        ]
+        .concat();
+        let (mut debian, _) = unsigned_archive(index.as_bytes());
+        let mut counts = Counts(Vec::new());
+        let available = debian
+            .observe(&mut counts)
+            .available()
+            .expect("the index is read");
+        assert!(available.contains("kept") && available.contains("also-kept"));
+        assert_eq!(counts.0, [(2, 3)]);
     }
 
     #[test]

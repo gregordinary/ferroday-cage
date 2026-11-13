@@ -464,6 +464,9 @@ pub ferroday_cage::provision::debian::DebianEvent::Downloading::total: usize
 pub ferroday_cage::provision::debian::DebianEvent::Extracting::package: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Fetching
 pub ferroday_cage::provision::debian::DebianEvent::Fetching::url: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Index
+pub ferroday_cage::provision::debian::DebianEvent::Index::packages: usize
+pub ferroday_cage::provision::debian::DebianEvent::Index::skipped: usize
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Resolved
 pub ferroday_cage::provision::debian::DebianEvent::Resolved::plan: &'a ferroday_cage::provision::debian::Plan
 pub ferroday_cage::provision::debian::DebianEvent::Resolving

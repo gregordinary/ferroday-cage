@@ -373,6 +373,9 @@ pub(crate) struct Index {
     releases: HashMap<usize, (String, ReleasePriority)>,
     /// The pin the index was merged under.
     pins: Pins,
+    /// How many stanzas were read but not kept, as [`merge`](Self::merge)
+    /// counts them.
+    skipped: usize,
 }
 
 impl Index {
@@ -400,6 +403,13 @@ impl Index {
     /// above decides, so [`Pins::check`] can report what the archives carry
     /// rather than only that something is missing; that check runs before
     /// anything resolves against the index.
+    ///
+    /// A stanza this layer cannot act on, one [`Package::from_stanza`] reads as
+    /// no package, is left out and counted in [`skipped`](Self::skipped) rather
+    /// than refusing the index: a package the closure needs and the mirror
+    /// malformed is still refused, by name, when nothing else answers it, and
+    /// one it does not need costs nothing. A stanza for another architecture is
+    /// neither kept nor counted, since it is not this bootstrap's.
     pub(crate) fn merge<'a>(
         sources: impl IntoIterator<Item = Source<'a>>,
         architecture: &str,
@@ -407,10 +417,12 @@ impl Index {
     ) -> Index {
         let mut by_name: HashMap<String, Vec<Package>> = HashMap::new();
         let mut releases = HashMap::new();
+        let mut skipped = 0;
         for source in sources {
             releases.insert(source.origin, (source.suite.to_string(), source.priority));
             for stanza in document::parse(source.text) {
                 let Some(mut package) = Package::from_stanza(&stanza) else {
+                    skipped += 1;
                     continue;
                 };
                 if package.architecture != architecture && package.architecture != "all" {
@@ -482,7 +494,19 @@ impl Index {
             providers,
             releases,
             pins: pins.clone(),
+            skipped,
         }
+    }
+
+    /// How many packages the index offers, each name counted once.
+    pub(crate) fn package_count(&self) -> usize {
+        self.by_name.len()
+    }
+
+    /// How many stanzas were read but not kept, because this layer cannot act
+    /// on them.
+    pub(crate) fn skipped(&self) -> usize {
+        self.skipped
     }
 
     /// The candidate for `name`, if it is a real package in this index: the
