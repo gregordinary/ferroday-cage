@@ -1600,9 +1600,9 @@ pub(super) enum GateFailure {
 /// The caller's half of a map gate: waits for the child's ready byte, has the
 /// delegate establish the child's identity map, and releases the child.
 ///
-/// Every provisioning child that takes a delegated map is driven through this:
-/// the export, the copy-in, and the removal. The child's side of the same
-/// handshake is [`child::enter_mapped_namespace`], which is why the two byte
+/// Every child that takes a delegated map is driven through this: the launch
+/// stage, and the export, the copy-in, and the removal. The child's side of the
+/// same handshake is [`child::establish_map`], which is why the two byte
 /// constants above are shared rather than restated.
 ///
 /// The gate is a seqpacket socket, so one read receives one whole message and
@@ -1940,15 +1940,16 @@ fn receive_primary(channel: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
 /// Establishes a range-mapped launch's identity map through its delegate.
 ///
 /// A no-op for the single-identity tier, which carries no gate. For a range
-/// tier: waits for stage A's ready byte (sent once it has unshared and
-/// swept), applies the resolved map against stage A's pid, and releases the
-/// stage with the go byte.
+/// tier, [`drive_map_gate`] waits for stage A's ready byte (sent once it has
+/// unshared and swept), applies the resolved map against stage A's pid, and
+/// releases the stage with the go byte.
 ///
-/// If stage A exits before signalling ready, the report pipe holds the true
-/// cause and is read for it. If the delegate fails, stage A is killed and
-/// reaped, and the delegate's own error is returned: the delegate ran
-/// caller-side, so the better diagnostic is already in hand. Either way stage A
-/// had not forked anything yet, so nothing else of the launch exists.
+/// Anything short of that ends stage A through [`abandon_gated_child`]. If
+/// stage A exited before signalling ready, the report pipe holds the true cause
+/// and is read for it. If the delegate failed, its own error is returned: the
+/// delegate ran caller-side, so the better diagnostic is already in hand.
+/// Either way stage A had not forked anything yet, so nothing else of the
+/// launch exists.
 ///
 /// The wait for the ready byte has no deadline, deliberately, like the launch's
 /// other reads of its own stages: [`read_report`] and [`receive_supervisor`].
@@ -1956,7 +1957,7 @@ fn receive_primary(channel: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
 /// what is awaited or exits, and its exit closes the end. Only a stage blocked
 /// in the kernel holds one open, a mount against an unresponsive server for
 /// instance, and the launch then waits as long as that mount does.
-fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<(), Error> {
+fn establish_identity_map(plan: &LaunchPlan, parent: &ParentSide) -> Result<(), Error> {
     let Some(gate) = &parent.map_gate else {
         return Ok(());
     };
@@ -1965,66 +1966,34 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
         return Ok(());
     };
 
-    let mut byte = [0u8; 1];
-    match frame::retry_on_intr!(rustix::io::read(gate, &mut byte)) {
-        // Stage A is unshared and waiting; the namespace exists.
-        Ok(n) if n > 0 => {}
-        // End-of-file: stage A exited before reaching the gate. The report
-        // pipe holds the step that failed, and no target, since nothing that
-        // creates one had been forked.
-        Ok(_) => {
-            let report = read_report(&parent.report_read, &mut Vec::new(), 0);
-            let _ = parent.stage.reap();
-            return Err(match report {
-                Ok(Report::SetupFailed {
-                    step,
-                    errno,
-                    detail,
-                }) => setup_error(step, errno, detail, Labels::of(plan)),
-                Ok(Report::ExecSucceeded | Report::Held) => Error::SupervisorLost,
-                Err(err) => err,
-            });
-        }
-        Err(errno) => {
-            parent.stage.kill();
-            let _ = parent.stage.reap();
-            return Err(wait_syscall_error(errno));
-        }
-    }
-
     // The map is written against stage A: the process that unshared, so the
     // process whose /proc map files name the new namespace.
-    let pid = parent.stage.pid().as_raw_nonzero().get() as u32;
-    match mapper.apply(pid, map) {
-        Ok(()) => {
-            // Release the stage. A failed write means it died; the caller's
-            // next read on the report or control path reports the outcome.
-            let _ = frame::retry_on_intr!(rustix::io::write(gate, &[MAP_GO_BYTE]));
-            Ok(())
-        }
-        Err(err) => {
-            // The delegate failed. Stage A is blocked at the gate in an
-            // unmapped namespace, before it forks anything, so killing it ends
-            // the launch cleanly; its report record is superseded by the
-            // delegate's error.
-            //
-            // Killed rather than released by closing the gate: a fork
-            // copies the whole descriptor table, so any process this caller
-            // forked concurrently holds a copy of this gate's caller end and
-            // keeps the peer open however promptly this one closes. The
-            // library's own children do sweep their inherited tables, but each
-            // only after its fork has returned in it, and nothing bounds when
-            // the kernel next schedules that child; a child the *consumer*
-            // forked sweeps nothing at all, and drops the copy only when it
-            // execs — the gate is close-on-exec — or exits. The end-of-file
-            // stage A waits on is therefore not something this caller can make
-            // arrive, and the reap below would block on it.
-            parent.stage.kill();
-            parent.map_gate = None;
-            let _ = parent.stage.reap();
-            Err(Error::IdentityMap(err))
-        }
-    }
+    let failure = match drive_map_gate(gate.as_fd(), parent.stage.pid(), mapper.as_ref(), map) {
+        Ok(Gated::Released) => return Ok(()),
+        failure => failure,
+    };
+    // Stage A is gone, or blocked at the gate in an unmapped namespace, and in
+    // neither case has it forked anything. A record it wrote before it exited
+    // stays in the report pipe.
+    abandon_gated_child(&parent.stage);
+    Err(match failure {
+        // Stage A exited before reaching the gate, the one way it ends one
+        // without a ready byte, since it reports through the report pipe and
+        // never on the gate. The pipe holds the step that failed, and no
+        // target, since nothing that creates one had been forked.
+        Ok(_) => match read_report(&parent.report_read, &mut Vec::new(), 0) {
+            Ok(Report::SetupFailed {
+                step,
+                errno,
+                detail,
+            }) => setup_error(step, errno, detail, Labels::of(plan)),
+            Ok(Report::ExecSucceeded | Report::Held) => Error::SupervisorLost,
+            Err(err) => err,
+        },
+        Err(GateFailure::Io(errno)) => wait_syscall_error(errno),
+        // The delegate's error supersedes stage A's report record.
+        Err(GateFailure::Map(err)) => Error::IdentityMap(err),
+    })
 }
 
 /// Decides how the launch stage is reaped for a command that is now running.
@@ -2117,7 +2086,7 @@ pub(crate) fn spawn(
     let mut parent = fork_launch(plan, observe, false, terminal, cgroup_procs)?;
     // A range map is established before the supervisor is published, so a
     // published sandbox always has a fully mapped user namespace.
-    establish_identity_map(plan, &mut parent)?;
+    establish_identity_map(plan, &parent)?;
     let received = receive_supervisor(&parent.host_sock);
     if let Ok(publication) = &received
         && let Some(foreground) = &mut parent.foreground
@@ -2372,7 +2341,7 @@ pub(crate) fn spawn_pending(
     // caller holds a Pending, /proc/<pid>/ns/user is fully mapped — the
     // ordering the network stack's helper relies on when it enters the
     // namespace.
-    establish_identity_map(plan, &mut parent)?;
+    establish_identity_map(plan, &parent)?;
     let proceed_write = parent
         .proceed_write
         .take()
