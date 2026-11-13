@@ -85,16 +85,31 @@ fn the_usage_reports_processor_time_and_peak_memory() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
+    // The peak cannot fall below the floor the launching process sets, this
+    // test process's own resident set (see `ResourceUsage::peak_rss_bytes`),
+    // so a buffer below the floor would pass unseen. A run that allocates
+    // nothing measures the floor, and the buffer is placed above it.
+    let floor = sh(rootfs, "true")
+        .output()
+        .expect("the sandbox runs to completion")
+        .usage
+        .expect("the init reports the usage")
+        .peak_rss_bytes;
+    let buffer_mib = (floor >> 20) + 64;
     // `dd` reads into a buffer of its block size, so the whole buffer is
     // resident; it runs as a child the shell waits for.
-    let script = format!("{CPU_LOOP}; dd if=/dev/zero of=/dev/null bs=64M count=1 2>/dev/null");
+    let script =
+        format!("{CPU_LOOP}; dd if=/dev/zero of=/dev/null bs={buffer_mib}M count=1 2>/dev/null");
     let output = sh(rootfs, &script)
         .output()
         .expect("the sandbox runs to completion");
     assert!(output.status.success(), "{output:?}");
     let usage = output.usage.expect("the init reports the usage");
     assert!(cpu(usage) >= LOOP_FLOOR, "{usage:?}");
-    assert!(usage.peak_rss_bytes >= 64 << 20, "{usage:?}");
+    assert!(
+        usage.peak_rss_bytes >= buffer_mib << 20,
+        "a {buffer_mib} MiB buffer over a floor of {floor} bytes: {usage:?}"
+    );
     assert_eq!(usage.peak_rss_bytes % 1024, 0, "{usage:?}");
 
     // The handle reports the same figure once its wait has returned.
@@ -224,6 +239,61 @@ fn output_produced_before_a_kill_is_drained_by_the_wait_after_it() {
     let status = running.wait().expect("the wait completes");
     assert_eq!(status.signal(), Some(9));
     assert_eq!(observer.stdout, b"before-kill\n");
+}
+
+/// How much memory the floor test's caller holds resident when it launches,
+/// in MiB.
+const FLOOR_MIB: usize = 128;
+
+/// Not a test of its own: when `FERRODAY_CAGE_TEST_PEAK_FLOOR` is set, this
+/// holds [`FLOOR_MIB`] of memory resident, runs a sandbox whose command
+/// allocates nothing, and prints the peak its usage reports.
+#[test]
+fn helper_report_peak() {
+    if std::env::var_os("FERRODAY_CAGE_TEST_PEAK_FLOOR").is_none() {
+        return;
+    }
+    let rootfs = common::fixture_rootfs().expect("the fixture root is provisioned");
+    // Written to, page by page, so every page is resident rather than mapped.
+    let held = vec![1u8; FLOOR_MIB << 20];
+    let output = sh(rootfs, "true")
+        .output()
+        .expect("the sandbox runs to completion");
+    let usage = output.usage.expect("the init reports the usage");
+    println!("peak={}", usage.peak_rss_bytes);
+    std::hint::black_box(&held);
+}
+
+#[test]
+fn the_peak_is_at_least_the_launching_process_resident_set() {
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    // The launch forks copies of its caller down to the command, and the
+    // kernel counts the resident set of the image an `execve` replaces toward
+    // the process that executes it. A caller holding much more than the
+    // command ever does sets the figure, as `ResourceUsage::peak_rss_bytes`
+    // states.
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = common::run_bounded(
+        std::process::Command::new(exe)
+            .args(["--exact", "helper_report_peak", "--nocapture"])
+            .env("FERRODAY_CAGE_TEST_PEAK_FLOOR", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+        Duration::from_secs(60),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    let peak: u64 = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("peak="))
+        .expect("the helper reports the peak")
+        .trim()
+        .parse()
+        .expect("a number");
+    assert!(peak >= (FLOOR_MIB as u64) << 20, "{peak} bytes");
 }
 
 /// Not a test of its own: when `FERRODAY_CAGE_TEST_HELPER` is set, this

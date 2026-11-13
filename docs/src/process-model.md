@@ -189,6 +189,15 @@ A process still running when the command exits is not counted. A kill under a
 PID namespace ends the init before it reports, so a killed sandbox has an
 outcome and no usage.
 
+The peak resident set has a floor: the resident set the calling process had
+when it launched the sandbox, its heap and stacks above all. The launch forks
+copies of the calling process down to the command, and each copy's resident
+set counts the pages it shares with the caller. When the command's `execve`
+replaces the last copy, the kernel records that copy's peak as the command's.
+A service holding 2 GiB that runs `/bin/true` therefore reports about 2 GiB.
+No figure that leaves the replaced image out is readable without privilege. A
+peak below the caller's own is therefore not one the field can show.
+
 [`run`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.run
 [`spawn`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.spawn
 [`terminate`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.terminate

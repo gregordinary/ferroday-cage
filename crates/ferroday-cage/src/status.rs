@@ -152,6 +152,19 @@ pub struct ResourceUsage {
     /// The peak of the largest process, not a sum: two processes that each
     /// held 100 MiB report 100 MiB, whether or not they ran at once. The
     /// kernel counts it in kibibytes, so it is a multiple of 1024.
+    ///
+    /// # The launching process's floor
+    ///
+    /// The figure is never below the resident set the launching process had
+    /// when it launched the sandbox, its heap and stacks above all. The launch
+    /// forks copies of the launching process down to the command, and a copy
+    /// shares the resident pages it was copied with, which count toward its own
+    /// resident set. When the command's `execve` replaces the last copy, the
+    /// kernel records that copy's peak as the command's. A service holding
+    /// 2 GiB that runs `/bin/true` therefore reports about 2 GiB. The kernel
+    /// keeps no figure that leaves the replaced image out and that a process
+    /// without privilege can read, so a peak below the launching process's own
+    /// is not one this field can show.
     pub peak_rss_bytes: u64,
 }
 
