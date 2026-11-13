@@ -117,11 +117,27 @@ it, as `apk` does.
 
 The resolver is not `apk`'s solver, and one difference remains. A provider
 already in the closure answers a later dependency on its name, in both. The two
-reach dependencies in different orders, though, so where a name is provided at
-no version they can settle it differently. A few KDE applications' closures hold
-`kwallet` and answer `dbus:org.freedesktop.Secrets` with it, where `apk`
-installs `gnome-keyring` beside it. Naming the provider with `include` makes the
-two agree.
+reach dependencies in different orders, though. Where a name is provided at no
+version, one can reach it with a provider already in the closure and the other
+without one. The one without takes the highest-priority provider, and holds two
+when the closure brings in the other for another reason.
+
+Resolved alone against `apk` 3.0.9, 22 of the 28,660 packages in v3.24's `main`
+and `community` differ this way. So do 17 of the 27,577 in v3.23. Three names
+account for all of them:
+
+- `dbus:org.freedesktop.Secrets`. In 13 KDE packages in each release, among
+  them `akonadi-calendar` and `korganizer`, `apk` installs `gnome-keyring`
+  beside `kwallet`. In `neochat`, `plasmatube`, `ruqola` and `tokodon` on
+  v3.24, this resolver installs it and `apk` does not.
+- `lua`. In `acf-db-lib`, `lua-resty-lock`, `lua-resty-openidc` and
+  `pdns-backend-lua2`, this resolver installs the highest-priority interpreter
+  beside the one `apk` uses. v3.23 has no `acf-db-lib` case.
+- `java-jre-headless`. `rmlmapper` gains `openjdk25-jre-headless` beside
+  `openjdk21-jre-headless`.
+
+Naming the provider `apk` installs with `include` makes the two install the same
+packages, in every one of these.
 
 ## Repositories
 

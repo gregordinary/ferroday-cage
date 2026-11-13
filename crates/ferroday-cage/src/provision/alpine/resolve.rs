@@ -92,11 +92,15 @@
 //! which settles names by propagating what their options share rather than one
 //! dependency at a time. Where a name provided at no version is reached after
 //! one of its providers was taken for another reason, the closure keeps that
-//! provider alone, and apk, having reached the name first, can hold its
-//! highest-priority provider as well. A few KDE applications' closures hold
-//! `kwallet`, and apk installs `gnome-keyring` beside it for
-//! `dbus:org.freedesktop.Secrets`. Naming the provider with `include` makes
-//! the two agree.
+//! provider alone; where it is reached first, the closure takes the
+//! highest-priority provider and holds both once the other is taken. apk
+//! reaches such names in its own order, so the two can settle one differently,
+//! in either direction. Over every package of Alpine's `main` and `community`
+//! resolved alone, three names do: `dbus:org.freedesktop.Secrets` in KDE
+//! packages (`gnome-keyring` beside `kwallet`, in some under apk and in others
+//! here), `lua` (a second interpreter here) and `java-jre-headless` (a second
+//! JRE here). Naming the provider apk installs with `include` makes the two
+//! agree in every case. The guide's Alpine chapter lists them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
